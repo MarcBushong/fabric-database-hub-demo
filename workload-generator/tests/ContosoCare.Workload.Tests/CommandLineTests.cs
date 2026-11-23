@@ -9,6 +9,10 @@ namespace ContosoCare.Workload.Tests;
 /// <summary>Argument parsing and validation. Every case here fails or finishes before the runner would connect to SQL.</summary>
 public sealed class CommandLineTests
 {
+    /// <summary>The validation result schema, loaded once: JsonSchema.Net registers a schema by its $id, once per process.</summary>
+    internal static readonly Lazy<Json.Schema.JsonSchema> ValidationResultSchema = new(() =>
+        Json.Schema.JsonSchema.FromText(File.ReadAllText(RepositoryPaths.Combine("scripts", "modules", "DbHubDemo", "schemas", "validation-result.schema.json"))));
+
     [Fact]
     public void RunNeedsATarget()
     {
@@ -253,10 +257,9 @@ public sealed class CommandLineTests
     public void ResultRecordsMatchTheValidationSchema()
     {
         var record = CommandLineDefinition.ResultRecord(DemoTarget.T1, "reset", new Sql.CheckRecord("no-open-demo-transactions", "Pass", "No demo session has an open transaction."), "2026-10-20T18:00:00.000Z");
-        var schema = Json.Schema.JsonSchema.FromText(File.ReadAllText(RepositoryPaths.Combine("scripts", "modules", "DbHubDemo", "schemas", "validation-result.schema.json")));
         using var document = JsonDocument.Parse(record.ToJsonString());
 
-        var result = schema.Evaluate(document.RootElement);
+        var result = ValidationResultSchema.Value.Evaluate(document.RootElement);
 
         Assert.True(result.IsValid);
         Assert.Equal("WORKLOAD.T1.RESET.NO_OPEN_DEMO_TRANSACTIONS", record["checkId"]!.GetValue<string>());

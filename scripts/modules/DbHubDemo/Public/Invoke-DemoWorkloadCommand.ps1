@@ -1,7 +1,7 @@
 function Invoke-DemoWorkloadCommand {
     <#
     .SYNOPSIS
-    Runs one ContosoCare.Workload command on a target through action Run Command: on T1 for T1, T3, and T4,
+    Runs one ContosoCare.Workload command on a target through action Run Command: on T1 for T1, T3, T4, and T5,
     and through the T2 host into the guest over PowerShell Direct for T2 (ADR 0010, ADR 0011).
 
     .DESCRIPTION
@@ -25,7 +25,7 @@ function Invoke-DemoWorkloadCommand {
     Result (a WORKLOAD.<target>.COMMAND record).
 
     .PARAMETER Target
-    T1, T2, T3, or T4.
+    T1, T2, T3, T4, or T5 (the Azure Cosmos DB account, ADR 0027, driven from T1 like T3 and T4).
 
     .PARAMETER ArgumentList
     The runner command and its options, without --target.
@@ -36,7 +36,7 @@ function Invoke-DemoWorkloadCommand {
     .PARAMETER ReadySeconds
     How long the VM side waits for the target to accept connections before an activity command ('profile set' other
     than off, or 'run'; 0 to 1800). The default 0 doesn't wait, so a module caller's time stays bounded by its own
-    retries (Set-DemoTargetProfile spends one budget across its attempts); the Fabric control's runbooks send their
+    retries (Set-DemoTargetProfile spends one budget across its attempts); the session control's runbooks send their
     own (ADR 0020).
 
     .EXAMPLE
@@ -52,7 +52,7 @@ function Invoke-DemoWorkloadCommand {
         [System.Collections.IDictionary] $Config,
 
         [Parameter(Mandatory)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target,
 
         [Parameter(Mandatory)]

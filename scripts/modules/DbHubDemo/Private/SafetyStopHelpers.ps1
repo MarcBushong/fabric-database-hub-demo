@@ -1,16 +1,22 @@
 # The nightly safety stop (ADR 0024), part of every deployment: deploy.ps1 sets it up after the template
 # (Invoke-DemoSafetyStopSetup), scripts/grant-safety-stop.ps1 assigns its role for an Owner, and status.ps1
 # (STATUS.SAFETYSTOP), validate.ps1 (COST.SAFETYSTOP), the cost estimate's T4 restart worst case, and stop-demo.ps1's and
-# status.ps1's T4 texts read it. It doesn't depend on the optional on-demand activity control (ADR 0020): its own
+# status.ps1's T4 texts read it. It doesn't depend on the session control (ADR 0020, ADR 0026), which every deployment has too: its own
 # identity, Automation account, and schedules live in the demo resource group and go with it, and they run the same
 # DbHub-Stop runbook code (automation/runbooks) with its own settings. Internal.
 
-# The custom role, exactly as the owner approved it on 2026-11-05 (ADR 0024): read and stop, nothing else. It can't start,
-# create, change, or delete anything; it has no Run Command, no data action, and no Automation, Key Vault, Fabric, or role
-# permission. Changing this list needs the owner's approval; tests/unit/DbHubDemo.SafetyStop.Tests.ps1 fails when it and
-# the ADR differ.
+# The custom role, as the owner approved it on 2026-11-05 (ADR 0024) and as amended on 2026-11-19 (below): read, stop, and
+# delete T5's session-only container, nothing else. It can't start, create, or change anything; it has no Run Command, no
+# data action, and no Automation, Key Vault, Fabric, or role permission. Changing this list needs the owner's approval;
+# tests/unit/DbHubDemo.SafetyStop.Tests.ps1 fails when it and the ADR differ.
+# 2026-11-19 (ADR 0024 and ADR 0027, approved by the owner on 2026-11-19): read and delete T5's session-only container,
+# so a session that ended without its stop doesn't leave its provisioned throughput billing all night. It could read or
+# delete any Azure Cosmos DB for NoSQL container in the demo resource group, where T5's account is the only account, and
+# the runbook deletes contosocare/patient-events only, and only while the DbHubT5Container tag is Session (a session
+# creates it again). Nothing of the account, its keys, its network, or its data plane.
+# https://learn.microsoft.com/azure/role-based-access-control/permissions/databases#microsoftdocumentdb
 $script:SafetyStopRoleName = 'DbHub Demo Safety Stop'
-$script:SafetyStopRoleDescription = 'Read and deallocate the Database Hub demo''s VMs, read and stop its PostgreSQL flexible server, and read its Azure SQL database''s status. Assigned only at the demo resource group, to the nightly safety stop''s identity.'
+$script:SafetyStopRoleDescription = 'Read and deallocate the Database Hub demo''s VMs, read and stop its PostgreSQL flexible server, read its Azure SQL database''s status, and read and delete its session-only Azure Cosmos DB container. Assigned only at the demo resource group, to the nightly safety stop''s identity.'
 $script:SafetyStopRoleActions = @(
     'Microsoft.Resources/subscriptions/resourceGroups/read'
     'Microsoft.Compute/virtualMachines/read'
@@ -19,6 +25,8 @@ $script:SafetyStopRoleActions = @(
     'Microsoft.Sql/servers/databases/read'
     'Microsoft.DBforPostgreSQL/flexibleServers/read'
     'Microsoft.DBforPostgreSQL/flexibleServers/stop/action'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
+    'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
 )
 $script:SafetyStopAutomationApiVersion = '2024-10-23'
 $script:SafetyStopDoc = 'https://learn.microsoft.com/azure/automation/shared-resources/schedules'
@@ -221,11 +229,11 @@ function Get-DemoSafetyStopRoleDefinition {
 function Get-DemoSafetyStopRunbookSetting {
     <#
     .SYNOPSIS
-    The settings baked into the safety stop's DbHub-Stop (ADR 0024): the names it acts on, the demo's shutdown time, its
-    waits, and the pinned API versions. The shared code's checks also want the control's runbook and schedule names, so
-    they're here with the control's values, though the Nightly and T3Check scopes never use them, and its account is this
-    one. Nothing in it is secret: it holds the subscription ID and the identity's client ID, which live in Azure only.
-    Internal.
+    The settings baked into the safety stop's DbHub-Stop (ADR 0024): the names it acts on (since 2026-11-19 T5's account and
+    container too, ADR 0027), the demo's shutdown time, its waits, and the pinned API versions. The shared code's checks
+    also want the control's runbook and schedule names, so they're here with the control's values, though the Nightly and
+    T3Check scopes never use them, and its account is this one. Nothing in it is secret: it holds the subscription ID and
+    the identity's client ID, which live in Azure only. Internal.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -242,8 +250,17 @@ function Get-DemoSafetyStopRunbookSetting {
     )
 
     $apiVersions = [ordered]@{}
-    foreach ($type in 'Microsoft.Automation/automationAccounts', 'Microsoft.Compute/virtualMachines', 'Microsoft.Resources/resourceGroups', 'Microsoft.Sql/servers/databases', 'Microsoft.DBforPostgreSQL/flexibleServers') {
+    # Microsoft.DocumentDB/databaseAccounts (2026-11-19, ADR 0027): T5's session-only container, which the nightly stop
+    # deletes when a session's stop didn't.
+    foreach ($type in 'Microsoft.Automation/automationAccounts', 'Microsoft.Compute/virtualMachines', 'Microsoft.Resources/resourceGroups', 'Microsoft.Sql/servers/databases', 'Microsoft.DBforPostgreSQL/flexibleServers', 'Microsoft.DocumentDB/databaseAccounts') {
         $apiVersions[$type] = Get-DemoPinnedApiVersion -ResourceType $type
+    }
+    # T5 (2026-11-19, ADR 0027): its account and container's names, and its throughput for the stop's text, when it's on.
+    $t5On = Test-DemoT5Enabled -Config $Config
+    $cosmos = Get-DemoCosmosSetting
+    $t5Container = $null
+    if ($t5On) {
+        $t5Container = [ordered]@{ databaseName = [string]$cosmos['databaseName']; containerName = [string]$cosmos['containerName']; throughput = [int]$cosmos['throughputRUs'] }
     }
     return [ordered]@{
         schemaVersion         = 1
@@ -270,6 +287,10 @@ function Get-DemoSafetyStopRunbookSetting {
         t4ServerPrefix        = 'pgflex01-'
         # T4's read replica (ADR 0025): the safety stop stops one a session left behind, only after T4 is stopped.
         t4ReplicaPrefix       = ('{0}-' -f (Get-DemoT4ReplicaSetting)['serverNamePrefix'])
+        # T5's container (2026-11-19, ADR 0027): the nightly stop deletes one a session's stop didn't, while the demo
+        # resource group's DbHubT5Container tag is Session; empty and $null when T5 is off.
+        t5AccountPrefix       = $(if ($t5On) { '{0}-' -f $cosmos['accountNamePrefix'] } else { '' })
+        t5Container           = $t5Container
         autoShutdownTime      = $(if ($Config['autoShutdownTime']) { [string]$Config['autoShutdownTime'] } else { '1900' })
         autoShutdownTimeZone  = $(if ($Config['autoShutdownTimeZone']) { [string]$Config['autoShutdownTimeZone'] } else { 'UTC' })
         t4WaitMinutes         = 10
@@ -429,6 +450,84 @@ function Get-DemoSafetyStopRoleState {
     $permissions = @(Get-DemoActivityControlList -InputObject (Get-DemoMemberValue -InputObject $match -Name 'properties') -Name 'permissions')
     $actions = @(foreach ($permission in $permissions) { Get-DemoActivityControlList -InputObject $permission -Name 'actions' })
     return [pscustomobject]@{ Id = [string](Get-DemoMemberValue -InputObject $match -Name 'name'); Actions = @($actions | ForEach-Object { [string]$_ }); Error = '' }
+}
+
+function Get-DemoDeployerRolePermission {
+    <#
+    .SYNOPSIS
+    Whether the signed-in deployer can write custom role definitions in the subscription (Microsoft.Authorization/
+    roleDefinitions/write) and create role assignments at the demo resource group, or at the subscription before the group
+    exists (roleAssignments/write): what deploy.ps1 needs to set up the nightly safety stop's and the session control's
+    roles in its own run (2026-11-19, the coordinator's option 2). Returns CanDefine, CanAssign, and Error ('' when both were
+    read). Never throws: what can't be read counts as $false (fail safe). Internal.
+    https://learn.microsoft.com/rest/api/authorization/permissions/list-for-resource-group
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $subscriptionId = [string]$Config['subscriptionId']
+    try {
+        $version = Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Authorization/roleAssignments'
+        $subscriptionRead = Invoke-DemoActivityControlArm -SubscriptionId $subscriptionId -Method get -Url ('https://management.azure.com/subscriptions/{0}/providers/Microsoft.Authorization/permissions?api-version={1}' -f $subscriptionId, $version)
+        $groupRead = $subscriptionRead
+        if (Test-DemoResourceGroupExist -Config $Config) {
+            $groupRead = Invoke-DemoActivityControlArm -SubscriptionId $subscriptionId -Method get -Url ('https://management.azure.com/subscriptions/{0}/resourceGroups/{1}/providers/Microsoft.Authorization/permissions?api-version={2}' -f $subscriptionId, (Get-DemoResourceGroupName -Config $Config), $version)
+        }
+        $canDefine = $subscriptionRead.Ok -and (Test-DemoPermission -Permission @(Get-DemoActivityControlList -InputObject $subscriptionRead.Value -Name 'value') -Action 'Microsoft.Authorization/roleDefinitions/write')
+        $canAssign = $groupRead.Ok -and (Test-DemoPermission -Permission @(Get-DemoActivityControlList -InputObject $groupRead.Value -Name 'value') -Action 'Microsoft.Authorization/roleAssignments/write')
+        $problem = @(@($subscriptionRead, $groupRead) | Where-Object { -not $_.Ok } | ForEach-Object { [string]$_.Error }) | Select-Object -First 1
+        return [pscustomobject]@{ CanDefine = [bool]$canDefine; CanAssign = [bool]$canAssign; Error = [string]$problem }
+    }
+    catch {
+        return [pscustomobject]@{ CanDefine = $false; CanAssign = $false; Error = (Protect-DemoText -Text $_.Exception.Message) }
+    }
+}
+
+function Get-DemoSafetyStopPlan {
+    <#
+    .SYNOPSIS
+    Whether deploy.ps1 puts the nightly safety stop fully in place in this run (2026-11-19, the coordinator's option 2): its
+    template, runbook, and schedules need only Contributor, and its role needs the deployer to assign it at the demo
+    resource group and, unless the custom role already has exactly its approved actions, to write it. Returns Planned,
+    Reason, and Evidence. -Permission is Get-DemoDeployerRolePermission's answer, read when it isn't given. Never throws:
+    what can't be read isn't planned (fail safe). Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $Permission = $null
+    )
+
+    try {
+        if ($null -eq $Permission) {
+            $Permission = Get-DemoDeployerRolePermission -Config $Config
+        }
+        $role = Get-DemoSafetyStopRoleState -SubscriptionId ([string]$Config['subscriptionId'])
+        $roleReady = [bool]$role.Id -and -not $role.Error -and @(Compare-Object -ReferenceObject @($script:SafetyStopRoleActions) -DifferenceObject @($role.Actions)).Count -eq 0
+        $planned = [bool]$Permission.CanAssign -and ([bool]$Permission.CanDefine -or $roleReady)
+        $evidence = [ordered]@{ planned = $planned; canDefineRoles = [bool]$Permission.CanDefine; canAssignRoles = [bool]$Permission.CanAssign; roleReady = $roleReady; error = [string]$Permission.Error }
+        $reason = if ($planned) {
+            'deploy.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role'
+        }
+        elseif (-not $Permission.CanAssign) {
+            'you can''t assign the nightly safety stop''s role (it takes an Owner, a User Access Administrator, or a Role Based Access Control Administrator), so deploy.ps1 can''t put it fully in place'
+        }
+        else {
+            'the nightly safety stop''s custom role needs writing first, which takes an Owner or a User Access Administrator'
+        }
+        return [pscustomobject]@{ Planned = $planned; Reason = $reason; Evidence = $evidence }
+    }
+    catch {
+        return [pscustomobject]@{ Planned = $false; Reason = ('whether deploy.ps1 can set up the nightly safety stop couldn''t be read ({0})' -f (Protect-DemoText -Text $_.Exception.Message)); Evidence = [ordered]@{ planned = $false } }
+    }
 }
 
 function Invoke-DemoSafetyStopTemplate {
@@ -726,14 +825,41 @@ function Grant-DemoSafetyStopRole {
             if (-not $write.Ok) {
                 return (& $warn ('The custom role "{0}" couldn''t be written: {1}.' -f $script:SafetyStopRoleName, $write.Error))
             }
+            # What changed (2026-11-19): an existing role is updated in place, under its own ID, so its assignments stay; the
+            # result says which actions it gained or lost, so an update's status page shows the role ready before a session.
+            if ($roleId) {
+                $evidence['updated'] = $true
+                $evidence['added'] = @($script:SafetyStopRoleActions | Where-Object { $_ -cnotin @($role.Actions) })
+                $evidence['removed'] = @(@($role.Actions) | Where-Object { $_ -cnotin $script:SafetyStopRoleActions })
+            }
             $roleId = $definitionId
             $evidence['roleWritten'] = $true
         }
     }
     $evidence['roleId'] = $roleId
+    $can = 'the nightly safety stop can stop the VMs and T4, read T3, and delete T5''s container between sessions'
+    $updatedText = if ([bool]$evidence['updated']) { ' (its definition was updated in place, under the same ID, to exactly the {0} approved actions{1}{2})' -f $script:SafetyStopRoleActions.Count, $(if (@($evidence['added']).Count) { '; added: {0}' -f (@($evidence['added']) -join ', ') } else { '' }), $(if (@($evidence['removed']).Count) { '; removed: {0}' -f (@($evidence['removed']) -join ', ') } else { '' }) } else { '' }
+    # A role this run couldn't write that doesn't have exactly its approved actions (review of ab91ee5): another environment's
+    # older deploy.ps1 wrote it back for the whole subscription (R910), so the nightly stop can't do what it lacks, such as
+    # deleting T5's container. A Warning that names them, never a Pass.
+    $stale = {
+        param([string] $State)
+        $missing = @($script:SafetyStopRoleActions | Where-Object { $_ -cnotin @($role.Actions) })
+        $extra = @(@($role.Actions) | Where-Object { $_ -cnotin $script:SafetyStopRoleActions })
+        $evidence['missingActions'] = $missing
+        $evidence['extraActions'] = $extra
+        # Assigned, so the nightly stop runs and does what its actions still allow; DONE says which (the re-review of 0590bbe).
+        $evidence['assigned'] = $true
+        $gap = @(if ($missing.Count) { 'it doesn''t have {0}' -f ($missing -join ', ') }) + @(if ($extra.Count) { 'it has {0}, which isn''t approved' -f ($extra -join ', ') })
+        $message = 'The role {0} is {1}, but the custom role "{2}" doesn''t have exactly its {3} approved actions: {4} (another environment''s deploy.ps1 on older code may have written it back for the whole subscription), and you can''t write it (it takes Microsoft.Authorization/roleDefinitions/write: an Owner or a User Access Administrator). Until then the nightly safety stop can''t do what it lacks{5}.' -f $label, $State, $script:SafetyStopRoleName, $script:SafetyStopRoleActions.Count, ($gap -join '; '), $(if (@($missing | Where-Object { $_ -like 'Microsoft.DocumentDB/*' }).Count) { ', such as deleting T5''s container between sessions' } else { '' })
+        New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('An Owner of the subscription runs, once: {0}, or ./scripts/deploy.ps1, which writes it back to exactly its approved actions.' -f $command) -DocUrl $script:SafetyStopRoleDoc
+    }
     $existing = Test-DemoActivityControlAssignment -SubscriptionId $Name.SubscriptionId -Scope $Name.ResourceGroupId -PrincipalId $PrincipalId -RoleId $roleId
     if ($existing.Exists) {
-        return (New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The role {0} is in place: the nightly safety stop can stop the VMs and T4, and read T3.' -f $label) -Evidence $evidence -DocUrl $script:SafetyStopRoleDoc)
+        if ([bool]$evidence['roleDiffers']) {
+            return (& $stale 'assigned')
+        }
+        return (New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The role {0} is in place{1}: {2}.' -f $label, $updatedText, $can) -Evidence $evidence -DocUrl $script:SafetyStopRoleDoc)
     }
     if ($existing.Error -and -not $existing.Missing) {
         return (& $warn ('The role {0} wasn''t checked: {1}.' -f $label, $existing.Error))
@@ -749,7 +875,10 @@ function Grant-DemoSafetyStopRole {
     $write = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method put -Url ('https://management.azure.com{0}/providers/Microsoft.Authorization/roleAssignments/{1}?api-version={2}' -f $Name.ResourceGroupId, $assignmentName, $permissionsVersion) -Body $body
     if ($write.Ok -or $write.Error -match 'RoleAssignmentExists') {
         $evidence['assigned'] = $true
-        return (New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The role {0} is assigned: the nightly safety stop can stop the VMs and T4, and read T3.' -f $label) -Evidence $evidence -DocUrl $script:SafetyStopRoleDoc)
+        if ([bool]$evidence['roleDiffers']) {
+            return (& $stale 'assigned now')
+        }
+        return (New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message ('The role {0} is assigned{1}: {2}.' -f $label, $updatedText, $can) -Evidence $evidence -DocUrl $script:SafetyStopRoleDoc)
     }
     return (& $warn ('The role {0} couldn''t be assigned: {1}.' -f $label, $write.Error))
 }
@@ -844,6 +973,62 @@ function Get-DemoSafetyStopState {
         Write-DemoLog -Level Warning -Message ('Whether the nightly safety stop is in place couldn''t be read: {0}' -f $answer.Error)
         return [pscustomobject]$answer
     }
+}
+
+function Get-DemoStopResultOutcome {
+    <#
+    .SYNOPSIS
+    What a DbHub-Stop job's result line (DBHUB-STOP) says it did to the VMs and T4, apart from T5's container (the re-review
+    of 0590bbe): Status, the result's own status, except Stopped for a result that is Partial only because of T5's container;
+    T5Only, true then; and T5Status, what happened to the container (t5Status, or, without it, NotGranted or Failed as the
+    text says). Since 2026-11-19 (review of ab91ee5) the runbooks keep T5's outcome apart (t5Status), so a container they
+    couldn't delete never makes a stop Partial; a result written before then has no t5Status, and is Partial only because of
+    T5 when every entry of its failed list starts with "T5's container" (the nightly safety stop and the auto-stop), or, with
+    no failed list (the daily T4 job), when its t5 text says the container wasn't deleted while T4's stop was accepted and
+    its replica didn't fail. An environment whose runbooks are older counts T4 as stopped then, so its preflight doesn't stop
+    deploy.ps1 before it publishes the runbooks that fix it. Internal and pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $Result
+    )
+
+    $status = [string](Get-DemoMemberValue -InputObject $Result -Name 'status')
+    $names = if ($null -eq $Result) { @() } elseif ($Result -is [System.Collections.IDictionary]) { @($Result.Keys | ForEach-Object { [string]$_ }) } else { @($Result.PSObject.Properties.Name) }
+    $outcome = [pscustomobject]@{ Status = $status; T5Only = $false; T5Status = [string](Get-DemoMemberValue -InputObject $Result -Name 't5Status') }
+    if ($status -ne 'Partial' -or $names -contains 't5Status') {
+        return $outcome
+    }
+    $t5Prefix = 'T5''s container'
+    $t5Kind = {
+        param([string] $Text)
+        if ($Text -match 'role can''t delete it') { return 'NotGranted' }
+        return 'Failed'
+    }
+    if ($names -contains 'failed') {
+        # Assigned first: Get-DemoMemberValue returns an array as one object.
+        $failedValue = Get-DemoMemberValue -InputObject $Result -Name 'failed'
+        $failed = @(@($failedValue) | Where-Object { $null -ne $_ -and [string]$_ } | ForEach-Object { [string]$_ })
+        if ($failed.Count -gt 0 -and @($failed | Where-Object { -not $_.StartsWith($t5Prefix, [System.StringComparison]::Ordinal) }).Count -eq 0) {
+            $outcome.Status = 'Stopped'
+            $outcome.T5Only = $true
+            $outcome.T5Status = & $t5Kind ($failed -join ' ')
+        }
+        return $outcome
+    }
+    # The daily T4 job's result (DbHub-Stop -Scope T4) has no failed list: Partial when T4's stop wasn't accepted, its read
+    # replica wasn't stopped, or T5's container wasn't deleted, as its message, replica, and t5 texts say.
+    $t5Text = [string](Get-DemoMemberValue -InputObject $Result -Name 't5')
+    $message = [string](Get-DemoMemberValue -InputObject $Result -Name 'message')
+    $replica = [string](Get-DemoMemberValue -InputObject $Result -Name 'replica')
+    if ($t5Text.StartsWith(($t5Prefix + ' not deleted'), [System.StringComparison]::Ordinal) -and $message -notmatch 'its stop was failed' -and $replica -notmatch '\) not stopped: ') {
+        $outcome.Status = 'Stopped'
+        $outcome.T5Only = $true
+        $outcome.T5Status = & $t5Kind $t5Text
+    }
+    return $outcome
 }
 
 function Get-DemoSafetyStopJobResult {
@@ -1037,7 +1222,10 @@ function Get-DemoSafetyStopStatus {
         }
         else {
             $stopResult = $runs.Stop.Result
-            $stopStatus = [string](Get-DemoMemberValue -InputObject $stopResult -Name 'status')
+            # Partial only because of T5's container, from runbooks older than its t5Status (the re-review of 0590bbe): the
+            # VMs and T4 were stopped, and T5's outcome is said below; its job Failed only because Partial fails a Nightly job.
+            $stopOutcome = Get-DemoStopResultOutcome -Result $stopResult
+            $stopStatus = $stopOutcome.Status
             $stopText = [string](Get-DemoMemberValue -InputObject $stopResult -Name 'message')
             if (-not $stopText) {
                 $stopText = 'its output had no result line'
@@ -1048,8 +1236,18 @@ function Get-DemoSafetyStopStatus {
             $evidence['lastStop'] = $stopStatus
             $parts.Add(('Last run {0:yyyy-MM-dd HH:mm} UTC (job {1}): {2}' -f ([datetime]$runs.Stop.CreatedUtc), $runs.Stop.Status, $stopText.TrimEnd('.') + '.'))
             # Deferred (2026-11-14): a deploy.ps1 run was still going, so it changed nothing, by design.
-            if ($runs.Stop.Status -ne 'Completed' -or $stopStatus -notin 'Stopped', 'Deferred') {
+            if (($runs.Stop.Status -ne 'Completed' -and -not ($stopOutcome.T5Only -and $runs.Stop.Status -eq 'Failed')) -or $stopStatus -notin 'Stopped', 'Deferred') {
                 $problems.Add('its last run didn''t finish its work')
+            }
+            # T5's container (2026-11-19, ADR 0027) is apart from its status (t5Status, review of ab91ee5), so a container it
+            # couldn't delete never makes T4's stop look failed (R910), and it's said here instead.
+            $t5Status = $stopOutcome.T5Status
+            $evidence['lastStopT5'] = $t5Status
+            if ($t5Status -eq 'NotGranted') {
+                $problems.Add('its last run couldn''t read or delete T5''s container: its role doesn''t have the container''s actions, so the container, if it''s there, bills until ./scripts/stop-demo.ps1 deletes it')
+            }
+            elseif ($t5Status -eq 'Failed') {
+                $problems.Add('its last run couldn''t delete T5''s container, so it bills until ./scripts/stop-demo.ps1 deletes it')
             }
         }
         if ($null -ne $runs.Check) {
@@ -1088,6 +1286,9 @@ function Get-DemoSafetyStopStatus {
     $fix = if (@($problems | Where-Object { $_ -match 'online past' }).Count -gt 0) {
         'Something kept T3 awake: the activity log''s Resume Databases events name what resumed it (https://learn.microsoft.com/azure/azure-sql/database/serverless-tier-monitor). Open the job in {0} (Process Automation > Jobs) for the rest.' -f $name.AutomationAccount
     }
+    elseif (@($problems | Where-Object { $_ -match 'container''s actions' }).Count -gt 0) {
+        'Run ./scripts/stop-demo.ps1 after each session, which deletes T5''s container with your rights. An Owner of the subscription runs, once: {0}. It gives the role the container''s actions again.' -f $command
+    }
     else {
         'Open the job in {0} (Process Automation > Jobs) to see why, then run ./scripts/status.ps1 again; ./scripts/deploy.ps1 sets the safety stop up again.' -f $name.AutomationAccount
     }
@@ -1114,15 +1315,119 @@ function Get-DemoSafetyStopNote {
     }
     $role = @($problems | Where-Object { [string]$_.checkId -eq 'SAFETYSTOP.ROLE' }) | Select-Object -Last 1
     if ($problems.Count -eq 1 -and $null -ne $role) {
-        $command = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $role -Name 'evidence') -Name 'command')
+        $roleEvidence = Get-DemoMemberValue -InputObject $role -Name 'evidence'
+        $command = [string](Get-DemoMemberValue -InputObject $roleEvidence -Name 'command')
         if (-not $command) {
             $command = Get-DemoSafetyStopCommand
+        }
+        # Assigned, but without exactly its approved actions (the re-review of 0590bbe; R910: another environment's older
+        # deploy.ps1 wrote the shared role back): the stop runs, and does all but what it lacks.
+        if ([bool](Get-DemoMemberValue -InputObject $roleEvidence -Name 'roleDiffers') -and [bool](Get-DemoMemberValue -InputObject $roleEvidence -Name 'assigned')) {
+            return (Get-DemoSafetyStopStaleNote -Evidence $roleEvidence -Command $command)
         }
         return ('The nightly safety stop is scheduled, but it can''t stop anything until its role is assigned: an Owner of the subscription runs, once, {0}. Until then T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply.' -f $command)
     }
     $first = $problems[0]
     $fix = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $first -Name 'remediation')
     return ('The nightly safety stop isn''t fully set up ({0}): {1} Until it is, T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply.{2}' -f [string]$first.checkId, (ConvertTo-DemoPlainText -Value $first.message).TrimEnd(), $(if ($fix) { ' ' + $fix } else { '' }))
+}
+
+function Get-DemoSafetyStopStaleNote {
+    <#
+    .SYNOPSIS
+    DONE's line when the nightly safety stop's role is assigned but doesn't have exactly its approved actions (the re-review
+    of 0590bbe; R910: another environment's deploy.ps1 on older code wrote the shared custom role back): what the stop still
+    does, what it can't, and the fix, from SAFETYSTOP.ROLE's evidence (missingActions, extraActions). Internal and pure.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $Evidence,
+
+        [string] $Command = ''
+    )
+
+    if (-not $Command) {
+        $Command = Get-DemoSafetyStopCommand
+    }
+    # Assigned first: Get-DemoMemberValue returns an array as one object.
+    $missingValue = Get-DemoMemberValue -InputObject $Evidence -Name 'missingActions'
+    $missing = @(@($missingValue) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $extraValue = Get-DemoMemberValue -InputObject $Evidence -Name 'extraActions'
+    $extra = @(@($extraValue) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    # What each of its approved actions is for, in the order the nightly stop does it.
+    $duties = @(
+        [pscustomobject]@{ Prefix = 'Microsoft.Compute/'; Does = 'stops the VMs'; Cannot = 'stop the VMs' }
+        [pscustomobject]@{ Prefix = 'Microsoft.DBforPostgreSQL/'; Does = 'stops T4'; Cannot = 'stop T4' }
+        [pscustomobject]@{ Prefix = 'Microsoft.Sql/'; Does = 'reads T3'; Cannot = 'read T3' }
+        [pscustomobject]@{ Prefix = 'Microsoft.DocumentDB/'; Does = 'deletes T5''s container between sessions'; Cannot = 'delete T5''s container between sessions' }
+    )
+    $blind = @($missing | Where-Object { $_ -like 'Microsoft.Resources/*' }).Count -gt 0
+    $lacks = { param([object] $Duty) $blind -or @($missing | Where-Object { $_ -like ($Duty.Prefix + '*') }).Count -gt 0 }
+    $does = @($duties | Where-Object { -not (& $lacks $_) } | ForEach-Object { $_.Does })
+    $cannot = @($duties | Where-Object { & $lacks $_ } | ForEach-Object { $_.Cannot })
+    $list = {
+        param([string[]] $Item)
+        if ($Item.Count -le 1) { return ($Item -join '') }
+        if ($Item.Count -eq 2) { return ('{0} and {1}' -f $Item[0], $Item[1]) }
+        return ('{0}, and {1}' -f (@($Item[0..($Item.Count - 2)]) -join ', '), $Item[-1])
+    }
+    $gap = @(if ($missing.Count) { 'it doesn''t have {0}' -f ($missing -join ', ') }) + @(if ($extra.Count) { 'it has {0}, which isn''t approved' -f ($extra -join ', ') })
+    $what = if ($cannot.Count -eq 0) {
+        'so it still does all it''s for: it {0}' -f (& $list $does)
+    }
+    elseif ($does.Count -eq 0) {
+        'so it can''t {0}' -f (& $list $cannot)
+    }
+    else {
+        'so it still {0}, but it can''t {1}' -f (& $list $does), (& $list $cannot)
+    }
+    return ('The nightly safety stop runs, but its role "{0}" doesn''t have exactly its {1} approved actions ({2}; another environment''s deploy.ps1 on older code may have written it back for the whole subscription), {3}. An Owner of the subscription runs, once, {4}, or ./scripts/deploy.ps1, which writes it back to exactly its approved actions.' -f $script:SafetyStopRoleName, $script:SafetyStopRoleActions.Count, ($gap -join '; '), $what, $Command)
+}
+
+function New-DemoSafetyStopPlanResult {
+    <#
+    .SYNOPSIS
+    DEPLOY.COST.T4RESTART (2026-11-19, the coordinator's option 2): preflight counted the nightly safety stop that this run
+    sets up (PREFLIGHT.COST.MONTHLY's t4RestartPlanned), but its setup didn't put it fully in place (a SAFETYSTOP.* result in
+    -SetupResult that isn't a Pass), so T4's 7-day automatic restart counts the rest of the month again. A Warning with the
+    worst case without it, the ceiling, and the fix; $null when preflight didn't count it, or the setup put it in place.
+    Internal and pure.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Creates an in-memory record only; it changes no system state.')]
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [AllowEmptyCollection()]
+        [object[]] $SetupResult = @(),
+
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = ''
+    )
+
+    $monthly = @(@($Result) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'PREFLIGHT.COST.MONTHLY' }) | Select-Object -Last 1
+    $evidence = Get-DemoMemberValue -InputObject $monthly -Name 'evidence'
+    if (-not [bool](Get-DemoMemberValue -InputObject $evidence -Name 't4RestartPlanned')) {
+        return $null
+    }
+    $problems = @(@($SetupResult) | Where-Object { $null -ne $_ -and [string]$_.checkId -like 'SAFETYSTOP.*' -and [string]$_.status -ne 'Pass' })
+    if ($problems.Count -eq 0) {
+        return $null
+    }
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $worst = [double](Get-DemoMemberValue -InputObject $evidence -Name 'monthlyWorstCaseWithoutSafetyStop')
+    $ceiling = [double]$Config['monthlyCeilingUsd']
+    $over = $worst -gt $ceiling
+    $first = $problems[0]
+    $message = [string]::Format($culture, 'Preflight counted the nightly safety stop that this run sets up, but it isn''t fully in place ({0}: {1}), so T4''s 7-day automatic restart counts the rest of the month again: the worst case is {2:N2} USD a month, {3} monthlyCeilingUsd ({4:N2} USD).', [string]$first.checkId, (ConvertTo-DemoPlainText -Value $first.message).TrimEnd(), $worst, $(if ($over) { 'over' } else { 'within' }), $ceiling)
+    $fix = [string]::Format($culture, 'An Owner of the subscription runs, once: {0}, which puts the nightly safety stop in place, so each restart counts as about a day again{1}', (Get-DemoSafetyStopCommand -ConfigPath $ConfigPath), $(if ($over) { [string]::Format($culture, '; or raise monthlyCeilingUsd to at least {0:N0} in your configuration.', [System.Math]::Ceiling($worst)) } else { '.' }))
+    return (New-DemoResult -CheckId 'DEPLOY.COST.T4RESTART' -Area 'infra' -Target 'T4' -Status 'Warning' -Message $message -Evidence ([ordered]@{ worstCaseWithoutSafetyStop = $worst; monthlyCeilingUsd = $ceiling; overCeiling = $over; setupProblem = [string]$first.checkId }) -Remediation $fix -DocUrl $script:SafetyStopRoleDoc)
 }
 
 function Get-DemoT4RestartStopState {

@@ -20,11 +20,32 @@ export interface QuerySpec {
     /** Sent as resultSetRowCountLimit: a result over the bound fails as 'overflow' instead of looking complete. */
     rowLimit: number;
     columns: ColumnSpec[];
+    /**
+     * The typed values the DAX was built from (targets, the UTC date window, a range), so a source that doesn't run DAX
+     * (the local preview's sample, a live source) answers the same question. Dates are ISO 8601 UTC days or instants.
+     */
+    params?: Record<string, unknown>;
+    /**
+     * Why the query can have no rows in a healthy environment (for example, until the first session). The deploy-time
+     * check says so instead of warning, and the page shows its own empty state.
+     */
+    mayBeEmpty?: string;
 }
 
 export interface Filters {
     targets: TargetKey[];
     window: DateWindow | null;
+}
+
+const isoDay = (d: Date) => d.toISOString().slice(0, 10);
+
+/** The filter as params, for sources that don't run DAX. */
+export function filterParams(f: Filters): Record<string, unknown> {
+    return { targets: [...f.targets], from: f.window ? isoDay(f.window.from) : null, to: f.window ? isoDay(f.window.to) : null };
+}
+
+function rangeParams(r: IncidentRange): Record<string, unknown> {
+    return { target: r.target, start: r.start.toISOString().slice(0, 19), end: r.end.toISOString().slice(0, 19) };
 }
 
 const SERIES_MEASURES = [
@@ -99,6 +120,7 @@ export function estateQuery(f: Filters): QuerySpec {
         id: "estate-targets",
         title: "Estate: key signals per target",
         rowLimit: 10,
+        params: filterParams(f),
         dax: `EVALUATE
 SUMMARIZECOLUMNS (
     ${args([
@@ -157,6 +179,7 @@ export function headlineQuery(f: Filters): QuerySpec {
         id: "headlines",
         title: "Headlines from the model's measures",
         rowLimit: 1,
+        params: filterParams(f),
         dax: filter ? `EVALUATE\nCALCULATETABLE (\n    ${row},\n    ${filter}\n)` : `EVALUATE\n${row}`,
         columns: [
             { key: "EstateHeadline", label: "Estate headline", kind: "text" },
@@ -174,6 +197,7 @@ export function findingsQuery(f: Filters): QuerySpec {
         id: "findings-latest",
         title: "What changed: the latest findings",
         rowLimit: 500,
+        params: filterParams(f),
         dax: `EVALUATE
 VAR FindingRows = ${scope}
 VAR LatestRows =
@@ -188,6 +212,7 @@ RETURN
         "FindingId", 'Analysis Findings'[Finding ID],
         "AnalysisKey", 'Analysis Findings'[Analysis Key],
         "Analysis", RELATED ( 'Analysis'[Analysis] ),
+        "AnalysisGroup", RELATED ( 'Analysis'[Analysis Group] ),
         "TargetKey", 'Analysis Findings'[Target Key],
         "Status", 'Analysis Findings'[Status Key],
         "StatusSort", RELATED ( 'Status'[Status Sort] ),
@@ -212,6 +237,7 @@ export function seriesQuery(f: Filters): QuerySpec {
         id: "signals-per-bin",
         title: "Signals per bin and target",
         rowLimit: 20000,
+        params: filterParams(f),
         dax: `EVALUATE
 SUMMARIZECOLUMNS (
     ${args(["'Telemetry Snapshots'[Bucket UTC]", "'Target'[Target Key]", targetFilter(f.targets), dateFilter(f.window), ...SERIES_MEASURES])}
@@ -231,6 +257,7 @@ export function waitsQuery(f: Filters): QuerySpec {
         id: "waits-by-category",
         title: "Where the wait time went",
         rowLimit: 1000,
+        params: filterParams(f),
         dax: `EVALUATE
 SUMMARIZECOLUMNS (
     ${args(["'Telemetry Snapshots'[Metric]", "'Target'[Target Key]", targetFilter(f.targets), dateFilter(f.window), '"WaitS", [Wait Time (s)]'])}
@@ -250,6 +277,7 @@ export function incidentsQuery(f: Filters): QuerySpec {
         id: "incident-windows",
         title: "Incident windows",
         rowLimit: 500,
+        params: filterParams(f),
         dax: `EVALUATE
 SELECTCOLUMNS (
     CALCULATETABLE ( ${args(["'Incident Windows'", targetFilter(f.targets), dateFilter(f.window)], "")} ),
@@ -294,6 +322,7 @@ export function incidentSeriesQuery(r: IncidentRange): QuerySpec {
         id: `replay-${r.target}`,
         title: `Replay: ${r.target}, bin by bin`,
         rowLimit: 5000,
+        params: rangeParams(r),
         dax: `EVALUATE
 SUMMARIZECOLUMNS (
     ${args(["'Telemetry Snapshots'[Bucket UTC]", targetFilter([r.target]), bucketRange(r.start, r.end), ...SERIES_MEASURES])}
@@ -309,6 +338,7 @@ export function incidentWaitsQuery(r: IncidentRange): QuerySpec {
         id: `spotlight-${r.target}`,
         title: `Waits before and during: ${r.target}`,
         rowLimit: 5000,
+        params: rangeParams(r),
         dax: `EVALUATE
 SUMMARIZECOLUMNS (
     ${args(["'Telemetry Snapshots'[Bucket UTC]", "'Telemetry Snapshots'[Metric]", targetFilter([r.target]), bucketRange(r.start, r.end), '"WaitS", [Wait Time (s)]'])}
@@ -328,6 +358,7 @@ export function readinessChecksQuery(): QuerySpec {
         id: "readiness-checks",
         title: "Validation checks, latest six runs",
         rowLimit: 3000,
+        mayBeEmpty: "until the first session's readiness check: Run all in NB_DatabaseHub_Control runs NB_DatabaseHub_Deployment",
         dax: `EVALUATE
 VAR Runs = TOPN ( 6, VALUES ( 'Validation Results'[Run ID] ), 'Validation Results'[Run ID], DESC )
 RETURN
@@ -568,6 +599,228 @@ ORDER BY [StatusSort] ASC, [FindingId] ASC`,
     };
 }
 
+/**
+ * The latest Cosmos DB capture's run (analysis `cosmosdb`, target T5): the notebook run with the newest `cosmosdb`
+ * finding. Every capture writes `cosmosdb.T5.capture`, so its points, when it has any, belong to the same run.
+ */
+const COSMOS_LATEST_RUN = `VAR LatestCapture =
+    CALCULATE ( MAX ( 'Analysis Findings'[Captured At UTC] ), REMOVEFILTERS (), 'Analysis Findings'[Analysis Key] = "cosmosdb" )
+VAR LatestRun =
+    CALCULATETABLE (
+        VALUES ( 'Analysis Findings'[Run ID] ),
+        REMOVEFILTERS (),
+        'Analysis Findings'[Analysis Key] = "cosmosdb",
+        'Analysis Findings'[Captured At UTC] = LatestCapture
+    )`;
+
+const COSMOS_EMPTY = "until a capture of T5's metrics: a session's end saves one (Run all), and so do stop-demo.ps1 -SaveHistory and deploy.ps1; none while T5 is off";
+
+/**
+ * T5's Azure Monitor metrics from the latest capture (analysis `cosmosdb`), one row per metric and interval: normalized
+ * RU, request units, requests and 429s, gateway latency, and the hourly provisioned throughput and availability. The
+ * notebook can't read Azure Monitor, so the operator side passes them (COSMOS_METRICS). Not filtered by target or period.
+ */
+export function cosmosSeriesQuery(): QuerySpec {
+    return {
+        id: "cosmos-series",
+        title: "T5 Azure Cosmos DB: Azure Monitor metrics, latest capture",
+        rowLimit: 5000,
+        mayBeEmpty: COSMOS_EMPTY,
+        dax: `EVALUATE
+${COSMOS_LATEST_RUN}
+RETURN
+    SELECTCOLUMNS (
+        CALCULATETABLE (
+            'Telemetry Snapshots',
+            REMOVEFILTERS (),
+            'Telemetry Snapshots'[Analysis Key] = "cosmosdb",
+            'Telemetry Snapshots'[Target Key] = "T5",
+            TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )
+        ),
+        "Bucket", 'Telemetry Snapshots'[Bucket UTC],
+        "ResourceName", 'Telemetry Snapshots'[Resource Name],
+        "Metric", 'Telemetry Snapshots'[Metric],
+        "Value", 'Telemetry Snapshots'[Value],
+        "Unit", 'Telemetry Snapshots'[Unit],
+        "WindowStart", 'Telemetry Snapshots'[Window Start UTC],
+        "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
+        "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
+    )
+ORDER BY [Bucket] ASC, [Metric] ASC`,
+        columns: [
+            { key: "Bucket", label: "Interval start (UTC)", kind: "datetime" },
+            { key: "ResourceName", label: "Account", kind: "text" },
+            { key: "Metric", label: "Azure Monitor metric", kind: "text" },
+            { key: "Value", label: "Value", kind: "decimal" },
+            { key: "Unit", label: "Unit", kind: "text" },
+            { key: "WindowStart", label: "Window start (UTC)", kind: "datetime" },
+            { key: "WindowEnd", label: "Window end (UTC)", kind: "datetime" },
+            { key: "CapturedAt", label: "Captured (UTC)", kind: "datetime" },
+        ],
+    };
+}
+
+/** The latest Cosmos DB capture's findings: what was captured, throttling, each throttling episode, and the recovery. */
+export function cosmosFindingsQuery(): QuerySpec {
+    return {
+        id: "cosmos-findings",
+        title: "T5 Azure Cosmos DB: findings of the latest capture",
+        rowLimit: 50,
+        mayBeEmpty: COSMOS_EMPTY,
+        dax: `EVALUATE
+${COSMOS_LATEST_RUN}
+RETURN
+    SELECTCOLUMNS (
+        CALCULATETABLE (
+            'Analysis Findings',
+            REMOVEFILTERS (),
+            'Analysis Findings'[Analysis Key] = "cosmosdb",
+            TREATAS ( LatestRun, 'Analysis Findings'[Run ID] )
+        ),
+        "FindingId", 'Analysis Findings'[Finding ID],
+        "TargetKey", 'Analysis Findings'[Target Key],
+        "Status", 'Analysis Findings'[Status Key],
+        "StatusSort", RELATED ( 'Status'[Status Sort] ),
+        "Finding", 'Analysis Findings'[Finding],
+        "Evidence", 'Analysis Findings'[Evidence],
+        "WindowStart", 'Analysis Findings'[Window Start UTC],
+        "WindowEnd", 'Analysis Findings'[Window End UTC],
+        "CapturedAt", 'Analysis Findings'[Captured At UTC]
+    )
+ORDER BY [StatusSort] ASC, [FindingId] ASC`,
+        columns: [
+            { key: "Status", label: "Status", kind: "status" },
+            { key: "Finding", label: "Finding", kind: "text" },
+            { key: "WindowStart", label: "Window start (UTC)", kind: "datetime" },
+            { key: "WindowEnd", label: "Window end (UTC)", kind: "datetime" },
+            { key: "CapturedAt", label: "Captured (UTC)", kind: "datetime" },
+            { key: "FindingId", label: "Finding ID", kind: "text" },
+        ],
+    };
+}
+/** The activity requests the notebooks recorded in the period, newest first: each session's plan and each incident request. */
+export function sessionsQuery(f: Filters): QuerySpec {
+    const filter = dateFilter(f.window);
+    const scope = filter ? `CALCULATETABLE ( 'Scenario Runs', ${filter} )` : "'Scenario Runs'";
+    return {
+        id: "scenario-runs",
+        title: "Sessions and activity requests",
+        rowLimit: 200,
+        params: filterParams(f),
+        mayBeEmpty: "until the first session: Run all in NB_DatabaseHub_Control records one",
+        dax: `EVALUATE
+TOPN (
+    100,
+    SELECTCOLUMNS (
+        ${scope},
+        "RequestId", 'Scenario Runs'[Request ID],
+        "RequestedAt", 'Scenario Runs'[Requested At UTC],
+        "TargetKey", 'Scenario Runs'[Target Key],
+        "Profile", 'Scenario Runs'[Profile],
+        "DurationMin", 'Scenario Runs'[Duration (min)],
+        "Intensity", 'Scenario Runs'[Intensity],
+        "Concurrency", 'Scenario Runs'[Concurrency],
+        "Dispatch", 'Scenario Runs'[Dispatch Mode],
+        "Status", 'Scenario Runs'[Status Key],
+        "Message", 'Scenario Runs'[Message],
+        "WindowStart", 'Scenario Runs'[Window Start UTC],
+        "WindowEnd", 'Scenario Runs'[Window End UTC]
+    ),
+    [RequestedAt], DESC
+)
+ORDER BY [RequestedAt] DESC`,
+        columns: [
+            { key: "RequestedAt", label: "Requested (UTC)", kind: "datetime" },
+            { key: "TargetKey", label: "Target", kind: "text" },
+            { key: "Profile", label: "Profile", kind: "text" },
+            { key: "DurationMin", label: "Duration (min)", kind: "minutes" },
+            { key: "Status", label: "Status", kind: "status" },
+            { key: "Message", label: "What happened", kind: "text" },
+            { key: "WindowStart", label: "Window start (UTC)", kind: "datetime" },
+            { key: "WindowEnd", label: "Window end (UTC)", kind: "datetime" },
+            { key: "Dispatch", label: "Dispatch", kind: "text" },
+            { key: "RequestId", label: "Request", kind: "text" },
+        ],
+    };
+}
+
+/**
+ * T3's Database Agent beats in the period (analysis database_agent, one finding per beat): when the plan regressed, when
+ * the run applied the documented response, and T3's CPU before and after it, in the finding's Evidence.
+ */
+export function agentLoopQuery(f: Filters): QuerySpec {
+    const filter = dateFilter(f.window);
+    return {
+        id: "agent-loop",
+        title: "Database Agent loop on T3",
+        rowLimit: 100,
+        params: filterParams(f),
+        mayBeEmpty: "until a session's Database Agent beat on T3",
+        dax: `EVALUATE
+SELECTCOLUMNS (
+    CALCULATETABLE ( ${args(["'Analysis Findings'", "'Analysis Findings'[Analysis Key] = \"database_agent\"", filter], "")} ),
+    "FindingId", 'Analysis Findings'[Finding ID],
+    "TargetKey", 'Analysis Findings'[Target Key],
+    "Status", 'Analysis Findings'[Status Key],
+    "Finding", 'Analysis Findings'[Finding],
+    "Evidence", 'Analysis Findings'[Evidence],
+    "RequestId", 'Analysis Findings'[Request ID],
+    "WindowStart", 'Analysis Findings'[Window Start UTC],
+    "WindowEnd", 'Analysis Findings'[Window End UTC],
+    "CapturedAt", 'Analysis Findings'[Captured At UTC]
+)
+ORDER BY [WindowStart] DESC`,
+        columns: [
+            { key: "Status", label: "Status", kind: "status" },
+            { key: "TargetKey", label: "Target", kind: "text" },
+            { key: "Finding", label: "Finding", kind: "text" },
+            { key: "WindowStart", label: "Beat start (UTC)", kind: "datetime" },
+            { key: "WindowEnd", label: "Beat end (UTC)", kind: "datetime" },
+            { key: "RequestId", label: "Request", kind: "text" },
+        ],
+    };
+}
+
+/** One row per UTC day and SQL target: the history past the telemetry's 7 days. */
+export function dailyTrendQuery(f: Filters): QuerySpec {
+    return {
+        id: "daily-trend",
+        title: "Daily history per target",
+        rowLimit: 2000,
+        params: filterParams(f),
+        dax: `EVALUATE
+SUMMARIZECOLUMNS (
+    ${args([
+        "'Date'[Date]",
+        "'Target'[Target Key]",
+        targetFilter(f.targets),
+        dateFilter(f.window),
+        '"CpuAvg", [CPU (%)]',
+        '"CpuPeak", [CPU Peak (%)]',
+        '"WaitS", [Wait Time (s)]',
+        '"BufferIoS", [Buffer IO Wait (s)]',
+        '"LockWaitS", [Lock Wait (s)]',
+        '"Batch", [Batch Requests]',
+        '"SessionsPeak", [Active Sessions (peak)]',
+        '"Incidents", [Incidents]',
+    ])}
+)
+ORDER BY 'Date'[Date], 'Target'[Target Key]`,
+        columns: [
+            { key: "Date", label: "Day (UTC)", kind: "datetime" },
+            { key: "Target Key", label: "Target", kind: "text" },
+            { key: "CpuAvg", label: "CPU, average (%)", kind: "percent" },
+            { key: "CpuPeak", label: "CPU, peak (%)", kind: "percent" },
+            { key: "WaitS", label: "Wait time (s)", kind: "seconds" },
+            { key: "BufferIoS", label: "Buffer IO waits (s)", kind: "seconds" },
+            { key: "LockWaitS", label: "Lock waits (s)", kind: "seconds" },
+            { key: "Batch", label: "Batch requests", kind: "int" },
+            { key: "SessionsPeak", label: "Active sessions, peak", kind: "int" },
+            { key: "Incidents", label: "Incident windows", kind: "int" },
+        ],
+    };
+}
+
 /** What history-meta found for the deploy-time check's T3 replay; every field is optional. */
 export interface CheckAnchors {
     t3IncidentStart?: Date | null;
@@ -635,5 +888,10 @@ export function catalogForCheck(latestDay: Date, anchors: CheckAnchors = {}): Qu
         targetNamesQuery(),
         postgresSeriesQuery(),
         postgresFindingsQuery(),
+        sessionsQuery(all),
+        dailyTrendQuery(week),
+        agentLoopQuery(all),
+        cosmosSeriesQuery(),
+        cosmosFindingsQuery(),
     ];
 }

@@ -1,0 +1,29 @@
+{
+  "name": "dbhub-ask-relay",
+  "description": "Database Hub Insights Ask: the chat relay between the Insights app's Ask page and each viewer's own GitHub Copilot, through the GitHub Copilot SDK. It holds no Azure, Fabric, or GitHub credentials; the page runs every tool.",
+  "license": "MIT",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "node dist/server.js",
+    "test": "vitest run",
+    "verify": "npm run typecheck && npm run test && npm run build"
+  },
+  "dependencies": {
+    "@microsoft/copilot-sdk": "2.0.0",
+    "ws": "8.22.2"
+  },
+  "devDependencies": {
+    "@types/node": "25.9.2",
+    "@types/ws": "8.18.2",
+    "typescript": "5.7.3",
+    "vitest": "4.1.12"
+  }
+}

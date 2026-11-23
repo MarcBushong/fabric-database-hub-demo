@@ -37,8 +37,8 @@ BeforeAll {
     }
 
     function New-TestInstance {
-        param([string] $Edition = 'Standard', [string] $LicenseType = 'PAYG', [bool] $Monitoring = $true, [string] $Container = $script:machineId, [string] $Name = 'arcsql01', [int] $Cores = 2)
-        [pscustomobject]@{
+        param([string] $Edition = 'Standard', [string] $LicenseType = 'PAYG', [bool] $Monitoring = $true, [string] $Container = $script:machineId, [string] $Name = 'arcsql01', [int] $Cores = 2, [AllowNull()] [object] $Assessment = $null)
+        $instance = [pscustomobject]@{
             name       = $Name
             properties = [pscustomobject]@{
                 instanceName        = 'MSSQLSERVER'
@@ -51,6 +51,10 @@ BeforeAll {
                 monitoring          = [pscustomobject]@{ enabled = $Monitoring }
             }
         }
+        if ($null -ne $Assessment) {
+            $instance.properties | Add-Member -NotePropertyName 'migration' -NotePropertyValue ([pscustomobject]@{ assessment = $Assessment })
+        }
+        return $instance
     }
 
     function New-TestExtension {
@@ -532,6 +536,13 @@ Describe 'Invoke-DemoArcOnboarding' {
         $script:sweepPart = [ordered]@{ computer = 'VM'; reachable = $true; pass = $true; found = [ordered]@{ user = 1; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 1; logApp = 0 }; remaining = [ordered]@{ user = 0; other = 0; app = 0; files = 0; archives = 0; caches = 0; unverified = 0; logUser = 0; logApp = 0 }; eventLogs = @('Windows PowerShell|u1 a0 o0|..'); found_at = @(); left_at = @(); seconds = 9 }
         # The guest's part when a test sets it; the host's otherwise.
         $script:sweepGuest = $null
+        # The sweep's other output (lock, guestRecovery) when a test sets it (2026-11-19).
+        $script:sweepExtra = [ordered]@{}
+        # The resource group's record that a sweep after onboarding is owed (DbHubArcSweepUtc): none unless a test sets it.
+        $script:sweepOwed = ''
+        $script:owedWrites = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcSweepOwed -MockWith { $script:sweepOwed }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoArcSweepOwed -MockWith { $script:owedWrites.Add([string]$Value); $script:sequence.Add($(if ($Value) { 'owed' } else { 'owed-cleared' })); $true }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ state = $script:hostState; message = 'host message' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcArmResource -MockWith { $script:machine }
@@ -555,7 +566,20 @@ Describe 'Invoke-DemoArcOnboarding' {
                 foreach ($key in $PesterBoundParameters['Parameter'].Keys) { $parameterCopy[$key] = $PesterBoundParameters['Parameter'][$key] }
             }
             $script:runs.Add([pscustomobject]@{ Name = $RunCommandName; Parameter = $parameterCopy; Protected = $protectedCopy; VmName = $PesterBoundParameters['VmName'] })
-            $output = if ($RunCommandName -eq 'DbHubDemo-ArcProbe') { $script:probe | ConvertTo-Json -Compress } elseif ($RunCommandName -eq 'DbHubDemo-SignInData') { [ordered]@{ action = 'Clean'; succeeded = $true; pass = [bool]$script:sweepPart.pass; local = $script:sweepPart; guest = $(if ($null -ne $script:sweepGuest) { $script:sweepGuest } else { $script:sweepPart }) } | ConvertTo-Json -Compress -Depth 6 } else { '{"succeeded":true,"outcome":"Onboarded","resourceId":"' + $script:machineId + '"}' }
+            $output = if ($RunCommandName -eq 'DbHubDemo-ArcProbe') {
+                $script:probe | ConvertTo-Json -Compress
+            }
+            elseif ($RunCommandName -eq 'DbHubDemo-SignInData') {
+                $guestPart = if ($null -ne $script:sweepGuest) { $script:sweepGuest } else { $script:sweepPart }
+                $sweepOut = [ordered]@{ action = 'Clean'; succeeded = $true; pass = [bool]$script:sweepPart.pass -and [bool]$guestPart.pass; local = $script:sweepPart; guest = $guestPart }
+                foreach ($key in $script:sweepExtra.Keys) {
+                    $sweepOut[$key] = $script:sweepExtra[$key]
+                }
+                $sweepOut | ConvertTo-Json -Compress -Depth 6
+            }
+            else {
+                '{"succeeded":true,"outcome":"Onboarded","resourceId":"' + $script:machineId + '"}'
+            }
             [pscustomobject]@{ Succeeded = $true; ExecutionState = 'Succeeded'; ExitCode = 0; Output = $output; Error = '' }
         }
     }
@@ -593,6 +617,101 @@ Describe 'Invoke-DemoArcOnboarding' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 0 -Exactly
     }
 
+    It 'with -Force, waits for the host''s pass over a new bootstrap generation before its probe and marker go into the guest (#65 follow-up)' {
+        # A golden copy after an update: the loader just started a generation whose pass hasn't reported yet.
+        $script:probe.agentStatus = 'Connected'
+        $script:probe.agentResourceName = 'arcsql01'
+        $script:probe.agentResourceGroup = 'rg-dbhub-demo'
+        $script:machine = New-TestMachine
+        $script:reads = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            $script:reads++
+            $script:sequence.Add('health')
+            if ($script:reads -lt 3) { [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup'; generationPending = $true } } else { [pscustomobject]@{ state = 'Ready'; message = 'Every step is in the desired state.' } }
+        }
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+        $result.status | Should -Be 'Pass'
+        $result.evidence.decision | Should -Be 'AlreadyConnected'
+        $result.evidence.hostState | Should -Be 'Ready'
+        $result.evidence.passWaitSeconds | Should -Not -BeNullOrEmpty
+        $result.evidence.PSObject.Properties['passPending'] | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 3 -Exactly
+        $script:sequence.IndexOf('DbHubDemo-ArcProbe') | Should -BeGreaterThan $script:sequence.LastIndexOf('health')
+    }
+
+    It 'with -Force, goes on waiting while the pass converges a step after its generation reported, and probes only once it''s Ready (#65 follow-up review)' {
+        # An existing golden copy keeps its Arc marker, so after an update its pass's first step that converges is WorkloadRunner,
+        # whose install stops the workload in the guest over PowerShell Direct: health.json then reports InProgress with the new
+        # generation, so generationPending is gone, but the pass isn't over.
+        $script:probe.agentStatus = 'Connected'
+        $script:probe.agentResourceName = 'arcsql01'
+        $script:probe.agentResourceGroup = 'rg-dbhub-demo'
+        $script:machine = New-TestMachine
+        $script:reads = 0
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
+            $script:reads++
+            $script:sequence.Add(('health {0}' -f $script:reads))
+            if ($script:reads -eq 1) { [pscustomobject]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup'; generationPending = $true } }
+            elseif ($script:reads -le 3) { [pscustomobject]@{ state = 'InProgress'; currentStep = 'WorkloadRunner'; message = 'Step WorkloadRunner is converging (attempt 1 of 3).' } }
+            else { [pscustomobject]@{ state = 'Ready'; message = 'Every step is in the desired state.' } }
+        }
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+        $result.status | Should -Be 'Pass'
+        $result.evidence.hostState | Should -Be 'Ready'
+        $result.evidence.PSObject.Properties['passPending'] | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 4 -Exactly
+        $script:sequence.IndexOf('DbHubDemo-ArcProbe') | Should -BeGreaterThan $script:sequence.IndexOf('health 4')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'runs its bootstrap pass \(InProgress, step WorkloadRunner\); onboarding waits until the pass ends' }
+    }
+
+    It 'with -Force, also waits through a restart and a host with no report yet, and not at all where a pass ends (#65 follow-up review)' {
+        $script:probe.agentStatus = 'Connected'
+        $script:probe.agentResourceName = 'arcsql01'
+        $script:probe.agentResourceGroup = 'rg-dbhub-demo'
+        $script:machine = New-TestMachine
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        $script:passReads = [System.Collections.Generic.Queue[object]]::new()
+        foreach ($state in 'RebootPending', 'NotStarted', 'Ready') {
+            $script:passReads.Enqueue([pscustomobject]@{ state = $state; currentStep = 'ConfigureSql' })
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:sequence.Add('health'); $script:passReads.Dequeue() }
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+        $result.evidence.hostState | Should -Be 'Ready'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 3 -Exactly
+        $script:sequence.IndexOf('DbHubDemo-ArcProbe') | Should -BeGreaterThan $script:sequence.LastIndexOf('health')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'runs its bootstrap pass \(RebootPending, step ConfigureSql\)' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'hasn''t reported a bootstrap pass yet \(NotStarted\)' }
+        # Where a pass ends, there's nothing to wait for: one read each, and no wait in the evidence.
+        foreach ($state in 'WaitingForArcOnboarding', 'ManualActionRequired', 'Failed', 'WaitingForProductKey', 'WaitingForGuestSql') {
+            $script:passReads.Enqueue([pscustomobject]@{ state = $state; currentStep = 'WorkloadRunner' })
+            $ended = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+            $ended.evidence.hostState | Should -Be $state
+            $ended.evidence.PSObject.Properties['passWaitSeconds'] | Should -BeNullOrEmpty -Because $state
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 8 -Exactly
+    }
+
+    It 'with -Force, goes ahead once PassWaitMinutes is over, and says the pass hadn''t ended (#65 follow-up)' {
+        $script:probe.agentStatus = 'Connected'
+        $script:probe.agentResourceName = 'arcsql01'
+        $script:probe.agentResourceGroup = 'rg-dbhub-demo'
+        $script:machine = New-TestMachine
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:passHealth }
+        foreach ($read in @([pscustomobject]@{ state = 'InProgress'; generationPending = $true }, [pscustomobject]@{ state = 'InProgress'; currentStep = 'WorkloadRunner' })) {
+            $script:passHealth = $read
+            $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PassWaitMinutes 0 -PollIntervalSeconds 1
+            $result.status | Should -Be 'Pass'
+            $result.evidence.passPending | Should -BeTrue
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -Times 2 -Exactly
+        @($script:runs | Where-Object { $_.Name -eq 'DbHubDemo-ArcProbe' }).Count | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'still checks every step again for its new bootstrap generation \(starting\) after 0 minutes' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'still runs its bootstrap pass \(InProgress, step WorkloadRunner\) after 0 minutes' }
+    }
+
     It 'gives the host the run''s recovery key, and keeps a guest restart the probe made in the evidence (issue #65)' {
         $script:probe.agentStatus = 'Connected'
         $script:probe.agentResourceName = 'arcsql01'
@@ -612,10 +731,25 @@ Describe 'Invoke-DemoArcOnboarding' {
         foreach ($run in @($script:runs | Where-Object { $_.Name -in 'DbHubDemo-ArcProbe', 'DbHubDemo-ArcOnboard' })) {
             $run.Parameter['RecoveryKey'] | Should -Be 'deploy-aaaaaaaaaaaa' -Because $run.Name
         }
-        # Outside a deploy.ps1 run, the host uses its own hourly key.
+    }
+
+    It 'outside a deploy.ps1 run, gives its probe, its onboarding, and its sign-in data check one key of its own, so they share one guest restart (review of e617f34)' {
+        # configure-arc.ps1 sets no run key: the host's own hourly keys differ by caller (arc- for the probe and the onboarding,
+        # signin- for the check), so the probe and the check could each restart arcsql01 in one call.
+        $script:machine = New-TestMachine -Status 'Disconnected'
+        $first = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $first.status | Should -Be 'Pass'
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-ArcProbe', 'DbHubDemo-ArcOnboard', 'DbHubDemo-SignInData')
+        $key = [string]$script:runs[0].Parameter['RecoveryKey']
+        $key | Should -Match '^arc-[0-9a-f]{12}$'
+        foreach ($run in $script:runs) {
+            $run.Parameter['RecoveryKey'] | Should -Be $key -Because $run.Name
+        }
+        # Each call has its own, as each deploy.ps1 run does.
         $script:runs.Clear()
         $null = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
-        $script:runs[0].Parameter.ContainsKey('RecoveryKey') | Should -BeFalse
+        $script:runs[0].Parameter['RecoveryKey'] | Should -Match '^arc-[0-9a-f]{12}$'
+        $script:runs[0].Parameter['RecoveryKey'] | Should -Not -Be $key
     }
 
     It 'rewrites the marker without a token when the guest is already Connected' {
@@ -645,7 +779,7 @@ Describe 'Invoke-DemoArcOnboarding' {
         $script:machine = New-TestMachine -Status 'Disconnected'
         $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
         $result.status | Should -Be 'Pass'
-        $script:sequence | Should -Be @('DbHubDemo-ArcProbe', 'cleanup', 'identity', 'token', 'DbHubDemo-ArcOnboard', 'DbHubDemo-SignInData')
+        $script:sequence | Should -Be @('DbHubDemo-ArcProbe', 'cleanup', 'identity', 'token', 'owed', 'DbHubDemo-ArcOnboard', 'DbHubDemo-SignInData', 'owed-cleared') -Because 'the sweep is recorded as owed before the token goes to the host, and cleared once it passed (2026-11-19)'
         $result.evidence.tokenSource | Should -Be 'Caller'
         $onboard = $script:runs[1]
         $onboard.VmName | Should -Be 'archost01'
@@ -778,6 +912,235 @@ Describe 'Invoke-DemoArcOnboarding' {
         $result.evaluationOnly | Should -BeTrue
         $script:runs[0].VmName | Should -Be 'arcsql01'
         $script:runs[0].Parameter['Mode'] | Should -Be 'EvaluationOnlyAzureVm'
+    }
+
+    It 'sweeps only after the host''s own bootstrap pass (its lock), with the run''s recovery key, and reports the guest restart that cleared the sweep''s broken channel (2026-11-19, dbhubfn)' {
+        $script:sweepExtra['lock'] = [ordered]@{ minutes = 30; seconds = 312; timedOut = $false }
+        $script:sweepExtra['guestRecovery'] = [ordered]@{ action = 'Restart'; restarted = $true; recovered = $true; ranAgain = $true; seconds = 95; atUtc = '2026-11-19T19:44:02.0000000Z'; restartUtc = '2026-11-19T19:44:31.0000000Z'; stoppedBy = 'Shutdown'; by = 'the sign-in data cleanup'; key = 'deploy-bbbbbbbbbbbb'; reason = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)'; message = 'arcsql01 was restarted once (a clean shutdown, 95 s) and answers over PowerShell Direct again.'; guest = 'arcsql01' }
+        InModuleScope DbHubDemo { Set-DemoRunRecoveryKey -Key 'deploy-bbbbbbbbbbbb' }
+        try {
+            $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        }
+        finally {
+            InModuleScope DbHubDemo { Set-DemoRunRecoveryKey -Key '' }
+        }
+        $result.status | Should -Be 'Pass'
+        $sweep = @($script:runs | Where-Object Name -EQ 'DbHubDemo-SignInData')[0]
+        $sweep.Parameter['ResidueScope'] | Should -Be 'Both'
+        $sweep.Parameter['ResidueLockMinutes'] | Should -Be '30' -Because 'the host''s own sign-in cleanup must never sweep the guest at the same time'
+        $sweep.Parameter['RecoveryKey'] | Should -Be 'deploy-bbbbbbbbbbbb'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'waits for archost01''s own bootstrap pass first \(at most 30 minutes\), so the two never sweep arcsql01 at the same time' }
+        $result.evidence.signInData.lockSeconds | Should -Be 312
+        $result.evidence.signInData.guestRecovery.restarted | Should -BeTrue
+        # deploy.ps1 reports it once, as it does the onboarding's own restart (issue #65).
+        $restarts = @(InModuleScope DbHubDemo -Parameters @{ R = $result } { param($R) Get-DemoGuestRecoveryRunResult -Result @($R) -CheckPrefix 'DEPLOY' })
+        $restarts.Count | Should -Be 1
+        $restarts[0].checkId | Should -Be 'DEPLOY.T2.GUESTRESTART'
+        $restarts[0].status | Should -Be 'Warning'
+        $restarts[0].message | Should -Match 'the sign-in data cleanup restarted arcsql01 once for this run'
+        $restarts[0].message | Should -Match 'Hyper-V socket target process has ended'
+    }
+
+    It 'fails closed with PowerShell Direct''s own error when the guest still can''t be reached, keeps the record, and NOT DONE''s one next step is ./scripts/deploy.ps1 (2026-11-19, dbhubfn)' {
+        $script:sweepGuest = [ordered]@{ reachable = $false; state = 'Running'; pass = $false; error = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)' }
+        $script:sweepExtra['guestRecovery'] = [ordered]@{ action = 'Restart'; restarted = $true; recovered = $false; tries = 4; ranAgain = $true; seconds = 140; atUtc = '2026-11-19T19:44:02.0000000Z'; restartUtc = '2026-11-19T19:44:31.0000000Z'; stoppedBy = 'Shutdown'; by = 'the sign-in data cleanup'; key = 'deploy-bbbbbbbbbbbb'; reason = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)'; message = 'arcsql01 was restarted once (a clean shutdown, 140 s) and answers over PowerShell Direct again.'; guest = 'arcsql01' }
+        $failed = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match 'traces couldn''t be removed and verified'
+        $failed.message | Should -Match 'arcsql01 \(guest\) couldn''t be reached \(Running: The Hyper-V socket target process has ended'
+        $failed.message | Should -Match 'It ran 3 more times, and each failed too, after archost01 restarted arcsql01 once for this run'
+        $failed.evidence.signInData.error | Should -Match 'PSSessionStateBroken'
+        $failed.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again: it runs the sign-in data cleanup after the Arc onboarding and its check again by itself'
+        # Owed before the onboarding, and again after the failed sweep; never cleared.
+        $script:owedWrites.Count | Should -Be 2
+        $script:owedWrites | Should -Not -Contain ''
+        # Live, NOT DONE said to run check-sign-in-data.ps1 until it passes, then configure-arc.ps1, then deploy.ps1 (F8).
+        $state = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Bootstraps'; TrackT4 = 'Telemetry'; TrackFabric = 'Fabric'; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ R = $failed; S = $state; C = (New-TestConfig) } { param($R, $S, $C) Get-DemoDeploymentOutcome -Result @($R) -State $S -Config $C -Command './scripts/deploy.ps1' }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+        $outcome.Next | Should -Match '^Run \./scripts/deploy\.ps1 again: '
+        $outcome.Next | Should -Not -Match 'check-sign-in-data|configure-arc|Then run'
+    }
+
+    It 'fails, and configuration waits, when the guest still doesn''t answer after the host''s pass and the probe''s tries; NOT DONE leads with it, and its one next step is ./scripts/deploy.ps1 (2026-11-19, dbhubfx)' {
+        $script:probe.guestReachable = $false
+        $script:probe.guestError = 'An error has occurred which Windows PowerShell cannot handle. A remote session might have ended.'
+        $script:probe.probeTries = 4
+        $script:probe.lockSeconds = 12
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $result.status | Should -Be 'Fail'
+        $result.evidence.decision | Should -Be 'GuestUnreachable'
+        $result.message | Should -Be 'arcsql01 didn''t answer over PowerShell Direct on archost01 after 4 tries: An error has occurred which Windows PowerShell cannot handle. A remote session might have ended. It isn''t onboarded to Azure Arc, so its configuration waits for it.'
+        $result.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again: it probes arcsql01 again'
+        ('{0} {1}' -f $result.message, $result.remediation) | Should -Not -Match 'configure-arc'
+        $result.evidence.guestError | Should -Match 'remote session might have ended'
+        $result.evidence.probeTries | Should -Be 4
+        $result.evidence.probeLockSeconds | Should -Be 12
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-ArcProbe')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmAccessToken -Times 0 -Exactly
+        # The probe waits for the host's pass (its lock, at most 30 minutes) and tries again, so its Run Command has room for both.
+        $script:runs[0].Parameter['LockMinutes'] | Should -Be '30'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $RunCommandName -eq 'DbHubDemo-ArcProbe' -and $TimeoutSeconds -gt (1500 + 30 * 60) }
+
+        # Live, a Warning let configuration go on, and NOT DONE led with its consequence, T2.ARC.SQLEXTENSION, and said to run
+        # configure-arc.ps1, then deploy.ps1 (F12, F13). A Fail skips configuration (Invoke-DemoArcConfiguration), so it leads.
+        $results = @(
+            $result
+            New-DemoResult -CheckId 'T2.ARC.CONFIGURATION' -Area 't2' -Target 'T2' -Status 'Not selected' -Message 'Configuring SQL Server enabled by Azure Arc was skipped because onboarding failed.'
+            New-DemoResult -CheckId 'DEPLOY.TRACK.T2' -Area 'infra' -Target 'T2' -Status 'Fail' -Message 'Track T2: Fail; finished steps: Restore, Artifacts, Bootstraps.' -Remediation 'Run ./scripts/deploy.ps1 again: it continues the unfinished track(s).'
+            New-DemoResult -CheckId 'HUB.ESTATE.T2' -Area 'hub' -Target 'T2' -Status 'Fail' -Message 'The Arc machine arcsql01 isn''t in Azure Resource Graph in rg-dbhub-demo, so T2 isn''t onboarded to Azure Arc.' -Remediation 'Onboard the guest with scripts/configure-arc.ps1 once the host reports WaitingForArcOnboarding.'
+        )
+        $state = [pscustomobject]@{ Stage = 'Validation'; TrackT1 = 'Telemetry'; TrackT2 = 'Bootstraps'; TrackT4 = 'Telemetry'; TrackFabric = 'Fabric'; T4Sku = ''; GuidedStopUtc = ''; HostPasswordUtc = '' }
+        $outcome = InModuleScope DbHubDemo -Parameters @{ R = $results; S = $state; C = (New-TestConfig) } { param($R, $S, $C) Get-DemoDeploymentOutcome -Result $R -State $S -Config $C -Command './scripts/deploy.ps1' }
+        $outcome.Kind | Should -Be 'NotDone'
+        $outcome.Reason | Should -Match '^T2\.ARC\.ONBOARDING: arcsql01 didn''t answer over PowerShell Direct'
+        $outcome.NextCommand | Should -Be './scripts/deploy.ps1'
+        $outcome.Next | Should -Match '^Run \./scripts/deploy\.ps1 again: '
+        $outcome.Next | Should -Not -Match 'configure-arc|Then run'
+
+        # With an Azure machine that's already Connected (an update), configuration, which goes through Azure, goes on.
+        $script:machine = New-TestMachine
+        $connected = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+        $connected.status | Should -Be 'Warning'
+        $connected.message | Should -Match 'Its Azure Arc machine is Connected, so its configuration goes on\.$'
+        $connected.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again'
+    }
+
+    It 'keeps the probe''s wait for the host''s bootstrap pass apart from the onboarding''s and the sweep''s (live, 2026-11-19, dbhubfy)' {
+        # Live, the row's lockSeconds was 0: the onboarding's own wait, which replaced the probe's in the evidence.
+        $script:probe.lockSeconds = 37
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $output = switch ([string]$PesterBoundParameters['RunCommandName']) {
+                'DbHubDemo-ArcProbe' { $script:probe | ConvertTo-Json -Compress }
+                'DbHubDemo-SignInData' { [ordered]@{ action = 'Clean'; succeeded = $true; pass = $true; local = $script:sweepPart; guest = $script:sweepPart; lock = [ordered]@{ minutes = 30; seconds = 441; timedOut = $false } } | ConvertTo-Json -Compress -Depth 6 }
+                default { [ordered]@{ succeeded = $true; outcome = 'Onboarded'; resourceId = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.HybridCompute/machines/arcsql01'; lockSeconds = 0 } | ConvertTo-Json -Compress }
+            }
+            [pscustomobject]@{ Succeeded = $true; ExecutionState = 'Succeeded'; ExitCode = 0; Output = $output; Error = '' }
+        }
+        $result = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $result.status | Should -Be 'Pass'
+        $result.evidence.decision | Should -Be 'Onboard'
+        $result.evidence.probeLockSeconds | Should -Be 37
+        $result.evidence.lockSeconds | Should -Be 0
+        $result.evidence.signInData.lockSeconds | Should -Be 441
+    }
+
+    It 'gives the onboarding Run Command room for the host''s pass and the tries, and a fix that''s a plain rerun when the host''s pass held its lock (2026-11-19, dbhubfx)' {
+        $script:machine = $null
+        $null = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $onboard = @($script:runs | Where-Object Name -EQ 'DbHubDemo-ArcOnboard')
+        $onboard.Count | Should -Be 1
+        $onboard[0].Parameter['LockMinutes'] | Should -Be '30'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $RunCommandName -eq 'DbHubDemo-ArcOnboard' -and $TimeoutSeconds -gt (1800 + 30 * 60) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $RunCommandName = $PesterBoundParameters['RunCommandName']
+            if ($RunCommandName -eq 'DbHubDemo-ArcProbe') {
+                return [pscustomobject]@{ Succeeded = $true; ExecutionState = 'Succeeded'; ExitCode = 0; Output = ($script:probe | ConvertTo-Json -Compress); Error = '' }
+            }
+            [pscustomobject]@{ Succeeded = $false; ExecutionState = 'Failed'; ExitCode = 1; Output = ''; Error = 'DbHubDemo Arc Onboard failed: The host''s own bootstrap pass held its lock (bootstrap.lock) for 1800 seconds, so Arc Onboard didn''t run beside it; nothing was changed (fail closed).' }
+        }
+        $failed = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match 'bootstrap\.lock'
+        $failed.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again: it onboards arcsql01 after archost01''s own bootstrap pass'
+        # The probe that the lock stopped: it says the probe failed, and why, with the same one fix.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            [pscustomobject]@{ Succeeded = $false; ExecutionState = 'Failed'; ExitCode = 1; Output = ''; Error = 'DbHubDemo Arc Probe failed: The host''s own bootstrap pass held its lock (bootstrap.lock) for 1800 seconds, so Arc Probe didn''t run beside it; nothing was changed (fail closed).' }
+        }
+        $probeFailed = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $probeFailed.status | Should -Be 'Fail'
+        $probeFailed.message | Should -Match '^The probe of arcsql01 on archost01 failed: DbHubDemo Arc Probe failed: The host''s own bootstrap pass held its lock \(bootstrap\.lock\)'
+        $probeFailed.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again'
+    }
+
+    It 'sweeps again by itself on a later run while the record says it''s owed, whatever the host''s state, and clears it once it passes (2026-11-19, dbhubfn)' {
+        $script:sweepOwed = '2026-11-19T19:37:17Z'
+        # A Ready host, where onboarding ran nothing before.
+        $script:hostState = 'Ready'
+        $ready = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $ready.status | Should -Be 'Pass'
+        $ready.message | Should -Match 'is Ready, so it isn''t waiting for onboarding'
+        $ready.message | Should -Match 'which didn''t pass then, passed now: Sign-in data was removed from archost01 and arcsql01 \(guest\), and none is left'
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-SignInData')
+        $script:runs[0].Parameter['ResidueScope'] | Should -Be 'Both'
+        $script:runs[0].Parameter['ResidueLockMinutes'] | Should -Be '30'
+        $script:owedWrites | Should -Be @('')
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArmAccessToken -Times 0 -Exactly
+
+        # Past onboarding and already Connected, while the host's pass still runs.
+        $script:hostState = 'InProgress'
+        $script:machine = New-TestMachine
+        $script:runs.Clear()
+        $script:owedWrites.Clear()
+        $connected = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $connected.status | Should -Be 'Pass'
+        $connected.message | Should -Match 'already Connected.*passed now'
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-SignInData')
+        $script:owedWrites | Should -Be @('')
+
+        # -Force on a guest that's Connected (a golden copy): after the marker.
+        $script:hostState = 'WaitingForArcOnboarding'
+        $script:probe.agentStatus = 'Connected'
+        $script:probe.agentResourceName = 'arcsql01'
+        $script:probe.agentResourceGroup = 'rg-dbhub-demo'
+        $script:runs.Clear()
+        $script:owedWrites.Clear()
+        $marker = Invoke-DemoArcOnboarding -Config (New-TestConfig) -Force -PollIntervalSeconds 1
+        $marker.status | Should -Be 'Pass'
+        $marker.message | Should -Match 'the marker was written again.*passed now'
+        @($script:runs | ForEach-Object { $_.Name }) | Should -Be @('DbHubDemo-ArcProbe', 'DbHubDemo-ArcOnboard', 'DbHubDemo-SignInData')
+        $script:runs[1].Parameter['Action'] | Should -Be 'WriteMarker'
+        $script:owedWrites | Should -Be @('')
+
+        # A sweep that fails again keeps the record, with the same time, and the same one fix.
+        $script:hostState = 'Ready'
+        $script:sweepGuest = [ordered]@{ reachable = $false; state = 'Running'; pass = $false; error = 'Cannot find path ''C:\Windows\Temp\x.log'' because it does not exist. (PathNotFound,Microsoft.PowerShell.Commands.GetItemCommand)' }
+        $script:owedWrites.Clear()
+        $again = Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1
+        $again.status | Should -Be 'Fail'
+        $again.message | Should -Match 'PathNotFound'
+        $again.remediation | Should -Match '^Run \./scripts/deploy\.ps1 again'
+        $script:owedWrites | Should -Be @('2026-11-19T19:37:17Z')
+
+        # Without the record, a Ready host runs nothing, as before.
+        $script:sweepOwed = ''
+        $script:runs.Clear()
+        (Invoke-DemoArcOnboarding -Config (New-TestConfig) -PollIntervalSeconds 1).message | Should -Not -Match 'passed now'
+        $script:runs.Count | Should -Be 0
+    }
+
+    It 'in the evaluation-only mode, never reads or writes the record of an owed check, nor runs one later (review of e617f34)' {
+        # That VM turns its Azure guest agent off at least 15 minutes after its Arc marker, so Run Command never reaches it again
+        # and configure-arc.ps1 reads it as Ready from its Arc machine: an owed check there failed on every later run.
+        $evaluation = New-TestConfig -Override @{ t2Mode = 'EvaluationOnlyAzureVm' }
+        $script:sweepOwed = 'unknown'
+        $ready = Invoke-DemoArcOnboarding -Config $evaluation -Health ([pscustomobject]@{ state = 'Ready'; message = 'Read from Azure Arc; the Azure guest agent is disabled.' }) -PollIntervalSeconds 1
+        $ready.status | Should -Be 'Pass'
+        $ready.message | Should -Not -Match 'passed now'
+        $script:runs.Count | Should -Be 0 -Because 'no Run Command reaches the VM once its agent is off'
+        # Already Connected while its bootstrap goes on: the same.
+        $script:machine = New-TestMachine
+        $connected = Invoke-DemoArcOnboarding -Config $evaluation -Health ([pscustomobject]@{ state = 'InProgress' }) -PollIntervalSeconds 1
+        $connected.status | Should -Be 'Pass'
+        $script:runs.Count | Should -Be 0
+
+        # The check right after its onboarding still runs, on the VM itself, as before; when it fails, nothing is recorded, and
+        # its fix is what works there.
+        $script:machine = $null
+        $script:sweepPart.pass = $false
+        $script:sweepPart.remaining.logUser = 2
+        $failed = Invoke-DemoArcOnboarding -Config $evaluation -PollIntervalSeconds 1
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match '^EVALUATION ONLY: arcsql01 is onboarded, but the onboarding token''s traces couldn''t be removed and verified'
+        $sweep = @($script:runs | Where-Object Name -EQ 'DbHubDemo-SignInData')
+        $sweep.Count | Should -Be 1
+        $sweep[0].VmName | Should -Be 'arcsql01'
+        $sweep[0].Parameter['ResidueScope'] | Should -Be 'Local'
+        $failed.remediation | Should -Match ([regex]::Escape('Run ./scripts/check-sign-in-data.ps1 -VmName arcsql01 -Clean -Force while Run Command still works on arcsql01'))
+        $failed.remediation | Should -Not -Match 'by itself'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoArcSweepOwed -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoArcSweepOwed -Times 0 -Exactly
     }
 }
 
@@ -1037,6 +1400,7 @@ Describe 'T2 Arc checks' {
                     'Extension' { Test-DemoArcSqlExtension -State $S }
                     'Instance' { Test-DemoArcSqlInstance -State $S }
                     'Monitoring' { Test-DemoArcMonitoring -State $S }
+                    'MigrationAssessment' { Test-DemoArcMigrationAssessment -State $S }
                     'Duplicates' { Test-DemoArcNoDuplicate -State $S }
                     'Connected' { Test-DemoArcConnected -State $S -Now $T }
                     'Disconnected' { Test-DemoArcDisconnection -State $S -Now $T }
@@ -1093,6 +1457,39 @@ Describe 'T2 Arc checks' {
         $developer = New-TestConfig -Override @{ t2SqlInstallMode = 'Developer' }
         $result = Invoke-Check 'Monitoring' (New-TestState -Config $developer -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Developer' -Monitoring $false))
         $result.status | Should -Be 'Not supported'
+    }
+
+    It 'checks migration assessment: uploaded is Pass with each target type''s readiness; off, none uploaded yet, or no machine is a Warning, never a Fail (2026-11-18)' {
+        $ready = [pscustomobject]@{
+            enabled                  = $true
+            assessmentUploadTime     = '2026-11-18T22:10:00Z'
+            skuRecommendationResults = [pscustomobject]@{
+                azureSqlDatabase        = [pscustomobject]@{ recommendationStatus = 'Ready'; targetSku = [pscustomobject]@{ computeSize = 2; category = [pscustomobject]@{ sqlServiceTier = 'General Purpose' } } }
+                azureSqlManagedInstance = [pscustomobject]@{ recommendationStatus = 'Ready' }
+                azureSqlVirtualMachine  = [pscustomobject]@{ recommendationStatus = 'NotReady' }
+            }
+        }
+        $pass = Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $ready) -Extension (New-TestExtension -Version '1.1.2600.1'))
+        $pass.checkId | Should -Be 'T2.ARC.MIGRATIONASSESSMENT'
+        $pass.status | Should -Be 'Pass'
+        $pass.message | Should -Match 'Azure SQL Database: Ready \(General Purpose, 2 vCores\); Azure SQL Managed Instance: Ready; SQL Server on Azure Virtual Machines: NotReady'
+        $pass.docUrl | Should -Be 'https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment'
+
+        $off = Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance) -Extension (New-TestExtension -Version '1.1.2600.1'))
+        # Optional (2026-11-18 review): a Warning with the fix, so it never ends T2's track or keeps the run from DONE.
+        $off.status | Should -Be 'Warning'
+        $off.message | Should -Match 'nothing else depends on it'
+        $off.remediation | Should -Match 'configure-arc\.ps1'
+
+        $pending = [pscustomobject]@{ enabled = $true }
+        (Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $pending) -Extension (New-TestExtension -Version '1.1.2600.1'))).status | Should -Be 'Warning'
+        $old = Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $pending) -Extension (New-TestExtension -Version '1.1.2504.99'))
+        $old.status | Should -Be 'Warning'
+        $old.message | Should -Match '1\.1\.2594\.118'
+        # Free for every edition: Developer mode is checked too.
+        $developer = New-TestConfig -Override @{ t2SqlInstallMode = 'Developer' }
+        (Invoke-Check 'MigrationAssessment' (New-TestState -Config $developer -Machine (New-TestMachine) -Instances @(New-TestInstance -Edition 'Developer' -Assessment $ready) -Extension (New-TestExtension -Version '1.1.2600.1'))).status | Should -Be 'Pass'
+        (Invoke-Check 'MigrationAssessment' (New-TestState -Config $config -Machine $null)).status | Should -Be 'Warning'
     }
 
     It 'checks monitoring and its documented prerequisites' {
@@ -1179,6 +1576,160 @@ Describe 'T2 Arc checks' {
     }
 }
 
+Describe 'Set-DemoArcSqlConfiguration turns on migration assessment and starts its first run (2026-11-18)' {
+    BeforeEach {
+        $script:config = New-TestConfig
+        $script:assessment = $null
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcState -MockWith { New-TestState -Config $script:config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $script:assessment) -Extension (New-TestExtension -Version '1.1.2600.1') }
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoArcSqlInstance -MockWith { , @(New-TestInstance -Assessment $script:assessment) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMonitoringUpdate -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $script:assessment = [pscustomobject]@{ enabled = $true }; $true }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -MockWith { 'InProgress' }
+    }
+
+    It 'turns it on and starts a run, which is Pass on its own row' {
+        $results = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -Times 1 -Exactly
+        ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').message | Should -Match 'Turned on migration assessment for arcsql01\. Started a migration assessment of arcsql01 \(job InProgress\)\.'
+        $row = $results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT'
+        $row.status | Should -Be 'Pass'
+        $row.message | Should -Match 'first run started \(InProgress\)'
+    }
+
+    It 'leaves one that has uploaded an assessment alone' {
+        $script:assessment = [pscustomobject]@{ enabled = $true; assessmentUploadTime = '2026-11-18T22:10:00Z' }
+        $results = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -Times 0 -Exactly
+        ($results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT').status | Should -Be 'Pass'
+    }
+
+    It 'says on its own row, as a Warning, when a policy denies it, and the rest of the configuration still counts (2026-11-18 review)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { throw 'Turning on migration assessment for arcsql01 failed: (RequestDisallowedByPolicy) Resource ''arcsql01'' was disallowed by policy.' }
+        $results = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').status | Should -Be 'Pass'
+        @($results | Where-Object status -EQ 'Fail') | Should -BeNullOrEmpty
+        $row = $results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT'
+        $row.status | Should -Be 'Warning'
+        $row.message | Should -Match 'RequestDisallowedByPolicy'
+        $row.remediation | Should -Match 'exemption'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -Times 0 -Exactly
+
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $script:assessment = [pscustomobject]@{ enabled = $true }; $true }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -MockWith { throw 'Starting a migration assessment of arcsql01 failed: (Conflict)' }
+        $script:assessment = $null
+        $again = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        ($again | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT').status | Should -Be 'Warning'
+    }
+
+    It 'is a Warning, and starts no run, when Azure accepted it but the setting doesn''t read as on yet (2026-11-18 review)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcMigrationAssessmentUpdate -MockWith { $false }
+        $results = @(Set-DemoArcSqlConfiguration -Config $script:config -WaitMinutes 0 -PollIntervalSeconds 1)
+        $row = $results | Where-Object checkId -eq 'T2.ARC.MIGRATIONASSESSMENT'
+        $row.status | Should -Be 'Warning'
+        $row.message | Should -Match 'didn''t read as on within 3 minutes'
+        ($results | Where-Object checkId -eq 'T2.ARC.CONFIGURATION').message | Should -Not -Match 'Turned on migration assessment'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -Times 0 -Exactly
+    }
+}
+
+Describe 'Invoke-DemoArcMigrationAssessmentUpdate reads the setting back after its PATCH (2026-11-18 review)' {
+    BeforeEach {
+        $script:target = InModuleScope -ModuleName DbHubDemo -Parameters @{ C = (New-TestConfig) } { param($C) Get-DemoArcTarget -Config $C }
+        $script:reads = 0
+        $script:onAfter = 2
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = ''; StdErr = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArmCollection -MockWith {
+            $script:reads++
+            $enabled = $script:onAfter -gt 0 -and $script:reads -ge $script:onAfter
+            , @(New-TestInstance -Assessment ([pscustomobject]@{ enabled = $enabled }))
+        }
+    }
+
+    It 'waits through a 202 Accepted until the setting reads as on' {
+        $on = InModuleScope -ModuleName DbHubDemo -Parameters @{ T = $script:target } { param($T) Invoke-DemoArcMigrationAssessmentUpdate -Target $T -InstanceName 'arcsql01' -WaitSeconds 60 -PollSeconds 15 -Confirm:$false }
+        $on | Should -BeTrue
+        $script:reads | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -match '--method patch' }
+    }
+
+    It 'returns false, without throwing, when the setting still reads as off after the wait' {
+        $script:onAfter = 0
+        $on = InModuleScope -ModuleName DbHubDemo -Parameters @{ T = $script:target } { param($T) Invoke-DemoArcMigrationAssessmentUpdate -Target $T -InstanceName 'arcsql01' -WaitSeconds 60 -PollSeconds 15 -Confirm:$false }
+        $on | Should -BeFalse
+        $script:reads | Should -Be 5
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -match 'didn''t read as on within 60 seconds' }
+    }
+
+    It 'throws the refusal, redacted, when Azure denies the PATCH, and reads nothing' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzWithConflictRetry -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: (RequestDisallowedByPolicy) Resource ''arcsql01'' was disallowed by policy.' } }
+        { InModuleScope -ModuleName DbHubDemo -Parameters @{ T = $script:target } { param($T) Invoke-DemoArcMigrationAssessmentUpdate -Target $T -InstanceName 'arcsql01' -Confirm:$false } } | Should -Throw '*RequestDisallowedByPolicy*'
+        $script:reads | Should -Be 0
+    }
+}
+
+Describe 'T2''s first migration assessment is tried again later in the run (2026-11-18 live finding)' {
+    BeforeEach {
+        $script:config = New-TestConfig
+        $script:assessment = [pscustomobject]@{ enabled = $true }
+        $script:tries = 0
+        $script:refusals = 2
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoArcState -MockWith { New-TestState -Config $script:config -Machine (New-TestMachine) -Instances @(New-TestInstance -Assessment $script:assessment) -Extension (New-TestExtension -Version '1.1.3579.481') }
+        Mock -ModuleName DbHubDemo -CommandName Start-DemoArcMigrationAssessment -MockWith {
+            $script:tries++
+            if ($script:tries -le $script:refusals) {
+                throw 'Starting a migration assessment of arcsql01 failed: ERROR: Internal Server Error({"error":{"code":"InternalServerError","message":"There was an unexpected problem communicating with the Arc Sql Extension"}})'
+            }
+            'InProgress'
+        }
+    }
+
+    It 'tries every 2 minutes until Azure takes the run, which is Pass' {
+        $row = InModuleScope -ModuleName DbHubDemo -Parameters @{ C = $script:config } { param($C) Invoke-DemoArcMigrationAssessmentRetry -Config $C -WaitMinutes 10 }
+        $script:tries | Should -Be 3
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 2 -Exactly -ParameterFilter { $Seconds -eq 120 }
+        $row.checkId | Should -Be 'T2.ARC.MIGRATIONASSESSMENT'
+        $row.status | Should -Be 'Pass'
+        $row.message | Should -Match 'first run started \(InProgress\)'
+    }
+
+    It 'stops at its deadline with a Warning that keeps Azure''s last answer' {
+        $script:refusals = 99
+        $row = InModuleScope -ModuleName DbHubDemo -Parameters @{ C = $script:config } { param($C) Invoke-DemoArcMigrationAssessmentRetry -Config $C -WaitMinutes 0 }
+        $script:tries | Should -Be 1
+        $row.status | Should -Be 'Warning'
+        $row.message | Should -Match 'communicating with the Arc Sql Extension'
+    }
+
+    It 'starts nothing when the assessment is off or already uploaded' {
+        foreach ($assessment in @([pscustomobject]@{ enabled = $false }, [pscustomobject]@{ enabled = $true; assessmentUploadTime = '2026-11-19T02:33:29Z' })) {
+            $script:assessment = $assessment
+            $null = InModuleScope -ModuleName DbHubDemo -Parameters @{ C = $script:config } { param($C) Invoke-DemoArcMigrationAssessmentRetry -Config $C }
+        }
+        $script:tries | Should -Be 0
+    }
+
+    It 'retries only a Warning whose assessment is on, with none uploaded and no run started' {
+        $retry = {
+            param([string] $Status, [object] $Evidence, [string] $CheckId = 'T2.ARC.MIGRATIONASSESSMENT')
+            $result = New-DemoResult -CheckId $CheckId -Area 't2' -Target 'T2' -Status $Status -Message 'm' -Evidence $Evidence
+            InModuleScope -ModuleName DbHubDemo -Parameters @{ R = $result } { param($R) Test-DemoArcMigrationAssessmentRetry -Result $R }
+        }
+        & $retry 'Warning' ([ordered]@{ enabled = $true; uploadedAt = ''; runStarted = '' }) | Should -BeTrue
+        & $retry 'Warning' ([ordered]@{ enabled = $false; uploadedAt = ''; runStarted = '' }) | Should -BeFalse
+        & $retry 'Warning' ([ordered]@{ enabled = $true; uploadedAt = '2026-11-19T02:33:29Z'; runStarted = '' }) | Should -BeFalse
+        & $retry 'Pass' ([ordered]@{ enabled = $true; uploadedAt = ''; runStarted = 'InProgress' }) | Should -BeFalse
+        & $retry 'Warning' ([ordered]@{ enabled = $true; uploadedAt = ''; runStarted = '' }) 'T2.ARC.MONITORING' | Should -BeFalse
+        InModuleScope -ModuleName DbHubDemo { Test-DemoArcMigrationAssessmentRetry -Result $null } | Should -BeFalse
+    }
+}
+
 Describe 'T1 SQL VM performance monitoring' {
     BeforeAll {
         $config = New-TestConfig
@@ -1235,7 +1786,8 @@ Describe 'T1 SQL VM performance monitoring' {
         # configure-monitoring.ps1 never does.
         $pending.message | Should -Match 'reports ''NotRunning'''
         $pending.remediation | Should -Match 'start-demo\.ps1, which restarts the SQL IaaS Agent service'
-        $pending.remediation | Should -Match ([regex]::Escape("--name sqlvm01 --command-id RunPowerShellScript --scripts 'Restart-Service -Name SQLIaaSExtension -Force'"))
+        $pending.remediation | Should -Match 'deploy\.ps1, which repairs T1''s SQL IaaS Agent extension'
+        $pending.remediation | Should -Not -Match 'az vm run-command' -Because 'a person never repairs it by hand (AGENTS.md)'
         $pending.remediation | Should -Not -Match 'configure-monitoring'
         $noStatus = & $convert (New-SqlVmState -Settings $flag -Message 'SqlIaasAgent: OK')
         $noStatus.status | Should -Be 'Warning'

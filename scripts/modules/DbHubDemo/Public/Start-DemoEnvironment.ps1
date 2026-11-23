@@ -30,12 +30,15 @@ function Start-DemoEnvironment {
        Running, or when no fresh status comes, and checks for Running and OK.
        A one-time host password left from an earlier session that couldn't be rotated is rotated now, unless
        -Interactive; with the Key Vault opt-in, the vault's copy is disabled too (START.KEYVAULT.CLEANUP).
-       Before the VMs start, with the on-demand activity control (control.enabled, ADR 0020), a pending auto-stop
-       of a notebook run is cancelled, because this session takes over: a Warning says the VMs now run until
-       stop-demo.ps1 or the nightly auto-shutdown (START.CONTROL.AUTOSTOP). When it can't be cancelled, the
-       Warning gives the pending stop's time and how to cancel it, and the start carries on. A DbHub-Stop job
-       that's queued or running is waited for, up to 10 minutes, and never stopped (START.CONTROL.STOPJOB): a Pass
-       when it finishes; a Warning when it's still running after the wait or its state can't be read.
+       Before the VMs start, the session's auto-stop is scheduled (2026-11-19, Register-DemoActivityControlAutoStop,
+       START.CONTROL.AUTOSTOP): the same one-time schedule a Run all session uses (dbhub-autostop, linked to DbHub-Stop),
+       -AutoStopHours (4) after this start, or after the warm-up it waits for, so a forgotten session stops by itself; it
+       replaces a pending one from an earlier session (the newer session's plan wins), and a later Run all or the Insights
+       app's Start replaces it in turn. The result says when the demo stops, the nightly stop included. Without the session
+       control's role (A1, before an Owner's grant) it isn't scheduled: a Warning says the nightly stop is the limit, with
+       the grant. A DbHub-Stop job that's queued or running is waited for first, up to 10 minutes, and never stopped
+       (START.CONTROL.STOPJOB): a Pass when it finishes; a Warning when it's still running after the wait or its state
+       can't be read.
        With fabric.manageCapacity true (Phase 26b, ADR 0023), the Fabric capacity in fabric.capacityName is resumed
        when it's Paused and recorded in the group's DbHubFabricCapacityResumed tag, so stop-demo.ps1 pauses only what
        the demo resumed (START.FABRIC.CAPACITY; Resume-DemoFabricCapacity). With false, the default, it's Not selected
@@ -61,8 +64,12 @@ function Start-DemoEnvironment {
        (Set-DemoT4ReplicaHold, 2026-11-16) before the warm-up: a new one through its template's tags, one that's running
        already at once, and one that was stopped once it's Ready. So a deploy.ps1 run that ends during the session leaves
        it (a Warning, START.T4.REPLICA.HOLD, when the mark couldn't be written).
+    4c. T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has no stop, so nothing starts it: START.T5 says whether
+       it's ready (a Warning with deploy.ps1's command for a demo deployed before T5). Its container exists only during a
+       session (2026-11-19): when a stop deleted it, it's created again here, while the VMs boot (START.T5.CONTAINER,
+       New-DemoT5Container, about a minute), and T5's profile is set with T1's once it's there.
     5. Sets the activity profile (-ActivityProfile, or the configured activityProfile, business-day by default since
-       2026-11-03) on T1, T3, T4, and T2 until the next auto-shutdown (START.PROFILE_*). A profile with incidents is set
+       2026-11-03) on T1, T3, T4, T5, and T2 until the next auto-shutdown (START.PROFILE_*). A profile with incidents is set
        as its interim, baseline, first. The VMs don't set it at boot unless
        activityProfileOnBoot is true, so this is what starts the demo's activity. T2's guest needs a few
        minutes after the host starts, so its profile is retried. Then the on-demand activity control's finished
@@ -132,6 +139,10 @@ function Start-DemoEnvironment {
     VMs whose switch from the interim baseline the caller makes itself, after Run Commands it still sends them
     (start-demo.ps1 with -Interactive -ResetAdminPassword holds archost01 for the host password).
 
+    .PARAMETER AutoStopHours
+    Hours after this start (after the warm-up with -WaitForWarmUp) when the session's auto-stop stops the demo (default 4,
+    2026-11-19); start-demo.ps1 -Hours.
+
     .EXAMPLE
     Start-DemoEnvironment -Config $config -WarmUpMinutes 30
     #>
@@ -173,7 +184,10 @@ function Start-DemoEnvironment {
 
         [AllowEmptyCollection()]
         [ValidateSet('sqlvm01', 'archost01')]
-        [string[]] $HoldActivitySwitchVm = @()
+        [string[]] $HoldActivitySwitchVm = @(),
+
+        [ValidateRange(0.5, 24)]
+        [double] $AutoStopHours = 4
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
@@ -206,8 +220,10 @@ function Start-DemoEnvironment {
         $results.Add((New-DemoResult -CheckId 'START.COST' -Area 'preflight' -Target 'subscription' -Status 'Not selected' -Message 'The cost guardrail was skipped (-SkipCostCheck).'))
     }
     else {
-        # T4 at the size the fallback recorded (Phase 28 follow-up), so a General Purpose T4 is priced as such.
-        $cost = @(Test-DemoStartCost -Config (Resolve-DemoEffectiveConfig -Config $Config -State $state) -NetworkMode $networkMode -T3UseFreeLimit $state.T3UseFreeLimit -ActivityProfile $activity.Name)
+        # T4 at the size the fallback recorded (Phase 28 follow-up), so a General Purpose T4 is priced as such. Bastion only
+        # with -Interactive, which deploys it, for at most bastionMaxHours (2026-11-19): a default session has none.
+        $bastionHours = if ($Interactive) { [System.Math]::Min([double]$Config['bastionMaxHours'], [double](Get-DemoProfile).assumptions.demoHoursPerSession) } else { -1 }
+        $cost = @(Test-DemoStartCost -Config (Resolve-DemoEffectiveConfig -Config $Config -State $state) -NetworkMode $networkMode -T3UseFreeLimit $state.T3UseFreeLimit -ActivityProfile $activity.Name -BastionHours $bastionHours)
         foreach ($item in $cost) {
             $results.Add($item)
         }
@@ -221,17 +237,30 @@ function Start-DemoEnvironment {
         $results.Add((New-DemoResult -CheckId 'START.DEMO' -Area 'infra' -Target 'subscription' -Status 'Not selected' -Message 'What if: nothing was started.'))
         return $results.ToArray()
     }
-    # A local session takes over from an on-demand run (ADR 0020): the run's pending auto-stop would deallocate this
-    # session's VMs, so it's cancelled first, with a Warning, and a stop job already in flight is waited for. Nothing
-    # here stops the start.
+    # This start's time, before it starts anything (2026-11-19, DbHubStartDemoUtc): deploy.ps1's stop at the end of an update
+    # leaves a session that began during that run alone, also one that gets no auto-stop (Get-DemoUpdateStopSession). Never
+    # in the start's way. Recorded again once the VMs' starts are asked for (below).
+    $recordStart = {
+        try {
+            Set-DemoDeploymentState -Config $Config -Value @{ StartDemoUtc = (ConvertTo-DemoBusyTimeText -Utc ([DateTime]::UtcNow)) } -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Debug -Message ('This start''s time wasn''t recorded on the resource group: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        }
+    }
+    & $recordStart
+    # start-demo.ps1's auto-stop (2026-11-19): the session stops by itself -AutoStopHours after this start, or after the
+    # warm-up it waits for, through the same one-time schedule a Run all session uses (dbhub-autostop), which replaces an
+    # earlier session's: the newer session's plan wins. A stop job already in flight is waited for first. Without the
+    # session control's role it isn't scheduled, with a Warning: the nightly stop is the limit. Nothing here stops the start.
     if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
         try {
-            foreach ($item in @(Clear-DemoActivityControlAutoStop -Config $Config -Purpose Start -Confirm:$false)) {
+            foreach ($item in @(Register-DemoActivityControlAutoStop -Config $Config -Hours $AutoStopHours -WarmUpMinutes $(if ($WaitForWarmUp) { $WarmUpMinutes } else { 0 }) -Confirm:$false)) {
                 $results.Add($item)
             }
         }
         catch {
-            $results.Add((New-DemoResult -CheckId 'START.CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('A pending on-demand auto-stop couldn''t be checked: {0}. If one is pending, it deallocates the VMs at its time; the start carried on.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'status.ps1 shows whether one is pending (STATUS.CONTROL). To cancel it, delete the schedule dbhub-autostop in the control Automation account aa-<prefix>-control (Shared resources > Schedules) in the Azure portal, or run start-demo.ps1 again.' -DocUrl 'https://learn.microsoft.com/rest/api/automation/schedule/delete'))
+            $results.Add((New-DemoResult -CheckId 'START.CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The demo''s auto-stop couldn''t be scheduled: {0}. The demo runs until ./scripts/stop-demo.ps1 or the nightly stop, and a pending one from an earlier session stops it at its time; the start carried on.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'status.ps1 shows whether one is pending (STATUS.CONTROL). Run start-demo.ps1 again to schedule it; run stop-demo.ps1 when the session ends.' -DocUrl 'https://learn.microsoft.com/rest/api/automation/schedule/create-or-update'))
         }
     }
     # The busy marker (2026-11-14): this session takes over from a run the nightly stop waited for, so the deferred pass
@@ -263,6 +292,10 @@ function Start-DemoEnvironment {
     foreach ($vm in 'sqlvm01', $hostVm) {
         $startRequested[$vm] = [bool](Request-DemoVmStart -Config $Config -VmName $vm)
     }
+    # Again now that the VMs' starts are asked for (the re-review of 2026-11-19): a deploy.ps1 that began after the first
+    # record, while this start was still on its control calls (a minute, or 10 when it waits for a stop job), found the VMs
+    # stopped, so this later time is what tells its stop at the end that this session began during that run.
+    & $recordStart
     # With activityProfileOnBoot, a VM this start starts sets the interim baseline itself at boot (2026-11-03), so its
     # targets are switched with the others.
     if ($activity.HasIncidents -and $Config.Contains('activityProfileOnBoot') -and [bool]$Config['activityProfileOnBoot']) {
@@ -274,9 +307,29 @@ function Start-DemoEnvironment {
     }
     $t4On = -not $SkipT4 -and (Test-DemoT4Enabled -Config $Config)
     $t4Request = if ($t4On) { Invoke-DemoT4PowerAction -Config $Config -Action Start -WaitMinutes 0 -CheckPrefix START } else { $null }
+    # T5 (2026-11-18, ADR 0027) has no stop, so its account was running already: START.T5 says whether it's there. Its
+    # container exists only during a session (2026-11-19): it's created here when a stop deleted it, while the VMs boot
+    # (START.T5.CONTAINER), and T5's activity profile is set with T1's below only once it's there.
+    $t5Ready = $false
+    if (Test-DemoT5Enabled -Config $Config) {
+        $t5 = Get-DemoT5State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $t5Ready = [bool]$t5.Exists -and [string]$t5.State -eq 'Succeeded'
+        if ($t5Ready) {
+            $results.Add((New-DemoResult -CheckId 'START.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message ('T5 ({0}) is ready: an Azure Cosmos DB account has no stop, so it was running already{1}.' -f $t5.Names.AccountName, $(if ($t5.FreeTier) { ', on the free tier' } else { '' }))))
+            $container = New-DemoT5Container -Config $Config -State $t5 -CheckId 'START.T5.CONTAINER' -Confirm:$false
+            $results.Add($container)
+            $t5Ready = [string]$container.status -eq 'Pass'
+        }
+        elseif ($t5.State -eq 'NotFound') {
+            $results.Add((New-DemoResult -CheckId 'START.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) doesn''t exist yet: a demo deployed before 2026-11-18 doesn''t have it, so this session has no Azure Cosmos DB.' -f $t5.Names.AccountName) -Remediation 'Run ./scripts/deploy.ps1: it adds T5, with nothing else to do.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['hubMonitor'])))
+        }
+        else {
+            $results.Add((New-DemoResult -CheckId 'START.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) is {1}{2}, so its activity isn''t started.' -f $t5.Names.AccountName, $t5.State, $(if ($t5.Error) { ': ' + $t5.Error } else { '' })) -Remediation 'Run ./scripts/status.ps1 in a few minutes; if it stays, run ./scripts/deploy.ps1.'))
+        }
+    }
     # A VM that was already running may still serve an earlier run's incidents: the targets this start sets get the
     # interim baseline before its own Run Commands reach that VM, and its switch brings the profile back (2026-11-03).
-    $quietTargets = @('T1') + @(if (-not $SkipT3) { 'T3' }) + @(if ($t4On) { 'T4' }) + @('T2')
+    $quietTargets = @('T1') + @(if (-not $SkipT3) { 'T3' }) + @(if ($t4On) { 'T4' }) + @(if ($t5Ready) { 'T5' }) + @('T2')
     $quieted = @(Invoke-DemoActivityQuiet -Config $Config -ActivityProfile $activity -VmName @(@('sqlvm01', $hostVm) | Where-Object { -not $startRequested[$_] }) -Target $quietTargets -RequestedBy 'start-demo' -PassThru | Where-Object { $_.Outcome -eq 'Sent' } | ForEach-Object { [string]$_.VmName } | Select-Object -Unique)
     $interimSent = [System.Collections.Generic.List[object]]::new()
     foreach ($vm in 'sqlvm01', $hostVm) {
@@ -424,7 +477,7 @@ function Start-DemoEnvironment {
     }
 
     $t3Enabled = $t3Ready -and ((Test-DemoDeploymentStageReached -Recorded $state.Stage -Stage 'T3') -or @($results | Where-Object { $_.checkId -like 'WORKLOAD.T3*' -and $_.status -in 'Pass', 'Warning' }).Count -gt 0)
-    $profileTargets = @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @('T2')
+    $profileTargets = @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' }) + @('T2')
     # A target whose interim baseline this start waited for has had that wait's readiness bound already: its VM tried it
     # every 15 seconds for up to 10 minutes. One that never answered then (TimedOut, or Failed after several attempts) gets
     # one more attempt below without another wait, so the two waits don't add up (review of PR 17, 2026-11-04).
@@ -438,8 +491,11 @@ function Start-DemoEnvironment {
         if (-not $state.RunnerSha256) {
             $skip = 'No workload runner was deployed (deploy.ps1 -SkipRunner).'
         }
-        elseif ($target -in 'T1', 'T3', 'T4' -and -not $running['sqlvm01']) {
+        elseif ($target -in 'T1', 'T3', 'T4', 'T5' -and -not $running['sqlvm01']) {
             $skip = 'sqlvm01 isn''t running.'
+        }
+        elseif ($target -eq 'T5' -and -not $t5Ready) {
+            $skip = 'T5 isn''t ready (START.T5 or START.T5.CONTAINER says why), so its activity wasn''t started.'
         }
         elseif ($target -eq 'T4' -and $SkipT4) {
             $skip = 'T4 was left alone (-SkipT4).'

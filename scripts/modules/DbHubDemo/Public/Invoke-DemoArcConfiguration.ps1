@@ -18,7 +18,7 @@ function Invoke-DemoArcConfiguration {
        the caller's token); a stale Arc machine from an earlier guest build is deleted first, so there are never
        duplicates.
     5. Once the host is past onboarding (or with -Force), converges the Azure extension for SQL Server, its
-       license type, the sqlServerInstances resource, and monitoring (Set-DemoArcSqlConfiguration). In
+       license type, the sqlServerInstances resource, monitoring, and migration assessment (Set-DemoArcSqlConfiguration). In
        PaygWizard mode without -Force, while the host's step is ArcOnboardingBeforeWizard, GuidedSetup, or
        SqlSetupWizard and its health doesn't show the setup check passed (Standard in the guest, nothing armed), that
        waits (T2.ARC.CONFIGURATION Manual action required), so a wrong install never gets pay-as-you-go (Phase 28);

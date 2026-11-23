@@ -76,8 +76,9 @@ Describe 'The progress model (Phase 28, brief item 11)' {
 
     It 'shows the history report''s snapshot after the validation, where it happens, as not blocking DONE, and leaves it out with -SkipFabric (2026-11-06)' {
         $model = New-TestModel
-        # The busy marker's Nightly stop row (2026-11-14), then the session control's (ADR 0026), come last, with or without Fabric.
-        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History', 'NightlyStop', 'Control')
+        # The busy marker's Nightly stop row (2026-11-14), then the session control's (ADR 0026), then the stop at the end of an
+        # update (2026-11-19), come last, with or without Fabric.
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History', 'NightlyStop', 'Control', 'EndStop')
         $history = Get-TestStep -Model $model -Id 'Fabric.History'
         $history['nonBlocking'] | Should -BeTrue
         $history['state'] | Should -Be 'Pending'
@@ -89,7 +90,17 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         (InModuleScope DbHubDemo { Get-DemoProgressStepLabel -Id 'NightlyStop' }) | Should -Be 'nightly stop'
         $skipFabric = InModuleScope DbHubDemo { New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -SkipFabric) }
         Get-TestStep -Model $skipFabric -Id 'Fabric.History' | Should -BeNullOrEmpty
-        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'NightlyStop', 'Control')
+        @(($skipFabric['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'NightlyStop', 'Control', 'EndStop')
+    }
+
+    It 'shows the stop at the end of an update last, after T4''s read replica, as not blocking DONE, labeled with -KeepRunning (2026-11-19)' {
+        $catalog = InModuleScope DbHubDemo { New-DemoProgressModel -Catalog (Get-DemoProgressCatalog -T4Enabled -T5Enabled) }
+        @(($catalog['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] })[-2..-1] | Should -Be @('T4ReplicaEnd', 'EndStop')
+        $endStop = Get-TestStep -Model $catalog -Id 'EndStop'
+        $endStop['nonBlocking'] | Should -BeTrue
+        $endStop['state'] | Should -Be 'Pending'
+        $endStop['label'] | Should -Match '-KeepRunning'
+        (InModuleScope DbHubDemo { Get-DemoProgressStepLabel -Id 'EndStop' }) | Should -Be 'stop at the end'
     }
 
     It 'takes the snapshot again on a resumed run that has nothing left to do, never "finished in an earlier run", and skips it on a run without the validation (2026-11-06)' {
@@ -258,7 +269,8 @@ Describe 'The status page''s banner: exactly one of three states' {
         $done = InModuleScope DbHubDemo -Parameters @{ Model = $model } { Get-DemoProgressBanner -Model $Model -NowUnix 1793000060 }
         $done.Kind | Should -Be 'Done'
         ($done.Lines -join ' ') | Should -Match 'The demo is complete'
-        ($done.Lines -join ' ') | Should -Match 'capture-t2-golden\.ps1'
+        ($done.Lines -join ' ') | Should -Match 'investigate what you see with Copilot in Database Hub\.'
+        ($done.Lines -join ' ') | Should -Not -Match 'with the Database Agent|capture-t2-golden' -Because 'DONE''s own lines name Copilot, and suggest no golden snapshot, which bills every month (S6)'
         ($done.Lines -join ' ') | Should -Not -Match '(?i)optional'
         @($done.Problems) | Should -Be @('Failed (doesn''t block DONE): the Insights app. It wasn''t created: FABRIC.APP.DEPLOY: rayfin up didn''t deploy APP_DatabaseHub_Insights (exit code 1, 42 s): Capacity is paused. To add it: run ./scripts/configure-fabric-app.ps1 -SignIn.')
 
@@ -448,5 +460,31 @@ Describe 'Show-DemoDeploymentProgress (status.ps1 -Watch)' {
         $script:watchPath = $path
         Show-DemoDeploymentProgress -Path $path -Watch -IntervalSeconds 2 | Should -Be 'Done'
         Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 1 -Exactly
+    }
+}
+
+Describe 'Add-DemoProgressStepNote (2026-11-19)' {
+    It 'adds a later finding after a finished row''s own message, raises its status when that''s worse, and keeps it ended' {
+        $path = New-TestModelFile
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+            Set-DemoProgressStep -Path $Path -Id 'Infrastructure' -State 'Done' -Status 'Pass' -Message 'The template deployed.'
+            Add-DemoProgressStepNote -Path $Path -Id 'Infrastructure' -Status 'Warning' -Note 'The nightly safety stop isn''t fully in place, so T4''s restart counts the rest of the month again.'
+        }
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $row = Get-TestStep -Model $model -Id 'Infrastructure'
+        $row['state'] | Should -Be 'Done'
+        $row['status'] | Should -Be 'Warning'
+        $row['message'] | Should -Be 'The template deployed. The nightly safety stop isn''t fully in place, so T4''s restart counts the rest of the month again.'
+        # A worse status stays, and a missing row or path changes nothing.
+        InModuleScope DbHubDemo -Parameters @{ Path = $path } {
+            Set-DemoProgressStep -Path $Path -Id 'Infrastructure' -State 'Failed' -Status 'Fail' -Message 'The template failed.'
+            Add-DemoProgressStepNote -Path $Path -Id 'Infrastructure' -Status 'Warning' -Note 'A note.'
+            Add-DemoProgressStepNote -Path $Path -Id 'No.Such.Row' -Status 'Warning' -Note 'A note.'
+            Add-DemoProgressStepNote -Path '' -Id 'Infrastructure' -Status 'Warning' -Note 'A note.'
+        }
+        $row = Get-TestStep -Model (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20) -Id 'Infrastructure'
+        $row['state'] | Should -Be 'Failed'
+        $row['status'] | Should -Be 'Fail'
+        $row['message'] | Should -Be 'The template failed. A note.'
     }
 }

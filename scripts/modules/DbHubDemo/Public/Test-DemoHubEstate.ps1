@@ -2,7 +2,7 @@ function Test-DemoHubEstate {
     <#
     .SYNOPSIS
     Checks that each selected target is in Azure Resource Graph, the inventory source of the Database Hub
-    Overview and Estate pages (HUB.ESTATE.T1, HUB.ESTATE.T2, HUB.ESTATE.T3, HUB.ESTATE.T4).
+    Overview and Estate pages (HUB.ESTATE.T1, HUB.ESTATE.T2, HUB.ESTATE.T3, HUB.ESTATE.T4, HUB.ESTATE.T5).
 
     .DESCRIPTION
     The Database Hub discovers SQL resources through Azure Resource Graph
@@ -22,6 +22,10 @@ function Test-DemoHubEstate {
       and Azure RBAC with Reader on the subscription; no extended property, Arc onboarding, or extra resource
       provider is needed (https://learn.microsoft.com/fabric/database/hub/monitor-postgresql, checked
       2026-10-23). A stopped server is still listed. T4 turned off (t4Enabled false) is Not selected.
+    - T5: the Azure Cosmos DB account cosmos01-<deploymentId> (2026-11-18, ADR 0027). The Estate lists the account,
+      not its databases or containers, with Reader on the subscription and no setup
+      (https://learn.microsoft.com/fabric/database/hub/monitor-cosmos-db, checked 2026-11-18). T5 turned off (t5Enabled
+      false) is Not selected.
     Targets not in -Target are Not selected.
 
     .PARAMETER Config
@@ -42,8 +46,8 @@ function Test-DemoHubEstate {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
-        [string[]] $Target = @('T1', 'T2', 'T3', 'T4'),
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
+        [string[]] $Target = @('T1', 'T2', 'T3', 'T4', 'T5'),
 
         [AllowEmptyString()]
         [string] $DeploymentId = ''
@@ -53,10 +57,14 @@ function Test-DemoHubEstate {
     $evaluationOnly = [string]$Config['t2Mode'] -eq 'EvaluationOnlyAzureVm'
     $installMode = if ($Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
     $manualCheck = 'Seeing it on the Hub Estate page is a manual check.'
-    $byTarget = [ordered]@{ T1 = $null; T2 = $null; T3 = $null; T4 = $null }
+    $byTarget = [ordered]@{ T1 = $null; T2 = $null; T3 = $null; T4 = $null; T5 = $null }
     if ('T4' -in $Target -and -not (Test-DemoT4Enabled -Config $Config)) {
         $Target = @($Target | Where-Object { $_ -ne 'T4' })
         $byTarget['T4'] = New-DemoResult -CheckId 'HUB.ESTATE.T4' -Area 'hub' -Target 'T4' -Status 'Not selected' -Message 'T4 is off in this configuration (t4Enabled is false).'
+    }
+    if ('T5' -in $Target -and -not (Test-DemoT5Enabled -Config $Config)) {
+        $Target = @($Target | Where-Object { $_ -ne 'T5' })
+        $byTarget['T5'] = New-DemoResult -CheckId 'HUB.ESTATE.T5' -Area 'hub' -Target 'T5' -Status 'Not selected' -Message 'T5 is off in this configuration (t5Enabled is false).'
     }
     function Add-TargetResult([string] $Name, [string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence, [string] $Remediation = '') {
         $byTarget[$Name] = New-DemoResult -CheckId ('HUB.ESTATE.{0}' -f $Name) -Area 'hub' -Target $Name -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $docUrl -EvaluationOnly:($Name -eq 'T2' -and $evaluationOnly)
@@ -74,7 +82,7 @@ function Test-DemoHubEstate {
         return @($byTarget.Values)
     }
 
-    $resolved = Resolve-DemoHubTarget -Config $Config -DeploymentId $DeploymentId -NeedT3:('T3' -in $Target -or 'T4' -in $Target)
+    $resolved = Resolve-DemoHubTarget -Config $Config -DeploymentId $DeploymentId -NeedT3:('T3' -in $Target -or 'T4' -in $Target -or 'T5' -in $Target)
     $query = Format-DemoKqlTemplate -Name 'ResourceGraph.Estate' -Parameters @{
         SubscriptionId = ConvertTo-DemoKqlLiteral -Value $resolved.SubscriptionId -Type String
         ResourceGroup  = ConvertTo-DemoKqlLiteral -Value $resolved.ResourceGroup -Type String
@@ -130,7 +138,7 @@ function Test-DemoHubEstate {
         elseif ($machine) {
             $evidence = [ordered]@{ machineResourceId = Get-RowValue $machine 'id'; machineStatus = Get-RowValue $machine 'status'; t2SqlInstallMode = $installMode }
             if ($installMode -eq 'PaygWizard') {
-                Add-TargetResult 'T2' 'Manual action required' 'The Arc machine arcsql01 is in Azure Resource Graph, but no SQL Server instance is yet: the PaygWizard setup-wizard step is still pending.' $evidence 'Finish the setup-wizard step in docs/deployment.md ("The PaygWizard manual step"); the Azure extension for SQL Server then reports the instance.'
+                Add-TargetResult 'T2' 'Manual action required' 'The Arc machine arcsql01 is in Azure Resource Graph, but no SQL Server instance is yet: the PaygWizard setup-wizard step is still pending.' $evidence 'Run ./scripts/deploy.ps1: it makes a T2 guest whose setup was never finished again from the Jumpstart image, with no setup wizard; the Azure extension for SQL Server then reports the instance.'
             }
             else {
                 Add-TargetResult 'T2' 'Warning' 'The Arc machine arcsql01 is in Azure Resource Graph, but the Azure extension for SQL Server hasn''t reported its SQL Server instance yet.' $evidence 'Check the extension with scripts/configure-arc.ps1 and run again in a few minutes.'
@@ -204,6 +212,31 @@ function Test-DemoHubEstate {
         }
         else {
             Add-TargetResult 'T4' 'Fail' ('T4 ({0}) isn''t in Azure Resource Graph in {1}.' -f $t4Name, $resolved.ResourceGroup) @{ resourceGroup = $resolved.ResourceGroup; expectedName = $t4Name } 'Deploy it with scripts/deploy.ps1 -Resume; a new resource can take a few minutes to appear in Resource Graph.'
+        }
+    }
+
+    if ('T5' -in $Target) {
+        $prefix = [string](Get-DemoCosmosSetting)['accountNamePrefix']
+        $t5Name = if ($resolved.DeploymentId) { '{0}-{1}' -f $prefix, $resolved.DeploymentId } else { '' }
+        $resolvedFrom = 'deploymentId'
+        $accounts = @(Get-TypedRow 'microsoft.documentdb/databaseaccounts' | Where-Object { (Get-RowValue $_ 'name') -like ('{0}-*' -f $prefix) })
+        if (-not $t5Name -and $accounts.Count -eq 1) {
+            $t5Name = Get-RowValue $accounts[0] 'name'
+            $resolvedFrom = 'resourceGraph'
+        }
+        $account = @($accounts | Where-Object { (Get-RowValue $_ 'name') -ieq $t5Name }) | Select-Object -First 1
+        if ($account) {
+            Add-TargetResult 'T5' 'Pass' ('T5 ({0}) is in Azure Resource Graph as an Azure Cosmos DB account, which the Hub Estate lists (its monitoring is Azure Monitor platform metrics: normalized RU, requests and 429s, and availability). {1}' -f $t5Name, $manualCheck) ([ordered]@{
+                    resourceId        = Get-RowValue $account 'id'
+                    provisioningState = Get-RowValue $account 'status'
+                    resolvedFrom      = $resolvedFrom
+                })
+        }
+        elseif (-not $t5Name) {
+            Add-TargetResult 'T5' 'Fail' 'T5''s account name isn''t known: the resource group has no deploymentId tag and no single cosmos01-* account is in Azure Resource Graph.' @{ resourceGroup = $resolved.ResourceGroup } 'Deploy it with scripts/deploy.ps1, or pass -DeploymentId.'
+        }
+        else {
+            Add-TargetResult 'T5' 'Fail' ('T5 ({0}) isn''t in Azure Resource Graph in {1}.' -f $t5Name, $resolved.ResourceGroup) @{ resourceGroup = $resolved.ResourceGroup; expectedName = $t5Name } 'Deploy it with ./scripts/deploy.ps1; a new resource can take a few minutes to appear in Resource Graph.'
         }
     }
 

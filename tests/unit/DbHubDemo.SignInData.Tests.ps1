@@ -170,6 +170,103 @@ Describe 'Get-DemoSignInDataResult' {
         $result.message | Should -Not -Match 'left armed'
         $result.remediation | Should -Match '-Clean'
     }
+
+    It 'says why the guest couldn''t be reached, with PowerShell Direct''s own error and what its recovery did (2026-11-19, dbhubfn)' {
+        # Live, the status page said only "couldn't be reached (Running)".
+        $guest = [ordered]@{ reachable = $false; pass = $false; state = 'Running'; error = 'The Hyper-V socket target process has ended. (PSSessionStateBroken)' }
+        $outcome = New-TestOutcome -Local (New-TestPart) -Guest $guest -Action 'Clean'
+        $outcome.Data | Add-Member -NotePropertyName 'guestRecovery' -NotePropertyValue ([pscustomobject]@{ action = 'Busy'; restarted = $false; recovered = $false; ranAgain = $false; message = 'Another restart of arcsql01 held the host''s recovery lock for 20 minutes, so it wasn''t restarted again.' })
+        $result = InModuleScope DbHubDemo -Parameters @{ O = $outcome } {
+            param($O)
+            Get-DemoSignInDataResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -VmName 'archost01' -GuestName 'arcsql01' -Outcome $O
+        }
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'arcsql01 \(guest\) couldn''t be reached \(Running: The Hyper-V socket target process has ended\. \(PSSessionStateBroken\)\)'
+        $result.message | Should -Match 'It didn''t run once more: Another restart of arcsql01 held the host''s recovery lock'
+        $result.evidence['arcsql01 (guest)'].error | Should -Match 'PSSessionStateBroken'
+        $result.evidence['arcsql01 (guest)'].state | Should -Be 'Running'
+        $result.evidence.guestRecovery.action | Should -Be 'Busy'
+    }
+
+    It 'fails closed, sweeping nothing, when the host''s own bootstrap pass held its lock past the bound (2026-11-19)' {
+        $busy = [ordered]@{ reachable = $false; pass = $false; state = 'Busy'; error = 'The host bootstrap held its lock (bootstrap.lock) for 1800 seconds, so nothing was swept beside its own sign-in cleanup.' }
+        $outcome = New-TestOutcome -Local $busy -Guest $busy -Action 'Clean'
+        $outcome.Data | Add-Member -NotePropertyName 'lock' -NotePropertyValue ([pscustomobject]@{ minutes = 30; seconds = 1800; timedOut = $true })
+        $result = InModuleScope DbHubDemo -Parameters @{ O = $outcome } {
+            param($O)
+            Get-DemoSignInDataResult -CheckId 'T2.ARC.ONBOARDING' -Area 't2' -Target 'T2' -VmName 'archost01' -GuestName 'arcsql01' -Outcome $O -Remediation 'Run ./scripts/deploy.ps1 again.'
+        }
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match 'wasn''t checked, so it''s treated as left \(fail closed\): archost01''s own bootstrap pass held its lock for 30 minutes'
+        $result.evidence.lockTimedOut | Should -BeTrue
+        $result.evidence.lockSeconds | Should -Be 1800
+        $result.remediation | Should -Be 'Run ./scripts/deploy.ps1 again.'
+    }
+}
+
+Describe 'Invoke-DemoSignInDataAction' {
+    BeforeEach {
+        $script:sent = $null
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $script:sent = [pscustomobject]@{ Parameter = $PesterBoundParameters['Parameter']; TimeoutSeconds = $PesterBoundParameters['TimeoutSeconds'] }
+            [pscustomobject]@{ Succeeded = $true; Output = '{"action":"Scan","succeeded":true,"pass":true}'; Error = ''; ExecutionState = 'Succeeded'; ExitCode = 0 }
+        }
+    }
+
+    It 'has a guest sweep wait for the host''s own bootstrap pass and recover the guest for the run, with the time that takes; a local one neither (2026-11-19)' {
+        InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } {
+            param($C)
+            Set-DemoRunRecoveryKey -Key 'deploy-cccccccccccc'
+            try {
+                $null = Invoke-DemoSignInDataAction -Config $C -VmName 'archost01' -Action 'Clean' -Scope 'Both'
+            }
+            finally {
+                Set-DemoRunRecoveryKey -Key ''
+            }
+        }
+        $script:sent.Parameter['ResidueLockMinutes'] | Should -Be '20'
+        $script:sent.Parameter['RecoveryKey'] | Should -Be 'deploy-cccccccccccc'
+        $script:sent.TimeoutSeconds | Should -Be 4800 -Because 'the wait comes before the sweep, its tries, and a restart of the guest'
+
+        InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { param($C) $null = Invoke-DemoSignInDataAction -Config $C -VmName 'archost01' -Action 'Clean' -Scope 'Both' -LockMinutes 30 -RecoveryKey '' }
+        $script:sent.Parameter['ResidueLockMinutes'] | Should -Be '30'
+        $script:sent.Parameter.Contains('RecoveryKey') | Should -BeFalse
+        $script:sent.TimeoutSeconds | Should -Be 5400
+
+        InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { param($C) $null = Invoke-DemoSignInDataAction -Config $C -VmName 'sqlvm01' -Action 'Scan' -Scope 'Local' }
+        $script:sent.Parameter.Contains('ResidueLockMinutes') | Should -BeFalse
+        $script:sent.Parameter.Contains('RecoveryKey') | Should -BeFalse
+        $script:sent.TimeoutSeconds | Should -Be 2400
+    }
+}
+
+Describe 'check-sign-in-data.ps1 where no one can answer its question (the final tests'' F9, 2026-11-19)' {
+    It 'stops at once with the same command and -Force, checking and changing nothing, instead of waiting on the question' {
+        # Live, a launcher's -Clean waited 7.5 minutes on its confirmation, with nothing on the screen.
+        $script = Join-Path -Path $repoRoot -ChildPath 'scripts/check-sign-in-data.ps1'
+        $configPath = Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json'
+        $outputPath = Join-Path -Path $TestDrive -ChildPath 'check-sign-in-data.jsonl'
+        $previous = $env:CI
+        # CI is one of the signs that no one can answer (Test-DemoInteractiveSession); so is redirected input.
+        $env:CI = 'true'
+        try {
+            $watch = [System.Diagnostics.Stopwatch]::StartNew()
+            $printed = & pwsh -NoProfile -File $script -ConfigPath $configPath -VmName archost01 -Clean -OutputPath $outputPath *>&1
+            $exitCode = $LASTEXITCODE
+            $watch.Stop()
+        }
+        finally {
+            $env:CI = $previous
+        }
+        $watch.Elapsed.TotalSeconds | Should -BeLessThan 60 -Because 'it never waits on the question'
+        $exitCode | Should -Be 0 -Because 'Manual action required, as init.ps1 where it can''t ask'
+        $records = @(Get-Content -LiteralPath $outputPath | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+        $records.Count | Should -Be 1 -Because 'nothing was checked: no guard, no Run Command'
+        $records[0].checkId | Should -Be 'SECURITY.SIGNIN.CONFIRM'
+        $records[0].status | Should -Be 'Manual action required'
+        $records[0].remediation | Should -Match ([regex]::Escape(('Run ./scripts/check-sign-in-data.ps1 -ConfigPath "{0}" -VmName archost01 -Clean -Force to clean without asking' -f $configPath)))
+        ($printed -join "`n") | Should -Match 'SECURITY\.SIGNIN\.CONFIRM'
+    }
 }
 
 Describe 'Find-DemoSignInData' {

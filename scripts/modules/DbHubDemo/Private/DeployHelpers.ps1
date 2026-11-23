@@ -84,6 +84,10 @@ function Get-DemoDeploymentStateTagName {
         # notebooks, the history model and report, the dashboard, and the Insights app, so a resume publishes them again
         # when this copy of the scripts has other ones (Get-DemoFabricContentReopen). Empty before 2026-11-16.
         FabricSha256      = 'DbHubFabricSha256'
+        # 2026-11-19 (ADR 0029): the NB_DatabaseHub_Control item ID that the Insights app's Manage was last deployed with,
+        # empty when the app was deployed before the notebook was in Fabric, so a resume deploys the app once more after the
+        # control's Fabric part (Get-DemoInsightsAppManageGap). Empty before 2026-11-19.
+        AppControlNotebookId = 'DbHubAppControlNotebook'
         T2Source          = 'DbHubT2Source'
         # fabric.manageCapacity (Phase 26b): the capacity start-demo.ps1 resumed, "<resource group>/<name>", and when.
         FabricCapacityResumed    = 'DbHubFabricCapacityResumed'
@@ -111,6 +115,11 @@ function Get-DemoDeploymentStateTagName {
         # zone the last replica was created with ("Standard_D4ds_v5@any"), where the next one starts while it still fits T4.
         T4Replica                = 'DbHubT4Replica'
         T4ReplicaSize            = 'DbHubT4ReplicaSize'
+        # 2026-11-19 (ADR 0027): T5's container lifecycle. Session once deploy.ps1 (or grant-safety-stop.ps1, start-demo.ps1,
+        # stop-demo.ps1) found that the session control's role can create the container, so the stop paths delete it and the
+        # start paths create it again; AlwaysOn while it can't, so nothing deletes it (a session never runs without it); empty
+        # in an environment deployed before then, where nothing deletes it either. The runbooks read it (Get-DbHubT5Lifecycle).
+        T5Container              = 'DbHubT5Container'
         # 2026-11-14: the busy marker (BusyMarkerHelpers.ps1). Until when a deploy.ps1 run, or a session, that's still going
         # keeps the nightly stop waiting (ISO 8601 UTC; empty when none), and who set it: deploy, deploy-grace (a run the
         # nightly stop waited for, which ended), or session. The safety stop's runbook reads them (Get-DbHubBusyMarker).
@@ -121,6 +130,18 @@ function Get-DemoDeploymentStateTagName {
         # workspace that one of these names, or that an environment without them might use (Get-DemoFabricWorkspaceGuard).
         FabricWorkspaceId        = 'DbHubFabricWorkspaceId'
         ControlWorkspaceId       = 'DbHubControlWorkspaceId'
+        # 2026-11-19 (review of T5): when Azure didn't create T5's account and deploy.ps1 deployed the rest without it (UTC),
+        # so a resume leaves T5 out instead of starting from preflight (Resolve-DemoT5LeftOut); a template run that creates
+        # T5 clears it.
+        T5Refused                = 'DbHubT5Refused'
+        # 2026-11-19 (review of the stop at the end of an update): when the last start-demo.ps1 began (UTC), written before it
+        # starts anything, so deploy.ps1's stop at the end of an update leaves a session that began during the run alone,
+        # also one with no auto-stop (Get-DemoUpdateStopSession).
+        StartDemoUtc             = 'DbHubStartDemoUtc'
+        # 2026-11-19 (dbhubfn): when an Arc onboarding of T2's guest began whose sign-in data sweep hasn't passed yet (UTC;
+        # empty when none is owed), written before the onboarding's Run Command, so a later run sweeps and verifies again
+        # by itself, whatever the host's state, until it passes (Invoke-DemoArcOnboarding).
+        ArcSweepUtc              = 'DbHubArcSweepUtc'
     }
 }
 
@@ -625,7 +646,8 @@ function Get-DemoT1PrincipalId {
 function Get-DemoT3State {
     <#
     .SYNOPSIS
-    Whether T3's database exists and its status (Online, Paused, ...), read with az sql db show. Internal.
+    Whether T3's database exists, its status (Online, Paused, ...), and its maximum vCores (MaxVcores, its SKU's capacity;
+    $null when not read), read with az sql db show. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -643,12 +665,57 @@ function Get-DemoT3State {
     $server = 'azuresql01-{0}' -f $id
     $database = Invoke-DemoAz -SubscriptionId ([string]$Config['subscriptionId']) -ArgumentList @('sql', 'db', 'show', '--resource-group', (Get-DemoResourceGroupName -Config $Config), '--server', $server, '--name', 'ContosoCare') -AsJson -AllowFailure
     $status = [string](Get-DemoMemberValue -InputObject $database -Name 'status')
+    $sku = Get-DemoMemberValue -InputObject $database -Name 'currentSku'
+    if ($null -eq $sku) {
+        $sku = Get-DemoMemberValue -InputObject $database -Name 'sku'
+    }
     return [pscustomobject]@{
         Exists       = ($null -ne $database)
         Status       = $status
+        MaxVcores    = (Get-DemoMemberValue -InputObject $sku -Name 'capacity')
         ServerName   = $server
         DeploymentId = $id
     }
+}
+
+function Get-DemoT3ScaleResult {
+    <#
+    .SYNOPSIS
+    DEPLOY.T3.SCALE (2026-11-18): a resumed run starts from preflight instead when T3's database has other maximum vCores
+    than the configuration's profile sets, as an existing lowest-cost T3 has after its maximum went from 1 to 2 vCores
+    (the owner's decision: Database Agents doesn't support one-vCore serverless databases). A resume past the template
+    would skip the deployment that scales it, online. Returns that Pass, or $null when the resume can go on: no
+    deploymentId to name the server by, a database that has the profile's maximum or doesn't exist, or one that couldn't
+    be read (fail safe). A read. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowNull()]
+        [object] $State
+    )
+
+    $tags = Get-DemoMemberValue -InputObject $State -Name 'Tags'
+    $deploymentId = ''
+    if ($tags -is [System.Collections.IDictionary] -and $tags.Contains('deploymentId')) {
+        $deploymentId = [string]$tags['deploymentId']
+    }
+    $sizing = (Get-DemoProfile).profiles[[string]$Config['profile']]
+    if (-not $deploymentId -or $null -eq $sizing) {
+        return $null
+    }
+    $wanted = [double]$sizing['t3']['maxVcores']
+    $current = Get-DemoT3State -Config $Config -DeploymentId $deploymentId
+    $deployed = Get-DemoMemberValue -InputObject $current -Name 'MaxVcores'
+    if (-not [bool](Get-DemoMemberValue -InputObject $current -Name 'Exists') -or $null -eq $deployed -or [double]$deployed -eq $wanted) {
+        return $null
+    }
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $message = [string]::Format($culture, 'T3''s database ContosoCare on {0} has {1} maximum vCores, and the profile {2} sets {3} (lowest-cost went from 1 to 2 on 2026-11-18, because Database Agents doesn''t support one-vCore serverless databases). Resuming would skip the template that scales it, so this run starts from preflight instead: the template scales T3 online, with a brief reconnect, and what earlier runs finished is checked again and kept.', [string]$current.ServerName, [double]$deployed, [string]$Config['profile'], $wanted)
+    return (New-DemoResult -CheckId 'DEPLOY.T3.SCALE' -Area 't3' -Target 'T3' -Status 'Pass' -Message $message -Evidence ([ordered]@{ serverName = [string]$current.ServerName; maxVcores = [double]$deployed; profile = [string]$Config['profile']; profileMaxVcores = $wanted; recordedStage = [string](Get-DemoMemberValue -InputObject $State -Name 'Stage') }) -DocUrl 'https://learn.microsoft.com/azure/azure-sql/database/single-database-scale')
 }
 
 function Get-DemoNextShutdownUtc {
@@ -730,7 +797,9 @@ function Invoke-DemoFabricStage {
     gate, and the dashboard's tile check to the validation, which passes -CheckDashboardData once telemetry
     flows, and -T3PerformanceMonitoringCheck with the T3.PROPERTY result, so the gate's extended-property part
     isn't left as a manual step. While fabric.importNotebooks is false, deploy passes -NewNotebooksOnly: notebooks
-    that aren't in the workspace yet are imported without asking, and existing ones stay as they are (Phase 26a).
+    that aren't in the workspace yet are imported without asking, and existing ones stay as they are (Phase 26a). The
+    track also passes -HistoryRunWaitMinutes and -ProgressPath (#68): a first deployment's first history run waits that
+    long while the capacity keeps it queued, and the status page's Fabric row shows the wait.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -750,7 +819,14 @@ function Invoke-DemoFabricStage {
 
         [switch] $CheckDashboardData,
 
-        [scriptblock] $T3PerformanceMonitoringCheck
+        [scriptblock] $T3PerformanceMonitoringCheck,
+
+        # The first history run's wait (configure-fabric.ps1 -HistoryRunWaitMinutes; #68), and the status page it shows on.
+        [ValidateRange(0, 120)]
+        [int] $HistoryRunWaitMinutes = 0,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
     )
 
     $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-fabric'
@@ -789,6 +865,12 @@ function Invoke-DemoFabricStage {
         }
         if ($CheckDashboardData) {
             $arguments['CheckDashboardData'] = $true
+        }
+        if ($HistoryRunWaitMinutes -ge 5) {
+            $arguments['HistoryRunWaitMinutes'] = $HistoryRunWaitMinutes
+        }
+        if ($ProgressPath) {
+            $arguments['ProgressPath'] = $ProgressPath
         }
         $null = Invoke-DemoRepositoryScript -Path (Join-Path -Path $script:RepoRoot -ChildPath 'scripts/configure-fabric.ps1') -Argument $arguments
         if (-not (Test-Path -LiteralPath $output)) {
@@ -1048,7 +1130,7 @@ function ConvertTo-DemoInsightsAppRecord {
     elseif ($marks.Contains('reportedStatus') -and -not $fix) {
         $Record | Add-Member -NotePropertyName 'remediation' -NotePropertyValue 'To add the Insights app, run ./scripts/configure-fabric-app.ps1 -SignIn.' -Force
     }
-    if (-not $own -and [string]$Record.message -notlike 'Insights app:*') {
+    if (-not $own -and [string]$Record.checkId -notlike 'ASK.*' -and [string]$Record.message -notlike 'Insights app:*') {
         $Record.message = 'Insights app: {0}' -f [string]$Record.message
     }
     return $Record
@@ -1107,6 +1189,7 @@ function Invoke-DemoInsightsAppStep {
     $records = @()
     try {
         Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State 'Running' -Message 'Creating or updating the Insights app (it doesn''t block DONE).'
+        Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State 'Running' -Message 'Setting up the app''s Copilot chat relay with the app (it doesn''t block DONE).'
         $null = Wait-DemoFabricAppSignIn -ProgressPath $ProgressPath
         $records = @(Invoke-DemoFabricAppStage -Config $Config -ConfigPath $ConfigPath -WorkspaceId (Get-DemoResolvedWorkspaceId -Result $FabricResult))
     }
@@ -1128,12 +1211,155 @@ function Invoke-DemoInsightsAppStep {
             # The console says so at once, as for any other step (Phase 28 live finding), and that the run goes on.
             Write-DemoLog -Level Warning -Message ('The Insights app step failed; it doesn''t block DONE, and the deployment goes on. {0} {1}' -f $app.Reason, $app.HowTo)
         }
+        # Ask (ADR 0028): the app's step sets up its chat relay; without any ASK.* record, it stopped before that.
+        $ask = Get-DemoAskSummary -Result $records
+        if ($null -eq $ask) {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State 'Skipped' -Status 'Not selected' -Message 'Not set up: the Insights app''s step stopped before it (the Insights app row says why). The next run sets it up.' -MaxLength 1200
+        }
+        else {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State $ask.State -Status $ask.Status -Message $ask.StepMessage -MaxLength 1200
+            if ([bool]$ask.Warning) {
+                Write-DemoLog -Level Warning -Message ('The Copilot chat in the Insights app (Ask) needs attention; it doesn''t block DONE, and the deployment goes on. {0} {1}' -f $ask.Reason, $ask.HowTo)
+            }
+        }
     }
     catch {
         if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) {
             throw
         }
         Write-DemoLog -Level Warning -Message ('The Insights app''s outcome couldn''t be shown on the status page: {0}' -f (Get-DemoExceptionText -Exception $_.Exception))
+    }
+    return $records
+}
+
+function Get-DemoInsightsAppManageRecord {
+    <#
+    .SYNOPSIS
+    What the deployment state records about the Insights app's Manage after one of deploy.ps1's app steps (2026-11-19,
+    ADR 0029): @{ AppControlNotebookId = <NB_DatabaseHub_Control's item ID in Manage's settings, or ''> } when the step
+    deployed the app (FABRIC.APP.DEPLOY Pass) and wrote Manage's settings (FABRIC.APP.ACTIONS), and an empty hashtable,
+    which records nothing, otherwise. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([hashtable])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @()
+    )
+
+    $all = @($Result | Where-Object { $null -ne $_ })
+    $deploy = @($all | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' }) | Select-Object -Last 1
+    $actions = @($all | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.ACTIONS' }) | Select-Object -Last 1
+    if ($null -eq $deploy -or [string]$deploy.status -ne 'Pass' -or $null -eq $actions) {
+        return @{}
+    }
+    $notebook = ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $actions -Name 'evidence') -Name 'controlNotebookId')).ToLowerInvariant()
+    return @{ AppControlNotebookId = $(if ($notebook -match '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$') { $notebook } else { '' }) }
+}
+
+function Get-DemoInsightsAppManageGap {
+    <#
+    .SYNOPSIS
+    Why the Insights app's step runs once more after the session control's Fabric part, or '' when it doesn't
+    (2026-11-19): the control's notebook is in Fabric now, and the app's Manage was deployed without it. Pure. Internal.
+
+    .DESCRIPTION
+    The app's step reads NB_DatabaseHub_Control's IDs when it stages the app (Resolve-DemoFabricAppItem), and the parallel
+    path puts the notebook in Fabric only after its tracks, so a first deployment's Manage had none and copied each request
+    for Run all (FABRIC.APP.ACTIONS: "missing NB_DatabaseHub_Control"; the final tests' net-new run, 2026-11-19). The step
+    runs once more when the control's Fabric part put the notebook in Fabric in this run (CONTROL.FABRIC.NOTEBOOK Pass),
+    and:
+    - this run deployed the app without the notebook in Manage's settings (Get-DemoInsightsAppManageRecord); or
+    - this run didn't run the app's step (a resume after its Fabric step), an earlier run published the app in full (the
+      state's FabricSha256), and the state records no notebook for its Manage (AppControlNotebookId, which an environment
+      deployed before 2026-11-19 doesn't have).
+    A run whose app wasn't deployed, or whose control notebook isn't in Fabric, says why in those records instead.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [AllowEmptyCollection()]
+        [object[]] $ControlResult = @(),
+
+        [AllowNull()]
+        [object] $State = $null
+    )
+
+    $placed = @($ControlResult | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'CONTROL.FABRIC.NOTEBOOK' }) | Select-Object -Last 1
+    if ($null -eq $placed -or [string]$placed.status -ne 'Pass') {
+        return ''
+    }
+    $app = @($Result | Where-Object { $null -ne $_ -and (Test-DemoInsightsAppRecord -Result $_) })
+    if (@($app | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' }).Count -gt 0) {
+        $record = Get-DemoInsightsAppManageRecord -Result $app
+        if (-not $record.Contains('AppControlNotebookId') -or $record['AppControlNotebookId']) {
+            return ''
+        }
+        return 'This run deployed the Insights app before NB_DatabaseHub_Control was in Fabric, so its Manage copies each request for Run all; the notebook is there now, so the app is deployed once more with its IDs.'
+    }
+    if (-not [string](Get-DemoMemberValue -InputObject $State -Name 'FabricSha256') -or [string](Get-DemoMemberValue -InputObject $State -Name 'AppControlNotebookId')) {
+        return ''
+    }
+    return 'No record says the Insights app''s Manage has NB_DatabaseHub_Control (an earlier run deployed the app before the notebook was in Fabric, or before 2026-11-19), so the app is deployed once more with its IDs.'
+}
+
+function Complete-DemoInsightsAppManage {
+    <#
+    .SYNOPSIS
+    The Insights app's step once more, after the session control's Fabric part, when the app's Manage was deployed without
+    NB_DatabaseHub_Control (Get-DemoInsightsAppManageGap, 2026-11-19), so a first deployment's Manage sends its actions
+    from the app. Internal.
+
+    .DESCRIPTION
+    Its records replace the earlier step's records with the same check IDs in -Results (so DONE and the status page show
+    FABRIC.APP.ACTIONS as it is now), and the state records the notebook the app's Manage now has (AppControlNotebookId).
+    Returns its records, or nothing when the step isn't needed. Never a Fail and never in DONE's way: the app's records
+    are non-blocking (ConvertTo-DemoInsightsAppRecord), and a state that can't be recorded is a log Warning only.
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = '',
+
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [System.Collections.Generic.List[object]] $Results,
+
+        [AllowEmptyCollection()]
+        [object[]] $ControlResult = @(),
+
+        [AllowNull()]
+        [object] $State = $null,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    $reason = Get-DemoInsightsAppManageGap -Result $Results.ToArray() -ControlResult $ControlResult -State $State
+    if (-not $reason) {
+        return @()
+    }
+    Write-DemoLog -Message $reason
+    $records = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $Results.ToArray() -ProgressPath $ProgressPath | Where-Object { $null -ne $_ })
+    $ids = @($records | ForEach-Object { [string]$_.checkId } | Select-Object -Unique)
+    foreach ($item in @($Results | Where-Object { $null -ne $_ -and [string]$_.checkId -in $ids -and (Test-DemoInsightsAppRecord -Result $_) })) {
+        $null = $Results.Remove($item)
+    }
+    $Results.AddRange([object[]]$records)
+    $record = Get-DemoInsightsAppManageRecord -Result $records
+    if ($record.Count -gt 0) {
+        try {
+            Set-DemoDeploymentState -Config $Config -Value $record -Confirm:$false
+        }
+        catch {
+            Write-DemoLog -Level Warning -Message ('The Insights app was deployed once more, but what its Manage has wasn''t recorded: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        }
     }
     return $records
 }

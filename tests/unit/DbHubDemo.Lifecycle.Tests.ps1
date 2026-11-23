@@ -17,12 +17,13 @@ BeforeAll {
     # The Fabric content the scripts publish (2026-11-16), the same as New-TestState records, unless a test says otherwise.
     Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricContentSha256 -MockWith { 'f' * 64 }
 
-    function New-TestConfig([switch] $WithT4) {
+    function New-TestConfig([switch] $WithT4, [switch] $WithT5) {
         $config = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
         $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
         $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
-        # T4 (Phase 24) has its own tests; the others keep their focus with T4 off.
+        # T4 (Phase 24) has its own tests; the others keep their focus with T4 off. T5 (2026-11-18, ADR 0027) too.
         $config['t4Enabled'] = [bool]$WithT4
+        $config['t5Enabled'] = [bool]$WithT5
         return $config
     }
 
@@ -35,7 +36,7 @@ BeforeAll {
         $state = [ordered]@{
             Exists = $true; Stage = ''; StageUtc = ''; BundleSha256 = ''; BundleChunkCount = 0; RunnerSha256 = ''; RunnerChunkCount = 0
             BundleSentTo = @(); RunnerSentTo = @(); NetworkMode = 'private'; T3UseFreeLimit = $false; T3AdminGroupName = 'DbHub T3 Admins'
-            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; FabricSha256 = ('f' * 64); Tags = @{ deploymentId = 'abc123' }
+            BastionExpiresUtc = ''; HostPasswordUtc = ''; T2BuildUtc = ''; FabricSha256 = ('f' * 64); AppControlNotebookId = ''; Tags = @{ deploymentId = 'abc123' }
         }
         foreach ($key in $Values.Keys) {
             $state[$key] = $Values[$key]
@@ -985,6 +986,10 @@ Describe 'Invoke-DemoDeployment' {
             $script:replicaEnd.Add([pscustomobject]@{ Before = $script:order.ToArray(); Snapshots = $script:history.Count })
             New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.END' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'replica end' -Evidence @{ outcome = 'Deleted' }
         }
+        # A run without preflight's check of the Fabric workspace that another environment records (2026-11-19) has its own
+        # tests (DbHubDemo.Preflight.Tests.ps1): here nobody else records it unless a test says so.
+        $script:fabricShared = $null
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricSharedResult -MockWith { $script:fabricShared }
     }
 
     It 'sets up the nightly safety stop after the Infrastructure stage, and not with -WhatIf (ADR 0024)' {
@@ -995,6 +1000,36 @@ Describe 'Invoke-DemoDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoSafetyStopSetup -Times 1 -Exactly
     }
 
+    It 'checks T5 in the T4 stage when t4Enabled is false too (-Sequential; review, 2026-11-19)' {
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5 -MockWith { $script:order.Add('TestT5'); New-TestResult 'T5.ACCOUNT' 'Pass' 't5' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -MockWith { $script:order.Add('WarmT5'); New-TestResult 'WORKLOAD.T5.WARMUP' 'Pass' 'workload' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4 -MockWith { $script:order.Add('TestT4'); New-TestResult 'T4.SERVER' 'Pass' 't4' 'T4' }
+        $script:state = New-TestState @{ Stage = 'T3'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+        $results = @(Invoke-DemoDeployment -Config (New-TestConfig -WithT5) -Resume -StopAfter T4)
+        $script:order | Should -Contain 'TestT5'
+        $script:order | Should -Contain 'WarmT5'
+        $script:order | Should -Not -Contain 'TestT4'
+        ($results | Where-Object { $_.checkId -eq 'T5.ACCOUNT' }).status | Should -Be 'Pass'
+        ($results | Where-Object { $_.checkId -eq 'WORKLOAD.T5.WARMUP' }).status | Should -Be 'Pass'
+    }
+
+    It 'goes on without T5 when the template left it out, and says so on the Infrastructure stage (-Sequential; review, 2026-11-19)' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5 -MockWith { $script:order.Add('TestT5'); New-TestResult 'T5.ACCOUNT' 'Pass' 't5' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -MockWith { $script:order.Add('WarmT5'); New-TestResult 'WORKLOAD.T5.WARMUP' 'Pass' 'workload' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoTemplateDeployment -MockWith {
+            $script:order.Add('Template')
+            [pscustomobject]@{ Succeeded = $true; Results = @(New-TestResult 'DEPLOY.TEMPLATE'); Outputs = @{}; Changes = @(); T3UseFreeLimit = $T3UseFreeLimit; T5Enabled = $false; T5LeftOut = 'ServiceUnavailable: high demand' }
+        }
+        $results = @(Invoke-DemoDeployment -Config (New-TestConfig -WithT5) -StopAfter T4)
+        $script:order | Should -Contain 'Template'
+        $script:order | Should -Not -Contain 'TestT5'
+        $script:order | Should -Not -Contain 'WarmT5'
+        $infrastructure = $results | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.INFRASTRUCTURE' }
+        $infrastructure.status | Should -Be 'Warning'
+        $infrastructure.message | Should -Match 'T5 is left out of this run'
+    }
+
     It 'checks T4''s size and autonomous tuning when -FromStage skips preflight, and stops before any change at a Fail (#24)' {
         $pinned = New-TestConfig -WithT4
         $pinned['t4SkuName'] = 'Standard_B1ms'
@@ -1003,6 +1038,20 @@ Describe 'Invoke-DemoDeployment' {
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.T4.TUNING' }).status | Should -Be 'Fail'
         $script:order | Should -Not -Contain 'Preflight'
         @($script:order | Where-Object { $_ -like 'Template*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'checks the Fabric workspace that another environment records when -FromStage skips preflight, and stops at a Fail before anything changes (2026-11-19)' {
+        $script:fabricShared = New-DemoResult -CheckId 'DEPLOY.FABRIC.SHARED' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The Fabric workspace "Database Hub Demo" (fabric.workspaceName) is the one rg-dbhub-demo records as its own.' -Remediation 'Give this environment its own workspace.'
+        $results = @(Invoke-DemoDeployment -Config $config -FromStage Infrastructure)
+        ($results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.SHARED' }).status | Should -Be 'Fail'
+        $script:order | Should -Not -Contain 'Preflight'
+        @($script:order | Where-Object { $_ -like 'Template*' }) | Should -BeNullOrEmpty
+        $script:order | Should -Not -Contain 'Fabric'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricSharedResult -Times 1 -Exactly -ParameterFilter { [bool]$Resolve }
+        # A run that stops before the Fabric stage, or skips it, changes nothing in Fabric, so it isn't read.
+        $null = Invoke-DemoDeployment -Config $config -FromStage Infrastructure -StopAfter T3
+        $null = Invoke-DemoDeployment -Config $config -FromStage Infrastructure -SkipFabric
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricSharedResult -Times 1 -Exactly
     }
 
     It 'starts deallocated VMs while preflight runs, and runs them before the first stage that needs them; running ones are only read (Phase 28 live finding)' {
@@ -1178,6 +1227,31 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Not -Contain 'App'
     }
 
+    It 'puts the session control''s notebook in Fabric before the Insights app''s step, so a first deployment''s Manage has its IDs, and records them (-Sequential, 2026-11-19)' {
+        # The final tests' net-new run: the app's step read NB_DatabaseHub_Control's IDs before the control's Fabric part
+        # put the notebook in Fabric, so Manage copied each request ("Manage's function is missing NB_DatabaseHub_Control").
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoControlDeployStep -MockWith { $script:order.Add(('Control:{0}' -f $Part)) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith {
+            $script:order.Add('App')
+            New-TestResult 'FABRIC.APP.DEPLOY' 'Pass' 'fabric' 'fabric'
+            New-DemoResult -CheckId 'FABRIC.APP.ACTIONS' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Manage sends its actions from the app.' -Evidence ([ordered]@{ controlNotebookId = 'ABABABAB-ABAB-ABAB-ABAB-ABABABABABAB'; nonBlocking = 'insightsApp' })
+        }
+        $script:state = New-TestState
+        $null = @(Invoke-DemoDeployment -Config $config)
+        $script:order.IndexOf('Control:Fabric') | Should -BeGreaterThan $script:order.IndexOf('PowerBI') -Because 'the workspace exists by then'
+        $script:order.IndexOf('Control:Fabric') | Should -BeLessThan $script:order.IndexOf('App')
+        @($script:recorded | Where-Object { $_.Contains('AppControlNotebookId') })[-1]['AppControlNotebookId'] | Should -Be 'abababab-abab-abab-abab-abababababab'
+    }
+
+    It 'checks T5''s container lifecycle again at the run''s end, once the session control is done, with the run''s own results (-Sequential, 2026-11-19, F14)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoControlDeployStep -MockWith { $script:order.Add(('Control:{0}' -f $Part)) }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5LifecycleRecheck -MockWith { $script:order.Add(('T5Recheck:{0}' -f $Results.GetType().Name)) }
+        $null = @(Invoke-DemoDeployment -Config $config)
+        @($script:order | Where-Object { $_ -like 'T5Recheck:*' }) | Should -Be @('T5Recheck:List`1') -Because 'it changes the run''s results in place'
+        $script:order.IndexOf('T5Recheck:List`1') | Should -BeGreaterThan $script:order.IndexOf('Control:Fabric')
+        $script:order.IndexOf('Control:Azure') | Should -BeLessThan $script:order.IndexOf('Control:Fabric')
+    }
+
     It 'reads the Rayfin CLI''s sign-in from before the guard when the Fabric stage can run, and the sign-in''s start takes that read (-Sequential, 2026-11-06)' {
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { $script:signInCalls.Add('guard'); New-TestResult 'PREFLIGHT.GUARD.CONTEXT' 'Pass' 'preflight' }
         Invoke-DemoDeployment -Config $config | Out-Null
@@ -1317,7 +1391,12 @@ Describe 'Invoke-DemoDeployment' {
             'Template+Bundle', 'Loader:sqlvm01', 'Loader:archost01', 'T1Ready', 'Group', 'T3Setup', 'EnableT3', 'TestT3',
             'Profile:T1=baseline', 'Profile:T3=baseline', 'Monitoring', 'Arc', 'Profile:T2=baseline', 'Fabric', 'PowerBI', 'App', 'Telemetry:T1,T2,T3', 'Inventory:Fail', 'RunnerStatus', 'DoneGate', 'Switch:T1,T3,T2=business-day'
         )
-        ($results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }).status | Should -Be 'Pass'
+        # The Database Agent loop's one-time selection (2026-11-18), which never keeps DONE (since 2026-11-19), is the one item a
+        # person confirms; since 2026-11-20 it says first that the beat needs it and nothing else does.
+        $summary = $results | Where-Object { $_.checkId -eq 'DEPLOY.SUMMARY' }
+        $summary.status | Should -Be 'Manual action required'
+        $summary.message | Should -Match 'Nothing else needs you for DONE\. Please confirm \(none of these keeps the run from DONE\): Required once for the Database Agent beat; everything else works without it\. Once per deployment'
+        ($results | Where-Object { $_.checkId -eq 'HUB.AGENT.T3' }).message | Should -Match 'check azuresql01-[a-z0-9]{6}/ContosoCare and Save'
         $script:state.Stage | Should -Be 'Validation'
         @($script:state.BundleSentTo | Sort-Object) | Should -Be @('archost01', 'sqlvm01')
         @($script:state.RunnerSentTo | Sort-Object) | Should -Be @('archost01', 'sqlvm01')
@@ -1360,6 +1439,30 @@ Describe 'Invoke-DemoDeployment' {
         @($script:order | Where-Object { $_ -like 'Switch:*' }) | Should -BeNullOrEmpty
         @($results | Where-Object { $_.checkId -like 'DEPLOY.INCIDENTS_*' -or $_.checkId -eq 'DEPLOY.ACTIVITYPROFILE' }) | Should -BeNullOrEmpty
         Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoTargetProfile -Times 3 -Exactly -ParameterFilter { $ProfileName -eq 'baseline' -and -not $SwitchTo }
+    }
+
+    It 'gives T2''s onboarding and T2''s profile this run''s own key for a guest restart, as the parallel path does, and a rerun its own (-Sequential; review of e617f34)' {
+        # Without one, the T2 host's hourly keys differ by caller, so the onboarding and T2's profile could each restart arcsql01.
+        $script:keys = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoArcConfiguration -MockWith {
+            $script:keys.Add('arc ' + (& (Get-Module -Name DbHubDemo) { Get-DemoRunRecoveryKey }))
+            New-TestResult 'T2.ARC.CONNECTED' 'Pass' 't2' 'T2'
+        }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoTargetProfile -MockWith {
+            if ($Target -eq 'T2') {
+                $script:keys.Add('profile ' + (& (Get-Module -Name DbHubDemo) { Get-DemoRunRecoveryKey }))
+            }
+            New-TestResult ('{0}.PROFILE_{1}' -f $CheckPrefix, $Target) 'Pass' 'workload' $Target
+        }
+        $null = @(Invoke-DemoDeployment -Config $config)
+        $script:keys.Count | Should -Be 2
+        $key = $script:keys[0].Substring(4)
+        $key | Should -Match '^deploy-[0-9a-f]{12}$'
+        $script:keys[1] | Should -Be ('profile ' + $key)
+        $script:keys.Clear()
+        $null = @(Invoke-DemoDeployment -Config $config)
+        $script:keys[0] | Should -Match '^arc deploy-[0-9a-f]{12}$'
+        $script:keys[0] | Should -Not -Be ('arc ' + $key)
     }
 
     It 'takes the history report''s snapshot last: after DONE''s checks and the switch, before DEPLOY.SUMMARY (-Sequential, 2026-11-06)' {
@@ -1804,6 +1907,84 @@ Describe 'Stop-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Deallocate:' + $VmName); New-TestResult ('STOP.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoT3 -MockWith { $script:order.Add('RemoveT3'); New-TestResult 'T3.REMOVE' 'Pass' 't3' 'T3' }
         Mock -ModuleName DbHubDemo -CommandName Clear-DemoChunkRunCommand -MockWith { @() }
+        # T3's FORCE_LAST_GOOD_PLAN (2026-11-18) has its own tests (DbHubDemo.T3Agent.Tests.ps1).
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT3State -MockWith { [pscustomobject]@{ Exists = $true; Status = 'Online'; ServerName = 'azuresql01-abc123'; DeploymentId = 'abc123' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -MockWith { [pscustomobject]@{ Ran = $true; Released = $false; RestoredState = ''; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -MockWith { $null }
+    }
+
+    It 'releases the beat''s hold through T3 before T1 deallocates, and reports FORCE_LAST_GOOD_PLAN after, only when T3''s profile went off during a session (2026-11-18 review)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -MockWith { $script:order.Add('Release'); [pscustomobject]@{ Ran = $true; Released = $true; RestoredState = 'DEFAULT'; Error = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -MockWith { $script:order.Add('AutoTuning'); New-TestResult 'STOP.T3.AUTOTUNING' 'Pass' 'infra' 'T3' }
+        $results = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
+        $script:order | Should -Be @('Bastion', 'Rotate:archost01', 'Profile:T1=off', 'Profile:T3=off', 'Profile:T2=off', 'Release', 'Guest', 'Deallocate:archost01', 'Deallocate:sqlvm01', 'AutoTuning')
+        @($results | Where-Object { $_.checkId -eq 'STOP.T3.AUTOTUNING' }).Count | Should -Be 1
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -Times 1 -Exactly -ParameterFilter { $T3.ServerName -eq 'azuresql01-abc123' -and $DeploymentId -eq 'abc123' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'STOP.T3.AUTOTUNING' -and $Release.Released -and $T3.ServerName -eq 'azuresql01-abc123' }
+        # sqlvm01 deallocated already: no session ran, so T3 isn't touched (it would wake a paused T3); -ParkT2 leaves T3 alone.
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/running' }
+        Stop-DemoEnvironment -Config $config -Confirm:$false | Out-Null
+        $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
+        Stop-DemoEnvironment -Config $config -ParkT2 -Confirm:$false | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -Times 1 -Exactly
+    }
+
+    It 'the stop at the end of an update (-UpdateEnd) stops nothing for a session that uses the demo, and ends before T2''s guest and the VMs for one that started meanwhile (the review of 2026-11-19, finding 1)' {
+        Mock -ModuleName DbHubDemo -CommandName Clear-DemoActivityControlAutoStop -MockWith { $script:order.Add('AutoStopClear'); New-TestResult 'STOP.CONTROL.AUTOSTOP' 'Pass' 'workload' }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoBusyNightlyStop -MockWith { $script:order.Add('Nightly') }
+        $script:sessions = [System.Collections.Generic.Queue[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUpdateStopSession -MockWith { $script:order.Add('Session'); $script:sessions.Dequeue() }
+        $free = [pscustomobject]@{ Held = $false; By = ''; UntilUtc = $null; Detail = ''; Ignored = $null; Error = '' }
+        $startDemo = [pscustomobject]@{ Held = $true; By = 'StartDemo'; UntilUtc = $null; Detail = ''; Ignored = $null; Error = '' }
+        $since = [datetime]::new(2026, 11, 19, 19, 15, 0, [System.DateTimeKind]::Utc)
+
+        # Before its first change: nothing is stopped.
+        $script:sessions.Enqueue($startDemo)
+        $results = @(Stop-DemoEnvironment -Config $config -UpdateEnd -RunStartedUtc $since -Confirm:$false)
+        $guard = @($results | Where-Object { $_.checkId -eq 'STOP.SESSION' })
+        $guard.Count | Should -Be 1
+        $guard[0].status | Should -Be 'Not selected'
+        $guard[0].message | Should -Be 'A start-demo.ps1 session started while this update ran, so the run leaves the demo running for it: ./scripts/stop-demo.ps1 stops it when the session ends, or the nightly stop does. Nothing was stopped.'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoUpdateStopSession -Times 1 -Exactly -ParameterFilter { $SinceUtc -eq $since }
+        $script:order | Should -Be @('Session') -Because 'a held stop changes nothing, Bastion and the host password included (the re-review of 2026-11-19)'
+        @($results | ForEach-Object { $_.checkId }) | Should -Be @('PREFLIGHT.GUARD.CONTEXT', 'STOP.SESSION')
+
+        # Before T2's guest and the VMs: they keep running, but the activity is off already.
+        $script:order.Clear()
+        $script:sessions.Enqueue($free)
+        $script:sessions.Enqueue($startDemo)
+        $results = @(Stop-DemoEnvironment -Config $config -UpdateEnd -RunStartedUtc $since -Confirm:$false)
+        $guard = @($results | Where-Object { $_.checkId -eq 'STOP.SESSION' })
+        $guard[0].status | Should -Be 'Warning'
+        $guard[0].message | Should -Match 'The stop at the end of this update ended there, before T2''s guest and the VMs, which keep running, but it had turned the demo''s activity off already\.$'
+        $guard[0].remediation | Should -Match '^For the session, run \./scripts/stop-demo\.ps1, then start it again \(Run all in NB_DatabaseHub_Control, or \./scripts/start-demo\.ps1\)'
+        $script:order | Should -Contain 'Profile:T1=off'
+        @($script:order | Where-Object { $_ -like 'Deallocate:*' -or $_ -in 'Guest', 'Nightly' }).Count | Should -Be 0
+
+        # stop-demo.ps1 doesn't ask: it stops now.
+        $script:order.Clear()
+        $null = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoUpdateStopSession -Times 3 -Exactly
+        $script:order | Should -Contain 'Deallocate:sqlvm01'
+    }
+
+    It 'the stop at the end of an update settles the nightly stop last, and only once everything is stopped, so a stop cut short or one that failed leaves tonight''s stop in place (the review of 2026-11-19, findings 2 and 4)' {
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoBusyNightlyStop -MockWith { $script:order.Add('Nightly') }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUpdateStopSession -MockWith { [pscustomobject]@{ Held = $false; By = ''; UntilUtc = $null; Detail = ''; Ignored = $null; Error = '' } }
+        $null = @(Stop-DemoEnvironment -Config $config -UpdateEnd -Confirm:$false)
+        $script:order[-1] | Should -Be 'Nightly'
+        $script:order.IndexOf('Nightly') | Should -BeGreaterThan $script:order.IndexOf('Deallocate:sqlvm01')
+        # stop-demo.ps1 settles it first, as before.
+        $script:order.Clear()
+        $null = @(Stop-DemoEnvironment -Config $config -Confirm:$false)
+        $script:order.IndexOf('Nightly') | Should -BeLessThan $script:order.IndexOf('Deallocate:archost01')
+        # A VM that wasn't deallocated keeps tonight's stop, which stops it.
+        $script:order.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Deallocate:' + $VmName); New-TestResult ('STOP.VM_{0}' -f $VmName.ToUpperInvariant()) $(if ($VmName -eq 'archost01') { 'Warning' } else { 'Pass' }) 'infra' 'T1' }
+        $null = @(Stop-DemoEnvironment -Config $config -UpdateEnd -Confirm:$false)
+        $script:order | Should -Contain 'Deallocate:archost01'
+        $script:order | Should -Not -Contain 'Nightly'
     }
 
     It 'sends the deletes of a running VM''s chunk Run Commands right before its deallocate, which completes them (R871)' {
@@ -1963,6 +2144,8 @@ Describe 'Start-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' 'Pass' 'preflight' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { $script:state }
+        # The start's own record (DbHubStartDemoUtc, 2026-11-19) has its own test below.
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoStartCost -MockWith { $script:order.Add('Cost'); New-TestResult 'START.COST.ACTUAL' $script:costStatus 'preflight' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -MockWith { $script:order.Add('Start:' + $VmName); New-TestResult ('START.VM_{0}' -f $VmName.ToUpperInvariant()) 'Pass' 'infra' 'T1' }
         Mock -ModuleName DbHubDemo -CommandName Request-DemoVmStart -MockWith { $script:order.Add('Request:' + $VmName); $true }
@@ -2015,18 +2198,21 @@ Describe 'Start-DemoEnvironment' {
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoControlRunCommand -MockWith { $script:cleanupAt = $script:order.Count; $script:cleanup }
         $script:autoStopThrows = $false
         $script:stopJobWaited = $false
-        Mock -ModuleName DbHubDemo -CommandName Clear-DemoActivityControlAutoStop -MockWith {
-            $script:order.Add('AutoStop:' + $Purpose)
+        # start-demo.ps1's auto-stop (2026-11-19) has its own tests in DbHubDemo.ActivityControl.Tests.ps1; here it records
+        # when it ran, and with what.
+        Mock -ModuleName DbHubDemo -CommandName Register-DemoActivityControlAutoStop -MockWith {
+            $script:order.Add('AutoStop:Start')
             if ($script:autoStopThrows) {
                 throw 'ERROR: (AuthorizationFailed) The client has no access to read the schedule.'
             }
             if ($script:stopJobWaited) {
-                New-TestResult 'START.CONTROL.AUTOSTOP' 'Not selected' 'workload'
                 New-TestResult 'START.CONTROL.STOPJOB' 'Pass' 'workload'
+                New-TestResult 'START.CONTROL.AUTOSTOP' 'Pass' 'workload'
                 return
             }
             New-TestResult 'START.CONTROL.AUTOSTOP' 'Warning' 'workload'
         }
+        Mock -ModuleName DbHubDemo -CommandName Clear-DemoActivityControlAutoStop -MockWith { $script:order.Add('AutoStopClear:' + $Purpose) }
         function New-ControlTestConfig {
             $controlConfig = New-TestConfig
             $controlConfig['control']['enabled'] = $true
@@ -2047,8 +2233,45 @@ Describe 'Start-DemoEnvironment' {
         }
         ($results | Where-Object { $_.checkId -eq 'START.INCIDENTS_T2' }).message | Should -Match ':05 \(cpu-pressure, 8 minutes\), :20 \(missing-index, 8 minutes\), :35 \(io-pressure, 8 minutes\), and :50 \(inefficient-query, 6 minutes\) past each UTC hour'
         ($results | Where-Object { $_.checkId -eq 'START.PROFILE_T1' }).message | Should -Match 'business-day'
-        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoStartCost -Times 1 -Exactly -ParameterFilter { $ActivityProfile -eq 'business-day' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoStartCost -Times 1 -Exactly -ParameterFilter { $ActivityProfile -eq 'business-day' -and $BastionHours -eq -1 }
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like 'Activity: business-day:*set activityProfile to baseline for a quiet demo*' } -Times 1 -Exactly
+    }
+
+    It 'creates T5''s container while the VMs boot, before T5''s profile, and leaves T5''s activity off when it can''t (2026-11-19)' {
+        $withT5 = New-TestConfig -WithT5
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ Enabled = $true; AccountName = 'cosmos01-abc123'; ContainerName = 'patient-events' }; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = $null; Error = '' } }
+        $script:containerStatus = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName New-DemoT5Container -MockWith { $script:order.Add('T5Container'); New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $script:containerStatus -Message 'T5''s container wasn''t there, so it was created.' }
+        $results = @(Start-DemoEnvironment -Config $withT5 -Confirm:$false)
+        ($results | Where-Object { $_.checkId -eq 'START.T5.CONTAINER' }).status | Should -Be 'Pass'
+        $script:order.IndexOf('T5Container') | Should -BeGreaterThan $script:order.IndexOf('Request:archost01') -Because 'it runs while the VMs boot'
+        $script:order.IndexOf('T5Container') | Should -BeLessThan $script:order.IndexOf('Profile:T5=baseline')
+        $script:order.Clear()
+        $script:containerStatus = 'Fail'
+        $results = @(Start-DemoEnvironment -Config $withT5 -Confirm:$false)
+        ($results | Where-Object { $_.checkId -eq 'START.T5.CONTAINER' }).status | Should -Be 'Fail'
+        $script:order | Should -Not -Contain 'Profile:T5=baseline'
+        ($results | Where-Object { $_.checkId -eq 'START.PROFILE_T5' }).message | Should -Match 'START\.T5\.CONTAINER'
+    }
+
+    It 'records when it began on the resource group before it starts anything (DbHubStartDemoUtc), and again once it asked for the VMs'' starts, so deploy.ps1''s stop at the end of an update leaves its session alone, and a failed write never stops the start (the review of 2026-11-19, finding 1, and its re-review)' {
+        $script:written = [System.Collections.Generic.List[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith {
+            if ($Value.Contains('StartDemoUtc')) { $script:written.Add([pscustomobject]@{ Value = [string]$Value['StartDemoUtc']; At = $script:order.Count }) }
+        }
+        $null = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        $script:written.Count | Should -Be 2
+        $script:written[0].Value | Should -Match '^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$'
+        $script:written[0].At | Should -Be $script:order.IndexOf('AutoStop:Start') -Because 'it''s written before the auto-stop and the VMs'' start'
+        $script:written[0].At | Should -BeLessThan $script:order.IndexOf('Request:sqlvm01')
+        # A deploy.ps1 that began while this start was on its control calls found the VMs stopped: the later time tells its
+        # stop at the end that this session began during it.
+        $script:written[1].At | Should -Be ($script:order.IndexOf('Request:archost01') + 1) -Because 'it''s written right after both starts are asked for'
+        [string]::CompareOrdinal($script:written[1].Value, $script:written[0].Value) | Should -BeGreaterOrEqual 0
+        $script:order.Clear()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { throw 'The tag write was refused.' }
+        $null = @(Start-DemoEnvironment -Config $config -Confirm:$false)
+        $script:order | Should -Contain 'Start:sqlvm01'
     }
 
     It 'clears an earlier run''s record that left T4 out, which no longer holds, and keeps any other record (2026-11-09)' {
@@ -2228,33 +2451,44 @@ Describe 'Start-DemoEnvironment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmPowerAction -Times 1 -Exactly -ParameterFilter { $VmName -eq 'archost01' -and -not $StartRequested }
     }
 
-    It 'cancels a pending on-demand auto-stop before the VMs start, with the control on (ADR 0020)' {
+    It 'schedules the session''s auto-stop before the VMs start, 4 hours by default, with the control on (2026-11-19)' {
         $results = Start-DemoEnvironment -Config (New-ControlTestConfig) -Confirm:$false
         @($script:order | Select-Object -First 3) | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01')
         ($results | Where-Object { $_.checkId -eq 'START.CONTROL.AUTOSTOP' }).status | Should -Be 'Warning'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Register-DemoActivityControlAutoStop -Times 1 -Exactly -ParameterFilter { $Hours -eq 4 -and $WarmUpMinutes -eq 0 }
+        # The start no longer cancels a pending auto-stop: the new one replaces it (the newer session's plan wins).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Clear-DemoActivityControlAutoStop -Times 0 -Exactly
+    }
+
+    It 'counts -AutoStopHours from the warm-up''s end when it waits for it, and from the start otherwise (2026-11-19)' {
+        $null = Start-DemoEnvironment -Config (New-ControlTestConfig) -AutoStopHours 2.5 -WarmUpMinutes 30 -Confirm:$false
+        Should -Invoke -ModuleName DbHubDemo -CommandName Register-DemoActivityControlAutoStop -Times 1 -Exactly -ParameterFilter { $Hours -eq 2.5 -and $WarmUpMinutes -eq 0 }
+        $null = Start-DemoEnvironment -Config (New-ControlTestConfig) -AutoStopHours 2.5 -WarmUpMinutes 30 -WaitForWarmUp -Confirm:$false
+        Should -Invoke -ModuleName DbHubDemo -CommandName Register-DemoActivityControlAutoStop -Times 1 -Exactly -ParameterFilter { $Hours -eq 2.5 -and $WarmUpMinutes -eq 30 }
     }
 
     It 'keeps both results when it waited for an on-demand stop job before the VMs start' {
         $script:stopJobWaited = $true
         $results = Start-DemoEnvironment -Config (New-ControlTestConfig) -Confirm:$false
-        ($results | Where-Object { $_.checkId -eq 'START.CONTROL.AUTOSTOP' }).status | Should -Be 'Not selected'
+        ($results | Where-Object { $_.checkId -eq 'START.CONTROL.AUTOSTOP' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'START.CONTROL.STOPJOB' }).status | Should -Be 'Pass'
         @($script:order | Select-Object -First 3) | Should -Be @('Cost', 'AutoStop:Start', 'Request:sqlvm01')
     }
 
-    It 'carries on with a Warning when a pending auto-stop can''t be checked' {
+    It 'carries on with a Warning when the auto-stop can''t be scheduled, and says the nightly stop is the limit' {
         $script:autoStopThrows = $true
         $results = Start-DemoEnvironment -Config (New-ControlTestConfig) -Confirm:$false
         $warning = $results | Where-Object { $_.checkId -eq 'START.CONTROL.AUTOSTOP' }
         $warning.status | Should -Be 'Warning'
-        $warning.message | Should -Match 'AuthorizationFailed.*the start carried on'
-        $warning.remediation | Should -Match 'delete the schedule dbhub-autostop'
+        $warning.message | Should -Match 'AuthorizationFailed.*the nightly stop.*the start carried on'
+        $warning.remediation | Should -Match 'Run start-demo\.ps1 again to schedule it'
         $script:order | Should -Contain 'Start:sqlvm01'
         $script:order | Should -Contain 'Profile:T2=baseline'
     }
 
     It 'leaves the auto-stop alone with -WhatIf; the control is part of every deployment since 2026-11-14 (ADR 0026)' {
         Start-DemoEnvironment -Config (New-ControlTestConfig) -WhatIf | Out-Null
+        Should -Invoke -ModuleName DbHubDemo -CommandName Register-DemoActivityControlAutoStop -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Clear-DemoActivityControlAutoStop -Times 0 -Exactly
     }
 
@@ -2360,6 +2594,8 @@ Describe 'Start-DemoEnvironment' {
     It 'deploys Bastion with -Interactive and leaves the password to start-demo.ps1' {
         $script:state.HostPasswordUtc = '2026-10-19T15:00:00Z'
         Start-DemoEnvironment -Config $config -Interactive -SkipT3 -Confirm:$false | Out-Null
+        # Its cost guardrail counts the Bastion it deploys, for at most bastionMaxHours (2026-11-19); a default start, none.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoStartCost -Times 1 -Exactly -ParameterFilter { $BastionHours -eq [System.Math]::Min([double]$config['bastionMaxHours'], 5) }
         $script:order | Should -Not -Contain 'Rotate'
         $script:order | Should -Not -Contain 'WarmT3'
         $script:order[-1] | Should -Be 'Bastion'
@@ -3058,8 +3294,9 @@ Describe 'Remove-DemoEnvironment' {
         # T4's read replica (ADR 0025) goes before the group, named from the manifest's deploymentId.
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -MockWith { $script:order.Add('Replica'); $null }
         $results = Remove-DemoEnvironment -Config $config -Confirm:$false
-        # The session control, the Fabric workspaces, and the security group go first (2026-11-17).
-        $script:order | Should -Be @('Extra', 'Instance', 'Machine', 'Replica', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
+        # The session control, the Fabric workspaces, and the security group go first (2026-11-17), after the read of whether
+        # the golden group exists, for the list of what goes and what stays (2026-11-19).
+        $script:order | Should -Be @('az group exists', 'Extra', 'Instance', 'Machine', 'Replica', 'az group delete', 'az deployment sub', 'az deployment sub', 'az rest --method', 'az rest --method', 'Residue') -Because 'JumpstartImage, the default since 2026-11-05, has no golden guard, so destroy reads no host first'
         Should -Invoke -ModuleName DbHubDemo -CommandName Remove-DemoT4Replica -Times 1 -Exactly -ParameterFilter { $CheckPrefix -eq 'DESTROY' -and $DeploymentId -eq 'abc123' -and $Quiet }
         ($results | Where-Object { $_.checkId -eq 'DESTROY.RESOURCEGROUP' }).status | Should -Be 'Pass'
         ($results | Where-Object { $_.checkId -eq 'DESTROY.ARC.SQLINSTANCES' }).area | Should -Be 'teardown'
@@ -3141,6 +3378,39 @@ Describe 'Invoke-DemoControl' {
     It 'leaves out the scenario''s defaults and the end time for off' {
         Invoke-DemoControl -Config $config -Target T3 -Scenario off -Confirm:$false | Out-Null
         $script:calls[0].Arguments | Should -Be 'profile set --name off --requested-by demo-control'
+    }
+
+    It 'sends T5 its activity on sqlvm01 with all when T5 is on, an ru-storm on T5, and nothing to T5 when it''s off (2026-11-18, ADR 0027)' {
+        $script:containerStatus = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName New-DemoT5Container -MockWith { New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $script:containerStatus -Message 'T5''s container is there.' -Evidence @{ action = 'none' } }
+        $withT5 = New-TestConfig -WithT5
+        $null = Invoke-DemoControl -Config $withT5 -Target all -Scenario baseline -DurationMinutes 30 -Confirm:$false
+        $script:calls.Target | Should -Be @('T1', 'T2', 'T3', 'T5')
+        $script:calls.Clear()
+        $results = Invoke-DemoControl -Config $withT5 -Target all -Scenario 'incident:ru-storm' -DurationMinutes 10 -Confirm:$false
+        $script:calls.Target | Should -Be @('T5') -Because 'an incident on all runs on its default target, and ru-storm''s is T5'
+        $script:calls[0].Arguments | Should -Match '^profile set --name incident:ru-storm --duration 10m '
+        ($results | Where-Object { $_.checkId -eq 'CONTROL.T5' }).status | Should -Be 'Pass'
+        $script:calls.Clear()
+        $results = Invoke-DemoControl -Config $config -Target T5 -Scenario baseline -Confirm:$false
+        $script:calls.Count | Should -Be 0
+        ($results | Where-Object { $_.checkId -eq 'CONTROL.T5' }).status | Should -Be 'Not selected'
+        ($results | Where-Object { $_.checkId -eq 'CONTROL.T5' }).message | Should -Match 't5Enabled is false'
+    }
+
+    It 'makes sure T5''s container exists before an activity on T5, and sends T5 nothing when it can''t be created (2026-11-19)' {
+        $script:containerStatus = 'Fail'
+        Mock -ModuleName DbHubDemo -CommandName New-DemoT5Container -MockWith { New-DemoResult -CheckId $CheckId -Area 't5' -Target 'T5' -Status $script:containerStatus -Message 'T5''s container couldn''t be created.' -Evidence @{ action = 'create' } }
+        $withT5 = New-TestConfig -WithT5
+        $results = Invoke-DemoControl -Config $withT5 -Target all -Scenario baseline -DurationMinutes 30 -Confirm:$false
+        $script:calls.Target | Should -Be @('T1', 'T2', 'T3')
+        ($results | Where-Object { $_.checkId -eq 'CONTROL.T5.CONTAINER' }).status | Should -Be 'Fail'
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoT5Container -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'CONTROL.T5.CONTAINER' }
+        # Turning T5's activity off needs no container.
+        $script:calls.Clear()
+        $null = Invoke-DemoControl -Config $withT5 -Target T5 -Scenario off -Confirm:$false
+        $script:calls.Target | Should -Be @('T5')
+        Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoT5Container -Times 1 -Exactly
     }
 
     It 'runs an incident on all on the scenario''s default target' {
@@ -3736,6 +4006,26 @@ Describe 'Request-DemoStoppedStart and Wait-DemoStoppedStart: deploy.ps1 starts 
         ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).message | Should -Match 'T4 is Ready'
     }
 
+    It 'records what the run found, for the stop at its end: the VMs that ran, and each stopped one''s state with T4''s (2026-11-19)' {
+        $withT4 = New-TestConfig -WithT4
+        $script:power = @{ sqlvm01 = 'PowerState/deallocated'; archost01 = 'PowerState/running' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT4PowerAction -MockWith {
+            $after = if ([int]$PesterBoundParameters['WaitMinutes'] -gt 0) { 'Ready' } else { 'Starting' }
+            New-DemoResult -CheckId 'DEPLOY.T4.START' -Area 'infra' -Target 'T4' -Status 'Pass' -Message ('T4 is {0}.' -f $after) -Evidence ([ordered]@{ stateBefore = 'Stopped'; stateAfter = $after })
+        }
+        $request = InModuleScope DbHubDemo -Parameters @{ Config = $withT4 } { Request-DemoStoppedStart -Config $Config -Confirm:$false }
+        $results = @(InModuleScope DbHubDemo -Parameters @{ Config = $withT4; Request = $request } { Wait-DemoStoppedStart -Config $Config -Request $Request })
+        $evidence = ($results | Where-Object { $_.checkId -eq 'DEPLOY.VMSTART' }).evidence
+        @($evidence['running']) | Should -Be @('archost01')
+        $evidence['before']['sqlvm01'] | Should -Be 'deallocated'
+        $evidence['before']['T4'] | Should -Be 'Stopped'
+        $evidence['before'].Contains('archost01') | Should -BeFalse -Because 'a VM that ran wasn''t started'
+        # So the run's end leaves the demo running: archost01 ran when the run began, so a session may use it.
+        $plan = InModuleScope DbHubDemo -Parameters @{ Result = $results } { Get-DemoUpdateStopPlan -Result $Result -OutcomeKind 'Done' }
+        $plan.Reason | Should -Be 'WasRunning'
+        $plan.Text | Should -Match '^archost01 was running when this run began'
+    }
+
     It 'says in plain words which VMs start because they were stopped, and that nothing is needed from the person (Phase 28 live run)' {
         # Live, 2026-10-30: "Starting the VMs that were stopped: no action needed (sqlvm01 (deallocated), archost01
         # (deallocated))" read as if nothing were needed for those VMs.
@@ -4029,6 +4319,38 @@ Describe 'Test-DemoStartCost' {
         $script:actual = $null
         $results = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
         ($results | Where-Object { $_.checkId -eq 'START.COST.ACTUAL' }).status | Should -Be 'Warning'
+    }
+
+    It 'counts Bastion''s hours only when it''s given them, as start-demo.ps1 -Interactive does (2026-11-19)' {
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null -BastionHours 4 } $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $BastionHours -eq 4 }
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { -not $PesterBoundParameters.ContainsKey('BastionHours') }
+    }
+
+    It 'lets a Contributor''s environment start with a Warning when only T5''s container priced all month, since nothing automatic deletes it, is over the ceiling (the re-review of 0590bbe)' {
+        # After the update: T5's container exists only during a session (its tag), the session control holds no role, and the
+        # nightly safety stop can't delete it, so only stop-demo.ps1 does. The estimate stands in for Get-DemoCostEstimate,
+        # whose Warning DbHubDemo.Cost.Tests.ps1 tests: over the ceiling, and a Fail unless it's told so.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; T5Container = 'Session'; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'NoRole'; Why = 'id-dbhub-demo-control holds no role at rg-dbhub-demo yet'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $false; HoldsOther = $false } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -MockWith { $false }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith {
+            $monthly = if ($PesterBoundParameters.ContainsKey('T5ManualDeleteOnly') -and [bool]$PesterBoundParameters['T5ManualDeleteOnly']) { 'Warning' } else { 'Fail' }
+            [pscustomobject]@{ SessionCost = 12.5; Results = @((New-TestResult 'PREFLIGHT.COST.SESSION' 'Pass' 'preflight'), (New-TestResult 'PREFLIGHT.COST.MONTHLY' $monthly 'preflight')) }
+        }
+        $results = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'AlwaysOn' -and $T5ManualDeleteOnly }
+        ($results | Where-Object { $_.checkId -eq 'PREFLIGHT.COST.MONTHLY' }).status | Should -Be 'Warning'
+        @($results | Where-Object { $_.status -eq 'Fail' }) | Should -BeNullOrEmpty -Because 'start-demo.ps1 stops only on a Fail'
+        # A nightly safety stop that deletes the container: priced for the running hours, with nothing to excuse.
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5SafetyStopDelete -MockWith { $true }
+        $null = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter { $T5ContainerLifecycle -ceq 'Session' -and -not $T5ManualDeleteOnly }
+        # A session-control role without the container's actions: all month for real, so the ceiling still fails.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5ControlRoleState -MockWith { [pscustomobject]@{ Mode = 'Lacking'; Why = 'its role doesn''t have the container''s actions'; RoleName = 'DbHub Demo Activity Operator'; RoleExists = $true; Lacking = @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'); IdentityExists = $true; HoldsRole = $true; HoldsOther = $false } }
+        $lacking = & (Get-Module -Name DbHubDemo) { param($c) Test-DemoStartCost -Config $c -NetworkMode public -T3UseFreeLimit $null } $config
+        ($lacking | Where-Object { $_.checkId -eq 'PREFLIGHT.COST.MONTHLY' }).status | Should -Be 'Fail'
     }
 }
 

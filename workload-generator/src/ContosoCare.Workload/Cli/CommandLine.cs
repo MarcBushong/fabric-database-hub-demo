@@ -3,6 +3,7 @@ using System.Globalization;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 using ContosoCare.Workload.Catalog;
+using ContosoCare.Workload.Cosmos;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Postgres;
 using ContosoCare.Workload.Profiles;
@@ -35,7 +36,7 @@ internal static partial class CommandLine
 
     public static RootCommand Build()
     {
-        var root = new RootCommand("Contoso Care Operations workload runner for the Fabric Database Hub hybrid SQL demo (ADR 0010). Every session it opens is tagged ContosoCare.Demo/<scenario>/<run> and works only in the ContosoCare database.");
+        var root = new RootCommand("Contoso Care Operations workload runner for the Fabric Database Hub hybrid demo (ADR 0010). Every session it opens, and every request it sends to T5, is tagged ContosoCare.Demo/<scenario>/<run>, and it works only in the ContosoCare database (contosocare on T4 and T5).");
         root.Options.Add(GlobalOptions.LogFormat);
         root.Options.Add(GlobalOptions.LogFile);
         root.Options.Add(GlobalOptions.Verbose);
@@ -144,10 +145,20 @@ internal static partial class CommandLine
                 var definition = ScenarioCatalog.Default.Get(parseResult.GetRequiredValue(scenario));
                 var request = run.ToRequest(parseResult, definition.Id, endpointTarget);
                 var plan = RunBounds.Plan(definition, request, DateTimeOffset.UtcNow);
-                IScenarioExecutor runner = endpointTarget == DemoTarget.T4
-                    ? target.PostgresRunner(parseResult, log)
-                    : new ScenarioRunner(new SqlConnectionOpener(target.Resolve(parseResult), log), log, TimeProvider.System);
-                var result = await runner.RunAsync(plan, cancellationToken).ConfigureAwait(false);
+                RunResult result;
+                if (endpointTarget == DemoTarget.T5)
+                {
+                    using var client = CosmosClient(target.ResolveCosmos(parseResult));
+                    result = await new CosmosScenarioRunner(client, target.RunStore(parseResult), log, TimeProvider.System).RunAsync(plan, cancellationToken).ConfigureAwait(false);
+                }
+                else
+                {
+                    IScenarioExecutor runner = endpointTarget == DemoTarget.T4
+                        ? target.PostgresRunner(parseResult, log)
+                        : new ScenarioRunner(new SqlConnectionOpener(target.Resolve(parseResult), log), log, TimeProvider.System);
+                    result = await runner.RunAsync(plan, cancellationToken).ConfigureAwait(false);
+                }
+
                 WriteRunResult(parseResult, result, parseResult.GetValue(json));
                 return result.Result == "Fail" ? ExitCodes.Failure : ExitCodes.Success;
             }).ConfigureAwait(false);
@@ -195,7 +206,11 @@ internal static partial class CommandLine
                 var scenarioId = parseResult.GetValue(scenario);
                 if (scenarioId is not null)
                 {
-                    ScenarioCatalog.Default.Get(scenarioId);
+                    var definition = ScenarioCatalog.Default.Get(scenarioId);
+                    if (targetValue == DemoTarget.T5 && !definition.AppliesTo(DemoTarget.T5))
+                    {
+                        throw new ScenarioRequestException($"Scenario '{scenarioId}' doesn't run on T5; T5 runs {string.Join(" and ", CosmosScenarioRunner.Scenarios.Order(StringComparer.Ordinal))}.");
+                    }
                 }
 
                 var id = parseResult.GetValue(runId);
@@ -219,14 +234,19 @@ internal static partial class CommandLine
 
                     profileOff = true;
                 }
-                else if (scope == "all" && targetValue is DemoTarget.T3 or DemoTarget.T4)
+                else if (scope == "all" && targetValue is DemoTarget.T3 or DemoTarget.T4 or DemoTarget.T5)
                 {
                     await new FileProfileStore(parseResult.GetValue(profileFile) ?? FileProfileStore.DefaultPathFor(targetValue)).SetAsync("off", who, null, null, null, cancellationToken).ConfigureAwait(false);
                 }
 
                 int cancelled;
                 CheckRecord? replicaCheck = null;
-                if (targetValue == DemoTarget.T4)
+                if (targetValue == DemoTarget.T5)
+                {
+                    // T5's runs are in the run store on this machine; their runners read it every 2 seconds.
+                    cancelled = await target.RunStore(parseResult).StopAsync(scope, id, scenarioId, who, cancellationToken).ConfigureAwait(false);
+                }
+                else if (targetValue == DemoTarget.T4)
                 {
                     var endpoint = target.ResolvePostgres(parseResult);
                     var replica = target.ResolvePostgresReplica(parseResult, endpoint);
@@ -249,7 +269,7 @@ internal static partial class CommandLine
                 }
 
                 log.Info("stop.requested", "Stop requested.", ("target", targetValue), ("scope", scope), ("runsCancelled", cancelled));
-                var check = new CheckRecord("stop", "Pass", string.Create(CultureInfo.InvariantCulture, $"Stop requested ({scope}); {cancelled} Running run(s) marked Cancelled. Their sessions end within a few seconds.{(scope == "all" ? " The activity profile is off." : string.Empty)}"));
+                var check = new CheckRecord("stop", "Pass", string.Create(CultureInfo.InvariantCulture, $"Stop requested ({scope}); {cancelled} Running run(s) marked Cancelled. Their {(targetValue == DemoTarget.T5 ? "writers stop" : "sessions end")} within a few seconds.{(scope == "all" ? " The activity profile is off." : string.Empty)}"));
                 WriteChecks(parseResult, targetValue, "stop", replicaCheck is null ? [check] : [check, replicaCheck], parseResult.GetValue(json));
                 return ExitCodes.Success;
             }).ConfigureAwait(false);
@@ -259,9 +279,9 @@ internal static partial class CommandLine
 
     private static Command ResetCommand()
     {
-        var command = new Command("reset", "Return a target to a known, quiet state: stop everything, wait, kill leftover ContosoCare.Demo/ sessions, verify no demo transaction is open, and empty the scratch tables.");
+        var command = new Command("reset", "Return a target to a known, quiet state: stop everything, wait, kill leftover ContosoCare.Demo/ sessions, verify no demo transaction is open, and empty the scratch tables. On T5: stop every run in T5's run store, wait for their writers, verify no run is Running, and delete any ru-storm document left over.");
         var target = new TargetOptions(command);
-        var wait = new Option<int>("--wait-seconds") { Description = "How long to wait for sessions to end before killing them (0 to 300).", DefaultValueFactory = _ => 30 };
+        var wait = new Option<int>("--wait-seconds") { Description = "How long to wait for sessions to end before killing them (0 to 300); on T5, for runs to end.", DefaultValueFactory = _ => 30 };
         var noKill = new Option<bool>("--no-kill") { Description = "Don't kill leftover demo sessions; only report them." };
         var keepProfile = new Option<bool>("--keep-profile") { Description = "Keep the activity profile (by default reset sets it to off)." };
         var undo = new Option<bool>("--undo-remediation") { Description = "Drop the missing-index remediation indexes, so that scenario starts again from 'before'. Needs an administrator." };
@@ -281,6 +301,9 @@ internal static partial class CommandLine
             return await Guard(parseResult, log, async () =>
             {
                 var targetValue = target.TargetOf(parseResult);
+
+                // T5's reset deletes leftover storm documents, so it needs the account; ask for it before anything changes.
+                var cosmosEndpoint = targetValue == DemoTarget.T5 ? target.ResolveCosmos(parseResult) : null;
                 var who = parseResult.GetValue(requestedBy)!;
                 var seconds = Math.Clamp(parseResult.GetValue(wait), 0, 300);
                 var checks = new List<CheckRecord>();
@@ -306,16 +329,24 @@ internal static partial class CommandLine
                     checks.Add(new CheckRecord("profile-off", "Pass", string.Create(CultureInfo.InvariantCulture, $"The {targetValue} activity profile is off (request {stamp.RequestId}).")));
                     keep = true;
                 }
-                else if (targetValue is DemoTarget.T3 or DemoTarget.T4 && !keep)
+                else if (targetValue is DemoTarget.T3 or DemoTarget.T4 or DemoTarget.T5 && !keep)
                 {
                     await new FileProfileStore(parseResult.GetValue(profileFile) ?? FileProfileStore.DefaultPathFor(targetValue)).SetAsync("off", who, null, null, null, cancellationToken).ConfigureAwait(false);
-                    checks.Add(new CheckRecord("profile-file-off", "Pass", targetValue == DemoTarget.T3
-                        ? "The T3 activity profile file is set to off, so the runner stops connecting and T3 can auto-pause."
-                        : "The T4 activity profile file is set to off, so the runner stops connecting to T4."));
+                    checks.Add(new CheckRecord("profile-file-off", "Pass", targetValue switch
+                    {
+                        DemoTarget.T3 => "The T3 activity profile file is set to off, so the runner stops connecting and T3 can auto-pause.",
+                        DemoTarget.T4 => "The T4 activity profile file is set to off, so the runner stops connecting to T4.",
+                        _ => "The T5 activity profile file is set to off, so the runner stops sending requests to T5.",
+                    }));
                 }
 
                 var options = new ResetOptions(who, seconds, !parseResult.GetValue(noKill), keep, parseResult.GetValue(undo), parseResult.GetValue(reseed));
-                if (targetValue == DemoTarget.T4)
+                if (cosmosEndpoint is not null)
+                {
+                    using var client = CosmosClient(cosmosEndpoint);
+                    checks.AddRange(await CosmosReset.RunAsync(target.RunStore(parseResult), client, options, TimeProvider.System, cancellationToken).ConfigureAwait(false));
+                }
+                else if (targetValue == DemoTarget.T4)
                 {
                     checks.AddRange(await target.PostgresRunner(parseResult, log).ResetAsync(options, cancellationToken).ConfigureAwait(false));
                 }
@@ -340,7 +371,7 @@ internal static partial class CommandLine
 
     private static Command StatusCommand()
     {
-        var command = new Command("status", "Show a target's activity profile, its profile host lane, running and recent runs, stop requests, live demo sessions, and space headroom.");
+        var command = new Command("status", "Show a target's activity profile, its profile host lane, running and recent runs, stop requests, live demo sessions, and space headroom. On T5: its runs, the account's container, and the live requests, request units, and 429s per second.");
         var target = new TargetOptions(command);
         var count = new Option<int>("--runs") { Description = "How many recent runs to show.", DefaultValueFactory = _ => 10 };
         var profileFile = ProfileFile();
@@ -355,7 +386,13 @@ internal static partial class CommandLine
             using var log = GlobalOptions.CreateLog(parseResult);
             return await Guard(parseResult, log, async () =>
             {
-                if (target.TargetOf(parseResult) == DemoTarget.T4)
+                var targetValue = target.TargetOf(parseResult);
+                if (targetValue == DemoTarget.T5)
+                {
+                    return await StatusT5Async(parseResult, target.ResolveCosmos(parseResult), target.RunStore(parseResult), Math.Clamp(parseResult.GetValue(count), 1, 100), parseResult.GetValue(profileFile), parseResult.GetValue(hostFile), parseResult.GetValue(json), cancellationToken).ConfigureAwait(false);
+                }
+
+                if (targetValue == DemoTarget.T4)
                 {
                     var t4 = target.ResolvePostgres(parseResult);
                     return await StatusT4Async(parseResult, t4, target.ResolvePostgresReplica(parseResult, t4), Math.Clamp(parseResult.GetValue(count), 1, 100), parseResult.GetValue(profileFile), parseResult.GetValue(hostFile), parseResult.GetValue(json), log, cancellationToken).ConfigureAwait(false);
@@ -582,6 +619,10 @@ internal static partial class CommandLine
         var t4Identity = new Option<string?>("--t4-managed-identity-client-id") { Description = "Client ID of a user-assigned identity for T4; omit for the VM's system-assigned identity." };
         var t4Replica = new Option<string?>("--t4-replica-server") { Description = "With --t4-server: T4's read replica's FQDN (ADR 0025), for replica-lag and for the end of the demo's sessions there in a reset. It exists only during a session; nothing connects to it until a run needs it." };
         var t4File = new Option<string?>("--t4-profile-file") { Description = "T4's activity profile file. Defaults to C:\\ProgramData\\DbHubDemo\\activity-t4.json (or /var/lib/DbHubDemo/activity-t4.json)." };
+        var t5Server = new Option<string?>("--t5-server") { Description = "Also drive T5 from this machine (T1 only): the Cosmos DB account's host name, cosmos01-<id>.documents.azure.com. Its profile lives in --t5-profile-file and its runs in --t5-run-file." };
+        var t5Identity = new Option<string?>("--t5-managed-identity-client-id") { Description = "With --t5-server: the client ID of a user-assigned identity for T5; omit for the VM's system-assigned identity." };
+        var t5File = new Option<string?>("--t5-profile-file") { Description = "With --t5-server: T5's activity profile file. Defaults to C:\\ProgramData\\DbHubDemo\\activity-t5.json (or /var/lib/DbHubDemo/activity-t5.json)." };
+        var t5RunFile = new Option<string?>("--t5-run-file") { Description = "With --t5-server: T5's run store. Defaults to C:\\ProgramData\\DbHubDemo\\t5-runs.json (or /var/lib/DbHubDemo/t5-runs.json)." };
         var hostFile = ProfileFile();
         var hostStateFile = HostStateFile();
         var notAfter = new Option<string?>("--not-after") { Description = "Stop activity 2 minutes before this time (ISO 8601 with an offset, typically the next auto-shutdown)." };
@@ -592,6 +633,10 @@ internal static partial class CommandLine
         host.Options.Add(t4Identity);
         host.Options.Add(t4Replica);
         host.Options.Add(t4File);
+        host.Options.Add(t5Server);
+        host.Options.Add(t5Identity);
+        host.Options.Add(t5File);
+        host.Options.Add(t5RunFile);
         host.Options.Add(hostFile);
         host.Options.Add(hostStateFile);
         host.Options.Add(notAfter);
@@ -602,48 +647,80 @@ internal static partial class CommandLine
             {
                 var limit = ParseNotAfter(parseResult.GetValue(notAfter));
                 var primary = hostTarget.TargetOf(parseResult);
+                var t5Requested = parseResult.GetValue(t5Server) is not null || parseResult.GetValue(t5Identity) is not null || parseResult.GetValue(t5File) is not null || parseResult.GetValue(t5RunFile) is not null;
+                if (t5Requested && primary != DemoTarget.T1)
+                {
+                    throw new ScenarioRequestException("--t5-server, --t5-managed-identity-client-id, --t5-profile-file, and --t5-run-file are for a T1 host that also drives T5.");
+                }
+
+                if (t5Requested && parseResult.GetValue(t5Server) is null)
+                {
+                    throw new ScenarioRequestException("--t5-managed-identity-client-id, --t5-profile-file, and --t5-run-file go with --t5-server.");
+                }
+
                 var targets = new List<ProfileTarget>();
-                if (primary == DemoTarget.T4)
+                CosmosRestClient? cosmos = null;
+                try
                 {
-                    var runner = hostTarget.PostgresRunner(parseResult, log);
-                    targets.Add(new ProfileTarget(DemoTarget.T4, runner, new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))) { HasReplica = runner.HasReplica });
-                }
-                else
-                {
-                    var endpoint = hostTarget.Resolve(parseResult);
-                    targets.Add(new ProfileTarget(endpoint.Target, new ScenarioRunner(new SqlConnectionOpener(endpoint, log), log, TimeProvider.System), Store(endpoint.Target, () => endpoint, parseResult.GetValue(hostFile), log)));
-                }
-
-                if (parseResult.GetValue(t3Server) is { } server)
-                {
-                    if (primary is DemoTarget.T3 or DemoTarget.T4)
+                    if (primary == DemoTarget.T4)
                     {
-                        throw new ScenarioRequestException("--t3-server is for a T1 host that also drives T3.");
+                        var runner = hostTarget.PostgresRunner(parseResult, log);
+                        targets.Add(new ProfileTarget(DemoTarget.T4, runner, new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))) { HasReplica = runner.HasReplica });
+                    }
+                    else if (primary == DemoTarget.T5)
+                    {
+                        cosmos = CosmosClient(hostTarget.ResolveCosmos(parseResult));
+                        targets.Add(new ProfileTarget(DemoTarget.T5, new CosmosScenarioRunner(cosmos, hostTarget.RunStore(parseResult), log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(hostFile) ?? FileProfileStore.DefaultPathFor(DemoTarget.T5))));
+                    }
+                    else
+                    {
+                        var endpoint = hostTarget.Resolve(parseResult);
+                        targets.Add(new ProfileTarget(endpoint.Target, new ScenarioRunner(new SqlConnectionOpener(endpoint, log), log, TimeProvider.System), Store(endpoint.Target, () => endpoint, parseResult.GetValue(hostFile), log)));
                     }
 
-                    var t3 = TargetEndpoint.Create(DemoTarget.T3, server, sqlLoginFromEnvironment: false, parseResult.GetValue(t3Identity));
-                    targets.Add(new ProfileTarget(DemoTarget.T3, new ScenarioRunner(new SqlConnectionOpener(t3, log), log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(hostFile) ?? FileProfileStore.DefaultPath)));
-                }
-
-                if (parseResult.GetValue(t4Server) is { } pgServer)
-                {
-                    if (primary is DemoTarget.T3 or DemoTarget.T4)
+                    if (parseResult.GetValue(t3Server) is { } server)
                     {
-                        throw new ScenarioRequestException("--t4-server is for a T1 host that also drives T4.");
+                        if (primary is DemoTarget.T3 or DemoTarget.T4 or DemoTarget.T5)
+                        {
+                            throw new ScenarioRequestException("--t3-server is for a T1 host that also drives T3.");
+                        }
+
+                        var t3 = TargetEndpoint.Create(DemoTarget.T3, server, sqlLoginFromEnvironment: false, parseResult.GetValue(t3Identity));
+                        targets.Add(new ProfileTarget(DemoTarget.T3, new ScenarioRunner(new SqlConnectionOpener(t3, log), log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(hostFile) ?? FileProfileStore.DefaultPath)));
                     }
 
-                    var t4 = PgEndpoint.Create(pgServer, parseResult.GetValue(t4User), passwordFromEnvironment: false, parseResult.GetValue(t4Identity));
-                    var t4Runner = PgRunner(t4, t4.Replica(parseResult.GetValue(t4Replica), "--t4-replica-server"), log);
-                    targets.Add(new ProfileTarget(DemoTarget.T4, t4Runner, new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))) { HasReplica = t4Runner.HasReplica });
-                }
-                else if (parseResult.GetValue(t4Replica) is not null)
-                {
-                    throw new ScenarioRequestException("--t4-replica-server goes with --t4-server; a T4 host takes --replica-server.");
-                }
+                    if (parseResult.GetValue(t4Server) is { } pgServer)
+                    {
+                        if (primary is DemoTarget.T3 or DemoTarget.T4 or DemoTarget.T5)
+                        {
+                            throw new ScenarioRequestException("--t4-server is for a T1 host that also drives T4.");
+                        }
 
-                var options = ProfileHostOptions.From(ActivityProfilesDefinition.Default, parseResult.GetValue(hostStateFile) ?? HostLanesFile.DefaultPath) with { RaisePriority = true };
-                await new ProfileHost(ActivityProfilesDefinition.Default, ScenarioCatalog.Default, log, TimeProvider.System, options).RunAsync(targets, limit, cancellationToken).ConfigureAwait(false);
-                return ExitCodes.Success;
+                        var t4 = PgEndpoint.Create(pgServer, parseResult.GetValue(t4User), passwordFromEnvironment: false, parseResult.GetValue(t4Identity));
+                        var t4Runner = PgRunner(t4, t4.Replica(parseResult.GetValue(t4Replica), "--t4-replica-server"), log);
+                        targets.Add(new ProfileTarget(DemoTarget.T4, t4Runner, new FileProfileStore(parseResult.GetValue(t4File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T4))) { HasReplica = t4Runner.HasReplica });
+                    }
+                    else if (parseResult.GetValue(t4Replica) is not null)
+                    {
+                        throw new ScenarioRequestException("--t4-replica-server goes with --t4-server; a T4 host takes --replica-server.");
+                    }
+
+                    if (parseResult.GetValue(t5Server) is { } cosmosServer)
+                    {
+                        // T5 (Azure Cosmos DB for NoSQL): its runs are in T1's run store, its profile in its own file.
+                        cosmos = CosmosClient(CosmosEndpoint.Create(cosmosServer, parseResult.GetValue(t5Identity)));
+                        var store = new CosmosRunStore(parseResult.GetValue(t5RunFile) ?? CosmosRunStore.DefaultPath);
+                        targets.Add(new ProfileTarget(DemoTarget.T5, new CosmosScenarioRunner(cosmos, store, log, TimeProvider.System), new FileProfileStore(parseResult.GetValue(t5File) ?? FileProfileStore.DefaultPathFor(DemoTarget.T5))));
+                    }
+
+                    var options = ProfileHostOptions.From(ActivityProfilesDefinition.Default, parseResult.GetValue(hostStateFile) ?? HostLanesFile.DefaultPath) with { RaisePriority = true };
+                    await new ProfileHost(ActivityProfilesDefinition.Default, ScenarioCatalog.Default, log, TimeProvider.System, options).RunAsync(targets, limit, cancellationToken).ConfigureAwait(false);
+                    return ExitCodes.Success;
+                }
+                finally
+                {
+                    cosmos?.Dispose();
+                }
             }).ConfigureAwait(false);
         });
 
@@ -655,7 +732,7 @@ internal static partial class CommandLine
 
     private static Command WarmupCommand()
     {
-        var command = new Command("warmup", "Connect and run a light query, retrying while a serverless database resumes (T3); reports how long it took.");
+        var command = new Command("warmup", "Connect and run a light query, retrying while a serverless database resumes (T3); reports how long it took. On T5: a token, the container's definition, and an upsert and a point read of the warmup document.");
         var target = new TargetOptions(command);
         var json = Json();
         command.Options.Add(json);
@@ -664,7 +741,13 @@ internal static partial class CommandLine
             using var log = GlobalOptions.CreateLog(parseResult);
             return await Guard(parseResult, log, async () =>
             {
-                if (target.TargetOf(parseResult) == DemoTarget.T4)
+                var targetValue = target.TargetOf(parseResult);
+                if (targetValue == DemoTarget.T5)
+                {
+                    return await WarmupT5Async(parseResult, target.ResolveCosmos(parseResult), parseResult.GetValue(json), cancellationToken).ConfigureAwait(false);
+                }
+
+                if (targetValue == DemoTarget.T4)
                 {
                     return await WarmupT4Async(parseResult, target.ResolvePostgres(parseResult), parseResult.GetValue(json), log, cancellationToken).ConfigureAwait(false);
                 }
@@ -694,10 +777,10 @@ internal static partial class CommandLine
 
     private static Command SetupCommand()
     {
-        var command = new Command("setup", "Create or update the demo objects (control tables, procedures) in ContosoCare. Run it as an administrator; it's idempotent.");
+        var command = new Command("setup", "Create or update the demo objects (control tables, procedures) in ContosoCare. Run it as an administrator; it's idempotent. On T5: verify the container (it exists only during a session: start-demo.ps1 or deploy.ps1 creates it) and, with --seed-scale, write the patient documents.");
         var target = new TargetOptions(command);
         var baseSchema = new Option<bool>("--include-base-schema") { Description = "Also apply 010-schema.sql and 020-seed.sql (the bootstraps normally do; T4's setup applies them itself)." };
-        var seedScale = new Option<int?>("--seed-scale") { Description = "Run demo.usp_seed_contosocare at this scale (1 to 50) unless that seed is already complete." };
+        var seedScale = new Option<int?>("--seed-scale") { Description = "Run demo.usp_seed_contosocare at this scale (1 to 50) unless that seed is already complete. On T5: upsert scale x 100 patient profile documents (p-0001 and on)." };
         var grant = new Option<string?>("--grant-windows-login") { Description = "T1 and T2: create a login, user, and contosocare_runner membership for the runner's service identity, for example 'NT SERVICE\\ContosoCareWorkload'." };
         var entraObject = new Option<string?>("--grant-entra-object-id") { Description = "T4: create the runner's PostgreSQL role for this Microsoft Entra object ID (T1's managed identity) and grant it the demo's rights. Needs --user to be an Entra administrator (the P6 group's name)." };
         var runnerRole = new Option<string?>("--runner-role") { Description = "T4: the runner's PostgreSQL role name (default contosocare_runner)." };
@@ -713,7 +796,18 @@ internal static partial class CommandLine
             using var log = GlobalOptions.CreateLog(parseResult);
             return await Guard(parseResult, log, async () =>
             {
-                if (target.TargetOf(parseResult) == DemoTarget.T4)
+                var targetValue = target.TargetOf(parseResult);
+                if (targetValue == DemoTarget.T5)
+                {
+                    if (parseResult.GetValue(baseSchema) || parseResult.GetValue(grant) is not null || parseResult.GetValue(entraObject) is not null || parseResult.GetValue(runnerRole) is not null)
+                    {
+                        throw new ScenarioRequestException("--include-base-schema, --grant-windows-login, --grant-entra-object-id, and --runner-role are for the SQL targets and T4: T5's database comes from the template, its container (only during a session) from start-demo.ps1 or deploy.ps1, and T1's data-plane role from deploy.ps1.");
+                    }
+
+                    return await SetupT5Async(parseResult, target.ResolveCosmos(parseResult), parseResult.GetValue(seedScale), parseResult.GetValue(json), cancellationToken).ConfigureAwait(false);
+                }
+
+                if (targetValue == DemoTarget.T4)
                 {
                     var objectId = parseResult.GetValue(entraObject) is { } text
                         ? Guid.TryParse(text, out var parsed) ? parsed : throw new ScenarioRequestException("--grant-entra-object-id must be an object ID (a GUID).")
@@ -780,13 +874,16 @@ internal static partial class CommandLine
     }
 
     private static IProfileStore Store(DemoTarget target, Func<TargetEndpoint> endpoint, string? profileFile, RunnerLog log) =>
-        target is DemoTarget.T3 or DemoTarget.T4
+        target is DemoTarget.T3 or DemoTarget.T4 or DemoTarget.T5
             ? new FileProfileStore(profileFile ?? FileProfileStore.DefaultPathFor(target))
             : new SqlProfileStore(new SqlConnectionOpener(endpoint(), log));
 
     /// <summary>T4's runner (Phase 24), with its read replica when there is one (ADR 0025).</summary>
     private static PgScenarioRunner PgRunner(PgEndpoint endpoint, PgEndpoint? replica, RunnerLog log) =>
         new(new PgConnectionOpener(endpoint, log), log, TimeProvider.System, replica is null ? null : new PgConnectionOpener(replica, log));
+
+    /// <summary>T5's REST client, signed in with T1's managed identity. The caller disposes it.</summary>
+    private static CosmosRestClient CosmosClient(CosmosEndpoint endpoint) => new(endpoint, CosmosTokenProvider.ForManagedIdentity(endpoint));
 
     private static async Task<int> Guard(ParseResult parseResult, RunnerLog log, Func<Task<int>> action)
     {
@@ -804,6 +901,13 @@ internal static partial class CommandLine
         {
             log.Error("command.sql-error", "A SQL call failed.", ("error", ex.Number), ("message", ex.Message));
             parseResult.InvocationConfiguration.Error.WriteLine(Redactor.Redact(string.Create(CultureInfo.InvariantCulture, $"SQL error {ex.Number}: {ex.Message}")));
+            return ExitCodes.Failure;
+        }
+        catch (CosmosException ex)
+        {
+            // T5: the message says what failed and what to do (for a 403, T1's data-plane role); it never holds the token.
+            log.Error("command.cosmos-error", "A Cosmos DB request failed.", ("failure", ex.Failure), ("status", ex.StatusCode), ("subStatus", ex.SubStatus), ("activityId", ex.ActivityId), ("message", ex.Message));
+            parseResult.InvocationConfiguration.Error.WriteLine(Redactor.Redact(ex.Message));
             return ExitCodes.Failure;
         }
         catch (Exception ex) when (ex is Npgsql.NpgsqlException or Azure.Identity.AuthenticationFailedException or Azure.Identity.CredentialUnavailableException)
@@ -968,15 +1072,18 @@ internal static partial class CommandLine
             ["status"] = Statuses.Contains(check.Status, StringComparer.Ordinal) ? check.Status : "Warning",
             ["message"] = Redactor.Redact(check.Message),
             ["evidence"] = new JsonObject { ["check"] = check.CheckId },
-            ["remediation"] = check.Status is "Pass" or "Not selected" ? string.Empty : "Run 'ContosoCare.Workload reset' as an administrator on the target, then 'status'.",
-            ["docUrl"] = DocUrl(command, target),
+            ["remediation"] = Remediation(command, target, check),
+            ["docUrl"] = DocUrl(command, target, check),
             ["evaluationOnly"] = false,
             ["timestamp"] = timestamp,
         };
     }
 
-    private static string DocUrl(string command, DemoTarget target) => (command, target) switch
+    private static string DocUrl(string command, DemoTarget target, CheckRecord check) => (command, target) switch
     {
+        (_, DemoTarget.T5) when IsThrottleCheck(check) => "https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-request-rate-too-large",
+        ("warmup" or "setup", DemoTarget.T5) => "https://learn.microsoft.com/azure/cosmos-db/nosql/how-to-grant-data-plane-access",
+        (_, DemoTarget.T5) => "https://learn.microsoft.com/azure/cosmos-db/monitor-normalized-request-units",
         ("reset" or "stop", DemoTarget.T4) => "https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SIGNAL",
         ("setup", DemoTarget.T4) => "https://learn.microsoft.com/azure/postgresql/security/security-manage-entra-users",
         (_, DemoTarget.T4) => "https://www.postgresql.org/docs/current/monitoring-stats.html#MONITORING-PG-STAT-ACTIVITY-VIEW",
@@ -985,9 +1092,21 @@ internal static partial class CommandLine
         _ => "https://learn.microsoft.com/sql/relational-databases/system-dynamic-management-views/sys-dm-exec-sessions-transact-sql",
     };
 
+    /// <summary>A T5 check about throttling: request rate too large (HTTP 429).</summary>
+    private static bool IsThrottleCheck(CheckRecord check) =>
+        check.CheckId.Contains("throttl", StringComparison.OrdinalIgnoreCase) || check.Message.Contains("HTTP 429", StringComparison.Ordinal);
+
+    private static string Remediation(string command, DemoTarget target, CheckRecord check) => check.Status is "Pass" or "Not selected" ? string.Empty : target switch
+    {
+        DemoTarget.T5 when IsThrottleCheck(check) => "Wait for the storm to end, or stop it ('ContosoCare.Workload stop --target T5 --scenario ru-storm'), then try again.",
+        DemoTarget.T5 when command is "setup" or "warmup" => "T5's container exists only during a session: run ./scripts/start-demo.ps1 (or deploy.ps1, which also creates T5's database and assigns T1's data-plane role), then 'ContosoCare.Workload setup --target T5 --server <host>' on T1.",
+        DemoTarget.T5 => "Run 'ContosoCare.Workload reset --target T5' on T1, then 'status --target T5 --server <host>'.",
+        _ => "Run 'ContosoCare.Workload reset' as an administrator on the target, then 'status'.",
+    };
+
     private static Option<bool> Json() => new("--json") { Description = "Write the result to standard output as JSON." };
 
-    private static Option<string?> ProfileFile() => new("--profile-file") { Description = "T3's or T4's activity profile file. Defaults to C:\\ProgramData\\DbHubDemo\\activity.json for T3 and activity-t4.json for T4 (or under /var/lib/DbHubDemo)." };
+    private static Option<string?> ProfileFile() => new("--profile-file") { Description = "T3's, T4's, or T5's activity profile file. Defaults to C:\\ProgramData\\DbHubDemo\\activity.json for T3, activity-t4.json for T4, and activity-t5.json for T5 (or under /var/lib/DbHubDemo)." };
 
     private static Option<string?> HostStateFile() => new("--host-state-file") { Description = "The profile host's heartbeat file, which 'profile run' writes and 'status' reads. Defaults to C:\\ProgramData\\DbHubDemo\\host-lanes.json (or /var/lib/DbHubDemo/host-lanes.json)." };
 
@@ -1018,13 +1137,14 @@ internal static partial class CommandLine
     /// <summary>--target, --server, and the authentication switches, added to one command.</summary>
     private sealed class TargetOptions
     {
-        private readonly Option<DemoTarget> target = new("--target", "-t") { Description = "T1 (SQL Server on an Azure VM), T2 (Arc-enabled SQL Server), T3 (Azure SQL Database), or T4 (Azure Database for PostgreSQL flexible server).", Required = true };
-        private readonly Option<string?> server = new("--server") { Description = "T1 and T2: the local instance (default '.'), Windows authentication. T3: the logical server name, Microsoft Entra managed identity. T4: the flexible server's FQDN, Microsoft Entra managed identity." };
-        private readonly Option<string?> clientId = new("--managed-identity-client-id") { Description = "T3 and T4: the client ID of a user-assigned managed identity; omit for the system-assigned identity." };
+        private readonly Option<DemoTarget> target = new("--target", "-t") { Description = "T1 (SQL Server on an Azure VM), T2 (Arc-enabled SQL Server), T3 (Azure SQL Database), T4 (Azure Database for PostgreSQL flexible server), or T5 (Azure Cosmos DB for NoSQL).", Required = true };
+        private readonly Option<string?> server = new("--server") { Description = "T1 and T2: the local instance (default '.'), Windows authentication. T3: the logical server name, Microsoft Entra managed identity. T4: the flexible server's FQDN, Microsoft Entra managed identity. T5: the Cosmos DB account's host name (cosmos01-<id>.documents.azure.com), Microsoft Entra managed identity." };
+        private readonly Option<string?> clientId = new("--managed-identity-client-id") { Description = "T3, T4, and T5: the client ID of a user-assigned managed identity; omit for the system-assigned identity." };
         private readonly Option<bool> sqlLogin = new("--sql-login-from-environment") { Description = "Local SQL Server containers only: sign in with CONTOSOCARE_SQL_USER and CONTOSOCARE_SQL_PASSWORD from the environment." };
         private readonly Option<string?> user = new("--user") { Description = "T4 only: the PostgreSQL role to sign in as with the managed identity's token (default contosocare_runner; setup signs in as the P6 group's name)." };
         private readonly Option<bool> pgPassword = new("--pg-password-from-environment") { Description = "Local PostgreSQL tests only (T4): sign in with CONTOSOCARE_PG_USER and CONTOSOCARE_PG_PASSWORD from the environment." };
         private readonly Option<string?> replicaServer = new("--replica-server") { Description = "T4 only: T4's read replica's FQDN (pgreplica01-<id>.postgres.database.azure.com, ADR 0025), signed in like --server. run needs it for replica-lag; stop and reset also end the demo's sessions there; status shows its replay lag. Other commands ignore it." };
+        private readonly Option<string?> runFile = new("--run-file") { Description = "T5 only: T5's run store, the file on this machine that records its runs and stop requests (T5 has no control tables). Defaults to C:\\ProgramData\\DbHubDemo\\t5-runs.json (or /var/lib/DbHubDemo/t5-runs.json), next to the profile files." };
 
         public TargetOptions(Command command)
         {
@@ -1035,6 +1155,7 @@ internal static partial class CommandLine
             command.Options.Add(user);
             command.Options.Add(pgPassword);
             command.Options.Add(replicaServer);
+            command.Options.Add(runFile);
         }
 
         public DemoTarget TargetOf(ParseResult parseResult)
@@ -1043,6 +1164,26 @@ internal static partial class CommandLine
             if (value != DemoTarget.T4 && parseResult.GetValue(replicaServer) is not null)
             {
                 throw new ScenarioRequestException("--replica-server is for T4: it names T4's read replica.");
+            }
+
+            if (value != DemoTarget.T5 && parseResult.GetValue(runFile) is not null)
+            {
+                throw new ScenarioRequestException("--run-file is for T5: it names T5's run store.");
+            }
+
+            if (value == DemoTarget.T5)
+            {
+                // Every T5 command refuses the other targets' sign-in options and checks --server when it's given (stop,
+                // reset, and profile get and set work from T1's files without it).
+                CheckCosmosOptions(parseResult);
+                if (parseResult.GetValue(server) is not null)
+                {
+                    _ = CosmosEndpoint.Create(parseResult.GetValue(server), parseResult.GetValue(clientId));
+                }
+                else if (parseResult.GetValue(clientId) is { } id && !Guid.TryParse(id, out _))
+                {
+                    throw new ScenarioRequestException("--managed-identity-client-id must be the client ID (a GUID) of a user-assigned identity.");
+                }
             }
 
             return value;
@@ -1076,6 +1217,29 @@ internal static partial class CommandLine
         {
             var endpoint = ResolvePostgres(parseResult);
             return PgRunner(endpoint, ResolvePostgresReplica(parseResult, endpoint), log);
+        }
+
+        /// <summary>T5's account from --server (required) and --managed-identity-client-id.</summary>
+        public CosmosEndpoint ResolveCosmos(ParseResult parseResult)
+        {
+            CheckCosmosOptions(parseResult);
+            return CosmosEndpoint.Create(parseResult.GetValue(server), parseResult.GetValue(clientId));
+        }
+
+        /// <summary>T5's run store: --run-file, or t5-runs.json next to the profile files.</summary>
+        public CosmosRunStore RunStore(ParseResult parseResult) => new(parseResult.GetValue(runFile) ?? CosmosRunStore.DefaultPath);
+
+        private void CheckCosmosOptions(ParseResult parseResult)
+        {
+            if (parseResult.GetValue(user) is not null || parseResult.GetValue(pgPassword))
+            {
+                throw new ScenarioRequestException("--user and --pg-password-from-environment are for T4.");
+            }
+
+            if (parseResult.GetValue(sqlLogin))
+            {
+                throw new ScenarioRequestException("--sql-login-from-environment is for SQL Server; T5 is Microsoft Entra only.");
+            }
         }
     }
 

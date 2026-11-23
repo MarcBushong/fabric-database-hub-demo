@@ -1,8 +1,8 @@
 name: demo-control
 
-# Changes the activity on the demo's targets (ADR 0010, ADR 0011). The inputs match what the live-activity
-# notebook dispatches (fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, prerequisite P9): every value is
-# a string. scripts/demo-control.ps1 validates them, and everything ends before the next auto-shutdown.
+# Changes the activity on the demo's targets (ADR 0010, ADR 0011). Optional, for maintainers: a demo session
+# needs no GitHub Actions, because Run all in NB_DatabaseHub_Control runs it (ADR 0026). Every input is a
+# string; scripts/demo-control.ps1 validates them, and everything ends before the next auto-shutdown.
 on:
   workflow_dispatch:
     inputs:
@@ -21,6 +21,7 @@ on:
           - T2
           - T3
           - T4
+          - T5
       scenario:
         description: baseline, business-day, off, or incident:<scenario>
         type: string

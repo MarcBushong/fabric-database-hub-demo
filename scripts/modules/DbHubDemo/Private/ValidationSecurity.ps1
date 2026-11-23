@@ -34,25 +34,45 @@ function Invoke-DemoValidationSecurity {
         $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Not selected' -Message 'There''s no local output to scan: out/ doesn''t exist and no -ScanPath was given.' -Remediation 'Save a run''s output in out/ (for example Start-Transcript -Path ./out/run.log, or gh run view <run-id> --log > ./out/actions.log), then run validate.ps1 -Area Security.' -DocUrl $outputDoc))
     }
     else {
-        $scan = Find-DemoSecretLeak -Path $roots
+        # Dependency trees and package caches (node_modules, __pycache__, and the like) anywhere under out/ and -ScanPath are
+        # left out without being walked (2026-11-18): out/fabric-app/node_modules alone held 114,315 third-party files after
+        # the Insights app's build, and reading them kept this area busy for more than 37 minutes.
+        # Only the Insights app's build stage, out/fabric-app, is expected to hold them (npm fills it from the repository's
+        # lockfiles); one anywhere else is left out too, but makes this a Warning that names it (review of ab91ee5), since it
+        # could hold the demo's own output, such as out/venv/run.log. -ScanPath <that folder> reads it and clears the Warning
+        # (the re-review of 0590bbe).
+        $scan = Find-DemoSecretLeak -Path $roots -DependencyRoot (Join-Path -Path $OutputRoot -ChildPath 'fabric-app')
+        $unexpectedCount = [int](Get-DemoMemberValue -InputObject $scan -Name 'UnexpectedPrunedCount')
+        $unexpectedList = Get-DemoMemberValue -InputObject $scan -Name 'UnexpectedPruned'
+        $unexpectedShown = @($unexpectedList | Where-Object { $_ } | Select-Object -First 5 | ForEach-Object { ConvertTo-DemoValidationRelativePath -Path ([string]$_) })
         $scanned = @($scan.Scanned)
+        $prunedCount = [int](Get-DemoMemberValue -InputObject $scan -Name 'PrunedCount')
+        $prunedList = Get-DemoMemberValue -InputObject $scan -Name 'Pruned'
+        $prunedShown = @($prunedList | Where-Object { $_ } | Select-Object -First 5 | ForEach-Object { ConvertTo-DemoValidationRelativePath -Path ([string]$_) })
         $evidence = [ordered]@{
-            roots           = @($roots | ForEach-Object { ConvertTo-DemoValidationRelativePath -Path $_ })
-            filesScanned    = $scanned.Count
-            filesSkipped    = @($scan.Skipped).Count
-            skipped         = @($scan.Skipped | Select-Object -First 10 | ForEach-Object { '{0} ({1})' -f (ConvertTo-DemoValidationRelativePath -Path $_.Source), $_.Reason })
-            rules           = @($script:RedactionRules | ForEach-Object { $_.Name })
-            registeredCount = $script:DemoSecrets.Count
+            roots             = @($roots | ForEach-Object { ConvertTo-DemoValidationRelativePath -Path $_ })
+            filesScanned      = $scanned.Count
+            filesSkipped      = @($scan.Skipped).Count
+            skipped           = @($scan.Skipped | Select-Object -First 10 | ForEach-Object { '{0} ({1})' -f (ConvertTo-DemoValidationRelativePath -Path $_.Source), $_.Reason })
+            directoriesPruned = $prunedCount
+            pruned            = $prunedShown
+            unexpectedPruned  = $unexpectedShown
+            rules             = @($script:RedactionRules | ForEach-Object { $_.Name })
+            registeredCount   = $script:DemoSecrets.Count
         }
+        $notScanned = ' Dependency trees (node_modules and package caches) aren''t scanned{0}.' -f $(if ($prunedCount -gt 0) { ' ({0} left out: {1}{2})' -f $prunedCount, ($prunedShown -join ', '), $(if ($prunedCount -gt $prunedShown.Count) { ', ...' } else { '' }) } else { '' })
         if (@($scan.Findings).Count -gt 0) {
             $evidence['findings'] = @(ConvertTo-DemoValidationFindingEvidence -Finding $scan.Findings)
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Fail' -Message ('{0} secret or token pattern match(es) in {1}: {2}.' -f @($scan.Findings).Count, ($evidence['roots'] -join ', '), (Format-DemoValidationFindingSummary -Finding $scan.Findings)) -Evidence $evidence -Remediation ('Delete the files, rotate any real credential they hold, and find the script that wrote it: output must go through Write-DemoLog and Export-DemoResult ({0}). Excerpts in the evidence are redacted.' -f $adr) -DocUrl $outputDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Fail' -Message ('{0} secret or token pattern match(es) in {1}: {2}.{3}' -f @($scan.Findings).Count, ($evidence['roots'] -join ', '), (Format-DemoValidationFindingSummary -Finding $scan.Findings), $notScanned) -Evidence $evidence -Remediation ('Delete the files, rotate any real credential they hold, and find the script that wrote it: output must go through Write-DemoLog and Export-DemoResult ({0}). Excerpts in the evidence are redacted.' -f $adr) -DocUrl $outputDoc))
         }
         elseif ($scanned.Count -eq 0) {
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Not selected' -Message ('There''s no readable text output to scan in {0}.' -f ($evidence['roots'] -join ', ')) -Evidence $evidence -DocUrl $outputDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Not selected' -Message ('There''s no readable text output to scan in {0}.{1}' -f ($evidence['roots'] -join ', '), $notScanned) -Evidence $evidence -DocUrl $outputDoc))
+        }
+        elseif ($unexpectedCount -gt 0) {
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Warning' -Message ('No secret or token pattern, and no value registered in this session, in {0} file(s) under {1}, but {2} folder(s) named like a dependency tree outside the Insights app''s build weren''t read: {3}{4}. They could hold this demo''s own output.{5}' -f $scanned.Count, ($evidence['roots'] -join ', '), $unexpectedCount, ($unexpectedShown -join ', '), $(if ($unexpectedCount -gt $unexpectedShown.Count) { ', ...' } else { '' }), $notScanned) -Evidence $evidence -Remediation 'Move the files you want scanned out of them, or scan them on purpose: ./scripts/validate.ps1 -Area Security -ScanPath <the folder>.' -DocUrl $outputDoc))
         }
         else {
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Pass' -Message ('No secret or token pattern, and no value registered in this session, in {0} file(s) under {1}.' -f $scanned.Count, ($evidence['roots'] -join ', ')) -Evidence $evidence -DocUrl $outputDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETSCAN.OUTPUT' -Area 'security' -Target 'repo' -Status 'Pass' -Message ('No secret or token pattern, and no value registered in this session, in {0} file(s) under {1}.{2}' -f $scanned.Count, ($evidence['roots'] -join ', '), $notScanned) -Evidence $evidence -DocUrl $outputDoc))
         }
     }
     if (-not $Context.GroupExists) {
@@ -235,10 +255,10 @@ function Invoke-DemoValidationSecurity {
     elseif (-not $vaultOptIn.Enabled) {
         $names = @(@($vaults.Value) | Where-Object { $null -ne $_ } | ForEach-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'name') })
         if ($names.Count -gt 0) {
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETS.KEYVAULT' -Area 'security' -Target 'subscription' -Status 'Warning' -Message ('A Key Vault is in {0} ({1}), but the demo creates none while keyVault.enabled is false: VM passwords are used only at creation, and nothing secret is stored.' -f $group, ($names -join ', ')) -Evidence @{ vaults = $names; keyVaultOptIn = $false } -Remediation 'Check who added it and what it holds. The optional P9 GitHub token belongs in a vault you own outside the demo resource group; a vault the Key Vault opt-in left behind goes with keyVault.enabled set back to true or with the resource group (ADR 0009).' -DocUrl $vaultDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETS.KEYVAULT' -Area 'security' -Target 'subscription' -Status 'Warning' -Message ('A Key Vault is in {0} ({1}), but the demo creates none while keyVault.enabled is false: VM passwords are used only at creation, and nothing secret is stored.' -f $group, ($names -join ', ')) -Evidence @{ vaults = $names; keyVaultOptIn = $false } -Remediation 'Check who added it and what it holds: the session control''s vault is in rg-<prefix>-control, not here. A vault the Key Vault opt-in left behind goes with keyVault.enabled set back to true, or with the resource group (ADR 0009).' -DocUrl $vaultDoc))
         }
         else {
-            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETS.KEYVAULT' -Area 'security' -Target 'subscription' -Status 'Pass' -Message ('No Key Vault in {0}: the default deployment stores no secret, so Contributor needs no data-plane role (ADR 0008, ADR 0009).' -f $group) -Evidence @{ keyVaultOptIn = $false } -DocUrl $vaultDoc))
+            $results.Add((New-DemoResult -CheckId 'SECURITY.SECRETS.KEYVAULT' -Area 'security' -Target 'subscription' -Status 'Pass' -Message ('No Key Vault in {0}: the demo resource group stores no secret, so Contributor needs no data-plane role (ADR 0008, ADR 0009).' -f $group) -Evidence @{ keyVaultOptIn = $false } -DocUrl $vaultDoc))
         }
     }
     else {

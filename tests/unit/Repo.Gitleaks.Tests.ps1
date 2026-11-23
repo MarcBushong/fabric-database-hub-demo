@@ -81,6 +81,14 @@ Describe 'gitleaks configuration (Phase 14, ADR 0009)' {
         $line.IsMatch(('"token": "{0}"' -f $hex)) | Should -BeFalse
     }
 
+    It 'ignores one historical finding by its fingerprint, RFC 6455''s sample WebSocket key in commit 60b8ebc''s relay test, and nothing else (2026-11-19)' {
+        $entries = @(Get-Content -LiteralPath (Join-Path -Path $script:repoRoot -ChildPath '.gitleaksignore') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
+        $entries | Should -Be @('60b8ebc8991e731cb980b95bf84b91a5ded9e716:ask-relay/test/server.test.ts:generic-api-key:195') -Because 'one commit, one file, one rule, one line: never a path-wide or rule-wide exception'
+        $relayTest = Get-Content -LiteralPath (Join-Path -Path $script:repoRoot -ChildPath 'ask-relay/test/server.test.ts') -Raw
+        $relayTest | Should -Not -Match 'Sec-WebSocket-Key:\s*[A-Za-z0-9+/]{22}==' -Because 'the test builds its WebSocket key at run time'
+        $relayTest | Should -Match 'randomBytes\(16\)\.toString\("base64"\)'
+    }
+
     It 'asks for no newer gitleaks than the one CI and the pre-commit hook pin' {
         $minimum = [regex]::Match($script:configText, '(?m)^minVersion\s*=\s*"([0-9]+\.[0-9]+\.[0-9]+)"\s*$')
         $minimum.Success | Should -BeTrue

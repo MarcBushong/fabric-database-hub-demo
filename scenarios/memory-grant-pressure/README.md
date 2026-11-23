@@ -7,7 +7,7 @@ Queries queuing for workspace memory on T2 (and any target): concurrent large so
 - **The grant:** the documented `MIN_GRANT_PERCENT` query hint reserves `grantPercent` of the most one query may get, which is 25% of the workspace memory in the default workload group. At the default 100, about four grants fit at once and the other sessions wait in the `RESOURCE_SEMAPHORE` queue. The value is validated (10 to 100) and placed in the statement text, because a query hint needs a literal.
 - **Bounds:** no server setting changes; SQL Server never grants more memory than it has, so the excess waits. Nothing is written.
 - **Expected signals:** Memory waits (`RESOURCE_SEMAPHORE`), `Granted Workspace Memory (KB)` at its ceiling and `Page life expectancy` falling, and `Memory Grants Pending` in `SqlServerPerformanceCountersDetailed` when the target lists it.
-- **By target:** T1 and T2 have 8 GiB of memory; Azure SQL Database (T3) honors the hint within the service objective's memory, so the queue forms sooner at 1 vCore.
+- **By target:** T1 and T2 have 8 GiB of memory; Azure SQL Database (T3) honors the hint within the service objective's memory, at most 6 GB at its 2-vCore maximum, so the queue forms sooner there.
 - **Reset:** read-only; grants are released when each query ends or its session closes.
 
 ```powershell

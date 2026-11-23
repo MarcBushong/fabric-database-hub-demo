@@ -8,7 +8,7 @@ function Invoke-DemoSafetyStopSetup {
     autoShutdownTimeZone, its runbook deallocates the demo's VMs that aren't deallocated and stops T4 when it runs (a
     stopped flexible server starts itself again after 7 days); a short second job afterward reads T3's status through
     Azure Resource Manager to say whether it paused, without waking it. It never starts anything, never uses Run Command,
-    and never connects to a database. It doesn't need the optional on-demand activity control (ADR 0020).
+    and never connects to a database. It doesn't need the session control (ADR 0020, ADR 0026), which every deployment has too.
 
     Default (deploy.ps1 runs it after the template, on every run; Contributor is enough for all but the role):
     1. infra/safetystop/safetystop.bicep in the demo resource group: the identity id-<prefix>-<environment>-safetystop and

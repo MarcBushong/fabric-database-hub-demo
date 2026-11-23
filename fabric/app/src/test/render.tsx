@@ -5,13 +5,20 @@ import { render } from "@testing-library/react";
 import type { ReactElement } from "react";
 import { vi } from "vitest";
 
-import { AppContext, type AppContextValue } from "@/app-context";
+import { FluentProvider, webLightTheme } from "@fluentui/react-components";
+
+import { AppContext, MANAGE_READ_ONLY, type AppContextValue, type ManageAccess } from "@/app-context";
+import type { CopilotApi } from "@/copilot/contract";
+import { CopilotContext } from "@/copilot/use-copilot";
+import { setLiveEstateReader, type EstateReader } from "@/data/live-estate";
 import { toMeta } from "@/data/model";
 import type { QuerySpec } from "@/data/queries";
 import type { QueryClient, QueryResult, Row } from "@/data/query-client";
 import { QueryClientContext } from "@/data/use-query";
 import type { AppRuntime } from "@/lib/runtime-config";
+import { sqlTargets } from "@/lib/estate";
 import { DEFAULT_VIEW, type ViewState } from "@/lib/view-state";
+import { sampleLiveReader } from "@/preview/sample-live";
 
 const ZERO = "00000000-0000-0000-0000-000000000000";
 
@@ -22,7 +29,11 @@ export const RUNTIME: AppRuntime = {
     itemId: ZERO,
     portalUrl: "https://app.fabric.microsoft.com",
     resourceGroup: "rg-dbhub-test",
-    links: { report: "https://app.fabric.microsoft.com/groups/x/reports/y" },
+    links: {
+        report: "https://app.fabric.microsoft.com/groups/x/reports/y",
+        controlNotebook: "https://app.fabric.microsoft.com/groups/c/synapsenotebooks/n",
+        t2MigrationAssessment: "https://portal.azure.com/#@00000000-0000-0000-0000-000000000000/resource/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-dbhub-test/providers/Microsoft.AzureArcData/sqlServerInstances/arcsql01",
+    },
 };
 
 const bins = (target: "T1" | "T2" | "T3" | null, hours: number, base: number): Row[] =>
@@ -58,8 +69,22 @@ const postgresPoints = (target: "T4" | "T4-replica", metric: string, values: num
         CapturedAt: "2026-11-13T18:06:00",
     }));
 
-export const FIXTURES: Record<string, Row[]> = {
-    "history-meta": [
+/** T5's capture: six minutes of an ru-storm wave, throttled at 100 % normalized RU, then back. */
+function cosmosPoints(): Row[] {
+    const series: Array<[string, string, number[]]> = [
+        ["NormalizedRUConsumption", "percent", [10, 60, 100, 100, 30, 12]],
+        ["TotalRequests", "requests", [300, 1500, 2400, 2300, 900, 310]],
+        ["ThrottledRequests", "requests", [0, 0, 800, 760, 0, 0]],
+        ["ServerSideLatencyGateway", "ms", [5, 7, 12, 11, 6, 5]],
+    ];
+    const rows: Row[] = [];
+    const base = { ResourceName: "cosmos01-test01", WindowStart: "2026-11-13T17:00:00", WindowEnd: "2026-11-13T17:06:00", CapturedAt: "2026-11-13T17:10:00" };
+    for (const [metric, unit, values] of series) values.forEach((value, i) => rows.push({ ...base, Bucket: `2026-11-13T17:0${i}:00`, Metric: metric, Value: value, Unit: unit }));
+    rows.push({ ...base, Bucket: "2026-11-13T17:00:00", Metric: "ProvisionedThroughput", Value: 400, Unit: "RU/s" }, { ...base, Bucket: "2026-11-13T17:00:00", Metric: "ServiceAvailability", Value: 100, Unit: "percent" });
+    return rows;
+}
+
+export const FIXTURES: Record<string, Row[]> = {    "history-meta": [
         { LatestCapture: "2026-10-21T20:30:00", LatestDay: "2026-10-21T00:00:00", EarliestDay: "2026-10-20T00:00:00", HoursSince: 2, Freshness: "Pass", NotebookRuns: 3, ScenarioRequests: 0, Incidents: 2, HasBins: 1 },
     ],
     "estate-targets": [
@@ -68,8 +93,9 @@ export const FIXTURES: Record<string, Row[]> = {
     ],
     headlines: [{ EstateHeadline: "3 of 3 SQL targets sent telemetry in this period; 3 findings need attention", ReadinessHeadline: "12 checks: 0 failed, 2 manual steps, 2 warnings", Freshness: "Pass" }],
     "findings-latest": [
-        { FindingId: "f1", Status: "Warning", StatusSort: 3, TargetKey: "T3", Analysis: "IO pressure", Finding: "Buffer IO waits rose sharply", CapturedAt: "2026-10-21T20:30:00" },
-        { FindingId: "f2", Status: "Pass", StatusSort: 4, TargetKey: "T1", Analysis: "Blocking", Finding: "No blocking chains", CapturedAt: "2026-10-21T20:30:00" },
+        { FindingId: "f1", AnalysisKey: "storage_io", Status: "Warning", StatusSort: 3, TargetKey: "T3", Analysis: "IO pressure", AnalysisGroup: "IO", Finding: "Buffer IO waits rose sharply", CapturedAt: "2026-10-21T20:30:00" },
+        { FindingId: "f2", AnalysisKey: "blocking", Status: "Pass", StatusSort: 4, TargetKey: "T1", Analysis: "Blocking", AnalysisGroup: "Locks and blocking", Finding: "No blocking chains", CapturedAt: "2026-10-21T20:30:00" },
+        { FindingId: "sec.T2.audit", AnalysisKey: "security_posture", Status: "Warning", StatusSort: 3, TargetKey: "T2", Analysis: "", AnalysisGroup: "", Finding: "Auditing is off on arcsql01", CapturedAt: "2026-10-21T20:30:00" },
     ],
     "signals-per-bin": [...bins("T3", 3, 10), ...bins("T1", 1, 1)],
     "waits-by-category": [
@@ -119,7 +145,35 @@ export const FIXTURES: Record<string, Row[]> = {
         ...postgresPoints("T4", "connections_failed", [0, 3, 1]),
         ...postgresPoints("T4", "physical_replication_delay_in_bytes", [184]),
     ],
-    "postgres-findings": [
+    "scenario-runs": [
+        { RequestId: "session:abcd1234:05", RequestedAt: "2026-10-21T09:00:01", TargetKey: "T3", Profile: "incident:plan-regression", DurationMin: 30, Intensity: 5, Concurrency: 2, Dispatch: "webhook", Status: "Pass", Message: "Session abcd1234's Database Agent beat: the plan regresses at 10:03 UTC; the run's response forces the last good plan at 10:26 UTC.", WindowStart: "2026-10-21T10:00:00", WindowEnd: "2026-10-21T10:30:00" },
+        { RequestId: "r1", RequestedAt: "2026-10-21T09:00:00", TargetKey: "", Profile: "showcase", DurationMin: 90, Intensity: null, Concurrency: null, Dispatch: "webhook", Status: "Pass", Message: "Session started on T1, T2, T3, and T4", WindowStart: "2026-10-21T09:00:00", WindowEnd: "2026-10-21T10:30:00" },
+    ],
+    "agent-loop": [
+        {
+            FindingId: "database_agent.T3.session:abcd1234:05",
+            TargetKey: "T3",
+            Status: "Pass",
+            Finding: "Database Agent loop: the plan regressed at 10:03 UTC and the response forced the last good plan at 10:26 UTC; T3's CPU fell from 84% to 22%.",
+            Evidence: '{"sessionId": "abcd1234", "regressUtc": "2026-10-21T10:03:00Z", "respondUtc": "2026-10-21T10:26:00Z", "cpuBeforePercent": 84, "cpuAfterPercent": 22}',
+            RequestId: "session:abcd1234:05",
+            WindowStart: "2026-10-21T10:00:00",
+            WindowEnd: "2026-10-21T10:30:00",
+            CapturedAt: "2026-10-21T11:05:00",
+        },
+    ],
+    "daily-trend": [
+        { Date: "2026-10-20T00:00:00", "Target Key": "T1", CpuAvg: 10, CpuPeak: 20, WaitS: 100, BufferIoS: 5, LockWaitS: 1, Batch: 1000, SessionsPeak: 5, Incidents: 0 },
+        { Date: "2026-10-21T00:00:00", "Target Key": "T1", CpuAvg: 12, CpuPeak: 30, WaitS: 120, BufferIoS: 6, LockWaitS: 2, Batch: 1100, SessionsPeak: 6, Incidents: 1 },
+        { Date: "2026-10-21T00:00:00", "Target Key": "T3", CpuAvg: 40, CpuPeak: 97.5, WaitS: 4000, BufferIoS: 900, LockWaitS: 3, Batch: 90000, SessionsPeak: 22, Incidents: 2 },
+    ],
+    "cosmos-series": cosmosPoints(),
+    "cosmos-findings": [
+        { FindingId: "cosmosdb.T5.throttling", TargetKey: "T5", Status: "Warning", StatusSort: 3, Finding: "T5 throttled 1,560 of 7,710 requests (20.2 %).", Evidence: "{}", WindowStart: "2026-11-13T17:00:00", WindowEnd: "2026-11-13T17:06:00", CapturedAt: "2026-11-13T17:10:00" },
+        { FindingId: "cosmosdb.T5.throttle.20261113T1702", TargetKey: "T5", Status: "Warning", StatusSort: 3, Finding: "Throttling episode from 17:02 to 17:04 UTC.", Evidence: "{}", WindowStart: "2026-11-13T17:02:00", WindowEnd: "2026-11-13T17:04:00", CapturedAt: "2026-11-13T17:10:00" },
+        { FindingId: "cosmosdb.T5.recovery", TargetKey: "T5", Status: "Pass", StatusSort: 4, Finding: "T5 recovered: normalized RU was back at baseline by 17:05 UTC.", Evidence: "{}", WindowStart: "2026-11-13T17:04:00", WindowEnd: "2026-11-13T17:06:00", CapturedAt: "2026-11-13T17:10:00" },
+        { FindingId: "cosmosdb.T5.capture", TargetKey: "T5", Status: "Pass", StatusSort: 4, Finding: "Azure Monitor metrics of T5 cosmos01-test01.", Evidence: "{}", WindowStart: "2026-11-13T17:00:00", WindowEnd: "2026-11-13T17:06:00", CapturedAt: "2026-11-13T17:10:00" },
+    ],    "postgres-findings": [
         {
             FindingId: "postgresql.T4.capture",
             TargetKey: "T4",
@@ -163,34 +217,61 @@ export function fakeQueryClient(overrides: Record<string, Row[] | Error> = {}): 
             ran.push(spec.id);
             const value = overrides[spec.id] ?? FIXTURES[spec.id] ?? [];
             if (value instanceof Error) throw value;
-            return { spec, columns: spec.columns, rows: value, requestId: "test", fetchedAt: new Date(Date.UTC(2026, 9, 21, 21)) };
+            return { spec, columns: spec.columns, rows: value, requestId: "test", fetchedAt: new Date(Date.UTC(2026, 9, 21, 21)), provenance: "history" };
         }),
     };
 }
 
-export function renderWithApp(ui: ReactElement, options: { view?: Partial<ViewState>; client?: FakeQueryClient; embedded?: boolean } = {}) {
+export interface RenderOptions {
+    view?: Partial<ViewState>;
+    client?: FakeQueryClient;
+    embedded?: boolean;
+    manage?: ManageAccess;
+    /** No history yet: the first run. */
+    metaEmpty?: boolean;
+    /** Database Hub's live answers: the sample's, none (the app's function isn't deployed; the default), or a reader's. */
+    live?: "sample" | "off" | EstateReader;
+    /** What dbhub-app.json adds to the runtime, such as t2Migration. */
+    runtime?: Partial<AppRuntime>;
+}
+
+export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
+    setLiveEstateReader(
+        typeof options.live === "function"
+            ? options.live
+            : sampleLiveReader({ at: "2026-10-21T21:00:00.000Z", off: options.live === "sample" ? undefined : "The live estate function isn't deployed in this app." }),
+    );
     const setView = vi.fn();
+    const navigate = vi.fn();
     const notify = vi.fn();
     const view: ViewState = { ...DEFAULT_VIEW, ...options.view };
     const context: AppContextValue = {
-        runtime: RUNTIME,
+        runtime: { ...RUNTIME, ...options.runtime },
         embedded: options.embedded ?? true,
         view,
         setView,
-        filters: { targets: view.targets, window: null },
-        meta: toMeta(FIXTURES["history-meta"]),
-        theme: "aurora",
-        setTheme: vi.fn(),
-        motion: "reduced",
-        setMotion: vi.fn(),
+        navigate,
+        filters: { targets: sqlTargets(view.targets), window: null },
+        meta: options.metaEmpty ? null : toMeta(FIXTURES["history-meta"]),
+        metaLoading: false,
+        metaError: null,
+        provenance: "history",
         reducedMotion: true,
         notify,
+        manage: options.manage ?? MANAGE_READ_ONLY,
     };
+    const copilot: CopilotApi = { open: vi.fn(), ask: vi.fn() };
     const client = options.client ?? fakeQueryClient();
     const result = render(
-        <QueryClientContext.Provider value={client}>
-            <AppContext.Provider value={context}>{ui}</AppContext.Provider>
-        </QueryClientContext.Provider>,
+        <FluentProvider theme={webLightTheme}>
+            <QueryClientContext.Provider value={client}>
+                <CopilotContext.Provider
+                    value={{ api: copilot, dock: { isOpen: false, setOpen: vi.fn() }, account: { status: "unavailable", signIn: vi.fn(), signOut: vi.fn() }, attached: null }}
+                >
+                    <AppContext.Provider value={context}>{ui}</AppContext.Provider>
+                </CopilotContext.Provider>
+            </QueryClientContext.Provider>
+        </FluentProvider>,
     );
-    return { ...result, setView, notify, client };
+    return { ...result, setView, navigate, notify, client, copilot };
 }

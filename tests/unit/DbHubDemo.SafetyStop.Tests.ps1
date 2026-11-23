@@ -21,6 +21,9 @@ BeforeAll {
         'Microsoft.Sql/servers/databases/read'
         'Microsoft.DBforPostgreSQL/flexibleServers/read'
         'Microsoft.DBforPostgreSQL/flexibleServers/stop/action'
+        # T5's session-only container (2026-11-19, ADR 0024's amendment, approved by the owner).
+        'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
+        'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
     )
     $script:now = [datetime]::new(2026, 11, 5, 18, 0, 0, [System.DateTimeKind]::Utc)
 
@@ -376,14 +379,15 @@ Describe 'The nightly safety stop''s names, role, and times (ADR 0024)' {
         $name.RoleName | Should -Be 'DbHub Demo Safety Stop'
     }
 
-    It 'has exactly the owner-approved actions, as ADR 0024 lists them, and nothing that starts, writes, or deletes' {
+    It 'has exactly the owner-approved actions, as ADR 0024 lists them, nothing that starts or writes, and no delete but T5''s session-only container''s' {
         $definition = InModuleScope DbHubDemo { Get-DemoSafetyStopRoleDefinition -SubscriptionId '11111111-2222-3333-4444-555555555555' }
         $actions = @($definition.properties.permissions[0].actions)
         $actions | Should -Be $script:approvedActions
         @($definition.properties.permissions[0].notActions) | Should -BeNullOrEmpty
         @($definition.properties.permissions[0].dataActions) | Should -BeNullOrEmpty
         @($definition.properties.assignableScopes) | Should -Be @('/subscriptions/11111111-2222-3333-4444-555555555555')
-        @($actions | Where-Object { $_ -match '\*|/start/|/write$|/delete$|runCommand|Microsoft\.Authorization|Microsoft\.Automation|Microsoft\.KeyVault' }) | Should -BeNullOrEmpty
+        @($actions | Where-Object { $_ -match '\*|/start/|/write$|/delete$|runCommand|Microsoft\.Authorization|Microsoft\.Automation|Microsoft\.KeyVault' }) | Should -Be @('Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete')
+        $definition.properties.description | Should -Match 'read and delete its session-only Azure Cosmos DB container'
         $adr = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'docs/adr/0024-nightly-safety-stop.md') -Raw
         $section = [regex]::Match($adr, '(?s)### The role: DbHub Demo Safety Stop(.+?)\n### ').Groups[1].Value
         @([regex]::Matches($section, '(?m)^- `([^`]+)`$') | ForEach-Object { $_.Groups[1].Value }) | Should -Be $script:approvedActions
@@ -471,6 +475,62 @@ Describe 'Invoke-DemoSafetyStopSetup against a fake Azure (ADR 0024)' {
         $note | Should -Be 'The nightly safety stop is scheduled, but it can''t stop anything until its role is assigned: an Owner of the subscription runs, once, ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json. Until then T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply.'
     }
 
+    It 'as an Owner, updates an existing role in place and says what it added, as an update from before T5''s container lifecycle does (2026-11-19)' {
+        $script:roleId = 'eeeeeeee-0000-0000-0000-00000000000e'
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' })
+        $results = & $script:setup
+        $role = $results | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
+        $role.status | Should -Be 'Pass'
+        $role.message | Should -Match ('its definition was updated in place, under the same ID, to exactly the {0} approved actions; added: Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/delete\)' -f $script:approvedActions.Count)
+        $role.message | Should -Match 'delete T5''s container between sessions\.$'
+        @($role.evidence['added']).Count | Should -Be 2
+        @($role.evidence['removed']).Count | Should -Be 0
+        @($script:roleDefinitions[0]['permissions'][0]['actions']) | Should -Be $script:approvedActions
+    }
+
+    It 'as a Contributor, says the shared role is stale when another environment''s older code wrote it back, and never claims it deletes T5''s container (review of ab91ee5)' {
+        # In place before: the role and its assignment (an Owner's earlier run), then older code wrote the role back to 7 actions.
+        Set-FakeInPlace
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' })
+        $script:canDefine = $false
+        $script:canAssign = $false
+        $results = & $script:setup
+        $role = $results | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
+        $role.status | Should -Be 'Warning'
+        $role.message | Should -Match '^The role "DbHub Demo Safety Stop" for id-dbhub-demo-safetystop at rg-dbhub-demo is assigned, but the custom role "DbHub Demo Safety Stop" doesn''t have exactly its 9 approved actions: it doesn''t have Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft\.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
+        $role.message | Should -Match 'such as deleting T5''s container between sessions\.$'
+        $role.message | Should -Not -Match 'can stop the VMs and T4, read T3, and delete T5''s container'
+        $role.remediation | Should -Match 'grant-safety-stop\.ps1'
+        @($role.evidence['missingActions']).Count | Should -Be 2
+        @($script:writes | Where-Object { $_ -match 'roleDefinitions' }) | Should -BeNullOrEmpty
+        # DONE says exactly that (the re-review of 0590bbe): assigned, so the stop still stops the VMs and T4, but it can't
+        # delete T5's container; never that it can't stop anything until its role is assigned.
+        $staleNote = 'The nightly safety stop runs, but its role "DbHub Demo Safety Stop" doesn''t have exactly its 9 approved actions (it doesn''t have Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete; another environment''s deploy.ps1 on older code may have written it back for the whole subscription), so it still stops the VMs, stops T4, and reads T3, but it can''t delete T5''s container between sessions. An Owner of the subscription runs, once, ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json, or ./scripts/deploy.ps1, which writes it back to exactly its approved actions.'
+        InModuleScope DbHubDemo -Parameters @{ Result = $results } { Get-DemoSafetyStopNote -Result $Result } | Should -Be $staleNote
+        # As a Role Based Access Control Administrator, who assigns it but can't write it: the same Warning once assigned.
+        $script:assignments.Clear()
+        $script:canAssign = $true
+        $assignedResults = & $script:setup
+        $assigned = $assignedResults | Where-Object checkId -EQ 'SAFETYSTOP.ROLE'
+        $assigned.status | Should -Be 'Warning'
+        $assigned.message | Should -Match 'is assigned now, but the custom role'
+        InModuleScope DbHubDemo -Parameters @{ Result = $assignedResults } { Get-DemoSafetyStopNote -Result $Result } | Should -Be $staleNote
+    }
+
+    It 'says in DONE what a stale safety-stop role still does and what it can''t, from SAFETYSTOP.ROLE''s evidence (the re-review of 0590bbe)' {
+        $note = {
+            param([string[]] $Missing, [string[]] $Extra = @())
+            $evidence = [ordered]@{ roleDiffers = $true; assigned = $true; missingActions = $Missing; extraActions = $Extra; command = './scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json' }
+            $role = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'stale' -Evidence $evidence
+            InModuleScope DbHubDemo -Parameters @{ Result = @($role) } { Get-DemoSafetyStopNote -Result $Result }
+        }
+        & $note @('Microsoft.DBforPostgreSQL/flexibleServers/stop/action') | Should -Match 'so it still stops the VMs, reads T3, and deletes T5''s container between sessions, but it can''t stop T4\. '
+        & $note @() @('Microsoft.Compute/virtualMachines/start/action') | Should -Match '\(it has Microsoft\.Compute/virtualMachines/start/action, which isn''t approved; another environment''s.*\), so it still does all it''s for: it stops the VMs, stops T4, reads T3, and deletes T5''s container between sessions\. '
+        & $note @('Microsoft.Resources/subscriptions/resourceGroups/read') | Should -Match 'so it can''t stop the VMs, stop T4, read T3, and delete T5''s container between sessions\. '
+        # A role that isn't assigned: the sentence for that, as before.
+        $unassigned = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'not assigned' -Evidence ([ordered]@{ roleDiffers = $true; command = './scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json' })
+        InModuleScope DbHubDemo -Parameters @{ Result = @($unassigned) } { Get-DemoSafetyStopNote -Result $Result } | Should -Match '^The nightly safety stop is scheduled, but it can''t stop anything until its role is assigned'
+    }
     It 'as a Role Based Access Control Administrator: assigns the role when it exists, and needs an Owner to create it' {
         $script:canDefine = $false
         $script:roleId = 'eeeeeeee-0000-0000-0000-00000000000e'
@@ -738,6 +798,35 @@ Describe 'The nightly safety stop''s state, runs, and status (ADR 0024)' {
         $warned.remediation | Should -Match 'Process Automation > Jobs'
     }
 
+    It 'warns about T5''s container from its own field, apart from a stop that stopped what ran (review of ab91ee5, R910)' {
+        Set-FakeInPlace
+        $kept = 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000002' -Status 'Completed' -Created '2026-11-05T03:00:05Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; t5Status = 'NotGranted'; t5 = $kept; message = ('Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready), {0}.' -f $kept) }
+        $warned = & $script:status
+        $warned.status | Should -Be 'Warning'
+        $warned.message | Should -Match 'To check: its last run couldn''t read or delete T5''s container: its role doesn''t have the container''s actions, so the container, if it''s there, bills until \./scripts/stop-demo\.ps1 deletes it\.$'
+        $warned.message | Should -Not -Match 'didn''t finish its work' -Because 'the VMs and T4 stopped, which the cost check of T4''s restart reads'
+        $warned.remediation | Should -Be 'Run ./scripts/stop-demo.ps1 after each session, which deletes T5''s container with your rights. An Owner of the subscription runs, once: ./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json. It gives the role the container''s actions again.'
+        $warned.evidence.lastStopT5 | Should -Be 'NotGranted'
+        $script:jobs = @()
+        $script:outputs = @{}
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000004' -Status 'Completed' -Created '2026-11-05T03:00:05Z' -Result @{ action = 'stop-nightly'; status = 'Stopped'; t5Status = 'Deleted'; message = 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped, T5''s container deleted (its 400 RU/s stop billing until the next session creates it).' }
+        (& $script:status).status | Should -Be 'Pass'
+    }
+
+    It 'says an older runbook''s nightly run that was Partial only because of T5''s container stopped what ran, and names T5''s container instead (the re-review of 0590bbe)' {
+        # Runbooks published before 2026-11-19's t5Status put T5's container in the failed list, and the job Failed for it.
+        Set-FakeInPlace
+        $notGranted = 'T5''s container not deleted: this identity''s role can''t delete it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once'
+        Add-FakeJob -Id 'aaaaaaaa-0000-0000-0000-000000000002' -Status 'Failed' -Created '2026-11-05T03:00:05Z' -Result @{ action = 'stop-nightly'; status = 'Partial'; failed = @($notGranted); t5 = $notGranted; message = ('Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready); failed: {0}.' -f $notGranted) }
+        $warned = & $script:status
+        $warned.status | Should -Be 'Warning'
+        $warned.message | Should -Not -Match 'didn''t finish its work'
+        $warned.message | Should -Match 'To check: its last run couldn''t read or delete T5''s container: its role doesn''t have the container''s actions'
+        $warned.evidence.lastStopT5 | Should -Be 'NotGranted'
+        $warned.remediation | Should -Match '^Run \./scripts/stop-demo\.ps1 after each session'
+    }
+
     It 'warns, with the fix, when <Case>' -ForEach @(
         @{ Case = 'it isn''t set up'; Setup = { }; Match = '^The nightly safety stop isn''t in place \(the schedule dbhub-safety-stop doesn''t exist\), so only the VMs'' own auto-shutdown stops them at 19:00, and nothing stops T4'; Fix = '^Run \./scripts/deploy\.ps1' }
         @{ Case = 'its role isn''t assigned'; Setup = { Set-FakeInPlace; $script:assignments.Clear() }; Match = 'but it can''t stop anything: id-dbhub-demo-safetystop doesn''t hold .* So T4 isn''t stopped when Azure starts it again after 7 days; the VMs'' nightly auto-shutdown and T3''s auto-pause still apply\.$'; Fix = '^An Owner of the subscription runs, once: \./scripts/grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json$' }
@@ -831,6 +920,86 @@ Describe 'What stops T4 after its 7-day restart, and DONE (ADR 0024)' {
     }
 }
 
+Describe 'A nightly safety stop that this run sets up (2026-11-19, the coordinator''s option 2)' {
+    BeforeEach {
+        Reset-FakeAzure
+        Register-FakeAzure
+        Initialize-GuardTestContext
+        $script:plan = { InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoSafetyStopPlan -Config $Config } }
+        $script:permission = { InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig) } { Get-DemoDeployerRolePermission -Config $Config } }
+        $script:planResult = { param([object[]] $Result, [object[]] $Setup, [System.Collections.IDictionary] $Config) InModuleScope DbHubDemo -Parameters @{ Result = $Result; Setup = $Setup; Config = $Config } { New-DemoSafetyStopPlanResult -Result $Result -SetupResult $Setup -Config $Config -ConfigPath './config/demo.config.json' } }
+    }
+
+    It 'counts it for an Owner, who can write and assign its role, on a first deployment and on an update, and only reads' {
+        $script:groupMissing = $true
+        $owner = & $script:permission
+        $owner.CanDefine | Should -BeTrue
+        $owner.CanAssign | Should -BeTrue -Because 'before the demo resource group exists, the subscription''s permissions say whether the deployer can assign roles there'
+        $owner.Error | Should -BeNullOrEmpty
+        $first = & $script:plan
+        $first.Planned | Should -BeTrue
+        $first.Reason | Should -Be 'deploy.ps1 sets up the nightly safety stop in this run, right after its template, and you can assign its role'
+        $script:groupMissing = $false
+        (& $script:plan).Planned | Should -BeTrue
+        @($script:writes) | Should -BeNullOrEmpty
+    }
+
+    It 'doesn''t count it for a Contributor, the documented minimum, or for someone who can assign roles but not write a role that isn''t current' {
+        $script:canDefine = $false
+        $script:canAssign = $false
+        $contributor = & $script:plan
+        $contributor.Planned | Should -BeFalse
+        $contributor.Reason | Should -Match '^you can''t assign the nightly safety stop''s role'
+        $contributor.Evidence['canAssignRoles'] | Should -BeFalse
+        $script:canAssign = $true
+        $administrator = & $script:plan
+        $administrator.Planned | Should -BeFalse
+        $administrator.Reason | Should -Match 'custom role needs writing first'
+        # A role that already has exactly its approved actions needs no writing: assigning it is enough.
+        $script:roleId = 'dddddddd-0000-0000-0000-00000000000d'
+        $script:roleActions = $script:approvedActions
+        $ready = & $script:plan
+        $ready.Planned | Should -BeTrue
+        $ready.Evidence['roleReady'] | Should -BeTrue
+        # An older definition, without T5's container actions, needs writing again.
+        $script:roleActions = @($script:approvedActions | Select-Object -SkipLast 2)
+        (& $script:plan).Planned | Should -BeFalse
+    }
+
+    It 'doesn''t count it when the deployer''s permissions can''t be read (fail safe)' {
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoResourceGroupExist -MockWith { throw 'The resource groups couldn''t be listed: timeout' }
+        $unread = & $script:permission
+        $unread.CanDefine | Should -BeFalse
+        $unread.CanAssign | Should -BeFalse
+        $unread.Error | Should -Match 'timeout'
+        (& $script:plan).Planned | Should -BeFalse
+    }
+
+    It 'says so again on the status page when its setup in this run doesn''t put it in place: the worst case without it, the ceiling, and the fix' {
+        $monthly = New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t4RestartPlanned = $true; monthlyWorstCaseWithoutSafetyStop = 423.10 })
+        $role = New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'The role assignment failed: Conflict.'
+        $setup = @((New-TestResult 'SAFETYSTOP.RESOURCES'), (New-TestResult 'SAFETYSTOP.RUNBOOK'), (New-TestResult 'SAFETYSTOP.SCHEDULE'), $role)
+        $config = New-SafetyConfig
+        $config['monthlyCeilingUsd'] | Should -Be 415 -Because 'the example''s default for a new configuration since 2026-11-19'
+        $over = & $script:planResult @($monthly) $setup $config
+        $over.checkId | Should -Be 'DEPLOY.COST.T4RESTART'
+        $over.status | Should -Be 'Warning'
+        $over.message | Should -Match '^Preflight counted the nightly safety stop that this run sets up, but it isn''t fully in place \(SAFETYSTOP\.ROLE: The role assignment failed: Conflict\.\)'
+        $over.message | Should -Match 'the worst case is 423\.10 USD a month, over monthlyCeilingUsd \(415\.00 USD\)\.$'
+        $over.remediation | Should -Match 'grant-safety-stop\.ps1 -ConfigPath \./config/demo\.config\.json'
+        $over.remediation | Should -Match 'or raise monthlyCeilingUsd to at least 424 in your configuration\.$'
+        $over.evidence['overCeiling'] | Should -BeTrue
+        $config['monthlyCeilingUsd'] = 430
+        $within = & $script:planResult @($monthly) $setup $config
+        $within.message | Should -Match 'within monthlyCeilingUsd \(430\.00 USD\)\.$'
+        $within.remediation | Should -Not -Match 'raise monthlyCeilingUsd'
+        # Nothing when the setup put it in place, or when preflight didn't count it.
+        $passed = @($setup | ForEach-Object { New-TestResult ([string]$_.checkId) })
+        & $script:planResult @($monthly) $passed $config | Should -BeNullOrEmpty
+        $unplanned = New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'Within the ceiling.' -Evidence ([ordered]@{ t4RestartPlanned = $false })
+        & $script:planResult @($unplanned) $setup $config | Should -BeNullOrEmpty
+    }
+}
 Describe 'scripts/grant-safety-stop.ps1, the Owner''s one command' {
     It 'runs Invoke-DemoSafetyStopSetup -GrantRole and the control''s grant with the configuration, writes their results, and exits 0 on a Warning' {
         $configPath = Join-Path -Path $TestDrive -ChildPath 'demo.config.json'
@@ -839,13 +1008,18 @@ Describe 'scripts/grant-safety-stop.ps1, the Owner''s one command' {
         Mock -CommandName Invoke-DemoSafetyStopSetup -MockWith { New-DemoResult -CheckId 'SAFETYSTOP.ROLE' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message 'You can''t create role assignments.' }
         # The session control's roles too (2026-11-14, ADR 0026): one grant script for everything deploy.ps1 couldn't assign.
         Mock -CommandName Invoke-DemoActivityControlSetup -MockWith { New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'You can''t create role assignments.' }
+        # Then T5's container lifecycle (2026-11-19, ADR 0027): once a session can create the container again, it exists only
+        # during a session.
+        Mock -CommandName Update-DemoT5ContainerLifecycle -MockWith { New-DemoResult -CheckId 'GRANT.T5.LIFECYCLE' -Area 't5' -Target 'T5' -Status 'Pass' -Message 'T5''s container exists only during a session from now on.' }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/grant-safety-stop.ps1') -ConfigPath $configPath -OutputPath $outputPath
         $LASTEXITCODE | Should -Be 0
         Should -Invoke -CommandName Invoke-DemoSafetyStopSetup -Times 1 -ParameterFilter { $GrantRole -and $ConfigPath -eq $configPath }
         Should -Invoke -CommandName Invoke-DemoActivityControlSetup -Times 1 -ParameterFilter { $GrantRole -and $ConfigPath -eq $configPath }
+        Should -Invoke -CommandName Update-DemoT5ContainerLifecycle -Times 1 -ParameterFilter { $Purpose -eq 'Grant' }
         $written = Get-Content -LiteralPath $outputPath -Raw
         $written | Should -Match 'SAFETYSTOP\.ROLE'
         $written | Should -Match 'CONTROL\.ROLE\.A1'
+        $written | Should -Match 'GRANT\.T5\.LIFECYCLE'
     }
 }
 
@@ -968,7 +1142,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $item.checkId | Should -Be 'DEPLOY.NIGHTLYSTOP'
         $item.status | Should -Be 'Warning'
         $item.message | Should -Be 'The nightly stop waited for this run: its 19:00 stop (Pacific Standard Time) found deploy.ps1 still running, so it changed nothing. The demo now stops at 21:35 (Pacific Standard Time), 60 minutes after this run ended: the deferred pass dbhub-safety-deferred stops the VMs and T4, and the VMs'' auto-shutdown is set to that time for tonight.'
-        $item.remediation | Should -Be 'To keep the demo running tonight, run ./scripts/start-demo.ps1: it cancels this stop, and the next nightly stop is tomorrow at 19:00. To stop the demo now, run ./scripts/stop-demo.ps1.'
+        $item.remediation | Should -Be 'To keep the demo running tonight, run ./scripts/start-demo.ps1: it cancels this stop, and then its session stops by itself 4 hours after that start (-Hours sets them; since 2026-11-19), or at the next nightly stop, tomorrow at 19:00, if that comes first. To stop the demo now, run ./scripts/stop-demo.ps1.'
         $item.evidence['stopsAt'] | Should -Be '21:35'
         $script:groupTags['DbHubBusyBy'] | Should -Be 'deploy-grace'
         $script:groupTags['DbHubBusyUntilUtc'] | Should -Be '2026-11-06T05:30:00Z'
@@ -1066,7 +1240,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $settled.Count | Should -Be 1
         $settled[0].checkId | Should -Be 'START.NIGHTLYSTOP'
         $settled[0].status | Should -Be 'Pass'
-        $settled[0].message | Should -Be 'This session takes over from a run the nightly stop waited for: the deferred nightly pass dbhub-safety-deferred is removed, sqlvm01''s auto-shutdown is back at 19:00, archost01''s auto-shutdown is back at 19:00, the busy marker (deploy-grace) is cleared. The demo runs until ./scripts/stop-demo.ps1 or the next nightly stop at 19:00 (Pacific Standard Time).'
+        $settled[0].message | Should -Be 'This session takes over from a run the nightly stop waited for: the deferred nightly pass dbhub-safety-deferred is removed, sqlvm01''s auto-shutdown is back at 19:00, archost01''s auto-shutdown is back at 19:00, the busy marker (deploy-grace) is cleared. The demo runs until its auto-stop (START.CONTROL.AUTOSTOP says when), ./scripts/stop-demo.ps1, or the next nightly stop at 19:00 (Pacific Standard Time).'
         $script:schedules.Contains('dbhub-safety-deferred') | Should -BeFalse
         $script:shutdowns['archost01'] | Should -Be '1900'
         $script:groupTags['DbHubBusyUntilUtc'] | Should -BeNullOrEmpty

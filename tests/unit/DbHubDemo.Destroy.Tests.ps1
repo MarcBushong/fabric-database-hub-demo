@@ -145,6 +145,15 @@ Describe 'Get-DemoDestroyFabricPlan: only workspaces that are this environment''
         $plan.Demo.Guard | Should -BeNullOrEmpty
     }
 
+    It 'deletes the demo''s workspace with the Insights app''s functions item, which its deployment makes since 2026-11-18' {
+        # dbhubc6, 2026-11-19: destroy.ps1 kept the workspace for "UserDataFunction APP_DatabaseHub_Insights", the app's
+        # functions, which its backend makes under the app's own name (rayfin.yml services.functions).
+        $script:items['demo-ws'] = @(New-DemoWorkspaceItem) + @(New-FabricItem 'UserDataFunction' 'APP_DatabaseHub_Insights')
+        $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
+        $plan.Demo.Delete | Should -BeTrue
+        $plan.Demo.Reason | Should -Be 'everything in it is the demo''s (10 item(s))'
+    }
+
     It 'keeps a workspace another environment records as its own, and names it; the other workspace still goes (the shared-workspace guard)' {
         $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @([pscustomobject]@{ Name = 'rg-dbhubfd-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhubfd-demo'; Tagged = $true; Claims = @('demo-ws', '0a0a0a0a-0000-0000-0000-000000000001') }) }
         $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
@@ -165,6 +174,34 @@ Describe 'Get-DemoDestroyFabricPlan: only workspaces that are this environment''
             $workspace.Reason | Should -Be 'rg-dbhub-demo (subscription 99999999-2222-3333-4444-555555555555) was deployed by an earlier version of the demo, which doesn''t record the workspaces it uses, so it might use it'
             $workspace.Remediation | Should -Match '^Run \./scripts/destroy\.ps1 again after the next \./scripts/deploy\.ps1 of rg-dbhub-demo \(subscription 99999999-2222-3333-4444-555555555555\), which records the workspaces it uses, or after its destroy; or delete it in Fabric once nothing uses it'
         }
+    }
+
+    It 'says an environment being deployed hasn''t recorded its workspaces yet, never that an earlier version deployed it, and keeps both with the same fix (the final tests'' F15)' {
+        # Live, 2026-11-19: destroy.ps1 of dbhubfx ran while dbhubfy was being deployed, before its Control step recorded its
+        # workspaces, and said rg-dbhubfy-demo "was deployed by an earlier version of the demo".
+        $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @([pscustomobject]@{ Name = 'rg-dbhubfy-demo'; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = 'rg-dbhubfy-demo'; Tagged = $false; Deployment = 'Running'; Claims = @() }) }
+        $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
+        foreach ($workspace in $plan.Demo, $plan.Control) {
+            $workspace.Delete | Should -BeFalse -Because 'a workspace it might use is still kept'
+            $workspace.Guard | Should -Be 'Untagged'
+            $workspace.Reason | Should -Be 'rg-dbhubfy-demo is being deployed and hasn''t recorded its workspaces yet, so it might use it'
+            $workspace.Remediation | Should -Be 'Run ./scripts/destroy.ps1 again after the next ./scripts/deploy.ps1 of rg-dbhubfy-demo, which records the workspaces it uses, or after its destroy; or delete it in Fabric once nothing uses it (Workspace settings > Remove this workspace).'
+        }
+
+        # Each one says its own, and the fix still names them all.
+        $others = foreach ($case in @(
+                @{ Name = 'rg-dbhuba-demo'; Deployment = 'Running' }
+                @{ Name = 'rg-dbhubb-demo'; Deployment = 'Running' }
+                @{ Name = 'rg-dbhubc-demo'; Deployment = 'Unfinished' }
+                @{ Name = 'rg-dbhubd-demo'; Deployment = '' }
+            )) {
+            [pscustomobject]@{ Name = $case.Name; SubscriptionId = '11111111-2222-3333-4444-555555555555'; Label = $case.Name; Tagged = $false; Deployment = $case.Deployment; Claims = @() }
+        }
+        $script:claim = [pscustomobject]@{ Ok = $true; Error = ''; Others = @($others) }
+        $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
+        $plan.Demo.Delete | Should -BeFalse
+        $plan.Demo.Reason | Should -Be 'rg-dbhuba-demo and rg-dbhubb-demo are being deployed and haven''t recorded their workspaces yet, so they might use it; rg-dbhubc-demo hasn''t finished deploying and hasn''t recorded its workspaces yet, so it might use it; rg-dbhubd-demo was deployed by an earlier version of the demo, which doesn''t record the workspaces it uses, so it might use it'
+        $plan.Demo.Remediation | Should -Be 'Run ./scripts/destroy.ps1 again after the next ./scripts/deploy.ps1 of rg-dbhuba-demo, rg-dbhubb-demo, rg-dbhubc-demo, and rg-dbhubd-demo, which records the workspaces each uses, or after their destroy; or delete it in Fabric once nothing uses it (Workspace settings > Remove this workspace).'
     }
 
     It 'keeps both when Resource Graph can''t be read, and says so' {
@@ -198,6 +235,24 @@ Describe 'Get-DemoDestroyFabricPlan: only workspaces that are this environment''
         $plan = InModuleScope DbHubDemo -Parameters @{ Config = $config; Token = $script:token; Control = $script:control } { Get-DemoDestroyFabricPlan -Config $Config -Token $Token -Control $Control }
         $plan.Ok | Should -BeFalse
         $plan.Kind | Should -Be 'CapacityInactive'
+    }
+}
+
+Describe 'Get-DemoFabricDemoItem: what the Insights app''s deployment makes beside the app (2026-11-19)' {
+    It 'lists an item for each service the app''s rayfin.yml enables, and rayfin.yml enables none that makes another' {
+        # The app's backend makes a user data function for its connectors (<app>_connector) and one for its functions (the
+        # app's name); the data and storage services would make a SQL database or a lakehouse that destroy.ps1 doesn't know.
+        $yml = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/rayfin/rayfin.yml') -Raw
+        $enabled = { param([string] $Service) $yml -match ('(?m)^  {0}:[ \t]*\r?\n(?:    .*\r?\n)*?    enabled:[ \t]*true\b' -f $Service) }
+        $listed = @(InModuleScope DbHubDemo { Get-DemoFabricDemoItem -LakehouseName 'LH_DatabaseHub' } | ForEach-Object { '{0} {1}' -f $_.Type, $_.Name })
+        $listed | Should -Contain 'AppBackend APP_DatabaseHub_Insights'
+        (& $enabled 'functions') | Should -BeTrue
+        $listed | Should -Contain 'UserDataFunction APP_DatabaseHub_Insights'
+        $yml | Should -Match '(?m)^connectors:[ \t]*\r?\n(?:[ \t]+.*\r?\n)*?  - name:'
+        $listed | Should -Contain 'UserDataFunction APP_DatabaseHub_Insights_connector'
+        foreach ($service in 'data', 'storage') {
+            (& $enabled $service) | Should -BeFalse -Because "services.$service would make an item destroy.ps1 doesn't list"
+        }
     }
 }
 
@@ -237,6 +292,56 @@ Describe 'Get-DemoFabricWorkspaceClaim: the other demo environments, across the 
         @($fd.Claims) | Should -Be @('dddddddd-0000-0000-0000-000000000002', 'cccccccc-0000-0000-0000-000000000002')
         $claim.Others[1].Tagged | Should -BeFalse -Because 'an earlier version records no workspace'
         $claim.Others[2].Tagged | Should -BeFalse -Because 'a record that isn''t a workspace ID doesn''t count'
+        # 2026-11-19: this environment's own group, which deploy.ps1's DEPLOY.FABRIC.SHARED compares with the others.
+        $claim.Own.Found | Should -BeTrue
+        $claim.Own.FabricWorkspaceId | Should -Be 'dddddddd-0000-0000-0000-000000000001'
+        @($claim.Own.Claims) | Should -Be @('dddddddd-0000-0000-0000-000000000001')
+        $claim.Own.UsedFabric | Should -BeTrue -Because 'its last finished stage, Validation, comes after Fabric'
+    }
+
+    It 'says whether this environment''s own group finished a Fabric step, which one deployed before 2026-11-17 did without recording its workspace' {
+        foreach ($case in @(
+                @{ Tags = @{ deploymentId = 'aaaaaa'; DbHubTrackFabric = 'Fabric' }; Used = $true }
+                @{ Tags = @{ deploymentId = 'aaaaaa'; DbHubDeployStage = 'Fabric' }; Used = $true }
+                @{ Tags = @{ deploymentId = 'aaaaaa'; DbHubDeployStage = 'Infrastructure'; DbHubTrackFabric = '' }; Used = $false }
+            )) {
+            $script:rows = @(
+                [pscustomobject]@{ id = ('/subscriptions/{0}' -f $script:subscription); name = 'Demo subscription'; type = 'microsoft.resources/subscriptions'; subscriptionId = $script:subscription; tags = $null }
+                [pscustomobject]@{ id = ('/subscriptions/{0}/resourceGroups/rg-dbhub-demo' -f $script:subscription); name = 'rg-dbhub-demo'; type = 'microsoft.resources/subscriptions/resourcegroups'; subscriptionId = $script:subscription; tags = [pscustomobject]$case.Tags }
+            )
+            $claim = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoFabricWorkspaceClaim -Config $Config }
+            $claim.Own.Found | Should -BeTrue
+            $claim.Own.FabricWorkspaceId | Should -BeNullOrEmpty
+            $claim.Own.UsedFabric | Should -Be $case.Used
+            @($claim.Others).Count | Should -Be 0
+        }
+        $script:rows = @($script:rows | Select-Object -First 1)
+        (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoFabricWorkspaceClaim -Config $Config }).Own.Found | Should -BeFalse -Because 'a new environment has no group yet'
+    }
+
+    It 'tells another environment that''s being deployed, or whose deployment hasn''t finished, from one an earlier version deployed (the final tests'' F15)' {
+        $now = [datetime]::new(2026, 11, 19, 23, 0, 0, [System.DateTimeKind]::Utc)
+        $ahead = '2026-11-19T23:40:00Z'
+        $past = '2026-11-19T22:00:00Z'
+        $script:rows = @(
+            $script:rows[0]
+            # dbhubfy, live: a first deployment before its Control step, with its busy marker ahead.
+            & $group 'rg-dbhubfy-demo' @{ deploymentId = 'f1'; DbHubDeployStage = 'Infrastructure'; DbHubBusyBy = 'deploy'; DbHubBusyUntilUtc = $ahead }
+            # An update of a finished environment while it runs: its stage is still the last run's.
+            & $group 'rg-dbhubup-demo' @{ deploymentId = 'f2'; DbHubDeployStage = 'Validation'; DbHubBusyBy = 'deploy'; DbHubBusyUntilUtc = $ahead }
+            # A run that stopped before the end (NOT DONE), and one whose window closed, so its marker is past.
+            & $group 'rg-dbhubnd-demo' @{ deploymentId = 'f3'; DbHubDeployStage = 'T2' }
+            & $group 'rg-dbhubcr-demo' @{ deploymentId = 'f4'; DbHubDeployStage = 'Monitoring'; DbHubBusyBy = 'deploy'; DbHubBusyUntilUtc = $past }
+            # Finished: a session that's going, a run the nightly stop waited for, an expired run's marker, and only the template's tag.
+            & $group 'rg-dbhubss-demo' @{ deploymentId = 'f5'; DbHubDeployStage = 'Validation'; DbHubBusyBy = 'session'; DbHubBusyUntilUtc = $ahead }
+            & $group 'rg-dbhubgr-demo' @{ deploymentId = 'f6'; DbHubDeployStage = 'Validation'; DbHubBusyBy = 'deploy-grace'; DbHubBusyUntilUtc = $ahead }
+            & $group 'rg-dbhubex-demo' @{ deploymentId = 'f7'; DbHubDeployStage = 'Validation'; DbHubBusyBy = 'deploy'; DbHubBusyUntilUtc = $past }
+            & $group 'rg-dbhubol-demo' @{ deploymentId = 'f8' }
+        )
+        $claim = InModuleScope DbHubDemo -Parameters @{ Config = $config; Now = $now } { Get-DemoFabricWorkspaceClaim -Config $Config -NowUtc $Now }
+        $claim.Ok | Should -BeTrue
+        @($claim.Others | ForEach-Object { '{0}={1}' -f $_.Name, $_.Deployment }) | Should -Be @('rg-dbhubfy-demo=Running', 'rg-dbhubup-demo=Running', 'rg-dbhubnd-demo=Unfinished', 'rg-dbhubcr-demo=Unfinished', 'rg-dbhubss-demo=', 'rg-dbhubgr-demo=', 'rg-dbhubex-demo=', 'rg-dbhubol-demo=')
+        @($claim.Others | Where-Object { $_.Tagged }) | Should -BeNullOrEmpty
     }
 
     It 'can''t tell when Resource Graph fails, cuts its answer short, throws, or doesn''t list the subscription' {
@@ -420,7 +525,14 @@ Describe 'Remove-DemoEnvironment lists what it deletes and keeps before it asks 
             [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; Delete = @('the Fabric workspace "Database Hub Demo" (everything in it is the demo''s (9 item(s)))'); Keep = @('the Fabric capacity and your licenses, which you manage') }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDestroyExtra -MockWith { throw 'nothing is deleted in a what-if' }
-        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'nothing is deleted in a what-if' }
+        # Whether the golden group exists is read before the list (2026-11-19); nothing else reaches the Azure CLI first.
+        $script:goldenAnswer = "true`n"
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith {
+            if (($ArgumentList -join ' ') -match '^group exists --name rg-dbhub-golden ') {
+                return [pscustomobject]@{ ExitCode = 0; StdOut = $script:goldenAnswer; StdErr = '' }
+            }
+            throw 'nothing is deleted in a what-if'
+        }
     }
 
     It 'names each in a what-if, deletes nothing, and passes -KeepFabric on' {
@@ -430,6 +542,28 @@ Describe 'Remove-DemoEnvironment lists what it deletes and keeps before it asks 
         $result[-1].message | Should -Match 'and keep the Fabric capacity and your licenses, which you manage; rg-dbhub-golden and its golden snapshots \(-IncludeGolden deletes them\)\.$'
         $script:keepFabric | Should -BeTrue
         Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq 'destroy.ps1 keeps the Fabric capacity and your licenses, which you manage.' } -Times 1 -Exactly
+    }
+
+    It 'leaves a golden group that doesn''t exist out of what it keeps, and says it doesn''t exist (2026-11-19)' {
+        $script:goldenAnswer = "false`n"
+        $result = @(Remove-DemoEnvironment -Config $config -WhatIf)
+        $result[-1].message | Should -Match 'and keep the Fabric capacity and your licenses, which you manage\. rg-dbhub-golden doesn''t exist, so there''s no golden snapshot\.$'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -eq 'rg-dbhub-golden doesn''t exist, so there''s no golden snapshot.' } -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -like '*keeps rg-dbhub-golden*' } -Times 0 -Exactly
+    }
+
+    It 'says before it asks to remove T3 from Database agent settings and Save, and why, with Learn''s page; nothing without T3''s name (2026-11-20)' {
+        # Live, 2026-11-20: T3s that earlier destroys had deleted stayed in the tenant's selection, and every Save failed.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith {
+            [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; T3Agent = 'azuresql01-abc123'; Delete = @(); Keep = @('the Fabric capacity and your licenses, which you manage') }
+        }
+        $result = @(Remove-DemoEnvironment -Config $config -WhatIf)
+        $result.checkId | Should -Be @('PREFLIGHT.GUARD.CONTEXT', 'DESTROY.RESOURCEGROUP') -Because 'a what-if deletes nothing, so DESTROY.HUB.AGENT.T3 comes only once T3 is gone'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Level -eq 'Warning' -and $Message -like 'If you selected T3 for Database Agents, uncheck only it, azuresql01-abc123/ContosoCare, in Database Hub''s Database agent settings and Save, before or after destroy.ps1; no API can. Deleted databases can stay in that list for a while*DESTROY.HUB.AGENT.T3 at the end says how (https://learn.microsoft.com/fabric/database/hub/enable-database-agents).' }
+
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyExtraPlan -MockWith { [pscustomobject]@{ Control = $null; Fabric = $null; Group = $null; Delete = @(); Keep = @() } }
+        $null = @(Remove-DemoEnvironment -Config $config -WhatIf)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -like '*Database agent settings*' } -Because 'a plan without T3''s name, as when the group''s tag can''t be read, adds no line to the first run''s one'
     }
 
     It 'pauses a capacity it resumed (fabric.manageCapacity) only after the Fabric workspaces, whose deletes need it, and before the group' {
@@ -444,5 +578,50 @@ Describe 'Remove-DemoEnvironment lists what it deletes and keeps before it asks 
         Mock -ModuleName DbHubDemo -CommandName Get-DemoArcSetting -MockWith { $script:order.Add('Arc'); throw 'the order is known' }
         { Remove-DemoEnvironment -Config $config -Confirm:$false } | Should -Throw '*the order is known*'
         ($script:order -join ' > ') | Should -Be 'fabric, control, and group > capacity > Arc'
+    }
+}
+
+Describe 'Get-DemoDestroyExtraPlan keeps T3''s selection in Database agent settings, named from the group''s tag (2026-11-20)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyControlPlan -MockWith { [pscustomobject]@{ Name = $null; State = 'None'; ServedGroup = ''; Resources = @(); Reason = 'none' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDestroyGroupPlan -MockWith { [pscustomobject]@{ Id = ''; Name = ''; State = 'None'; Reason = 'none' } }
+    }
+
+    It 'names T3 from the deploymentId tag, and lists its selection as kept; none when the tag is <Case>' -ForEach @(
+        @{ Case = 'read'; Tags = @{ deploymentId = 'abc123' }; Server = 'azuresql01-abc123' }
+        @{ Case = 'missing (the group is gone)'; Tags = @{}; Server = '' }
+        @{ Case = 'not a deploymentId'; Tags = @{ deploymentId = 'ABC 12' }; Server = '' }
+    ) {
+        $script:tags = $Tags
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { $script:tags }
+        $plan = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoDestroyExtraPlan -Config $C -KeepFabric }
+        $plan.T3Agent | Should -Be $Server
+        $plan.NoT3 | Should -BeFalse -Because 'only the golden boot test''s group is known to have no T3'
+        $line = @($plan.Keep | Where-Object { $_ -like '*Database agent settings*' })
+        if ($Server) {
+            $line | Should -Be @('T3''s selection in Database Hub''s Database agent settings (azuresql01-abc123/ContosoCare), if you made it: no API removes it')
+        }
+        else {
+            $line.Count | Should -Be 0
+        }
+    }
+
+    It 'names no T3 for the golden boot test''s group, which has a deploymentId tag but never a T3, and says so in NoT3 (review of 5d1f4b0)' {
+        # test-t2-golden.ps1 deletes rg-<prefix>-gtest through this path. Its group has a random deploymentId tag, but
+        # infra/golden-test.bicep deploys only the network and archost01, so every run, -CleanupOnly too, ended with "1 item(s)
+        # need you: ... uncheck azuresql01-<random>/ContosoCare" for a database that never existed.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { @{ deploymentId = 'k3x9q2'; purpose = 't2-golden-boot-test'; environment = 'gtest' } }
+        $plan = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoDestroyExtraPlan -Config $C -KeepFabric }
+        $plan.T3Agent | Should -Be ''
+        $plan.NoT3 | Should -BeTrue
+        @($plan.Keep | Where-Object { $_ -like '*Database agent settings*' }).Count | Should -Be 0
+    }
+
+    It 'goes on without T3''s name when the tag can''t be read' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith { throw 'the Azure CLI isn''t answering' }
+        $plan = InModuleScope DbHubDemo -Parameters @{ C = (New-TestConfig) } { Get-DemoDestroyExtraPlan -Config $C -KeepFabric }
+        $plan.T3Agent | Should -Be ''
+        $plan.Keep | Should -Contain 'the Fabric capacity and your licenses, which you manage'
     }
 }

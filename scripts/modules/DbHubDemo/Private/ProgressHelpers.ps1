@@ -119,7 +119,7 @@ function Get-DemoProgressCatalog {
     T1 (artifacts, bootstrap, activity, monitoring, telemetry); T3; T4; Fabric (the Insights app included, marked
     non-blocking: it's part of every deployment, but it never blocks DONE); T2 (a golden restore, or the host build,
     which in JumpstartImage mode is the Jumpstart image's download and first boot, then the sign-in cleanup, Arc
-    onboarding, PAYG and monitoring, and telemetry;
+    onboarding, PAYG, monitoring, and migration assessment, and telemetry;
     Set-DemoProgressPlan skips what the T2 source doesn't use); Validation, with the history report's snapshot after it
     (Fabric.History, 2026-11-06; marked non-blocking, not with -SkipFabric). Each step has an id, a label, the track steps
     (Get-DemoTrackStep) it belongs to, and nonBlocking.
@@ -131,6 +131,8 @@ function Get-DemoProgressCatalog {
         [string] $InstallMode = 'JumpstartImage',
 
         [switch] $T4Enabled,
+
+        [switch] $T5Enabled,
 
         [switch] $SkipFabric
     )
@@ -171,11 +173,25 @@ function Get-DemoProgressCatalog {
                 )
             })
     }
+    if ($T5Enabled) {
+        # T5 (2026-11-18, ADR 0027): the Cosmos DB account's checks and T1's access to it run in T1's track, because the
+        # access check is the runner's warmup on sqlvm01, which runs one Run Command at a time. Its container's lifecycle
+        # (2026-11-19) follows the session control's setup, which deploy.ps1 itself runs (Update-DemoT5ContainerLifecycle):
+        # non-blocking, it never keeps the run from DONE.
+        $tracks.Add([ordered]@{ name = 'T5'; label = 'T5: Azure Cosmos DB'; steps = @(
+                    (& $step 'T5.Checks' 'Account checks and T1''s access (the data-plane role)' @('T1/T5'))
+                    (& $step 'T5.Lifecycle' 'Container only during a session (the session control''s role creates it at each session''s start)' @() $true)
+                    (& $step 'T5.Telemetry' 'Metrics in Azure Monitor (normalized RU, requests, 429s)' @('Validation'))
+                )
+            })
+    }
     if (-not $SkipFabric) {
         $tracks.Add([ordered]@{ name = 'Fabric'; label = 'Fabric'; steps = @(
                     (& $step 'Fabric.Items' 'Workspace, notebooks, and the Real-Time Dashboard' @('Fabric/Fabric'))
                     (& $step 'Fabric.Report' 'History report' @('Fabric/Fabric'))
                     (& $step 'Fabric.App' 'Insights app' @('Fabric/Fabric') $true)
+                    # Ask (ADR 0028): the app's Copilot chat relay, set up by the app's step (configure-fabric-app.ps1).
+                    (& $step 'Fabric.Ask' 'Copilot chat in the app (Ask: its relay scales to zero; each viewer signs in with GitHub once)' @('Fabric/Fabric') $true)
                 )
             })
     }
@@ -192,7 +208,7 @@ function Get-DemoProgressCatalog {
     $t2.Add((& $step 'T2.HostBuild' $hostBuild @('T2/T2')))
     $t2.Add((& $step 'T2.SignInCleanup' 'Sign-in data cleanup' @('T2/T2')))
     $t2.Add((& $step 'T2.ArcOnboarding' 'Arc onboarding' @('T2/T2')))
-    $t2.Add((& $step 'T2.Monitoring' 'PAYG and monitoring' @('T2/T2')))
+    $t2.Add((& $step 'T2.Monitoring' 'PAYG, monitoring, and migration assessment' @('T2/T2')))
     $t2.Add((& $step 'T2.Telemetry' 'Telemetry in Database Hub' @('T2/Telemetry')))
     # Displayed when it happens (issue #65, 2026-11-18): archost01 restarts its guest once for the run when PowerShell
     # Direct into it breaks while it runs; the T2 track and the run's end set it (Set-DemoGuestRecoveryProgress).
@@ -216,6 +232,9 @@ function Get-DemoProgressCatalog {
         # history snapshot have read it, unless a session uses it. Non-blocking: it never keeps the run from DONE.
         $validation.Add((& $step 'T4ReplicaEnd' 'T4''s read replica at the end (deleted unless a session uses it; start-demo.ps1 and Run all create it for each session)' @() $true))
     }
+    # The stop at the end of an update (2026-11-19, Invoke-DemoUpdateEndStop): once the run is DONE, what it started is
+    # stopped again when the demo was stopped when it began. Non-blocking: it never keeps the run from DONE.
+    $validation.Add((& $step 'EndStop' 'Stop at the end (an update stops again what it started, as it found the demo; -KeepRunning keeps it running)' @() $true))
     $tracks.Add([ordered]@{ name = 'Validation'; label = 'Validation'; steps = $validation.ToArray() })
     return $tracks.ToArray()
 }
@@ -238,6 +257,7 @@ function Get-DemoProgressStepId {
         'T1/Bootstraps' { return @('T1.Bootstraps') }
         'T1/T3' { return @('T3.Checks') }
         'T1/T4' { return @('T4.Setup') }
+        'T1/T5' { return @('T5.Checks') }
         'T1/Activity' { return @('T1.Activity') }
         'T1/Monitoring' { return @('T1.Monitoring') }
         'T1/Telemetry' { return @('T1.Telemetry') }
@@ -249,7 +269,7 @@ function Get-DemoProgressStepId {
         'T4/Server' { return @('T4.Server') }
         'T4/Replica' { return @('T4.Replica') }
         'T4/Telemetry' { return @('T4.Telemetry') }
-        'Fabric/Fabric' { return @('Fabric.Items', 'Fabric.Report', 'Fabric.App') }
+        'Fabric/Fabric' { return @('Fabric.Items', 'Fabric.Report', 'Fabric.App', 'Fabric.Ask') }
         default { return @() }
     }
 }
@@ -272,7 +292,7 @@ function Get-DemoProgressStepLabel {
         [string] $InstallMode = 'JumpstartImage'
     )
 
-    foreach ($track in @(Get-DemoProgressCatalog -T4Enabled -InstallMode $InstallMode)) {
+    foreach ($track in @(Get-DemoProgressCatalog -T4Enabled -T5Enabled -InstallMode $InstallMode)) {
         foreach ($item in @($track['steps'])) {
             if ([string]$item['id'] -ne $Id) {
                 continue
@@ -282,7 +302,7 @@ function Get-DemoProgressStepLabel {
                 $label = [string][char]::ToLowerInvariant($label[0]) + $label.Substring(1)
             }
             $group = ($Id -split '\.')[0]
-            if ($group -in 'T3', 'T4') {
+            if ($group -in 'T3', 'T4', 'T5') {
                 $label = '{0} {1}' -f $group, ($label -replace '^set up\b', 'setup')
             }
             return $label
@@ -785,6 +805,51 @@ function Set-DemoProgressStep {
     }
 }
 
+function Add-DemoProgressStepNote {
+    <#
+    .SYNOPSIS
+    Adds a later finding to a step that already ended, after its own message, and raises its status to -Status when that's
+    worse (2026-11-19: DEPLOY.COST.T4RESTART on the Infrastructure row, when the nightly safety stop that preflight counted
+    isn't in place after all). Never throws. Internal.
+    #>
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes the Git-ignored local progress model only.')]
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [string] $Path,
+
+        [Parameter(Mandatory)]
+        [string] $Id,
+
+        [Parameter(Mandatory)]
+        [string] $Status,
+
+        [Parameter(Mandatory)]
+        [string] $Note,
+
+        [ValidateRange(20, 4000)]
+        [int] $MaxLength = 1200
+    )
+
+    if (-not $Path) {
+        return
+    }
+    try {
+        $model = Read-DemoProgress -Path $Path
+        $item = if ($null -ne $model) { Find-DemoProgressStep -Model $model -Id $Id } else { $null }
+        if ($null -eq $item) {
+            return
+        }
+        $text = (@([string]$item['message'], $Note) | Where-Object { $_ }) -join ' '
+        $worst = Get-DemoWorstStatus -Status @(@([string]$item['status'], $Status) | Where-Object { $_ })
+        $state = if ([string]$item['state'] -in 'Done', 'Failed', 'Skipped', 'Action needed') { [string]$item['state'] } else { 'Done' }
+        Set-DemoProgressStep -Path $Path -Id $Id -State $state -Status $worst -Message $text -MaxLength $MaxLength
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The status page''s {0} row wasn''t updated: {1}' -f $Id, (Protect-DemoText -Text $_.Exception.Message))
+    }
+}
+
 function Set-DemoProgressStopped {
     <#
     .SYNOPSIS
@@ -888,7 +953,7 @@ function Set-DemoProgressValue {
         $clean = @(foreach ($entry in @($Value | Where-Object { $null -ne $_ })) {
                 [ordered]@{
                     name    = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'name'))
-                    state   = $(if ([string](Get-DemoMemberValue -InputObject $entry -Name 'state') -in 'Failed', 'Action needed') { [string](Get-DemoMemberValue -InputObject $entry -Name 'state') } else { 'Failed' })
+                    state   = $(if ([string](Get-DemoMemberValue -InputObject $entry -Name 'state') -in 'Failed', 'Action needed', 'Warning') { [string](Get-DemoMemberValue -InputObject $entry -Name 'state') } else { 'Failed' })
                     message = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'message')) -MaxLength 1200
                     howTo   = Protect-DemoProgressText -Text ([string](Get-DemoMemberValue -InputObject $entry -Name 'howTo')) -MaxLength 1200
                 }
@@ -1056,12 +1121,13 @@ function Get-DemoProgressBanner {
                 $lines.Add(('- {0}' -f [string]$entry))
             }
         }
-        $lines.Add('Where to look: open Database Hub in the Fabric portal and look at Estate and Performance; then start an incident (./scripts/demo-control.ps1) and investigate it with the Database Agent.')
+        # DONE's own wording (2026-11-19): Copilot investigates, and where Run all is comes in the reason's notes
+        # (DEPLOY.CONTROL). No golden-snapshot suggestion: a snapshot bills every month, also after destroy.ps1 (S6).
+        $lines.Add('Where to look: open Database Hub in the Fabric portal, look at Estate and Performance, and investigate what you see with Copilot in Database Hub.')
         # What runs now, and how to choose the other profile (2026-11-03); a model from before it has no activity.
         if ([string]$run['activity']) {
             $lines.Add([string]$run['activity'])
         }
-        $lines.Add('Capture a golden snapshot with ./scripts/capture-t2-golden.ps1 to make future redeploys skip T2''s build.')
         return [pscustomobject]@{ Kind = 'Done'; Title = 'Done'; Lines = $lines.ToArray(); Problems = $problems; Command = '' }
     }
     $stale = Test-DemoProgressStale -Model $Model -NowUnix $NowUnix -HeartbeatMinutes $HeartbeatMinutes

@@ -6,8 +6,9 @@ subscription deployment record, and checks that nothing is left (plan section 9.
 
 .DESCRIPTION
 Arc onboarding creates the T2 guest's Arc resources outside the template, so they're deleted explicitly,
-SQL Server instances first, then machines. Then the resource group goes, with T3, the budget, and Bastion,
-then the subscription-scope deployment record dbhub-<environment>-main. Last, the residual check
+SQL Server instances first, then machines, and T4's read replica before its server. Then the resource group goes
+with everything in it (the VMs, T3, T4, T5, Ask's chat relay, the network, and Bastion), then the subscription-scope
+deployment record <prefix>-<environment>-main and the group's budget, which outlive the group. Last, the residual check
 (Test-DemoTeardownResidue, TEARDOWN.RESIDUAL.*) confirms that nothing carrying the environment's deploymentId, no
 Arc resource, role assignment, managed identity, P6 membership, deployment record, or budget is left
 (DESTROY.RESIDUAL; docs/cleanup.md). Only this environment counts: its resource group by its exact name and its
@@ -16,10 +17,14 @@ deploymentId, never another prefix's environment with the same environment name.
 It deletes the rest of what deploy.ps1 created too, each only when it can tell it's this environment's (2026-11-17):
 the session control in rg-<prefix>-control, when its runbooks serve this environment's resource group; the demo's
 Fabric workspace, when every item in it is one the demo creates, and the control's, when its control notebook serves
-this environment; the T3 administrators' security group, when init.ps1 created it for this environment; and the custom
+this environment; the T3 and T4 administrators' security group, when init.ps1 created it for this environment; and the custom
 role definitions, once no role assignment holds them. What isn't this environment's stays, and the results say why.
 -KeepFabric keeps the Fabric workspaces and the history. The Fabric capacity and your licenses are never touched.
 It asks for confirmation, listing what it deletes and what it keeps, unless -Force.
+T3's selection in Database Hub's Database agent settings stays too, because no API removes it (2026-11-20): before it
+asks, and at its end (DESTROY.HUB.AGENT.T3, Manual action required, which doesn't change the exit code), it says to
+remove T3 there and Save, before or after this run. Deleted databases can stay in that list, selected, for a while, and
+while one is, every Save there fails (docs/database-agents.md).
 With -IfExpired (the scheduled expiry workflow) it deletes only when the resource group's expiresOn tag
 (expiresOn in the configuration) has passed, and otherwise does nothing. Running it again after an
 interruption finishes the cleanup.
@@ -60,7 +65,8 @@ Fail), so give each environment its own path to keep both.
 
 .PARAMETER IncludeGolden
 Also delete rg-<prefix>-golden and its T2 golden snapshots (ADR 0018). Without it, the golden group stays, so
-the next deploy.ps1 restores T2 from it (DESTROY.GOLDEN says so).
+the next deploy.ps1 restores T2 from it (DESTROY.GOLDEN says so). A golden group that doesn't exist is never listed
+as kept: DESTROY.GOLDEN is then a Pass that says it doesn't exist, with or without -IncludeGolden.
 
 .PARAMETER WithoutGolden
 Changes nothing now. Until 2026-11-09 it let destroy.ps1 delete a PaygWizard environment that no boot-verified golden

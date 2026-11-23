@@ -25,6 +25,11 @@ early warning) and, in JumpstartImage mode, the Jumpstart image's etag, Last-Mod
 Since 2026-11-18 both views also print guestRecovery, the last restart that cleared a broken PowerShell Direct channel
 into the T2 guest, read from guest-recovery.json itself (issue #65): when, by whom, its run key, how long it took, how
 the guest stopped, whether it answered again, and the first 200 characters of the error.
+Since 2026-11-19, on the T2 host (role ArcHost), both views report a bootstrap generation that the loader started in the
+last 30 minutes and health.json doesn't report yet as InProgress (status Warning), with that generation, state.json's
+current step once its pass has started, generationPending, and health.json's own generation and state
+(reportedGeneration, reportedState): that pass checks every step again and writes health.json only when a step
+converges or when it ends, so health.json's "Ready" is still the pass before's (#65 follow-up).
 That always fits in 4 KB, even when instructions are long.
 
 .PARAMETER Root
@@ -240,6 +245,77 @@ function Get-DemoHealthRecoveryFact {
     }
 }
 
+function Get-DemoHealthPassFact {
+    # The bootstrap generation that the loader started on the T2 host and health.json doesn't report yet (#65 follow-up).
+    # A new generation's pass checks every step again, and it writes health.json only when a step converges or when it
+    # ends, so until then health.json still has the pass before's report, "Ready" from the generation before; on the user's
+    # update (2026-11-18), deploy.ps1's PowerShell Direct sessions into the guest went ahead on that report and broke while
+    # the pass ran. Returns generation (settings.json's), reportedGeneration and reportedState (health.json's), loaderRunUtc,
+    # and currentStep (state.json's, once that generation's pass has started). $null when health.json reports the newest
+    # generation, on a VM that isn't the T2 host (role ArcHost), and once the loader ran more than PendingMinutes ago: a
+    # pass has reported by then unless the bootstrap doesn't run, which health.json's own updatedUtc shows. Never throws.
+    param([string] $StateRoot, [object] $Health, [int] $PendingMinutes = 30, [datetime] $NowUtc = [DateTime]::UtcNow)
+
+    try {
+        $settingsPath = Join-Path -Path $StateRoot -ChildPath 'settings.json'
+        if ($null -eq $Health -or -not (Test-Path -LiteralPath $settingsPath -PathType Leaf)) {
+            return $null
+        }
+        $settings = [System.IO.File]::ReadAllText($settingsPath) | ConvertFrom-Json
+        $text = {
+            param([object] $Object, [string] $Name)
+            if ($null -eq $Object) {
+                return ''
+            }
+            $property = $Object.PSObject.Properties[$Name]
+            if (-not $property -or $null -eq $property.Value) {
+                return ''
+            }
+            # PowerShell 7's ConvertFrom-Json reads an ISO time as a DateTime; Windows PowerShell 5.1 keeps the text.
+            if ($property.Value -is [datetime]) {
+                return $property.Value.ToUniversalTime().ToString('o', [System.Globalization.CultureInfo]::InvariantCulture)
+            }
+            return [string]$property.Value
+        }
+        $role = & $text $settings 'role'
+        if (-not $role) {
+            $role = & $text $Health 'role'
+        }
+        $generation = & $text $settings 'generation'
+        $reported = & $text $Health 'generation'
+        if ($role -ne 'ArcHost' -or -not $generation -or [string]::Equals($generation, $reported, [System.StringComparison]::OrdinalIgnoreCase)) {
+            return $null
+        }
+        $loaderUtc = [datetime]::MinValue
+        $styles = [System.Globalization.DateTimeStyles]::AdjustToUniversal -bor [System.Globalization.DateTimeStyles]::AssumeUniversal
+        if (-not [datetime]::TryParse((& $text $settings 'loaderRunUtc'), [System.Globalization.CultureInfo]::InvariantCulture, $styles, [ref]$loaderUtc)) {
+            return $null
+        }
+        if (($NowUtc.ToUniversalTime() - $loaderUtc).TotalMinutes -gt $PendingMinutes) {
+            return $null
+        }
+        $fact = [ordered]@{
+            generation         = $generation
+            reportedGeneration = $reported
+            reportedState      = & $text $Health 'state'
+            loaderRunUtc       = $loaderUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+            currentStep        = $null
+        }
+        $statePath = Join-Path -Path $StateRoot -ChildPath 'state.json'
+        if (Test-Path -LiteralPath $statePath -PathType Leaf) {
+            $state = [System.IO.File]::ReadAllText($statePath) | ConvertFrom-Json
+            $step = & $text $state 'currentStep'
+            if ($step -and (& $text $state 'generation') -eq $generation) {
+                $fact['currentStep'] = $step
+            }
+        }
+        return $fact
+    }
+    catch {
+        return $null
+    }
+}
+
 $path = Join-Path -Path $Root -ChildPath 'health.json'
 $guestFacts = Get-DemoHealthGuestFact -StateRoot $Root -Guest $GuestName
 $rebuildFacts = Get-DemoHealthRebuildFact -StateRoot $Root -Guest $GuestName
@@ -253,6 +329,17 @@ if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
     return
 }
 $health = [System.IO.File]::ReadAllText($path) | ConvertFrom-Json
+# A generation whose pass hasn't reported yet is reported as in progress, with the pass's step (#65 follow-up), so no
+# caller takes the pass before's "Ready" for this one.
+$passFacts = Get-DemoHealthPassFact -StateRoot $Root -Health $health
+if ($null -ne $passFacts) {
+    $passStep = if ($passFacts['currentStep']) { 'at step {0}' -f $passFacts['currentStep'] } else { 'starting' }
+    $passMessage = 'Bootstrap generation {0}, which the loader started at {1}, checks every step again ({2}); health.json still has the report of generation {3} ({4}) until that pass converges a step or ends.' -f $passFacts['generation'], $passFacts['loaderRunUtc'], $passStep, $(if ($passFacts['reportedGeneration']) { $passFacts['reportedGeneration'] } else { 'none' }), $(if ($passFacts['reportedState']) { $passFacts['reportedState'] } else { 'no state' })
+    $passValues = [ordered]@{ state = 'InProgress'; status = 'Warning'; message = $passMessage; currentStep = $passFacts['currentStep']; generation = $passFacts['generation']; generationPending = $true; reportedGeneration = $passFacts['reportedGeneration']; reportedState = $passFacts['reportedState'] }
+    foreach ($name in $passValues.Keys) {
+        $health | Add-Member -NotePropertyName $name -NotePropertyValue $passValues[$name] -Force
+    }
+}
 if ($View -eq 'Summary') {
     $read = {
         param($Object, [string[]] $Names)
@@ -316,6 +403,11 @@ if ($View -eq 'Summary') {
     }
     if ($null -ne $recoveryFacts) {
         $summary['guestRecovery'] = $recoveryFacts
+    }
+    if ($null -ne $passFacts) {
+        $summary['generationPending'] = $true
+        $summary['reportedGeneration'] = $passFacts['reportedGeneration']
+        $summary['reportedState'] = $passFacts['reportedState']
     }
     Write-Output (ConvertTo-Json -InputObject $summary -Compress -Depth 4)
     return

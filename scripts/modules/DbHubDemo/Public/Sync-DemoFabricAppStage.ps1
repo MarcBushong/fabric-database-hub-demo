@@ -9,7 +9,8 @@ function Sync-DemoFabricAppStage {
     rayfin/.env, .env.local). Keeping that folder under out/ keeps every real ID out of Git. Each run:
     1. Mirrors the source into the stage: copies every file except build output, packages, and local files, and
        removes stage files the source no longer has. The CLI's own files (rayfin/.deployments.json, rayfin/.env,
-       .env.local, rayfin/.temp) and node_modules stay.
+       .env.local, rayfin/.temp) and node_modules stay; with -WorkspaceId, rayfin/.deployments.json loses its records of
+       other workspaces.
     2. Sets the connector's IDs in rayfin/.env (-EnvValues; rayfin.yml reads them as ${NAME}, so the committed file
        holds only placeholders) and writes public/dbhub-app.json (-DeployFile: the live links and the expected
        account, which the app reads at run time).
@@ -29,6 +30,11 @@ function Sync-DemoFabricAppStage {
     .PARAMETER DeployFile
     The content of public/dbhub-app.json: links (databaseHub, realTimeDashboard, report, workspace),
     expectedAccount, and expectedTenantId.
+
+    .PARAMETER WorkspaceId
+    The Fabric workspace the app deploys to. The stage then drops rayfin up's records of other workspaces
+    (Remove-DemoFabricAppStaleDeployment): rayfin up finds its record by the workspace's name, so after destroy.ps1 a
+    new workspace with the same name would reuse the deleted one's app. Without it, the records stay as they are.
 
     .PARAMETER SkipInstall
     Don't run npm ci (the dependencies result is Not selected).
@@ -52,6 +58,13 @@ function Sync-DemoFabricAppStage {
 
         [System.Collections.IDictionary] $DeployFile = @{},
 
+        # The live estate function's scope (rayfin/functions/src/scope.generated.ts): subscriptionId and resourceGroups.
+        # Without it, the stage gets an empty scope and the function answers that it has none.
+        [System.Collections.IDictionary] $FunctionScope = $null,
+
+        [AllowEmptyString()]
+        [string] $WorkspaceId = '',
+
         [switch] $SkipInstall,
 
         [ValidateRange(60, 7200)]
@@ -68,7 +81,8 @@ function Sync-DemoFabricAppStage {
     }
 
     # Paths relative to the project root, with forward slashes. Never copied from the source, never removed from the stage.
-    $keep = '^(node_modules|dist|coverage|\.vite|rayfin/\.temp)(/|$)|^(\.env|\.env\..*|rayfin/\.env|rayfin/\.env\..*|rayfin/\.deployments\.json|public/rayfin\.config\.json|public/dbhub-app\.json)$'
+    # The functions project (rayfin/functions) has its own packages and build output, and a scope written at deploy time.
+    $keep = '^(node_modules|dist|coverage|\.vite|rayfin/\.temp|rayfin/functions/node_modules|rayfin/functions/dist)(/|$)|^(\.env|\.env\..*|rayfin/\.env|rayfin/\.env\..*|rayfin/\.deployments\.json|public/rayfin\.config\.json|public/dbhub-app\.json|rayfin/functions/src/scope\.generated\.ts|rayfin/functions/local\.settings\.json|rayfin/functions/runtimemetadata\.json)$'
     $relativeOf = {
         param([string] $Root, [string] $Path)
         return [System.IO.Path]::GetRelativePath($Root, $Path).Replace('\', '/')
@@ -103,6 +117,7 @@ function Sync-DemoFabricAppStage {
 
     $copied = 0
     $removed = 0
+    $stale = @()
     try {
         $null = New-Item -ItemType Directory -Path $stage -Force
         foreach ($file in $sourceFiles) {
@@ -126,6 +141,9 @@ function Sync-DemoFabricAppStage {
             Sort-Object -Property { $_.FullName.Length } -Descending |
             Where-Object { -not (Get-ChildItem -LiteralPath $_.FullName -Force | Select-Object -First 1) } |
             ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force }
+        if ($WorkspaceId -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' -and $WorkspaceId -ne [guid]::Empty.ToString()) {
+            $stale = @(Remove-DemoFabricAppStaleDeployment -StagePath $stage -WorkspaceId $WorkspaceId -Confirm:$false)
+        }
 
         if ($EnvValues.Count -gt 0) {
             Set-DemoFabricAppEnvValue -Path (Join-Path -Path $stage -ChildPath 'rayfin/.env') -Values $EnvValues -Confirm:$false
@@ -133,39 +151,63 @@ function Sync-DemoFabricAppStage {
         $deployPath = Join-Path -Path $stage -ChildPath 'public/dbhub-app.json'
         $null = New-Item -ItemType Directory -Path (Split-Path -Path $deployPath -Parent) -Force
         [System.IO.File]::WriteAllText($deployPath, (($DeployFile | ConvertTo-Json -Depth 5) + "`n"), [System.Text.UTF8Encoding]::new($false))
+        if (Test-Path -LiteralPath (Join-Path -Path $source -ChildPath 'rayfin/functions/src') -PathType Container) {
+            [System.IO.File]::WriteAllText((Join-Path -Path $stage -ChildPath 'rayfin/functions/src/scope.generated.ts'), (Get-DemoFabricAppScopeSource -Scope $FunctionScope), [System.Text.UTF8Encoding]::new($false))
+        }
     }
     catch {
         $results.Add((New-DemoResult -CheckId 'FABRIC.APP.STAGE' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('The deploy stage {0} couldn''t be updated: {1}' -f $StagePath, $_.Exception.Message) -Remediation 'Close any program that holds files in the stage (an editor or a dev server), then run the script again.' -DocUrl $docUrl))
         return $results.ToArray()
     }
     $evidence = [ordered]@{ files = $sourceFiles.Count; copied = $copied; removed = $removed; envValues = @($EnvValues.Keys | Sort-Object); deployFileLinks = @(if ($DeployFile['links']) { $DeployFile['links'].Keys | Sort-Object }) }
-    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.STAGE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('The deploy stage {0} matches fabric/app ({1} files; {2} copied, {3} removed) and has the deploy-time values.' -f $StagePath, $sourceFiles.Count, $copied, $removed) -Evidence $evidence -DocUrl $docUrl))
+    $message = 'The deploy stage {0} matches fabric/app ({1} files; {2} copied, {3} removed) and has the deploy-time values.' -f $StagePath, $sourceFiles.Count, $copied, $removed
+    if ($stale.Count -gt 0) {
+        # Another workspace's record, which a destroyed environment leaves: rayfin up would reuse its deleted app.
+        $evidence['droppedDeployments'] = @($stale | ForEach-Object { [ordered]@{ key = $_.Key; workspaceId = $_.WorkspaceId; itemName = $_.ItemName } })
+        $message += ' It dropped rayfin up''s record of {0} other Fabric workspace(s) ({1}), which a deleted environment leaves behind, so rayfin up doesn''t reuse that app.' -f $stale.Count, (($stale | ForEach-Object { $_.Key }) -join ', ')
+    }
+    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.STAGE' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message $message -Evidence $evidence -DocUrl $docUrl))
 
-    # Dependencies: npm ci when the lock file changed since the last successful install.
+    # Dependencies: npm ci in the app and in its functions project, each when its lock file changed since its last install.
     $installDoc = 'https://docs.npmjs.com/cli/commands/npm-ci'
     if ($SkipInstall) {
         $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPENDENCIES' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'Skipped (-SkipInstall); the stage keeps the packages it has.' -DocUrl $installDoc))
         return $results.ToArray()
     }
-    $lockHash = Get-DemoFabricAppFileHash -Path (Join-Path -Path $stage -ChildPath 'package-lock.json')
-    $marker = Join-Path -Path $stage -ChildPath 'node_modules/.dbhub-lock.sha256'
-    $installed = if (Test-Path -LiteralPath $marker -PathType Leaf) { (Get-Content -LiteralPath $marker -Raw).Trim() } else { '' }
-    if ($installed -eq $lockHash -and (Get-DemoRayfinCliPath -StagePath $stage)) {
-        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPENDENCIES' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'The stage''s packages already match package-lock.json.' -Evidence @{ lockSha256 = $lockHash; installed = $false } -DocUrl $installDoc))
-        return $results.ToArray()
+    $projects = [System.Collections.Generic.List[object]]::new()
+    $projects.Add([pscustomobject]@{ Label = 'the app'; Path = $stage; NeedsCli = $true })
+    if (Test-Path -LiteralPath (Join-Path -Path $stage -ChildPath 'rayfin/functions/package-lock.json') -PathType Leaf) {
+        $projects.Add([pscustomobject]@{ Label = 'its functions'; Path = (Join-Path -Path $stage -ChildPath 'rayfin/functions'); NeedsCli = $false })
     }
-    $started = [System.Diagnostics.Stopwatch]::StartNew()
-    $install = Invoke-DemoFabricAppProcess -Tool 'npm' -ArgumentList @('ci', '--no-audit', '--no-fund', '--loglevel=error') -WorkingDirectory $stage -TimeoutSeconds $TimeoutSeconds
-    $seconds = [int]$started.Elapsed.TotalSeconds
-    if ($install.ExitCode -ne 0 -or -not (Get-DemoRayfinCliPath -StagePath $stage)) {
-        $detail = (@($install.StdErr, $install.StdOut) | Where-Object { $_ } | Select-Object -First 1)
-        if ($detail.Length -gt 600) {
-            $detail = $detail.Substring(0, 600)
+    $installedAny = $false
+    $seconds = 0
+    $hashes = [ordered]@{}
+    foreach ($project in $projects) {
+        $lockHash = Get-DemoFabricAppFileHash -Path (Join-Path -Path $project.Path -ChildPath 'package-lock.json')
+        $hashes[$project.Label] = $lockHash
+        $marker = Join-Path -Path $project.Path -ChildPath 'node_modules/.dbhub-lock.sha256'
+        $installed = if (Test-Path -LiteralPath $marker -PathType Leaf) { (Get-Content -LiteralPath $marker -Raw).Trim() } else { '' }
+        if ($installed -eq $lockHash -and (-not $project.NeedsCli -or (Get-DemoRayfinCliPath -StagePath $stage))) {
+            continue
         }
-        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPENDENCIES' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('npm ci failed in the stage (exit code {0}, {1} s): {2}' -f $install.ExitCode, $seconds, $detail) -Evidence @{ exitCode = $install.ExitCode; seconds = $seconds } -Remediation ('Check that Node.js {0} and npm can reach your npm registry, then run the script again.' -f ((Get-DemoFabricAppSetting)['supportedNodeMajors'] -join ', ')) -DocUrl $installDoc))
+        $started = [System.Diagnostics.Stopwatch]::StartNew()
+        $install = Invoke-DemoFabricAppProcess -Tool 'npm' -ArgumentList @('ci', '--no-audit', '--no-fund', '--loglevel=error') -WorkingDirectory $project.Path -TimeoutSeconds $TimeoutSeconds
+        $seconds += [int]$started.Elapsed.TotalSeconds
+        if ($install.ExitCode -ne 0 -or ($project.NeedsCli -and -not (Get-DemoRayfinCliPath -StagePath $stage))) {
+            $detail = (@($install.StdErr, $install.StdOut) | Where-Object { $_ } | Select-Object -First 1)
+            if ($detail.Length -gt 600) {
+                $detail = $detail.Substring(0, 600)
+            }
+            $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPENDENCIES' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message ('npm ci failed for {0} in the stage (exit code {1}, {2} s): {3}' -f $project.Label, $install.ExitCode, $seconds, $detail) -Evidence @{ exitCode = $install.ExitCode; seconds = $seconds; project = $project.Label } -Remediation ('Check that Node.js {0} and npm can reach your npm registry, then run the script again.' -f ((Get-DemoFabricAppSetting)['supportedNodeMajors'] -join ', ')) -DocUrl $installDoc))
+            return $results.ToArray()
+        }
+        [System.IO.File]::WriteAllText($marker, $lockHash, [System.Text.UTF8Encoding]::new($false))
+        $installedAny = $true
+    }
+    if (-not $installedAny) {
+        $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPENDENCIES' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'The stage''s packages already match their lock files.' -Evidence @{ lockSha256 = $hashes; installed = $false } -DocUrl $installDoc))
         return $results.ToArray()
     }
-    [System.IO.File]::WriteAllText($marker, $lockHash, [System.Text.UTF8Encoding]::new($false))
-    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPENDENCIES' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('npm ci installed the pinned packages in {0} s.' -f $seconds) -Evidence @{ lockSha256 = $lockHash; installed = $true; seconds = $seconds } -DocUrl $installDoc))
+    $results.Add((New-DemoResult -CheckId 'FABRIC.APP.DEPENDENCIES' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message ('npm ci installed the pinned packages in {0} s.' -f $seconds) -Evidence @{ lockSha256 = $hashes; installed = $true; seconds = $seconds } -DocUrl $installDoc))
     return $results.ToArray()
 }

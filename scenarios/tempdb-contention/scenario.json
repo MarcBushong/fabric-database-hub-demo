@@ -13,7 +13,7 @@
     "default": ["T2"],
     "notes": {
       "T1": "tempdb lives on the VM's local temporary disk.",
-      "T3": "Azure SQL Database's tempdb is managed by the service; with 1 vCore at most, fewer sessions run at once, so expect fewer latch waits and more CPU waits."
+      "T3": "Azure SQL Database's tempdb is managed by the service, so expect fewer latch waits and more CPU waits (seen at 1 vCore; T3's maximum is 2 vCores since 2026-11-18)."
     }
   },
   "parameters": {

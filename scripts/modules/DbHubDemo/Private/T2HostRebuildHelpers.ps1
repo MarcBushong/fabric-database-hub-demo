@@ -392,7 +392,7 @@ function Invoke-DemoT2HostRebuild {
         return [pscustomobject]@{ Rebuilt = ($Status -ne 'Fail'); Result = $result; Results = @($result) }
     }
     if ((Get-DemoHostVmName -Config $Config) -ne 'archost01') {
-        return (& $finish 'Fail' 'Only the nested T2 host, archost01, is rebuilt automatically; this configuration''s T2 is an Azure VM (t2Mode EvaluationOnlyAzureVm).' 'Rebuild T2 by hand: ./scripts/destroy.ps1, then ./scripts/deploy.ps1.')
+        return (& $finish 'Fail' 'Only the nested T2 host, archost01, is rebuilt automatically; this configuration''s T2 is an Azure VM (t2Mode EvaluationOnlyAzureVm).' 'Deploy the environment again: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1, which keeps the Fabric workspaces with their history.')
     }
     if (-not $PSCmdlet.ShouldProcess('archost01', 'Delete the T2 host and its disks, and create it again from its template')) {
         return [pscustomobject]@{ Rebuilt = $false; Result = $null; Results = @() }
@@ -407,11 +407,11 @@ function Invoke-DemoT2HostRebuild {
         $template = Get-DemoT2HostTemplate
     }
     catch {
-        return (& $finish 'Fail' ('archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, and the host wasn''t rebuilt: its template couldn''t be read ({1}). Nothing was deleted.' -f $why, (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/deploy.ps1 again from a complete checkout of the repository; or rebuild T2 by hand: ./scripts/destroy.ps1, then ./scripts/deploy.ps1.')
+        return (& $finish 'Fail' ('archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, and the host wasn''t rebuilt: its template couldn''t be read ({1}). Nothing was deleted.' -f $why, (Protect-DemoText -Text $_.Exception.Message)) 'Run ./scripts/deploy.ps1 again from a complete checkout of the repository; or deploy the environment again: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1.')
     }
     $parameters = Get-DemoT2HostDeploymentParameter -Config $Config -Template $template
     if (-not $parameters.Ok) {
-        return (& $finish 'Fail' ('archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, and the host wasn''t rebuilt: {1}. Nothing was deleted.' -f $why, $parameters.Error) 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template records archost01''s deployment again, and the run rebuilds the host if its agent still stays down. Or rebuild T2 by hand: ./scripts/destroy.ps1, then ./scripts/deploy.ps1.')
+        return (& $finish 'Fail' ('archost01''s VM agent stayed down, and a deallocate and start didn''t bring it back{0}, and the host wasn''t rebuilt: {1}. Nothing was deleted.' -f $why, $parameters.Error) 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template records archost01''s deployment again, and the run rebuilds the host if its agent still stays down. Or deploy the environment again: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1.')
     }
     Reset-DemoT2HostRecord -Config $Config -Confirm:$false
     Set-DemoProgressStep -Path $ProgressPath -Id $row -State 'Running' -AzureSide -Message 'Deleting archost01 and its disks (Azure-side; no action needed).'

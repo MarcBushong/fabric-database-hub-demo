@@ -10,12 +10,12 @@ dataSources: [databasehub-skill, telemetry-endpoint]
 capability: Lists the demo targets that Database Hub and the telemetry endpoint can see, with resource type, last sample time, and available history, and summarizes CPU, memory, storage, and blocking over a baseline window so an incident can be compared with it later.
 permission: Signed in to the Azure CLI as yourself in the demo tenant. The Database Hub skill needs a delegated user and the same Database Hub access as the in-Hub surface (P4); the telemetry endpoint needs Reader or higher on the subscription and Microsoft.Sql registered.
 responseShape: A table with one row per resource (type, last sample time, days of history, and CPU, memory, and blocking ranges), followed by coverage gaps, partial results, and the KQL or skill calls it ran.
-previewLimitation: The microsoft-sql-fdh plugin is read-only and calls Database Hub routes that its authors say aren't a public contract and can change; its health data covers CPU, storage, and memory, not IO. The telemetry endpoint and schema are previews with up to 7 days of retention.
+previewLimitation: The GA databasehub-cli skill is read-only and calls Database Hub routes that its own reference says aren't a public contract and can change; its SQL health data covers CPU, storage, and memory, not IO. The telemetry endpoint and schema are previews with up to 7 days of retention.
 fallback: Without an agent, run the Learn telemetry sample queries 1, 2, 3, and 8 in the Azure Data Explorer web UI against the documented connection and database, then show the Database Hub Performance page.
 actionPolicy: read-only
 adrPrompts: [estate-health-summary, target-most-pressure, baseline-vs-incident]
 sources:
-  - https://github.com/microsoft/microsoft-sql/tree/main/plugins/microsoft-sql-fdh
+  - https://github.com/microsoft/skills-for-fabric/tree/main/skills/databasehub-cli
   - https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry
   - https://learn.microsoft.com/fabric/database/hub/monitor-sql
 reviewed: 2026-10-20

@@ -25,7 +25,9 @@ function Invoke-DemoPreflight {
       or the capacity deploy.ps1 would create it on; the optional P11, Power BI viewer licensing, which
       the demo assumes since 2026-11-14 (Test-DemoFabricViewerLicense, Not selected, nothing read); and P12 and P13, the tenant settings the Insights
       app needs, which never block the run (Test-DemoFabricAppTenantSetting, PREFLIGHT.FABRIC.APPSETTINGS: a Pass, or a
-      Warning when one is off or can't be read; 2026-11-05).
+      Warning when one is off or can't be read; 2026-11-05). A workspace that exists and that another demo environment
+      records, while this one doesn't, is a Fail before anything is created (DEPLOY.FABRIC.SHARED, Get-DemoFabricSharedResult;
+      2026-11-19): one Azure Resource Graph query.
     - P6: the T3 Entra admin group exists and the caller owns it, read from Microsoft Graph with a token
       verified for the configured tenant (Invoke-DemoRestRequest). The group's display name is in the
       evidence (groupDisplayName), for T3's administrator login.
@@ -170,7 +172,7 @@ function Invoke-DemoPreflight {
         'Microsoft.GuestConfiguration', 'Microsoft.HybridConnectivity', 'Microsoft.Compute', 'Microsoft.Network',
         'Microsoft.Storage', 'Microsoft.Consumption', 'Microsoft.DevTestLab', 'Microsoft.Automation', 'Microsoft.KeyVault',
         'Microsoft.ManagedIdentity'
-    ) + @(if (Test-DemoT4Enabled -Config $Config) { 'Microsoft.DBforPostgreSQL' })
+    ) + @(if (Test-DemoT4Enabled -Config $Config) { 'Microsoft.DBforPostgreSQL' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'Microsoft.DocumentDB' })
     $providerStates = @{}
     foreach ($provider in @(Invoke-Az -Arguments @('provider', 'list') -Json)) {
         $providerStates[$provider.namespace] = $provider.registrationState
@@ -552,6 +554,14 @@ function Invoke-DemoPreflight {
     $results.Add((Test-DemoFabricHubSetting -Config $Config -CheckId 'PREFLIGHT.P4.HUBSETTING'))
     $fabricCheck = Test-DemoFabricResolution -Config $Config
     $results.Add($fabricCheck.Result)
+    # 2026-11-19: the workspace P5 found, when another demo environment records it and this one doesn't, is a Fail here,
+    # before anything is created, so a second environment never puts its items in another's workspace
+    # (DEPLOY.FABRIC.SHARED, Get-DemoFabricSharedResult); one this environment shares already is a Warning, and its update
+    # goes on. Nothing when the workspace is nobody else's or doesn't exist yet.
+    $sharedCheck = Get-DemoFabricSharedResult -Config $Config -WorkspaceId ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $fabricCheck.Result -Name 'evidence') -Name 'workspaceId'))
+    if ($null -ne $sharedCheck) {
+        $results.Add($sharedCheck)
+    }
     # P11 (optional): Power BI viewer licenses are assumed since 2026-11-14 (the user), so it's Not selected and reads
     # nothing; it used to warn on every deployment below F64.
     $results.Add((Test-DemoFabricViewerLicense -Config $fabricCheck.Config))
@@ -722,12 +732,28 @@ function Invoke-DemoPreflight {
     catch {
         Write-DemoLog -Level Warning -Message ('The T2 golden snapshots could not be listed, so the cost estimate leaves them out: {0}' -f $_.Exception.Message)
     }
+    # T5's free tier (2026-11-18, ADR 0027): the account's own, or whether the subscription's one free-tier account is free.
+    $costParameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $Config
+    # What deploy.ps1 can set up in this run (2026-11-19, the coordinator's option 2 and gap fix): the nightly safety stop's
+    # and the session control's roles need the deployer to assign them, and to write them when they aren't current.
+    $deployer = Get-DemoDeployerRolePermission -Config $Config
+    # T5's container lifecycle (2026-11-19): its throughput bills for the running hours only, as this run's lifecycle step
+    # will record it (Get-DemoT5CostLifecycle -ThisRunDeploys), unless the container stays between sessions. Priced all month
+    # only because nothing automatic deletes it (the re-review of 0590bbe), it never makes the hard ceiling a Fail by itself.
+    $t5Cost = Get-DemoT5CostLifecycle -Config $Config -ThisRunDeploys -Permission $deployer -Detail
+    $costParameters['T5ContainerLifecycle'] = $t5Cost.Lifecycle
+    if ($t5Cost.ManualDeleteOnly) {
+        $costParameters['T5ManualDeleteOnly'] = $true
+    }
     # T4's 7-day automatic restart (2026-11-04, ADR 0016): about a day per restart in the worst case only where a safety stop
     # is fully in place (the nightly safety stop, ADR 0024: its schedule, its role, and a last run that didn't fail; or the
     # control's); otherwise the rest of the month, with a Warning that names what's missing (PREFLIGHT.COST.T4RESTART). On
-    # a first deployment the nightly safety stop doesn't exist yet: this run sets it up after the template.
+    # a first deployment the nightly safety stop doesn't exist yet, and deploy.ps1 sets it up in this run, after its
+    # template: it counts as in place when the deployer can assign its role (Resolve-DemoT4RestartCoverage; 2026-11-19, the
+    # coordinator's option 2, which estimate-cost.ps1 uses too), and DEPLOY.COST.T4RESTART says so again if its setup then
+    # doesn't put it in place.
     if ($t4On) {
-        $costParameters['T4RestartCoverage'] = Get-DemoT4RestartCoverage -Config $Config
+        $costParameters['T4RestartCoverage'] = (Resolve-DemoT4RestartCoverage -Config $Config -Permission $deployer).Coverage
     }
     $results.Add((New-DemoT4RestartCoverageResult -Config $Config -Coverage $(if ($t4On) { $costParameters['T4RestartCoverage'] } else { $null }) -CheckPrefix 'PREFLIGHT'))
     $estimate = $null

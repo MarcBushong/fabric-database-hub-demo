@@ -24,7 +24,7 @@ internal sealed record ActivityProfilesDefinition
 
         // The source-generated deserializer sets missing init-only properties to null instead of running their
         // initializers, so optional collections are normalized here.
-        return parsed with
+        var definition = parsed with
         {
             Baseline = parsed.Baseline with { ByTarget = parsed.Baseline.ByTarget ?? [] },
             Profiles = parsed.Profiles.ToDictionary(
@@ -32,6 +32,8 @@ internal sealed record ActivityProfilesDefinition
                 p => p.Value with { Incidents = [.. (p.Value.Incidents ?? []).Select(i => i with { Parameters = i.Parameters ?? [] })] },
                 StringComparer.Ordinal),
         };
+        Validate(definition);
+        return definition;
     }
 
     public ProfileDefinition For(ProfileName name)
@@ -47,6 +49,23 @@ internal sealed record ActivityProfilesDefinition
         return Baseline.ByTarget.TryGetValue(target.ToString(), out var load)
             ? load
             : new BaselineLoad { Concurrency = Baseline.Concurrency, Intensity = Baseline.Intensity };
+    }
+
+    /// <summary>Refuses a slot whose recoveryMinutes isn't 0 to <see cref="IncidentSlot.MaximumRecoveryMinutes"/>, as activity-profiles.schema.json does.</summary>
+    private static void Validate(ActivityProfilesDefinition definition)
+    {
+        foreach (var (name, profile) in definition.Profiles)
+        {
+            foreach (var slot in profile.Incidents)
+            {
+                if (slot.RecoveryMinutes is < 0 or > IncidentSlot.MaximumRecoveryMinutes)
+                {
+                    throw new InvalidOperationException(string.Create(
+                        CultureInfo.InvariantCulture,
+                        $"Activity profile '{name}' has an invalid recoveryMinutes ({slot.RecoveryMinutes}) on its {slot.Target} {slot.Scenario} slot at minute {slot.StartMinute}: it must be 0 to {IncidentSlot.MaximumRecoveryMinutes}."));
+                }
+            }
+        }
     }
 
     private static ActivityProfilesDefinition LoadEmbedded()
@@ -104,6 +123,9 @@ internal sealed record ProfileDefinition
 
 internal sealed record IncidentSlot
 {
+    /// <summary>The most minutes <see cref="RecoveryMinutes"/> may be.</summary>
+    public const int MaximumRecoveryMinutes = 30;
+
     public required string Target { get; init; }
 
     public required string Scenario { get; init; }
@@ -128,6 +150,13 @@ internal sealed record IncidentSlot
     /// replica slot takes over); null runs on every host.
     /// </summary>
     public bool? Replica { get; init; }
+
+    /// <summary>
+    /// When set, the slot runs only in full and with this many minutes left before the profile's end for the target to
+    /// recover to its baseline (T5's ru-storm: normalized RU back under 100% and no 429s); a slot that can't is skipped, not
+    /// clipped. Null keeps the default: a slot is clipped at the profile's end.
+    /// </summary>
+    public int? RecoveryMinutes { get; init; }
 
     public Dictionary<string, string> Parameters { get; init; } = [];
 
@@ -424,7 +453,9 @@ internal static class ProfileScheduler
     /// The activities the profile wants at <paramref name="now"/> on <paramref name="target"/>; each ends at its window's end.
     /// The host starts one only when <see cref="PlannedActivity.CanStart"/> (enough time is left), but keeps a running one
     /// for as long as it's returned here. A slot that needs T4's read replica is planned only when
-    /// <paramref name="hasReplica"/> says the host has one configured.
+    /// <paramref name="hasReplica"/> says the host has one configured. A slot is clipped at the profile's end, except one
+    /// with <see cref="IncidentSlot.RecoveryMinutes"/>, which is planned only whole, within the profile, and with its
+    /// recovery before the profile's end.
     /// </summary>
     public static IReadOnlyList<PlannedActivity> Plan(
         ProfileState state,
@@ -492,7 +523,16 @@ internal static class ProfileScheduler
             foreach (var slot in profile.Incidents.Where(s => string.Equals(s.Target, target.ToString(), StringComparison.Ordinal) && s.RunsInCycle(index + 1) && s.RunsOnTier(parameters?.Tier) && s.RunsWithReplica(hasReplica)))
             {
                 var windowStart = cycleStart + TimeSpan.FromMinutes(slot.StartMinute);
-                var windowEnd = Min(windowStart + TimeSpan.FromMinutes(slot.DurationMinutes), end);
+                var windowStop = windowStart + TimeSpan.FromMinutes(slot.DurationMinutes);
+                if (slot.RecoveryMinutes is { } recovery && (windowStart < state.SetAt || windowStop + TimeSpan.FromMinutes(recovery) > end))
+                {
+                    // A slot that must run whole and leave its target time to recover (T5's ru-storm, R896) is skipped, never
+                    // clipped: its window began before the profile was set, or it and its recovery don't end before the
+                    // profile does. The target ends the profile at its baseline.
+                    continue;
+                }
+
+                var windowEnd = Min(windowStop, end);
                 if (now >= windowStart && windowEnd > now)
                 {
                     var scenario = catalog.Get(slot.Scenario);

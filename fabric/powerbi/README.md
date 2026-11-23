@@ -4,7 +4,7 @@ This folder holds the demo's history surface: a Direct Lake semantic model over 
 
 | Item | What it is |
 |---|---|
-| `SM_DatabaseHub_History` | Semantic model, Direct Lake on OneLake, over the five Delta tables that the notebooks write to `LH_DatabaseHub`: `validation_results`, `scenario_runs`, `telemetry_snapshots`, `analysis_findings`, and `incident_windows`. It has five calculated dimensions (Target, Status, Analysis, Signal, Date), 16 relationships, and 103 measures. |
+| `SM_DatabaseHub_History` | Semantic model, Direct Lake on OneLake, over the five Delta tables that the notebooks write to `LH_DatabaseHub`: `validation_results`, `scenario_runs`, `telemetry_snapshots`, `analysis_findings`, and `incident_windows`. It has five calculated dimensions (Target, Status, Analysis, Signal, Date), 16 relationships, and 114 measures. |
 | `RPT_DatabaseHub_History` | Report with four pages: **Estate at a glance**, **The incident, minute by minute** (also the drillthrough target on a target), **Signal explorer**, and **Readiness checks**, in the dark "DbHub Cockpit Dark" theme. Every page says it's history and gives its times in UTC. |
 
 The approved design is [`_brief/report-spec.md`](_brief/report-spec.md); its `Design Brief:` block is the contract that the report is generated from.
@@ -12,6 +12,12 @@ The approved design is [`_brief/report-spec.md`](_brief/report-spec.md); its `De
 The demo's Fabric app is a separate item: a Fabric Apps (preview) item built with the Rayfin SDK and CLI, over `SM_DatabaseHub_History` through the semantic model connector (Phase 19b). This folder and `configure-powerbi.ps1` create no app. The model's table, column, and measure names are the app's contract, so they stay stable.
 
 T4, the PostgreSQL flexible server, and its read replica (ADR 0025) have rows too, when the scripts passed their Azure Monitor metrics to the live-activity notebook: `telemetry_snapshots` and `analysis_findings` with the analysis `postgresql` and the targets `T4` and `T4-replica`, which the Target dimension names as **PostgreSQL target** rows and the Analysis dimension as **PostgreSQL (Azure Monitor)**. The report's measures and pages stay on the three SQL targets; T4's findings appear in its findings tables, and the Insights app's **PostgreSQL** page charts its metrics.
+
+T5, the Azure Cosmos DB account (ADR 0027), has rows the same way, when the control's Run all, `stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s history snapshot, or `configure-fabric.ps1 -RunLiveActivity` passed its Azure Monitor metrics (`COSMOS_METRICS`): analysis `cosmosdb` (**Azure Cosmos DB (Azure Monitor)**, group **Cosmos DB**) and target `T5` (**T5 · Azure Cosmos DB**, a **Cosmos DB target** row).
+
+- `telemetry_snapshots`: one row per interval, `resource_type` `databaseAccounts`, `resource_name` `cosmos01-<deploymentId>`, and `metric` with its `unit`: `NormalizedRUConsumption` (`percent`, maximum per interval), `TotalRequestUnits` (`RU`, total), `TotalRequests` (`requests`, count), `ThrottledRequests` (`requests`: TotalRequests with status code 429, count; 0 in an interval with requests and no 429s), `ServerSideLatencyGateway` (`ms`, average), and hourly `ProvisionedThroughput` (`RU/s`, maximum) and `ServiceAvailability` (`percent`, average).
+- `analysis_findings`: `cosmosdb.T5.capture`, `cosmosdb.T5.throttling`, one `cosmosdb.T5.throttle.<yyyymmddThhmm>` per throttling episode, and `cosmosdb.T5.recovery` (whether T5 was back at its baseline, with no 429s, before the capture's end).
+- Measures, folder **Cosmos DB** of Telemetry Snapshots: **Peak Norm RU (%)**, **Cosmos DB Requests**, **Throttled Requests (429s)**, **429 Rate (%)**, **RU Consumed**, **Provisioned RU/s**, **Cosmos DB Availability (%)**, **Cosmos DB Gateway Latency (ms)**, and **Cosmos DB Headline**, with the hidden **Has Cosmos DB Bins** for an empty state; and **Throttling Episodes** in Analysis Findings. Like the SQL sums, the sums count the latest capture of each bin, so two captures of one period at different intervals both count. The report's pages don't show T5.
 
 ## History and live
 

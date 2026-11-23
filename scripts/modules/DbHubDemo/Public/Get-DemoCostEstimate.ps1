@@ -22,7 +22,11 @@ function Get-DemoCostEstimate {
     - Defender for open-source relational databases (OpenSourceRelationalDatabases): the T4 server, per month,
       stopped or not (Phase 24, ADR 0019), and T4's read replica for the hours it exists (ADR 0025).
     - Defender CSPM (CloudPosture): T1 and the T2 host while they aren't deallocated, the T4 server all month, T4's read
-      replica while it exists, and the T3 server all month. Arc machines aren't billable resources.
+      replica while it exists, and the T3 server all month. Arc machines aren't billable resources, and neither is an
+      Azure Cosmos DB account (https://learn.microsoft.com/azure/defender-for-cloud/concept-cloud-security-posture-management).
+    - Defender for Azure Cosmos DB (CosmosDbs): T5's provisioned throughput, per 100 RU/s an hour, for the hours T5's
+      container exists: a session's running hours since 2026-11-19, or all month with -T5ContainerLifecycle AlwaysOn
+      (ADR 0027). The database has no throughput of its own, so without the container nothing is provisioned.
     - Defender for Storage: the deployment creates no storage accounts, so it adds nothing.
     Subscription-wide plans, such as Defender for Resource Manager, aren't attributed to the demo.
     Without -DefenderPlans the estimate excludes Defender and reports a Warning.
@@ -31,8 +35,20 @@ function Get-DemoCostEstimate {
     stop-demo.ps1 deletes it. So its compute (at T4's size), its storage (prorated by the hour), and its Defender
     plans are running costs, and no 7-day restart applies to it. A Burstable T4 has no replica.
 
+    T5's container (2026-11-19, ADR 0027) exists only during a session by default (-T5ContainerLifecycle Session): an
+    Azure Cosmos DB account has no stop, so start-demo.ps1 and Run all create the container and the stop paths delete it.
+    So its throughput, its storage (prorated by the hour), and Defender for Azure Cosmos DB are running costs; the
+    account's private endpoint and private DNS zone stay, and bill all month.
+
+    Bastion (2026-11-19): a default deployment and a default session have none. Only start-demo.ps1 -Interactive creates
+    it, for interactive access such as T2's missing-index fix, and it goes after bastionMaxHours. So -BastionHours defaults
+    to bastionHoursPerSession in config/profiles.json, 0 (it was 1); start-demo.ps1 -Interactive counts it for up to
+    bastionMaxHours, and estimate-cost.ps1 -BastionHours prices such a session.
+
     Returns hourly running cost, one demo-day session, idle monthly cost, and a light-use month, plus
-    validation results that compare them with the configured ceilings. The monthly ceiling is hard: a
+    validation results that compare them with the configured ceilings. PREFLIGHT.COST.MONTHLY says the month's worst case,
+    the total it compares with monthlyCeilingUsd (the light-use month plus T4's automatic restart), the ceiling, the
+    margin, and what it assumed: T4's restart hours and T5's container lifecycle (2026-11-19). The monthly ceiling is hard: a
     light-use month above monthlyCeilingUsd is Fail, or a Warning when only a T4 size the person didn't choose puts it
     over (2026-11-09; -SkipCeilingReference says when). A session above sessionCeilingUsd is a Warning. A
     missing price is reported as a Warning and left out of the totals, never guessed. Data disk tiers
@@ -82,6 +98,32 @@ function Get-DemoCostEstimate {
     restart counts as about a day, until the next safety stop: at most 4 a month, 96 hours (Get-DemoT4RestartWorstCase).
     Otherwise, or without it, the worst case counts T4 running for the rest of the month. PREFLIGHT.COST.MONTHLY says which
     one applies and why.
+
+    .PARAMETER T5FreeTier
+    Whether T5's Azure Cosmos DB account has, or gets, the subscription's free tier (Get-DemoT5FreeTierStatus; 2026-11-18,
+    ADR 0027): true prices its throughput and storage with the Free Tier meters (the first 1000 RU/s and 25 GB of an account
+    are free, so its 400 RU/s cost nothing); false, or $null when it wasn't checked, at list price, an upper bound, and
+    PREFLIGHT.COST.MONTHLY says which. -T5ContainerLifecycle says whether they bill all month or only while the demo
+    runs.
+
+    .PARAMETER T5ContainerLifecycle
+    When T5's container, the only part of the account with provisioned throughput, exists (2026-11-19, ADR 0027): Session,
+    the default, once the session control's role can create it (the resource group's DbHubT5Container tag), so it exists
+    only during a session, and its throughput, its storage (prorated by the hour), and Defender for Azure Cosmos DB, when
+    its plan (CosmosDbs) is on Standard, are running costs; AlwaysOn while that role can't create it, or in an environment
+    deployed before then (until ./scripts/deploy.ps1 runs as an Owner, or an Owner runs ./scripts/grant-safety-stop.ps1), so
+    the container stays between sessions and they bill all month, as before. T5's private endpoint and private DNS zone bill
+    all month either way. PREFLIGHT.COST.MONTHLY gives the difference between the two (T5AlwaysOnExtraMonthly).
+
+    .PARAMETER T5ManualDeleteOnly
+    With -T5ContainerLifecycle AlwaysOn (2026-11-19, the re-review of 0590bbe; the coordinator's decision, which the owner
+    can reverse): the container is priced all month only because nothing automatic deletes it after a session (the session
+    control holds no role, and no nightly safety stop can; Get-DemoT5CostLifecycle -Detail's ManualDeleteOnly), while
+    ./scripts/stop-demo.ps1 still does. Then, as for a T4 size the person didn't choose, the hard ceiling is a Warning, not
+    a Fail, when only that puts the month over monthlyCeilingUsd: the month with the container for the running hours only
+    fits. The Warning names the three fixes (an Owner's ./scripts/grant-safety-stop.ps1, a higher monthlyCeilingUsd, or
+    t5Enabled false), and the configured ceiling and its budget stay as they are. A month over the ceiling for any other
+    reason is still a Fail.
 
     .PARAMETER SkipCeilingReference
     Internal (2026-11-09): skips the reference size's estimate behind PREFLIGHT.COST.MONTHLY's Warning instead of a Fail
@@ -135,6 +177,14 @@ function Get-DemoCostEstimate {
 
         [AllowNull()]
         [object] $T4RestartCoverage = $null,
+
+        [AllowNull()]
+        [object] $T5FreeTier = $null,
+
+        [ValidateSet('Session', 'AlwaysOn')]
+        [string] $T5ContainerLifecycle = 'Session',
+
+        [switch] $T5ManualDeleteOnly,
 
         [switch] $SkipCeilingReference
     )
@@ -279,6 +329,18 @@ function Get-DemoCostEstimate {
     $ipItem = $ipItems | Where-Object { $_.meterName -eq 'Standard IPv4 Static Public IP' } | Select-Object -First 1
     Add-Component 'Bastion public IP' 'bastion' $ipItem 1 'hour'
 
+    # Ask's chat relay (ADR 0028): billed per second only while its replica runs, that is while someone uses the Copilot
+    # chat in the Insights app (it scales to zero after a few idle minutes), so a running hour is its upper bound; idle,
+    # it costs nothing.
+    $askSetting = Get-DemoAskSetting -Config $Config
+    if ($askSetting.Enabled) {
+        $acaItems = Get-CachedPrice "serviceName eq 'Azure Container Apps' and armRegionName eq '$location' and skuName eq 'Standard' and priceType eq 'Consumption'"
+        $askCpu = [double]$askSetting.ContainerApp['cpu']
+        $askMemory = [double](([string]$askSetting.ContainerApp['memory']) -replace 'Gi$', '')
+        Add-Component 'Ask relay vCPU (only while someone uses the Copilot chat)' 'running' ($acaItems | Where-Object { $_.meterName -eq 'Standard vCPU Active Usage' } | Select-Object -First 1) (3600 * $askCpu) 'vCPU-second'
+        Add-Component 'Ask relay memory (only while someone uses the Copilot chat)' 'running' ($acaItems | Where-Object { $_.meterName -eq 'Standard Memory Active Usage' } | Select-Object -First 1) (3600 * $askMemory) 'GiB-second'
+    }
+
     # Always billed (per month). Data disk tiers match the template (Resolve-DemoDataDiskTier, ADR 0016).
     $zone = if ($Config.Contains('zone') -and $Config['zone']) { [string]$Config['zone'] } else { '' }
     $diskOverride = Get-DemoDataDiskOverride -Config $Config
@@ -330,6 +392,8 @@ function Get-DemoCostEstimate {
     $t4ComputeItem = $null
     $t4WorstCase = $null
     $t4Restart = $null
+    $t4WorstCaseWithout = $null
+    $t4WorstCaseCapped = $null
     $t4ReplicaOn = $false
     if ($t4On -and $null -ne $sizing.t4) {
         # The size actually deployed: the t4SkuName setting or the default (General Purpose Standard_D4ds_v5 since
@@ -351,6 +415,18 @@ function Get-DemoCostEstimate {
             $t4Capped = $null -ne $T4RestartCoverage -and [bool](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Counts')
             $t4Restart = Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $t4Capped -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])
             $t4WorstCase = [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $t4Restart.Hours, 2)
+            # A safety stop that deploy.ps1 sets up in this run (2026-11-19, the coordinator's option 2): the worst case
+            # without it too, which the run reports when its setup doesn't put it in place (DEPLOY.COST.T4RESTART).
+            if ($t4Capped -and [bool](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Planned')) {
+                $t4Uncapped = Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $false -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])
+                $t4WorstCaseWithout = [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $t4Uncapped.Hours, 2)
+            }
+            # With a safety stop in place, whatever this estimate counts (the re-review of 0590bbe): the month after an Owner's
+            # grant-safety-stop.ps1, which T5's ceiling exception names.
+            $t4WorstCaseCapped = if ($t4Capped) { $t4WorstCase } else {
+                $t4CappedHours = (Get-DemoT4RestartWorstCase -HoursPerMonth $hoursPerMonth -LightUseHoursPerMonth $LightUseHoursPerMonth -Capped $true -StoppedDays ([int](Get-DemoPostgresSetting)['autoStartAfterStoppedDays'])).Hours
+                [System.Math]::Round([double]$t4ComputeItem.retailPrice * $t4ComputeQuantity * $t4CappedHours, 2)
+            }
         }
         # T4's read replica (2026-11-13, ADR 0025): created for each session and deleted after it, so everything it bills is
         # counted for the session's running hours only: its compute at T4's size, and its storage prorated by the hour (its
@@ -365,6 +441,40 @@ function Get-DemoCostEstimate {
 
     # T2 golden snapshots (ADR 0018): incremental snapshots are stored as Standard HDD, LRS or ZRS
     # (https://learn.microsoft.com/azure/virtual-machines/disks-incremental-snapshots).
+    # T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): an account has no stop, so its private endpoint and its private
+    # DNS zone bill all month, in both network modes. Its container, the only part with provisioned throughput (the database
+    # has none of its own), exists only during a session since 2026-11-19 (Session): start-demo.ps1 and Run all create it,
+    # and stop-demo.ps1, the session's end, and the nightly safety stop delete it. So its throughput and its storage
+    # (prorated by the hour, as T4's read replica's) bill for the running hours only. Cosmos DB bills provisioned throughput
+    # by the hour, and storage by the hourly amount stored (https://learn.microsoft.com/azure/cosmos-db/understand-your-bill).
+    # AlwaysOn, while the session control's role can't create the container, keeps it between sessions, so they bill all
+    # month, as before. On the free tier (the first 1000 RU/s and 25 GB of one account per subscription,
+    # https://learn.microsoft.com/azure/cosmos-db/free-tier), its throughput and storage are priced with the Free Tier
+    # meters, which cost nothing. Its periodic backup's two copies are free.
+    $t5On = Test-DemoT5Enabled -Config $Config
+    $t5Free = if ($null -eq $T5FreeTier) { $null } else { [bool]$T5FreeTier }
+    $t5Session = $T5ContainerLifecycle -ceq 'Session'
+    $t5Units = 0.0
+    if ($t5On) {
+        $cosmos = Get-DemoCosmosSetting
+        $t5Units = [double]$cosmos['throughputRUs'] / 100.0
+        $cosmosItems = Get-CachedPrice "serviceName eq 'Azure Cosmos DB' and armRegionName eq '$location' and productName eq 'Azure Cosmos DB' and priceType eq 'Consumption'"
+        $t5Sku = if ($t5Free -eq $true) { 'Free Tier' } else { 'RUs' }
+        $t5Label = if ($t5Free -eq $true) { 'free tier' } else { 'list price' }
+        $t5Throughput = $cosmosItems | Where-Object { $_.skuName -eq $t5Sku -and $_.meterName -eq '100 RU/s' -and $_.unitOfMeasure -match '^1\s*/?\s*Hour$' } | Select-Object -First 1
+        $t5Storage = $cosmosItems | Where-Object { $_.skuName -eq $t5Sku -and $_.meterName -eq 'Data Stored' } | Select-Object -First 1
+        if ($t5Session) {
+            Add-Component ('T5 throughput ({0} RU/s manual, {1}, for each session only)' -f $cosmos['throughputRUs'], $t5Label) 'running' $t5Throughput $t5Units '100 RU/s-hour'
+            Add-Component ('T5 storage (about {0} GB, {1}, for each session only)' -f $cosmos['estimatedStorageGB'], $t5Label) 'running' $t5Storage ([double]$cosmos['estimatedStorageGB'] / $hoursPerMonth) 'GB-month'
+        }
+        else {
+            Add-Component ('T5 throughput ({0} RU/s manual, {1})' -f $cosmos['throughputRUs'], $t5Label) 'idle' $t5Throughput ($t5Units * $hoursPerMonth) '100 RU/s-hour'
+            Add-Component ('T5 storage (about {0} GB, {1})' -f $cosmos['estimatedStorageGB'], $t5Label) 'idle' $t5Storage ([double]$cosmos['estimatedStorageGB']) 'GB-month'
+        }
+        Add-Component 'T5 private endpoint' 'idle' (Select-HourlyPrice "serviceName eq 'Virtual Network' and productName eq 'Virtual Network Private Link' and skuName eq 'Standard'" 'Standard Private Endpoint') $hoursPerMonth 'hour'
+        $t5DnsItems = Get-CachedPrice "serviceName eq 'Azure DNS' and skuName eq 'Private' and meterName eq 'Private Zone' and priceType eq 'Consumption'"
+        Add-Component 'T5 private DNS zone' 'idle' ($t5DnsItems | Where-Object { $_.armRegionName -notmatch 'Gov' } | Sort-Object -Property tierMinimumUnits, armRegionName | Select-Object -First 1) 1 'zone-month'
+    }
     foreach ($snapshot in @($GoldenSnapshots | Where-Object { $null -ne $_ })) {
         $snapshotSku = [string](Get-DemoMemberValue -InputObject $snapshot -Name 'Sku')
         $redundancy = if ($snapshotSku -match 'ZRS') { 'ZRS' } else { 'LRS' }
@@ -467,7 +577,20 @@ function Get-DemoCostEstimate {
             Add-Component 'Defender for open-source relational databases (T4 read replica, for each session only)' 'running' $ossItem (1.0 / $hoursPerMonth) 'server-month' -Defender
         }
     }
-    $attributed = @('VirtualMachines', 'SqlServerVirtualMachines', 'SqlServers', 'CloudPosture', 'StorageAccounts') + @(if ($t4On) { 'OpenSourceRelationalDatabases' })
+    if ($t5On -and $standardPlans.Contains('CosmosDbs')) {
+        # Defender for Azure Cosmos DB bills an account's provisioned throughput per 100 RU/s an hour
+        # (https://azure.microsoft.com/pricing/details/defender-for-cloud/), so only while T5's container exists: the running
+        # hours with Session, all month with AlwaysOn (2026-11-19, ADR 0027).
+        $billedPlans.Add('CosmosDbs')
+        $item = Select-HourlyPrice "serviceFamily eq 'Security' and productName eq 'Microsoft Defender for Azure Cosmos DB' and skuName eq 'Standard'" 'Standard 100 RU/s'
+        if ($t5Session) {
+            Add-Component ('Defender for Azure Cosmos DB (T5, {0:N0} RU/s, for each session only)' -f ($t5Units * 100)) 'running' $item $t5Units '100 RU/s-hour' -Defender
+        }
+        else {
+            Add-Component ('Defender for Azure Cosmos DB (T5, {0:N0} RU/s)' -f ($t5Units * 100)) 'idle' $item ($t5Units * $hoursPerMonth) '100 RU/s-hour' -Defender
+        }
+    }
+    $attributed = @('VirtualMachines', 'SqlServerVirtualMachines', 'SqlServers', 'CloudPosture', 'StorageAccounts') + @(if ($t4On) { 'OpenSourceRelationalDatabases' }) + @(if ($t5On) { 'CosmosDbs' })
     $notAttributed = @($standardPlans.Keys | Where-Object { $_ -notin $attributed })
 
     $sum = {
@@ -519,6 +642,32 @@ function Get-DemoCostEstimate {
         }
     }
     $t4FixedMonthly = if ($t4On) { [System.Math]::Round($t4Fixed, 2) } else { $null }
+    # T5 (ADR 0027): its fixed month, what it bills whatever the demo does (its private endpoint and DNS zone, and with
+    # AlwaysOn its container too), and its running hour (its container's, with Session; 2026-11-19). Then what AlwaysOn adds
+    # to the light-use month, or what Session saves: the container's month less its light-use hours, at the same prices.
+    $t5Fixed = 0.0
+    $t5Running = 0.0
+    $t5ContainerHourly = 0.0
+    $t5ContainerMonthly = 0.0
+    foreach ($component in $components) {
+        if ($component.Name -notmatch '^T5 |\(T5[,)]') {
+            continue
+        }
+        if ($component.Basis -eq 'idle') {
+            $t5Fixed += [double]$component.Cost
+        }
+        else {
+            $t5Running += [double]$component.Cost
+        }
+        if ($component.Name -match '^T5 (throughput|storage) |^Defender for Azure Cosmos DB \(T5,') {
+            $hourlyQuantity = if ($component.Basis -eq 'running') { [double]$component.Quantity } else { [double]$component.Quantity / $hoursPerMonth }
+            $t5ContainerHourly += [System.Math]::Round([double]$component.UnitPrice * $hourlyQuantity, 4)
+            $t5ContainerMonthly += [System.Math]::Round([double]$component.UnitPrice * $hourlyQuantity * $hoursPerMonth, 4)
+        }
+    }
+    $t5FixedMonthly = if ($t5On) { [System.Math]::Round($t5Fixed, 2) } else { $null }
+    $t5RunningHourly = if ($t5On) { [System.Math]::Round($t5Running, 4) } else { $null }
+    $t5AlwaysOnExtra = if ($t5On) { [System.Math]::Round([System.Math]::Max(0.0, $t5ContainerMonthly - $t5ContainerHourly * $LightUseHoursPerMonth), 2) } else { $null }
 
     $results = [System.Collections.Generic.List[object]]::new()
     $evidence = @{
@@ -543,15 +692,39 @@ function Get-DemoCostEstimate {
     if ($t4On) {
         $evidence['t4FixedMonthly'] = $t4FixedMonthly
         $evidence['t4AutoRestartWorstCaseMonthly'] = $t4WorstCase
+        $evidence['t4AutoRestartWithSafetyStopMonthly'] = $t4WorstCaseCapped
         $evidence['t4RestartAssumption'] = if ($null -ne $t4Restart -and $t4Restart.Restarts -gt 0) { 'SafetyStop' } else { 'RestOfMonth' }
         $evidence['t4RestartHours'] = if ($null -ne $t4Restart) { $t4Restart.Hours } else { $null }
         $evidence['t4RestartMissing'] = if ($null -eq $T4RestartCoverage) { 'NotChecked' } else { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Missing') }
+        # A safety stop that this run sets up (option 2): the worst case without it, for DEPLOY.COST.T4RESTART.
+        $evidence['t4RestartPlanned'] = $null -ne $t4WorstCaseWithout
+        if ($null -ne $t4WorstCaseWithout) {
+            $evidence['t4AutoRestartWorstCaseWithoutSafetyStopMonthly'] = $t4WorstCaseWithout
+            $evidence['monthlyWorstCaseWithoutSafetyStop'] = [System.Math]::Round($lightUseMonthly + $t4WorstCaseWithout, 2)
+            $evidence['t4RestartWithoutReason'] = [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'WithoutReason')
+            $evidence['t4RestartWithoutFix'] = [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'WithoutFix')
+        }
         # T4's read replica (ADR 0025): per session, so only in the running hours.
         $evidence['t4ReplicaIncluded'] = [bool]$t4ReplicaOn
         $evidence['t4ReplicaHourly'] = [System.Math]::Round($replicaRunning, 4)
         $evidence['t4ReplicaSession'] = [System.Math]::Round($replicaRunning * $DemoHours, 2)
         $evidence['t4ReplicaMonthly'] = [System.Math]::Round($replicaRunning * $LightUseHoursPerMonth, 2)
     }
+    $evidence['t5Enabled'] = [bool]$t5On
+    if ($t5On) {
+        $evidence['t5FixedMonthly'] = $t5FixedMonthly
+        $evidence['t5FreeTier'] = $t5Free
+        # T5's container (2026-11-19, ADR 0027): Session or AlwaysOn, its running hour, and the difference between the two.
+        $evidence['t5ContainerLifecycle'] = $T5ContainerLifecycle
+        $evidence['t5RunningHourly'] = $t5RunningHourly
+        $evidence['t5AlwaysOnExtraMonthly'] = $t5AlwaysOnExtra
+        $evidence['t5ManualDeleteOnly'] = [bool]$T5ManualDeleteOnly -and -not $t5Session
+    }
+    # The monthly check's worst case (2026-11-19): DEPLOY.T5.LIFECYCLE prices it again when the run records what preflight
+    # didn't assume.
+    $evidence['lightUseMonthly'] = $lightUseMonthly
+    $evidence['monthlyWorstCase'] = [System.Math]::Round($lightUseMonthly + [double]$t4WorstCase, 2)
+    $evidence['bastionHours'] = $BastionHours
     if ($defenderIncluded) {
         $evidence['defenderSession'] = $defenderSession
         $evidence['defenderMonthly'] = $defenderMonthly
@@ -570,7 +743,29 @@ function Get-DemoCostEstimate {
         $monthlyStatus = if ($lightUseMonthly + [double]$t4WorstCase -le $monthlyCeiling) { 'Pass' } else { 'Fail' }
         $sessionDefender = if ($defenderIncluded) { ' (of which Defender for Cloud: {0:N2} USD)' -f $defenderSession } else { '' }
         $monthlyDefender = if ($defenderIncluded) { ' (of which Defender for Cloud: {0:N2} USD)' -f $defenderMonthly } else { '' }
-        $monthlyMessage = '{0}: idle plus {1} hours of use is estimated at {2:N2} USD a month{3} against the hard ceiling of {4:N2} USD.' -f $ProfileName, $LightUseHoursPerMonth, $lightUseMonthly, $monthlyDefender, $monthlyCeiling
+        # The total the ceiling is checked against, its margin, and what it assumes (2026-11-19, the docs audit): the
+        # light-use month, T4's automatic restart, and T5's container, so the result says why it passed or failed.
+        $worstCulture = [System.Globalization.CultureInfo]::InvariantCulture
+        $worstMonth = [double]$evidence['monthlyWorstCase']
+        $worstMargin = [System.Math]::Round($monthlyCeiling - $worstMonth, 2)
+        $evidence['monthlyCeiling'] = $monthlyCeiling
+        $evidence['monthlyMargin'] = $worstMargin
+        $counted = [System.Collections.Generic.List[string]]::new()
+        $counted.Add([string]::Format($worstCulture, 'idle plus {0} hours of use, {1:N2} USD{2}', $LightUseHoursPerMonth, $lightUseMonthly, $monthlyDefender))
+        if ($t4On) {
+            if ($null -ne $t4Restart -and $null -ne $t4WorstCase) {
+                $counted.Add([string]::Format($worstCulture, 'T4''s automatic restart for {0:N0} hours, {1:N2} USD', [double]$t4Restart.Hours, [double]$t4WorstCase))
+            }
+            else {
+                $counted.Add('no T4 restart (its price couldn''t be read)')
+            }
+        }
+        if ($t5On) {
+            $counted.Add($(if ($t5Session) { 'T5''s container for the running hours only (Session)' } else { 'T5''s container all month (AlwaysOn)' }))
+        }
+        $countedText = if ($counted.Count -gt 1) { (@($counted)[0..($counted.Count - 2)] -join '; ') + '; and ' + $counted[$counted.Count - 1] } else { $counted[0] }
+        $versus = if ($worstMargin -ge 0) { [string]::Format($worstCulture, '{0:N2} USD under', $worstMargin) } else { [string]::Format($worstCulture, '{0:N2} USD over', -$worstMargin) }
+        $monthlyMessage = [string]::Format($worstCulture, '{0}: the month''s worst case is {1:N2} USD, {2} the hard ceiling of {3:N2} USD. It counts {4}.', $ProfileName, $worstMonth, $versus, $monthlyCeiling, $countedText)
         if ($null -ne $arcSqlWorstCase) {
             $monthlyMessage += ' If Defender for SQL also bills the Arc SQL instance while it''s disconnected (not documented), add up to {0:N2} USD.' -f $arcSqlWorstCase
         }
@@ -582,7 +777,8 @@ function Get-DemoCostEstimate {
                 ' Its compute price couldn''t be read, so its automatic restart isn''t counted.'
             }
             elseif ($t4Restart.Restarts -gt 0) {
-                [string]::Format($culture, ' Azure starts a stopped T4 again on its own after 7 days, and {0}, so the worst case counts up to {1} restarts a month of about a day each, until the next safety stop: {2:N0} hours, {3:N2} USD of T4 compute, against the ceiling.', [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Reason'), $t4Restart.Restarts, $t4Restart.Hours, [double]$t4WorstCase)
+                $plannedText = if ($null -ne $t4WorstCaseWithout) { [string]::Format($culture, ' If its setup in this run doesn''t put it in place, the worst case is {0:N2} USD a month, which the run then says (DEPLOY.COST.T4RESTART).', $lightUseMonthly + $t4WorstCaseWithout) } else { '' }
+                [string]::Format($culture, ' Azure starts a stopped T4 again on its own after 7 days, and {0}, so the worst case counts up to {1} restarts a month of about a day each, until the next safety stop: {2:N0} hours, {3:N2} USD of T4 compute, against the ceiling.{4}', [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Reason'), $t4Restart.Restarts, $t4Restart.Hours, [double]$t4WorstCase, $plannedText)
             }
             else {
                 $why = if ($null -eq $T4RestartCoverage) { 'whether the nightly safety stop is in place wasn''t checked' } else { [string](Get-DemoMemberValue -InputObject $T4RestartCoverage -Name 'Reason') }
@@ -631,12 +827,15 @@ function Get-DemoCostEstimate {
                         $monthlyStatus = 'Warning'
                         $month = [System.Math]::Round($lightUseMonthly + [double]$t4WorstCase, 2)
                         $evidence['ceilingReference'] = [ordered]@{ skuName = $reference; monthlyUsd = $referenceMonth; reason = $(if ($reference -ceq $asked -and $pinnedSku) { 'fallback' } else { 'init250' }) }
-                        $monthlyMessage += if ($evidence['ceilingReference']['reason'] -eq 'fallback') {
-                            [string]::Format($culture, ' This is a Warning, not a Fail: T4 runs as {0} only because Azure refused {1}, the size t4SkuName sets (deploy.ps1''s fallback chose {0}), and with T4 at {1} the month would be {2:N2} USD, within the ceiling; {0} brings it to {3:N2} USD.', $t4Sku, $reference, $referenceMonth, $month)
+                        $referenceText = if ($evidence['ceilingReference']['reason'] -eq 'fallback') {
+                            [string]::Format($culture, 'This is a Warning, not a Fail: T4 runs as {0} only because Azure refused {1}, the size t4SkuName sets (deploy.ps1''s fallback chose {0}), and with T4 at {1} the month would be {2:N2} USD, within the ceiling; {0} brings it to {3:N2} USD.', $t4Sku, $reference, $referenceMonth, $month)
                         }
                         else {
-                            [string]::Format($culture, ' This is a Warning, not a Fail: monthlyCeilingUsd is 250, which init.ps1 wrote by default from 2026-10-27 to 2026-11-04, when T4''s default size was Standard_B1ms; with T4 at that size the month would be {0:N2} USD, within it, and T4 at {1} brings it to {2:N2} USD.', $referenceMonth, $t4Sku, $month)
+                            [string]::Format($culture, 'This is a Warning, not a Fail: monthlyCeilingUsd is 250, which init.ps1 wrote by default from 2026-10-27 to 2026-11-04, when T4''s default size was Standard_B1ms; with T4 at that size the month would be {0:N2} USD, within it, and T4 at {1} brings it to {2:N2} USD.', $referenceMonth, $t4Sku, $month)
                         }
+                        $monthlyMessage += ' ' + $referenceText
+                        # What the status page's Preflight row says (2026-11-19): the worst case against the ceiling, and why it's a Warning.
+                        $evidence['ceilingWarning'] = [string]::Format($culture, 'The month''s worst case is {0:N2} USD, {1:N2} USD over the hard ceiling of {2:N2} USD. {3}', $worstMonth, -$worstMargin, $monthlyCeiling, $referenceText)
                         $monthlyRemediation = [string]::Format($culture, 'Raise monthlyCeilingUsd to at least {0:N0} in your configuration (the budget follows it at the next deploy.ps1 -FromStage Infrastructure), or keep it: deploy.ps1 and start-demo.ps1 go on, the Azure budget alerts at 50, 80, and 100 percent of it, and start-demo.ps1 stops starting the demo once this month''s actual cost reaches it.{1}', [System.Math]::Ceiling($month), $safetyFix)
                     }
                 }
@@ -644,6 +843,43 @@ function Get-DemoCostEstimate {
         }
         if ($networkModeAssumed) {
             $monthlyMessage += ' networkMode auto isn''t resolved yet, so the estimate assumes private mode (private endpoint and private DNS zone).'
+        }
+        if ($t5On) {
+            # T5 (ADR 0027): its private endpoint and DNS zone all month; its container's throughput, storage, and Defender
+            # for the running hours with Session (2026-11-19), all month with AlwaysOn; the free tier, when it was checked,
+            # prices the throughput and storage. Each case names the other's difference.
+            $t5Culture = [System.Globalization.CultureInfo]::InvariantCulture
+            $t5Defender = if ($billedPlans -contains 'CosmosDbs') { ', and Defender for Azure Cosmos DB' } else { '' }
+            $t5FreeText = if ($t5Free -eq $true) {
+                ' It has the subscription''s free tier, so its throughput and storage cost nothing.'
+            }
+            elseif ($t5Free -eq $false) {
+                ' It doesn''t have the free tier (another account in the subscription has it, or t5UseFreeTier is false), so its throughput is at list price.'
+            }
+            else {
+                ' Whether it can have the subscription''s free tier wasn''t checked, so its throughput is at list price, an upper bound; preflight checks it, and on the free tier it costs nothing.'
+            }
+            $t5Rus = (Get-DemoCosmosSetting)['throughputRUs']
+            if ($t5Session) {
+                $t5Other = if ($t5AlwaysOnExtra -gt 0) {
+                    [string]::Format($t5Culture, ' If the session control holds a role without the container''s actions (an update by someone who isn''t an Owner, until an Owner runs ./scripts/grant-safety-stop.ps1 once), the container stays between sessions and adds about {0:N2} USD a month.', [double]$t5AlwaysOnExtra)
+                }
+                else { '' }
+                $t5Parts = if ($billedPlans -contains 'CosmosDbs') { ', its storage, and Defender for Azure Cosmos DB' } else { ' and its storage' }
+                $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) costs {0:N2} USD a month whether the demo runs or not (its private endpoint and private DNS zone). Its container exists only during a session (start-demo.ps1 and Run all create it; stop-demo.ps1, the session''s end, and the nightly safety stop delete it), so its {1} RU/s of throughput{2} add {3:N3} USD a running hour.{4}{5}', [double]$t5FixedMonthly, $t5Rus, $t5Parts, [double]$t5RunningHourly, $t5FreeText, $t5Other)
+            }
+            elseif ($T5ManualDeleteOnly) {
+                # Only ./scripts/stop-demo.ps1 deletes the container (2026-11-19, the re-review): it's priced all month because
+                # nothing automatic does, not because it stays.
+                $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) is priced at {0:N2} USD a month (its {1} RU/s of throughput, storage, private endpoint, and private DNS zone{2}): its container exists only during a session, but only ./scripts/stop-demo.ps1 deletes it after one, since the session control has no role and the nightly safety stop''s role can''t, so the estimate counts it all month, about {3:N2} USD more than for the running hours only.{4}', [double]$t5FixedMonthly, $t5Rus, $t5Defender, [double]$t5AlwaysOnExtra, $t5FreeText)
+            }
+            else {
+                $t5Other = if ($t5AlwaysOnExtra -gt 0) {
+                    [string]::Format($t5Culture, ' Once ./scripts/deploy.ps1 runs as an Owner of the subscription, or an Owner runs ./scripts/grant-safety-stop.ps1 once, the container exists only during a session, which saves about {0:N2} USD a month.', [double]$t5AlwaysOnExtra)
+                }
+                else { '' }
+                $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) costs {0:N2} USD a month whether the demo runs or not (its {1} RU/s of throughput, storage, private endpoint, and private DNS zone{2}): its container stays between sessions until the session control''s role can create it.{3}{4}', [double]$t5FixedMonthly, $t5Rus, $t5Defender, $t5FreeText, $t5Other)
+            }
         }
         if ($t3UsesFreeOffer) {
             $monthlyMessage += ' T3 uses the Azure SQL Database free offer, whose monthly allowance covers {0:N2} USD of T3 compute and 32 GB of data.' -f $t3FreeCreditMonthly
@@ -663,6 +899,30 @@ function Get-DemoCostEstimate {
             }
             $monthlyMessage += $activityText
             $sessionActivity = $activityText
+        }
+        # 2026-11-19 (the re-review of 0590bbe; the coordinator's decision, which the owner can reverse): T5's container priced
+        # all month only because nothing automatic deletes it after a session (-T5ManualDeleteOnly: no session-control role,
+        # and no nightly safety stop that can, while ./scripts/stop-demo.ps1 does) never makes the hard ceiling a Fail by
+        # itself, when the month fits with it for the running hours only, as for a T4 size the person didn't choose (above):
+        # an existing configuration keeps its own ceiling, and a Contributor's update and start stay one click. A month over
+        # the ceiling for any other reason stays a Fail; the configured value stays, and the budget keeps alerting at it.
+        if ($monthlyStatus -eq 'Fail' -and $t5On -and -not $t5Session -and $T5ManualDeleteOnly -and [double]$t5AlwaysOnExtra -gt 0) {
+            $exceptionCulture = [System.Globalization.CultureInfo]::InvariantCulture
+            $sessionMonth = [System.Math]::Round($worstMonth - [double]$t5AlwaysOnExtra, 2)
+            if ($sessionMonth -le $monthlyCeiling) {
+                $monthlyStatus = 'Warning'
+                # After an Owner's grant: the container for the running hours only, and T4's restart about a day each, since
+                # the nightly safety stop then holds its role.
+                $grantMonth = $sessionMonth
+                if ($t4On -and $null -ne $t4WorstCase -and $null -ne $t4WorstCaseCapped) {
+                    $grantMonth = [System.Math]::Round($sessionMonth - [double]$t4WorstCase + [double]$t4WorstCaseCapped, 2)
+                }
+                $evidence['t5CeilingException'] = [ordered]@{ sessionMonthlyUsd = $sessionMonth; t5AlwaysOnExtraMonthly = [double]$t5AlwaysOnExtra; grantMonthlyUsd = $grantMonth }
+                $exception = Get-DemoT5CeilingExceptionText -ExtraMonthly ([double]$t5AlwaysOnExtra) -SessionMonthly $sessionMonth -GrantMonthly $grantMonth -WorstMonthly $worstMonth
+                $monthlyMessage += ' ' + $exception.Text
+                $evidence['ceilingWarning'] = [string]::Format($exceptionCulture, 'The month''s worst case is {0:N2} USD, {1:N2} USD over the hard ceiling of {2:N2} USD. {3}', $worstMonth, -$worstMargin, $monthlyCeiling, $exception.Text)
+                $monthlyRemediation = $exception.Fix
+            }
         }
         # T4's read replica (ADR 0025): its share of the session, which start-demo.ps1 -SkipT4Replica leaves out.
         $sessionReplica = ''
@@ -728,6 +988,10 @@ function Get-DemoCostEstimate {
         SessionCost                    = $sessionCost
         IdleMonthly                    = $idleMonthly
         LightUseMonthly                = $lightUseMonthly
+        MonthlyWorstCase               = [System.Math]::Round($lightUseMonthly + [double]$t4WorstCase, 2)
+        MonthlyCeiling                 = $(if ($CurrencyCode -eq 'USD') { [double]$Config['monthlyCeilingUsd'] } else { $null })
+        MonthlyMargin                  = $(if ($CurrencyCode -eq 'USD') { [System.Math]::Round([double]$Config['monthlyCeilingUsd'] - ($lightUseMonthly + [double]$t4WorstCase), 2) } else { $null })
+        BastionHours                   = $BastionHours
         DefenderIncluded               = $defenderIncluded
         DefenderSession                = $defenderSession
         DefenderMonthly                = $defenderMonthly
@@ -742,6 +1006,12 @@ function Get-DemoCostEstimate {
         T4ReplicaMonthly               = $(if ($t4On) { $evidence['t4ReplicaMonthly'] } else { $null })
         SessionCostWithoutReplica      = $sessionCostWithoutReplica
         LightUseMonthlyWithoutReplica  = $lightUseMonthlyWithoutReplica
+        T5Enabled                      = [bool]$t5On
+        T5FixedMonthly                 = $t5FixedMonthly
+        T5FreeTier                     = $t5Free
+        T5ContainerLifecycle           = $(if ($t5On) { $T5ContainerLifecycle } else { $null })
+        T5RunningHourly                = $t5RunningHourly
+        T5AlwaysOnExtraMonthly         = $t5AlwaysOnExtra
         T3FreeOffer                    = [bool]$t3UsesFreeOffer
         T3FreeOfferUnchecked           = $t3FreeOfferUnchecked
         T3FreeOfferCreditMonthly       = $t3FreeCreditMonthly

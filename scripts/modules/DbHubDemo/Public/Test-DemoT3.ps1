@@ -20,6 +20,11 @@ function Test-DemoT3 {
       additional charges" (BillOverUsage).
     - T3.PROPERTY: the extended property MS_EnablePerformanceMonitoringPreview is 'true'. A Warning when T1
       isn't running or its login isn't effective yet; Not selected with -SkipSqlCheck.
+    - T3.AUTOTUNING (2026-11-18, from the same status query): FORCE_LAST_GOOD_PLAN, which the Database Agent beat holds
+      off until its response (ConvertTo-DemoT3AutoTuningResult).
+    - T3.AGENT (2026-11-18): what Database Agents needs from T3 that Azure shows: not one-vCore serverless, not in an
+      elastic pool, the signed-in account's write access, and monitoring on (Test-DemoT3AgentReadiness); a Warning with
+      the fix, never a Fail.
 
     Sources (checked 2026-10-20):
     - az sql server show --expand-ad-admin: https://learn.microsoft.com/cli/azure/sql/server
@@ -291,6 +296,8 @@ function Test-DemoT3 {
 
     # T3.PROPERTY
     $hubDoc = 'https://learn.microsoft.com/fabric/database/hub/add-sql'
+    $statusRow = $null
+    $propertyValue = ''
     if ($SkipSqlCheck) {
         Add-T3Result 'T3.PROPERTY' 'Not selected' 'The T-SQL check of the extended property was skipped (-SkipSqlCheck).' -DocUrl $hubDoc
     }
@@ -299,7 +306,9 @@ function Test-DemoT3 {
         $evidence = @{ reason = $run.Reason }
         if ($run.Status -eq 'Pass') {
             $row = @($run.Rows) | Select-Object -First 1
+            $statusRow = $row
             $value = [string](Get-DemoMemberValue -InputObject $row -Name 'performance_monitoring')
+            $propertyValue = $value
             $evidence['value'] = $value
             $evidence['seedStatus'] = [string](Get-DemoMemberValue -InputObject $row -Name 'seed_status')
             $evidence['queryStore'] = [string](Get-DemoMemberValue -InputObject $row -Name 'query_store_state')
@@ -318,6 +327,13 @@ function Test-DemoT3 {
             Add-T3Result 'T3.PROPERTY' 'Fail' ('The extended property couldn''t be checked: {0}' -f $run.Message) $evidence $run.Result.remediation $hubDoc
         }
     }
+
+    # T3.AUTOTUNING and T3.AGENT (2026-11-18): FORCE_LAST_GOOD_PLAN from the same status row, which the Database Agent beat
+    # holds off until its response; and what Database Agents needs from T3 that Azure shows.
+    if ($null -ne $statusRow) {
+        $results.Add((ConvertTo-DemoT3AutoTuningResult -Row $statusRow))
+    }
+    $results.Add((Test-DemoT3AgentReadiness -Config $Config -ServerName $names.ServerName -Database $database -PerformanceMonitoring $propertyValue))
 
     return $results.ToArray()
 }

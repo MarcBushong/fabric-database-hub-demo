@@ -39,8 +39,9 @@ Describe 'Get-DemoConfig' {
         $config.networkMode | Should -Be 'auto'
         $config.t2Mode | Should -Be 'Nested'
         $config.t2SqlInstallMode | Should -Be 'JumpstartImage' -Because 'the default since 2026-11-05 (user-directed: a one-click deployment that needs no person)'
-        $config.monthlyCeilingUsd | Should -Be 375 -Because 'the default since 2026-11-04 (user-directed, for the 4-core T4)'
-        $config.sessionCeilingUsd | Should -Be 15
+        $config.monthlyCeilingUsd | Should -Be 415 -Because 'the default for a new configuration since 2026-11-19 (the owner''s decision; 375 from 2026-11-04): room for T5 in a Contributor''s first deployment''s worst case'
+        $config.sessionCeilingUsd | Should -Be 20 -Because 'the default since 2026-11-18 (the owner''s decision, for lowest-cost''s 2-vCore T3)'
+        $config.Contains('sessionCeilingUsdSource') | Should -BeFalse
         $config.assignRoles | Should -BeFalse
         $config.bastionMaxHours | Should -Be 4
         $config.t3AutoPauseMinutes | Should -Be 15
@@ -55,6 +56,26 @@ Describe 'Get-DemoConfig' {
         $config.profile | Should -Be 'demo-day'
         $config.securityType.t1 | Should -Be 'Standard'
         $config.securityType.t2Host | Should -Be 'Standard'
+    }
+
+    It 'gives a sessionCeilingUsd of exactly 15 (written <Label>), the default before 2026-11-18, today''s 20, marked legacy (the owner''s decision)' -ForEach @(
+        @{ Value = 15; Label = '15' }
+        @{ Value = 15.0; Label = '15.0' }
+    ) {
+        $config = Get-DemoConfig -Path (New-TestConfig -Values @{ sessionCeilingUsd = $Value })
+        $config.sessionCeilingUsd | Should -Be 20
+        $config.sessionCeilingUsdSource | Should -Be 'legacy'
+    }
+
+    It 'keeps any other sessionCeilingUsd someone set as it is: <Value>' -ForEach @(
+        @{ Value = 14 }
+        @{ Value = 15.5 }
+        @{ Value = 20 }
+        @{ Value = 25 }
+    ) {
+        $config = Get-DemoConfig -Path (New-TestConfig -Values @{ sessionCeilingUsd = $Value })
+        $config.sessionCeilingUsd | Should -Be $Value
+        $config.Contains('sessionCeilingUsdSource') | Should -BeFalse
     }
 
     It 'rejects a malformed subscription ID' {

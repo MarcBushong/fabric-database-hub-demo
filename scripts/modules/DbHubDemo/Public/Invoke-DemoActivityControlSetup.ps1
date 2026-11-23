@@ -1,12 +1,12 @@
 function Invoke-DemoActivityControlSetup {
     <#
     .SYNOPSIS
-    Sets up, grants, rotates, or removes the optional on-demand activity control (ADR 0020): an Azure Automation
-    webhook that a Fabric notebook calls to start the demo's targets and run bounded scenarios, with every stop layer.
+    Sets up, grants, rotates, or removes the session control (ADR 0020, ADR 0026): an Azure Automation webhook that
+    NB_DatabaseHub_Control's Run all calls to start the demo's targets and run a bounded session, with every stop layer.
 
     .DESCRIPTION
-    The control is optional and off by default (control.enabled). Its resources live in rg-<prefix>-control, which
-    destroy.ps1 keeps. Every write goes through the subscription guard (Invoke-DemoAz) or the Fabric REST API, and
+    deploy.ps1 sets the control up in every deployment since 2026-11-14 (control.enabled no longer turns it off). Its
+    resources live in rg-<prefix>-control, which destroy.ps1 deletes when the control's runbooks serve its environment. Every write goes through the subscription guard (Invoke-DemoAz) or the Fabric REST API, and
     -WhatIf changes nothing: each step reports Not selected with what it would do.
 
     Default (Contributor on the subscription, and Admin of the workspaces it creates):
@@ -21,20 +21,23 @@ function Invoke-DemoActivityControlSetup {
     5. The daily T4 safety stop (DbHub-Stop -Scope T4).
     6. A webhook for DbHub-Control and its URL in the secret dbhub-activity-webhook, when there's no valid one (or with
        -RotateWebhook): created through infra/control/webhook.bicep with the URL as a secure parameter only.
-    7. The control notebook NB_DatabaseHub_Control: in a folder of the existing workspace (public), or in the
-       "DBHub Control" workspace on the same capacity with a managed private endpoint to the vault, approved on the
+    7. The control notebook NB_DatabaseHub_Control: in a folder of the existing workspace (public), or in its own
+       workspace ("<workspace> Control" by default) on the same capacity with a managed private endpoint to the vault, approved on the
        vault (private). The Fabric capacity is never resumed, paused, or scaled.
 
-    -GrantRole (an Owner, signed in with multifactor authentication): creates or updates the custom role
-    "DbHub Demo Activity Operator" with exactly the approved actions, and assigns A1 (the identity at the demo
-    resource group), A2 (the identity at the control account), and A3 (Key Vault Secrets User on the one secret, for
-    the signed-in owner and control.notebookUserObjectIds). It shows the identity's object ID before it assigns
-    anything. This is the only path that creates the role; deploy.ps1 re-grants A1 after a redeploy when assignRoles
-    and control.enabled are true, with the same function.
+    -GrantRole (an Owner, signed in with multifactor authentication): creates or updates the custom roles
+    "DbHub Demo Activity Operator" and "DbHub Demo Session Writer" with exactly their approved actions, and assigns A1 (the identity at the demo
+    resource group), A2 (the identity at the control account), A3 (Key Vault Secrets User on the control vault's three secrets, for
+    the signed-in owner, the environment's deployer, and control.notebookUserObjectIds), and A4 (the identity at the
+    vault's two session secrets). The deployer (2026-11-19) is
+    the person whose deploy.ps1 last set up the control vault, as Azure records it on the vault, so a Contributor who
+    deployed can Run all after an Owner's one run (CONTROL.ROLE.DEPLOYER). It shows the identity's object ID before it
+    assigns anything. deploy.ps1, when the person who runs it may assign roles, and grant-safety-stop.ps1 run this same
+    step (2026-11-14, ADR 0026).
 
     -RotateWebhook: a new webhook and a new secret version, then the old webhook is deleted.
 
-    -Remove: deletes A1-A3 and the custom role (an Owner), the Fabric notebook, folder, control workspace, and managed
+    -Remove: deletes A1-A4 and the custom roles (an Owner), the Fabric notebook, folder, control workspace, and managed
     private endpoint, and the Automation account, the identity, and the vault (then purges it); the group only when
     nothing else is left in it.
 
@@ -47,7 +50,7 @@ function Invoke-DemoActivityControlSetup {
     The configuration file's path, for the commands that results print.
 
     .PARAMETER GrantRole
-    Create the custom role and assign A1-A3 (needs an Owner).
+    Create the custom roles and assign A1-A4 (needs an Owner).
 
     .PARAMETER RotateWebhook
     Replace the webhook and its secret.
@@ -110,7 +113,7 @@ function Invoke-DemoActivityControlSetup {
         }
     }
     catch {
-        $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing changed. Sign in yourself (az login) and run setup-activity-control.ps1 again.'))
+        $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing changed. Sign in yourself (az login), then run ./scripts/deploy.ps1 again.'))
         return $results.ToArray()
     }
     $name = Get-DemoActivityControlName -Config $Config
@@ -123,13 +126,13 @@ function Invoke-DemoActivityControlSetup {
             return (Get-DemoFabricToken -SubscriptionId $name.SubscriptionId)
         }
         catch {
-            $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.TOKEN' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message ('No Fabric token: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Sign in with an account that can use the Fabric workspace, then run setup-activity-control.ps1 again.' -DocUrl 'https://learn.microsoft.com/rest/api/fabric/articles/get-started/fabric-api-quickstart'))
+            $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.TOKEN' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' -Message ('No Fabric token: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Sign in with an account that can use the Fabric workspace, then run ./scripts/deploy.ps1 again.' -DocUrl 'https://learn.microsoft.com/rest/api/fabric/articles/get-started/fabric-api-quickstart'))
             return $null
         }
     }
 
     if ($GrantRole) {
-        foreach ($item in @(Grant-DemoActivityControlRole -Config $Config -IncludeDefinition -ConfigPath $ConfigPath)) {
+        foreach ($item in @(Grant-DemoActivityControlRole -Config $Config -IncludeDefinition -IncludeDeployer -ConfigPath $ConfigPath)) {
             $results.Add($item)
         }
         return $results.ToArray()
@@ -202,7 +205,7 @@ function Invoke-DemoActivityControlSetup {
 
     # 7. The notebook.
     if ($SkipFabric) {
-        $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'The Fabric part was skipped (-SkipFabric); run setup-activity-control.ps1 again for the notebook.'))
+        $results.Add((New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'The Fabric part was skipped (-SkipFabric); ./scripts/deploy.ps1 without -SkipFabric puts the notebook in Fabric.'))
     }
     else {
         $fabricToken = & $getToken

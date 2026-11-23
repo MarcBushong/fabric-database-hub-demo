@@ -1,0 +1,444 @@
+/* The Copilot dock. It uses the Fluent 2 tokens the FluentProvider sets, with fallbacks, so it follows the app's
+   theme. The shell sizes and places the panel; everything here is inside it. */
+
+.copilot-dock {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    min-height: 0;
+    background: var(--colorNeutralBackground1, #ffffff);
+    color: var(--colorNeutralForeground1, #242424);
+}
+
+.copilot-dock-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 8px 8px 14px;
+    border-bottom: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+}
+
+.copilot-dock-titles {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    min-width: 0;
+}
+
+.copilot-dock-titleline {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+.copilot-dock-head h2 {
+    margin: 0;
+    font-size: var(--fontSizeBase400, 16px);
+    font-weight: 600;
+}
+
+.copilot-mark {
+    display: inline-grid;
+    place-items: center;
+    width: 28px;
+    height: 28px;
+    flex: none;
+    border-radius: 8px;
+    color: #ffffff;
+    background: linear-gradient(135deg, #8a3ffc 0%, #0f6cbd 100%);
+}
+
+.copilot-dock-spacer {
+    flex: 1;
+}
+
+.copilot-account {
+    max-width: 100%;
+    min-width: 0;
+    min-height: 0;
+    height: auto;
+    padding: 0;
+    gap: 4px;
+    justify-content: flex-start;
+    color: var(--colorNeutralForeground2, #424242);
+    font-size: var(--fontSizeBase200, 12px);
+}
+
+.copilot-account-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-weight: 400;
+}
+
+.copilot-account-plan {
+    color: var(--colorNeutralForeground3, #616161);
+}
+
+.copilot-dock-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 16px 14px;
+}
+
+.copilot-dock[data-mode="fullscreen"] .copilot-dock-body > *,
+.copilot-dock[data-mode="fullscreen"] .copilot-dock-foot > * {
+    width: min(920px, 100%);
+    margin-inline: auto;
+}
+
+.copilot-card {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding: 16px;
+    border-radius: var(--borderRadiusXLarge, 8px);
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    background: var(--colorNeutralBackground2, #fafafa);
+}
+
+.copilot-card h3 {
+    margin: 0;
+    font-size: var(--fontSizeBase400, 16px);
+    font-weight: 600;
+}
+
+.copilot-card p {
+    margin: 0;
+    line-height: 1.5;
+}
+
+.copilot-signin > button {
+    align-self: flex-start;
+}
+
+.copilot-code {
+    font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+    font-size: 30px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+}
+
+.copilot-fine {
+    margin: 0;
+    padding-left: 18px;
+    font-size: var(--fontSizeBase200, 12px);
+    color: var(--colorNeutralForeground3, #616161);
+    line-height: 1.45;
+}
+
+.copilot-dock-foot .copilot-fine,
+p.copilot-fine {
+    padding-left: 0;
+}
+
+.copilot-error {
+    margin: 0;
+    color: var(--colorPaletteRedForeground1, #bc2f32);
+}
+
+.copilot-row {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.copilot-intro-title {
+    font-size: var(--fontSizeBase400, 16px);
+    font-weight: 600;
+    margin: 0 0 4px;
+}
+
+.copilot-intro p {
+    margin: 0 0 12px;
+    color: var(--colorNeutralForeground2, #424242);
+    line-height: 1.45;
+}
+
+.copilot-starters {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 8px;
+}
+
+.copilot-starters button {
+    text-align: left;
+    justify-content: flex-start;
+    height: auto;
+    min-height: 28px;
+    white-space: normal;
+}
+
+.copilot-followups {
+    flex-direction: row;
+    flex-wrap: wrap;
+    margin-top: 4px;
+}
+
+.copilot-turns {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.copilot-user {
+    align-self: flex-end;
+    max-width: 88%;
+    padding: 9px 12px;
+    border-radius: 14px 14px 4px 14px;
+    background: var(--colorBrandBackground, #0f6cbd);
+    color: var(--colorNeutralForegroundOnBrand, #ffffff);
+}
+
+.copilot-user p {
+    margin: 0;
+    white-space: pre-wrap;
+    line-height: 1.45;
+}
+
+.copilot-from {
+    display: block;
+    margin-bottom: 4px;
+    font-size: 11px;
+    opacity: 0.85;
+}
+
+.copilot-answer {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+.copilot-answer-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+}
+
+.copilot-model {
+    margin-left: auto;
+    color: var(--colorNeutralForeground4, #707070);
+}
+
+.copilot-figure {
+    margin: 0;
+    padding: 10px;
+    border-radius: var(--borderRadiusXLarge, 8px);
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    background: var(--colorNeutralBackground1, #ffffff);
+}
+
+.copilot-source {
+    border-radius: var(--borderRadiusLarge, 6px);
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    background: var(--colorNeutralBackground2, #fafafa);
+    font-size: var(--fontSizeBase200, 12px);
+}
+
+.copilot-source-failed {
+    border-color: var(--colorPaletteYellowBorder2, #e9a23b);
+}
+
+.copilot-source-head {
+    display: flex;
+    width: 100%;
+    align-items: center;
+    gap: 6px;
+    padding: 7px 9px;
+    border: none;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.copilot-source-head:focus-visible {
+    outline: 2px solid var(--colorStrokeFocus2, #000000);
+    outline-offset: -2px;
+}
+
+.copilot-source-head svg {
+    flex: none;
+    color: var(--colorNeutralForeground3, #616161);
+}
+
+.copilot-source-purpose {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.copilot-source-meta {
+    color: var(--colorNeutralForeground3, #616161);
+    white-space: nowrap;
+}
+
+.copilot-source-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 0 9px 9px;
+    min-width: 0;
+}
+
+.copilot-source-body .dax {
+    margin: 0;
+    max-height: 260px;
+    overflow: auto;
+}
+
+.copilot-routes {
+    margin: 0;
+    padding-left: 18px;
+}
+
+.copilot-pre {
+    margin: 0;
+    padding: 8px;
+    max-height: 260px;
+    overflow: auto;
+    border-radius: var(--borderRadiusMedium, 4px);
+    background: var(--colorNeutralBackground3, #f5f5f5);
+    font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+    font-size: 11px;
+}
+
+.copilot-dock-foot {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 10px 14px 14px;
+    border-top: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+}
+
+.copilot-attached {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 4px 4px 4px 10px;
+    border-radius: var(--borderRadiusLarge, 6px);
+    background: var(--colorNeutralBackground2, #fafafa);
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    font-size: var(--fontSizeBase200, 12px);
+}
+
+.copilot-input {
+    display: flex;
+    align-items: flex-end;
+    gap: 8px;
+}
+
+.copilot-input > span {
+    flex: 1;
+}
+
+.copilot-input textarea {
+    min-height: 56px;
+    max-height: 200px;
+}
+
+/* Copilot's answers: Markdown rendered as React elements (markdown.tsx). */
+.cp-md {
+    line-height: 1.55;
+    font-size: var(--fontSizeBase300, 14px);
+    overflow-wrap: anywhere;
+}
+
+.cp-md > :first-child {
+    margin-top: 0;
+}
+
+.cp-md > :last-child {
+    margin-bottom: 0;
+}
+
+.cp-md h3,
+.cp-md h4,
+.cp-md h5,
+.cp-md h6 {
+    margin: 12px 0 6px;
+    font-size: var(--fontSizeBase300, 14px);
+    font-weight: 600;
+}
+
+.cp-md p {
+    margin: 0 0 8px;
+}
+
+.cp-md ul,
+.cp-md ol {
+    margin: 0 0 8px;
+    padding-left: 20px;
+}
+
+.cp-md code {
+    padding: 1px 5px;
+    border-radius: 4px;
+    background: var(--colorNeutralBackground3, #f5f5f5);
+    font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+    font-size: 0.86em;
+}
+
+.cp-md a {
+    color: var(--colorBrandForegroundLink, #115ea3);
+}
+
+.cp-md blockquote {
+    margin: 8px 0;
+    padding-left: 10px;
+    border-left: 3px solid var(--colorNeutralStroke1, #d1d1d1);
+    color: var(--colorNeutralForeground2, #424242);
+}
+
+.cp-md hr {
+    border: none;
+    border-top: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+}
+
+.cp-code {
+    margin: 6px 0;
+    padding: 10px;
+    overflow-x: auto;
+    border-radius: var(--borderRadiusMedium, 4px);
+    background: var(--colorNeutralBackground3, #f5f5f5);
+    font-family: "JetBrains Mono Variable", ui-monospace, monospace;
+    font-size: 12px;
+    white-space: pre;
+}
+
+.cp-table-wrap {
+    overflow-x: auto;
+    margin: 0 0 8px;
+    border-radius: var(--borderRadiusMedium, 4px);
+    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+}
+
+.cp-table-wrap table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+}
+
+.cp-table-wrap th,
+.cp-table-wrap td {
+    padding: 5px 8px;
+    border-bottom: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    text-align: left;
+    white-space: nowrap;
+}
+
+.cp-table-wrap th {
+    background: var(--colorNeutralBackground2, #fafafa);
+    font-weight: 600;
+}

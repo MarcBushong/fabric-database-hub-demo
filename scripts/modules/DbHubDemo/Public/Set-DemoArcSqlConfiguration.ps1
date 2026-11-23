@@ -18,9 +18,13 @@ function Set-DemoArcSqlConfiguration {
     3. Turns on monitoring with the documented command: az resource update --set
        properties.monitoring.enabled=true --api-version 2023-09-01-preview (sql-monitoring). Not in Developer
        mode, where Arc monitoring isn't supported.
-    Then it returns T2.ARC.CONFIGURATION (what was changed), T2.ARC.SQLEXTENSION, T2.ARC.SQLINSTANCE, and
-    T2.ARC.MONITORING. In PaygWizard mode, nothing can converge until the setup-wizard step installs SQL
-    Server; the SQL checks then report Manual action required. Under -WhatIf nothing changes.
+    4. Turns on migration assessment (2026-11-18) with the documented Sql Server Instances - Update
+       (properties.migration.assessment.enabled), and starts a run (Run Migration Assessment) while no assessment has
+       been uploaded, so Database Hub's Optimization shows T2 with a migration assessment ready. It's free for every
+       edition, Developer included (migration-assessment). A failure here is T2.ARC.MIGRATIONASSESSMENT's alone.
+    Then it returns T2.ARC.CONFIGURATION (what was changed), T2.ARC.SQLEXTENSION, T2.ARC.SQLINSTANCE,
+    T2.ARC.MONITORING, and T2.ARC.MIGRATIONASSESSMENT. In PaygWizard mode, nothing can converge until the setup-wizard
+    step installs SQL Server; the SQL checks then report Manual action required. Under -WhatIf nothing changes.
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -57,6 +61,9 @@ function Set-DemoArcSqlConfiguration {
 
     $actions = [System.Collections.Generic.List[string]]::new()
     $failure = ''
+    $assessmentProblem = ''
+    $assessmentRunProblem = ''
+    $assessmentRun = ''
     $connected = $false
     try {
         $state = Get-DemoArcState -Config $Config
@@ -88,6 +95,33 @@ function Set-DemoArcSqlConfiguration {
                     Invoke-DemoArcMonitoringUpdate -Target $target -InstanceName $info.Name -Confirm:$false
                     $actions.Add(('Turned on monitoring for {0} (api-version {1}).' -f $info.Name, $setting.MonitoringApiVersion))
                 }
+                # Migration assessment (2026-11-18), for Database Hub's Optimization: on, and a run until the first assessment
+                # is uploaded. It's optional, so its own result says what went wrong, as a Warning, and the rest of the
+                # configuration still counts (2026-11-18 review).
+                if ($null -ne $info) {
+                    try {
+                        if (-not $info.MigrationAssessment.Enabled) {
+                            if (Invoke-DemoArcMigrationAssessmentUpdate -Target $target -InstanceName $info.Name -Confirm:$false) {
+                                $actions.Add(('Turned on migration assessment for {0}.' -f $info.Name))
+                            }
+                            else {
+                                $assessmentProblem = 'Azure accepted turning it on, but it didn''t read as on within 3 minutes'
+                            }
+                        }
+                    }
+                    catch {
+                        $assessmentProblem = $_.Exception.Message
+                    }
+                    if (-not $assessmentProblem -and -not $info.MigrationAssessment.UploadedAt) {
+                        try {
+                            $assessmentRun = Start-DemoArcMigrationAssessment -Target $target -InstanceName $info.Name -Confirm:$false
+                            $actions.Add(('Started a migration assessment of {0} (job {1}).' -f $info.Name, $assessmentRun))
+                        }
+                        catch {
+                            $assessmentRunProblem = $_.Exception.Message
+                        }
+                    }
+                }
             }
         }
     }
@@ -100,8 +134,10 @@ function Set-DemoArcSqlConfiguration {
     }
     catch {
         $message = 'Azure couldn''t be read: {0}' -f $_.Exception.Message
-        foreach ($id in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLEXTENSION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING') {
-            New-DemoArcResult -CheckId $id -Target $target -Status 'Fail' -Message $message -DocUrl $docUrl
+        foreach ($id in 'T2.ARC.CONFIGURATION', 'T2.ARC.SQLEXTENSION', 'T2.ARC.SQLINSTANCE', 'T2.ARC.MONITORING', 'T2.ARC.MIGRATIONASSESSMENT') {
+            # The migration assessment is optional (2026-11-18 review): never a Fail.
+            $status = if ($id -eq 'T2.ARC.MIGRATIONASSESSMENT') { 'Warning' } else { 'Fail' }
+            New-DemoArcResult -CheckId $id -Target $target -Status $status -Message $message -DocUrl $docUrl
         }
         return
     }
@@ -122,4 +158,5 @@ function Set-DemoArcSqlConfiguration {
     Test-DemoArcSqlExtension -State $final
     Test-DemoArcSqlInstance -State $final
     Test-DemoArcMonitoring -State $final
+    Test-DemoArcMigrationAssessment -State $final -RunStatus $assessmentRun -Problem $assessmentProblem -RunProblem $assessmentRunProblem
 }

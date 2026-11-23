@@ -14,7 +14,7 @@
     "notes": {
       "T1": "2 vCPUs: plans run at DOP 2.",
       "T2": "The guest has 2 vCPUs: plans run at DOP 2.",
-      "T3": "At 1 vCore or less the database has no second scheduler, so the plans run serially: expect CPU waits, not Parallelism waits."
+      "T3": "At its 2-vCore maximum (since 2026-11-18) the plans can run at DOP 2; at 1 vCore the database had no second scheduler, so they ran serially, with CPU waits instead of Parallelism waits."
     }
   },
   "parameters": {
@@ -28,7 +28,7 @@
   "expectedSymptoms": [
     "Parallel plans (Parallelism operators) for the reporting aggregate on SQL Server, chosen by cost",
     "CXCONSUMER waits from each query's coordinating thread and CXPACKET waits at the exchanges",
-    "On Azure SQL Database at 1 vCore, serial plans and CPU waits instead"
+    "On Azure SQL Database, DOP 2 at 2 vCores, and serial plans with CPU waits instead at 1 vCore"
   ],
   "queryLevelEvidence": [
     "sys.dm_os_tasks and sys.dm_exec_requests: several tasks per request with CXPACKET or CXCONSUMER waits (needs VIEW SERVER STATE)",

@@ -365,6 +365,7 @@ Describe 'A broken PowerShell Direct channel into the guest (issue #65)' {
         Mock -CommandName Wait-DemoGuestOnline -MockWith { -not $script:broken }
         Mock -CommandName Enter-DemoGuestRecoveryLock -MockWith { [pscustomobject]@{ Lock = 'test' } }
         Mock -CommandName Exit-DemoGuestRecoveryLock -MockWith { }
+        Mock -CommandName Invoke-DemoArcBootstrapTask -MockWith { $true }
         $script:credential = New-TestCredential
     }
 
@@ -496,6 +497,184 @@ Describe 'A broken PowerShell Direct channel into the guest (issue #65)' {
         Test-DemoHostGuestReachable -Context $context | Should -BeTrue
         Should -Invoke -CommandName Stop-VM -Times 1 -Exactly
         (Get-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'guest-recovery.json') -Raw | ConvertFrom-Json).restarts[0].key | Should -Be 'bootstrap-6a85c5d88e3a-20261118134518'
+    }
+}
+
+Describe 'The host bootstrap''s lock and more tries around the Arc actions (2026-11-19, dbhubfx)' {
+    BeforeAll {
+        foreach ($stub in @(
+                @{ Name = 'Get-VM'; Body = 'param([string] $Name)' }
+                @{ Name = 'Stop-VM'; Body = 'param([string] $Name, [switch] $Force, [switch] $AsJob, [switch] $TurnOff)' }
+                @{ Name = 'Start-VM'; Body = 'param([string] $Name)' }
+            )) {
+            if (-not (Get-Command -Name $stub.Name -ErrorAction SilentlyContinue)) {
+                New-Item -Path ('function:global:' + $stub.Name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stub.Body)) | Out-Null
+            }
+        }
+        $script:brokenText = 'The background process reported an error with the following message: "The Hyper-V socket target process has ended.".'
+        function Test-TestLockHeld([string] $Root) {
+            # What a bootstrap run that starts now finds (Enter-DemoVmLock): true while another handle holds bootstrap.lock.
+            try {
+                [System.IO.FileStream]::new((Join-Path -Path $Root -ChildPath 'bootstrap.lock'), [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Dispose()
+                return $false
+            }
+            catch {
+                return $true
+            }
+        }
+    }
+
+    BeforeEach {
+        $script:root = New-TestStateRoot
+        $script:vm = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; Uptime = [timespan]::FromMinutes(42) }
+        # How PowerShell Direct into the guest answers: ok, broken (issue #65), or refused (another failure).
+        $script:channel = 'ok'
+        Mock -CommandName Get-VM -MockWith { [pscustomobject]@{ Name = 'arcsql01'; State = $script:vm.State; Heartbeat = $script:vm.Heartbeat; Uptime = $script:vm.Uptime; VMId = '77777777-8888-9999-0000-111111111111' } }
+        Mock -CommandName Stop-VM -MockWith { $script:vm.State = 'Off' }
+        Mock -CommandName Start-VM -MockWith { $script:vm.State = 'Running'; $script:vm.Uptime = [timespan]::FromSeconds(40); $script:channel = 'ok' }
+        Mock -CommandName Start-Sleep -MockWith { }
+        Mock -CommandName Get-DemoGuestComputerName -MockWith {
+            switch ($script:channel) {
+                'broken' { throw $script:brokenText }
+                'refused' { throw 'The credential is invalid.' }
+                default { 'ARCSQL01' }
+            }
+        }
+        Mock -CommandName Wait-DemoGuestOnline -MockWith { $script:channel -eq 'ok' }
+        Mock -CommandName Enter-DemoGuestRecoveryLock -MockWith { [pscustomobject]@{ Lock = 'test' } }
+        Mock -CommandName Exit-DemoGuestRecoveryLock -MockWith { }
+        Mock -CommandName Get-DemoGuestCredential -MockWith {
+            $secure = [System.Security.SecureString]::new()
+            foreach ($character in 'not-a-real-secret'.ToCharArray()) { $secure.AppendChar($character) }
+            [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+        }
+        $script:events = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Invoke-DemoArcBootstrapTask -MockWith { $script:events.Add($(if (Test-TestLockHeld -Root $script:root) { 'task (lock held)' } else { 'task' })); $true }
+    }
+
+    It 'holds bootstrap.lock while the action runs, and starts the bootstrap task only once it released it' {
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith {
+            $script:events.Add($(if (Test-TestLockHeld -Root $script:root) { 'action (lock held)' } else { 'action' }))
+            $script:events.Add(('no task {0}' -f $PesterBoundParameters.ContainsKey('NoBootstrapTask')))
+            [ordered]@{ action = 'WriteMarker'; succeeded = $true; outcome = 'AlreadyConnected'; message = 'arcsql01 was already Connected; the marker was written again.'; taskStarted = $false }
+        }
+        $result = Invoke-DemoArcOnboardWithRecovery -ActionName 'WriteMarker' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot -RecoveryKey 'deploy-aaaaaaaaaaaa'
+        $result.succeeded | Should -BeTrue
+        $result.taskStarted | Should -BeTrue
+        $result.lockSeconds | Should -Be 0
+        @($script:events) | Should -Be @('action (lock held)', 'no task True', 'task') -Because 'a bootstrap run that the task starts while the lock is held exits and runs again 5 minutes later'
+        Test-TestLockHeld -Root $script:root | Should -BeFalse
+        # A Probe holds it too, and starts no task.
+        $script:events.Clear()
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith { $script:events.Add($(if (Test-TestLockHeld -Root $script:root) { 'probe (lock held)' } else { 'probe' })); [ordered]@{ action = 'Probe'; succeeded = $true; guestReachable = $true } }
+        (Invoke-DemoArcOnboardWithRecovery -ActionName 'Probe' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot).guestReachable | Should -BeTrue
+        @($script:events) | Should -Be @('probe (lock held)')
+    }
+
+    It 'waits while a bootstrap run holds the lock, and fails closed, changing nothing, when it isn''t free in time' {
+        Mock -CommandName Start-Sleep -ParameterFilter { $Milliseconds -gt 0 } -MockWith { [System.Threading.Thread]::Sleep(100) }
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith { [ordered]@{ action = 'WriteMarker'; succeeded = $true } }
+        $held = [System.IO.FileStream]::new((Join-Path -Path $script:root -ChildPath 'bootstrap.lock'), [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+        try {
+            { Invoke-DemoArcOnboardWithRecovery -ActionName 'WriteMarker' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot -LockSeconds 1 } | Should -Throw '*own bootstrap pass held its lock (bootstrap.lock)*nothing was changed (fail closed)*'
+        }
+        finally {
+            $held.Dispose()
+        }
+        Should -Invoke -CommandName Invoke-DemoArcOnboardAction -Times 0 -Exactly
+        Should -Invoke -CommandName Invoke-DemoArcBootstrapTask -Times 0 -Exactly
+        # An installed bundle without the helper (an older one): the action runs without the lock, as before.
+        Enter-DemoArcBootstrapLock -StateRoot $script:root -BundleRoot $TestDrive | Should -BeNullOrEmpty
+    }
+
+    It 'probes again after pauses of 10 and 30 seconds while the guest''s channel answers, and reports the guest that answered as a retry' {
+        # dbhubfx: the probe found arcsql01 unreachable, and the channel test answered at once; the probe gave up.
+        $script:probes = 0
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith {
+            $script:probes++
+            if ($script:probes -lt 3) {
+                return [ordered]@{ action = 'Probe'; succeeded = $true; guestReachable = $false; guestError = 'An error has occurred which Windows PowerShell cannot handle. A remote session might have ended.' }
+            }
+            [ordered]@{ action = 'Probe'; succeeded = $true; guestReachable = $true; guestError = '' }
+        }
+        $result = Invoke-DemoArcOnboardWithRecovery -ActionName 'Probe' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot -RecoveryKey 'deploy-aaaaaaaaaaaa'
+        $result.guestReachable | Should -BeTrue
+        $script:probes | Should -Be 3
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 10 }
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 30 }
+        Should -Invoke -CommandName Start-Sleep -Times 0 -Exactly -ParameterFilter { $Seconds -eq 60 }
+        $result.guestRecovery.action | Should -Be 'Healed'
+        $result.guestRecovery.restarted | Should -BeFalse
+        $result.guestRecovery.recovered | Should -BeTrue
+        $result.guestRecovery.tries | Should -Be 3
+        $result.guestRecovery.seconds | Should -Be 40
+        $result.guestRecovery.atUtc | Should -Not -BeNullOrEmpty
+        $result.guestRecovery.reason | Should -Match 'remote session might have ended'
+        $result.guestRecovery.message | Should -Be 'arcsql01 answered the Arc Probe on try 3, after 40 seconds of pauses.'
+        Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+    }
+
+    It 'keeps PowerShell Direct''s own error and the tries when the guest still doesn''t answer, and restarts nothing for a channel that isn''t broken' {
+        $script:channel = 'refused'
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith { [ordered]@{ action = 'Probe'; succeeded = $true; guestReachable = $false; guestError = 'The credential is invalid.' } }
+        $result = Invoke-DemoArcOnboardWithRecovery -ActionName 'Probe' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot -RecoveryKey 'deploy-aaaaaaaaaaaa'
+        $result.guestReachable | Should -BeFalse
+        $result.probeTries | Should -Be 4
+        $result.guestError | Should -Be 'The credential is invalid.'
+        $result.guestRecovery.action | Should -Be 'Retry'
+        $result.guestRecovery.recovered | Should -BeFalse
+        $result.guestRecovery.seconds | Should -Be 100
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 10 }
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 30 }
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 60 }
+        Should -Invoke -CommandName Invoke-DemoArcOnboardAction -Times 4 -Exactly
+        Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+    }
+
+    It 'gives a channel it finds broken between the tries issue #65''s one restart, and probes once more' {
+        $script:channel = 'broken'
+        $script:probes = 0
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith { $script:probes++; [ordered]@{ action = 'Probe'; succeeded = $true; guestReachable = ($script:channel -eq 'ok') } }
+        $result = Invoke-DemoArcOnboardWithRecovery -ActionName 'Probe' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot -RecoveryKey 'deploy-aaaaaaaaaaaa'
+        $result.guestReachable | Should -BeTrue
+        $script:probes | Should -Be 2
+        $result.guestRecovery.restarted | Should -BeTrue
+        $result.guestRecovery.reason | Should -Match 'Hyper-V socket target process has ended'
+        Should -Invoke -CommandName Stop-VM -Times 1 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+    }
+
+    It 'runs an Onboard that stopped before it changed anything, because the guest didn''t answer, again once it answers; another failure stays as it is' {
+        $script:actions = 0
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith {
+            $script:actions++
+            if ($script:actions -eq 1) {
+                throw 'arcsql01 did not answer over PowerShell Direct; it may be starting. Nothing was changed. (An error has occurred which Windows PowerShell cannot handle. A remote session might have ended.)'
+            }
+            [ordered]@{ action = 'Onboard'; succeeded = $true; outcome = 'Onboarded'; message = 'arcsql01 is Connected to Azure Arc; the marker was written.'; taskStarted = $false }
+        }
+        $result = Invoke-DemoArcOnboardWithRecovery -ActionName 'Onboard' -InputValue (New-TestInput) -Token 'not-a-token' -StateRoot $script:root -BundleRoot $repoRoot -RecoveryKey 'deploy-aaaaaaaaaaaa'
+        $result.succeeded | Should -BeTrue
+        $script:actions | Should -Be 2
+        $result.guestRecovery.action | Should -Be 'Healed'
+        $result.guestRecovery.tries | Should -Be 2
+        $result.taskStarted | Should -BeTrue
+        Should -Invoke -CommandName Start-Sleep -Times 1 -Exactly -ParameterFilter { $Seconds -eq 10 }
+        $script:actions = 0
+        Mock -CommandName Invoke-DemoArcOnboardAction -MockWith { $script:actions++; throw 'azcmagent connect failed with exit code 42: AZCM0042' }
+        { Invoke-DemoArcOnboardWithRecovery -ActionName 'Onboard' -InputValue (New-TestInput) -Token 'not-a-token' -StateRoot $script:root -BundleRoot $repoRoot } | Should -Throw 'azcmagent connect failed*'
+        $script:actions | Should -Be 1
+    }
+
+    It 'reports PowerShell Direct''s own error from the probe, and in the error of an action that changed nothing' {
+        $script:channel = 'refused'
+        Mock -CommandName Get-DemoArcGuestVmId -MockWith { '77777777-8888-9999-0000-111111111111' }
+        $probe = Invoke-DemoArcOnboardAction -ActionName 'Probe' -InputValue @{ Mode = 'Nested'; MachineName = 'arcsql01' } -StateRoot $script:root -BundleRoot $repoRoot
+        $probe.guestReachable | Should -BeFalse
+        $probe.guestError | Should -Be 'The credential is invalid.'
+        { Invoke-DemoArcOnboardAction -ActionName 'WriteMarker' -InputValue (New-TestInput) -StateRoot $script:root -BundleRoot $repoRoot } | Should -Throw '*did not answer over PowerShell Direct; it may be starting. Nothing was changed. (The credential is invalid.)'
+        Test-Path -LiteralPath (Join-Path -Path $script:root -ChildPath 'arc-onboarded.json') | Should -BeFalse
     }
 }
 
@@ -638,6 +817,43 @@ Describe 'A restart of the guest that its process didn''t finish (review of #65)
         Set-TestUnfinishedRestart -Root $script:root
         (Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false).Recovered | Should -BeFalse
         (Get-TestLastRestart -Root $script:root).endedUtc | Should -BeNullOrEmpty
+    }
+
+    It 'never restarts a guest that still runs its old boot under a golden capture, and keeps its entry for later (review of the #65 follow-up)' {
+        Mock -CommandName Get-DemoGuestHostVmId -MockWith { '' }
+        $script:vm.State = 'Running'
+        $script:vm.Heartbeat = 'OkApplicationsHealthy'
+        $script:vm.Uptime = [timespan]::FromHours(3)
+        Set-TestUnfinishedRestart -Root $script:root -StartedUtc ([DateTime]::UtcNow.AddMinutes(-4).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        New-Item -ItemType Directory -Path (Join-Path -Path $script:root -ChildPath 'golden') -Force | Out-Null
+        # A marker that names no host counts as a capture in progress (fail closed).
+        Set-Content -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture-in-progress.json') -Value '{"snapshotName":"snap-dbhub-t2golden-202611190400"}'
+        Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false | Should -BeNullOrEmpty
+        Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+        (Get-TestLastRestart -Root $script:root).endedUtc | Should -BeNullOrEmpty
+        # Once the capture is over, a run finishes it.
+        Remove-Item -LiteralPath (Join-Path -Path $script:root -ChildPath 'golden\capture-in-progress.json')
+        (Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false).Recovered | Should -BeTrue
+        Should -Invoke -CommandName Stop-VM -Times 1 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 1 -Exactly
+    }
+
+    It 'takes a running guest whose uptime rounds to 0 as restarted, so it only completes its entry (review of the #65 follow-up)' {
+        $script:vm.State = 'Running'
+        $script:vm.Heartbeat = 'OkApplicationsHealthy'
+        $script:vm.Uptime = [timespan]::FromSeconds(2)
+        $script:answers = $true
+        Set-TestUnfinishedRestart -Root $script:root -StartedUtc ([DateTime]::UtcNow.AddMinutes(-1).ToString('yyyy-MM-ddTHH:mm:ssZ'))
+        (Complete-DemoGuestRecoveryInterrupted -Name 'arcsql01' -Credential $script:credential -StateRoot $script:root -Confirm:$false).Recovered | Should -BeTrue
+        Should -Invoke -CommandName Stop-VM -Times 0 -Exactly
+        Should -Invoke -CommandName Start-VM -Times 0 -Exactly
+        (Get-TestLastRestart -Root $script:root).stoppedBy | Should -Be 'Interrupted'
+        # Only a running guest: one that's off, or one without an uptime, can't tell.
+        $since = [DateTime]::UtcNow.AddMinutes(-1)
+        Test-DemoGuestRestartedSince -Vm ([pscustomobject]@{ State = 'Off'; Uptime = [timespan]::Zero }) -SinceUtc $since | Should -BeFalse
+        Test-DemoGuestRestartedSince -Vm ([pscustomobject]@{ State = 'Running' }) -SinceUtc $since | Should -BeFalse
+        Test-DemoGuestRestartedSince -Vm ([pscustomobject]@{ State = 'Running'; Uptime = [timespan]::FromHours(1) }) -SinceUtc $since | Should -BeFalse
     }
 }
 

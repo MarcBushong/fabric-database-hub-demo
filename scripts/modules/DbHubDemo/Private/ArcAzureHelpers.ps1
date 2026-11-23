@@ -482,6 +482,190 @@ function Invoke-DemoArcMonitoringUpdate {
     Write-DemoLog -Message ('Turned on monitoring for the SQL Server instance {0}.' -f $InstanceName)
 }
 
+function Invoke-DemoArcMigrationAssessmentUpdate {
+    <#
+    .SYNOPSIS
+    Turns on migration assessment for one SQL Server instance with the documented REST API (Sql Server Instances - Update):
+    PATCH properties.migration.assessment.enabled = true, at the sqlServerInstances API version in config/versions.json
+    (2026-11-18). Returns $true once the setting reads back as on, $false when it doesn't within -WaitSeconds. Internal.
+
+    .DESCRIPTION
+    The assessment is free for every edition and runs weekly once it's on (migration-assessment). The body goes through a
+    private temporary file, because cmd.exe can't pass JSON to az.cmd; a 409 Conflict is retried. Update can answer
+    202 Accepted, and az rest doesn't follow the long-running operation, so the instance is read back until the setting is
+    on, every -PollSeconds, at most -WaitSeconds (2026-11-18 review). Throws a redacted error when Azure refuses the
+    change, for example a policy's RequestDisallowedByPolicy.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Target,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z0-9._-]{1,128}$')]
+        [string] $InstanceName,
+
+        [ValidateRange(0, 900)]
+        [int] $WaitSeconds = 180,
+
+        [ValidateRange(1, 120)]
+        [int] $PollSeconds = 15
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($InstanceName, 'Set properties.migration.assessment.enabled = true')) {
+        return $false
+    }
+    $url = Get-DemoArcSqlInstanceUrl -Target $Target -Name $InstanceName
+    $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-arm'
+    try {
+        $bodyPath = Write-DemoPrivateFile -Directory $directory -Name 'body.json' -Content '{"properties":{"migration":{"assessment":{"enabled":true}}}}'
+        $patch = Invoke-DemoAzWithConflictRetry -SubscriptionId $Target.SubscriptionId -ArgumentList @('rest', '--method', 'patch', '--url', $url, '--body', "@$bodyPath") -Label ('Turning on migration assessment for {0}' -f $InstanceName)
+    }
+    finally {
+        Remove-DemoPrivateDirectory -Path $directory -Confirm:$false | Out-Null
+    }
+    if ($patch.ExitCode -ne 0) {
+        throw ('Turning on migration assessment for {0} failed: {1}' -f $InstanceName, (Protect-DemoText -Text ([string]$patch.StdErr).Trim()))
+    }
+    $attempts = 1 + [int][System.Math]::Ceiling($WaitSeconds / $PollSeconds)
+    for ($i = 0; $i -lt $attempts; $i++) {
+        $instance = $null
+        foreach ($item in (Get-DemoArmCollection -SubscriptionId $Target.SubscriptionId -Url $Target.SqlInstancesUrl)) {
+            if ([string](Get-DemoMemberValue -InputObject $item -Name 'name') -eq $InstanceName) {
+                $instance = $item
+                break
+            }
+        }
+        $assessment = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $instance -Name 'properties') -Name 'migration') -Name 'assessment'
+        if ([bool](Get-DemoMemberValue -InputObject $assessment -Name 'enabled')) {
+            Write-DemoLog -Message ('Turned on migration assessment for the SQL Server instance {0}.' -f $InstanceName)
+            return $true
+        }
+        if ($i -lt $attempts - 1) {
+            Start-Sleep -Seconds $PollSeconds
+        }
+    }
+    Write-DemoLog -Level Warning -Message ('Azure accepted turning on migration assessment for {0}, but it didn''t read as on within {1} seconds.' -f $InstanceName, $WaitSeconds)
+    return $false
+}
+
+function Start-DemoArcMigrationAssessment {
+    <#
+    .SYNOPSIS
+    Starts a migration assessment of one SQL Server instance now, as the portal's Run assessment does, with the documented
+    REST API (Sql Server Instances - Run Migration Assessment: POST .../runMigrationAssessment), and returns the job's
+    status (NotStarted, InProgress, Succeeded, or Failed; "accepted" when the response has none). Internal.
+
+    .DESCRIPTION
+    A new assessment replaces the last successful one, so a run is started only until the first one is uploaded
+    (Set-DemoArcSqlConfiguration). Throws a redacted error when Azure refuses it.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([string])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Target,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[A-Za-z0-9._-]{1,128}$')]
+        [string] $InstanceName
+    )
+
+    if (-not $PSCmdlet.ShouldProcess($InstanceName, 'Run a migration assessment now')) {
+        return ''
+    }
+    $url = '{0}{1}/runMigrationAssessment?api-version={2}' -f $Target.SqlInstanceUrlStart, $InstanceName, $Target.Setting.SqlInstanceApiVersion
+    $post = Invoke-DemoAzWithConflictRetry -SubscriptionId $Target.SubscriptionId -ArgumentList @('rest', '--method', 'post', '--url', $url) -Label ('Starting a migration assessment of {0}' -f $InstanceName)
+    if ($post.ExitCode -ne 0) {
+        throw ('Starting a migration assessment of {0} failed: {1}' -f $InstanceName, (Protect-DemoText -Text ([string]$post.StdErr).Trim()))
+    }
+    $status = ''
+    if (-not [string]::IsNullOrWhiteSpace($post.StdOut)) {
+        try {
+            $status = [string](Get-DemoMemberValue -InputObject ($post.StdOut | ConvertFrom-Json -Depth 32) -Name 'jobStatus')
+        }
+        catch {
+            Write-Debug -Message 'The run''s response wasn''t JSON.'
+        }
+    }
+    if ($status -notmatch '^[A-Za-z]{1,32}$') {
+        $status = 'accepted'
+    }
+    Write-DemoLog -Message ('Started a migration assessment of the SQL Server instance {0} (job {1}).' -f $InstanceName, $status)
+    return $status
+}
+
+function Test-DemoArcMigrationAssessmentRetry {
+    <#
+    .SYNOPSIS
+    Whether a T2.ARC.MIGRATIONASSESSMENT result says the assessment is on, none was uploaded yet, and no run was started:
+    the case a later try fixes (Invoke-DemoArcMigrationAssessmentRetry). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $Result
+    )
+
+    if ($null -eq $Result -or [string](Get-DemoMemberValue -InputObject $Result -Name 'checkId') -ne 'T2.ARC.MIGRATIONASSESSMENT' -or [string](Get-DemoMemberValue -InputObject $Result -Name 'status') -ne 'Warning') {
+        return $false
+    }
+    $evidence = Get-DemoMemberValue -InputObject $Result -Name 'evidence'
+    return ([bool](Get-DemoMemberValue -InputObject $evidence -Name 'enabled') -and -not [string](Get-DemoMemberValue -InputObject $evidence -Name 'uploadedAt') -and -not [string](Get-DemoMemberValue -InputObject $evidence -Name 'runStarted'))
+}
+
+function Invoke-DemoArcMigrationAssessmentRetry {
+    <#
+    .SYNOPSIS
+    Starts T2's first migration assessment again, every -PollSeconds for at most -WaitMinutes, until Azure takes the run,
+    and returns the T2.ARC.MIGRATIONASSESSMENT result. Internal.
+
+    .DESCRIPTION
+    Live, 2026-11-18: right after the assessment is turned on, Azure refuses a run (HTTP 500, "There was an unexpected
+    problem communicating with the Arc Sql Extension") until the Azure extension for SQL Server has the setting, and a
+    try minutes later is taken. deploy.ps1's T2 track calls this after T2's host is Ready, when its first try failed. It
+    stops early when the assessment is off, already uploaded, or T2 has no SQL Server instance resource.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidateRange(0, 60)]
+        [int] $WaitMinutes = 10,
+
+        [ValidateRange(1, 600)]
+        [int] $PollSeconds = 120
+    )
+
+    $deadline = (Get-Date).AddMinutes($WaitMinutes)
+    $run = ''
+    $problem = ''
+    while ($true) {
+        $state = Get-DemoArcState -Config $Config
+        $info = Get-DemoArcInstanceInfo -Instance @($state.HostedInstances) -MinimumCores $state.Target.Setting.MinimumCoresPerOse
+        if ($null -eq $info -or -not $info.MigrationAssessment.Enabled -or $info.MigrationAssessment.UploadedAt) {
+            break
+        }
+        try {
+            $run = Start-DemoArcMigrationAssessment -Target $state.Target -InstanceName $info.Name -Confirm:$false
+            $problem = ''
+            break
+        }
+        catch {
+            $problem = $_.Exception.Message
+        }
+        if ((Get-Date).AddSeconds($PollSeconds) -gt $deadline) {
+            break
+        }
+        Start-Sleep -Seconds $PollSeconds
+    }
+    return (Test-DemoArcMigrationAssessment -State $state -RunStatus $run -RunProblem $problem)
+}
+
 function Wait-DemoVmHealthState {
     <#
     .SYNOPSIS

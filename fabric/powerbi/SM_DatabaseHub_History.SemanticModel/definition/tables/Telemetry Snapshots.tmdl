@@ -398,6 +398,113 @@ table 'Telemetry Snapshots'
         isHidden
         displayFolder: Coverage
 
+    /// T5's peak normalized RU consumption in the selection (NormalizedRUConsumption, maximum per bin; analysis cosmosdb), 0 to 100 %: Database Hub's Peak Norm RU %. At 100 % T5 used all of its provisioned throughput in at least one second of a bin, and further requests are throttled (429).
+    measure 'Peak Norm RU (%)' =
+            CALCULATE (
+                MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "NormalizedRUConsumption" )
+            )
+        formatString: #,0.0" %"
+        displayFolder: Cosmos DB
+
+    /// T5's requests in the selected bins (TotalRequests, count per bin), the throttled ones included: what the 429 rate divides by. Like every sum here, two captures of one period at different intervals both count.
+    measure 'Cosmos DB Requests' =
+            CALCULATE (
+                [Snapshot Value],
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "TotalRequests" )
+            )
+        formatString: #,0
+        displayFolder: Cosmos DB
+
+    /// T5's throttled requests in the selected bins: TotalRequests with status code 429 (request rate too large), Database Hub's Throttled Requests (429s). 0 when T5 served requests and none was throttled.
+    measure 'Throttled Requests (429s)' =
+            VAR Throttled =
+                CALCULATE (
+                    [Snapshot Value],
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+                    KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "ThrottledRequests" )
+                )
+            RETURN IF ( ISBLANK ( Throttled ) && NOT ISBLANK ( [Cosmos DB Requests] ), 0, Throttled )
+        formatString: #,0
+        displayFolder: Cosmos DB
+
+    /// Share of T5's requests in the selection that were throttled (429s), in percent: Database Hub's 429 Rate %.
+    measure '429 Rate (%)' = DIVIDE ( [Throttled Requests (429s)], [Cosmos DB Requests] ) * 100
+        formatString: #,0.0" %"
+        displayFolder: Cosmos DB
+
+    /// Request units T5 consumed in the selected bins (TotalRequestUnits, total per bin): Database Hub's Total RU consumed.
+    measure 'RU Consumed' =
+            CALCULATE (
+                [Snapshot Value],
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "TotalRequestUnits" )
+            )
+        formatString: #,0
+        displayFolder: Cosmos DB
+
+    /// T5's provisioned throughput in RU/s in the selection (ProvisionedThroughput, maximum per hour): Database Hub's Provisioned RU/s, to compare with what it consumed.
+    measure 'Provisioned RU/s' =
+            CALCULATE (
+                MAXX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "ProvisionedThroughput" )
+            )
+        formatString: #,0
+        displayFolder: Cosmos DB
+
+    /// T5's availability in the selection (ServiceAvailability, the average of its hourly values), as Database Hub's Performance shows it. A throttled request isn't a failure, so an ru-storm leaves it at 100 %.
+    measure 'Cosmos DB Availability (%)' =
+            CALCULATE (
+                AVERAGEX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "ServiceAvailability" )
+            )
+        formatString: #,0.00" %"
+        displayFolder: Cosmos DB
+
+    /// T5's server-side latency of gateway requests in the selection (ServerSideLatencyGateway, the average of its per-bin averages), in milliseconds. The workload runner uses gateway mode, so Database Hub's Avg Latency (direct mode) stays empty.
+    measure 'Cosmos DB Gateway Latency (ms)' =
+            CALCULATE (
+                AVERAGEX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ),
+                KEEPFILTERS ( 'Telemetry Snapshots'[Metric] = "ServerSideLatencyGateway" )
+            )
+        formatString: #,0.0
+        displayFolder: Cosmos DB
+
+    /// 1 when the lakehouse holds any T5 (Azure Cosmos DB) metric, whatever the filters; drives the Cosmos DB view's empty state.
+    measure 'Has Cosmos DB Bins' =
+            IF (
+                CALCULATE (
+                    COUNTROWS ( 'Telemetry Snapshots' ),
+                    REMOVEFILTERS (),
+                    'Telemetry Snapshots'[Analysis Key] = "cosmosdb"
+                ) > 0,
+                1,
+                0
+            )
+        formatString: 0
+        isHidden
+        displayFolder: Cosmos DB
+
+    /// The Cosmos DB view's title: T5's peak normalized RU and its throttled requests (429s) in the selection, or an empty-state sentence while the lakehouse has no T5 history.
+    measure 'Cosmos DB Headline' =
+            VAR Peak = [Peak Norm RU (%)]
+            VAR Throttled = [Throttled Requests (429s)]
+            VAR PeakText = IF ( ISBLANK ( Peak ), "an unknown", FORMAT ( Peak, "0" ) & " %" )
+            RETURN
+                SWITCH (
+                    TRUE (),
+                    [Has Cosmos DB Bins] = 0, "No Azure Cosmos DB history yet: a session's end, stop-demo.ps1 -SaveHistory, or deploy.ps1 saves T5's Azure Monitor metrics",
+                    ISBLANK ( Peak ) && ISBLANK ( Throttled ), "No T5 metrics in this period",
+                    Throttled > 0, "T5 reached " & PeakText & " normalized RU with " & FORMAT ( Throttled, "#,0" ) & " throttled requests (" & FORMAT ( [429 Rate (%)], "0.0" ) & " % of its requests) in this period",
+                    "T5 had no throttled requests in this period; normalized RU peaked at " & PeakText
+                )
+        displayFolder: Cosmos DB
+
     column 'Run ID'
         dataType: string
         isHidden

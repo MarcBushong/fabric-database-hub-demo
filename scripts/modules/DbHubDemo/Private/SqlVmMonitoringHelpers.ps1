@@ -1426,7 +1426,7 @@ function ConvertTo-DemoSqlVmMonitoringResult {
         # start). A Warning, as before: T1's database keeps working, and a restart of the agent's service, which
         # start-demo.ps1 and every Fabric run do on their own, brings it back.
         $evidence['pending'] = $true
-        return (& $new 'Warning' ('The {0} flag is set on {1}, but {2} reports ''{3}'' (upload ''{4}''), so T1 sends Database Hub no telemetry.' -f $flagName, $State.VmName, $setting['statusPlugin'], $plugin.State, $plugin.MetricsUploadStatus) ('Run ./scripts/start-demo.ps1, which restarts the SQL IaaS Agent service and reads the plugin again (a run from the Fabric control does the same); or restart it yourself: az vm run-command invoke --subscription {0} --resource-group {1} --name {2} --command-id RunPowerShellScript --scripts ''Restart-Service -Name SQLIaaSExtension -Force'', then check again in 5 minutes.' -f $State.SubscriptionId, $State.ResourceGroupName, $State.VmName))
+        return (& $new 'Warning' ('The {0} flag is set on {1}, but {2} reports ''{3}'' (upload ''{4}''), so T1 sends Database Hub no telemetry.' -f $flagName, $State.VmName, $setting['statusPlugin'], $plugin.State, $plugin.MetricsUploadStatus) 'Run ./scripts/start-demo.ps1, which restarts the SQL IaaS Agent service and reads the plugin again (a Run all session does the same), then check again in 5 minutes. If it still reports this, run ./scripts/deploy.ps1, which repairs T1''s SQL IaaS Agent extension when it needs to.')
     }
     if (-not $plugin.Found -or $plugin.State -ne 'Running' -or $plugin.MetricsUploadStatus -ne 'OK') {
         $evidence['pending'] = $true

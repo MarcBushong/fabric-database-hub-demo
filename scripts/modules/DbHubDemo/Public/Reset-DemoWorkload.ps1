@@ -22,7 +22,9 @@ function Reset-DemoWorkload {
     Configuration from Get-DemoConfig.
 
     .PARAMETER Target
-    all (default), T1, T2, T3, or T4 (when t4Enabled).
+    all (default), T1, T2, T3, T4 (when t4Enabled), or T5 (when t5Enabled, 2026-11-18: the runner's reset stops T5's runs,
+    sets its profile off, and deletes any storm document a cut-off ru-storm left, which an idempotent query finds;
+    -Reseed and -UndoRemediation are Not supported there, because T5's scenarios write only bounded sets of documents).
 
     .PARAMETER Reseed
     Reseed the business data (minutes, depending on the profile's seed scale).
@@ -45,7 +47,7 @@ function Reset-DemoWorkload {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [ValidateSet('all', 'T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('all', 'T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target = 'all',
 
         [switch] $Reseed,
@@ -71,10 +73,10 @@ function Reset-DemoWorkload {
     $hostVm = Get-DemoHostVmName -Config $Config
 
     if ($RebuildGuest) {
-        $results.Add((New-DemoResult -CheckId 'RESET.GUEST' -Area 'workload' -Target 'T2' -Status 'Not supported' -Message 'Rebuilding the T2 guest isn''t supported yet: the host''s bootstrap state machine skips guest steps that succeeded, and resetting them safely is a follow-up.' -Remediation 'To start T2 over, run ./scripts/destroy.ps1, then ./scripts/deploy.ps1. To return its data to a known state, run reset-demo.ps1 -Target T2 -Reseed.'))
+        $results.Add((New-DemoResult -CheckId 'RESET.GUEST' -Area 'workload' -Target 'T2' -Status 'Not supported' -Message 'Rebuilding the T2 guest isn''t supported yet: the host''s bootstrap state machine skips guest steps that succeeded, and resetting them safely is a follow-up.' -Remediation 'To start T2 over, run ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1, which keeps the Fabric workspaces with their history. To return its data to a known state, run ./scripts/reset-demo.ps1 -Target T2 -Reseed.'))
     }
 
-    $targets = if ($Target -eq 'all') { @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @('T2') } else { @($Target) }
+    $targets = if ($Target -eq 'all') { @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' }) + @('T2') } else { @($Target) }
     $power = @{}
     foreach ($vm in 'sqlvm01', $hostVm) {
         $power[$vm] = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName $vm
@@ -122,6 +124,16 @@ function Reset-DemoWorkload {
             }
             elseif ($t4.State -ne 'Ready') {
                 $skip = 'T4 is {0}; start it with start-demo.ps1.' -f $t4.State
+            }
+        }
+        elseif ($item -eq 'T5') {
+            # T5 (ADR 0027): an account that doesn't exist has nothing to reset.
+            $t5 = Get-DemoT5State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+            if (-not (Test-DemoT5Enabled -Config $Config)) {
+                $skip = 'T5 is off in this configuration (t5Enabled is false).'
+            }
+            elseif (-not $t5.Exists) {
+                $skip = 'T5''s Cosmos DB account doesn''t exist ({0}); ./scripts/deploy.ps1 creates it.' -f $t5.State
             }
         }
         if ($skip) {

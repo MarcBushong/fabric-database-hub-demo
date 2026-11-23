@@ -38,6 +38,17 @@ BeforeAll {
         [pscustomobject]@{ id = $Id; displayName = $Name; sku = 'F2'; state = 'Active'; region = 'West US 3' }
     }
 
+    function New-InitClaim {
+        # What Azure Resource Graph says the other demo environments record (Get-DemoFabricWorkspaceClaim, 2026-11-19): each
+        # -Other is "<label>=<workspace ID>", and -Problem makes the read fail.
+        param([string[]] $Other = @(), [string] $Problem = '')
+        $others = @(foreach ($entry in $Other) {
+                $label, $id = $entry -split '=', 2
+                [pscustomobject]@{ Name = ($label -split ' ')[0]; SubscriptionId = $script:subA; Label = $label; Tagged = $true; Claims = @($id) }
+            })
+        [pscustomobject]@{ Ok = (-not $Problem); Error = $Problem; Others = $others; Own = [pscustomobject]@{ Found = $false; FabricWorkspaceId = ''; Claims = @(); UsedFabric = $false } }
+    }
+
     function New-DemoWorkspaceContent {
         # What a workspace that holds only the demo's items lists (Items - List Items): its lakehouse with its SQL
         # analytics endpoint, and its three notebooks (-Own); plus -Extra items, each "<type>|<name>" (issue 60's follow-up).
@@ -66,6 +77,9 @@ BeforeAll {
             WorkspaceItems = @{}
             ItemsError   = ''
             RoleSuffix   = [pscustomobject]@{ Found = $false; Suffix = ''; Others = @(); Note = ''; Error = '' }
+            # What the other demo environments record (Get-DemoFabricWorkspaceClaim, 2026-11-19): nobody else's workspace
+            # unless a test says so (New-InitClaim).
+            Claim        = (New-InitClaim)
         }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoAzProfileSubscription -MockWith { $script:calls.Add('Profile'); $script:init.Profile }
@@ -104,6 +118,7 @@ BeforeAll {
         # them (New-InitEnvironment), and each record's parameters.
         Mock -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionInventory -MockWith { $script:calls.Add('Inventory'); $script:init.Inventory }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoControlRoleSuffix -MockWith { $script:calls.Add('Roles:' + $ResourceGroup); $script:init.RoleSuffix }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -MockWith { $script:calls.Add(('Claim:rg-{0}-{1}' -f $Config['prefix'], $Config['environment'])); $script:init.Claim }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentRecord -MockWith {
             $script:calls.Add('Record:' + $Name)
             if ($script:init.Records.Contains($Name)) {
@@ -146,6 +161,12 @@ BeforeAll {
 
     function Get-InitResult([object] $Init, [string] $CheckId) {
         @($Init.Results | Where-Object { $_.checkId -eq $CheckId }) | Select-Object -First 1
+    }
+
+    function Get-InitCommand([string] $Path) {
+        # The init.ps1 command a fix names for a configuration outside the repository, as TestDrive is (2026-11-19): with
+        # its -ConfigPath, so it never writes config/demo.config.json (Resolve-DemoInitCommandText).
+        './scripts/init.ps1 -ConfigPath "{0}"' -f [System.IO.Path]::GetFullPath($Path)
     }
 }
 
@@ -573,7 +594,7 @@ Describe 'A first run in a subscription that already has the environment (issue 
         Test-Path -LiteralPath $script:path | Should -BeFalse
         $refused = Get-InitResult $init 'INIT.EXISTING'
         $refused.status | Should -Be 'Manual action required'
-        $refused.remediation | Should -Match 'init\.ps1 -Prefix dbhubvn -OwnerEmail <the budget address it records>'
+        $refused.remediation | Should -Be ('If it''s yours, run {0} -Prefix dbhubvn -OwnerEmail <the budget address it records>, or ask an owner of its administrators'' group to add you as an owner and run {0} -Prefix dbhubvn again. Otherwise choose another -Prefix.' -f (Get-InitCommand $script:path))
         Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoEntraSecurityGroup -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -Times 0 -Exactly
 
@@ -592,7 +613,7 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubvu' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
         $workspace = Get-InitResult $init 'INIT.FABRIC.WORKSPACE'
         $workspace.status | Should -Be 'Manual action required'
-        $workspace.remediation | Should -Match 'init\.ps1 -Force -Prefix dbhubvu -WorkspaceName'
+        $workspace.remediation | Should -Be ('Run {0} -Force -Prefix dbhubvu -WorkspaceName <its Fabric workspace''s name>.' -f (Get-InitCommand $script:path))
         (Get-DemoConfig -Path $script:path)['fabric']['workspaceName'] | Should -Not -Be 'Database Hub Demo'
         $named = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubvu' -WorkspaceName 'Contoso VU' -Force -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
         (Get-InitResult $named 'INIT.FABRIC.WORKSPACE').status | Should -Be 'Pass'
@@ -671,7 +692,7 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $shared = Join-Path -Path $TestDrive -ChildPath ('shared.{0}.json' -f [guid]::NewGuid().ToString('N'))
         $init = Initialize-DemoConfig -Path $shared -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
         (Get-DemoConfig -Path $shared)['fabric']['importNotebooks'] | Should -BeFalse -Because 'a workspace that holds anything else, and none of the demo''s notebooks, keeps a first run''s rule'
-        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), and none of the demo''s notebooks, so deploy\.ps1 adds only the notebooks that are missing and keeps the copies there \(\./scripts/configure-fabric\.ps1 updates them\)\.'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match ('fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), and none of the demo''s notebooks, so deploy\.ps1 adds only the notebooks that are missing and keeps the copies there \(\./scripts/configure-fabric\.ps1 -ConfigPath "{0}" updates them\)\.' -f [regex]::Escape([System.IO.Path]::GetFullPath($shared))) -Because 'the script it names updates this configuration''s workspace, not config/demo.config.json''s (2026-11-19)'
         (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 adds only the notebooks that are missing'
 
         $script:init.ItemsError = 'HTTP 403: InsufficientWorkspaceRole'
@@ -728,6 +749,330 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $failed.message | Should -Match 'couldn''t be checked: the role assignments at rg-dbhub-demo couldn''t be read: HTTP 429\. A first run writes nothing it can''t check'
         $init.Existing.Kind | Should -Be 'Unreadable'
         Should -Invoke -ModuleName DbHubDemo -CommandName New-DemoEntraSecurityGroup -Times 0 -Exactly
+    }
+}
+
+Describe 'A second environment''s Fabric workspace (2026-11-19, the final tests'' F5)' {
+    BeforeEach {
+        Set-InitMock
+        $script:path = Join-Path -Path $TestDrive -ChildPath ('demo.config.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        $script:backup = Join-Path -Path $TestDrive -ChildPath 'backup'
+        $script:init.Groups = @([pscustomobject]@{ id = $script:groupId; displayName = 'sg-contoso-admins'; securityEnabled = $true })
+        # The owner's environment, rg-dbhub-demo, yours, and the Fabric workspace it records as its own.
+        $script:ownerWorkspaceId = 'dddddddd-0000-0000-0000-000000000001'
+        $script:init.Workspaces = @(New-FabricWorkspaceItem 'Database Hub Demo' $script:ownerWorkspaceId $script:capacityFabricId)
+        New-InitEnvironment -Tag @{ owner = 'colleague@contoso.example'; DbHubFabricWorkspaceId = $script:ownerWorkspaceId } -Parameter (New-RecordParameter)
+        $script:init.Claim = New-InitClaim -Other ('rg-dbhub-demo={0}' -f $script:ownerWorkspaceId)
+    }
+
+    It 'gives a new environment with an explicit -Prefix its own workspace, "Database Hub Demo" and the prefix, never the first one''s' {
+        # The README's "./scripts/init.ps1 -Prefix <prefix>", followed literally: it wrote "Database Hub Demo" (Pass) at 9a218e0.
+        $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $init.Existing.Kind | Should -Be 'New'
+        $written = Get-DemoConfig -Path $script:path
+        $written['prefix'] | Should -Be 'dbhubfn'
+        $written['fabric']['workspaceName'] | Should -Be 'Database Hub Demo dbhubfn'
+        $written['fabric']['importNotebooks'] | Should -BeTrue -Because 'its own workspace doesn''t exist yet, so deploy.ps1 creates it with the notebooks'
+        InModuleScope DbHubDemo -Parameters @{ Config = $written } { (Get-DemoActivityControlSetting -Config $Config).FabricWorkspaceName } | Should -Be 'Database Hub Demo dbhubfn Control' -Because 'the control''s workspace follows the demo workspace''s name, so it''s the environment''s own too'
+        $workspace = Get-InitResult $init 'INIT.FABRIC.WORKSPACE'
+        $workspace.status | Should -Be 'Pass'
+        $workspace.message | Should -Match '^The Fabric workspace "Database Hub Demo dbhubfn" doesn''t exist yet: deploy\.ps1 creates it on "contosofabric"'
+        (Get-InitResult $init 'INIT.CONFIG').message | Should -Match 'the workspace "Database Hub Demo dbhubfn" on "contosofabric"'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -Times 0 -Exactly -Because 'a workspace that doesn''t exist yet is nobody''s'
+
+        # The first environment deployed before 2026-11-17 records no workspace: the second one gets its own all the same.
+        $script:init.Inventory.Groups['rg-dbhub-demo'] = @{ owner = 'colleague@contoso.example' }
+        $script:init.Claim = New-InitClaim
+        $unrecorded = Join-Path -Path $TestDrive -ChildPath ('unrecorded.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        Initialize-DemoConfig -Path $unrecorded -Prefix 'dbhubfn' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false | Out-Null
+        (Get-DemoConfig -Path $unrecorded)['fabric']['workspaceName'] | Should -Be 'Database Hub Demo dbhubfn'
+    }
+
+    It 'keeps "Database Hub Demo" for the default prefix''s environment, a next prefix''s own name, and a -WorkspaceName nobody else records' {
+        $script:init.Inventory = [pscustomobject]@{ Succeeded = $true; Error = ''; Groups = @{}; Deployments = [System.Collections.Generic.List[string]]::new() }
+        $script:init.Claim = New-InitClaim
+        foreach ($case in @(
+                @{ Prefix = ''; Name = ''; Expected = 'Database Hub Demo'; Kind = 'New' }
+                @{ Prefix = 'dbhub'; Name = ''; Expected = 'Database Hub Demo'; Kind = 'New' }
+                @{ Prefix = 'dbhubfn'; Name = 'Contoso FN'; Expected = 'Contoso FN'; Kind = 'New' }
+            )) {
+            $file = Join-Path -Path $TestDrive -ChildPath ('case.{0}.json' -f [guid]::NewGuid().ToString('N'))
+            $parameters = @{ Path = $file; CreateAdminGroup = $true; NonInteractive = $true; BackupDirectory = $script:backup; Confirm = $false }
+            if ($case.Prefix) { $parameters['Prefix'] = $case.Prefix }
+            if ($case.Name) { $parameters['WorkspaceName'] = $case.Name }
+            $init = Initialize-DemoConfig @parameters
+            $init.Existing.Kind | Should -Be $case.Kind
+            (Get-DemoConfig -Path $file)['fabric']['workspaceName'] | Should -Be $case.Expected
+            (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').status | Should -Be 'Pass' -Because ('no other environment records "{0}"' -f $case.Expected)
+        }
+        # A prefix the run picks, because rg-dbhub-demo isn't yours: its own name, as since 2026-11-18.
+        New-InitEnvironment -Tag @{ owner = 'someone@fabrikam.example' } -Parameter (New-RecordParameter -Owner 'someone@fabrikam.example' -OwnerEmail 'someone@fabrikam.example' -GroupId '77777777-aaaa-bbbb-cccc-777777777777')
+        $script:init.OwnedGroups = @()
+        $next = Join-Path -Path $TestDrive -ChildPath ('next.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        $init = Initialize-DemoConfig -Path $next -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $init.Existing.Kind | Should -Be 'NewPrefix'
+        (Get-DemoConfig -Path $next)['fabric']['workspaceName'] | Should -Be 'Database Hub Demo dbhub2'
+    }
+
+    It 'gives way to the environment''s own name when the default one is another environment''s, and says so' {
+        # A new environment in another subscription, whose default name is the workspace this subscription's rg-dbhub-demo records.
+        $script:init.Inventory = [pscustomobject]@{ Succeeded = $true; Error = ''; Groups = @{}; Deployments = [System.Collections.Generic.List[string]]::new() }
+        $script:init.Claim = New-InitClaim -Other ('rg-dbhub-demo (subscription {0})={1}' -f $script:subB, $script:ownerWorkspaceId)
+        $init = Initialize-DemoConfig -Path $script:path -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $written = Get-DemoConfig -Path $script:path
+        $written['fabric']['workspaceName'] | Should -Be 'Database Hub Demo dbhub'
+        $written['fabric']['importNotebooks'] | Should -BeTrue
+        $workspace = Get-InitResult $init 'INIT.FABRIC.WORKSPACE'
+        $workspace.status | Should -Be 'Warning' -Because 'an automatic change is never silent'
+        $workspace.message | Should -Match '^The Fabric workspace "Database Hub Demo dbhub" doesn''t exist yet: deploy\.ps1 creates it'
+        $workspace.message | Should -Match ('It''s this environment''s own: "Database Hub Demo", the name it would have had, is the workspace rg-dbhub-demo \(subscription {0}\) records as its own, so init\.ps1 doesn''t give it to this environment\.$' -f $script:subB)
+        $workspace.remediation | Should -Be ('Nothing to do. To choose another name, run {0} -Force -Prefix dbhub -WorkspaceName <a name no other environment uses>.' -f (Get-InitCommand $script:path))
+        $init.Existing.Note | Should -Be ('The Fabric workspace is "Database Hub Demo dbhub", this environment''s own: "Database Hub Demo", the name it would have had, is the one rg-dbhub-demo (subscription {0}) records as its own (INIT.FABRIC.WORKSPACE).' -f $script:subB) -Because 'an automatic change shows on deploy.ps1''s start banner and status page too'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoFabricWorkspaceClaim -Times 1 -Exactly -ParameterFilter { $Config['prefix'] -eq 'dbhub' -and $Config['subscriptionId'] -eq $script:subA }
+
+        # Its own name is taken too, by a workspace another environment records: the next one.
+        $script:init.Workspaces = @($script:init.Workspaces) + @(New-FabricWorkspaceItem 'Database Hub Demo dbhub' 'dddddddd-0000-0000-0000-000000000002' $script:capacityFabricId)
+        $script:init.Claim = New-InitClaim -Other ('rg-dbhub-demo (subscription {0})={1}' -f $script:subB, $script:ownerWorkspaceId), 'rg-dbhubx-demo=dddddddd-0000-0000-0000-000000000002'
+        $taken = Join-Path -Path $TestDrive -ChildPath ('taken.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        Initialize-DemoConfig -Path $taken -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false | Out-Null
+        (Get-DemoConfig -Path $taken)['fabric']['workspaceName'] | Should -Be 'Database Hub Demo dbhub 2'
+    }
+
+    It 'never gives an explicit -WorkspaceName that another environment records: Manual action required, with the environment and the fix' {
+        $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -WorkspaceName 'Database Hub Demo' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $workspace = Get-InitResult $init 'INIT.FABRIC.WORKSPACE'
+        $workspace.status | Should -Be 'Manual action required'
+        $workspace.message | Should -Be 'The Fabric workspace "Database Hub Demo" (-WorkspaceName) is the one rg-dbhub-demo records as its own, so init.ps1 doesn''t give it to this environment: deploy.ps1 would put this environment''s lakehouse, history model, report, notebooks, and Insights app there, over the other environment''s, so it stops before it creates anything (DEPLOY.FABRIC.SHARED).'
+        $workspace.remediation | Should -Be ('Run {0} -Force -Prefix dbhubfn -WorkspaceName <a name no other environment uses>, for example "Database Hub Demo dbhubfn".' -f (Get-InitCommand $script:path))
+        @($workspace.evidence.recordedBy) | Should -Be @('rg-dbhub-demo')
+        (Get-DemoConfig -Path $script:path)['fabric']['workspaceName'] | Should -Be 'Database Hub Demo' -Because 'what you named is kept, and deploy.ps1''s DEPLOY.FABRIC.SHARED stops before it creates anything there'
+        @($init.NextSteps)[0] | Should -Match 'INIT\.FABRIC\.WORKSPACE'
+    }
+
+    It 'keeps a recovered environment''s own workspace that another environment records too, with a Warning and how to move, so its update changes nothing' {
+        # The existing user who updates: rg-dbhub-demo records "Database Hub Demo", and so does rg-dbhubfu-demo, by mistake.
+        $script:init.Claim = New-InitClaim -Other ('rg-dbhubfu-demo={0}' -f $script:ownerWorkspaceId)
+        $init = Initialize-DemoConfig -Path $script:path -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $init.Existing.Kind | Should -Be 'Recovered'
+        $written = Get-DemoConfig -Path $script:path
+        $written['fabric']['workspaceName'] | Should -Be 'Database Hub Demo'
+        $written['fabric']['importNotebooks'] | Should -BeTrue -Because 'it''s the workspace the environment records'
+        $workspace = Get-InitResult $init 'INIT.FABRIC.WORKSPACE'
+        $workspace.status | Should -Be 'Warning'
+        $workspace.message | Should -Match 'rg-dbhub-demo records it as its own, and so does rg-dbhubfu-demo: the environments share it, and each deploy\.ps1 puts its own notebooks there, over the other''s\. The configuration keeps it, as deployed\.$'
+        $workspace.remediation | Should -Be ('To give this environment a workspace of its own, set fabric.workspaceName in its configuration to a name no other environment uses, for example "Database Hub Demo dbhub", then run ./scripts/deploy.ps1 -ConfigPath "{0}": it creates that workspace with the demo''s items and records it, and "Database Hub Demo" stays as it is for rg-dbhubfu-demo.' -f [System.IO.Path]::GetFullPath($script:path))
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match 'the Fabric workspace "Database Hub Demo"'
+
+        # One deployed before 2026-11-17 records none: the workspace by its default name may be its own, so it stays too.
+        $script:init.Inventory.Groups['rg-dbhub-demo'] = @{ owner = 'colleague@contoso.example' }
+        $old = Join-Path -Path $TestDrive -ChildPath ('old.{0}.json' -f [guid]::NewGuid().ToString('N'))
+        $init = Initialize-DemoConfig -Path $old -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-DemoConfig -Path $old)['fabric']['workspaceName'] | Should -Be 'Database Hub Demo'
+        $workspace = Get-InitResult $init 'INIT.FABRIC.WORKSPACE'
+        $workspace.status | Should -Be 'Warning'
+        $workspace.message | Should -Match 'rg-dbhub-demo records no Fabric workspace \(it was deployed before 2026-11-17\), and this is the one rg-dbhubfu-demo records as its own, so the environments may share it'
+    }
+
+    It 'warns, and never passes, when Resource Graph can''t say whether another environment records the workspace' {
+        $script:init.Inventory = [pscustomobject]@{ Succeeded = $true; Error = ''; Groups = @{}; Deployments = [System.Collections.Generic.List[string]]::new() }
+        $script:init.Claim = New-InitClaim -Problem 'HTTP 503: ServiceUnavailable.'
+        $init = Initialize-DemoConfig -Path $script:path -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-DemoConfig -Path $script:path)['fabric']['workspaceName'] | Should -Be 'Database Hub Demo'
+        $workspace = Get-InitResult $init 'INIT.FABRIC.WORKSPACE'
+        $workspace.status | Should -Be 'Warning'
+        $workspace.message | Should -Match 'exists; the scripts use it, and deploy\.ps1 adds only the notebooks that are missing\. Whether another demo environment records it couldn''t be checked \(HTTP 503: ServiceUnavailable\), so it may be another environment''s\.$'
+        $workspace.remediation | Should -Be ('If it''s another environment''s, run {0} -Force -Prefix dbhub -WorkspaceName <a name no other environment uses>. deploy.ps1 checks again before it creates anything (DEPLOY.FABRIC.SHARED).' -f (Get-InitCommand $script:path))
+    }
+}
+
+Describe 'The commands init.ps1 tells you to run name the run''s -Prefix and -ConfigPath (2026-11-19, after the final tests'' F5)' {
+    # Before, a fix said "init.ps1 -Force ...": for a second environment, following it wrote the default prefix's
+    # configuration, in config/demo.config.json, and the next deploy.ps1 updated the first environment.
+    BeforeEach {
+        Set-InitMock
+        $script:path = Join-Path -Path $TestDrive -ChildPath ('second.{0}.local.json' -f [guid]::NewGuid().ToString('N'))
+        $script:full = [System.IO.Path]::GetFullPath($script:path)
+        $script:backup = Join-Path -Path $TestDrive -ChildPath 'backup'
+        $script:command = Get-InitCommand $script:path
+    }
+
+    It 'writes each init.ps1 command as the run''s own, and leaves a default run''s text and mentions in passing as they are' {
+        $text = 'Run init.ps1 -Force -CreateAdminGroup to create it, or: Then run init.ps1 -Force -AdminGroupObjectId <its object ID>. init.ps1 doesn''t guess, and init.ps1''s own -Prefix stays as it is.'
+        InModuleScope DbHubDemo -Parameters @{ Text = $text; Path = $script:path; Full = $script:full; Command = $script:command } {
+            $default = Join-Path -Path $script:RepoRoot -ChildPath 'config/demo.config.json'
+            Resolve-DemoInitCommandText -Text $Text -Prefix 'dbhub' -ConfigPath $default | Should -BeExactly $Text
+            Resolve-DemoInitCommandText -Text $Text -Prefix '' -ConfigPath $default | Should -BeExactly $Text
+            $own = Resolve-DemoInitCommandText -Text $Text -Prefix 'dbhubfn' -ConfigPath $Path
+            $own | Should -BeExactly ('Run {0} -Prefix dbhubfn -Force -CreateAdminGroup to create it, or: Then run {0} -Prefix dbhubfn -Force -AdminGroupObjectId <its object ID>. init.ps1 doesn''t guess, and init.ps1''s own -Prefix stays as it is.' -f $Command)
+            Resolve-DemoInitCommandText -Text $own -Prefix 'dbhubfn' -ConfigPath $Path | Should -BeExactly $own -Because 'a text that went through once stays as it is'
+            Resolve-DemoInitCommandText -Text $Text -Prefix 'dbhubfn' -ConfigPath $default | Should -BeLike 'Run ./scripts/init.ps1 -Prefix dbhubfn -Force -CreateAdminGroup to create it, or: Then run ./scripts/init.ps1 -Prefix dbhubfn -Force -AdminGroupObjectId*'
+            Resolve-DemoInitCommandText -Text $Text -Prefix 'dbhub' -ConfigPath $Path | Should -BeLike ('Run {0} -Force -CreateAdminGroup to create it, or: Then run {0} -Force -AdminGroupObjectId*' -f $Command)
+            Resolve-DemoInitCommandText -Text 'Run init.ps1 -Force -Prefix dbhub -WorkspaceName <a name>.' -Prefix 'dbhubfn' -ConfigPath $Path | Should -BeExactly ('Run {0} -Force -Prefix dbhub -WorkspaceName <a name>.' -f $Command) -Because 'a command that names its -Prefix keeps it'
+            Resolve-DemoInitCommandText -Text 'If it''s yours: ./scripts/destroy.ps1 deletes the new one, and ./scripts/deploy.ps1.' -Prefix 'dbhubfn' -ConfigPath $Path | Should -BeExactly ('If it''s yours: ./scripts/destroy.ps1 -ConfigPath "{0}" deletes the new one, and ./scripts/deploy.ps1 -ConfigPath "{0}".' -f $Full)
+        }
+    }
+
+    It 'names them in the administrators'' group''s fix, INIT.USER''s, and the next step that runs init.ps1 again' {
+        # No group exists, -CreateAdminGroup isn't given, and the sign-in has no address for the budget alerts.
+        $script:init.Profile.Subscriptions[0].Account = 'colleague'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSignedInUser -MockWith { $null }
+        $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $group = Get-InitResult $init 'INIT.P6.GROUP'
+        $group.status | Should -Be 'Manual action required'
+        $group.remediation | Should -BeLike ('Run {0} -Prefix dbhubfn -Force -CreateAdminGroup to create it with you as its owner, or: *' -f $script:command)
+        $group.remediation | Should -BeLike ('* Then run {0} -Prefix dbhubfn -Force -AdminGroupObjectId <the group''s object ID>.' -f $script:command)
+        (Get-InitResult $init 'INIT.USER').remediation | Should -Be ('Run {0} -Prefix dbhubfn -OwnerEmail <address> -Force.' -f $script:command)
+        @($init.NextSteps)[0] | Should -Be ('Fix what''s listed under Manual action required above (INIT.USER, INIT.P6.GROUP), then run {0} -Prefix dbhubfn -Force again.' -f $script:command)
+    }
+
+    It 'names them in the Fabric capacity''s fix' {
+        $script:init.Capacities = @((New-FabricItem 'contosofabric'), (New-FabricItem 'fabrikamfabric'))
+        $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $capacity = Get-InitResult $init 'INIT.FABRIC.CAPACITY'
+        $capacity.status | Should -Be 'Manual action required'
+        $capacity.remediation | Should -Be ('Run {0} -Prefix dbhubfn -Force -CapacityName <name>, or run {0} -Prefix dbhubfn -Force in a terminal that can take input, to choose.' -f $script:command) -Because 'nothing passed -NonInteractive: the terminal couldn''t take input (the final tests'' F6)'
+
+        # -NonInteractive given where a person could answer: that's what to leave out.
+        $script:init.Interactive = $true
+        $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -CreateAdminGroup -NonInteractive -Force -BackupDirectory $script:backup -Confirm:$false
+        (Get-InitResult $init 'INIT.FABRIC.CAPACITY').remediation | Should -Be ('Run {0} -Prefix dbhubfn -Force -CapacityName <name>, or run {0} -Prefix dbhubfn -Force without -NonInteractive, to choose.' -f $script:command)
+    }
+
+    It 'names them before the run knows its prefix: the subscription''s fix, the sign-in''s, and the one for a file that exists, with its next steps' {
+        $script:init.Profile = [pscustomobject]@{ Installed = $true; SignedIn = $true; Error = ''; Subscriptions = @((New-ProfileEntry $script:subA 'Contoso Demo' $true), (New-ProfileEntry $script:subB 'Fabrikam')) }
+        $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-InitResult $init 'INIT.SUBSCRIPTION').remediation | Should -Be ('Run {0} -Prefix dbhubfn -SubscriptionId <id> (''az account list --output table'' lists them), or run {0} -Prefix dbhubfn in a terminal that can take input, to choose.' -f $script:command)
+
+        $script:init.Profile = [pscustomobject]@{ Installed = $true; SignedIn = $false; Error = 'No subscription.'; Subscriptions = @() }
+        $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-InitResult $init 'INIT.AZ.SIGNIN').remediation | Should -BeLike ('* press Enter at the subscription selector, then run {0} -Prefix dbhubfn again. Nothing here signs in for you or changes your default subscription.' -f $script:command)
+
+        # A file that exists: its fix and the next steps name it, and, without -Prefix, the fix names the prefix it holds.
+        Set-Content -LiteralPath $script:path -Value '{ "prefix": "dbhubfn" }'
+        foreach ($given in @{ Prefix = 'dbhubfn' }, @{}) {
+            $init = Initialize-DemoConfig -Path $script:path -NonInteractive -BackupDirectory $script:backup -Confirm:$false @given
+            (Get-InitResult $init 'INIT.CONFIG').remediation | Should -Be ('To write it again from your sign-in, run {0} -Prefix dbhubfn -Force: it keeps a copy of the old file in out/config-backup first.' -f $script:command)
+            @($init.NextSteps) | Should -Be @(('./scripts/preflight.ps1 -ConfigPath "{0}"' -f $script:full), ('./scripts/deploy.ps1 -ConfigPath "{0}"' -f $script:full))
+        }
+        Set-Content -LiteralPath $script:path -Value '{ "prefix": "dbhub" }'
+        $init = Initialize-DemoConfig -Path $script:path -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-InitResult $init 'INIT.CONFIG').remediation | Should -Be ('To write it again from your sign-in, run {0} -Force: it keeps a copy of the old file in out/config-backup first.' -f $script:command)
+    }
+
+    It 'names them in the line it logs about T2''s mode' {
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add([string]$Message) }
+        Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false | Out-Null
+        @($script:logged | Where-Object { $_ -like 'T2 gets SQL Server from*' }) | Should -Be @(('T2 gets SQL Server from Arc Jumpstart''s prebuilt SQL Server 2022 Standard guest (t2SqlInstallMode JumpstartImage, the default): unattended, so nobody signs in to a VM. To choose another mode on purpose, run {0} -Prefix dbhubfn -Force -T2SqlInstallMode Developer (T2 in Database Hub''s Estate only), or set ProductKey in the configuration (prerequisite P10).' -f $script:command))
+    }
+
+    It 'names them in deploy.ps1''s first run, whose NOT DONE passes on the fix init.ps1 gives the prefix it picked' {
+        # rg-dbhub-demo isn't yours, so the first run picks dbhub2, and two capacities need a choice nobody can make here.
+        New-InitEnvironment -Tag @{ owner = 'someone@fabrikam.example' } -Parameter (New-RecordParameter -Owner 'someone@fabrikam.example' -OwnerEmail 'someone@fabrikam.example' -GroupId '77777777-aaaa-bbbb-cccc-777777777777')
+        $script:init.OwnedGroups = @()
+        $script:init.Capacities = @((New-FabricItem 'contosofabric'), (New-FabricItem 'fabrikamfabric'))
+        $noInput = [pscustomobject]@{ GitHubActions = $false; Ci = $false; Interactive = $false; Codespaces = $false; Windows = $true }
+        $first = Initialize-DemoFirstRun -ConfigPath $script:path -Environment $noInput
+        $first.Outcome.Kind | Should -Be 'NotDone'
+        $first.Outcome.Reason | Should -Match 'INIT\.FABRIC\.CAPACITY'
+        $first.Outcome.Next | Should -Be ('Run {0} -Prefix dbhub2 -Force -CapacityName <name>, or run {0} -Prefix dbhub2 -Force in a terminal that can take input, to choose. Then run ./scripts/deploy.ps1 -ConfigPath "{1}" again: it writes the configuration (when it isn''t there yet) and deploys.' -f $script:command, $script:full)
+    }
+
+    It 'keeps the prefix of the configuration that -Force overwrites without -Prefix, so the fix the final tests followed literally stays with its environment (F7)' {
+        # The final tests' F7: rg-dbhub-demo is yours, and init.ps1 -Prefix dbhubfn wrote dbhubfn's file with
+        # INIT.FABRIC.CAPACITY open. Its fix, followed as it read before, named no -Prefix, and wrote the default prefix's.
+        New-InitEnvironment -Tag @{ owner = 'colleague@contoso.example' } -Parameter (New-RecordParameter)
+        $script:init.Capacities = @((New-FabricItem 'contosofabric'), (New-FabricItem 'fabrikamfabric'), (New-FabricItem 'northwindfabric'))
+        $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-InitResult $init 'INIT.FABRIC.CAPACITY').status | Should -Be 'Manual action required'
+        (Get-DemoConfig -Path $script:path)['prefix'] | Should -Be 'dbhubfn'
+
+        $rerun = Initialize-DemoConfig -Path $script:path -Force -CapacityName 'contosofabric' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $rerun.Existing.Kind | Should -Be 'New' -Because 'rg-dbhub-demo, the owner''s, is never this file''s environment'
+        $written = Get-DemoConfig -Path $script:path
+        $written['prefix'] | Should -Be 'dbhubfn'
+        $written['environment'] | Should -Be 'demo'
+        $written['fabric']['workspaceName'] | Should -Be 'Database Hub Demo dbhubfn'
+        $written['fabric']['capacityName'] | Should -Be 'contosofabric'
+        (Get-InitResult $rerun 'INIT.CONFIG').message | Should -Match ' It kept the prefix dbhubfn from the configuration it overwrote \(no -Prefix was given\), so the file is still for rg-dbhubfn-demo\.$'
+
+        # An explicit -Prefix still wins: here, the default prefix's environment, as asked.
+        $switched = Initialize-DemoConfig -Path $script:path -Prefix 'dbhub' -Force -CapacityName 'contosofabric' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $switched.Existing.Kind | Should -Be 'Recovered'
+        (Get-DemoConfig -Path $script:path)['prefix'] | Should -Be 'dbhub'
+        (Get-InitResult $switched 'INIT.CONFIG').message | Should -Not -Match 'It kept'
+    }
+
+    It 'keeps the environment with the prefix, and treats a kept prefix as named: an environment that isn''t yours writes nothing, never another prefix (F7)' {
+        Set-Content -LiteralPath $script:path -Value '{ "prefix": "dbhubfn", "environment": "test" }'
+        $dry = Initialize-DemoConfig -Path $script:path -Force -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false -WhatIf
+        (Get-InitResult $dry 'INIT.CONFIG').message | Should -Match ' It would keep the prefix dbhubfn and the environment test from the configuration it overwrites \(no -Prefix was given\), so the file is still for rg-dbhubfn-test\.$'
+        $init = Initialize-DemoConfig -Path $script:path -Force -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $written = Get-DemoConfig -Path $script:path
+        $written['prefix'] | Should -Be 'dbhubfn'
+        $written['environment'] | Should -Be 'test'
+        $init.Existing.ResourceGroup | Should -Be 'rg-dbhubfn-test'
+        $named = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -Force -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        (Get-DemoConfig -Path $script:path)['environment'] | Should -Be 'test' -Because 'the fixes name -Prefix now, and following one keeps the environment too'
+        (Get-InitResult $named 'INIT.CONFIG').message | Should -Match ' It kept the environment test from the configuration it overwrote, so the file is still for rg-dbhubfn-test\.$'
+        Initialize-DemoConfig -Path $script:path -Prefix 'dbhubx' -Force -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false | Out-Null
+        (Get-DemoConfig -Path $script:path)['environment'] | Should -Be 'demo' -Because 'another prefix is another environment'
+
+        # rg-dbhub-demo isn't yours: with dbhub kept from the file, nothing is written, rather than a new prefix's file.
+        $script:init.OwnedGroups = @()
+        New-InitEnvironment -Tag @{ owner = 'someone@fabrikam.example' } -Parameter (New-RecordParameter -Owner 'someone@fabrikam.example' -OwnerEmail 'someone@fabrikam.example')
+        Set-Content -LiteralPath $script:path -Value '{ "prefix": "dbhub" }'
+        $refused = Initialize-DemoConfig -Path $script:path -Force -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $refused.Existing.Kind | Should -Be 'NotYours'
+        $refused.Written | Should -BeFalse
+        (Get-Content -LiteralPath $script:path -Raw).Trim() | Should -Be '{ "prefix": "dbhub" }'
+    }
+
+    It 'scans every result, fix, and next step of runs for another environment: each init.ps1 command names the run''s -ConfigPath and a -Prefix' {
+        $other = '12121212-1212-1212-1212-121212121212'
+        $runs = @(
+            @{ Name = 'no group, no address'; Parameters = @{}; Setup = { $script:init.Profile.Subscriptions[0].Account = 'colleague'; Mock -ModuleName DbHubDemo -CommandName Get-DemoSignedInUser -MockWith { $null } } }
+            @{ Name = 'two capacities'; Parameters = @{ CreateAdminGroup = $true }; Setup = { $script:init.Capacities = @((New-FabricItem 'contosofabric'), (New-FabricItem 'fabrikamfabric')) } }
+            @{ Name = 'no capacity'; Parameters = @{ CreateAdminGroup = $true }; Setup = { $script:init.Capacities = @() } }
+            @{ Name = 'a capacity nobody has'; Parameters = @{ CreateAdminGroup = $true; CapacityName = 'nowhere' }; Setup = { } }
+            @{ Name = 'two subscriptions'; Parameters = @{}; Setup = { $script:init.Profile = [pscustomobject]@{ Installed = $true; SignedIn = $true; Error = ''; Subscriptions = @((New-ProfileEntry $script:subA 'Contoso Demo' $true), (New-ProfileEntry $script:subB 'Fabrikam')) } } }
+            @{ Name = 'a subscription the CLI lacks'; Parameters = @{ SubscriptionId = $other }; Setup = { } }
+            @{ Name = 'signed out'; Parameters = @{}; Setup = { $script:init.Profile = [pscustomobject]@{ Installed = $true; SignedIn = $false; Error = 'No subscription.'; Subscriptions = @() } } }
+            @{ Name = 'no Azure CLI'; Parameters = @{}; Setup = { $script:init.Profile = [pscustomobject]@{ Installed = $false; SignedIn = $false; Error = 'az was not found.'; Subscriptions = @() } } }
+            @{ Name = 'another tenant'; Parameters = @{}; Setup = { $script:init.GuardThrows = $true } }
+            @{ Name = 'a group you don''t own'; Parameters = @{}; Setup = { $script:init.Groups = @([pscustomobject]@{ id = $script:groupId; displayName = 'dbhubfn-demo-sql-admins'; securityEnabled = $true }); $script:init.Owner = $false } }
+            @{ Name = 'two groups'; Parameters = @{}; Setup = { $script:init.Groups = @([pscustomobject]@{ id = $script:groupId; displayName = 'dbhubfn-demo-sql-admins'; securityEnabled = $true }, [pscustomobject]@{ id = '13131313-1313-1313-1313-131313131313'; displayName = 'dbhubfn-demo-sql-admins'; securityEnabled = $true }) } }
+            @{ Name = 'a group ID nobody has'; Parameters = @{ AdminGroupObjectId = $other }; Setup = { } }
+            @{ Name = 'a group name Entra can''t take'; Parameters = @{ CreateAdminGroup = $true; AdminGroupName = 'not a name' }; Setup = { } }
+            @{ Name = 'another environment''s workspace'; Parameters = @{ CreateAdminGroup = $true; WorkspaceName = 'Database Hub Demo' }; Setup = { $script:init.Workspaces = @(New-FabricWorkspaceItem 'Database Hub Demo' 'dddddddd-0000-0000-0000-000000000001' $script:capacityFabricId); $script:init.Claim = New-InitClaim -Other 'rg-dbhub-demo=dddddddd-0000-0000-0000-000000000001' } }
+            @{ Name = 'an environment that isn''t yours'; Parameters = @{ CreateAdminGroup = $true }; Setup = { New-InitEnvironment -Prefix 'dbhubfn' -Tag @{ owner = 'someone@fabrikam.example' } -Parameter (New-RecordParameter -Owner 'someone@fabrikam.example' -OwnerEmail 'someone@fabrikam.example'); $script:init.OwnedGroups = @() } }
+            @{ Name = 'a file that exists'; Parameters = @{}; Setup = { Set-Content -LiteralPath $script:path -Value '{}' } }
+        )
+        $commands = [ordered]@{}
+        foreach ($run in $runs) {
+            Set-InitMock
+            Remove-Item -LiteralPath $script:path -ErrorAction SilentlyContinue
+            . $run.Setup
+            $parameters = $run.Parameters
+            $init = Initialize-DemoConfig -Path $script:path -Prefix 'dbhubfn' -NonInteractive -BackupDirectory $script:backup -Confirm:$false @parameters
+            $texts = @(@($init.Results | ForEach-Object { [string]$_.message; [string]$_.remediation }) + @($init.NextSteps) | Where-Object { $_ })
+            $commands[$run.Name] = 0
+            foreach ($text in $texts) {
+                $text | Should -Not -Match '(?<![/\w])init\.ps1 -' -Because ('{0}: "{1}"' -f $run.Name, $text)
+                $text | Should -Not -Match '(?i)\brun init\.ps1\b' -Because ('{0}: "{1}"' -f $run.Name, $text)
+                foreach ($match in [regex]::Matches($text, '\./scripts/[a-z-]+\.ps1')) {
+                    $after = $text.Substring($match.Index + $match.Length)
+                    $clause = [regex]::Match($after, '^(?:"[^"]*"|[^.;:,()"])*').Value
+                    $clause | Should -Match ('\s-ConfigPath "{0}"' -f [regex]::Escape($script:full)) -Because ('{0}: every script it names takes this run''s file: "{1}"' -f $run.Name, $text)
+                    if ($match.Value -eq './scripts/init.ps1') {
+                        $after | Should -BeLike (' -ConfigPath "{0}" *' -f $script:full)
+                        $clause | Should -Match '\s-Prefix \S' -Because ('{0}: an init.ps1 command names a -Prefix: "{1}"' -f $run.Name, $text)
+                        $commands[$run.Name]++
+                    }
+                }
+            }
+        }
+        @($commands.Keys | Where-Object { $commands[$_] -eq 0 }) | Should -BeNullOrEmpty -Because 'each run gives at least one init.ps1 command to check'
     }
 }
 
@@ -839,6 +1184,8 @@ Describe 'Reading back what a deployment recorded (issue 60)' {
             $item = { param([string] $Type, [string] $Name) [pscustomobject]@{ type = $Type; displayName = $Name } }
             $decide = { param([object] $ItemList) Resolve-DemoRecoveredNotebookImport -WorkspaceName 'Contoso Hub' -Workspace $workspace -Found 1 -RecordedId 'dddddddd-0000-0000-0000-000000000099' -ItemList $ItemList -Allowed $allowed -Notebook $notebooks }
             (& $decide (& $list @((& $item 'Lakehouse' 'LH_DatabaseHub'), (& $item 'Notebook' 'NB_DatabaseHub_Control')))).Import | Should -BeTrue
+            # The Insights app's deployment since 2026-11-18 adds its functions item, under the app's own name.
+            (& $decide (& $list @((& $item 'Notebook' 'NB_DatabaseHub_Deployment'), (& $item 'AppBackend' 'APP_DatabaseHub_Insights'), (& $item 'UserDataFunction' 'APP_DatabaseHub_Insights_connector'), (& $item 'UserDataFunction' 'APP_DatabaseHub_Insights')))).Reason | Should -Match '^everything in "Contoso Hub" is the demo''s \(4 item\(s\)\)'
             (& $decide (& $list @((& $item 'Notebook' 'nb_databasehub_control')))).Import | Should -BeFalse
             (& $decide (& $list @((& $item 'Lakehouse' 'LH_DatabaseHub')) $false)).Import | Should -BeFalse -Because 'items it didn''t list could be anyone''s'
             $many = & $decide (& $list @(1..7 | ForEach-Object { & $item 'Notebook' ('Mine{0}' -f $_) }))
@@ -1192,6 +1539,25 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 4 -Exactly
     }
 
+    It 'sends T5''s metrics as COSMOS_METRICS only to a copy of the notebook that knows it, and otherwise says that Azure Monitor keeps them (2026-11-18)' {
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C -CosmosMetrics '{"version":1,"accounts":[]}' }
+        $saved.Result.status | Should -Be 'Pass'
+        $saved.CosmosDropped | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { $Parameter['COSMOS_METRICS'] -eq '{"version":1,"accounts":[]}' -and -not $Parameter.Contains('POSTGRES_METRICS') }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 1 -Exactly -ParameterFilter { $Name -eq 'NB_DatabaseHub_LiveActivity' -and $Parameter -eq 'COSMOS_METRICS' }
+
+        # A copy from before T5's history would ignore them: they aren't sent, and the run is a Warning that says so.
+        $script:notebookKnows = [pscustomobject]@{ Known = $true; Has = $false; Error = '' }
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C -CosmosMetrics '{"version":1}' }
+        $saved.Result.status | Should -Be 'Warning'
+        $saved.CosmosDropped | Should -BeTrue
+        $saved.PostgresDropped | Should -BeFalse -Because 'T5''s metrics stay in Azure Monitor, so nothing is kept in out/history-pending'
+        $saved.Result.message | Should -Match 'T5''s metrics weren''t sent: the workspace''s NB_DatabaseHub_LiveActivity is from before T5''s history \(2026-11-18\), so it would ignore them; Azure Monitor keeps them'
+        $saved.Result.evidence['cosmosMetrics'] | Should -Be 'withheld'
+        $saved.Result.remediation | Should -Match 'configure-fabric\.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity adds T5''s metrics from Azure Monitor'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { -not $Parameter.Contains('COSMOS_METRICS') }
+    }
+
     It 'runs NB_DatabaseHub_LiveActivity with only its safe switches, bounded at 15 minutes' {
         $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C }
         $saved.Result.checkId | Should -Be 'STOP.FABRIC.SAVEHISTORY'
@@ -1241,6 +1607,8 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $script:stopConfig['subscriptionId'] = $script:subA
             $script:stopConfig['tenantId'] = $script:tenant
             $script:stopConfig['t4Enabled'] = $false
+            # T5 (2026-11-18) has its own test below; the others keep their focus with T5 off.
+            $script:stopConfig['t5Enabled'] = $false
             $script:stopConfig['fabric']['manageCapacity'] = $true
             Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'ok' }
             Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ Exists = $true; RunnerSha256 = ''; RunnerSentTo = @(); HostPasswordUtc = ''; Tags = @{ deploymentId = 'abc123' }; FabricCapacityResumed = 'rg-fabric/fabcap01'; FabricCapacityResumedUtc = '2026-10-27T14:00:00Z' } }
@@ -1275,6 +1643,13 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $script:order.Clear()
             Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false | Out-Null
             $script:order | Should -Contain 'SaveHistory'
+        }
+
+        It 'with -SkipFabric, the stop at the end of an update, stops the VMs but neither saves the history nor pauses the capacity (2026-11-19)' {
+            # That run took its own history snapshot, which a pause would cancel.
+            $script:stopConfig['fabric']['saveHistoryOnStop'] = $true
+            Stop-DemoEnvironment -Config $script:stopConfig -SkipFabric -Confirm:$false | Out-Null
+            $script:order | Should -Be @('Deallocate:archost01', 'Deallocate:sqlvm01')
         }
 
         It 'keeps T4''s and its read replica''s captured metrics when the history run didn''t save them, and only then (ADR 0025)' {
@@ -1322,6 +1697,26 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
             $script:order | Should -Contain 'Keep:{"version":1}'
             ($results | Where-Object { $_.checkId -eq 'STOP.T4.HISTORY.PENDING' }).status | Should -Be 'Warning'
+        }
+
+        It 'reads T5''s metrics for the history right before the run, and sends them as COSMOS_METRICS; nothing without -SaveHistory (2026-11-18)' {
+            $script:stopConfig['t5Enabled'] = $true
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123' }; Exists = $true; State = 'Succeeded'; FreeTier = $true; Account = $null; Error = '' } }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5ContainerStop -MockWith { $script:order.Add('T5ContainerStop'); New-DemoResult -CheckId 'STOP.T5' -Area 't5' -Target 'T5' -Status 'Pass' -Message 'T5''s container was deleted.' }
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoCosmosHistoryCapture -MockWith { $script:order.Add(('CosmosCapture:{0}:{1}:{2}' -f $CheckId, $DeploymentId, $WindowMinutes)); [pscustomobject]@{ Json = '{"version":1,"accounts":[{"target":"T5"}]}'; Result = (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'T5' -Status 'Pass' -Message 'captured') } }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -MockWith { $script:order.Add('SaveHistory:' + $CosmosMetrics); [pscustomobject]@{ Result = (New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'saved'); StillRunning = $false } }
+            $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -SaveHistoryWindowMinutes 240 -Confirm:$false
+            $capture = $script:order.IndexOf('CosmosCapture:STOP.T5.HISTORY:abc123:240')
+            $capture | Should -BeGreaterOrEqual 0
+            $capture | Should -BeLessThan $script:order.IndexOf('SaveHistory:{"version":1,"accounts":[{"target":"T5"}]}')
+            # T5's container (2026-11-19) goes only after its metrics were read and sent with the history.
+            $script:order.IndexOf('T5ContainerStop') | Should -BeGreaterThan $script:order.IndexOf('SaveHistory:{"version":1,"accounts":[{"target":"T5"}]}')
+            ($results | Where-Object { $_.checkId -eq 'STOP.T5.HISTORY' }).status | Should -Be 'Pass'
+            ($results | Where-Object { $_.checkId -eq 'STOP.T5' }).status | Should -Be 'Pass'
+            $script:order.Clear()
+            Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false | Out-Null
+            @($script:order | Where-Object { $_ -like 'CosmosCapture:*' }) | Should -BeNullOrEmpty
+            $script:order | Should -Contain 'T5ContainerStop'
         }
     }
 }

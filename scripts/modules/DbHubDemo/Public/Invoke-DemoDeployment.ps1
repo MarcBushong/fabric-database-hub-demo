@@ -14,7 +14,10 @@ function Invoke-DemoDeployment {
     Stages:
 
     1. Preflight: Invoke-DemoPreflight (subscription guard, P1-P6, region, sizes, quota, policy, cost). Any
-       Fail stops here. It resolves the network mode, the T3 free offer, and the P6 group's name.
+       Fail stops here. It resolves the network mode, the T3 free offer, and the P6 group's name. A run that starts
+       after it (a resume) checks the Fabric workspace as preflight does when it reaches the Fabric stage
+       (Get-DemoFabricSharedResult -Resolve; 2026-11-19): one that another demo environment records, and this one
+       doesn't, stops it before anything changes (DEPLOY.FABRIC.SHARED Fail).
     2. Infrastructure: the template without the bootstraps' new settings (Invoke-DemoTemplateDeployment); a
        free-offer rejection falls back to regular serverless with a Warning. With the Key Vault opt-in
        (keyVault.enabled), Initialize-DemoKeyVault then deploys the vault and the operator's access to it; a
@@ -58,6 +61,9 @@ function Invoke-DemoDeployment {
         does. It never stops the run or keeps it from DONE.
     12. T4's read replica at the run's end (2026-11-16; Invoke-DemoT4ReplicaDeployEnd, DEPLOY.T4.REPLICA.END), as the
         parallel path does: deleted unless a session uses it now, on a run that stops at a Fail too. Never a Fail.
+    13. Not here: once deploy.ps1 judges the run DONE, its ending stops again what the run started when it found the demo
+        stopped (2026-11-19; Complete-DemoDeploymentRun, Invoke-DemoUpdateEndStop, DEPLOY.ENDSTOP), from DEPLOY.VMSTART's
+        evidence of what ran when the run began. Both paths record it the same way (Wait-DemoStoppedStart).
 
     A Fail stops the run, and nothing after it runs but the switch and the replica's end. Manual action required never
     stops it and is never hidden: it's in the results and in DEPLOY.SUMMARY. Deployment success alone is never Pass
@@ -258,6 +264,11 @@ function Invoke-DemoDeployment {
     }
 
     $state = Get-DemoDeploymentState -Config $Config
+    # Issue #65: this run's key for the T2 host's guest restart, as the parallel path has (Invoke-DemoParallelDeployment), so
+    # T2's onboarding, its sign-in data check, and its profile restart the guest at most once for this run, and a rerun gets
+    # its own (review of e617f34: -Sequential had none, so the host's hourly keys, which differ by caller, each allowed one).
+    $recoveryModel = Read-DemoProgress -Path $ProgressPath
+    Set-DemoRunRecoveryKey -Key (New-DemoRunRecoveryKey -RunId $(if ($null -ne $recoveryModel) { [string]$recoveryModel['runId'] } else { '' }))
     $startIndex = 0
     if ($FromStage) {
         $startIndex = [array]::IndexOf($stages, $FromStage)
@@ -331,6 +342,15 @@ function Invoke-DemoDeployment {
     # the template.
     $infrastructureIndex = [array]::IndexOf($stages, 'Infrastructure')
     $Config = Resolve-DemoEffectiveConfig -Config $Config -State $state -TemplateRuns:(-not $whatIf -and $startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex)
+    # A resume after an earlier run left T5 out because Azure didn't create its account (DbHubT5Refused; review, 2026-11-19):
+    # this run leaves it out too, with DEPLOY.T5; a run that deploys the template tries T5 again.
+    $t5Resume = if ($whatIf) { $null } else { Resolve-DemoT5LeftOut -Config $Config -State $state -TemplateRuns:($startIndex -le $infrastructureIndex -and $stopIndex -ge $infrastructureIndex) }
+    if ($null -ne $t5Resume) {
+        $Config = $t5Resume.Config
+        $results.Add($t5Resume.Result)
+        Write-DemoLog -Level Warning -Message ([string]$t5Resume.Result.message)
+        Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Warning' -Message ([string]$t5Resume.Result.message)
+    }
     # T4's size and autonomous tuning (#24, 2026-11-17): a run that deploys the template without preflight checks them as
     # PREFLIGHT.T4.TUNING does, so a t4SkuName that can't run the tuning t4AutonomousTuning asks for is a Fail before
     # anything changes.
@@ -341,6 +361,19 @@ function Invoke-DemoDeployment {
             Write-DemoLog -Level Warning -Message ([string]$tuning.message)
             Set-DemoProgressStep -Path $ProgressPath -Id 'Infrastructure' -State 'Failed' -Status 'Fail' -Message ('{0} {1}' -f $tuning.message, $tuning.remediation)
             return $results.ToArray()
+        }
+    }
+    # The Fabric workspace that another demo environment records (2026-11-19), as preflight checks it, before a stage
+    # writes to Fabric: a configuration edited by hand since the earlier run stops here (DEPLOY.FABRIC.SHARED).
+    if ($startIndex -gt 0 -and -not $whatIf -and -not $SkipFabric -and $stopIndex -ge $fabricIndex) {
+        $sharedCheck = Get-DemoFabricSharedResult -Config $Config -Resolve
+        if ($null -ne $sharedCheck) {
+            $results.Add($sharedCheck)
+            if ([string]$sharedCheck.status -eq 'Fail') {
+                Write-DemoLog -Level Warning -Message ([string]$sharedCheck.message)
+                Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Items' -State 'Failed' -Status 'Fail' -Message ('{0} {1}' -f $sharedCheck.message, $sharedCheck.remediation) -MaxLength 1200
+                return $results.ToArray()
+            }
         }
     }
 
@@ -555,21 +588,43 @@ function Invoke-DemoDeployment {
                         $Config = if ([bool]$deployedT4 -and $deployedSku) { Copy-DemoT4Config -Config $Config -Source deployed -SkuName $deployedSku } else { Copy-DemoT4Config -Config $Config -Source deployed -Off }
                     }
                 }
+                # T5 left out because Azure didn't create its account (review, 2026-11-19): the later stages go on without
+                # it, the Bootstraps stage's template included, and its rows say why.
+                $t5LeftOutText = ''
+                $deployedT5 = Get-DemoMemberValue -InputObject $deployment -Name 'T5Enabled'
+                if ($null -ne $deployedT5 -and -not [bool]$deployedT5 -and (Test-DemoT5Enabled -Config $Config)) {
+                    $t5LeftOutText = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T5LeftOut')
+                    $Config = Copy-DemoT5OffConfig -Config $Config -Reason $t5LeftOutText
+                    $t5Warning = @($results | Where-Object { [string]$_.checkId -eq 'DEPLOY.T5' }) | Select-Object -Last 1
+                    Set-DemoProgressStep -Path $ProgressPath -Id 'T5.Checks', 'T5.Telemetry' -State 'Skipped' -Status 'Warning' -Message $(if ($null -ne $t5Warning) { [string]$t5Warning.message } else { 'T5 is left out of this run: Azure didn''t create its account.' })
+                }
                 & $recordStage 'Infrastructure' @{ NetworkMode = $context.NetworkMode; T3UseFreeLimit = [bool]$context.T3UseFreeLimit; T3AdminGroupName = [string]$context.T3AdminGroupName }
                 $t4NoteValue = [string](Get-DemoMemberValue -InputObject $deployment -Name 'T4Note')
                 # T4 created over a cost ceiling, or without a price, by a run without preflight (#26): the stage is a Warning.
                 $deploymentResults = Get-DemoMemberValue -InputObject $deployment -Name 'Results'
                 $overCeiling = @(@($deploymentResults) | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'DEPLOY.T4.SIZE' -and [string](Get-DemoMemberValue -InputObject $_.evidence -Name 'outcome') -eq 'Create' }).Count -gt 0
-                & $stageResult 'Infrastructure' $(if ($overCeiling) { 'Warning' } else { 'Pass' }) $(if ($t4NoteValue) { 'The infrastructure is deployed. ' + $t4NoteValue } else { 'The infrastructure is deployed.' })
+                & $stageResult 'Infrastructure' $(if ($overCeiling -or $t5LeftOutText) { 'Warning' } else { 'Pass' }) ((@($(if ($t4NoteValue) { 'The infrastructure is deployed. ' + $t4NoteValue } else { 'The infrastructure is deployed.' }), $(if ($t5LeftOutText) { 'T5 is left out of this run: Azure didn''t create its account (DEPLOY.T5 says why, with the fix).' })) | Where-Object { $_ }) -join ' ')
                 if ((Get-DemoKeyVaultSetting -Config $Config).Enabled) {
                     # Opt-in, and only start-demo.ps1 -Interactive needs it, so a vault Fail is reported (it
                     # counts in DEPLOY.SUMMARY and the exit code) without stopping the deployment.
                     & $addAll @(Initialize-DemoKeyVault -Config $Config -Confirm:$false)
                 }
                 # The nightly safety stop (ADR 0024), part of every deployment; its problems are Warnings, never a Fail.
-                & $addAll @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                $safetyResults = @(Invoke-DemoSafetyStopSetup -Config $Config -ConfigPath $ConfigPath -Confirm:$false)
+                & $addAll $safetyResults
+                # Preflight counted this safety stop (2026-11-19, option 2): when its setup didn't put it in place, the worst case
+                # without it, on the console and the Infrastructure row (DEPLOY.COST.T4RESTART).
+                $planResult = New-DemoSafetyStopPlanResult -Result $results.ToArray() -SetupResult $safetyResults -Config $Config -ConfigPath $ConfigPath
+                if ($null -ne $planResult) {
+                    $results.Add($planResult)
+                    Write-DemoLog -Level Warning -Message ('{0} {1}' -f $planResult.message, $planResult.remediation)
+                    Add-DemoProgressStepNote -Path $ProgressPath -Id 'Infrastructure' -Status 'Warning' -Note ('{0} {1}' -f $planResult.message, $planResult.remediation)
+                }
                 # The session control's Azure part (ADR 0026), the same way; its notebook comes with the Fabric stage.
                 & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Azure -ProgressPath $ProgressPath -SkipFabric:$SkipFabric)
+                # T5's container lifecycle (2026-11-19, ADR 0027), once the control's role and runbooks are up to date: Session
+                # when Run all can create the container again, so the stops delete it; a Warning otherwise. Never a Fail.
+                & $addAll @(Update-DemoT5ContainerLifecycle -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -PriorResult $results.ToArray() -Confirm:$false)
             }
             'Artifacts' {
                 $current = Get-DemoDeploymentState -Config $Config
@@ -716,6 +771,20 @@ function Invoke-DemoDeployment {
                 & $stageResult 'T3' 'Pass' 'T3 is configured from T1 and checked.'
             }
             'T4' {
+                # T5 (2026-11-18, ADR 0027), which this stage covers too, as T1's T5 step does in the parallel path: the Cosmos
+                # DB account's checks, then T1's access through the runner's warmup. First, so a configuration with t4Enabled
+                # false still checks it (review, 2026-11-19). A T5 failure doesn't stop the stage; DONE needs HUB.ESTATE.T5 and
+                # METRICS.T5.
+                if (Test-DemoT5Enabled -Config $Config) {
+                    # The container exists only during a session (2026-11-19): a resumed run skips the template, which creates it.
+                    $results.Add((New-DemoT5Container -Config $Config -CheckId 'DEPLOY.T5.CONTAINER' -Confirm:$false))
+                    $t5Checks = @(Test-DemoT5 -Config $Config)
+                    & $addAll $t5Checks
+                    $t5Current = Get-DemoDeploymentState -Config $Config
+                    if (-not (& $hasStatus $t5Checks 'Fail') -and $t5Current.RunnerSha256 -and 'sqlvm01' -in $t5Current.RunnerSentTo) {
+                        $results.Add((Invoke-DemoT5WarmUp -Config $Config))
+                    }
+                }
                 # T4 (Phase 24, ADR 0019): the server's checks, then T1 sets it up through the P6 group (already
                 # joined in the T3 stage), then its Azure Monitor metrics. A T4 failure doesn't stop the run.
                 if (-not (Test-DemoT4Enabled -Config $Config)) {
@@ -772,7 +841,7 @@ function Invoke-DemoDeployment {
                 $current = Get-DemoDeploymentState -Config $Config
                 $profileName = $activity.Interim
                 $skip = if ($current.RunnerSha256) { '' } else { 'No workload runner was deployed (-SkipRunner).' }
-                $activityResults = @(foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' })) {
+                $activityResults = @(foreach ($target in @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' })) {
                         Set-DemoTargetProfile -Config $Config -Target $target -ProfileName $profileName -CheckPrefix 'DEPLOY' -SkipReason $skip -RequestedBy 'deploy' -SwitchTo $switchTo
                     })
                 & $addAll $activityResults
@@ -876,6 +945,10 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Fabric' 'Fail' 'The history semantic model or report failed.' 'Read the FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
                     return (& $finishEarly)
                 }
+                # The session control's notebook (ADR 0026), now that the workspace exists, and before the Insights app, whose
+                # Manage runs it (ADR 0029): the app's step reads its IDs, so a first deployment's Manage has them
+                # (2026-11-19, the final tests' net-new run). Never a Fail.
+                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
                 & $addAll @(Complete-DemoFabricAppSignIn -SignIn $appSignIn -Wait)
                 $app = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $fabric)
                 & $addAll $app
@@ -884,10 +957,13 @@ function Invoke-DemoDeployment {
                 $null = Update-DemoFabricAppSignInFromApp -SignIn $appSignIn -AppResult $app -Results $results
                 $appSummary = Get-DemoInsightsAppSummary -Result $app
                 $appText = if ($null -ne $appSummary -and [bool]$appSummary.Failed) { '; the Insights app wasn''t created or doesn''t work, which doesn''t block DONE (the summary says why)' } elseif ($null -ne $appSummary -and [bool]$appSummary.Deployed) { ', with the Insights app' } else { '' }
-                # The session control's notebook (ADR 0026), now that the workspace exists; never a Fail.
-                & $addAll @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
-                # What the stage published, once the app is this version's too (2026-11-16, Get-DemoFabricContentReopen).
-                & $recordStage 'Fabric' $(if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') { @{ FabricSha256 = $fabricContent } } else { @{} })
+                # What the stage published, once the app is this version's too (2026-11-16, Get-DemoFabricContentReopen), and
+                # what the app's Manage has (2026-11-19).
+                $published = Get-DemoInsightsAppManageRecord -Result $app
+                if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') {
+                    $published['FabricSha256'] = $fabricContent
+                }
+                & $recordStage 'Fabric' $published
                 & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}{1}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }), $appText)
             }
             'Validation' {
@@ -905,6 +981,12 @@ function Invoke-DemoDeployment {
                     $status = Invoke-DemoWorkloadCommand -Config $Config -Target 'T1' -ArgumentList 'status', '--json' -TimeoutSeconds 300 -Confirm:$false
                     $results.Add($status.Result)
                 }
+                # The Database Agent loop's one manual step, once per deployment (2026-11-18): under "Please confirm"
+                # (HUB.AGENT.T3), as in the parallel path.
+                $agentItem = Get-DemoT3AgentSetupItem -Config $Config -ServerName ('azuresql01-{0}' -f [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $current -Name 'Tags') -Name 'deploymentId'))
+                if ($null -ne $agentItem) {
+                    $results.Add($agentItem)
+                }
                 & $recordStage 'Validation'
                 & $stageResult 'Validation' 'Pass' ('The validation ran for {0}.' -f ($targets -join ', '))
                 $validated = $true
@@ -921,7 +1003,7 @@ function Invoke-DemoDeployment {
     if ($validated -and -not $context.OpenStage -and -not (& $hasStatus $results.ToArray() 'Fail')) {
         $current = Get-DemoDeploymentState -Config $Config
         $installMode = if ([string]$Config['t2SqlInstallMode']) { [string]$Config['t2SqlInstallMode'] } else { 'JumpstartImage' }
-        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric
+        $requirement = Get-DemoDoneRequirement -InstallMode $installMode -SkipFabric:$SkipFabric -SkipT5:(-not (Test-DemoT5Enabled -Config $Config))
         & $addAll @(Invoke-DemoDoneGate -Config $Config -Result $results.ToArray() -Requirement $requirement -TelemetryWaitMinutes $TelemetryWaitMinutes -ProgressPath $ProgressPath)
         $doneChecked = $true
     }
@@ -933,6 +1015,11 @@ function Invoke-DemoDeployment {
     # NB_DatabaseHub_LiveActivity runs once, analyze-only, and the history model is refreshed. Never a Fail.
     if ($validated) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
+    }
+    # T5's container lifecycle once more, now that the session control is done (2026-11-19, F14), as in the parallel path:
+    # only when this run granted the control's role and the first check, right after the grant, didn't see it.
+    if (-not $whatIf) {
+        $null = Invoke-DemoT5LifecycleRecheck -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath -Results $results
     }
     # T4's read replica (2026-11-16), as in the parallel path: DONE's checks and the history snapshot have read it, so it's
     # deleted unless a session uses it now. Never a Fail.

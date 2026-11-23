@@ -1,10 +1,10 @@
 // Rule-based insights: plain sentences computed from the query results in the browser. No external AI service.
 
 import { SQL_TARGETS, type TargetKey } from "./dax";
-import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc, type NumberKind } from "./format";
+import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc, percent, type NumberKind } from "./format";
 import { mean } from "./stats";
 import type { StatusName } from "./status";
-import type { PageId } from "./view-state";
+import type { EstateTarget, PageId } from "./view-state";
 import {
     FAMILY_LABEL,
     POSTGRES_METRICS,
@@ -31,19 +31,50 @@ export interface Insight {
     title: string;
     detail: string;
     page?: PageId;
+    /** The target the page drills into. */
+    target?: EstateTarget;
     incident?: string;
 }
 
+type BinField = "cpu" | "blocked" | "lockWaitS" | "bufferIoS" | "logRateS" | "waitS" | "ioMb" | "batch" | "sessions";
+
+/** An incident family's own signal: a column of every bin, or one wait category, the one the analysis notebook's
+ *  detector reads for that family (WAIT_FAMILY_CATEGORIES in NB_DatabaseHub_LiveActivity). */
+export interface FamilySignal {
+    label: string;
+    kind: NumberKind;
+    field?: BinField;
+    category?: string;
+}
+
 /** The signal each incident family is about, with its unit for sentences. */
-export const FAMILY_SIGNAL: Record<string, { field: keyof Bin; label: string; kind: NumberKind }> = {
+export const FAMILY_SIGNAL: Record<string, FamilySignal> = {
     io: { field: "bufferIoS", label: "Buffer IO (PAGEIOLATCH) waits", kind: "seconds" },
     cpu: { field: "cpu", label: "CPU", kind: "percent" },
     blocking: { field: "blocked", label: "blocked processes", kind: "int" },
     log_rate: { field: "logRateS", label: "Log Rate Governor waits", kind: "seconds" },
+    tran_log: { category: "Tran Log IO", label: "Tran Log IO (log flush) waits", kind: "seconds" },
+    latch: { category: "Buffer Latch", label: "Buffer Latch waits", kind: "seconds" },
+    network: { category: "Network IO", label: "Network IO waits", kind: "seconds" },
+    memory: { category: "Memory", label: "Memory waits", kind: "seconds" },
+    parallelism: { category: "Parallelism", label: "Parallelism waits", kind: "seconds" },
 };
 
-export function familySignal(family: string): { field: keyof Bin; label: string; kind: NumberKind } {
-    return FAMILY_SIGNAL[family] ?? { field: "waitS", label: "wait time", kind: "seconds" };
+const ALL_WAITS: FamilySignal = { field: "waitS", label: "wait time", kind: "seconds" };
+
+/** The family's own signal. A wait category needs bins with their waits per category (withCategoryWaits): without
+ *  them, it's all the waits, and says so, rather than a series that isn't there. */
+export function familySignal(family: string, bins?: readonly Bin[]): FamilySignal {
+    const signal = FAMILY_SIGNAL[family] ?? ALL_WAITS;
+    if (signal.category && bins !== undefined && !bins.some((b) => b.waits)) return ALL_WAITS;
+    return signal;
+}
+
+/** A bin's value of the signal. A category with no row in a bin that has categories waited 0 seconds; a bin without
+ *  them is unknown. */
+export function signalValue(signal: FamilySignal, b: Bin): number | null {
+    if (signal.category) return b.waits ? (b.waits[signal.category] ?? 0) : null;
+    return signal.field ? b[signal.field] : null;
 }
 
 function joinTargets(keys: readonly string[]): string {
@@ -66,11 +97,29 @@ export interface IncidentComparison {
     ratio: number | null;
 }
 
+/** A ratio against a baseline on a tile: "3.4×", "35×", and ">100×" beyond, where a baseline near zero makes the exact
+ *  number noise (dbhubc5's tempdb latch: 1610× a baseline of 0.02 s). */
+export function timesShort(ratio: number): string {
+    return ratio >= 100 ? ">100×" : `${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)}×`;
+}
+
+/** The same ratio in a sentence: "3.4 times", "35 times", "more than 100 times". */
+export function timesText(ratio: number): string {
+    return ratio >= 100 ? "more than 100 times" : `${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)} times`;
+}
+
+/** "baseline 0.4 s per bin", or "baseline near zero" when it rounds to nothing at the signal's precision. */
+export function baselineText(baseline: number, kind: NumberKind): string {
+    const text = formatNumber(baseline, kind);
+    return text === formatNumber(0, kind) ? "baseline near zero" : `baseline ${text} per bin`;
+}
+
 /** Mean of the incident's own signal in the padding before the window against the window itself. */
 export function compareIncident(incident: Incident, bins: readonly Bin[]): IncidentComparison {
-    const { field, label, kind } = familySignal(incident.family);
+    const signal = familySignal(incident.family, bins);
+    const { label, kind } = signal;
     const pad = incidentPadMinutes(incident) * 60000;
-    const value = (b: Bin) => b[field] as number | null;
+    const value = (b: Bin) => signalValue(signal, b);
     const before = bins.filter((b) => b.at >= new Date(incident.start.getTime() - pad) && b.at < incident.start).map(value);
     const inside = bins.filter((b) => b.at >= incident.start && b.at < incident.end);
     const during = inside.map(value).filter((v): v is number => v !== null);
@@ -93,12 +142,11 @@ export function incidentInsight(incident: Incident, comparison: IncidentComparis
     const family = FAMILY_LABEL[incident.family] ?? "An incident";
     const span = `${formatTimeUtc(incident.start)} to ${formatTimeUtc(incident.end)} UTC on ${formatDayUtc(incident.start)}`;
     if (comparison && comparison.ratio !== null && comparison.during !== null) {
-        const times = comparison.ratio >= 10 ? Math.round(comparison.ratio).toString() : comparison.ratio.toFixed(1);
         return {
             id: `incident-ratio-${incident.key}`,
             status: comparison.ratio >= 2 ? "Warning" : null,
-            metric: `${times}×`,
-            title: `${incident.target} ${comparison.signal} ran at ${times} times their baseline from ${span}.`,
+            metric: timesShort(comparison.ratio),
+            title: `${incident.target} ${comparison.signal} ran at ${timesText(comparison.ratio)} their baseline from ${span}.`,
             detail: `${formatNumber(comparison.during, comparison.kind)} per bin on average during the window, against ${formatNumber(comparison.baseline, comparison.kind)} in the ${formatDuration(incidentPadMinutes(incident))} before; peak ${formatNumber(comparison.peak, comparison.kind)} at ${formatTimeUtc(comparison.peakAt)} UTC.`,
             page: "incidents",
             incident: incident.key,
@@ -148,8 +196,8 @@ export function dominantWaitInsight(flows: readonly WaitFlow[]): Insight | null 
     return {
         id: "dominant-wait",
         status: null,
-        metric: `${Math.round(share * 100)} %`,
-        title: `${busiest} carries ${Math.round(share * 100)} % of the estate's wait time; its biggest category is ${top.category}.`,
+        metric: percent(share),
+        title: `${busiest} carries ${percent(share)} of the estate's wait time; its biggest category is ${top.category}.`,
         detail: `${formatNumber(top.seconds, "seconds")} of ${top.category} out of ${formatNumber(busiestSeconds, "seconds")} on ${busiest}, and ${formatNumber(total, "seconds")} across the selected targets.`,
         page: "incidents",
     };
@@ -257,7 +305,7 @@ export function readinessInsight(summary: ReadinessSummary | null, checks: reado
     return {
         id: "readiness",
         status,
-        metric: `${Math.round(share * 100)} %`,
+        metric: percent(share),
         title: `${summary.passed} of ${applicable} applicable checks pass; ${summary.failed} failed, ${summary.manual} need a manual step, and ${summary.warnings} carry warnings.`,
         detail: next ? `Next step (${next.checkId}): ${next.remediation}` : summary.runLabel,
         page: "readiness",
@@ -310,7 +358,8 @@ export function replicaLagInsight(capture: PostgresCapture | null): Insight | nu
                 metric: "catch-up",
                 title: "The latest capture's Read replica lag is only the replica's catch-up after its restart.",
                 detail: `Up to ${formatNumber(caughtPeak.value, "seconds")} from ${formatTimeUtc(caught[0].at)} UTC on ${formatDayUtc(caught[0].at)}: the time since its last replay until T4 wrote again, not replication lag.`,
-                page: "postgres",
+                page: "estate",
+                target: "T4",
             };
         }
         return {
@@ -319,7 +368,8 @@ export function replicaLagInsight(capture: PostgresCapture | null): Insight | nu
             metric: "none",
             title: "The latest capture has no Read replica lag.",
             detail: "T4's read replica exists only during a session: start-demo.ps1 creates it, and stop-demo.ps1 captures its metrics before it deletes it.",
-            page: "postgres",
+            page: "estate",
+            target: "T4",
         };
     }
     const replica = capture.servers["T4-replica"];
@@ -329,7 +379,8 @@ export function replicaLagInsight(capture: PostgresCapture | null): Insight | nu
         metric: formatNumber(peak.value, "seconds"),
         title: `Read replica lag peaked at ${formatNumber(peak.value, "seconds")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
         detail: `${formatNumber(mean(lag.map((p) => p.value)), "seconds")} on average over ${lag.length} interval${lag.length === 1 ? "" : "s"}${replica ? ` on ${replica}` : ""}; ${REPLICA_LAG_WARNING_SECONDS} s or more is a warning.${left}`,
-        page: "postgres",
+        page: "estate",
+        target: "T4",
     };
 }
 
@@ -345,7 +396,8 @@ export function postgresCpuInsight(capture: PostgresCapture | null): Insight | n
         metric: formatNumber(peak.value, "percent"),
         title: `T4's CPU peaked at ${formatNumber(peak.value, "percent")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
         detail: `${formatNumber(mean(cpu.map((p) => p.value)), "percent")} on average${connections ? `; active connections peaked at ${formatNumber(connections.value, "int")} at ${formatTimeUtc(connections.at)} UTC` : ""}. ${POSTGRES_CPU_WARNING_PERCENT} % or more is a warning.`,
-        page: "postgres",
+        page: "estate",
+        target: "T4",
     };
 }
 
@@ -362,7 +414,8 @@ export function failedConnectionsInsight(capture: PostgresCapture | null): Insig
             metric: "0",
             title: "No failed connections on T4 in the latest capture.",
             detail: `${failed.length} interval${failed.length === 1 ? "" : "s"} from ${formatDateTimeUtc(failed[0].at)} to ${formatDateTimeUtc(failed[failed.length - 1].at)}.`,
-            page: "postgres",
+            page: "estate",
+            target: "T4",
         };
     }
     const interval = capture?.intervalMinutes;
@@ -372,6 +425,7 @@ export function failedConnectionsInsight(capture: PostgresCapture | null): Insig
         metric: formatNumber(total, "int"),
         title: `${formatNumber(total, "int")} failed connection${total === 1 ? "" : "s"} on T4 in the latest capture.`,
         detail: `At most ${formatNumber(peak.value, "int")} in one${interval ? ` ${formatNumber(interval, "int")}-minute` : ""} interval, at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
-        page: "postgres",
+        page: "estate",
+        target: "T4",
     };
 }

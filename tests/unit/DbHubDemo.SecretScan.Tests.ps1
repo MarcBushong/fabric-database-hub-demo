@@ -154,4 +154,110 @@ Describe 'Find-DemoSecretLeak (Phase 14 secret scan)' {
         (Find-DemoSecretLeak -Text 'password=secret' -Source 's').Findings | Should -BeNullOrEmpty
         @((Find-DemoSecretLeak -Text ('Server=x;Password={0};' -f ('Pw1-' + [guid]::NewGuid().ToString('N').Substring(0, 10))) -Source 's').Findings).Rule | Should -Be 'connection-password'
     }
+
+    It 'leaves dependency trees and package caches out, anywhere under a folder, and names them; generated output stays in (2026-11-18)' {
+        # Live, 2026-11-18: out/fabric-app/node_modules held 114,315 files after the Insights app's build, and the Security
+        # area read them for more than 37 minutes. The same token in each file: only the demo's own output may count.
+        $out = Join-Path -Path $TestDrive -ChildPath ('out-' + [guid]::NewGuid().ToString('N'))
+        $at = { param([string] $Relative) [System.IO.Path]::GetFullPath((Join-Path -Path $out -ChildPath $Relative)) }
+        $files = [ordered]@{
+            Package = & $at 'fabric-app/node_modules/pkg/index.js'
+            Cache   = & $at 'tools/scripts/__pycache__/helper.txt'
+            Log     = & $at 'logs/run.log'
+            Env     = & $at 'fabric-app/rayfin/.env'
+        }
+        foreach ($key in $files.Keys) {
+            New-Item -ItemType Directory -Path (Split-Path -Path $files[$key] -Parent) -Force | Out-Null
+            $line = if ($key -eq 'Env') { 'VITE_APP_NAME=insights' } else { 'token={0}' -f $script:jwt }
+            Set-Content -LiteralPath $files[$key] -Value @('first line', $line) -Encoding utf8NoBOM
+        }
+        $scan = Find-DemoSecretLeak -Path $out
+        @($scan.Scanned) | Should -Be @($files['Env'], $files['Log']) -Because 'generated output, such as the app''s .env, is still scanned'
+        @($scan.Findings | ForEach-Object { '{0}:{1}:{2}' -f $_.Source, $_.Line, $_.Rule }) | Should -Be @('{0}:2:jwt' -f $files['Log'])
+        @($scan.Skipped).Count | Should -Be 0
+        $scan.PrunedCount | Should -Be 2
+        @($scan.Pruned) | Should -Be @((& $at 'fabric-app/node_modules'), (& $at 'tools/scripts/__pycache__'))
+        # Without -DependencyRoot every one is unexpected; with the app's build stage, only the one outside it (review of ab91ee5).
+        $scan.UnexpectedPrunedCount | Should -Be 2
+        $staged = Find-DemoSecretLeak -Path $out -DependencyRoot (& $at 'fabric-app')
+        $staged.PrunedCount | Should -Be 2
+        $staged.UnexpectedPrunedCount | Should -Be 1
+        @($staged.UnexpectedPruned) | Should -Be @(& $at 'tools/scripts/__pycache__')
+        ($scan | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($script:jwt))
+        # A file or folder named on purpose is scanned, even inside such a tree.
+        @((Find-DemoSecretLeak -Path $files['Package']).Findings).Rule | Should -Contain 'jwt'
+        @((Find-DemoSecretLeak -Path (& $at 'tools/scripts/__pycache__')).Scanned) | Should -Be @($files['Cache'])
+    }
+
+    It 'doesn''t count a dependency-named folder scanned on purpose through -Path as unexpected, nor the trees inside it (the re-review of 0590bbe)' {
+        # validate.ps1's Warning names out/venv; its remediation, -ScanPath ./out/venv, scans it through -Path next to out/.
+        $out = Join-Path -Path $TestDrive -ChildPath ('named-' + [guid]::NewGuid().ToString('N'))
+        $at = { param([string] $Relative) [System.IO.Path]::GetFullPath((Join-Path -Path $out -ChildPath $Relative)) }
+        $files = [ordered]@{
+            Log     = & $at 'venv/run.log'
+            Package = & $at 'venv/Lib/site-packages/pkg/module.py'
+            NpmLog  = & $at '.npm/_logs/debug.log'
+        }
+        foreach ($key in $files.Keys) {
+            New-Item -ItemType Directory -Path (Split-Path -Path $files[$key] -Parent) -Force | Out-Null
+            Set-Content -LiteralPath $files[$key] -Value @('first line', ('token={0}' -f $script:jwt)) -Encoding utf8NoBOM
+        }
+        $plain = Find-DemoSecretLeak -Path $out
+        @($plain.UnexpectedPruned) | Should -Be @((& $at '.npm'), (& $at 'venv'))
+        $named = Find-DemoSecretLeak -Path $out, (& $at 'venv')
+        @($named.Findings | ForEach-Object { $_.Source }) | Should -Be @($files['Log']) -Because 'the folder named on purpose is read, and its own site-packages is still left out'
+        @($named.Pruned) | Should -Be @((& $at '.npm'), (& $at 'venv'), (& $at 'venv/Lib/site-packages'))
+        @($named.UnexpectedPruned) | Should -Be @(& $at '.npm') -Because 'out/.npm wasn''t named, so it still wasn''t read'
+        $named.UnexpectedPrunedCount | Should -Be 1
+        # A folder inside one, named on purpose: the tree that holds it isn't unexpected either.
+        $logs = Find-DemoSecretLeak -Path $out, (& $at '.npm/_logs')
+        @($logs.Findings | ForEach-Object { $_.Source }) | Should -Be @($files['NpmLog'])
+        @($logs.UnexpectedPruned) | Should -Be @(& $at 'venv')
+        # Both named: nothing is unexpected.
+        (Find-DemoSecretLeak -Path $out, (& $at 'venv'), (& $at '.npm')).UnexpectedPrunedCount | Should -Be 0
+    }
+
+    It 'never lists the files of a deep dependency tree: 3,000 files under node_modules, with nested ones, are one pruned folder' {
+        $out = Join-Path -Path $TestDrive -ChildPath ('deep-' + [guid]::NewGuid().ToString('N'))
+        $modules = [System.IO.Path]::GetFullPath((Join-Path -Path $out -ChildPath 'fabric-app/node_modules'))
+        foreach ($package in 1..30) {
+            $folder = Join-Path -Path $modules -ChildPath ('pkg{0}/node_modules/dep/lib/esm' -f $package)
+            New-Item -ItemType Directory -Path $folder -Force | Out-Null
+            foreach ($index in 1..100) {
+                [System.IO.File]::WriteAllText((Join-Path -Path $folder -ChildPath ('m{0}.js' -f $index)), ('export const token = "{0}";' -f $script:jwt))
+            }
+        }
+        $log = [System.IO.Path]::GetFullPath((Join-Path -Path $out -ChildPath 'deploy.jsonl'))
+        Set-Content -LiteralPath $log -Value '{"checkId":"DEPLOY.DONE","status":"Pass"}' -Encoding utf8NoBOM
+        $scan = Find-DemoSecretLeak -Path $out
+        @($scan.Scanned) | Should -Be @($log)
+        @($scan.Findings).Count | Should -Be 0
+        @($scan.Skipped).Count | Should -Be 0
+        $scan.PrunedCount | Should -Be 1 -Because 'nothing under the top node_modules is walked, so its nested ones aren''t seen'
+        @($scan.Pruned) | Should -Be @($modules)
+    }
+}
+
+Describe 'The Insights app''s deploy stage and the output scan (SECURITY.SECRETSCAN.OUTPUT)' {
+    AfterEach {
+        Clear-DemoSecret
+    }
+
+    It 'holds nothing the output scan flags: every file the deploy stage copies from fabric/app, tests included (2026-11-20)' {
+        # validate.ps1 scans out/, and the app's deploy stage, out/fabric-app, is a copy of fabric/app with its tests
+        # (Sync-DemoFabricAppStage). A test's literal "Bearer <token>" fixture made SECURITY.SECRETSCAN.OUTPUT a Fail on every
+        # environment (the final tests, 2026-11-20), while the repository's own secret scan, with other rules, passed. So the
+        # real source is staged here, as a deploy does it, and read with the product's own scan and rules.
+        $repo = [System.IO.Path]::GetFullPath((Join-Path -Path $PSScriptRoot -ChildPath '../..'))
+        $stage = Join-Path -Path $TestDrive -ChildPath ('fabric-app-' + [guid]::NewGuid().ToString('N'))
+        $staged = @(Sync-DemoFabricAppStage -SourcePath (Join-Path -Path $repo -ChildPath 'fabric/app') -StagePath $stage -SkipInstall -Confirm:$false)
+        $copy = $staged | Where-Object { $_.checkId -eq 'FABRIC.APP.STAGE' }
+        $copy.status | Should -Be 'Pass'
+        # The rules alone, as in a session that registered no secret.
+        Clear-DemoSecret
+        $scan = Find-DemoSecretLeak -Path $stage -DependencyRoot $stage
+        (@($scan.Scanned).Count + @($scan.Skipped).Count) | Should -BeGreaterOrEqual ([int]$copy.evidence['files']) -Because 'every file the stage copied is read, or listed as skipped'
+        @($scan.Scanned | Where-Object { $_ -match '\.test\.tsx?$' }).Count | Should -BeGreaterThan 0 -Because 'the stage copies the app''s tests, and the output scan reads them there'
+        @($scan.Findings | ForEach-Object { '{0}:{1} ({2})' -f [System.IO.Path]::GetRelativePath($stage, $_.Source).Replace('\', '/'), $_.Line, $_.Rule }) | Should -BeNullOrEmpty -Because 'tests build their fake tokens at run time, so the stage holds no text the output scan takes for a secret'
+    }
 }

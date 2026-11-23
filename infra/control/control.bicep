@@ -1,8 +1,10 @@
-// The on-demand activity control's Azure resources in the persistent group rg-<prefix>-control (ADR 0020), deployed by
-// scripts/setup-activity-control.ps1 into an existing group, never by deploy.ps1, so destroy.ps1 keeps them:
-// - id-<prefix>-automation: the user-assigned identity the runbooks use; its only role is DbHub Demo Activity Operator
-//   at the demo resource group (A1) and at the control account (A2), which setup-activity-control.ps1 -GrantRole
-//   assigns as the signed-in owner.
+// The session control's Azure resources in the group rg-<prefix>-control (ADR 0020, ADR 0026), deployed into that
+// group by deploy.ps1 on every run since 2026-11-14 (or scripts/setup-activity-control.ps1); destroy.ps1 deletes them
+// when the runbooks serve its environment, as setup-activity-control.ps1 -Remove does:
+// - id-<prefix>-automation: the user-assigned identity the runbooks use; its roles are DbHub Demo Activity Operator
+//   at the demo resource group (A1) and at the control account (A2), and DbHub Demo Session Writer at the two session
+//   secrets (A4), which deploy.ps1 assigns when the deployer may, and otherwise an Owner's grant-safety-stop.ps1, once
+//   (docs/permissions.md).
 // - aa-<prefix>-control: the Automation account (Basic; public network access and local authentication on, because
 //   webhooks need both), with only that identity and no system-assigned identity, and its variable DbHubSessionStatus
 //   (2026-11-16), the session's last status, which DbHub-Monitor reads back.

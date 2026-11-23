@@ -32,7 +32,7 @@ mkdirSync(outDir, { recursive: true });
 const index = catalogForCheck(latestDay, anchors).map((spec) => {
     const file = `${spec.id}.json`;
     writeFileSync(join(outDir, file), JSON.stringify({ query: spec.dax, resultSetRowCountLimit: spec.rowLimit }), "utf8");
-    return { id: spec.id, title: spec.title, file, rowLimit: spec.rowLimit };
+    return { id: spec.id, title: spec.title, file, rowLimit: spec.rowLimit, ...(spec.mayBeEmpty ? { mayBeEmpty: spec.mayBeEmpty } : {}) };
 });
 const incidentRange = { target: range.target, start: range.start.toISOString(), end: range.end.toISOString() };
 writeFileSync(join(outDir, "index.json"), `${JSON.stringify({ latestDay: latestDay.toISOString().slice(0, 10), incidentRange, queries: index }, null, 2)}\n`, "utf8");

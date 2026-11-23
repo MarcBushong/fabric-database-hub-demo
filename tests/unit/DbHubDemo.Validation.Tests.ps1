@@ -727,8 +727,8 @@ Describe 'Cost area' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI call expected' }
         $script:schedule = @{ properties = @{ status = 'Enabled'; dailyRecurrence = @{ time = '1900' }; timeZoneId = 'Pacific Standard Time' } }
         $script:costResponse = Get-TestAzResponse
-        # The budget at monthlyCeilingUsd's default, 375 since 2026-11-04 (ADR 0016).
-        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '375.0'; timeGrain = 'Monthly' })
+        # The budget at monthlyCeilingUsd's default, 415 for a new configuration since 2026-11-19 (ADR 0016).
+        $script:costResponse['^consumption budget list'] = Get-TestAzOk @(@{ name = 'budget-dbhub-demo'; amount = '415.0'; timeGrain = 'Monthly' })
         $script:costResponse['^resource show --resource-group rg-dbhub-demo --name shutdown-computevm-.* --resource-type Microsoft\.DevTestLab/schedules'] = Get-TestAzOk $script:schedule
         $script:costResponse['^resource list .*bastionHosts'] = Get-TestAzOk @()
         $script:costResponse['^network public-ip list'] = Get-TestAzOk @()
@@ -827,6 +827,60 @@ Describe 'Security area' {
         $output.message | Should -Match 'jwt'
         ($output.evidence.findings | Where-Object { $_.rule -eq 'jwt' }).line | Should -Be 2
         ($output | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($token))
+    }
+
+    It 'leaves dependency trees out of the output scan, and says which, in its message and evidence (2026-11-18)' {
+        # Live, 2026-11-18: out/fabric-app/node_modules held 114,315 third-party files, which kept this area busy for more
+        # than 37 minutes, and some of them match the patterns (a Bearer challenge in a package's comments).
+        $encode = { param([string] $Text) [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)).TrimEnd('=') }
+        $token = '{0}.{1}.{2}' -f (& $encode '{"alg":"HS256"}'), (& $encode ('{"oid":"' + [guid]::NewGuid().ToString() + '"}')), (& $encode ([guid]::NewGuid().ToString('N')))
+        $package = Join-Path -Path $script:scanFolder -ChildPath 'fabric-app/node_modules/pkg'
+        New-Item -ItemType Directory -Path $package -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path -Path $package -ChildPath 'index.js') -Value ('// Authorization: Bearer {0}' -f $token) -Encoding utf8NoBOM
+        $context = New-TestContext
+        $output = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context; P = $script:scanFolder } { param($X, $P) Invoke-DemoValidationSecurity -Context $X -OutputRoot $P }) | Where-Object { $_.checkId -eq 'SECURITY.SECRETSCAN.OUTPUT' }
+        $output.status | Should -Be 'Pass'
+        $output.message | Should -Match '^No secret or token pattern, and no value registered in this session, in 1 file\(s\) under .+\. Dependency trees \(node_modules and package caches\) aren''t scanned \(1 left out: .+fabric-app[\\/]node_modules\)\.$'
+        $output.evidence.filesScanned | Should -Be 1
+        $output.evidence.directoriesPruned | Should -Be 1
+        @($output.evidence.pruned).Count | Should -Be 1
+        @($output.evidence.pruned)[0] | Should -Match 'fabric-app[\\/]node_modules$'
+    }
+
+    It 'warns, naming the folder, when a dependency-named folder outside the Insights app''s build holds what the scan left out (review of ab91ee5)' {
+        # A log in out/venv/ is the demo's own output: left out, the scan must not pass silently.
+        $encode = { param([string] $Text) [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)).TrimEnd('=') }
+        $token = '{0}.{1}.{2}' -f (& $encode '{"alg":"HS256"}'), (& $encode ('{"oid":"' + [guid]::NewGuid().ToString() + '"}')), (& $encode ([guid]::NewGuid().ToString('N')))
+        foreach ($folder in 'venv', 'fabric-app/node_modules/pkg') {
+            New-Item -ItemType Directory -Path (Join-Path -Path $script:scanFolder -ChildPath $folder) -Force | Out-Null
+            Set-Content -LiteralPath (Join-Path -Path $script:scanFolder -ChildPath ('{0}/run.log' -f $folder)) -Value ('token={0}' -f $token) -Encoding utf8NoBOM
+        }
+        $context = New-TestContext
+        $output = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context; P = $script:scanFolder } { param($X, $P) Invoke-DemoValidationSecurity -Context $X -OutputRoot $P }) | Where-Object { $_.checkId -eq 'SECURITY.SECRETSCAN.OUTPUT' }
+        $output.status | Should -Be 'Warning'
+        $output.message | Should -Match 'but 1 folder\(s\) named like a dependency tree outside the Insights app''s build weren''t read: .*venv\. They could hold this demo''s own output\.'
+        $output.message | Should -Not -Match 'fabric-app[\\/]node_modules\. They could'
+        $output.remediation | Should -Match 'validate\.ps1 -Area Security -ScanPath'
+        @($output.evidence.unexpectedPruned).Count | Should -Be 1
+        @($output.evidence.unexpectedPruned)[0] | Should -Match 'venv$'
+        $output.evidence.directoriesPruned | Should -Be 2
+        ($output | ConvertTo-Json -Depth 8) | Should -Not -Match ([regex]::Escape($token))
+    }
+
+    It 'passes once the folder the Warning names is scanned on purpose with -ScanPath, its own site-packages left out (the re-review of 0590bbe)' {
+        foreach ($file in 'venv/run.log', 'venv/Lib/site-packages/pkg/module.py', 'logs/deploy.log') {
+            $path = Join-Path -Path $script:scanFolder -ChildPath $file
+            New-Item -ItemType Directory -Path (Split-Path -Path $path -Parent) -Force | Out-Null
+            Set-Content -LiteralPath $path -Value 'nothing secret here' -Encoding utf8NoBOM
+        }
+        $context = New-TestContext
+        $scan = { param([string[]] $Extra) @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context; P = $script:scanFolder; S = $Extra } { param($X, $P, $S) Invoke-DemoValidationSecurity -Context $X -OutputRoot $P -ScanPath $S }) | Where-Object { $_.checkId -eq 'SECURITY.SECRETSCAN.OUTPUT' } }
+        (& $scan @()).status | Should -Be 'Warning'
+        $output = & $scan @((Join-Path -Path $script:scanFolder -ChildPath 'venv'))
+        $output.status | Should -Be 'Pass' -Because 'the remediation clears its own Warning'
+        $output.evidence.filesScanned | Should -Be 3 -Because 'out/venv/run.log is read through -ScanPath, with out/clean.log and out/logs/deploy.log'
+        @($output.evidence.unexpectedPruned).Count | Should -Be 0
+        $output.message | Should -Match 'Dependency trees \(node_modules and package caches\) aren''t scanned \(2 left out: '
     }
 
     It 'warns on role assignments the demo never creates and on a Key Vault, and fails on a public IP or an open inbound rule' {
@@ -1102,11 +1156,13 @@ Describe 'Plumbing for read-only runs' {
         @(Get-ChildItem -LiteralPath $temp -Filter '*.tmp' -Force) | Should -BeNullOrEmpty -Because 'a caller''s -WhatIf must not skip the cleanup'
     }
 
-    It 'adds the cost and security areas to the result schema, and only those' {
+    It 'adds the cost and security areas to the result schema, and only those (and t5 for T5, 2026-11-18)' {
         $schema = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/schemas/validation-result.schema.json') -Raw | ConvertFrom-Json -AsHashtable
-        $schema.properties.area.enum | Should -Be @('static', 'preflight', 'infra', 't1', 't2', 't3', 't4', 'hub', 'workload', 'teardown', 'fabric', 'cost', 'security')
+        $schema.properties.area.enum | Should -Be @('static', 'preflight', 'infra', 't1', 't2', 't3', 't4', 't5', 'hub', 'workload', 'teardown', 'fabric', 'cost', 'security')
         $parameter = (Get-Command -Name New-DemoResult).Parameters['Area']
         ($parameter.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }).ValidValues | Should -Be $schema.properties.area.enum
+        $target = (Get-Command -Name New-DemoResult).Parameters['Target']
+        ($target.Attributes | Where-Object { $_ -is [System.Management.Automation.ValidateSetAttribute] }).ValidValues | Should -Be $schema.properties.target.enum
     }
 }
 
@@ -1157,7 +1213,7 @@ Describe 'scripts/validate.ps1 (the contract with validate.yml)' {
         $output.DefaultValue.Extent.Text | Should -Match ([regex]::Escape("'../out/validate.jsonl'"))
         $area = $script:ast.ParamBlock.Parameters | Where-Object { $_.Name.VariablePath.UserPath -eq 'Area' }
         $set = $area.Attributes | Where-Object { $_.TypeName.Name -eq 'ValidateSet' }
-        @($set.PositionalArguments.Value) | Should -Be @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')
+        @($set.PositionalArguments.Value) | Should -Be @('Preflight', 'Infrastructure', 'T1', 'T2', 'T3', 'T4', 'T5', 'Hub', 'Telemetry', 'Workload', 'Cost', 'Security', 'Teardown')
         $binding = $script:ast.ParamBlock.Attributes | Where-Object { $_.TypeName.Name -eq 'CmdletBinding' }
         $named = @($binding.NamedArguments | ForEach-Object { $_.ArgumentName })
         $named | Should -Not -Contain 'SupportsShouldProcess' -Because 'validation never asks for -WhatIf; it changes nothing in the demo'
@@ -1181,7 +1237,7 @@ Describe 'scripts/validate.ps1 (the contract with validate.yml)' {
         $output | Should -Match 'Manual action required'
         $output | Should -Match 'INFRA\.VM\.SQLVM01'
         Should -Invoke -CommandName Invoke-DemoValidation -Times 1 -Exactly -ParameterFilter {
-            @($Area).Count -eq 12 -and @($Target).Count -eq 4 -and $WaitMinutes -eq 0 -and $Config['subscriptionId'] -eq $script:HubSubscriptionId
+            @($Area).Count -eq 13 -and @($Target).Count -eq 5 -and $WaitMinutes -eq 0 -and $Config['subscriptionId'] -eq $script:HubSubscriptionId
         }
     }
 

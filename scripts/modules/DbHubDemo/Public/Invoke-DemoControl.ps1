@@ -1,21 +1,24 @@
 function Invoke-DemoControl {
     <#
     .SYNOPSIS
-    Changes the activity on the demo's targets, as demo-control.yml and the live-activity notebook ask:
+    Changes the activity on the demo's targets, as demo-control.ps1 and the optional demo-control.yml workflow ask:
     a profile (baseline, business-day, off) or one bounded incident (incident:<scenario>) (ADR 0010, ADR 0011).
 
     .DESCRIPTION
-    The inputs are the ones the notebook dispatches (Phase 12), as strings or their typed equivalents:
-    environment (the caller's), target (all, T1, T2, T3, or T4), scenario (baseline, business-day, off, or
+    The inputs are the ones demo-control.yml declares (Phase 12), as strings or their typed equivalents:
+    environment (the caller's), target (all, T1, T2, T3, T4, or T5), scenario (baseline, business-day, off, or
     incident:<scenario>), duration (1-240 minutes), concurrency (0 for the scenario's default, or 1-64),
     intensity (0, or 1-10), reset-before, and auto-cleanup.
 
-    For each target it runs 'profile set' through Invoke-DemoWorkloadCommand (on sqlvm01 for T1, T3, and T4,
+    For each target it runs 'profile set' through Invoke-DemoWorkloadCommand (on sqlvm01 for T1, T3, T4, and T5,
     through archost01 for T2): --name, and unless the profile is off, --duration <minutes>m and --not-after the
     next auto-shutdown, plus --concurrency, --intensity, --reset-before, and --no-auto-cleanup when asked. The
     runner clamps everything to the scenario's limits. An incident on 'all' runs on the scenario's default
-    target (scenarios/<id>/scenario.json), as the notebook does. A target whose runner isn't installed yet
-    (T2 before its guest has SQL Server) reports Warning, not Fail.
+    target (scenarios/<id>/scenario.json). A target whose runner isn't installed yet (T2 before its guest has
+    SQL Server) reports Warning, not Fail. 'all' includes T4, which every deployment has, and T5, the Azure
+    Cosmos DB account (2026-11-18, ADR 0027), when t5Enabled; T5 has no stop or start, so its activity needs sqlvm01 and,
+    since 2026-11-19, its container, which exists only during a session: it's created first when a stop deleted it
+    (CONTROL.T5.CONTAINER, New-DemoT5Container).
 
     Returns one CONTROL.<target> result per target.
 
@@ -23,7 +26,8 @@ function Invoke-DemoControl {
     Configuration from Get-DemoConfig.
 
     .PARAMETER Target
-    all, T1, T2, T3, or T4 (the PostgreSQL flexible server, when t4Enabled; Phase 24, ADR 0019).
+    all, T1, T2, T3, T4 (the PostgreSQL flexible server; Phase 24, ADR 0019), or T5 (the Azure Cosmos DB
+    account, when t5Enabled; ADR 0027).
 
     .PARAMETER Scenario
     baseline, business-day, off, or incident:<scenario>.
@@ -55,7 +59,7 @@ function Invoke-DemoControl {
         [Parameter(Mandatory)]
         [System.Collections.IDictionary] $Config,
 
-        [ValidateSet('all', 'T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('all', 'T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target = 'all',
 
         [Parameter(Mandatory)]
@@ -88,7 +92,7 @@ function Invoke-DemoControl {
         return $results.ToArray()
     }
 
-    $targets = if ($Target -eq 'all') { @('T1', 'T2', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) } else { @($Target) }
+    $targets = if ($Target -eq 'all') { @('T1', 'T2', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' }) } else { @($Target) }
     if ($Scenario -like 'incident:*') {
         $id = $Scenario.Substring(9)
         $definition = Join-Path -Path $script:RepoRoot -ChildPath ('scenarios/{0}/scenario.json' -f $id)
@@ -100,6 +104,23 @@ function Invoke-DemoControl {
             $default = @((Get-Content -LiteralPath $definition -Raw | ConvertFrom-Json).targets.default)
             $targets = @(if ($default.Count -gt 0) { [string]$default[0] } else { 'T1' })
             Write-DemoLog -Message ('An incident runs on one target: {0}, the default for {1}.' -f $targets[0], $id)
+        }
+    }
+    # T5 when it's off (t5Enabled false, ADR 0027): there's no account to drive, so nothing is sent to it.
+    if ('T5' -in $targets -and -not (Test-DemoT5Enabled -Config $Config)) {
+        $results.Add((New-DemoResult -CheckId 'CONTROL.T5' -Area 'workload' -Target 'T5' -Status 'Not selected' -Message 'T5 (Azure Cosmos DB) is off in this configuration (t5Enabled is false), so its activity wasn''t changed.' -Remediation 'To add T5, remove t5Enabled from the configuration (or set it to true) and run ./scripts/deploy.ps1.'))
+        $targets = @($targets | Where-Object { $_ -ne 'T5' })
+    }
+    # T5's container exists only during a session (2026-11-19, ADR 0027): an activity on T5 needs it, so it's created first
+    # when a stop deleted it; without it, nothing is sent to T5 (CONTROL.T5.CONTAINER says why).
+    if ('T5' -in $targets -and $Scenario -ne 'off' -and $PSCmdlet.ShouldProcess('T5', 'Make sure T5''s container exists')) {
+        $container = New-DemoT5Container -Config $Config -CheckId 'CONTROL.T5.CONTAINER' -Confirm:$false
+        if ([string]$container.status -ne 'Pass') {
+            $results.Add($container)
+            $targets = @($targets | Where-Object { $_ -ne 'T5' })
+        }
+        elseif ([string](Get-DemoMemberValue -InputObject $container.evidence -Name 'action') -eq 'create') {
+            $results.Add($container)
         }
     }
     # replica-lag (ADR 0025) needs T4 and its read replica running: checked here first, because 'profile set' only stores the

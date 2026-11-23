@@ -19,11 +19,12 @@ Actions:
   display name (it's a member, Add-DemoT1ToT3AdminGroup), creates runnerRole for runnerObjectId (its own
   object ID), applies and seeds the schema, records t4-workload.json, sets T4's activity profile, and
   restarts DbHubDemo-Workload so its host adds T4.
-- Runner (sqlvm01 for T1, T3, and T4; archost01 relays T2 into the guest over PowerShell Direct)
-  { target, arguments[], timeoutSeconds, readySeconds, replicaServerFqdn, recoveryKey }: runs one runner command. The token
-  {{NEXT_SHUTDOWN}} in an argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, and T4
+- Runner (sqlvm01 for T1, T3, T4, and T5; archost01 relays T2 into the guest over PowerShell Direct)
+  { target, arguments[], timeoutSeconds, readySeconds, replicaServerFqdn, recoveryKey, lockSeconds }: runs one runner command. The token
+  {{NEXT_SHUTDOWN}} in an argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, T4
   commands the flexible server's FQDN, the runner's role, and T4's read replica when it's known (--replica-server, from
-  the request's optional replicaServerFqdn or else workload-install.json; ADR 0025). The evidence keeps the end of the
+  the request's optional replicaServerFqdn or else workload-install.json; ADR 0025), and T5 commands the Cosmos DB
+  account's documents host (ADR 0027). The evidence keeps the end of the
   runner's output, and the active profile's name and expiry, read from the whole output first (re-review of PR 16,
   2026-11-04). Before a command that starts activity ('profile set' with a profile other than off, or 'run'), the
   target must accept connections within readySeconds (10 minutes by default, 20 for T2; 0 skips the wait): the
@@ -36,7 +37,11 @@ Actions:
   hour without it; Invoke-DemoGuestRecovery): before a command that starts activity when a probe finds it broken, or
   after any command failed with it, which then runs again once. A command that ran after such a restart is a Warning
   that says what broke and that the restart cleared it; one that still fails says that the run's restart didn't help,
-  or why there was none.
+  or why there was none. Since 2026-11-19 (dbhubfx: the Arc probe's PowerShell Direct sessions ran inside the host's own
+  bootstrap pass and failed), T2's command waits for that pass and holds its lock (bootstrap.lock) while it runs in the
+  guest, at most the request's optional lockSeconds (120 by default; 0 doesn't take it). When the lock isn't free by
+  then, the command runs as before, and the evidence says so (lockTimedOut), so a long pass never fails a command that
+  the readiness wait and the recovery above already cover.
 - StopGuest (archost01) { timeoutMinutes }: shuts the guest down cleanly (Stop-VM) and waits until it's
   off, so the host can be deallocated.
 
@@ -465,21 +470,27 @@ function Test-DemoControlTransientFailure {
       exceptions 08000, 08001, 08003, 08004, 08006, and 08007 (not 08P01, a protocol violation, which doesn't pass by
       itself), 57P03 (cannot connect now) and 53300 (too many connections), or Npgsql's failure to connect (a refused
       or timed-out socket).
+    - T5, the Azure Cosmos DB account (ADR 0027): a data-plane role assignment that isn't in effect yet (401 or 403
+      right after the template assigned it), a documents host the private DNS zone doesn't resolve yet, a refused or
+      timed-out connection, and the status codes Learn lists as retryable: 408, 429 (request rate too large), 449, and
+      503.
     - Any target: the managed identity endpoint not answering yet right after a boot, and a warmup that ran out of time.
     Anything else means the target answered.
-    Sources (checked 2026-11-03):
+    Sources (checked 2026-11-03; T5's 2026-11-18):
     - https://learn.microsoft.com/sql/connect/ado-net/internal-retry-logic-providers-sqlclient (built-in transient list)
     - https://learn.microsoft.com/troubleshoot/sql/database-engine/connect/network-related-or-instance-specific-error-occurred-while-establishing-connection
     - https://learn.microsoft.com/azure/azure-sql/database/troubleshoot-common-errors-issues (transient fault list)
     - https://learn.microsoft.com/azure/postgresql/troubleshoot/concepts-connectivity, and PostgreSQL's error codes:
       https://www.postgresql.org/docs/current/errcodes-appendix.html
     - https://learn.microsoft.com/entra/identity/managed-identities-azure-resources/how-to-use-vm-token (retry guidance)
+    - https://learn.microsoft.com/rest/api/cosmos-db/http-status-codes-for-cosmosdb and
+      https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-unauthorized
     #>
     [CmdletBinding()]
     [OutputType([bool])]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target,
 
         [AllowEmptyString()]
@@ -502,6 +513,12 @@ function Test-DemoControlTransientFailure {
             return $true
         }
         return [bool]($value -match '(?i)failed to connect|exception while connecting|actively refused|connection refused|no connection could be made|timeout during|timed out|database system is starting up')
+    }
+    if ($Target -eq 'T5') {
+        if ($value -match '(?i)\b(401|403|408|429|449|503)\b|Forbidden|Unauthorized|data-plane role|role assignment') {
+            return $true
+        }
+        return [bool]($value -match '(?i)no such host is known|name or service not known|could not be resolved|actively refused|connection refused|no connection could be made|timed out|timeout|An error occurred while sending the request')
     }
     if ($Target -eq 'T2' -and $value -match '(?i)not in running state|session might have ended') {
         return $true
@@ -535,7 +552,7 @@ function Wait-DemoControlTargetReady {
     [OutputType([pscustomobject])]
     param(
         [Parameter(Mandatory = $true)]
-        [ValidateSet('T1', 'T2', 'T3', 'T4')]
+        [ValidateSet('T1', 'T2', 'T3', 'T4', 'T5')]
         [string] $Target,
 
         [Parameter(Mandatory = $true)]
@@ -593,7 +610,8 @@ function Get-DemoControlTargetArgument {
     <#
     .SYNOPSIS
     The target options a runner command gets on sqlvm01: --target, and the server (T3's FQDN; T4's FQDN and the runner's
-    role) from the install record unless the arguments name one. T4 commands also get T4's read replica (ADR 0025),
+    role; T5's documents host, ADR 0027) from the install record unless the arguments name one. T4 commands also get T4's
+    read replica (ADR 0025),
     --replica-server: ReplicaServerFqdn (the request's, already checked) or else the install record's. An install record
     from before the replica has none, and then no flag goes. Returns Arguments, or Error when the target isn't set up on
     this VM.
@@ -647,6 +665,18 @@ function Get-DemoControlTargetArgument {
             if ($replica -match $script:ControlReplicaFqdnPattern) {
                 $full += @('--replica-server', $replica)
             }
+        }
+    }
+    if ($Target -eq 'T5') {
+        $t5 = $null
+        if ($Install.Contains('t5')) {
+            $t5 = $Install['t5']
+        }
+        if ($null -eq $t5 -or -not $t5['accountHost']) {
+            return [pscustomobject]@{ Arguments = @(); Error = 'T1 has no T5 account in its workload settings: T5 is off (t5Enabled), or T1 was bootstrapped before T5 existed (./scripts/deploy.ps1 updates it).' }
+        }
+        if ($full -notcontains '--server') {
+            $full += @('--server', [string]$t5['accountHost'])
         }
     }
     return [pscustomobject]@{ Arguments = $full; Error = '' }
@@ -1123,7 +1153,7 @@ function Invoke-DemoControlRunner {
     $readySeconds = Get-DemoControlReadyTimeout -Target $target -Request $Request
     $readyNote = [ordered]@{}
 
-    if ($role -eq 'SqlVm' -and $target -in @('T1', 'T3', 'T4')) {
+    if ($role -eq 'SqlVm' -and $target -in @('T1', 'T3', 'T4', 'T5')) {
         $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $StateRoot).InstallRecord
         if ($null -eq $install) {
             Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message 'The workload runner is not installed on T1 yet.'
@@ -1172,8 +1202,12 @@ function Invoke-DemoControlRunner {
         . ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'hyperv-guest', 'GuestVm.ps1'))
         $requestKey = if ($Request.Contains('recoveryKey')) { [string]$Request['recoveryKey'] } else { '' }
         $recoveryKey = Get-DemoGuestRecoveryKey -Key $requestKey -Prefix 'control'
+        $lockSeconds = 120
+        if ($Request.Contains('lockSeconds') -and $null -ne $Request['lockSeconds']) {
+            $lockSeconds = [int][System.Math]::Max(0, [System.Math]::Min(600, [int]$Request['lockSeconds']))
+        }
         $full = @($arguments) + @('--target', 'T2')
-        $t2 = @{ StateRoot = $StateRoot; GuestName = $guestName; Guest = $guest; Arguments = $full; TimeoutSeconds = $timeout; Activity = $activity; ReadySeconds = $readySeconds }
+        $t2 = @{ StateRoot = $StateRoot; GuestName = $guestName; Guest = $guest; Arguments = $full; TimeoutSeconds = $timeout; Activity = $activity; ReadySeconds = $readySeconds; LockSeconds = $lockSeconds }
         # Only activity probes first; a read, a stop, or a reset just runs, and a broken channel it meets is cleared after it.
         $recovery = $null
         if ($activity) {
@@ -1227,7 +1261,7 @@ function Invoke-DemoControlRunner {
         $run = $attempt.Run
     }
     else {
-        Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message ('Target {0} is not driven from this VM (role {1}): T1, T3, and T4 run on sqlvm01, T2 through archost01.' -f $target, $role)
+        Write-DemoControlResult -ActionName 'Runner' -Status 'Fail' -Message ('Target {0} is not driven from this VM (role {1}): T1, T3, T4, and T5 run on sqlvm01, T2 through archost01.' -f $target, $role)
         return
     }
 
@@ -1289,7 +1323,10 @@ function Invoke-DemoControlT2Attempt {
 
         [bool] $Activity,
 
-        [int] $ReadySeconds = 0
+        [int] $ReadySeconds = 0,
+
+        [ValidateRange(0, 600)]
+        [int] $LockSeconds = 120
     )
 
     $readyNote = [ordered]@{}
@@ -1310,22 +1347,73 @@ function Invoke-DemoControlT2Attempt {
     else {
         $credential = Get-DemoGuestCredential -SecretPath ([System.IO.Path]::Combine($StateRoot, 'protected', 'guest-administrator.bin')) -UserName $Guest.AdministratorName
     }
-    $run = Invoke-DemoControlGuestCommand -GuestName $GuestName -Credential $credential -ArgumentList @($Guest.ToolsFolder, $Arguments, $TimeoutSeconds) -ScriptBlock {
-        param($Folder, $Arguments, $TimeoutSeconds)
-        $modulePath = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
-        if (-not (Test-Path -LiteralPath $modulePath)) {
-            # Before SQL Server setup, the guest has no demo module yet (Phase 28 live finding): the caller reports
-            # Not selected, not a Warning.
-            throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
+    # dbhubfx (2026-11-19): PowerShell Direct sessions that ran beside the host's own bootstrap pass failed. The command
+    # waits for that pass and holds its lock while it runs in the guest, at most LockSeconds; when the lock isn't free by
+    # then, it runs as before, and the evidence says so. Taken after the readiness wait, which takes the same lock itself
+    # to release or start the guest.
+    $lock = $null
+    if ($LockSeconds -gt 0) {
+        $lock = Enter-DemoControlBootstrapLock -StateRoot $StateRoot -Seconds $LockSeconds
+    }
+    if ($null -ne $lock) {
+        $readyNote['lockSeconds'] = [int]$lock.Seconds
+        if ([bool]$lock.TimedOut) {
+            $readyNote['lockTimedOut'] = $true
         }
-        Import-Module -Name $modulePath -Force
-        $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $Folder).InstallRecord
-        if ($null -eq $install) {
-            throw 'The workload runner is not installed in the guest yet.'
+    }
+    try {
+        $run = Invoke-DemoControlGuestCommand -GuestName $GuestName -Credential $credential -ArgumentList @($Guest.ToolsFolder, $Arguments, $TimeoutSeconds) -ScriptBlock {
+            param($Folder, $Arguments, $TimeoutSeconds)
+            $modulePath = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
+            if (-not (Test-Path -LiteralPath $modulePath)) {
+                # Before SQL Server setup, the guest has no demo module yet (Phase 28 live finding): the caller reports
+                # Not selected, not a Warning.
+                throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.'
+            }
+            Import-Module -Name $modulePath -Force
+            $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $Folder).InstallRecord
+            if ($null -eq $install) {
+                throw 'The workload runner is not installed in the guest yet.'
+            }
+            Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $Arguments -TimeoutSeconds $TimeoutSeconds
         }
-        Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $Arguments -TimeoutSeconds $TimeoutSeconds
+    }
+    finally {
+        if ($null -ne $lock -and $null -ne $lock.Stream) {
+            $lock.Stream.Dispose()
+        }
     }
     return [pscustomobject]@{ Run = $run; ReadyNote = $readyNote; Failure = $null }
+}
+
+function Enter-DemoControlBootstrapLock {
+    <#
+    .SYNOPSIS
+    Takes the host bootstrap's own lock (bootstrap.lock in StateRoot) with the sign-in data check's helper,
+    Enter-DemoSignInBootstrapLock from this bundle's Invoke-DemoSignInResidue.ps1, as the Arc onboarding does: it waits up
+    to Seconds while a bootstrap run holds it, and a run that starts meanwhile exits and runs again 5 minutes later.
+    Returns that helper's Stream, Seconds, and TimedOut, or $null when this bundle has no such helper.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot,
+
+        [ValidateRange(1, 7200)]
+        [int] $Seconds = 120
+    )
+
+    $path = [System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'bootstrap', 'Invoke-DemoSignInResidue.ps1')
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return $null
+    }
+    # Dot-sourced in this function's scope, so the script's own parameters stay here; it only defines its functions.
+    . $path
+    if (-not (Get-Command -Name 'Enter-DemoSignInBootstrapLock' -CommandType Function -ErrorAction SilentlyContinue)) {
+        return $null
+    }
+    return (Enter-DemoSignInBootstrapLock -Root $StateRoot -Seconds $Seconds)
 }
 
 function Invoke-DemoControlT2Recovery {

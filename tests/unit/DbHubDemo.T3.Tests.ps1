@@ -495,6 +495,8 @@ Describe 'Resolve-DemoT3FreeOfferError' {
         @{ Name = 'deployment JSON'; Text = '{"status":"Failed","error":{"code":"DeploymentFailed","message":"At least one resource deployment operation failed.","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Sql/servers/azuresql01-abc123/databases/ContosoCare","message":"The resource write operation failed.","details":[{"code":"FreeDatabaseLimitReached","message":"The subscription has reached its free database limit."}]}]}}'; Code = 'FreeDatabaseLimitReached' }
         @{ Name = 'property name'; Text = 'ERROR: (InvalidParameterValue) Invalid value given for parameter useFreeLimit. Specify a valid parameter value.'; Code = 'InvalidParameterValue' }
         @{ Name = 'free offer region'; Text = 'ERROR: (ProvisioningDisabled) The free offer is not available in region westus3 for this subscription.'; Code = 'ProvisioningDisabled' }
+        # Azure SQL's real refusal (Microsoft Q&A 6001016, 2026-09): it names a "free limit database", never a "free tier".
+        @{ Name = 'Azure SQL''s real refusal (Microsoft Q&A)'; Text = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/azuresql01","details":[{"code":"ProvisioningDisabled","message":"Provisioning of free limit database is not supported for provided service level objective or region"}]}]}}'; Code = 'ProvisioningDisabled' }
     ) {
         $verdict = Resolve-DemoT3FreeOfferError -ErrorText $Text
         $verdict.IsFreeOfferError | Should -BeTrue
@@ -511,10 +513,22 @@ Describe 'Resolve-DemoT3FreeOfferError' {
         @{ Name = 'unrelated free text'; Text = 'ERROR: (SubnetIsFull) Subnet snet-pe has no free IP addresses left.' }
         @{ Name = 'conflict'; Text = 'ERROR: (Conflict) Another operation is in progress on server azuresql01-abc123.' }
         @{ Name = 'empty'; Text = '' }
+        # Azure Cosmos DB refusing T5's free tier (review, 2026-11-19): never T3's free offer.
+        @{ Name = 'T5''s free tier, internal subscription (live 2026-11-18)'; Text = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"{\r\n  \"code\": \"BadRequest\",\r\n  \"message\": \"Free tier is not supported for Internal subscriptions.\\r\\nActivityId: 00000000-0000-0000-0000-000000000000, Microsoft.Azure.Documents.Common/2.14.0\"\r\n}"}]}]}}' }
+        @{ Name = 'T5''s free tier, taken by another account'; Text = 'ERROR: (BadRequest) Free tier has already been applied to another Azure Cosmos DB account in this subscription. To apply free tier to this account, you can select another subscription for this account or delete the existing free tier account.' }
+        @{ Name = 'a Cosmos DB detail that names a free offer'; Text = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"BadRequest","message":"The free offer for Azure Cosmos DB accounts is not available."}]}}' }
     ) {
         $verdict = Resolve-DemoT3FreeOfferError -ErrorText $Text
         $verdict.IsFreeOfferError | Should -BeFalse
         $verdict.Result | Should -BeNullOrEmpty
+    }
+
+    It 'still recognizes T3''s own refusal next to a Cosmos DB refusal in the same error (review, 2026-11-19)' {
+        $text = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","details":[{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/cosmos01","details":[{"code":"BadRequest","message":"Free tier has already been applied to another Azure Cosmos DB account in this subscription. To apply free tier to this account, you can select another subscription for this account or delete the existing free tier account."}]},{"code":"ResourceDeploymentFailure","target":"/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/azuresql01","details":[{"code":"ProvisioningDisabled","message":"Provisioning of free limit database is not supported for provided service level objective or region"}]}]}}'
+        $verdict = Resolve-DemoT3FreeOfferError -ErrorText $text
+        $verdict.IsFreeOfferError | Should -BeTrue
+        $verdict.Code | Should -Be 'ProvisioningDisabled'
+        $verdict.Message | Should -Be 'Provisioning of free limit database is not supported for provided service level objective or region'
     }
 
     It 'redacts and shortens the message it reports' {
@@ -585,7 +599,7 @@ Describe 'Test-DemoT3' {
             publicNetworkAccess = 'Disabled'; minimalTlsVersion = '1.2'
             administrators = @{ administratorType = 'ActiveDirectory'; azureAdOnlyAuthentication = $true; principalType = 'Group'; sid = '77777777-7777-7777-7777-777777777777'; login = 'sg-test' }
         }
-        $script:database = @{ name = 'ContosoCare'; status = 'Paused'; currentSku = @{ name = 'GP_S_Gen5'; tier = 'GeneralPurpose'; capacity = 1 }; autoPauseDelay = 15; minCapacity = 0.5; maxSizeBytes = 34359738368; useFreeLimit = $true; freeLimitExhaustionBehavior = 'BillOverUsage' }
+        $script:database = @{ name = 'ContosoCare'; status = 'Paused'; currentSku = @{ name = 'GP_S_Gen5'; tier = 'GeneralPurpose'; capacity = 2 }; autoPauseDelay = 15; minCapacity = 0.5; maxSizeBytes = 34359738368; useFreeLimit = $true; freeLimitExhaustionBehavior = 'BillOverUsage' }
         $script:firewallRules = @()
         $script:vnetRules = @()
         $script:endpoint = @{ name = 'pe-dbhub-demo-azuresql01'; provisioningState = 'Succeeded'; privateLinkServiceConnections = @(@{ privateLinkServiceId = $script:serverId; privateLinkServiceConnectionState = @{ status = 'Approved' } }) }
@@ -606,13 +620,17 @@ Describe 'Test-DemoT3' {
             }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -MockWith {
-            [pscustomobject]@{ Status = 'Pass'; Reason = 'Ok'; Message = 'ok'; Data = @{}; Rows = @(@{ performance_monitoring = 'true'; seed_status = 'Completed'; query_store_state = 'READ_WRITE' }); Result = [pscustomobject]@{ remediation = '' } }
+            [pscustomobject]@{ Status = 'Pass'; Reason = 'Ok'; Message = 'ok'; Data = @{}; Rows = @(@{ performance_monitoring = 'true'; seed_status = 'Completed'; query_store_state = 'READ_WRITE'; force_last_good_plan_desired = 'DEFAULT'; force_last_good_plan_actual = 'ON' }); Result = [pscustomobject]@{ remediation = '' } }
+        }
+        # T3.AGENT (2026-11-18) reads the signed-in account's permissions on the database (DbHubDemo.T3Agent.Tests.ps1).
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRestRequest -MockWith {
+            [pscustomobject]@{ ExitCode = 0; StdOut = '{"value":[{"actions":["*"],"notActions":["Microsoft.Authorization/*/Write"]}]}'; StdErr = ''; StatusCode = 200 }
         }
     }
 
     It 'passes every check for a healthy private-mode T3 on the free offer' {
         $results = Test-DemoT3 -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $true
-        @($results.checkId) | Should -Be @('T3.EXISTS', 'T3.ENTRAONLY', 'T3.NETWORK', 'T3.DATABASE', 'T3.FREEOFFER', 'T3.PROPERTY')
+        @($results.checkId) | Should -Be @('T3.EXISTS', 'T3.ENTRAONLY', 'T3.NETWORK', 'T3.DATABASE', 'T3.FREEOFFER', 'T3.PROPERTY', 'T3.AUTOTUNING', 'T3.AGENT')
         $results | Where-Object { $_.status -ne 'Pass' } | Should -BeNullOrEmpty
         ($results | Where-Object checkId -eq 'T3.NETWORK').evidence.privateEndpointConnection | Should -Be 'Approved'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -Times 1 -Exactly -ParameterFilter { $Name -eq 'Status' -and $CheckId -eq 'T3.PROPERTY' }
@@ -671,6 +689,13 @@ Describe 'Test-DemoT3' {
         $database = Test-DemoT3 -Config $config -NetworkMode private -SkipSqlCheck | Where-Object checkId -eq 'T3.DATABASE'
         $database.status | Should -Be 'Pass'
         $database.message | Should -Match 'auto-pause after 60 minutes'
+    }
+
+    It 'warns about a lowest-cost T3 still at 1 maximum vCore, the size before 2026-11-18, until deploy.ps1 scales it' {
+        $script:database.currentSku.capacity = 1
+        $database = Test-DemoT3 -Config (New-TestConfig) -NetworkMode private -SkipSqlCheck | Where-Object checkId -eq 'T3.DATABASE'
+        $database.status | Should -Be 'Warning'
+        $database.message | Should -Match '1 maximum vCores, not 2'
     }
 
     It 'fails the property check when the property is missing, and warns when T1 can''t run the query' {

@@ -449,7 +449,7 @@ function Get-DemoRayfinTokenRefusal {
         $said = @($said['code'], $said['message']) -join ' '
     }
     $text = (@([string]$said, [string](Get-DemoMemberValue -InputObject $Run -Name 'StdErr'), [string](Get-DemoMemberValue -InputObject $Run -Name 'StdOut')) | Where-Object { $_ }) -join ' '
-    if ($text -notmatch '(?i)\b40[13]\b|unauthori[sz]ed|forbidden|invalid[_ ]?(auth(entication)?[_ ]?)?token|token (has )?expired|expired token|wrong audience|audience|AADSTS\d+|insufficient (privileges|permissions?)|not authori[sz]ed|access (is )?denied|permission') {
+    if ($text -notmatch '(?i)\b40[13]\b|unauthori[sz]ed|forbidden|invalid[_ ]?(auth(entication)?[_ ]?)?token|token ?(has |is )?expired|expired token|wrong audience|audience|AADSTS\d+|insufficient (privileges|permissions?)|not authori[sz]ed|access (is )?denied|permission') {
         return ''
     }
     $line = (($text -replace '\s+', ' ').Trim())
@@ -457,6 +457,29 @@ function Get-DemoRayfinTokenRefusal {
         $line = $line.Substring(0, 300) + '...'
     }
     return $line
+}
+
+function Test-DemoRayfinTokenExpiry {
+    <#
+    .SYNOPSIS
+    True when a refusal (Get-DemoRayfinTokenRefusal's reason) says the token expired, rather than that Fabric refuses that
+    kind of token. Pure. Internal.
+
+    .DESCRIPTION
+    F16 (live, 2026-11-20): the Azure CLI hands out a cached token until about 5 minutes before it expires, and one taken
+    with minutes left ran out during rayfin up ("401 ... Access token has expired"). That isn't a refusal: the caller takes
+    a new token and runs the command once more, and nothing records a refusal, which would start a browser sign-in at the
+    next deploy.ps1's start.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [AllowEmptyString()]
+        [string] $Reason
+    )
+
+    return [bool]($Reason -match '(?i)\btoken\b[^.;]{0,40}\bexpired\b|\bexpired\b[^.;]{0,20}\btoken\b|TokenExpired|ExpiredAuthenticationToken|lifetime validation failed')
 }
 
 function Get-DemoRayfinAuthRecord {
@@ -561,7 +584,8 @@ function Get-DemoFabricAppDeploymentRecord {
     <#
     .SYNOPSIS
     Reads the active deployment that 'rayfin up' recorded in the stage (rayfin/.deployments.json): item name and ID,
-    workspace, hosting URL, and the portal deep link. Never returns the publishable key. Null when there is none.
+    workspace, hosting URL, the app's API (fabricApiUrl, which the Manage function checks callers' keys at), and the
+    portal deep link. Never returns the publishable key. Null when there is none.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -592,8 +616,96 @@ function Get-DemoFabricAppDeploymentRecord {
         WorkspaceId = [string]$record['fabricWorkspaceId']
         TenantId    = [string]$record['fabricTenantId']
         HostingUrl  = [string]$record['hostingUrl']
+        ApiUrl      = [string]$record['fabricApiUrl']
         ItemUrl     = [string]$record['fabricDeepLink']
     }
+}
+
+function Remove-DemoFabricAppStaleDeployment {
+    <#
+    .SYNOPSIS
+    Drops the records of other Fabric workspaces from the deploy stage's rayfin/.deployments.json, so rayfin up and the
+    demo's own reads of it find only the target workspace's. Returns what it dropped: Key, WorkspaceId, and ItemName,
+    never the publishable key. Internal.
+
+    .DESCRIPTION
+    rayfin up takes the record under the slug of the target workspace's name and reuses its item, without checking the
+    record's workspace (Rayfin CLI 1.36.2: resolveExistingDeployment in dist/commands/up/up.js). destroy.ps1 deletes the
+    demo's workspace, and the next deploy creates one with the same name: with the old record, rayfin up would deploy to
+    the deleted app's ID in the new workspace, and fail. 'active' moves to the target's record, or goes when there's none,
+    because Manage's settings and the Ask relay read the active record before rayfin up. A missing, unreadable, or empty
+    registry stays as it is, and the file is written the way the CLI writes it: two-space JSON and a newline.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject[]])]
+    param(
+        [Parameter(Mandatory)]
+        [string] $StagePath,
+
+        [Parameter(Mandatory)]
+        [ValidatePattern('^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')]
+        [string] $WorkspaceId
+    )
+
+    $path = Join-Path -Path $StagePath -ChildPath 'rayfin/.deployments.json'
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+        return @()
+    }
+    try {
+        $registry = [System.Text.Json.Nodes.JsonNode]::Parse([System.IO.File]::ReadAllText($path))
+    }
+    catch {
+        Write-DemoLog -Level Debug -Message ('The stage''s rayfin/.deployments.json wasn''t read: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return @()
+    }
+    if ($registry -isnot [System.Text.Json.Nodes.JsonObject] -or $registry['deployments'] -isnot [System.Text.Json.Nodes.JsonObject]) {
+        return @()
+    }
+    $deployments = $registry['deployments'].AsObject()
+    $dropped = [System.Collections.Generic.List[object]]::new()
+    $kept = [System.Collections.Generic.List[string]]::new()
+    foreach ($key in @($deployments | ForEach-Object { $_.Key })) {
+        $record = $deployments[$key]
+        $recordWorkspace = if ($record -is [System.Text.Json.Nodes.JsonObject]) { [string]$record['fabricWorkspaceId'] } else { '' }
+        if (-not $recordWorkspace) {
+            # The CLI skips a record without a workspace.
+            continue
+        }
+        if ([string]::Equals($recordWorkspace, $WorkspaceId, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $kept.Add($key)
+        }
+        else {
+            $dropped.Add([pscustomobject]@{ Key = $key; WorkspaceId = $recordWorkspace; ItemName = [string]$record['itemName'] })
+        }
+    }
+    if ($dropped.Count -eq 0 -or -not $PSCmdlet.ShouldProcess($path, ('Drop the records of {0} other Fabric workspace(s)' -f $dropped.Count))) {
+        return @()
+    }
+    foreach ($entry in $dropped) {
+        $null = $deployments.Remove($entry.Key)
+    }
+    $active = if ($null -ne $registry['active']) { [string]$registry['active'] } else { '' }
+    if (-not $active -or -not $deployments.ContainsKey($active)) {
+        if ($kept.Count -gt 0) {
+            $registry['active'] = [System.Text.Json.Nodes.JsonValue]::Create([string]$kept[0])
+        }
+        else {
+            $null = $registry.AsObject().Remove('active')
+        }
+    }
+    $options = [System.Text.Json.JsonSerializerOptions]::new()
+    $options.WriteIndented = $true
+    $options.Encoder = [System.Text.Encodings.Web.JavaScriptEncoder]::UnsafeRelaxedJsonEscaping
+    $bytes = [System.Text.UTF8Encoding]::new($false).GetBytes($registry.ToJsonString($options).Replace("`r`n", "`n") + "`n")
+    # Truncate, not WriteAllText: Windows refuses to overwrite a hidden file, which a dot-file can be.
+    $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::Truncate, [System.IO.FileAccess]::Write)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    return $dropped.ToArray()
 }
 
 function Get-DemoFabricAppFileHash {
@@ -612,6 +724,37 @@ function Get-DemoFabricAppFileHash {
         return ''
     }
     return (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLowerInvariant()
+}
+
+function Get-DemoFabricAppScopeSource {
+    <#
+    .SYNOPSIS
+    The TypeScript of rayfin/functions/src/scope.generated.ts for the deploy stage: the subscription and resource groups
+    the live estate function may read (Database Hub's view, filtered to them). A missing or malformed scope gives the
+    empty placeholder, which the function reports as "no scope". Names only: a subscription ID and resource group
+    names, never a secret.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [System.Collections.IDictionary] $Scope
+    )
+
+    $subscription = if ($Scope) { [string]$Scope['subscriptionId'] } else { '' }
+    $groups = @(if ($Scope) { @($Scope['resourceGroups']) | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^[\w.()-]{1,90}$' } })
+    if ($subscription -notmatch '^[0-9a-fA-F]{8}-([0-9a-fA-F]{4}-){3}[0-9a-fA-F]{12}$' -or $groups.Count -eq 0) {
+        $subscription = ''
+        $groups = @()
+    }
+    $list = ($groups | ForEach-Object { '"{0}"' -f $_ }) -join ', '
+    return @(
+        '// Written by scripts/configure-fabric-app.ps1 in the deploy stage: the demo''s own resources, the only scope the',
+        '// estate function reads. Git holds an empty placeholder.',
+        'import type { EstateScope } from "./estate-core.js";',
+        '',
+        ('export const ESTATE_SCOPE: EstateScope = {{ subscriptionId: "{0}", resourceGroups: [{1}] }};' -f $subscription.ToLowerInvariant(), $list),
+        ''
+    ) -join "`n"
 }
 
 function Set-DemoFabricAppEnvValue {
@@ -819,4 +962,156 @@ function Test-DemoFabricAppTenantSetting {
         $parts.Add(('not found among the {0} settings the admin API returned (the preview may have renamed it): {1}' -f $items.Count, ($notFound -join ', ')))
     }
     return (& $result 'Warning' ('The Fabric tenant settings the Insights app needs aren''t all on for the organization ({0}). The app isn''t created, or its queries fail, while one is off; that doesn''t keep the run from DONE.' -f ($parts -join '; ')) $evidence $steps)
+}
+
+function ConvertTo-DemoT2MigrationVerdict {
+    <#
+    .SYNOPSIS
+    The verdict of one Microsoft.AzureArcData/sqlServerInstances resource's migration assessment, for the Insights app's
+    dbhub-app.json (t2Migration, R924): its readiness per Azure SQL target type, with Azure's own names and values, and the
+    recommended service tier and size when the result names them. $null when the assessment has no readiness yet. Internal
+    and pure.
+
+    .DESCRIPTION
+    From properties.migration.assessment (Sql Server Instances - Get, api-version 2026-01-01), the same fields
+    Get-DemoArcMigrationReadiness reads for T2.ARC.MIGRATIONASSESSMENT: enabled, assessmentUploadTime, and
+    skuRecommendationResults.<azureSqlDatabase|azureSqlManagedInstance|azureSqlVirtualMachine>: recommendationStatus and
+    targetSku (category.sqlServiceTier, computeSize). Words and numbers only, each checked against a pattern, so the app
+    never shows anything else. The Insights app's migration card shows it, with its time, when Database Hub's live view
+    isn't available to the app.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [AllowNull()]
+        [object] $Instance,
+
+        [Parameter(Mandatory)]
+        [datetime] $ReadAt
+    )
+
+    $name = [string](Get-DemoMemberValue -InputObject $Instance -Name 'name')
+    if ($name -notmatch '^[A-Za-z0-9._-]{1,128}$') {
+        return $null
+    }
+    $assessment = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Instance -Name 'properties') -Name 'migration') -Name 'assessment'
+    $results = Get-DemoMemberValue -InputObject $assessment -Name 'skuRecommendationResults'
+    $targets = [ordered]@{}
+    $recommended = [ordered]@{}
+    foreach ($key in 'azureSqlManagedInstance', 'azureSqlVirtualMachine', 'azureSqlDatabase') {
+        $result = Get-DemoMemberValue -InputObject $results -Name $key
+        $status = [string](Get-DemoMemberValue -InputObject $result -Name 'recommendationStatus')
+        if ($status -cnotmatch '^[A-Za-z][A-Za-z ]{0,31}$') {
+            continue
+        }
+        $targets[$key] = $status
+        $sku = Get-DemoMemberValue -InputObject $result -Name 'targetSku'
+        $tier = ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $sku -Name 'category') -Name 'sqlServiceTier')) -creplace '([a-z])([A-Z])', '$1 $2'
+        $size = [string](Get-DemoMemberValue -InputObject $sku -Name 'computeSize')
+        $parts = @(@($tier, $(if ($size -match '^\d{1,4}$') { '{0} vCores' -f $size } else { '' })) | Where-Object { $_ })
+        $text = $parts -join ', '
+        if ($text -match '^\w[\w ,.()-]{0,63}$') {
+            $recommended[$key] = $text
+        }
+    }
+    if ($targets.Count -eq 0) {
+        return $null
+    }
+    $enabled = Get-DemoMemberValue -InputObject $assessment -Name 'enabled'
+    $uploaded = ConvertTo-DemoUtcDate -Value (Get-DemoMemberValue -InputObject $assessment -Name 'assessmentUploadTime')
+    $iso = { param([datetime] $Value) $Value.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+    return [ordered]@{
+        resource    = $name
+        readAt      = & $iso $ReadAt
+        enabled     = ($enabled -eq $true -or [string]$enabled -eq 'true')
+        uploadedAt  = $(if ($uploaded -is [datetime]) { & $iso $uploaded } else { '' })
+        targets     = $targets
+        recommended = $recommended
+    }
+}
+
+function Get-DemoT2Migration {
+    <#
+    .SYNOPSIS
+    T2's SQL Server instance enabled by Azure Arc, for the Insights app: its Azure portal page (Link, 2026-11-18), and its
+    migration assessment's verdict as Azure has it now (Verdict, R924), from one read. Internal.
+
+    .DESCRIPTION
+    Learn's path to an instance's migration assessment is its SQL Server resource, then Migration, Assessments
+    (https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment). The portal documents no link to that
+    menu item, so the link opens the resource, and the app names the rest of the path. The verdict
+    (ConvertTo-DemoT2MigrationVerdict) is what the app's migration card shows, with its time, when Database Hub's live
+    view isn't available to the app (R924: Database Hub refuses the token Fabric gives the app's functions).
+    Read-only: one list of the resource group's Microsoft.AzureArcData/sqlServerInstances through Invoke-DemoAz, pinned to
+    the configured subscription; the instance hosted on T2's Arc machine is taken, the default instance (MSSQLSERVER)
+    first. Link is '' and Verdict $null when T2 has no instance resource yet, when Azure can't be read, or without a
+    tenant: the app then names the whole path.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $none = [pscustomobject]@{ Link = ''; Verdict = $null }
+    $tenantId = [string]$Config['tenantId']
+    if ($tenantId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        return $none
+    }
+    try {
+        $target = Get-DemoArcTarget -Config $Config
+        # Both return their array as one object (return , $array), as Get-DemoArcState reads them: no @() around them.
+        $instances = Get-DemoArmCollection -SubscriptionId $target.SubscriptionId -Url $target.SqlInstancesUrl
+        $hosted = Select-DemoArcSqlInstance -Instance $instances -MachineId $target.MachineId
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('T2''s SQL Server instance couldn''t be read, so the Insights app names the Azure portal path to its migration assessment instead of linking it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return $none
+    }
+    $readAt = [datetime]::UtcNow
+    $defaultFirst = @($hosted | Sort-Object -Property @{ Expression = { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'instanceName') -ne 'MSSQLSERVER' } })
+    foreach ($instance in $defaultFirst) {
+        $id = [string](Get-DemoMemberValue -InputObject $instance -Name 'id')
+        if ($id -match '^/subscriptions/[0-9a-fA-F-]{36}/resourceGroups/[\w.()-]{1,90}/providers/Microsoft\.AzureArcData/sqlServerInstances/[A-Za-z0-9._-]{1,128}$') {
+            return [pscustomobject]@{
+                Link    = 'https://portal.azure.com/#@{0}/resource{1}' -f $tenantId.ToLowerInvariant(), $id
+                Verdict = ConvertTo-DemoT2MigrationVerdict -Instance $instance -ReadAt $readAt
+            }
+        }
+    }
+    return $none
+}
+
+function Get-DemoFabricAppManageCatalog {
+    <#
+    .SYNOPSIS
+    The session control's own rules for the Insights app's Manage function (ADR 0029), from the same runbook settings the
+    control's runbooks and NB_DatabaseHub_Control's CATALOG_JSON come from: its targets (T5 only while it's on), its
+    incidents, a run's minutes, and a session's (the showcase's). So the function sends only what the control accepts.
+    Names and numbers only. Null when the settings can't be built. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([System.Collections.Specialized.OrderedDictionary])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    try {
+        # The identity's client ID only goes into the runbooks' own copy, so the placeholder changes nothing here.
+        $setting = Get-DemoActivityControlRunbookSetting -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -IdentityClientId '00000000-0000-0000-0000-000000000000'
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The control''s catalog for the Insights app''s Manage function couldn''t be built: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+        return $null
+    }
+    $showcase = $setting['profiles']['showcase']
+    return [ordered]@{
+        targets            = @($setting['targets'].Keys | ForEach-Object { [string]$_ })
+        scenarios          = $setting['scenarios']
+        minDurationMinutes = [int]$setting['minDurationMinutes']
+        maxDurationMinutes = [int]$setting['maxDurationMinutes']
+        session            = [ordered]@{ minMinutes = [int]$setting['minSessionMinutes']; maxMinutes = [int]$showcase['maxMinutes']; defaultMinutes = [int]$showcase['defaultMinutes'] }
+    }
 }

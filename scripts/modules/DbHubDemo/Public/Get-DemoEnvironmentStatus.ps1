@@ -28,6 +28,9 @@ function Get-DemoEnvironmentStatus {
       that delete them; Pass when there's none. On the T2 host (2026-11-17), the demo's Run Commands that Azure is still
       deleting come first, as a Warning whose fix is deploy.ps1. Read-only.
     - STATUS.T3: whether T3 exists and its status (Online, Paused); Not selected after stop-demo.ps1 -RemoveT3.
+    - STATUS.T3.AUTOTUNING (2026-11-18): T3's FORCE_LAST_GOOD_PLAN, read only while T3 is Online (reading it could wake a
+      paused T3): Pass when it's on; a Warning when it's off, which a session's Database Agent beat does from the
+      regression to its response, with what puts it back (Invoke-DemoT3AutoTuningCheck).
     - STATUS.T4 (Phase 24, ADR 0019): T4's state; while it runs, its live Azure Monitor metrics from the last
       15 minutes (CPU, memory, connections, CPU credits, and the enhanced metrics: sessions by state and by
       wait event type, the oldest transaction, deadlocks); while it's stopped, when Azure starts it again on its own (seven
@@ -40,6 +43,11 @@ function Get-DemoEnvironmentStatus {
       the difference (Get-DemoT4RecordedSizeChange). STATUS.PROFILE_T4 is its activity
       profile, and with -Detail STATUS.T4.LIVE is T1's runner's live view of T4 (connections against
       max_connections, sessions by state, blockers, the oldest transaction, deadlocks).
+    - STATUS.T5 (2026-11-18, ADR 0027): the Azure Cosmos DB account's state and its Azure Monitor metrics from the last 15
+      minutes (requests, throttled requests (429), request units, normalized RU consumption), with whether its container
+      is there and what that bills: since 2026-11-19 the container exists only during a session once its lifecycle is
+      Session, and a Warning says when it stays between sessions instead, with the fix. A demo deployed before T5 gets a
+      Warning with the upgrade's command. STATUS.PROFILE_T5 is its activity profile (T1's runner runs T5's workload).
     - T1.SQLVM.ASSOCIATEDSERVICES (Phase 7, read-only): the SQL Server instances unified inventory lists for
       T1, Pass with the engine only and a Warning while associated services are still listed; and T1.SQLVM.MONITORING while sqlvm01
       runs (an extension that's Updating after a redeployment is a Warning).
@@ -238,6 +246,12 @@ function Get-DemoEnvironmentStatus {
     }
     if ($t3.Exists) {
         $results.Add((New-DemoResult -CheckId 'STATUS.T3' -Area 't3' -Target 'T3' -Status 'Pass' -Message ('{0}/ContosoCare is {1}.' -f $t3.ServerName, $t3.Status) -Evidence ([ordered]@{ status = $t3.Status })))
+        # FORCE_LAST_GOOD_PLAN (2026-11-18), which the Database Agent beat holds off until its response; read only while T3
+        # is Online, since reading it could wake a paused T3.
+        $tuning = Invoke-DemoT3AutoTuningCheck -Config $Config -T3 $t3 -CheckId 'STATUS.T3.AUTOTUNING'
+        if ($null -ne $tuning) {
+            $results.Add($tuning)
+        }
     }
     else {
         $results.Add((New-DemoResult -CheckId 'STATUS.T3' -Area 't3' -Target 'T3' -Status 'Not selected' -Message ('T3 ({0}) doesn''t exist; start-demo.ps1 recreates it under the same names.' -f $t3.ServerName)))
@@ -322,10 +336,63 @@ function Get-DemoEnvironmentStatus {
         }
     }
 
+    # T5 (2026-11-18, ADR 0027): the Azure Cosmos DB account, with its Azure Monitor metrics from the last 15 minutes (the
+    # ones Database Hub's Cosmos DB views chart). It has no stop; its container, which holds the throughput that bills by the
+    # hour, exists only during a session once its lifecycle is Session (2026-11-19), so the row says whether it's there.
+    $t5 = $null
+    if (-not (Test-DemoT5Enabled -Config $Config)) {
+        $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status 'Not selected' -Message 'T5 is off in this configuration (t5Enabled is false).'))
+    }
+    else {
+        $t5 = Get-DemoT5State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
+        $t5Docs = (Get-DemoCosmosSetting)['docUrls']
+        if (-not $t5.Exists -and $t5.State -eq 'NotFound') {
+            $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) doesn''t exist: a demo deployed before 2026-11-18 doesn''t have it yet.' -f $t5.Names.AccountName) -Remediation 'Run ./scripts/deploy.ps1: it adds T5, with nothing else to do.' -DocUrl ([string]$t5Docs['hubMonitor'])))
+        }
+        elseif (-not $t5.Exists) {
+            $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5 ({0}) couldn''t be read: {1}' -f $t5.Names.AccountName, $t5.Error) -Remediation 'Run status.ps1 again.'))
+        }
+        else {
+            $snapshot = Get-DemoT5MetricSnapshot -Config $Config -AccountId $t5.Names.AccountId -Minutes 15
+            $container = Get-DemoT5Resource -Config $Config -AccountId $t5.Names.AccountId -Child (Get-DemoT5ContainerPath)
+            $lifecycle = [string](Get-DemoMemberValue -InputObject $state -Name 'T5Container')
+            $session = $lifecycle -ceq 'Session'
+            $t5Status = if ($t5.State -eq 'Succeeded') { 'Pass' } else { 'Warning' }
+            $t5Fix = ''
+            if (-not $container.Found -and $container.NotFound) {
+                $billing = 'its container {0} isn''t there now{1}, so its throughput doesn''t bill' -f $t5.Names.ContainerName, $(if ($session) { ' (it exists only during a session: start-demo.ps1 and Run all create it)' } else { '' })
+                if (-not $session) {
+                    $t5Status = 'Warning'
+                    $t5Fix = 'Run ./scripts/start-demo.ps1 or ./scripts/deploy.ps1, which create it.'
+                }
+            }
+            elseif (-not $container.Found) {
+                $billing = 'its container couldn''t be read: {0}' -f $container.Error
+            }
+            elseif ($t5.FreeTier) {
+                $billing = 'its container {0} is there, and the free tier makes its {1} RU/s cost nothing' -f $t5.Names.ContainerName, $t5.Names.Throughput
+            }
+            elseif ($session) {
+                $billing = 'its container {0} is there, so its {1} RU/s bill until a stop deletes it (it exists only during a session)' -f $t5.Names.ContainerName, $t5.Names.Throughput
+            }
+            else {
+                $said = Get-DemoT5LifecycleText -Lifecycle ([pscustomobject]@{ Lifecycle = $lifecycle; Recorded = $lifecycle; Changed = $false; Known = $true; Why = ''; RoleName = (Get-DemoActivityControlName -Config $Config).RoleName }) -FreeTier $false
+                $billing = 'its container {0} is there, and {1}' -f $t5.Names.ContainerName, ($said.Text -replace '^T5''s container ', 'it ')
+                $billing = $billing.TrimEnd('.')
+                $t5Status = 'Warning'
+                $t5Fix = $said.Fix
+            }
+            $metricText = if ($snapshot.Succeeded) { Format-DemoT5MetricText -Snapshot $snapshot } else { 'its metrics couldn''t be read: {0}' -f $snapshot.Error }
+            $message = '{0} is {1}: {2} (Azure Monitor; Database Hub''s Cosmos DB views chart the same metrics); {3}.' -f $t5.Names.AccountName, $t5.State, $metricText, $billing
+            $evidence = [ordered]@{ state = $t5.State; freeTier = [bool]$t5.FreeTier; throughput = $t5.Names.Throughput; container = [bool]$container.Found; lifecycle = $lifecycle; requests = $snapshot.Requests; throttled = $snapshot.Throttled; requestUnits = $snapshot.RequestUnits; peakNormalizedRuPercent = $snapshot.PeakNormalizedRu; latestNormalizedRuPercent = $snapshot.LatestNormalizedRu }
+            $results.Add((New-DemoResult -CheckId 'STATUS.T5' -Area 't5' -Target 'T5' -Status $t5Status -Message $message -Evidence $evidence -Remediation $t5Fix -DocUrl ([string]$t5Docs['hubMonitor'])))
+        }
+    }
+
     if ($running['sqlvm01'] -and $state.RunnerSha256) {
         # The active profile (plan section 9.6). The T3 profile is a file on T1, so reading it doesn't wake T3.
         $configuredActivity = Get-DemoActivityProfile -Config $Config
-        $profileTargets = @('T1') + @(if ($t3.Exists) { 'T3' }) + @(if ($null -ne $t4 -and $t4.Exists) { 'T4' })
+        $profileTargets = @('T1') + @(if ($t3.Exists) { 'T3' }) + @(if ($null -ne $t4 -and $t4.Exists) { 'T4' }) + @(if ($null -ne $t5 -and $t5.Exists) { 'T5' })
         if ($Detail -and $hostVm -eq 'archost01' -and $running[$hostVm] -and 'archost01' -in $state.RunnerSentTo) {
             $profileTargets += 'T2'
         }

@@ -62,6 +62,8 @@ BeforeAll {
         $script:groupTags = @{}
         $script:jobs = @()
         $script:autostop = ''
+        $script:autostopDescription = ''
+        $script:backupDescription = ''
         $script:rechecks = @{}
         $script:links = [System.Collections.Generic.List[object]]::new()
         # T1's plugin state, or a script block that returns it for the clock; '' means the agent reports no plugin
@@ -118,6 +120,20 @@ BeforeAll {
         $script:variableMissing = $false
         $script:variableReads = 0
         $script:variableReadHook = $null
+        # T5's Azure Cosmos DB account (2026-11-18, ADR 0027): $null when it isn't there (its metrics answer 404, as between
+        # deployments without T5), or a hashtable when it is.
+        $script:cosmos = $null
+        # T5's container (2026-11-19, ADR 0027): Present (by default, as an environment deployed before its lifecycle),
+        # '' when it's gone, or Creating or Deleting until t5ContainerAt; the methods Azure refuses the identity (403); how many
+        # creates Azure refuses first with a conflict (it still deletes the last one); how many seconds a create and a delete
+        # take; and the last create's body.
+        $script:t5Container = 'Present'
+        $script:t5ContainerAt = $null
+        $script:t5ContainerForbidden = @()
+        $script:t5ContainerConflicts = 0
+        $script:t5ContainerCreateSeconds = 30
+        $script:t5ContainerDeleteSeconds = 20
+        $script:t5ContainerBody = $null
     }
 
     # The Automation sandbox's internal cmdlets for an existing variable, as the runbooks call them.
@@ -148,6 +164,30 @@ BeforeAll {
 
     function Invoke-TestAzure([string] $Method, [string] $Path, [object] $Body) {
         switch -Regex ($Path) {
+            '/databaseAccounts/cosmos01-abc123/sqlDatabases/contosocare/containers/patient-events$' {
+                # T5's container (2026-11-19): Sql Resources - Get, Create Update, and Delete Sql Container.
+                if ($Method -in @($script:t5ContainerForbidden)) { return (New-Response 403 ('{{"error":{{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/{0}."}}}}' -f @{ GET = 'read'; PUT = 'write'; DELETE = 'delete' }[$Method])) }
+                if ($script:t5Container -eq 'Creating' -and $script:clock -ge $script:t5ContainerAt) { $script:t5Container = 'Present' }
+                if ($script:t5Container -eq 'Deleting' -and $script:clock -ge $script:t5ContainerAt) { $script:t5Container = '' }
+                if ($Method -eq 'PUT') {
+                    if ($script:t5ContainerConflicts -gt 0) {
+                        $script:t5ContainerConflicts--
+                        return (New-Response 409 '{"error":{"code":"Conflict","message":"Operation on the resource cannot be performed because the container is being deleted."}}')
+                    }
+                    $script:t5ContainerBody = $Body
+                    $script:t5Container = 'Creating'
+                    $script:t5ContainerAt = $script:clock.AddSeconds($script:t5ContainerCreateSeconds)
+                    return (New-Response 202)
+                }
+                if ($Method -eq 'DELETE') {
+                    if (-not $script:t5Container) { return (New-Response 204) }
+                    $script:t5Container = 'Deleting'
+                    $script:t5ContainerAt = $script:clock.AddSeconds($script:t5ContainerDeleteSeconds)
+                    return (New-Response 202)
+                }
+                if ($script:t5Container -in 'Present', 'Deleting') { return (New-Response 200 '{"name":"patient-events","properties":{"resource":{"id":"patient-events"}}}') }
+                return (New-Response 404 '{"error":{"code":"NotFound","message":"Resource Not Found."}}')
+            }
             '/resourceGroups/rg-dbhub-demo/providers/Microsoft\.Resources/tags/default$' {
                 if ($script:tagsForbidden) { return (New-Response 403 '{"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.Resources/tags/write."}}') }
                 foreach ($property in $Body.properties.tags.GetEnumerator()) { $script:groupTags[[string]$property.Key] = [string]$property.Value }
@@ -159,6 +199,33 @@ BeforeAll {
                 if (-not $script:secrets.ContainsKey($name)) { $script:secrets[$name] = [System.Collections.Generic.List[object]]::new() }
                 $script:secrets[$name].Add([pscustomobject]@{ Value = [string]$Body.properties.value; Tags = $Body['tags']; At = $script:clock })
                 return (New-Response 200 '{}')
+            }
+            '/databaseAccounts/cosmos01-abc123/providers/Microsoft\.Insights/metrics\?' {
+                # T5's metrics (2026-11-18): three 1-minute points of each, normalized RU at 100% in the middle one, which
+                # alone has throttled requests (429s), and one hourly point for the hourly reads.
+                if ($null -eq $script:cosmos) { return (New-Response 404 '{"error":{"code":"ResourceNotFound","message":"The Resource ''Microsoft.DocumentDB/databaseAccounts/cosmos01-abc123'' was not found."}}') }
+                $null = $Path -match 'metricnames=([^&]+)'
+                $name = $Matches[1]
+                $null = $Path -match 'aggregation=(\w+)'
+                $field = $Matches[1].ToLowerInvariant()
+                $hourly = $Path -match 'interval=PT1H'
+                $throttled = $Path -match '\$filter=StatusCode%20eq%20%27429%27'
+                $values = switch ($name) {
+                    'NormalizedRUConsumption' { @(35, 100, 40) }
+                    'TotalRequestUnits' { @(1200, 24000, 1300) }
+                    'TotalRequests' { if ($throttled) { @($null, 120, $null) } else { @(600, 900, 610) } }
+                    'ServerSideLatencyGateway' { @(5.25, 9.5, 5) }
+                    'ProvisionedThroughput' { @(400) }
+                    'ServiceAvailability' { @(100) }
+                }
+                $points = for ($index = 0; $index -lt @($values).Count; $index++) {
+                    $at = if ($hourly) { $script:clock.Date.AddHours(15) } else { $script:clock.Date.AddHours(15).AddMinutes($index) }
+                    $point = @{ timeStamp = $at.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+                    if ($null -ne @($values)[$index]) { $point[$field] = @($values)[$index] }
+                    $point
+                }
+                $unit = @{ NormalizedRUConsumption = 'Percent'; ServiceAvailability = 'Percent'; ServerSideLatencyGateway = 'MilliSeconds' }[$name]
+                return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @(@{ name = @{ value = $name }; unit = $(if ($unit) { $unit } else { 'Count' }); timeseries = @(@{ data = @($points) }) }) } -Depth 8))
             }
             '/flexibleServers/(pgflex01|pgreplica01)-abc123/providers/Microsoft\.Insights/metrics\?' {
                 # Three 1-minute points of each metric asked for; Read Replica Lag climbs to 180 seconds and drops.
@@ -183,10 +250,10 @@ BeforeAll {
             '/schedules/dbhub-autostop-backup$' {
                 if ($Method -eq 'GET') {
                     if (-not $script:backup) { return (New-Response 404) }
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:backup } }))
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:backup; description = $script:backupDescription } }))
                 }
-                if ($Method -eq 'PUT') { $script:backup = [string]$Body.properties.startTime; return (New-Response 201 '{}') }
-                if ($Method -eq 'DELETE') { $script:backup = ''; return (New-Response 200) }
+                if ($Method -eq 'PUT') { $script:backup = [string]$Body.properties.startTime; $script:backupDescription = [string]$Body.properties.description; return (New-Response 201 '{}') }
+                if ($Method -eq 'DELETE') { $script:backup = ''; $script:backupDescription = ''; return (New-Response 200) }
             }
             '/resourceGroups/rg-dbhub-demo$' {
                 if ($script:group -ne 200) { return (New-Response $script:group) }
@@ -199,12 +266,13 @@ BeforeAll {
                 return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($script:jobs) } -Depth 8))
             }
             '/schedules/dbhub-autostop$' {
+                # Its description too (2026-11-19): start-demo.ps1's own auto-stop begins with [start-demo.ps1].
                 if ($Method -eq 'GET') {
                     if (-not $script:autostop) { return (New-Response 404) }
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:autostop } }))
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ properties = @{ startTime = $script:autostop; description = $script:autostopDescription } }))
                 }
-                if ($Method -eq 'PUT') { $script:autostop = [string]$Body.properties.startTime; return (New-Response 201 '{}') }
-                if ($Method -eq 'DELETE') { $script:autostop = ''; return (New-Response 200) }
+                if ($Method -eq 'PUT') { $script:autostop = [string]$Body.properties.startTime; $script:autostopDescription = [string]$Body.properties.description; return (New-Response 201 '{}') }
+                if ($Method -eq 'DELETE') { $script:autostop = ''; $script:autostopDescription = ''; return (New-Response 200) }
             }
             '/schedules/(dbhub-monitor-\d+)$' {
                 $name = $Matches[1]
@@ -290,7 +358,12 @@ BeforeAll {
             }
             '/runCommands/([A-Za-z0-9-]+)\?\$expand=instanceView$' {
                 if ($script:runCommandViews.ContainsKey($Matches[1])) {
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ name = $Matches[1]; properties = @{ instanceView = $script:runCommandViews[$Matches[1]] } } -Depth 6))
+                    $view = $script:runCommandViews[$Matches[1]]
+                    # A view can be a scriptblock, run when it's read, for output that depends on when the Run Command went out.
+                    if ($view -is [scriptblock]) {
+                        $view = & $view
+                    }
+                    return (New-Response 200 (ConvertTo-Json -InputObject @{ name = $Matches[1]; properties = @{ instanceView = $view } } -Depth 6))
                 }
                 return (New-Response 202)
             }
@@ -377,6 +450,8 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         @{ Name = 'a reset of every target'; Body = @{ action = 'reset' } }
         @{ Name = 'the showcase on every target'; Body = @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'showcase' }, @{ target = 'T3'; scenario = 'showcase' }, @{ target = 'T4'; scenario = 'showcase' }); durationMinutes = 90 } }
         @{ Name = 'the showcase with a target off'; Body = @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }); durationMinutes = 120 } }
+        @{ Name = 'an ru-storm on T5, at its maximum concurrency'; Body = @{ action = 'run'; activities = @(@{ target = 'T5'; scenario = 'ru-storm'; intensity = 8; concurrency = 16 }); durationMinutes = 30 } }
+        @{ Name = 'a reset of T5'; Body = @{ action = 'reset'; targets = @('T5') } }
     ) {
         $request = Test-DbHubControlRequest -WebhookData (New-Webhook $Body) -Settings $script:settings
         $request.Reason | Should -BeNullOrEmpty
@@ -431,6 +506,9 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         @{ Name = 'a run of off only'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"off"},{"target":"T4","scenario":"off"}],"durationMinutes":20}'; Match = 'at least one activity that isn''t off' }
         @{ Name = 'the showcase in another case'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"Showcase"}],"durationMinutes":20}'; Match = 'isn''t a scenario' }
         @{ Name = 'business-day, which the control doesn''t run'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"business-day"}],"durationMinutes":20}'; Match = 'isn''t a scenario' }
+        @{ Name = 'ru-storm on a SQL target'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"ru-storm"}],"durationMinutes":20}'; Match = 'T1' }
+        @{ Name = 'an ru-storm over its maximum concurrency'; Raw = '{"action":"run","activities":[{"target":"T5","scenario":"ru-storm","concurrency":17}],"durationMinutes":20}'; Match = 'concurrency' }
+        @{ Name = 'a target past T5'; Raw = '{"action":"run","activities":[{"target":"T6","scenario":"baseline"}],"durationMinutes":20}'; Match = 'target must be' }
     ) {
         $data = if ($null -eq $Raw) { $null } else { New-Webhook $Raw }
         $request = Test-DbHubControlRequest -WebhookData $data -Settings $script:settings
@@ -439,10 +517,12 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
     }
 
     It 'allows the catalog''s targets and scenarios only, from scenarios/*/scenario.json' {
-        # T4 is in the catalog since Phase 24's scenarios (connection-surge, idle-in-transaction) list it.
-        @($script:settings.targets.PSObject.Properties.Name) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        # T4 is in the catalog since Phase 24's scenarios (connection-surge, idle-in-transaction) list it, and T5 since
+        # ru-storm does (2026-11-18, ADR 0027), with T5 on in the configuration.
+        @($script:settings.targets.PSObject.Properties.Name) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
         $scenarios = @($script:settings.scenarios.PSObject.Properties.Name)
         $scenarios | Should -Contain 'connection-surge'
+        $scenarios | Should -Contain 'ru-storm'
         $scenarios | Should -Contain 'blocking-chain'
         $scenarios | Should -Contain 'capacity-max'
         $scenarios | Should -Not -Contain 'healthy-baseline'
@@ -451,11 +531,11 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         $script:settings.scenarios.'blocking-chain'.maxConcurrency | Should -Be 4
     }
 
-    It 'allows the showcase profile, from scenarios/activity-profiles.json: 90 minutes by default, 120 at most, on T1 to T4' {
+    It 'allows the showcase profile, from scenarios/activity-profiles.json: 90 minutes by default, 120 at most, on T1 to T5' {
         @($script:settings.profiles.PSObject.Properties.Name) | Should -Be @('showcase')
         $script:settings.profiles.showcase.defaultMinutes | Should -Be 90
         $script:settings.profiles.showcase.maxMinutes | Should -Be 120
-        @($script:settings.profiles.showcase.targets) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        @($script:settings.profiles.showcase.targets) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
         # A session the auto-shutdown cuts short ends after whole cycles (2026-11-14).
         $script:settings.profiles.showcase.cycleMinutes | Should -Be 30
     }
@@ -566,6 +646,27 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         $active.Active | Should -BeTrue
         $active.Reason | Should -Match 'Stop now'
         (Get-DbHubActiveRun -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 27, 15, 11, 0, [System.DateTimeKind]::Utc)))).Active | Should -BeFalse
+    }
+
+    It 'lets a run start while only start-demo.ps1''s auto-stop is pending, and replaces it, with its backup, by the run''s own plan (2026-11-19)' {
+        # The newer session's plan wins: start-demo.ps1 marks its auto-stop, so a later Run all or the Insights app's Start
+        # isn't refused, and that start-demo.ps1 auto-stop doesn't cut the run off.
+        $script:autostop = '2026-10-27T18:00:00Z'
+        $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at 2026-10-27T14:00:00Z.'
+        $script:backup = '2026-10-27T18:30:00Z'
+        $script:backupDescription = '[start-demo.ps1] Stops the demo if the auto-stop of the start-demo.ps1 session that started at 2026-10-27T14:00:00Z didn''t.'
+        $script:links.Add([pscustomobject]@{ Id = 'ffffffff-0000-0000-0000-000000000001'; Schedule = 'dbhub-autostop'; Runbook = 'DbHub-Stop'; Parameters = @{ Scope = 'All' } })
+        $script:links.Add([pscustomobject]@{ Id = 'ffffffff-0000-0000-0000-000000000002'; Schedule = 'dbhub-autostop-backup'; Runbook = 'DbHub-Stop'; Parameters = @{ Scope = 'All' } })
+        $pending = Get-DbHubAutoStopRunEnd -Context (New-TestContext)
+        $pending.State | Should -Be 'None'
+        $pending.StartDemo | Should -BeTrue
+        (Get-DbHubActiveRun -Context (New-TestContext)).Active | Should -BeFalse
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        $script:autostop | Should -Be '2026-10-27T15:30:00Z'
+        $script:autostopDescription | Should -Not -Match '^\[start-demo\.ps1\]'
+        $script:backupDescription | Should -Not -Match '^\[start-demo\.ps1\]'
+        @($script:links | Where-Object { $_.Id -in 'ffffffff-0000-0000-0000-000000000001', 'ffffffff-0000-0000-0000-000000000002' }) | Should -BeNullOrEmpty
     }
 
     It 'treats jobs it can''t read as an active run' {
@@ -1080,7 +1181,7 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
 
     It 'exits cleanly when the demo resource group <Name>' -ForEach @(
         @{ Name = 'doesn''t exist'; Code = 404; Match = 'doesn''t exist' }
-        @{ Name = 'can''t be read (A1 missing after a redeploy)'; Code = 403; Match = '-GrantRole' }
+        @{ Name = 'can''t be read (A1 missing after a redeploy)'; Code = 403; Match = 'an Owner runs \./scripts/grant-safety-stop\.ps1 \(A1\)' }
     ) {
         $script:group = $Code
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 20 }) -Context (New-TestContext)
@@ -1093,7 +1194,8 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'reset' }) -Context (New-TestContext)
         $result.status | Should -Be 'Dispatched'
-        @($result.dispatched) | Should -Be @('T1', 'T3')
+        # T5 (2026-11-18) goes with sqlvm01, as T1 and T3 do: Azure Cosmos DB has no stop.
+        @($result.dispatched) | Should -Be @('T1', 'T3', 'T5')
         $result.message | Should -Match 'T2 \(archost01 isn''t running\)'
         @($script:calls | Where-Object { $_.Path -match '/start$' }) | Should -BeNullOrEmpty
     }
@@ -1177,7 +1279,7 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $session.Action | Should -Be 'session'
         $session.SessionId | Should -Be $script:sessionId
         $session.DurationMinutes | Should -Be 90
-        @($session.Activities | ForEach-Object Target) | Should -Be @('T1', 'T2', 'T3', 'T4')
+        @($session.Activities | ForEach-Object Target) | Should -Be @('T1', 'T2', 'T3', 'T4', 'T5')
         @($session.Activities | ForEach-Object Scenario | Select-Object -Unique) | Should -Be @('showcase')
         (Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; durationMinutes = 120 }) -Settings $script:settings).DurationMinutes | Should -Be 120
         foreach ($body in @(
@@ -1396,6 +1498,38 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status.metrics.status | Should -Be 'Pass'
     }
 
+    It 'keeps the session''s plan in its stopped status, from the status its start wrote, never another session''s (2026-11-19)' {
+        # The control notebook's Stop now and its next Run all's pre-check rebuild the session's beats from it, to save
+        # its history with them when the run that was ending it stopped first.
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $running = Get-SessionStatus
+        $running.phase | Should -Be 'running'
+        $plan = 'acceptedUtc', 'runEndUtc', 'dispatchUtc', 't4', 'replicaLag', 't5'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc $script:clock)
+        $result.status | Should -Be 'Stopped'
+        $stopped = Get-SessionStatus
+        $stopped.phase | Should -Be 'stopped'
+        $stopped.stoppedBy | Should -Be 'Stop now'
+        $stopped.metrics.status | Should -Be 'Pass'
+        foreach ($name in $plan) {
+            (ConvertTo-Json -InputObject $stopped.$name -Depth 8 -Compress) | Should -BeExactly (ConvertTo-Json -InputObject $running.$name -Depth 8 -Compress) -Because $name
+        }
+        $stopped.planKept | Should -BeTrue
+        $stopped.PSObject.Properties.Name | Should -Not -Contain 'steps'
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:secrets['dbhub-session-status'][-1].Value
+        # A copy of another session's status (one that started since) gives a stop of this session nothing of it.
+        $script:automationVariables['DbHubSessionStatus'] = '{"sessionId":"fedcba9876543210fedcba9876543210","phase":"running","acceptedUtc":"2026-10-27T18:00:00Z","runEndUtc":"2026-10-27T19:30:00Z","dispatchUtc":{"T1":"2026-10-27T18:04:00Z"}}'
+        $script:groupTags['DbHubSessionId'] = $script:sessionId
+        $null = Invoke-DbHubStop -Scope All -Context (New-TestContext -NowUtc $script:clock)
+        $again = Get-SessionStatus
+        $again.stoppedBy | Should -Be 'Auto-stop'
+        $again.sessionId | Should -Be $script:sessionId
+        foreach ($name in $plan) {
+            $again.PSObject.Properties.Name | Should -Not -Contain $name
+        }
+        $again.planKept | Should -BeFalse -Because 'the notebook says the runbook didn''t find the plan, rather than that the runbooks are old'
+    }
+
     It 'asks T4 to stop again when Azure fails its first stop right after the replica''s delete (SourceReplicasStartStopOrder, live 2026-11-14)' {
         # Live: the session's auto-stop saw the replica's 404 about 20 seconds before its delete finished, and T4's stop,
         # accepted, failed a minute later, which left T4 running.
@@ -1506,6 +1640,336 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
     }
 }
 
+Describe 'T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): its showcase in a session, its stop, and its metrics' {
+    BeforeEach {
+        Reset-TestAzure
+        Mock Get-DbHubUtcNow { return $script:clock }
+        Mock Start-Sleep { $script:clock = $script:clock.AddSeconds($Seconds) }
+        Mock Invoke-DbHubArm {
+            $script:calls.Add([pscustomobject]@{ Method = $Method; Path = $Path; Body = $Body; At = $script:clock })
+            return (Invoke-TestAzure -Method $Method -Path $Path -Body $Body)
+        }
+        $script:sessionId = '0123456789abcdef0123456789abcdef'
+        $script:decodeRequest = { param($Call) @([regex]::Matches($Call.Body.properties.source.script, "-RequestBase64 '([A-Za-z0-9+/=]+)'") | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_.Groups[1].Value)) | ConvertFrom-Json }) }
+    }
+
+    It 'says when T5 is back at its baseline after its last ru-storm, as the runner plans it: a profile of <Profile> minutes, minute <Expected> (risk R896)' -ForEach @(
+        @{ Profile = 90; Expected = 88 }
+        @{ Profile = 88; Expected = 88 }
+        @{ Profile = 87; Expected = 75 }
+        @{ Profile = 75; Expected = 75 }
+        @{ Profile = 74; Expected = 58 }
+        @{ Profile = 31; Expected = 28 }
+        @{ Profile = 27; Expected = 15 }
+        @{ Profile = 15; Expected = 15 }
+        @{ Profile = 14; Expected = 0 }
+        @{ Profile = 0; Expected = 0 }
+    ) {
+        # The showcase's T5 slots, baked from scenarios/activity-profiles.json: ru-storm from minute 3 for 10 minutes and from
+        # minute 18 for 8, each with 2 minutes of recovery, in every 30-minute cycle; one runs only when it and its recovery
+        # end by the profile's end.
+        $slots = @($script:settings.profiles.showcase.t5Slots)
+        @($slots | ForEach-Object { '{0}+{1}+{2}' -f $_.startMinute, $_.durationMinutes, $_.recoveryMinutes }) | Should -Be @('3+10+2', '18+8+2')
+        Get-DbHubT5LastStormMinute -ProfileMinutes $Profile -CycleMinutes 30 -Slot $slots | Should -Be $Expected
+    }
+
+    It 'clips a T5 slot without recoveryMinutes at the profile''s end, as the runner does' {
+        $slots = @([pscustomobject]@{ startMinute = 3; durationMinutes = 10; recoveryMinutes = $null }, [pscustomobject]@{ startMinute = 18; durationMinutes = 8 })
+        Get-DbHubT5LastStormMinute -ProfileMinutes 87 -CycleMinutes 30 -Slot $slots | Should -Be 86
+        Get-DbHubT5LastStormMinute -ProfileMinutes 80 -CycleMinutes 30 -Slot $slots | Should -Be 80
+    }
+
+    It 'runs T5''s showcase the whole run, and says at its dispatch when T5 is back at its baseline after its last ru-storm; other activities are left alone (risk R896)' {
+        $now = [datetime]::new(2026, 10, 27, 15, 4, 0, [System.DateTimeKind]::Utc)
+        $notAfter = [datetime]::new(2026, 10, 27, 16, 32, 0, [System.DateTimeKind]::Utc)
+        $t5 = [pscustomobject]@{ Target = 'T5'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 90; NotAfterUtc = $notAfter }
+        # The profile ends at 16:30, the runner's 2 minutes before --not-after: 86 minutes from 15:04, less 2 for its Run Command,
+        # 84, so the third cycle's second ru-storm (minutes 78 to 86, and 2 of recovery) doesn't run, and T5 is back at its
+        # baseline at minute 75 of its profile, after the first one. Its profile starts when the Run Command sets it, at most 2
+        # minutes after the dispatch, so that's by minute 77 from the dispatch (review of ab91ee5).
+        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $t5 -NowUtc $now | Should -Be $now.AddMinutes(77)
+        $t5.Minutes | Should -Be 90 -Because 'nothing is cut: T5''s baseline runs on until the run ends'
+        # A profile whose own minutes end first: 60, less 2, is 58, the end of the second cycle's second storm and its recovery,
+        # by minute 60 from the dispatch.
+        $short = [pscustomobject]@{ Target = 'T5'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 60; NotAfterUtc = $notAfter }
+        Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $short -NowUtc $now | Should -Be $now.AddMinutes(60)
+        foreach ($other in @(
+                [pscustomobject]@{ Target = 'T1'; Scenario = 'showcase'; Intensity = 0; Concurrency = 0; Minutes = 90; NotAfterUtc = $notAfter }
+                [pscustomobject]@{ Target = 'T5'; Scenario = 'ru-storm'; Intensity = 0; Concurrency = 0; Minutes = 10; NotAfterUtc = $null }
+                [pscustomobject]@{ Target = 'T5'; Scenario = 'baseline'; Intensity = 0; Concurrency = 0; Minutes = 30; NotAfterUtc = $notAfter })) {
+            $minutes = $other.Minutes
+            Get-DbHubT5LastStormEnd -Settings $script:settings -Activity $other -NowUtc $now | Should -BeNullOrEmpty
+            $other.Minutes | Should -Be $minutes
+        }
+    }
+
+    It 'creates T5''s container while the VMs start, sends T5''s showcase for the whole session with sqlvm01''s, and says both on the status (2026-11-19)' {
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubT5Container = 'Session' }
+        $script:t5Container = ''
+        $script:t4 = 'Stopped'
+        $script:t4Sku = 'Standard_D4ds_v5'
+        $script:t4Tier = 'GeneralPurpose'
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Started'
+        $script:t5Container | Should -Be 'Present'
+        # The container's create goes out after the VMs' starts, so it overlaps them, and before sqlvm01's dispatch.
+        $create = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/containers/patient-events$' })
+        $create.Count | Should -Be 1
+        $sqlvm = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/sqlvm01/runCommands/DbHubControl-sqlvm01-\d' }) | Select-Object -First 1
+        $vmStart = @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/virtualMachines/sqlvm01/start$' }) | Select-Object -First 1
+        $script:calls.IndexOf($vmStart) | Should -BeLessThan $script:calls.IndexOf($create[0])
+        $script:calls.IndexOf($create[0]) | Should -BeLessThan $script:calls.IndexOf($sqlvm)
+        $writes = $script:secrets['dbhub-session-status']
+        $status = $writes[$writes.Count - 1].Value | ConvertFrom-Json
+        $status.names.t5Account | Should -Be 'cosmos01-abc123'
+        $dispatch = ConvertTo-DbHubUtc -Value $status.dispatchUtc.T5
+        $dispatch | Should -Be (ConvertTo-DbHubUtc -Value $status.dispatchUtc.T1) -Because 'T5 goes with sqlvm01''s targets'
+        # The container took 30 seconds, so sqlvm01's activity went out at 15:00:30.
+        $dispatch | Should -Be ([datetime]::new(2026, 10, 27, 15, 0, 30, [System.DateTimeKind]::Utc))
+        # T5's request in sqlvm01's Run Command: its showcase, for the whole session, as every target's.
+        $request = @(& $script:decodeRequest $sqlvm) | Where-Object target -EQ 'T5'
+        @($request).Count | Should -Be 1
+        $arguments = @($request.arguments)
+        $arguments[0..3] | Should -Be @('profile', 'set', '--name', 'showcase')
+        $arguments[[array]::IndexOf($arguments, '--duration') + 1] | Should -Be '90m'
+        @($status.dispatched) | Should -Contain 'T5: showcase for 90 minutes'
+        # The session ends at 16:30; from 15:00:30 the profile has 89 minutes, less 2 for its Run Command, 87: the third
+        # cycle's second ru-storm and its recovery (to minute 88) don't fit, so T5 is back at its baseline at minute 75 of its
+        # profile, which starts at most 2 minutes after the dispatch: by 16:17:30.
+        $t5End = ConvertTo-DbHubUtc -Value $status.t5.endUtc
+        $t5End | Should -Be $dispatch.AddMinutes(77)
+        $steps = @($status.steps | Where-Object step -EQ 'T5')
+        @($steps | ForEach-Object state) | Should -Be @('Pass', 'Pass')
+        $steps[0].message | Should -Be 'T5''s container contosocare/patient-events (cosmos01-abc123) was created for this session, with its 400 RU/s; the stop at its end deletes it, so it bills only while the demo runs.'
+        $zone = [System.TimeZoneInfo]::FindSystemTimeZoneById('Eastern Standard Time')
+        $endText = [System.TimeZoneInfo]::ConvertTimeFromUtc($t5End, $zone).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+        $runEndText = [System.TimeZoneInfo]::ConvertTimeFromUtc((ConvertTo-DbHubUtc -Value $status.runEndUtc), $zone).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
+        $steps[1].message | Should -Be ('T5 (cosmos01-abc123): its last ru-storm ends, and T5 is back at its baseline, with no throttled requests (429s), by {0} (Eastern Standard Time); its baseline runs on until the session ends at {1}, and the next Run all starts its ru-storm cycles again from the first.' -f $endText, $runEndText)
+    }
+
+    It 'runs the session without T5 when its container can''t be created, and says why with the fix (2026-11-19)' {
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubT5Container = 'Session' }
+        $script:t5Container = ''
+        $script:t5ContainerForbidden = @('PUT')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Partial'
+        @($result.skipped) | Should -Contain 'T5 (its container isn''t there: the session control''s role can''t create it yet; an Owner runs ./scripts/grant-safety-stop.ps1)'
+        $writes = $script:secrets['dbhub-session-status']
+        $status = $writes[$writes.Count - 1].Value | ConvertFrom-Json
+        $status.phase | Should -Be 'running'
+        $step = @($status.steps | Where-Object step -EQ 'T5')
+        $step.Count | Should -Be 1
+        $step[0].state | Should -Be 'Fail'
+        $step[0].message | Should -Be 'T5''s container contosocare/patient-events (cosmos01-abc123) couldn''t be read or created: the session control''s role doesn''t have the container''s actions yet, so T5 gets no activity in this session; the other targets go on.'
+        $step[0].fix | Should -Be 'An Owner runs ./scripts/grant-safety-stop.ps1 once, which gives the session control its role; then Run all again. ./scripts/start-demo.ps1 creates the container too.'
+        # T5's activity isn't sent; the other targets' is.
+        $sqlvm = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/sqlvm01/runCommands/DbHubControl-sqlvm01-\d' }) | Select-Object -First 1
+        @(& $script:decodeRequest $sqlvm | ForEach-Object target) | Should -Be @('T1', 'T3')
+        @($status.dispatched) | Should -Not -Contain 'T5: showcase for 90 minutes'
+        @($status.dispatched) | Should -Contain 'T1: showcase for 90 minutes'
+    }
+
+    It 'neither reads nor creates T5''s container when it stays between sessions (<Lifecycle>), and still sends T5 its showcase (2026-11-19: a non-Owner''s control role)' -ForEach @(@{ Lifecycle = 'AlwaysOn' }, @{ Lifecycle = '' }) {
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubT5Container = $Lifecycle }
+        $script:t5Container = 'Present'
+        # The control's role has no container actions yet: any container call would be refused.
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        @($result.skipped | Where-Object { $_ -like 'T5 *' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Path -match '/containers/patient-events' }) | Should -BeNullOrEmpty
+        $writes = $script:secrets['dbhub-session-status']
+        $status = $writes[$writes.Count - 1].Value | ConvertFrom-Json
+        @($status.dispatched) | Should -Contain 'T5: showcase for 90 minutes'
+        $step = @($status.steps | Where-Object step -EQ 'T5') | Select-Object -First 1
+        $step.state | Should -Be 'Pass'
+        $step.message | Should -Match 'stays between sessions \(.+\), so this session uses it as it is\.$'
+    }
+
+    It 'makes sure T5''s container is there: there already, or created once Azure has read it back, through its GET only (2026-11-19)' {
+        $tags = @{ deploymentId = 'abc123'; solution = 'fabric-database-hub-demo'; environment = 'demo'; owner = 'presenter@contoso.example'; purpose = 'demo'; costCenter = 'cc-1'; autoShutdown = '1900'; expiresOn = '2026-12-31'; component = 'demo'; DbHubBusyBy = 'session'; DbHubT5Container = 'Session' }
+        $present = New-DbHubT5Container -Context (New-TestContext) -Tags $tags
+        $present.Outcome | Should -Be 'Present'
+        $present.Name | Should -Be 'contosocare/patient-events'
+        @($script:calls | Where-Object Method -NE 'GET') | Should -BeNullOrEmpty
+        $script:t5Container = ''
+        $script:calls.Clear()
+        $created = New-DbHubT5Container -Context (New-TestContext) -Tags $tags
+        $created.Outcome | Should -Be 'Created'
+        $created.Throughput | Should -Be 400
+        ($script:clock - [datetime]::new(2026, 10, 27, 15, 0, 0, [System.DateTimeKind]::Utc)).TotalSeconds | Should -Be 30 -Because 'it reads the container again every 10 seconds until Azure has created it'
+        @($script:calls | ForEach-Object Method) | Should -Be @('GET', 'PUT', 'GET', 'GET', 'GET', 'GET')
+        @($script:calls | Where-Object { $_.Path -notmatch '/providers/Microsoft\.DocumentDB/databaseAccounts/cosmos01-abc123/sqlDatabases/contosocare/containers/patient-events$' }) | Should -BeNullOrEmpty -Because 'never the asynchronous operation''s URL, which is outside the role'
+        # The body: config/versions.json's definition, as cosmos01.bicep creates it, with the demo's own tags only.
+        $body = $script:t5ContainerBody
+        @($body['tags'].Keys | Sort-Object) | Should -Be @('autoShutdown', 'costCenter', 'deploymentId', 'environment', 'expiresOn', 'owner', 'purpose', 'solution')
+        $body['tags']['deploymentId'] | Should -Be 'abc123'
+        $body['tags']['owner'] | Should -Be 'presenter@contoso.example'
+        $resource = $body['properties']['resource']
+        $resource['id'] | Should -Be 'patient-events'
+        @($resource['partitionKey']['paths']) | Should -Be @('/patientId')
+        $resource['partitionKey']['kind'] | Should -Be 'Hash'
+        $resource['partitionKey']['version'] | Should -Be 2
+        $resource['indexingPolicy'].indexingMode | Should -Be 'consistent'
+        @($resource['indexingPolicy'].excludedPaths | ForEach-Object path) | Should -Be @('/payload/?', '/"_etag"/?')
+        $body['properties']['options']['throughput'] | Should -Be 400
+    }
+
+    It 'asks again while Azure still deletes the last container (a conflict), then creates it (2026-11-19)' {
+        $script:t5Container = ''
+        $script:t5ContainerConflicts = 2
+        $created = New-DbHubT5Container -Context (New-TestContext) -Tags @{ deploymentId = 'abc123' }
+        $created.Outcome | Should -Be 'Created'
+        @($script:calls | Where-Object Method -EQ 'PUT').Count | Should -Be 3
+    }
+
+    It 'reports <Case> as NotGranted, with nothing created (2026-11-19)' -ForEach @(
+        @{ Case = 'a container it can''t read'; Forbidden = @('GET', 'PUT', 'DELETE'); Puts = 0 }
+        @{ Case = 'a create Azure refuses (403)'; Forbidden = @('PUT'); Puts = 1 }
+    ) {
+        $script:t5Container = ''
+        $script:t5ContainerForbidden = $Forbidden
+        $outcome = New-DbHubT5Container -Context (New-TestContext) -Tags @{ deploymentId = 'abc123' }
+        $outcome.Outcome | Should -Be 'NotGranted'
+        @($script:calls | Where-Object Method -EQ 'PUT').Count | Should -Be $Puts
+        $script:t5Container | Should -Be ''
+    }
+
+    It 'keeps T5''s container, and sends nothing, when its lifecycle isn''t Session: <Lifecycle> (2026-11-19)' -ForEach @(
+        @{ Lifecycle = 'AlwaysOn'; Reason = 'the session control''s role can''t create it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once' }
+        @{ Lifecycle = ''; Reason = 'this environment was deployed before T5''s container lived only during a session, so its throughput keeps billing; ./scripts/deploy.ps1 sets that up' }
+        @{ Lifecycle = 'session'; Reason = 'this environment was deployed before T5''s container lived only during a session, so its throughput keeps billing; ./scripts/deploy.ps1 sets that up' }
+    ) {
+        $kept = Remove-DbHubT5Container -Context (New-TestContext) -Tags @{ deploymentId = 'abc123'; DbHubT5Container = $Lifecycle }
+        $kept.Outcome | Should -Be 'Kept'
+        $kept.Reason | Should -Be $Reason
+        Get-DbHubT5ContainerText -Outcome $kept | Should -Be ('T5''s container kept between sessions ({0})' -f $Reason)
+        $script:calls.Count | Should -Be 0
+        $script:t5Container | Should -Be 'Present'
+    }
+
+    It 'deletes T5''s container while its lifecycle is Session and waits until it''s gone, says when it''s already gone, and reports a delete it isn''t granted (2026-11-19)' {
+        $tags = @{ deploymentId = 'abc123'; DbHubT5Container = 'Session' }
+        $deleted = Remove-DbHubT5Container -Context (New-TestContext) -Tags $tags
+        $deleted.Outcome | Should -Be 'Deleted'
+        Get-DbHubT5ContainerText -Outcome $deleted | Should -Be 'T5''s container deleted (its 400 RU/s stop billing until the next session creates it)'
+        $script:t5Container | Should -Be ''
+        @($script:calls | ForEach-Object Method) | Should -Be @('GET', 'DELETE', 'GET', 'GET', 'GET')
+        $script:calls.Clear()
+        $missing = Remove-DbHubT5Container -Context (New-TestContext) -Tags $tags
+        $missing.Outcome | Should -Be 'Missing'
+        Get-DbHubT5ContainerText -Outcome $missing | Should -Be 'T5''s container already gone'
+        @($script:calls | ForEach-Object Method) | Should -Be @('GET') -Because 'nothing is written when there''s nothing to delete'
+        $script:t5Container = 'Present'
+        $script:t5ContainerForbidden = @('DELETE')
+        $refused = Remove-DbHubT5Container -Context (New-TestContext) -Tags $tags
+        $refused.Outcome | Should -Be 'NotGranted'
+        Get-DbHubT5ContainerText -Outcome $refused | Should -Be 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+        $script:t5Container | Should -Be 'Present'
+        # Without T5 in the settings, or without the group's deploymentId: nothing to say, and nothing sent.
+        $script:calls.Clear()
+        (Remove-DbHubT5Container -Context (New-TestContext) -Tags @{ DbHubT5Container = 'Session' }).Outcome | Should -Be 'NotConfigured'
+        Get-DbHubT5ContainerText -Outcome ([pscustomobject]@{ Outcome = 'NotConfigured' }) | Should -BeNullOrEmpty
+        $script:calls.Count | Should -Be 0
+    }
+
+    It 'deletes T5''s container on Stop now when its lifecycle is Session, and keeps it, saying why, when it''s AlwaysOn (2026-11-19)' {
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:groupTags = @{ DbHubT5Container = 'Session' }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop' }) -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        @($result.done) | Should -Contain 'T5''s container deleted (its 400 RU/s stop billing until the next session creates it)'
+        $script:t5Container | Should -Be ''
+        # After sqlvm01's deallocation, whose runner drives T5.
+        $deallocate = @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }) | Select-Object -First 1
+        $delete = @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/containers/patient-events$' }) | Select-Object -First 1
+        $script:calls.IndexOf($deallocate) | Should -BeLessThan $script:calls.IndexOf($delete)
+        Reset-TestAzure
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:groupTags = @{ DbHubT5Container = 'AlwaysOn' }
+        $kept = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop' }) -Context (New-TestContext)
+        $kept.status | Should -Be 'Stopped'
+        @($kept.done) | Should -Contain 'T5''s container kept between sessions (the session control''s role can''t create it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+        @($script:calls | Where-Object { $_.Path -match 'databaseAccounts' }) | Should -BeNullOrEmpty
+        $script:t5Container | Should -Be 'Present'
+    }
+
+    It 'deletes again the T5 container a run created when it stops what it started, and lists one it didn''t start as left running (#27, 2026-11-19)' {
+        $script:groupTags = @{ DbHubT5Container = 'Session' }
+        $script:t5Container = ''
+        $script:runCommandRefused = @('sqlvm01')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T5'; scenario = 'ru-storm' }); durationMinutes = 20 }) -Context (New-TestContext)
+        $result.status | Should -Be 'Failed'
+        $result.t5Container | Should -Be 'Created'
+        $result.message | Should -Match 'so this run stopped what it started: auto-stop removed, sqlvm01 deallocating, T5''s container deleted \(its 400 RU/s stop billing until the next session creates it\)\.$'
+        $script:t5Container | Should -Be ''
+        # One it didn't create, while sqlvm01 ran before: left as it was, and said.
+        Reset-TestAzure
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:groupTags = @{ DbHubT5Container = 'Session' }
+        $left = Get-DbHubLeftRunning -Context (New-TestContext) -Tags @{ deploymentId = 'abc123'; DbHubT5Container = 'Session' }
+        $left.Text | Should -Match '^This run didn''t start sqlvm01 \(running\) and T5''s container \(its throughput bills\), so it left them running'
+        (Get-DbHubLeftRunning -Context (New-TestContext) -Tags @{ deploymentId = 'abc123'; DbHubT5Container = 'AlwaysOn' }).Text | Should -Not -Match 'T5'
+    }
+
+    It 'skips a reset of T5 when its container isn''t there, with a note (2026-11-19)' {
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t5Container = ''
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'reset' }) -Context (New-TestContext)
+        $result.status | Should -Be 'Dispatched'
+        @($result.dispatched) | Should -Be @('T1', 'T3')
+        @($result.skipped) | Should -Contain 'T5 (its container isn''t there between sessions, so there''s nothing to reset; the next session creates it)'
+    }
+    It 'saves T5''s metrics with T4''s in the metrics secret, as its cosmos member, the throttled requests read with StatusCode 429' {
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:cosmos = @{}
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'capture'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Captured'
+        $result.cosmos | Should -BeTrue
+        $secret = $script:secrets['dbhub-session-metrics'][0]
+        $secret.Tags['t5'] | Should -Be 'yes'
+        [System.Text.Encoding]::UTF8.GetByteCount($secret.Value) | Should -BeLessOrEqual 24000
+        $secret.Value | Should -Not -Match '(?i)/subscriptions/|resourceGroups|management\.azure\.com'
+        $document = $secret.Value | ConvertFrom-Json
+        @($document.servers | ForEach-Object role) | Should -Be @('primary', 'replica')
+        $cosmos = $document.cosmos
+        $cosmos.version | Should -Be 1
+        $cosmos.sessionId | Should -Be $script:sessionId
+        $cosmos.capturedBy | Should -Be 'control'
+        @($cosmos.accounts | ForEach-Object { '{0}={1}' -f $_.target, $_.resourceName }) | Should -Be @('T5=cosmos01-abc123')
+        @($cosmos.series | ForEach-Object metric) | Should -Be @('NormalizedRUConsumption', 'TotalRequestUnits', 'TotalRequests', 'ThrottledRequests', 'ServerSideLatencyGateway', 'ProvisionedThroughput', 'ServiceAvailability')
+        $throttled = @($cosmos.series) | Where-Object metric -EQ 'ThrottledRequests'
+        $throttled.statusCode | Should -Be '429'
+        $throttled.aggregation | Should -Be 'Count'
+        @($throttled.points | ForEach-Object { $_[1] }) | Should -Be @(120)
+        @(@($cosmos.series) | Where-Object metric -EQ 'NormalizedRUConsumption' | ForEach-Object { $_.points } | ForEach-Object { $_[1] }) | Should -Be @(35, 100, 40)
+        (@($cosmos.series) | Where-Object metric -EQ 'ProvisionedThroughput').intervalMinutes | Should -Be 60
+        @($script:calls | Where-Object { $_.Path -match 'databaseAccounts/cosmos01-abc123/providers/Microsoft\.Insights/metrics\?.*\$filter=StatusCode%20eq%20%27429%27' }).Count | Should -Be 1
+
+        # Without T5's account, the secret is T4's document alone, as before.
+        Reset-TestAzure
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'capture'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Captured'
+        $result.cosmos | Should -BeFalse
+        $script:secrets['dbhub-session-metrics'][0].Tags['t5'] | Should -Be 'no'
+        ($script:secrets['dbhub-session-metrics'][0].Value | ConvertFrom-Json).PSObject.Properties.Name | Should -Not -Contain 'cosmos'
+
+        # T5's alone, without T4: an empty T4 document carries it, which the notebook reads as no T4 metrics.
+        Reset-TestAzure
+        $script:cosmos = @{}
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'capture'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.cosmos | Should -BeTrue
+        $alone = $script:secrets['dbhub-session-metrics'][0].Value | ConvertFrom-Json
+        @($alone.series).Count | Should -Be 0
+        @($alone.servers).Count | Should -Be 0
+        $alone.sessionId | Should -Be $script:sessionId
+        @($alone.cosmos.series).Count | Should -Be 7
+    }
+}
+
 Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 0024) against a mocked Azure Resource Manager' {
     # Start-Sleep moves the fake clock (Get-DbHubUtcNow), so the waits take no real time.
     BeforeEach {
@@ -1519,6 +1983,10 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         function Get-TestWrite {
             @($script:calls | Where-Object Method -NE 'GET')
         }
+        # T5's container as between sessions in an environment on the current code (2026-11-19): its lifecycle is Session, and
+        # the session's stop deleted it.
+        $script:groupTags['DbHubT5Container'] = 'Session'
+        $script:t5Container = ''
     }
 
     It 'deallocates the running VMs and stops a running T4, through Azure Resource Manager only, and starts nothing' {
@@ -1527,7 +1995,7 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
         $result.action | Should -Be 'stop-nightly'
         $result.status | Should -Be 'Stopped'
-        $result.message | Should -Be 'Nightly safety stop: sqlvm01 deallocated (was running), archost01 deallocated (was running), T4 stopped (was Ready).'
+        $result.message | Should -Be 'Nightly safety stop: sqlvm01 deallocated (was running), archost01 deallocated (was running), T4 stopped (was Ready), T5''s container already gone.'
         @($result.failed) | Should -BeNullOrEmpty
         $result.vms['sqlvm01'] | Should -Be 'deallocated (was running)'
         $result.t4 | Should -Be 'T4 stopped (was Ready)'
@@ -1544,7 +2012,7 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         $script:t4 = $T4
         $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
         $result.status | Should -Be 'Stopped'
-        $result.message | Should -Be ('Nightly safety stop: {0}.' -f $Text)
+        $result.message | Should -Be ('Nightly safety stop: {0}, T5''s container already gone.' -f $Text)
         Get-TestWrite | Should -BeNullOrEmpty
     }
 
@@ -1620,11 +2088,129 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         $script:replica = 'Stopped'
         $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
         $result.status | Should -Be 'Stopped'
-        $result.message | Should -Be 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped, T4''s read replica pgreplica01-abc123 already stopped (a session left it behind; ./scripts/stop-demo.ps1 deletes it).'
+        $result.message | Should -Be 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped, T4''s read replica pgreplica01-abc123 already stopped (a session left it behind; ./scripts/stop-demo.ps1 deletes it), T5''s container already gone.'
         Get-TestWrite | Should -BeNullOrEmpty
         $script:calls.Clear()
         $script:replica = ''
-        (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).message | Should -Be 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped.'
+        (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).message | Should -Be 'Nightly safety stop: sqlvm01 already deallocated, archost01 already deallocated, T4 already stopped, T5''s container already gone.'
+    }
+
+    It 'deletes T5''s container a session''s stop didn''t, after the VMs and T4, keeps it unless its lifecycle is Session, and reports a delete it isn''t granted apart from its status (2026-11-19)' {
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Ready'
+        $script:t5Container = 'Present'
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.t5 | Should -Be 'T5''s container deleted (its 400 RU/s stop billing until the next session creates it)'
+        $result.message | Should -Be 'Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready), T5''s container deleted (its 400 RU/s stop billing until the next session creates it).'
+        $script:t5Container | Should -Be ''
+        @(Get-TestWrite | ForEach-Object { '{0} {1}' -f $_.Method, ($_.Path -replace '^.*/providers/', '') }) | Should -Be @('POST Microsoft.Compute/virtualMachines/sqlvm01/deallocate', 'POST Microsoft.DBforPostgreSQL/flexibleServers/pgflex01-abc123/stop', 'DELETE Microsoft.DocumentDB/databaseAccounts/cosmos01-abc123/sqlDatabases/contosocare/containers/patient-events')
+        # AlwaysOn: kept, nothing sent.
+        $script:calls.Clear()
+        $script:t5Container = 'Present'
+        $script:groupTags['DbHubT5Container'] = 'AlwaysOn'
+        $kept = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $kept.status | Should -Be 'Stopped'
+        $kept.t5 | Should -Be 'T5''s container kept between sessions (the session control''s role can''t create it yet, so its throughput keeps billing; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+        @($script:calls | Where-Object { $_.Path -match 'databaseAccounts' }) | Should -BeNullOrEmpty
+        # Without the role's container actions: kept, and said in t5Status, apart from the job's status (review of ab91ee5).
+        $script:calls.Clear()
+        $script:groupTags['DbHubT5Container'] = 'Session'
+        $script:t5ContainerForbidden = @('DELETE')
+        $refused = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $refused.status | Should -Be 'Stopped'
+        @($refused.failed) | Should -BeNullOrEmpty
+        $refused.t5Status | Should -Be 'NotGranted'
+        $refused.t5 | Should -Be 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+        $script:t5Container | Should -Be 'Present'
+    }
+
+    It 'keeps T5''s container apart from the status of the nightly stop, the daily T4 stop, and the auto-stop when its role lacks the container''s actions, so T4''s stop still counts (review of ab91ee5, R910)' {
+        # The shared role written back to its 7 actions by older code (R910): a 403 on the container's GET, whether or not
+        # it exists. The VMs and T4 stop as usual, so each job says Stopped (or Skipped), which the cost check of T4's
+        # restart reads (Get-DemoT4RestartCoverage).
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Ready'
+        $script:t5Container = ''
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $nightly = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $nightly.status | Should -Be 'Stopped'
+        @($nightly.failed) | Should -BeNullOrEmpty
+        $nightly.t5Status | Should -Be 'NotGranted'
+        $nightly.message | Should -Be 'Nightly safety stop: sqlvm01 deallocated (was running), archost01 already deallocated, T4 stopped (was Ready), T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once).'
+        $nightly.message | Should -Not -Match 'keeps billing'
+        Reset-TestAzure
+        $script:groupTags['DbHubT5Container'] = 'Session'
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $script:t4 = 'Ready'
+        $daily = Invoke-DbHubStop -Scope T4 -Context (New-TestContext)
+        $daily.status | Should -Be 'Stopped'
+        $daily.t5Status | Should -Be 'NotGranted'
+        $script:t4 = 'Stopped'
+        $stopped = Invoke-DbHubStop -Scope T4 -Context (New-TestContext)
+        $stopped.status | Should -Be 'Skipped' -Because 'T4 was stopped already and nothing else was'
+        $stopped.message | Should -Be 'T4 is Stopped. T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once).'
+        Reset-TestAzure
+        $script:groupTags['DbHubT5Container'] = 'Session'
+        $script:t5ContainerForbidden = @('GET', 'PUT', 'DELETE')
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Ready'
+        $auto = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+        $auto.status | Should -Be 'Stopped'
+        @($auto.failed) | Should -BeNullOrEmpty
+        $auto.t5Status | Should -Be 'NotGranted'
+        @($auto.done) | Should -Contain 'T5''s container kept: this identity''s role lacks the container''s actions (./scripts/stop-demo.ps1 deletes it if it''s there; an Owner runs ./scripts/grant-safety-stop.ps1 once)'
+    }
+
+    It 'leaves T5''s container alone when a session started sqlvm01 again while the nightly stop waited for T4 (review of ab91ee5)' {
+        # The nightly stop read the busy marker once, at its start; a presenter's Run all right after the auto-shutdown
+        # starts sqlvm01 while the nightly stop waits for a starting T4, and its session uses the container.
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $script:t4 = 'Starting'
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $script:t5Container = 'Present'
+        $script:sessionAt = $script:clock.AddMinutes(2)
+        Mock Start-Sleep {
+            $script:clock = $script:clock.AddSeconds($Seconds)
+            if ($script:clock -ge $script:sessionAt -and $script:vm['sqlvm01'] -eq 'deallocating') {
+                $script:vm['sqlvm01'] = 'starting'
+            }
+        }
+        $result = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.t5Status | Should -Be 'InUse'
+        $result.t5 | Should -Be 'T5''s container left alone: sqlvm01 is starting, so a session may use it'
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match 'databaseAccounts' }) | Should -BeNullOrEmpty
+        $script:t5Container | Should -Be 'Present'
+        # Once sqlvm01 is down for good, the next pass deletes it.
+        $script:vm['sqlvm01'] = 'deallocated'
+        (Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)).t5Status | Should -Be 'Deleted'
+        $script:t5Container | Should -Be ''
+        # A container kept between sessions (AlwaysOn) is said as kept, whatever sqlvm01 does: nothing would delete it.
+        $script:groupTags['DbHubT5Container'] = 'AlwaysOn'
+        $script:t5Container = 'Present'
+        $script:vm['sqlvm01'] = 'running'
+        $script:deallocateStatus['sqlvm01'] = 409
+        $kept = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext)
+        $kept.t5Status | Should -Be 'Kept'
+        $kept.t5 | Should -Match '^T5''s container kept between sessions \('
+    }
+
+    It 'deletes T5''s container in the control''s daily T4 stop too, only while sqlvm01 doesn''t run (2026-11-19)' {
+        $script:t4 = 'Stopped'
+        $script:t5Container = 'Present'
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+        $busy = Invoke-DbHubStop -Scope T4 -Context (New-TestContext)
+        $busy.status | Should -Be 'Skipped'
+        $busy.message | Should -Be 'T4 is Stopped; nothing to stop.'
+        @($script:calls | Where-Object { $_.Path -match 'databaseAccounts' }) | Should -BeNullOrEmpty -Because 'a run on sqlvm01 may use it'
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $result = Invoke-DbHubStop -Scope T4 -Context (New-TestContext)
+        $result.status | Should -Be 'Stopped'
+        $result.message | Should -Be 'T4 is Stopped. T5''s container deleted (its 400 RU/s stop billing until the next session creates it).'
+        $result.t5 | Should -Be 'T5''s container deleted (its 400 RU/s stop billing until the next session creates it)'
+        $script:t5Container | Should -Be ''
+        (Invoke-DbHubStop -Scope T4 -Context (New-TestContext)).status | Should -Be 'Skipped' -Because 'T4 stopped and the container gone: nothing was stopped now'
     }
 
     It 'reports a left-over replica it couldn''t stop, without waiting, when T4''s own stop failed' {
@@ -1725,6 +2311,37 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         It 'never defers the per-run auto-stop (Scope All): it''s a session''s own end' {
             $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
             $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'session' }
+            $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+            $result.status | Should -Be 'Stopped'
+            @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 1
+        }
+
+        It 'moves start-demo.ps1''s auto-stop to 5 minutes after a deploy.ps1 run that''s still going, keeping its mark, and stops nothing now (2026-11-19)' {
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+            $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = 'deploy' }
+            $script:autostop = '2026-10-27T15:00:00Z'
+            $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at 2026-10-27T11:00:00Z.'
+            $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
+            $result.status | Should -Be 'Deferred'
+            $result.message | Should -Be 'Deferred: deploy.ps1 is still running (busy until 2026-10-27T15:45:00Z), so start-demo.ps1''s auto-stop stopped nothing now; it stops the demo at 2026-10-27T15:50:00Z.'
+            $script:autostop | Should -Be '2026-10-27T15:50:00Z'
+            $script:autostopDescription.StartsWith('[start-demo.ps1] ', [System.StringComparison]::Ordinal) | Should -BeTrue
+            $script:backupDescription.StartsWith('[start-demo.ps1] ', [System.StringComparison]::Ordinal) | Should -BeTrue
+            @($script:links | Where-Object { $_.Schedule -eq 'dbhub-autostop' -and $_.Runbook -eq 'DbHub-Stop' }).Count | Should -Be 1
+            @($script:calls | Where-Object { $_.Path -match '/deallocate$' }) | Should -BeNullOrEmpty
+        }
+
+        It 'stops at once for <Case>' -ForEach @(
+            @{ Case = 'a session''s auto-stop from the control notebook while deploy.ps1 runs'; Description = 'Stops the demo after the on-demand run that job aaaaaaaa started (ADR 0020).'; By = 'deploy' }
+            @{ Case = 'start-demo.ps1''s auto-stop once deploy.ps1 has ended (its grace period)'; Description = '[start-demo.ps1] Stops the demo 4 hours after this start.'; By = 'deploy-grace' }
+            @{ Case = 'start-demo.ps1''s auto-stop without a busy marker'; Description = '[start-demo.ps1] Stops the demo 4 hours after this start.'; By = '' }
+        ) {
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+            if ($By) {
+                $script:groupTags = @{ DbHubBusyUntilUtc = '2026-10-27T15:45:00Z'; DbHubBusyBy = $By }
+            }
+            $script:autostop = '2026-10-27T15:00:00Z'
+            $script:autostopDescription = $Description
             $result = Invoke-DbHubStop -Scope All -Context (New-TestContext)
             $result.status | Should -Be 'Stopped'
             @($script:calls | Where-Object { $_.Path -match '/sqlvm01/deallocate$' }).Count | Should -Be 1
@@ -1850,6 +2467,11 @@ Describe 'The nightly safety stop (DbHub-Stop -Scope Nightly and T3Check, ADR 00
         $settings.controlResourceGroup | Should -Be 'rg-dbhub-demo'
         $settings.identityClientId | Should -Be '99999999-9999-9999-9999-999999999999'
         $settings.t4WaitMinutes | Should -Be 10
+        # T5's container (2026-11-19, ADR 0027): the names, throughput, and API version the nightly stop deletes it with.
+        $settings.t5AccountPrefix | Should -Be 'cosmos01-'
+        '{0}/{1} {2}' -f $settings.t5Container.databaseName, $settings.t5Container.containerName, $settings.t5Container.throughput | Should -Be 'contosocare/patient-events 400'
+        $settings.apiVersions.'Microsoft.DocumentDB/databaseAccounts' | Should -Be '2025-10-15'
+        Get-DbHubT5ContainerPath -Settings $settings -Tags @{ deploymentId = 'abc123' } | Should -Be ($script:demo + '/providers/Microsoft.DocumentDB/databaseAccounts/cosmos01-abc123/sqlDatabases/contosocare/containers/patient-events')
         $content = InModuleScope -ModuleName DbHubDemo -Parameters @{ Json = $json } { Get-DemoActivityControlRunbookContent -Name 'DbHub-Stop' -Setting ($Json | ConvertFrom-Json -AsHashtable) }
         $errors = $null
         [void][System.Management.Automation.Language.Parser]::ParseInput($content, [ref]$null, [ref]$errors)
@@ -2041,6 +2663,60 @@ Describe 'The session''s hosts (2026-11-16, live: a host''s start failed mid-ses
         @(Get-HostStep | ForEach-Object message) | Should -Be @('T2: the Run Command DbHubControl-archost01-20261027150000 that set its activity on archost01 ended with exit code 1, so T2 may have no activity this session.')
     }
 
+    It 'moves each target''s dispatchUtc to when its Run Command''s script set it, before the session runs, and keeps the accepted time otherwise (2026-11-19)' {
+        # Live, 2026-11-19: on a VM that had just started, sqlvm01's Run Command set T3's profile 2 minutes 41 seconds after
+        # Azure accepted it, which is when T3's showcase counts its cycles from, so the control notebook's times for T3, its
+        # "Now: T3 Respond" line included, came that much early.
+        $script:runCommandViews['DbHubControl-sqlvm01-20261027150000'] = {
+            $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/sqlvm01/runCommands/DbHubControl-sqlvm01-' })[0]
+            $set = [ordered]@{ T1 = $put.At.AddSeconds(158).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture); T3 = $put.At.AddSeconds(161).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+            return @{ executionState = 'Succeeded'; exitCode = 0; output = ("DBHUBDEMO-WORKLOAD {}`nDBHUB-SET " + (ConvertTo-Json -InputObject $set -Compress)) }
+        }
+        $context = New-TestContext
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context $context
+        $result.status | Should -Be 'Started'
+        @(Get-HostStep) | Should -BeNullOrEmpty -Because 'a later set is no problem'
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'running'
+        $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/sqlvm01/runCommands/DbHubControl-sqlvm01-' })[0]
+        $text = { param($Value) ConvertTo-DbHubTimeText -Value (ConvertTo-DbHubUtc -Value $Value) }
+        (& $text $status.dispatchUtc.T1) | Should -Be (& $text $put.At.AddSeconds(158))
+        (& $text $status.dispatchUtc.T3) | Should -Be (& $text $put.At.AddSeconds(161))
+        (& $text $status.dispatchUtc.T4) | Should -Be (& $text $status.t4.dispatchUtc) -Because 'T4 isn''t in the line, so it keeps the accepted time'
+        @($context.Log | Where-Object { $_ -match 'T3: its activity was set on sqlvm01 at \d\d:\d\d:\d\d UTC, \d+ s after Azure accepted the Run Command' }).Count | Should -Be 1
+    }
+
+    It 'keeps the accepted time for a set within 5 seconds of it, before it, or more than an hour after it, and moves only the command''s own targets' {
+        $script:vm['sqlvm01'] = 'running'
+        $script:vm['archost01'] = 'running'
+        $status = [ordered]@{
+            sessionId   = $script:sessionId
+            acceptedUtc = '2026-10-27T15:00:00Z'
+            dispatchUtc = [ordered]@{ T1 = '2026-10-27T15:04:00Z'; T2 = '2026-10-27T15:04:00Z'; T3 = '2026-10-27T15:04:00Z'; T4 = '2026-10-27T15:04:00Z'; T5 = '2026-10-27T15:04:00Z' }
+            runCommands = @([ordered]@{ vm = 'sqlvm01'; name = 'DbHubControl-sqlvm01-anchor'; targets = @('T1', 'T3', 'T4', 'T5') })
+        }
+        $script:runCommandViews['DbHubControl-sqlvm01-anchor'] = @{ executionState = 'Succeeded'; exitCode = 0; output = 'DBHUB-SET {"T1":"2026-10-27T15:04:04Z","T3":"2026-10-27T16:04:30Z","T4":"2026-10-27T15:03:00Z","T5":"2026-10-27T15:36:41Z","T2":"2026-10-27T15:06:41Z"}' }
+        @(Get-DbHubSessionHealth -Context (New-TestContext -NowUtc $script:clock.AddMinutes(10)) -Status $status) | Should -BeNullOrEmpty
+        $status['dispatchUtc']['T1'] | Should -Be '2026-10-27T15:04:00Z' -Because '4 seconds is within the 5'
+        $status['dispatchUtc']['T3'] | Should -Be '2026-10-27T15:04:00Z' -Because 'more than an hour later isn''t a set time to trust'
+        $status['dispatchUtc']['T4'] | Should -Be '2026-10-27T15:04:00Z' -Because 'a set never comes before its Run Command'
+        $status['dispatchUtc']['T5'] | Should -Be '2026-10-27T15:36:41Z' -Because 'T2''s guest, say, can take more than 30 minutes after a cold start'
+        $status['dispatchUtc']['T2'] | Should -Be '2026-10-27T15:04:00Z' -Because 'T2 isn''t one of this Run Command''s targets'
+        # Idempotent: the next check finds the time it moved to, and changes nothing.
+        @(Get-DbHubSessionHealth -Context (New-TestContext -NowUtc $script:clock.AddMinutes(40)) -Status $status) | Should -BeNullOrEmpty
+        $status['dispatchUtc']['T5'] | Should -Be '2026-10-27T15:36:41Z'
+    }
+
+    It 'reads the last DBHUB-SET line''s targets and times, and nothing from output without one, or with one it can''t read (2026-11-19)' {
+        $set = @(Get-DbHubDispatchSetTime -Output ("before`nDBHUB-SET {""T1"":""2026-10-27T15:01:00Z""}`nDBHUB-SET {""T1"":""2026-10-27T15:02:41Z"",""T3"":""2026-10-27T15:02:44Z"",""T9"":""2026-10-27T15:02:45Z"",""T4"":""soon""}`nDBHUB-DISPATCH {}"))
+        @($set | ForEach-Object Target) | Should -Be @('T1', 'T3')
+        (ConvertTo-DbHubTimeText -Value $set[0].SetUtc) | Should -Be '2026-10-27T15:02:41Z'
+        (ConvertTo-DbHubTimeText -Value $set[1].SetUtc) | Should -Be '2026-10-27T15:02:44Z'
+        @(Get-DbHubDispatchSetTime -Output 'DBHUB-SET {not json') | Should -BeNullOrEmpty
+        @(Get-DbHubDispatchSetTime -Output 'DBHUB-DISPATCH {"failed":[]}') | Should -BeNullOrEmpty
+        @(Get-DbHubDispatchSetTime -Output '') | Should -BeNullOrEmpty
+    }
+
     It 'adds a host that stopped mid-session to the running session''s status once, through DbHub-Monitor, and starts or stops nothing' {
         $null = Start-TestSession
         $before = Get-SessionStatus
@@ -2224,12 +2900,32 @@ Describe 'The dispatch Run Command''s script: a target whose activity wasn''t se
         $run.ExitCode | Should -Be 0
         @($run.Lines | Where-Object { $_.StartsWith('DBHUBDEMO-WORKLOAD ') }).Count | Should -Be 2
         @($run.Lines | Where-Object { $_.StartsWith('DBHUB-DISPATCH ') }) | Should -BeNullOrEmpty
+        $run.Lines[-1] | Should -Match '^DBHUB-SET ' -Because 'each target''s set time is the last line then'
+    }
+
+    It 'writes one DBHUB-SET line with each target that got its activity and the VM''s UTC time right after its set, before DBHUB-DISPATCH (2026-11-19)' {
+        # Live, 2026-11-19: on a VM that had just started, sqlvm01's Run Command set T3's profile 2 minutes 41 seconds after
+        # Azure accepted it, which is when T3's showcase counts its cycles from.
+        $before = [DateTime]::UtcNow.AddSeconds(-1)
+        $run = Invoke-DispatchScript -Target 'T1', 'T3', 'T4' -Outcome @{ T1 = @{ status = 'Pass'; message = 'ok' }; T3 = @{ status = 'Fail'; message = 'runner profile set --target T3: Fail. error=547' }; T4 = @{ status = 'Warning'; message = 'set, with a warning' } }
+        $after = [DateTime]::UtcNow.AddSeconds(1)
+        $run.ExitCode | Should -Be 1
+        $run.Lines[-1] | Should -Match '^DBHUB-DISPATCH ' -Because 'DBHUB-DISPATCH stays the last line'
+        @($run.Lines | Where-Object { $_.StartsWith('DBHUB-SET ') }).Count | Should -Be 1
+        $set = @(Get-DbHubDispatchSetTime -Output ($run.Lines -join "`n"))
+        @($set | ForEach-Object Target) | Should -Be @('T1', 'T4') -Because 'T3''s activity wasn''t set'
+        foreach ($item in $set) {
+            $item.SetUtc | Should -BeGreaterOrEqual $before.AddTicks(-($before.Ticks % [TimeSpan]::TicksPerSecond))
+            $item.SetUtc | Should -BeLessOrEqual $after
+        }
+        @($run.Failed | ForEach-Object Target) | Should -Be @('T3')
     }
 
     It 'fails a target that wrote no result line, and with the module''s own template a VM without the control' {
         $run = Invoke-DispatchScript -Target 'T1' -Outcome @{ T1 = @{ status = $null; message = $null } }
         $run.ExitCode | Should -Be 1
         $run.Failed[0].Status | Should -Be 'NoResult'
+        @($run.Lines | Where-Object { $_.StartsWith('DBHUB-SET ') }) | Should -BeNullOrEmpty -Because 'no target got its activity'
         if (Test-Path -LiteralPath 'C:\ProgramData\DbHubDemo\settings.json') {
             Set-ItResult -Skipped -Because 'this machine has the VM-side control'
             return
@@ -2321,7 +3017,7 @@ Describe 'The published runbooks' {
         ([string]($output | Select-Object -Last 1)).Trim() | Should -Be (($expected | ForEach-Object { $_.ToString() }) -join ',')
     }
 
-    It 'orders the replica''s sizes, combines metric points, and writes a session''s JSON the same way in Windows PowerShell 5.1 (2026-11-14)' {
+    It 'orders the replica''s sizes, combines metric points, and writes a session''s JSON and T5''s container''s body the same way in Windows PowerShell 5.1 (2026-11-14, 2026-11-19)' {
         $powershell = Get-Command -Name 'powershell.exe' -CommandType Application -ErrorAction SilentlyContinue
         if (-not $IsWindows -or -not $powershell) {
             Set-ItResult -Skipped -Because 'Windows PowerShell 5.1 runs on Windows only'
@@ -2343,7 +3039,9 @@ Describe 'The published runbooks' {
             $windows = Get-DbHubReplicaLagPlan -ProfileSetUtc (New-Object -TypeName DateTime -ArgumentList 2026, 10, 27, 15, 10, 0, ([System.DateTimeKind]::Utc)) -RunEndUtc (New-Object -TypeName DateTime -ArgumentList 2026, 10, 27, 17, 8, 0, ([System.DateTimeKind]::Utc))
             $status = [ordered]@{ windows = $windows; steps = @() }
             Add-DbHubSessionStep -Status $status -Step 'Replica' -State 'Pass' -Message 'Ready.'
-            return @($order, (ConvertTo-Json -InputObject $document -Depth 8 -Compress), (ConvertTo-Json -InputObject $status -Depth 8 -Compress))
+            # T5's container's body as Invoke-DbHubArm sends it (2026-11-19): the settings' indexing policy, parsed by each runtime.
+            $body = Get-DbHubT5ContainerBody -Settings $settings -Tags @{ deploymentId = 'abc123'; owner = 'presenter@contoso.example'; component = 'demo'; DbHubBusyBy = 'session' }
+            return @($order, (ConvertTo-Json -InputObject $document -Depth 8 -Compress), (ConvertTo-Json -InputObject $status -Depth 8 -Compress), ($body | ConvertTo-Json -Depth 20 -Compress))
         }
         $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
         $here = & $probe $common $script:settingsJson
@@ -2352,12 +3050,14 @@ Describe 'The published runbooks' {
         $command = "`$in = Get-Content -LiteralPath '{0}' -Raw | ConvertFrom-Json; `$probe = [scriptblock]::Create(`$in.probe); `$out = & `$probe `$in.common `$in.settings; `$out | ForEach-Object {{ [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]`$_)) }}" -f $inputFile
         $output = @(& $powershell.Source -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $command)
         $LASTEXITCODE | Should -Be 0
-        $there = @($output | Select-Object -Last 3 | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(([string]$_).Trim())) })
+        $there = @($output | Select-Object -Last 4 | ForEach-Object { [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(([string]$_).Trim())) })
         $there[0] | Should -Be 'Standard_D2ds_v5,Standard_D4ads_v5,Standard_D4ds_v5'
         $there[0] | Should -Be $here[0]
         $there[1] | Should -Be $here[1]
         $there[1] | Should -Match '"points":\[\["2026-10-27T15:00:00Z",[0-9.]+\],\["2026-10-27T15:05:00Z",[0-9.]+\]\]'
         $there[2] | Should -Match '"windows":\[\{"startUtc":"2026-10-27T16:00:00Z","endUtc":"2026-10-27T16:09:00Z"\},\{"startUtc":"2026-10-27T17:00:00Z","endUtc":"2026-10-27T17:06:00Z"\}\]'
         $there[2] | Should -Match '"steps":\[\{"step":"Replica","state":"Pass"'
+        $there[3] | Should -Be $here[3]
+        $there[3] | Should -Be '{"tags":{"owner":"presenter@contoso.example","deploymentId":"abc123"},"properties":{"resource":{"id":"patient-events","partitionKey":{"paths":["/patientId"],"kind":"Hash","version":2},"indexingPolicy":{"indexingMode":"consistent","automatic":true,"includedPaths":[{"path":"/*"}],"excludedPaths":[{"path":"/payload/?"},{"path":"/\"_etag\"/?"}]}},"options":{"throughput":400}}}'
     }
 }

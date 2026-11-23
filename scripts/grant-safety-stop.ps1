@@ -1,18 +1,20 @@
 #Requires -Version 7.4
 <#
 .SYNOPSIS
-Assigns the nightly safety stop's one role (ADR 0024), for an Owner, once per deployment when deploy.ps1 couldn't.
+Grants the nightly safety stop's role and the session control's roles (ADR 0024, ADR 0026), for an Owner, once per
+deployment when deploy.ps1 couldn't.
 
 .DESCRIPTION
 Every deployment has a nightly safety stop: at the VMs' auto-shutdown time it deallocates the demo's VMs, stops T4 (a
-stopped PostgreSQL flexible server starts itself again after 7 days), and later checks that T3 paused, without waking
-it, and stops T4 again if it runs. Its runbook acts with the identity id-<prefix>-<environment>-safetystop, which needs
-the custom role "DbHub Demo Safety Stop" (read and stop only) at the demo resource group. deploy.ps1 assigns it when the
-person who runs it may; when not, it ends DONE with a Warning that names this command.
+stopped PostgreSQL flexible server starts itself again after 7 days), deletes T5's container when a session left it
+(2026-11-19: it exists only during a session), and later checks that T3 paused, without waking it, and stops T4 again if
+it runs. Its runbook acts with the identity id-<prefix>-<environment>-safetystop, which needs the custom role "DbHub Demo
+Safety Stop" (read and stop, and delete T5's session-only container) at the demo resource group. deploy.ps1 assigns it
+when the person who runs it may; when not, it ends DONE with a Warning that names this command.
 
 This script, run by an Owner (or a User Access Administrator; a Role Based Access Control Administrator once the role
 exists):
-1. creates or updates the custom role with exactly its seven approved actions, assignable in the configured subscription
+1. creates or updates the custom role with exactly its nine approved actions, assignable in the configured subscription
    only, when it's missing or differs;
 2. assigns it to the safety stop's identity at rg-<prefix>-<environment> only; the result names the identity's object ID.
 
@@ -22,10 +24,16 @@ would do. It never signs in or changes the Azure CLI context: sign in first with
 
 Since 2026-11-14 (ADR 0026) it also grants the on-demand control's roles, which deploy.ps1 sets up in every deployment:
 "DbHub Demo Activity Operator" for id-<prefix>-automation at the demo resource group (A1) and the control's Automation
-account (A2), with the session's actions (create and delete T4's read replica, set its streaming delay, join T4's subnet
-and private DNS zone, read the servers' metrics, and tag the demo resource group); "DbHub Demo Session Writer" for the
-same identity at the control vault's two session secrets only (A4); and Key Vault Secrets User on the control vault's
-three secrets for you and control.notebookUserObjectIds (A3). Its results list what each new action could touch.
+account (A2), with the session's actions (create and delete T4's read replica, set its streaming delay, read the servers'
+metrics, tag the demo resource group, and since 2026-11-19 create, read, and
+delete T5's container); "DbHub Demo Session Writer" for the same identity at the control vault's two session secrets
+only (A4); and Key Vault Secrets User on the control vault's three secrets for you, the environment's deployer, and
+control.notebookUserObjectIds (A3). The deployer (2026-11-19) is the person whose deploy.ps1 last set up the control
+vault, as Azure records it on the vault (CONTROL.ROLE.DEPLOYER), so a Contributor who deployed can Run all in
+NB_DatabaseHub_Control after this one run, without editing the configuration; nobody else gets the secrets, whose
+webhook URL is a bearer secret. Its results list what each new action could touch. Then it records T5's container
+lifecycle (GRANT.T5.LIFECYCLE, 2026-11-19, ADR 0027): once the control's role can create the container again, the
+container exists only during a session, so its throughput stops billing between sessions.
 
 .PARAMETER ConfigPath
 Path to the demo configuration (config/demo.config.json).
@@ -65,6 +73,9 @@ $config = Get-DemoConfig -Path $ConfigPath
 $results = @(Invoke-DemoSafetyStopSetup -Config $config -ConfigPath $ConfigPath -GrantRole -WhatIf:([bool]$WhatIfPreference) -Confirm:$false)
 # The control's roles too (2026-11-14, ADR 0026): one grant script for everything deploy.ps1 couldn't assign.
 $results += @(Invoke-DemoActivityControlSetup -Config $config -ConfigPath $ConfigPath -GrantRole -WhatIf:([bool]$WhatIfPreference) -Confirm:$false)
+# T5's container lifecycle (2026-11-19, ADR 0027): once the control's role can create the container again, it exists only
+# during a session, so its throughput stops billing between sessions.
+$results += @(Update-DemoT5ContainerLifecycle -Config $config -Purpose Grant -ConfigPath $ConfigPath -WhatIf:([bool]$WhatIfPreference) -Confirm:$false)
 
 Write-DemoResultReport -Result $results -Title 'grant-safety-stop.ps1'
 Export-DemoResult -Result $results -Path $OutputPath

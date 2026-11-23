@@ -17,15 +17,30 @@ function Find-DemoSecretLeak {
     with a digit or a symbol (not counting sentence punctuation at the end), as real tokens and generated
     passwords have.
 
-    Folders are scanned recursively, except .git. Text is decoded as UTF-8, or as UTF-16 or UTF-32 when a
+    Folders are scanned recursively, except .git and dependency trees: a folder named node_modules,
+    bower_components, jspm_packages, .npm, .pnpm-store, .yarn, .nuget, __pycache__, .venv, venv, site-packages,
+    .tox, .gradle, or .m2 anywhere under a scanned folder is third-party code or a package cache, never the
+    repository's or the user's output, so it's left out as the folder is walked, without reading or even
+    listing its files (2026-11-18: after the Insights app's build, out/fabric-app/node_modules alone held
+    114,315 files, 658 MB, and walking it kept validate.ps1's Security area busy for more than 37 minutes).
+    Junctions and symbolic links to folders aren't followed. A folder or file named in -Path is scanned even
+    when it's inside such a tree. A tree outside every -DependencyRoot is left out too, but listed apart
+    (UnexpectedPruned), so the caller can say it wasn't read (review of ab91ee5: a log in out/venv/ or
+    out/.npm/_logs/ is the demo's own output, and the scan shouldn't pass silently without it), unless it was scanned
+    on purpose (the re-review of 0590bbe): a folder named in -Path that is such a tree, or lies inside one, isn't
+    unexpected, and neither is the tree that holds it, nor a tree inside it, so -Path ./out, ./out/venv clears out/venv
+    and its own site-packages. Text is decoded as UTF-8, or as UTF-16 or UTF-32 when a
     byte order mark says so, or as UTF-16 without one when NUL bytes fall on every other byte (Windows
     PowerShell 5.1's Out-File and redirection write UTF-16). Other files with a NUL byte in the first 8,000
-    bytes are binary; they, files larger than -MaxFileBytes, and files that can't be read are skipped and
-    listed. A file another process is still writing, such as a transcript, is read with shared access.
+    bytes are binary; they, files larger than -MaxFileBytes, and files and folders that can't be read are
+    skipped and listed. A file another process is still writing, such as a transcript, is read with shared
+    access.
     Returns one DbHubDemo.SecretScan object:
     Findings (each with Source, Line, Rule, and an Excerpt in which every match is replaced by
-    [REDACTED:<rule>] and the rest is redacted again), Scanned (the sources read), and Skipped (with the
-    reason).
+    [REDACTED:<rule>] and the rest is redacted again), Scanned (the sources read), Skipped (with the
+    reason), Pruned (the dependency-tree folders left out, full paths, sorted, the first 50), and PrunedCount
+    (how many were left out), and UnexpectedPruned and UnexpectedPrunedCount (those of them outside every
+    -DependencyRoot and not scanned on purpose through -Path; all the others when -DependencyRoot isn't given).
 
     Sources (checked 2026-10-20): what ADR 0009 requires scanned, and gitleaks for the repository itself
     (https://github.com/gitleaks/gitleaks); GitHub Actions log masking
@@ -45,6 +60,11 @@ function Find-DemoSecretLeak {
 
     .PARAMETER MaxFileBytes
     Larger files are skipped.
+
+    .PARAMETER DependencyRoot
+    Folders whose dependency trees are expected, such as the Insights app's build stage, out/fabric-app, which npm fills
+    from the repository's lockfiles. A tree left out under one of them is only listed in Pruned; any other one is in
+    UnexpectedPruned too.
 
     .EXAMPLE
     (Find-DemoSecretLeak -Path ./out).Findings | Format-Table Source, Line, Rule, Excerpt
@@ -70,7 +90,10 @@ function Find-DemoSecretLeak {
         [securestring[]] $KnownValue = @(),
 
         [ValidateRange(1024, 1073741824)]
-        [long] $MaxFileBytes = 52428800
+        [long] $MaxFileBytes = 52428800,
+
+        [Parameter(ParameterSetName = 'Path')]
+        [string[]] $DependencyRoot = @()
     )
 
     $values = [System.Collections.Generic.List[object]]::new()
@@ -90,6 +113,10 @@ function Find-DemoSecretLeak {
     $findings = [System.Collections.Generic.List[object]]::new()
     $scanned = [System.Collections.Generic.List[string]]::new()
     $skipped = [System.Collections.Generic.List[object]]::new()
+    $pruned = [System.Collections.Generic.List[string]]::new()
+    $unexpected = [System.Collections.Generic.List[string]]::new()
+    $rootFolders = [System.Collections.Generic.List[string]]::new()
+    $expectedRoots = @($DependencyRoot | Where-Object { $_ } | ForEach-Object { [System.IO.Path]::GetFullPath($_).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar })
 
     if ($PSCmdlet.ParameterSetName -eq 'Text') {
         foreach ($finding in @(Find-DemoSecretInText -Text $Text -Source $Source -Value $values.ToArray())) {
@@ -98,21 +125,74 @@ function Find-DemoSecretLeak {
         $scanned.Add($Source)
     }
     else {
+        # Dependency trees and package caches are left out while each folder is walked, one level at a time, so not one of
+        # their files is listed: Get-ChildItem -Recurse with a filter after it still walked all of node_modules.
+        $prunedNames = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($name in @('node_modules', 'bower_components', 'jspm_packages', '.npm', '.pnpm-store', '.yarn', '.nuget', '__pycache__', '.venv', 'venv', 'site-packages', '.tox', '.gradle', '.m2')) {
+            $null = $prunedNames.Add($name)
+        }
+        # Hidden and system entries too, as Get-ChildItem -Force listed them; a folder that can't be read is skipped and
+        # listed rather than left out silently.
+        $options = [System.IO.EnumerationOptions]::new()
+        $options.RecurseSubdirectories = $false
+        $options.IgnoreInaccessible = $false
+        $options.AttributesToSkip = [System.IO.FileAttributes]::None
+        $options.ReturnSpecialDirectories = $false
         $files = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
         foreach ($item in $Path) {
             if (Test-Path -LiteralPath $item -PathType Leaf) {
                 $files.Add((Get-Item -LiteralPath $item -Force))
             }
             elseif (Test-Path -LiteralPath $item -PathType Container) {
-                $separator = '[\\/]'
-                Get-ChildItem -LiteralPath $item -Recurse -File -Force |
-                    Where-Object { $_.FullName -notmatch ($separator + '\.git' + $separator) } |
-                    Sort-Object -Property FullName |
-                    ForEach-Object { $files.Add($_) }
+                $found = [System.Collections.Generic.List[System.IO.FileInfo]]::new()
+                $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
+                $rootFolder = Get-Item -LiteralPath $item -Force
+                $rootFolders.Add($rootFolder.FullName.TrimEnd('\', '/'))
+                $pending.Push($rootFolder)
+                while ($pending.Count -gt 0) {
+                    $directory = $pending.Pop()
+                    try {
+                        $entries = $directory.GetFileSystemInfos('*', $options)
+                    }
+                    catch {
+                        $skipped.Add([pscustomobject]@{ Source = $directory.FullName; Reason = ('unreadable: {0}' -f $_.Exception.Message) })
+                        continue
+                    }
+                    foreach ($entry in $entries) {
+                        if ($entry -is [System.IO.FileInfo]) {
+                            $found.Add($entry)
+                        }
+                        elseif ($prunedNames.Contains($entry.Name)) {
+                            $pruned.Add($entry.FullName)
+                        }
+                        elseif ($entry.Name -ne '.git' -and -not $entry.Attributes.HasFlag([System.IO.FileAttributes]::ReparsePoint)) {
+                            $pending.Push($entry)
+                        }
+                    }
+                }
+                foreach ($file in @($found | Sort-Object -Property FullName)) {
+                    $files.Add($file)
+                }
             }
             else {
                 $skipped.Add([pscustomobject]@{ Source = $item; Reason = 'not found' })
             }
+        }
+        # Unexpected: outside every -DependencyRoot, and not scanned on purpose (the re-review of 0590bbe). A -Path folder that
+        # is a tree left out, or lies inside one, was named on purpose: that tree, and any tree inside the folder, isn't
+        # unexpected, so -Path ./out, ./out/venv clears the Warning that named out/venv.
+        $separator = [System.IO.Path]::DirectorySeparatorChar
+        $inside = { param([string] $Child, [string] $Parent) $Child.StartsWith($Parent.TrimEnd('\', '/') + $separator, [System.StringComparison]::OrdinalIgnoreCase) }
+        $same = { param([string] $Left, [string] $Right) [string]::Equals($Left.TrimEnd('\', '/'), $Right.TrimEnd('\', '/'), [System.StringComparison]::OrdinalIgnoreCase) }
+        $named = @($rootFolders | Where-Object { $root = $_; @($pruned | Where-Object { (& $same $root $_) -or (& $inside $root $_) }).Count -gt 0 })
+        foreach ($folder in $pruned) {
+            if (@($expectedRoots | Where-Object { $folder.StartsWith($_, [System.StringComparison]::OrdinalIgnoreCase) }).Count -gt 0) {
+                continue
+            }
+            if (@($named | Where-Object { (& $same $folder $_) -or (& $inside $folder $_) -or (& $inside $_ $folder) }).Count -gt 0) {
+                continue
+            }
+            $unexpected.Add($folder)
         }
         foreach ($file in $files) {
             if ($file.Length -gt $MaxFileBytes) {
@@ -148,9 +228,13 @@ function Find-DemoSecretLeak {
     }
 
     [pscustomobject]@{
-        PSTypeName = 'DbHubDemo.SecretScan'
-        Findings   = $findings.ToArray()
-        Scanned    = $scanned.ToArray()
-        Skipped    = $skipped.ToArray()
+        PSTypeName            = 'DbHubDemo.SecretScan'
+        Findings              = $findings.ToArray()
+        Scanned               = $scanned.ToArray()
+        Skipped               = $skipped.ToArray()
+        Pruned                = @($pruned | Sort-Object | Select-Object -First 50)
+        PrunedCount           = $pruned.Count
+        UnexpectedPruned      = @($unexpected | Sort-Object | Select-Object -First 50)
+        UnexpectedPrunedCount = $unexpected.Count
     }
 }

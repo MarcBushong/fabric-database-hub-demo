@@ -11,7 +11,7 @@ dataSources: [telemetry-endpoint, sql-diagnostics-skills]
 capability: Measures Parallelism and CPU waits, CPU, and throughput on any target from the telemetry endpoint and compares them with the baseline, then, where a SQL connection is possible, reads the scenario statement's cached plan and the live degree of parallelism with the microsoft-sql plan skill.
 permission: Telemetry prompts need the Azure CLI signed in as you, Reader or higher on the subscription, and Microsoft.Sql registered. T-SQL prompts need network line of sight to the target and a database identity with VIEW DATABASE STATE on T3 (Microsoft Entra only), or VIEW SERVER PERFORMANCE STATE on T1 and T2 (Windows authentication on the VM or guest).
 responseShape: A verdict, then a table of waits, CPU, and batch requests for the baseline and incident windows, then the plan's parallelism and the sessions' live degree of parallelism when a SQL connection exists, then gaps, then the KQL and T-SQL it ran.
-previewLimitation: The telemetry endpoint and schema are previews and have no plans. The plan skill is documented for Azure SQL Database, so on T1 and T2 it can decline, and on T3 at 1 vCore or less the plans are serial.
+previewLimitation: The telemetry endpoint and schema are previews and have no plans. The plan skill is documented for Azure SQL Database, so on T1 and T2 it can decline, and on T3, whose maximum is 2 vCores since 2026-11-18, the plans can run at DOP 2 or serially.
 fallback: Without an agent, run Learn telemetry sample queries 4, 5, and 9 in the Azure Data Explorer web UI for both windows, then show the plan from Query Store in SSMS on the VM through Bastion.
 actionPolicy: read-only
 adrPrompts: [inefficient-queries, correlate-signals, baseline-vs-incident, supporting-evidence]
@@ -53,7 +53,7 @@ Use the read-execution-plan skill on the ContosoCare database of {target}, conne
 |---|---|---|
 | T1 | `CXPACKET`, `CXCONSUMER`, and `CXSYNC_PORT` waits; CPU high; `SOS_SCHEDULER_YIELD` with a high signal-wait share when sessions outnumber schedulers | Undocumented on SQL Server: the skill can decline. If it runs, a parallel plan with exchange operators, and `dop` 2 |
 | T2 (default) | The same as T1 | The same as T1 |
-| T3 | CPU waits without Parallelism waits | Documented: a serial plan, because there's no second scheduler |
+| T3 | Parallelism waits at DOP 2, or CPU waits | Documented: at its 2-vCore maximum (since 2026-11-18), a parallel plan at `dop` 2 when the optimizer picks one; at 1 vCore, a serial plan, with no second scheduler |
 
 - No hint forces parallelism: the scenario's statement costs well above the default cost threshold for parallelism and carries only a `MAXDOP` hint, and it groups by a skewed key, so the threads get uneven work.
 

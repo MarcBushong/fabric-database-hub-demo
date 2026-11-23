@@ -1,6 +1,6 @@
 # ADR 0013: Agent experience: in-Hub Database Agent first, skills as fallback
 
-- **Status:** Accepted, validation pending: the live coverage record waits for the owner's rehearsal
+- **Status:** Accepted, validation pending: the live coverage record waits for the owner's rehearsal. Amended 2026-11-18: the GA `databasehub-cli` skill replaces the `microsoft-sql-fdh` plugin, and the Insights app's estate function has one narrow exception to the private-route rule ([amendment](#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception))
 - **Date:** 2026-10-19
 - **Decision source:** User-directed (Q3)
 - **Related:** [ADR 0010](0010-workload-generator-technology.md), [ADR 0012](0012-validation-model.md), [ADR 0014](0014-notebook-role-and-capacity.md), `fabric/agent/`
@@ -13,7 +13,7 @@
   - The monitoring doc says Estate findings can come from agents.
   - The in-Hub Database Agent is a preview that's enabled in the owner's tenant.
 - **What isn't documented about the in-Hub agent:** supported targets, prerequisites, permissions, and latency. It has no public API.
-- **The `microsoft-sql-fdh` plugin** (Database Hub agent skills) is read-only. It covers inventory, performance and health, and security posture. It works only with a delegated user identity, and it calls routes that aren't a public contract. It doesn't expose blocking, active sessions, query text, plans, or Query Store.
+- **The Database Hub agent skill** (the `microsoft-sql-fdh` plugin until 2026-11-18, then the GA `databasehub-cli` skill in `microsoft/skills-for-fabric`) is read-only. It covers inventory, performance and health, and security posture. It works only with a delegated user identity, and it calls routes that aren't a public contract. It doesn't expose blocking, active sessions, query text, plans, or Query Store.
 - **The `microsoft-sql` plugin** has diagnostics skills such as `diagnose-blocking-and-deadlocks` and `diagnose-slow-query`. They need network line of sight and database authentication.
 - **The telemetry REST endpoint** is documented and needs subscription Reader. The plan records an agent-instructions block on that page; a 2026-10-19 search couldn't confirm it, so Phase 10 re-checks it.
 - **The Fabric data agent** works over OneLake data, not Hub signals.
@@ -31,7 +31,7 @@
 
 - **Presenter-driven, in the Hub UI.** Classification: Manual / Optional preview.
 - **Any proposed action needs explicit human approval** before anything runs.
-- **The repo never automates, scrapes, or calls the Hub.** It never calls `/v1/databasehub/__private` routes or any other undocumented route.
+- **The repo never automates, scrapes, or calls the Hub.** It never calls `/v1/databasehub/__private` routes or any other undocumented route, with one narrow exception since 2026-11-18: the Insights app's estate function ([amendment](#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)).
 - **Any target:** every incident scenario can run on T1, T2, or T3 (ADR 0010), so the walkthrough uses whichever targets the agent supports in the tenant.
 - **Phase 10 records** which targets the agent covered and the latency observed, with the date.
 
@@ -40,7 +40,7 @@
 | Piece | Role |
 |---|---|
 | GitHub Copilot CLI (primary host) and VS Code | Agent hosts |
-| `microsoft-sql-fdh` plugin | Hub inventory, performance health, and security posture (read-only, delegated user) |
+| `fabric-skills` plugin (GA skill `databasehub-cli`; `microsoft-sql-fdh` until 2026-11-18) | Hub inventory, performance health, and security posture (read-only, delegated user) |
 | `microsoft-sql` plugin | Blocking, deadlocks, resource pressure, slow queries, and plans, run on T1 or T3 through Bastion or an allowed client |
 | Telemetry REST endpoint instructions | Investigation from Hub telemetry, with attribution to Learn |
 | Learn MCP server (`https://learn.microsoft.com/api/mcp`) | Documentation grounding |
@@ -50,7 +50,7 @@ Plugin versions are pinned in `config/versions.json`, and their install steps ar
 ### Out of scope
 
 - The Fabric data agent.
-- Any custom agent that calls private routes.
+- Any custom agent that calls private routes. The Insights app's Copilot chat ([ADR 0028](0028-ask-copilot-in-the-insights-app.md)) calls none: its live answers come from the app's estate function, under the exception below.
 
 ### Prompt pack (`fabric/agent/prompts/*.md`)
 
@@ -69,7 +69,7 @@ Phase 10 (live, pending go-ahead):
 
 - Run every prompt on the in-Hub agent and on the fallback path.
 - Record coverage by target, latency, and limitations, with dates, in `fabric/agent/README.md`.
-- Confirm that no repo code calls a private route (a static check in CI).
+- Confirm that no repo code calls a private route (a static check in CI), except the estate function's core, the one file the check allows since 2026-11-18.
 
 ## Sources (checked 2026-10-19)
 
@@ -77,7 +77,8 @@ Phase 10 (live, pending go-ahead):
 - Database Hub FAQ: <https://learn.microsoft.com/fabric/database/hub/faq>
 - Database Hub monitoring: <https://learn.microsoft.com/fabric/database/hub/monitor-sql>
 - Telemetry REST endpoint: <https://learn.microsoft.com/fabric/database/hub/microsoft-sql-query-performance-monitoring-telemetry>
-- `microsoft-sql-fdh` plugin: <https://github.com/microsoft/microsoft-sql/tree/main/plugins/microsoft-sql-fdh>
+- `microsoft-sql-fdh` plugin (until 2026-11-18): <https://github.com/microsoft/microsoft-sql/tree/main/plugins/microsoft-sql-fdh>
+- GA `databasehub-cli` skill (since 2026-11-18): <https://github.com/microsoft/skills-for-fabric/tree/main/skills/databasehub-cli>
 - `microsoft-sql` repository: <https://github.com/microsoft/microsoft-sql>
 - Learn MCP server: <https://learn.microsoft.com/api/mcp>
 
@@ -113,3 +114,31 @@ The prompt pack and install guide are in `fabric/agent/`. The static work is don
 - VS Code agent plugins (commit-pinned marketplaces): <https://code.visualstudio.com/docs/agent-customization/agent-plugins>
 - Learn MCP server: <https://learn.microsoft.com/training/support/mcp>
 - Optimized locking: <https://learn.microsoft.com/sql/relational-databases/performance/optimized-locking>
+
+## Amendment: general availability, and the Database Agent loop on T3 (2026-11-18)
+
+- **Decision source:** the owner's go-ahead for the coordinator's review of the Ignite announcements (2026-11-17), items 3 and 6 ("do them all"), and the owner's decisions of 2026-11-18, through the coordinator: T3's lowest-cost maximum goes from 1 to 2 vCores, because Database Agents doesn't support one-vCore serverless databases ([ADR 0016](0016-cost-profiles.md)); automatic tuning's `FORCE_LAST_GOOD_PLAN` is held off for the beat, and every way a session ends puts it back; the safety stop keeps changing nothing (option A, no role change, [ADR 0024](0024-nightly-safety-stop.md)).
+- **What's documented now** (Learn, updated 2026-11-17): Database Hub is generally available, and Copilot in Database Hub and Database Agents are previews ([overview](https://learn.microsoft.com/fabric/database/hub/overview)). Database Agents covers Azure SQL Database in Database Hub, and PostgreSQL only as a limited preview in Visual Studio Code. It detects and investigates without an LLM; contextual Copilot (**Explain why**, **Analyze slow query**, and prompt buttons) covers high CPU and long-running query issues on the capacity's Copilot; it applies no change ("All scenarios require a manual response"); a new issue takes about 15 minutes; an issue closes after the manual response or when the condition clears, and a recurrence opens a new one. Its setup is UI-only (**Manage agents** > **Database agent settings**), saving needs Azure RBAC write on each database, and the database must be in the region associated with the Fabric tenant's home region. It doesn't support one-vCore serverless databases, elastic pools, Managed Instance, SQL Server on Azure VMs, or SQL Server enabled by Azure Arc ([Database Agents](https://learn.microsoft.com/fabric/database/hub/database-agents), [enable](https://learn.microsoft.com/fabric/database/hub/enable-database-agents), [review an issue](https://learn.microsoft.com/fabric/database/hub/review-performance-issue)). Copilot's own target coverage and latency still aren't documented.
+- **Decision:**
+  1. **The Database Agent loop on T3**, in the showcase's second cycle: `plan-regression` holds `FORCE_LAST_GOOD_PLAN` off, so the regression lasts until Database Agents raises its issue; the presenter shows **Explain why** and **Analyze slow query**; at 85% of the beat the run makes the issue's documented manual response itself, forcing the last good plan through Query Store, and puts the option back; T3's CPU falls and the issue closes. Run all does it all, so a session stays one action. The agent never acts, and nothing here automates Database Hub ([ADR 0010](0010-workload-generator-technology.md#amendment-the-database-agent-beat-2026-11-18)).
+  2. **One manual step, once per deployment:** selecting T3 in **Manage agents**. `deploy.ps1` lists it under "Please confirm" with Database Hub's link, the exact database, and the Agent policy options (`HUB.AGENT.T3`); what Azure can show is checked (`T3.AGENT`: not one-vCore serverless, not pooled, the signed-in account's write access, monitoring on), and a gap is a **Warning** with the fix.
+  3. **Copilot's three starting questions** of general availability ("What changed in my databases?", "Which resource should I investigate next?", "Which security findings should I address first?") are the prompt file `overview.in-hub.md`, the first step of a demo.
+  4. The rest stands: presenter-driven, read-only or propose-only prompts, every incident on T1, T2, and T3 for Copilot, and the fallback ladder.
+- **Consequences:** every Run all repeats the loop, with a new issue each session. `status.ps1` shows `FORCE_LAST_GOOD_PLAN` (`STATUS.T3.AUTOTUNING`), and every release is logged as an `auto-tuning-restored` event. Whether the agent raises the issue within the beat, which issue type it raises (long-running query, high CPU, or plan regression), and its close are live checks ([implementation report](../implementation-report.md)).
+
+## Amendment (2026-11-18): the GA skill, and one narrow exception
+
+- **Decision source:** User-directed (2026-11-17, after Ignite: "do them all", including the in-app GitHub Copilot chat), with the coordinator's decision 3 of 2026-11-18.
+- **The GA skill replaces the plugin.** Database Hub became generally available on 2026-11-17, and its CLI skill moved to Microsoft's `microsoft/skills-for-fabric` marketplace (name `fabric-collection`) as `databasehub-cli`, in the `fabric-skills` bundle. The fallback installs that bundle at a pinned commit, `config/versions.json` (`agentPlugins.marketplaces`) records both marketplaces, and the `microsoft-sql` diagnostics plugin stays on `microsoft/microsoft-sql`. Unlike the old plugin, the bundle also carries Fabric agents and three remote MCP servers, one of which can author semantic models, so the guide starts demo sessions with deny rules for them, or installs the skill alone with APM (`fabric/agent/README.md`).
+- **The exception: the Insights app's estate function.** The app's in-app Copilot chat (ADR 0028) and its pages need the live estate: inventory, SQL and PostgreSQL health, Cosmos DB availability and RU, and security posture. Database Hub has no public API for it; the GA skill reads it through Database Hub's own routes, which its reference calls not a public contract. The app's function (`fabric/app/rayfin/functions/src/estate-core.ts`) calls the same routes, under these limits:
+  - **Exactly 8 read-only routes,** the code's allowlist (`ALLOWED_ROUTES`), relative to Database Hub's base: `POST /savedView/resources/list`, `POST /health/v2/filtered-summary`, `POST /health/v2/filtered-usage-details`, `POST /postgreSql/health/v2/summary`, `POST /cosmosDb/health/summary`, `GET /auth/warnings`, `GET /auditing/warnings`, and `GET /cmk/warnings`. The POST routes are queries with a filter body; nothing changes anything.
+  - **The function only,** as the app item's owner, which Fabric Apps documents as the functions' app identity. No script, notebook, or page calls them. The private base is named once, in `estate-core.ts` (`DBHUB_BASE`); tests and other code import it and `ALLOWED_ROUTES` rather than typing it.
+  - **The guard:** `tests/unit/DbHubDemo.HubKql.Tests.ps1` fails when any file outside the docs names the private base, except `estate-core.ts`, where it may appear once, and when `ALLOWED_ROUTES` differs from the test's own explicit list of these 8 routes. Adding a route takes a deliberate change to that list and to this amendment.
+  - **Answers name routes, not the base:** an answer's `source` lists each route that answered as `<METHOD> /<route>`, exactly an allowlist entry, and the app shows them under **Database Hub API**, so the private base never reaches the screen when a DBA presents to customers.
+  - **The demo's own resources only:** every query filters to the configured subscription and the demo's resource group (`rg-<prefix>-<environment>`), which `configure-fabric-app.ps1` writes into the deploy stage, never into Git; the tenant-wide security findings are filtered by resource ID before they leave the function.
+  - **As the app, not as the skill:** the calls carry the app's own User-Agent, `DbHubDemo-InsightsApp/<version>`, not the skill's `x-ms-fabric-skill` telemetry header.
+  - **Bounded:** 30 seconds per call, 90 seconds per answer, and one answer shared for 60 seconds, so many viewers make one call.
+  - **When the routes change:** the function returns what it read with each failed route's error, the chat and the pages say the live estate is unavailable and show the error with its source, and every history answer (the semantic model) keeps working. The fix is a code change in the function, checked against the pinned skill's routes.
+  - **The rules name it** (the owner's decision, 2026-11-19): `.github/copilot-instructions.md`, `CONTRIBUTING.md`, the pull request template, `fabric/README.md`, and the walkthrough's out-of-scope list name this one exception. Everything else stays "never", scraping or automating the portal included.
+- **Why not the alternatives:** the viewer's own token isn't available to Fabric Apps code (functions get only the owner's tokens), and answering "now" from the lakehouse snapshot would lose Cosmos DB and the security posture.
+- **Sources (checked 2026-11-18):** the skill and its route contract, <https://github.com/microsoft/skills-for-fabric/tree/main/skills/databasehub-cli>; Fabric Apps functions and their app identity, <https://learn.microsoft.com/fabric/apps/functions>; the Copilot CLI plugin reference, <https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-plugin-reference>.

@@ -1,27 +1,68 @@
 import { createContext, useContext } from "react";
 
-import type { Filters } from "./data/queries";
+import type { DataProvenance } from "./copilot/contract";
 import type { Meta } from "./data/model";
+import type { Filters } from "./data/queries";
+import type { ControlRequest } from "./lib/control";
+import type { ManageAccessAnswer, ManageJobAnswer, ManageRequestAnswer } from "./lib/manage-client";
 import type { AppRuntime } from "./lib/runtime-config";
-import type { ViewState } from "./lib/view-state";
-import type { ThemeId } from "./theme/themes";
+import type { PageId, ViewState } from "./lib/view-state";
 
-export type MotionPreference = "system" | "reduced" | "full";
+export type NotifyIntent = "success" | "info" | "warning" | "error";
+
+/** How the Manage page sends actions here: the app's Manage function (A), or by copying them for Run all (C). */
+export interface ManageAccess {
+    /** "run": the app's Manage function sends confirmed requests; "copy": it isn't deployed, so each action copies its request for Run all. */
+    mode: "run" | "copy";
+    /** Run mode: the verified viewer is an operator (the deployer or a member of the demo's admin group). */
+    canRun: boolean;
+    /** One short sentence: why the viewer can't run actions, or how copy mode works. */
+    reason: string;
+    /** Run mode: the verified viewer, as the control records them. */
+    who?: string;
+    /** Run mode: the control's run that's queued or in progress; a new session follows it, and Stop now cancels it first. */
+    running?: ManageAccessAnswer["running"];
+    /** Run mode: the control's targets (T5 only while it's on), when the function says. */
+    targets?: string[];
+    /** Run mode: sends a confirmed request. */
+    send?: (request: ControlRequest) => Promise<ManageRequestAnswer>;
+    /** Run mode: reads one of the control's runs, to show its real state. */
+    job?: (jobInstance: string) => Promise<ManageJobAnswer>;
+    /** Run mode: switches to copy mode, with the reason, when the function couldn't send a request that Run all can. */
+    fallBack?: (reason: string) => void;
+    /** Run mode: reads the viewer's access and the control's run in progress again (before each action, and after a start). */
+    refresh?: () => Promise<void>;
+    /** Run mode: true while refresh reads them. */
+    refreshing?: boolean;
+    /** Still finding out which mode this deployment has. */
+    checking?: boolean;
+}
+
+/** Copy mode (C): without the app's Manage function, each action copies its request for Run all in the control notebook. */
+export const MANAGE_READ_ONLY: ManageAccess = {
+    mode: "copy",
+    canRun: false,
+    reason: "This deployment has no Manage function, so each action copies its request for NB_DatabaseHub_Control, where Run all sends it.",
+};
 
 export interface AppContextValue {
     runtime: AppRuntime;
     embedded: boolean;
     view: ViewState;
     setView: (patch: Partial<ViewState>) => void;
+    /** Opens a page; drill-downs that belong to another page are cleared unless the patch sets them. */
+    navigate: (page: PageId, patch?: Partial<ViewState>) => void;
+    /** The SQL targets of the global filter (the telemetry history's) and the period. */
     filters: Filters;
     meta: Meta | null;
-    theme: ThemeId;
-    setTheme: (id: ThemeId) => void;
-    motion: MotionPreference;
-    setMotion: (value: MotionPreference) => void;
-    /** True when animations should stop: the OS asks for reduced motion, or the user switched motion off. */
+    /** True while the history's freshness is loading; false once known, even when empty. */
+    metaLoading: boolean;
+    metaError: Error | null;
+    /** Where the app's data comes from: the history model, or the preview's sample. */
+    provenance: DataProvenance;
     reducedMotion: boolean;
-    notify: (message: string) => void;
+    notify: (message: string, intent?: NotifyIntent) => void;
+    manage: ManageAccess;
 }
 
 export const AppContext = createContext<AppContextValue | null>(null);

@@ -16,7 +16,8 @@ function Start-DemoDeploymentRun {
     - The banner: Get-DemoDeploymentExpectation and Get-DemoDeploymentNotice, through the redacting console writer.
     - The busy marker (2026-11-14), with -BusyMarker: Start-DemoBusyMarkerRun starts its refresher, which keeps the nightly
       stop waiting while the run goes on; Complete-DemoDeploymentRun ends it. Not with -WhatIf.
-    Returns ProgressPath, PagePath, Writer, KeepAwake, StartedUtc, Command, Environment, InstallMode, WaitForT2, and Busy, for
+    Returns ProgressPath, PagePath, Writer, KeepAwake, StartedUtc, Command, Environment, InstallMode, WaitForT2, Busy, and
+    OutputDirectory (the out folder, where the ending also keeps what an earlier run of the deployment found; F10), for
     Invoke-DemoDeployment and Complete-DemoDeploymentRun.
 
     .PARAMETER Config
@@ -80,7 +81,7 @@ function Start-DemoDeploymentRun {
     $installMode = (Get-DemoArcTarget -Config $Config).InstallMode
     $paths = Get-DemoProgressPath -Directory $OutputDirectory
     $command = Get-DemoDeployCommand -ConfigPath $ConfigPath
-    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -SkipFabric:$SkipFabric -Note @(@($Note) + @((Get-DemoT2LegacyModeText -Config $Config), (Get-DemoT4IgnoredText -Config $Config)))
+    $expect = Get-DemoDeploymentExpectation -InstallMode $installMode -SkipFabric:$SkipFabric -Note @(@($Note) + @((Get-DemoT2LegacyModeText -Config $Config), (Get-DemoT4IgnoredText -Config $Config), (Get-DemoSessionCeilingLegacyText -Config $Config)))
     $run = [pscustomobject]@{
         ProgressPath = ''
         PagePath     = ''
@@ -92,6 +93,8 @@ function Start-DemoDeploymentRun {
         InstallMode  = $installMode
         WaitForT2    = [bool]$WaitForT2
         Busy         = $null
+        # The out folder: the ending keeps what this run found there for the next run of the deployment (F10, 2026-11-19).
+        OutputDirectory = $paths.Directory
     }
     if (-not $PSCmdlet.ShouldProcess($paths.Model, 'Write the status page and keep this PC awake')) {
         return $run
@@ -102,7 +105,8 @@ function Start-DemoDeploymentRun {
         $pageLine = ''
         if (-not $NoStatusPage -and -not $environment.GitHubActions) {
             # T4's rows are always there (2026-11-09): a run without T4 says on them why, and how to add it (DEPLOY.T4.OFF).
-            $catalog = Get-DemoProgressCatalog -InstallMode $installMode -T4Enabled -SkipFabric:$SkipFabric
+            # T5's rows are there too (2026-11-18, ADR 0027): a configuration that turns T5 off shows them Skipped.
+            $catalog = Get-DemoProgressCatalog -InstallMode $installMode -T4Enabled -T5Enabled -SkipFabric:$SkipFabric
             $model = New-DemoProgressModel -Catalog $catalog -Environment ([string]$Config['environment']) -ResourceGroup (Get-DemoResourceGroupName -Config $Config) -Command $command -PagePath $paths.Page -Expect @{ text = $expect.Text }
             try {
                 Initialize-DemoProgress -Path $paths.Model -Model $model -Confirm:$false

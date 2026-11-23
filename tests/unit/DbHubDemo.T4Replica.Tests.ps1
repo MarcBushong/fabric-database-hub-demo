@@ -614,6 +614,98 @@ Describe 'deploy.ps1''s end deletes the replica unless a session uses it (2026-1
     }
 }
 
+Describe 'Whether a session uses T4''s read replica, as the stop at the end of an update reads it (Get-DemoT4ReplicaHold; the review of 2026-11-19)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        $script:now = [datetime]::new(2026, 11, 19, 20, 0, 0, [System.DateTimeKind]::Utc)
+        $script:autoStop = [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith { $script:autoStop }
+        $script:replica = New-ReplicaState -State 'NotFound'
+        $script:replicaThrows = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -MockWith {
+            if ($script:replicaThrows) { throw 'ERROR: (TooManyRequests) a fake throttle.' }
+            $script:replica
+        }
+        $script:marker = InModuleScope DbHubDemo { $script:ActivityControlStartDemoMarker }
+        function Get-Hold([object] $Since = $null) {
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Now = $script:now; Since = $Since } { Get-DemoT4ReplicaHold -Config $Config -DeploymentId 'abc123' -StartDemoSinceUtc $Since -NowUtc $Now }
+        }
+        # A start-demo.ps1 session's auto-stop, as Register-DemoActivityControlAutoStop writes it.
+        function Set-StartDemoAutoStop([string] $StartedAt, [string] $Due = '2026-11-19T21:30:00Z') {
+            $script:autoStop = [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ startTime = $Due; description = ('{0} Stops the demo 4 hours after this start: the start-demo.ps1 session started at {1}. Run all, the Insights app''s Start, or a run replaces it with its own plan.' -f $script:marker, $StartedAt) } }; Error = '' }
+        }
+    }
+
+    It 'keeps a session it can''t rule out: <Case> (finding 6)' -ForEach @(
+        @{ Case = 'a replica read that failed'; Setup = { $script:replica = New-ReplicaState -State 'Unknown'; $script:replica.Error = 'ERROR: (TooManyRequests) a fake throttle.' }; Match = 'T4''s read replica couldn''t be read \(ERROR: \(TooManyRequests\) a fake throttle\)' }
+        @{ Case = 'a replica read that threw'; Setup = { $script:replicaThrows = $true }; Match = 'session mark couldn''t be read \(ERROR: \(TooManyRequests\) a fake throttle\)' }
+        @{ Case = 'no deploymentId to name the replica'; Setup = { $script:replica = [pscustomobject]@{ Names = [pscustomobject]@{ ServerName = '' }; State = 'NotFound'; Present = $false; Server = $null; Error = 'The resource group has no deploymentId tag.' } }; Match = 'can''t be named: the resource group has no deploymentId tag' }
+    ) {
+        . $Setup
+        $hold = Get-Hold
+        $hold.Held | Should -BeTrue
+        $hold.By | Should -Be 'Unknown'
+        $hold.Error | Should -Match $Match
+    }
+
+    It 'finds no session for a replica that isn''t there, or one without a mark' {
+        (Get-Hold).Held | Should -BeFalse
+        $script:replica = New-ReplicaState -State 'Ready' -SkuName 'Standard_D4ds_v5'
+        (Get-Hold).Held | Should -BeFalse
+    }
+
+    It 'leaves out a start-demo.ps1 auto-stop from a session that the nightly stop ended before this run, and still reads the replica''s mark (finding 3)' {
+        # 16:30 PST on 11-18 the session starts, the nightly stop at 19:00 ends it, the update starts at 19:15 and ends at
+        # 20:45, and the auto-stop moved past it to 21:30 (Get-DbHubStartDemoDeferral).
+        $script:now = [datetime]::new(2026, 11, 19, 4, 45, 0, [System.DateTimeKind]::Utc)
+        Set-StartDemoAutoStop -StartedAt '2026-11-19T00:30:00Z' -Due '2026-11-19T05:30:00Z'
+        $since = [datetime]::new(2026, 11, 19, 3, 15, 0, [System.DateTimeKind]::Utc)
+        $hold = Get-Hold -Since $since
+        $hold.Held | Should -BeFalse
+        $hold.Ignored | Should -Be ([datetime]::new(2026, 11, 19, 5, 30, 0, [System.DateTimeKind]::Utc))
+        $script:replica = New-ReplicaState -State 'Ready' -SkuName 'Standard_D4ds_v5'
+        $script:replica.Server = [pscustomobject]@{ tags = [pscustomobject]@{ deploymentId = 'abc123'; DbHubSessionUntilUtc = '2026-11-20T03:00:00Z' } }
+        $hold = Get-Hold -Since $since
+        $hold.Held | Should -BeTrue
+        $hold.By | Should -Be 'StartDemo'
+        $hold.UntilUtc | Should -Be ([datetime]::new(2026, 11, 20, 3, 0, 0, [System.DateTimeKind]::Utc))
+    }
+
+    It 'counts a start-demo.ps1 auto-stop from a session that started just before this run, with no nightly stop between: its VMs weren''t started yet when the run began (the re-review of 2026-11-19)' {
+        # start-demo.ps1 records its start at 10:00:05 PST and asks for the VMs' starts a minute later; deploy.ps1 starts at
+        # 10:00:30 and finds them stopped.
+        Set-StartDemoAutoStop -StartedAt '2026-11-19T18:00:05Z' -Due '2026-11-19T22:00:00Z'
+        $hold = Get-Hold -Since ([datetime]::new(2026, 11, 19, 18, 0, 30, [System.DateTimeKind]::Utc))
+        $hold.Held | Should -BeTrue
+        $hold.By | Should -Be 'StartDemo'
+        $hold.UntilUtc | Should -Be ([datetime]::new(2026, 11, 19, 22, 0, 0, [System.DateTimeKind]::Utc))
+        $hold.Ignored | Should -BeNullOrEmpty
+    }
+
+    It 'finds the last nightly stop at or before a time, also across a change of daylight saving time' -ForEach @(
+        @{ Before = '2026-11-19T18:00:30Z'; Last = '2026-11-19T03:00:00Z' }
+        @{ Before = '2026-11-19T03:00:00Z'; Last = '2026-11-19T03:00:00Z' }
+        @{ Before = '2026-11-19T02:59:59Z'; Last = '2026-11-18T03:00:00Z' }
+        # 2026-11-01 ends daylight saving time: 19:00 PDT on 10-31 is 02:00 UTC, and 19:00 PST on 11-01 is 03:00 UTC, 25 hours on.
+        @{ Before = '2026-11-02T02:30:00Z'; Last = '2026-11-01T02:00:00Z' }
+    ) {
+        # Not $before or $last: PowerShell's variable names don't tell case apart, so those would replace the test's data.
+        $beforeUtc = [datetime]::Parse($Before, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+        $found = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); BeforeUtc = $beforeUtc } { Get-DemoLastNightlyStopUtc -Config $Config -BeforeUtc $BeforeUtc }
+        $found.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture) | Should -Be $Last
+    }
+
+    It 'counts a start-demo.ps1 auto-stop from a session that started during this run, and every one when there''s no run to compare (the replica''s deploy end)' {
+        Set-StartDemoAutoStop -StartedAt '2026-11-19T19:40:00Z'
+        $hold = Get-Hold -Since ([datetime]::new(2026, 11, 19, 19, 15, 0, [System.DateTimeKind]::Utc))
+        $hold.Held | Should -BeTrue
+        $hold.By | Should -Be 'StartDemo'
+        $hold.StartedUtc | Should -Be ([datetime]::new(2026, 11, 19, 19, 40, 0, [System.DateTimeKind]::Utc))
+        Set-StartDemoAutoStop -StartedAt '2026-11-19T16:30:00Z'
+        (Get-Hold).By | Should -Be 'StartDemo'
+    }
+}
+
 Describe 'The history keeps the session''s lag: captured before stop-demo.ps1 deletes the replica (ADR 0025)' {
     It 'stop-demo.ps1 captures the metrics before it sends the delete, and hands them to the notebook' {
         # Azure Monitor answers ResourceNotFound for a deleted replica's metrics (live, 2026-11-13), so the order matters.
@@ -715,5 +807,115 @@ Describe 'A resumed upgrade gives T1 the replica''s name the older template didn
         $plain = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Settings = $noT4 } { Add-DemoT4ReplicaLoaderSetting -Config $Config -LoaderSettings $Settings }
         $plain.sqlVm.PSObject.Properties.Name | Should -Not -Contain 't4'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaName -Times 0 -Exactly
+    }
+}
+
+Describe 'The replica''s checks while T4 doesn''t run, or while the replica is created or deleted: a Warning with the reason, never a Fail (2026-11-18)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { [pscustomobject]@{ T4Replica = 'Session'; T4ReplicaSize = ''; Tags = @{ deploymentId = 'abc123' } } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith { throw ('unexpected Azure CLI call: {0}' -f (@($ArgumentList) -join ' ')) }
+        $script:t4State = 'Ready'
+        $script:replicaState = 'Ready'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4State -MockWith { New-T4State -State $script:t4State }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -MockWith {
+            $replica = New-ReplicaState -State $script:replicaState -SkuName 'Standard_D4ds_v5' -Zone '3'
+            if ($replica.Present) {
+                $replica.Server = [pscustomobject]@{ properties = [pscustomobject]@{ network = [pscustomobject]@{ delegatedSubnetResourceId = '/subscriptions/x/subnets/snet-pg' }; authConfig = [pscustomobject]@{ passwordAuth = 'Disabled' } } }
+            }
+            $replica
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ParameterState -MockWith { [pscustomobject]@{ Found = $true; Value = '600000'; PendingRestart = $false; Source = 'user-override'; Error = '' } }
+        # Fresh lag from Azure Monitor, as a running replica of a running T4 sends.
+        $script:snapshotReads = 0
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaMetricSnapshot -MockWith {
+            $script:snapshotReads++
+            $latest = [ordered]@{ physical_replication_delay_in_seconds = 2.0; cpu_percent = 11.0 }
+            [pscustomobject]@{ Succeeded = $true; Error = $null; Latest = $latest; Peak = $latest; PrimaryLatest = [ordered]@{}; PrimaryPeak = [ordered]@{}; LatestUtc = '2026-11-18T22:00:00.0000000Z'; Minutes = $Minutes }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoHubTarget -MockWith { [pscustomobject]@{ SubscriptionId = '11111111-2222-3333-4444-555555555555'; ResourceGroup = 'rg-dbhub-demo' } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHubResourceGraph -MockWith { [pscustomobject]@{ Succeeded = $true; Rows = @(); Error = '' } }
+        $script:checks = {
+            InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } {
+                Test-DemoT4ReplicaServer -Config $Config -DeploymentId 'abc123'
+                Test-DemoT4ReplicaMetricFlow -Config $Config -DeploymentId 'abc123'
+                Test-DemoT4ReplicaEstate -Config $Config -DeploymentId 'abc123'
+                Get-DemoT4ReplicaStatusResult -Config $Config -DeploymentId 'abc123'
+            }
+        }
+    }
+
+    It 'while T4 is <T4>: no replica check fails, and a replica that''s there anyway is a Warning that says why, with the fix' -ForEach @(
+        @{ T4 = 'Stopped'; Why = ': a session that ended without stop-demo\.ps1 leaves it, and it bills until it''s deleted\.$'; Fix = '^\./scripts/stop-demo\.ps1 deletes it, or \./scripts/start-demo\.ps1 or the control notebook''s Run all starts T4 for a session' }
+        @{ T4 = 'Stopping'; Why = ': a session that ended without stop-demo\.ps1 leaves it'; Fix = '^\./scripts/stop-demo\.ps1 deletes it' }
+        @{ T4 = 'Starting'; Why = ' until T4 is Ready \(Azure starts a replica before its source\)\.$'; Fix = '^Check it again once T4 is Ready \(\./scripts/validate\.ps1 -Area T4\)\.$' }
+    ) {
+        $script:t4State = $T4
+        foreach ($replicaState in 'NotFound', 'Ready', 'Stopped', 'Provisioning', 'Dropping') {
+            $script:replicaState = $replicaState
+            $failed = @(& $script:checks | Where-Object { [string]$_.status -eq 'Fail' } | ForEach-Object { $_.checkId })
+            $failed | Should -BeNullOrEmpty -Because ('T4 is {0} and its replica {1}' -f $T4, $replicaState)
+        }
+        $script:replicaState = 'Ready'
+        $replica = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Test-DemoT4ReplicaServer -Config $Config -DeploymentId 'abc123' }
+        $replica.checkId | Should -Be 'T4.REPLICA'
+        $replica.status | Should -Be 'Warning'
+        $replica.message | Should -Match ('^T4''s read replica \(pgreplica01-abc123\) is Ready, but T4 \(pgflex01-abc123\) is {0}, so it has nothing to replicate' -f $T4)
+        $replica.message | Should -Match $Why
+        $replica.remediation | Should -Match $Fix
+        $replica.evidence.t4State | Should -Be $T4
+        $script:snapshotReads = 0
+        $metrics = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Test-DemoT4ReplicaMetricFlow -Config $Config -DeploymentId 'abc123' }
+        $metrics.status | Should -Be 'Warning'
+        $metrics.message | Should -Be ('T4''s read replica (pgreplica01-abc123) runs, but T4 (pgflex01-abc123) is {0}, so it has nothing to replicate and no Read replica lag to show.' -f $T4)
+        $metrics.remediation | Should -Be './scripts/start-demo.ps1 or the control notebook''s Run all starts T4; the check runs then (./scripts/validate.ps1 -Area T4).'
+        $script:snapshotReads | Should -Be 0 -Because 'a replica with nothing to replicate has no lag worth reading'
+
+        # The same replica while T4 runs: T4.REPLICA and its metrics pass, as before.
+        $script:t4State = 'Ready'
+        (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Test-DemoT4ReplicaServer -Config $Config -DeploymentId 'abc123' }).status | Should -Be 'Pass'
+        (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Test-DemoT4ReplicaMetricFlow -Config $Config -DeploymentId 'abc123' }).status | Should -Be 'Pass'
+    }
+
+    It 'a replica being created or deleted is a Warning that says so, and its settings aren''t judged while it''s created' {
+        $script:replicaState = 'Provisioning'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -MockWith {
+            # Azure fills in the replication role as the creation goes on.
+            $replica = New-ReplicaState -State 'Provisioning' -SkuName 'Standard_D4ds_v5'
+            $replica.Role = ''
+            $replica
+        }
+        $replica = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Test-DemoT4ReplicaServer -Config $Config -DeploymentId 'abc123' }
+        $replica.status | Should -Be 'Warning'
+        $replica.message | Should -Be 'T4''s read replica (pgreplica01-abc123) is being created (Provisioning), so it isn''t checked yet: a session''s replica takes about 9 minutes.'
+        $replica.remediation | Should -Be 'Check it again once it''s Ready (./scripts/validate.ps1 -Area T4).'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoT4ParameterState -Times 0 -Exactly
+        $status = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4ReplicaStatusResult -Config $Config -DeploymentId 'abc123' }
+        $status.status | Should -Be 'Warning'
+        $status.message | Should -Match '^T4''s read replica \(pgreplica01-abc123\) is being created \(Provisioning\)'
+
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT4ReplicaState -MockWith { New-ReplicaState -State 'Dropping' -SkuName 'Standard_D4ds_v5' }
+        $results = @(& $script:checks)
+        foreach ($result in $results) {
+            $result.status | Should -Be 'Warning' -Because $result.checkId
+            $result.message | Should -Match 'is being deleted' -Because $result.checkId
+        }
+        ($results | Where-Object checkId -EQ 'STATUS.T4.REPLICA').remediation | Should -Be 'Check it again in a few minutes (./scripts/status.ps1).'
+        ($results | Where-Object checkId -EQ 'HUB.ESTATE.T4.REPLICA').message | Should -Not -Match 'doesn''t list it yet' -Because 'a replica that''s going isn''t one Resource Graph hasn''t caught up with'
+    }
+
+    It 'status.ps1: a replica running while T4 starts says so without the delete; while T4 updates, it''s a Pass' {
+        $script:t4State = 'Starting'
+        $status = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4ReplicaStatusResult -Config $Config -DeploymentId 'abc123' }
+        $status.status | Should -Be 'Warning'
+        $status.message | Should -Be 'T4''s read replica (pgreplica01-abc123) is running while T4 is Starting (Azure starts a replica before its source), so it has nothing to replicate until T4 is Ready.'
+        $status.remediation | Should -Not -Match 'stop-demo' -Because 'deleting the replica of a session that''s starting is the wrong fix'
+        $script:t4State = 'Updating'
+        (InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4ReplicaStatusResult -Config $Config -DeploymentId 'abc123' }).status | Should -Be 'Pass'
+        $script:t4State = 'Stopped'
+        $left = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoT4ReplicaStatusResult -Config $Config -DeploymentId 'abc123' }
+        $left.status | Should -Be 'Warning'
+        $left.remediation | Should -Be 'Run ./scripts/stop-demo.ps1, which deletes it.'
     }
 }

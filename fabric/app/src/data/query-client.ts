@@ -1,7 +1,11 @@
-// Runs catalog queries through the read-only connector, with a bounded, time-limited cache and in-flight
-// de-duplication, so switching pages or themes never re-queries the model.
+// Runs catalog queries through a data source, with a bounded, time-limited cache and in-flight de-duplication, so
+// switching pages or themes never re-queries. Sources are pluggable: the history model through the read-only connector
+// (the deployed app), the local preview's sample, and later a live source. Every result says which one answered.
 
+import type { DataProvenance } from "@/copilot/contract";
 import type { ColumnSpec, QuerySpec } from "./queries";
+
+export type { DataProvenance };
 
 export interface RawColumn {
     name: string;
@@ -23,6 +27,8 @@ export interface QueryResult {
     rows: Row[];
     requestId: string;
     fetchedAt: Date;
+    /** Which source answered: the history model, a live source, or the preview's sample. */
+    provenance: DataProvenance;
 }
 
 export class QueryFailure extends Error {
@@ -74,13 +80,49 @@ export function describeFailure(category: string, message: string): string {
     }
 }
 
+/**
+ * Where rows come from. A source answers the catalog questions it can: the history model answers every query by its
+ * DAX; a live source would answer the ones it has routes for, by the query's ID and params, and the history answers the
+ * rest.
+ */
+export interface DataSource {
+    provenance: DataProvenance;
+    answers(spec: QuerySpec): boolean;
+    fetch(spec: QuerySpec): Promise<{ rows: Row[]; requestId: string }>;
+}
+
+/** The history model through the read-only semantic model connector, as the signed-in user. */
+export function historySource(execute: Execute): DataSource {
+    return {
+        provenance: "history",
+        answers: () => true,
+        async fetch(spec) {
+            const result = await execute({ query: spec.dax, resultSetRowCountLimit: spec.rowLimit });
+            if (result.status !== "success") {
+                const { category, message, code } = result.error;
+                throw new QueryFailure(describeFailure(category, message), category, code, result.requestId);
+            }
+            return { rows: toRows(result.table.columns, result.table.rows), requestId: result.requestId };
+        },
+    };
+}
+
 export interface QueryClient {
     run(spec: QuerySpec, options?: { force?: boolean }): Promise<QueryResult>;
     peek(spec: QuerySpec): QueryResult | undefined;
+    /** The last result for a query even when it's older than the cache keeps fresh, for a view that keeps showing it while a refresh runs or after one fails. */
+    peekStale?(spec: QuerySpec): QueryResult | undefined;
     clear(): void;
 }
 
-export function createQueryClient(execute: Execute, options: { ttlMs?: number; maxEntries?: number; now?: () => number } = {}): QueryClient {
+export interface ClientOptions {
+    ttlMs?: number;
+    maxEntries?: number;
+    now?: () => number;
+}
+
+/** A client over sources, tried in order: the first that answers a query runs it. */
+export function createSourceClient(sources: readonly DataSource[], options: ClientOptions = {}): QueryClient {
     const ttl = options.ttlMs ?? 5 * 60 * 1000;
     const max = options.maxEntries ?? 60;
     const now = options.now ?? (() => Date.now());
@@ -90,11 +132,9 @@ export function createQueryClient(execute: Execute, options: { ttlMs?: number; m
 
     function fresh(key: string): QueryResult | undefined {
         const hit = cache.get(key);
-        if (!hit) return undefined;
-        if (now() - hit.at > ttl) {
-            cache.delete(key);
-            return undefined;
-        }
+        // An expired entry isn't fresh, but it stays as the query's last result (peekStale) until a refresh replaces it or
+        // the least recently used order drops it.
+        if (!hit || now() - hit.at > ttl) return undefined;
         // Refresh recency for the LRU order.
         cache.delete(key);
         cache.set(key, hit);
@@ -103,6 +143,7 @@ export function createQueryClient(execute: Execute, options: { ttlMs?: number; m
 
     return {
         peek: (spec) => fresh(keyOf(spec)),
+        peekStale: (spec) => cache.get(keyOf(spec))?.result,
         clear: () => cache.clear(),
         run(spec, runOptions) {
             const key = keyOf(spec);
@@ -112,19 +153,13 @@ export function createQueryClient(execute: Execute, options: { ttlMs?: number; m
             }
             const pending = inFlight.get(key);
             if (pending) return pending;
-            const request = execute({ query: spec.dax, resultSetRowCountLimit: spec.rowLimit })
-                .then((result) => {
-                    if (result.status !== "success") {
-                        const { category, message, code } = result.error;
-                        throw new QueryFailure(describeFailure(category, message), category, code, result.requestId);
-                    }
-                    const value: QueryResult = {
-                        spec,
-                        columns: spec.columns,
-                        rows: toRows(result.table.columns, result.table.rows),
-                        requestId: result.requestId,
-                        fetchedAt: new Date(now()),
-                    };
+            const source = sources.find((s) => s.answers(spec));
+            if (!source) return Promise.reject(new QueryFailure(`No data source answers ${spec.id}.`, "source"));
+            const request = source
+                .fetch(spec)
+                .then(({ rows, requestId }) => {
+                    const value: QueryResult = { spec, columns: spec.columns, rows, requestId, fetchedAt: new Date(now()), provenance: source.provenance };
+                    cache.delete(key);
                     cache.set(key, { at: now(), result: value });
                     while (cache.size > max) {
                         const oldest = cache.keys().next().value;
@@ -138,4 +173,9 @@ export function createQueryClient(execute: Execute, options: { ttlMs?: number; m
             return request;
         },
     };
+}
+
+/** The deployed app's client: the history model through the connector. */
+export function createQueryClient(execute: Execute, options: ClientOptions = {}): QueryClient {
+    return createSourceClient([historySource(execute)], options);
 }

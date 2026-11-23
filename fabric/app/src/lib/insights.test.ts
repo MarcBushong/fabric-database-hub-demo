@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 
-import { replicaCatchUp, type Bin, type Incident, type PostgresCapture, type PostgresPoint, type TargetSummary, type WaitFlow } from "@/data/model";
+import { replicaCatchUp, withCategoryWaits, type Bin, type Incident, type PostgresCapture, type PostgresPoint, type TargetSummary, type WaitFlow } from "@/data/model";
 import {
     busiestHourInsight,
     compareIncident,
     coverageInsight,
     dominantWaitInsight,
     failedConnectionsInsight,
+    familySignal,
     freshnessInsight,
     incidentInsight,
     incidentPadMinutes,
@@ -14,6 +15,10 @@ import {
     postgresCpuInsight,
     readinessInsight,
     replicaLagInsight,
+    signalValue,
+    timesShort,
+    timesText,
+    baselineText,
 } from "./insights";
 import { mean, quantile, density } from "./stats";
 import { statusBySort, statusClass, statusColor, statusMeta, worstStatus } from "./status";
@@ -125,6 +130,31 @@ describe("insights", () => {
         expect(insight.title).toContain("lasted 1 h");
     });
 
+    it("measures a wait family by its own category, as the detector does, not by all waits (dbhubc5, 2026-11-18)", () => {
+        // T3's detected log flush waits: Tran Log IO at about 0.4 s a bin, then 15.8 to 20.4 s, while all the waits fell.
+        const logFlush: Incident = { ...incident, key: "detected:T3:tran_log", family: "tran_log", start: at(1, 52), end: at(1, 57), durationMin: 5, peakValue: 20.417 };
+        const tranLog = [...Array<number>(30).fill(0.4), 15.8, 20.4, 16.8, 7.3, 5.5];
+        const bins = tranLog.map((_, i) => bin(1, 22 + i, 0, { bufferIoS: null, waitS: i < 30 ? 168 : 142 }));
+        const waits = tranLog.map((seconds, i) => ({ at: bins[i].at, category: "Tran Log IO", seconds }));
+        const own = compareIncident(logFlush, withCategoryWaits(bins, [...waits, { at: at(1, 22), category: "Preemptive", seconds: 9 }]));
+        expect(own.signal).toBe("Tran Log IO (log flush) waits");
+        expect(own.peak).toBe(20.4);
+        expect(own.peakAt).toEqual(at(1, 53));
+        expect(own.baseline).toBeCloseTo(0.4, 6);
+        expect(own.ratio).toBeCloseTo(32.9, 1);
+        // A bin with categories but no Tran Log IO row waited 0 seconds; without the waits query, it's all the waits.
+        expect(signalValue(familySignal("tran_log"), { ...bins[0], waits: { Preemptive: 9 } })).toBe(0);
+        expect(signalValue(familySignal("tran_log"), bins[0])).toBeNull();
+        const all = compareIncident(logFlush, bins);
+        expect(all.signal).toBe("wait time");
+        expect(all.ratio).toBeCloseTo(142 / 168, 6);
+        // dbhubc5's tempdb latch window: 33.9 s against a baseline of 0.02 s is "more than 100 times", not 1610.
+        expect([timesShort(3.42), timesShort(35.3), timesShort(1610)]).toEqual(["3.4×", "35×", ">100×"]);
+        expect(timesText(1610)).toBe("more than 100 times");
+        expect(baselineText(0.02, "seconds")).toBe("baseline near zero");
+        expect(baselineText(0.4, "seconds")).toBe("baseline 0.4 s per bin");
+    });
+
     it("flags stale telemetry and passes fresh telemetry", () => {
         const stale = lagInsight([target("T1", { lagMin: 220.7 }), target("T3", { lagMin: 0.2 })]);
         expect(stale?.status).toBe("Warning");
@@ -159,6 +189,19 @@ describe("insights", () => {
         expect(insight?.status).toBe("Manual action required");
         expect(insight?.metric).toBe("64 %");
         expect(insight?.detail).toBe("Next step (hub-setting): Turn it on.");
+    });
+
+    it("never rounds a share to 100 % or 0 % when it isn't exactly that", () => {
+        const dominant = dominantWaitInsight([
+            { category: "CPU", target: "T3", seconds: 996 },
+            { category: "CPU", target: "T1", seconds: 4 },
+        ]);
+        expect(dominant?.metric).toBe("more than 99 %");
+        expect(dominant?.title).toBe("T3 carries more than 99 % of the estate's wait time; its biggest category is CPU.");
+        const summary = { checks: 300, failed: 0, manual: 0, warnings: 299, passed: 1, notSupported: 0, notSelected: 0, readiness: 0.003, runLabel: "run" };
+        expect(readinessInsight(summary, [])?.metric).toBe("less than 1 %");
+        expect(readinessInsight({ ...summary, warnings: 1, passed: 299 }, [])?.metric).toBe("more than 99 %");
+        expect(readinessInsight({ ...summary, warnings: 0, passed: 300 }, [])?.metric).toBe("100 %");
     });
 
     it("asks for a notebook run when there is no snapshot, and warns when it's old", () => {

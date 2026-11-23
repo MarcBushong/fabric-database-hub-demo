@@ -1324,6 +1324,57 @@ Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (
             }
         }
 
+        It 'holds the host bootstrap''s lock while the command runs in the guest, and not while it waits for the guest (2026-11-19, dbhubfx)' {
+            $script:guest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start' }
+            $root = New-ReadyRoot -Role 'ArcHost'
+            $script:lockPath = Join-Path -Path $root -ChildPath 'bootstrap.lock'
+            $script:held = {
+                try {
+                    [System.IO.FileStream]::new($script:lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None).Dispose()
+                    return 'free'
+                }
+                catch {
+                    return 'held'
+                }
+            }
+            Mock -CommandName Invoke-DemoControlGuestCommand -MockWith {
+                $text = $ScriptBlock.ToString()
+                if ($text -match 'MSSQLSERVER') {
+                    $script:guestCalls.Add('sql ' + (& $script:held))
+                    return [pscustomobject]@{ status = 'Running'; seconds = 1; startedByScript = $false }
+                }
+                if ($text -match "'warmup'") {
+                    $script:guestCalls.Add('warmup ' + (& $script:held))
+                    return (New-Run)
+                }
+                $script:guestCalls.Add('runner ' + (& $script:held))
+                return (New-Run -StdOut '[{"status":"Pass","message":"ok"}]')
+            }
+            Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = $script:profileSet }) -StateRoot $root
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Pass'
+            @($script:guestCalls) | Should -Be @('sql free', 'warmup free', 'runner held')
+            $result.evidence.lockSeconds | Should -Be 0
+            & $script:held | Should -Be 'free' -Because 'the lock goes when the command ends'
+        }
+
+        It 'runs the command as before, and says so, when a bootstrap run holds the lock past its bound (2026-11-19, dbhubfx)' {
+            Mock -CommandName Start-Sleep -ParameterFilter { $Milliseconds -gt 0 } -MockWith { [System.Threading.Thread]::Sleep(100) }
+            $root = New-ReadyRoot -Role 'ArcHost'
+            $lock = [System.IO.FileStream]::new((Join-Path -Path $root -ChildPath 'bootstrap.lock'), [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)
+            try {
+                Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T2'; arguments = @('profile', 'get', '--json'); lockSeconds = 1 }) -StateRoot $root
+            }
+            finally {
+                $lock.Dispose()
+            }
+            $result = Get-ControlResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.lockTimedOut | Should -BeTrue
+            $result.evidence.lockSeconds | Should -BeGreaterOrEqual 1
+            @($script:guestCalls) | Should -Be @('runner profile get --json --target T2')
+        }
+
         Context 'a broken PowerShell Direct channel (issue #65)' {
             BeforeEach {
                 $script:guest = @{ State = 'Running'; Heartbeat = 'OkApplicationsHealthy'; AutomaticStartAction = 'Start'; Uptime = [timespan]::FromMinutes(42) }
@@ -1559,5 +1610,55 @@ Describe 'The health read''s live view of the T2 guest (T2.GUEST.STATE, 2026-11-
         $summary = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
         $summary.PSObject.Properties['t2Guest'] | Should -BeNullOrEmpty
         $summary.state | Should -Be 'Ready'
+    }
+
+    It 'reports a bootstrap generation that health.json doesn''t report yet as in progress, with its pass''s step, in both views (#65 follow-up)' {
+        $root = New-HealthRoot
+        $before = 'aaaaaaaaaaaa-20261119020000'
+        $new = 'bbbbbbbbbbbb-20261119040000'
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), (ConvertTo-Json -InputObject ([ordered]@{ schemaVersion = 1; role = 'ArcHost'; state = 'Ready'; status = 'Pass'; message = 'Every step is in the desired state.'; currentStep = $null; generation = $before; steps = @() })))
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'settings.json'), (ConvertTo-Json -InputObject ([ordered]@{ role = 'ArcHost'; bundlePath = $repoRoot; generation = $new; loaderRunUtc = [DateTime]::UtcNow.AddMinutes(-2).ToString('o') })))
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'state.json'), (ConvertTo-Json -InputObject ([ordered]@{ state = 'InProgress'; currentStep = 'GuestSignInCleanup'; generation = $new })))
+        $summary = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $summary.state | Should -Be 'InProgress'
+        $summary.status | Should -Be 'Warning'
+        $summary.generation | Should -Be $new
+        $summary.currentStep | Should -Be 'GuestSignInCleanup'
+        $summary.generationPending | Should -BeTrue
+        $summary.reportedGeneration | Should -Be $before
+        $summary.reportedState | Should -Be 'Ready'
+        $summary.message | Should -Match 'checks every step again \(at step GuestSignInCleanup\)'
+        $full = (& $healthScript -Root $root -View Full) | ConvertFrom-Json
+        $full.state | Should -Be 'InProgress'
+        $full.generationPending | Should -BeTrue
+        # Before that pass starts, state.json still has the generation before: no step yet.
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'state.json'), (ConvertTo-Json -InputObject ([ordered]@{ state = 'Ready'; currentStep = 'WorkloadRunner'; generation = $before })))
+        $starting = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $starting.state | Should -Be 'InProgress'
+        $starting.currentStep | Should -BeNullOrEmpty
+        $starting.message | Should -Match '\(starting\)'
+    }
+
+    It 'leaves health.json as it is once it reports that generation, on T1, and for a loader that ran more than 30 minutes ago (#65 follow-up)' {
+        $root = New-HealthRoot
+        $new = 'bbbbbbbbbbbb-20261119040000'
+        $health = [ordered]@{ schemaVersion = 1; role = 'ArcHost'; state = 'Ready'; status = 'Pass'; message = 'Every step is in the desired state.'; currentStep = $null; generation = $new; steps = @() }
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), (ConvertTo-Json -InputObject $health))
+        $settings = [ordered]@{ role = 'ArcHost'; bundlePath = $repoRoot; generation = $new; loaderRunUtc = [DateTime]::UtcNow.AddMinutes(-2).ToString('o') }
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'settings.json'), (ConvertTo-Json -InputObject $settings))
+        $reported = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $reported.state | Should -Be 'Ready'
+        $reported.PSObject.Properties['generationPending'] | Should -BeNullOrEmpty
+        $health['generation'] = 'aaaaaaaaaaaa-20261119020000'
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), (ConvertTo-Json -InputObject $health))
+        foreach ($case in @(@{ Role = 'SqlVm'; Minutes = -2 }, @{ Role = 'ArcHost'; Minutes = -45 })) {
+            $settings['role'] = $case.Role
+            $settings['loaderRunUtc'] = [DateTime]::UtcNow.AddMinutes($case.Minutes).ToString('o')
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'settings.json'), (ConvertTo-Json -InputObject $settings))
+            $left = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+            $left.state | Should -Be 'Ready'
+            $left.generation | Should -Be 'aaaaaaaaaaaa-20261119020000'
+            $left.PSObject.Properties['generationPending'] | Should -BeNullOrEmpty
+        }
     }
 }

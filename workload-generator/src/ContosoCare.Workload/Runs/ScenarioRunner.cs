@@ -116,17 +116,26 @@ internal sealed record RunResult
     /// <summary>
     /// Why a Refused run never started: <c>connect</c>, <c>running-run</c> (demo.usp_run_begin's 50108: its scenario
     /// already has a Running run), <c>run-limit</c> (50109: four runs are Running in the database), <c>sql</c>, or <c>request</c>.
+    /// T5's run store refuses with the same reasons, a T5 account that can't be reached, or whose data-plane role isn't
+    /// effective yet (HTTP 401 or 403), is <c>connect</c>, and a T5 container that doesn't exist now is <c>request</c> with
+    /// <see cref="RefusalPasses"/>.
     /// </summary>
     public string? RefusalReason { get; init; }
+
+    /// <summary>
+    /// True when a refusal passes by itself although its reason is <c>request</c>: T5's container doesn't exist now, because
+    /// it exists only during a session, whose start creates it (or it was deleted at a session's end).
+    /// </summary>
+    public bool RefusalPasses { get; init; }
 
     /// <summary>The SQL error number behind a refusal, when there was one.</summary>
     public int? SqlErrorNumber { get; init; }
 
     /// <summary>True for a refusal that passes by itself, so the profile host tries the activity again, bounded (Phase 25b).</summary>
-    public bool CanRetryRefusal => Status == "Refused" && RefusalReason is "connect" or "running-run" or "run-limit";
+    public bool CanRetryRefusal => Status == "Refused" && (RefusalReason is "connect" or "running-run" or "run-limit" || RefusalPasses);
 }
 
-/// <summary>Runs bounded scenarios on one target and resets it: the T-SQL runner for T1 to T3, the PostgreSQL runner for T4.</summary>
+/// <summary>Runs bounded scenarios on one target and resets it: the T-SQL runner for T1 to T3, the PostgreSQL runner for T4, the Cosmos DB runner for T5.</summary>
 internal interface IScenarioExecutor
 {
     /// <summary>A description of the target that's safe to log.</summary>
@@ -137,7 +146,7 @@ internal interface IScenarioExecutor
     Task<IReadOnlyList<CheckRecord>> ResetAsync(ResetOptions options, CancellationToken cancellationToken);
 }
 
-/// <summary>An executor that can end the profile runs an earlier host process left Running (Phase 25b): the T-SQL runner. The profile host skips the recovery for the others.</summary>
+/// <summary>An executor that can end the profile runs an earlier host process left Running (Phase 25b): the T-SQL runner, and T5's, whose run store records each run's process. The profile host skips the recovery for the others.</summary>
 internal interface IOrphanedRunRecovery
 {
     /// <summary>Ends <paramref name="machineName"/>'s profile runs that started before <paramref name="startedBefore"/> and have no live session; null when sessions can't be seen.</summary>

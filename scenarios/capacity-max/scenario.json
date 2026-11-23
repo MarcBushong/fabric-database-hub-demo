@@ -6,7 +6,7 @@
   "orchestration": "capacity",
   "procedure": "demo.usp_scenario_capacity_max",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1200 },
-  "concurrency": { "default": 8, "min": 2, "max": 16, "description": "CPU sessions; T1 and T2 have 2 vCPUs and T3 at most 1 vCore, so 8 keeps every scheduler busy with several runnable tasks each." },
+  "concurrency": { "default": 8, "min": 2, "max": 16, "description": "CPU sessions; T1 and T2 have 2 vCPUs and T3 at most 2 vCores by default, so 8 keeps every scheduler busy with several runnable tasks each." },
   "intensity": { "default": 10, "min": 1, "max": 10, "description": "CPU work per report and the pause between units of work: about 1 second at 1, none at 10." },
   "targets": {
     "applicable": ["T1", "T2", "T3"],

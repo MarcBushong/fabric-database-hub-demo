@@ -315,6 +315,57 @@ Describe 'Invoke-DemoInsightsAppStep (2026-11-05)' {
     }
 }
 
+Describe 'Complete-DemoInsightsAppManage: the app''s step once more after the control''s notebook is in Fabric (2026-11-19)' {
+    BeforeEach {
+        $config = New-TestConfig
+        $script:notebookId = 'abababab-abab-abab-abab-abababababab'
+        $script:logged = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { $script:logged.Add(('{0}: {1}' -f $PesterBoundParameters['Level'], $PesterBoundParameters['Message'])) }
+        $script:record = { param([string] $CheckId, [string] $Status, [System.Collections.IDictionary] $Evidence = @{}) New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status $Status -Message ('{0} {1}' -f $CheckId, $Status) -Evidence $Evidence }
+        $script:placed = @(& $script:record 'CONTROL.FABRIC.NOTEBOOK' 'Pass')
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -MockWith {
+            & $script:record 'FABRIC.APP.DEPLOY' 'Pass' ([ordered]@{ nonBlocking = 'insightsApp' })
+            & $script:record 'FABRIC.APP.ACTIONS' 'Pass' ([ordered]@{ controlNotebookId = $script:notebookId; nonBlocking = 'insightsApp' })
+        }
+        $script:stateValues = [System.Collections.Generic.List[hashtable]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { $script:stateValues.Add(@{} + $Value) }
+        $script:results = [System.Collections.Generic.List[object]]::new()
+        foreach ($item in @(
+                (& $script:record 'FABRIC.APP.DEPLOY' 'Pass' ([ordered]@{ nonBlocking = 'insightsApp' }))
+                (& $script:record 'FABRIC.APP.ACTIONS' 'Warning' ([ordered]@{ controlNotebookId = ''; nonBlocking = 'insightsApp' }))
+                (& $script:record 'FABRIC.APP.TOKEN' 'Warning' ([ordered]@{ nonBlocking = 'insightsApp' }))
+                (& $script:record 'HUB.ESTATE.T1' 'Pass')
+            )) {
+            $script:results.Add($item)
+        }
+        $script:complete = { param($Control) & (Get-Module -Name DbHubDemo) { param($c, $r, $k) Complete-DemoInsightsAppManage -Config $c -Results $r -ControlResult $k } $config $script:results $Control }
+    }
+
+    It 'replaces the earlier step''s records that have the same check IDs, keeps the others, and records the notebook its Manage has now' {
+        $records = @(& $script:complete $script:placed)
+        $records.Count | Should -Be 2
+        @($script:results | ForEach-Object { '{0} {1}' -f $_.checkId, $_.status }) | Should -Be @('FABRIC.APP.TOKEN Warning', 'HUB.ESTATE.T1 Pass', 'FABRIC.APP.DEPLOY Pass', 'FABRIC.APP.ACTIONS Pass')
+        @($script:stateValues) | ForEach-Object { $_['AppControlNotebookId'] } | Should -Be $script:notebookId
+        @($script:logged | Where-Object { $_ -like '*: This run deployed the Insights app before NB_DatabaseHub_Control was in Fabric*' }).Count | Should -Be 1
+
+        # Its Manage has the notebook now, so a second call does nothing.
+        @(& $script:complete $script:placed).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -Times 1 -Exactly
+    }
+
+    It 'leaves an app that this run didn''t deploy, or a notebook that isn''t in Fabric, to their own records, and never throws when the state can''t be recorded' {
+        @(& $script:complete @(& $script:record 'CONTROL.FABRIC.NOTEBOOK' 'Warning')).Count | Should -Be 0
+        $script:results[0].status = 'Manual action required'
+        @(& $script:complete $script:placed).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoInsightsAppStep -Times 0 -Exactly
+
+        $script:results[0].status = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoDeploymentState -MockWith { throw 'Recording the deployment state failed: (AuthorizationFailed)' }
+        @(& $script:complete $script:placed).Count | Should -Be 2
+        @($script:logged | Where-Object { $_ -like 'Warning: The Insights app was deployed once more, but what its Manage has wasn''t recorded: *AuthorizationFailed*' }).Count | Should -Be 1
+    }
+}
+
 Describe 'Invoke-DemoFabricNotebookRun' {
     BeforeEach {
         $config = New-TestConfig
@@ -399,6 +450,37 @@ Describe 'Invoke-DemoFabricNotebookRun' {
         $result.message | Should -Match 'still InProgress'
     }
 
+    It 'waits for a run that a busy capacity keeps queued for more than 10 minutes, shows the wait on the status page, and passes (#68)' {
+        # Live (2026-11-19, a shared F4): the first history run stayed NotStarted for about 15 minutes, then ran in 76 seconds.
+        $script:now = [datetime]::new(2026, 11, 19, 2, 2, 45, [System.DateTimeKind]::Utc)
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:now = $script:now.AddSeconds([int]$PesterBoundParameters['Seconds']) }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        $script:states.Clear()
+        foreach ($i in 1..46) { $script:states.Enqueue([pscustomobject]@{ status = 'NotStarted'; startTimeUtc = '2026-11-19T02:02:45Z'; endTimeUtc = $null }) }
+        $script:states.Enqueue([pscustomobject]@{ status = 'InProgress'; startTimeUtc = '2026-11-19T02:02:45Z'; endTimeUtc = $null })
+        $script:states.Enqueue([pscustomobject]@{ status = 'Completed'; startTimeUtc = '2026-11-19T02:02:45Z'; endTimeUtc = '2026-11-19T02:19:23Z' })
+        $result = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -TimeoutMinutes 45 -ProgressPath 'deploy-progress.json' -ProgressId 'Fabric.Items' -ProgressNote 'The history model refreshes once it has run.'
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match '^NB_DatabaseHub_LiveActivity waited about 16 minutes in the capacity''s queue, then ran on demand and completed'
+        $result.evidence.queuedSeconds | Should -Be 940
+        $result.evidence.PSObject.Properties['jobLocation'] | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -ParameterFilter { $Id -eq 'Fabric.Items' -and $Message -eq 'NB_DatabaseHub_LiveActivity is queued on the capacity (15 of at most 45 minutes). The history model refreshes once it has run.' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -ParameterFilter { $Message -match '^NB_DatabaseHub_LiveActivity is running \(15 of at most 45 minutes\)' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -ParameterFilter { $Message -match 'still queued on the capacity after 10 minutes' }
+    }
+
+    It 'returns the job''s location when the wait ends while it''s still queued, so deploy.ps1 can follow it (#68)' {
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        $script:states.Clear()
+        foreach ($i in 1..200) { $script:states.Enqueue([pscustomobject]@{ status = 'NotStarted'; startTimeUtc = '2026-11-19T02:02:45Z'; endTimeUtc = $null }) }
+        $result = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -TimeoutMinutes 1 -PollSeconds 1
+        $result.status | Should -Be 'Warning'
+        $result.evidence.status | Should -Be 'NotStarted'
+        $result.evidence.jobLocation | Should -Match '/jobs/instances/55555555-5555-5555-5555-555555555555$'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -Times 0 -Exactly -Because 'without -ProgressPath nothing goes to the status page'
+    }
+
     It 'counts -TimeoutMinutes in elapsed time, the reads included, when every read pays its retries (review of c7c86ec)' {
         # Each read answers HTTP 503 after its attempts and backoff, about 50 seconds; before, the polls were counted, not the time.
         $script:reads = 0
@@ -415,5 +497,104 @@ Describe 'Invoke-DemoFabricNotebookRun' {
         $result.status | Should -Be 'Warning'
         $script:reads | Should -BeLessOrEqual 3 -Because 'eight polls of 65 seconds each would take more than 8 minutes'
         ($script:now - $start).TotalMinutes | Should -BeLessOrEqual 3
+    }
+}
+
+Describe 'A first deployment''s first history run on a busy capacity (#68)' {
+    BeforeEach {
+        $config = New-TestConfig
+        $script:job = 'https://api.fabric.microsoft.com/v1/workspaces/22222222-2222-2222-2222-222222222222/items/44444444-4444-4444-4444-444444444444/jobs/instances/55555555-5555-5555-5555-555555555555'
+        $script:now = [datetime]::new(2026, 11, 19, 2, 47, 45, [System.DateTimeKind]::Utc)
+        $script:polls = [System.Collections.Generic.Queue[object]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -MockWith { [securestring]::new() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoUtcNow -MockWith { $script:now }
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { $script:now = $script:now.AddSeconds([int]$PesterBoundParameters['Seconds']) }
+        # The job's reads: the queued ones, then the last one again.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -MockWith { [pscustomobject]@{ StatusCode = 200; Headers = @{}; Body = $(if ($script:polls.Count -gt 1) { $script:polls.Dequeue() } else { $script:polls.Peek() }) } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { @(New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Refreshed the semantic model (Direct Lake framing) in about 5 seconds.') }
+        function New-TestRun([string] $Status, [string] $JobStatus, [string] $Message, [switch] $Located) {
+            $evidence = [ordered]@{ notebook = 'NB_DatabaseHub_LiveActivity'; status = $JobStatus; seconds = 2700; queuedSeconds = 2700 }
+            if ($Located) {
+                $evidence['jobLocation'] = $script:job
+            }
+            New-DemoResult -CheckId 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Evidence $evidence
+        }
+        function New-TestRefresh {
+            # Live, 2026-11-19: the model refreshed while the first history run was still queued.
+            New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.REFRESH' -Area 'fabric' -Target 'fabric' -Status 'Fail' -Message 'The refresh ended with status Failed: Retry attempts for failures while executing the refresh exceeded the retry limit set on the request. | 0xC14700C7 We cannot access the source Delta table ''<oii>scenario_runs</oii>'' referenced by table ''<oii>Scenario Runs</oii>''.'
+        }
+        function Invoke-TestFirstRun([object[]] $Fabric, [object[]] $PowerBI, [int] $FollowMinutes = 45) {
+            InModuleScope DbHubDemo -Parameters @{ Fabric = $Fabric; PowerBI = $PowerBI; Config = $config; Follow = $FollowMinutes } {
+                $firstRun = Get-DemoHistoryFirstRun -Result $Fabric
+                Set-DemoHistoryFirstRunWarning -FirstRun $firstRun
+                $waiting = Set-DemoHistoryRefreshWaiting -Result $PowerBI -FirstRun $firstRun -WaitMinutes 45 -FollowMinutes $Follow
+                $again = @(Invoke-DemoHistoryFirstRunFollowUp -Config $Config -FirstRun $firstRun -RefreshWarning $waiting -FollowMinutes $Follow -ProgressPath 'deploy-progress.json')
+                [pscustomobject]@{ FirstRun = $firstRun; Waiting = $waiting; Again = $again }
+            }
+        }
+    }
+
+    It 'refreshes the model again once a run still queued at the bound completes, and says so' {
+        foreach ($status in 'NotStarted', 'NotStarted', 'InProgress', 'Completed') { $script:polls.Enqueue([pscustomobject]@{ status = $status }) }
+        $fabric = @(New-TestRun -Status 'Warning' -JobStatus 'NotStarted' -Message 'NB_DatabaseHub_LiveActivity is still NotStarted after 45 minutes; it keeps running. Check its run in the workspace (Monitor hub).' -Located)
+        $powerBI = @(New-TestRefresh)
+        $done = Invoke-TestFirstRun -Fabric $fabric -PowerBI $powerBI
+        $done.FirstRun.Pending | Should -BeTrue
+        $powerBI[0].status | Should -Be 'Warning'
+        $powerBI[0].message | Should -Be 'The history model had no tables to read at first: NB_DatabaseHub_LiveActivity, the first history run, was still queued on the capacity when its wait ended. It completed 2 minutes later, and deploy.ps1 refreshed the model then.'
+        $powerBI[0].evidence.earlierMessage | Should -Match '0xC14700C7'
+        @($done.Again).Count | Should -Be 1
+        $done.Again[0].status | Should -Be 'Pass'
+        $fabric[0].status | Should -Be 'Pass'
+        $fabric[0].message | Should -Match 'completed once the capacity ran it, 2 minutes after its first wait ended'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -Times 1 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -ParameterFilter { $Id -eq 'Fabric.Report' -and $Message -eq 'NB_DatabaseHub_LiveActivity is queued on the capacity (0 of at most 45 minutes). The history model refreshes once it completes.' }
+    }
+
+    It 'keeps both Warnings, saying what fills the model, and runs nothing more when the run is still queued after the follow-up too' {
+        $script:polls.Enqueue([pscustomobject]@{ status = 'NotStarted' })
+        $fabric = @(New-TestRun -Status 'Warning' -JobStatus 'NotStarted' -Message 'NB_DatabaseHub_LiveActivity is still NotStarted after 45 minutes; it keeps running. Check its run in the workspace (Monitor hub).' -Located)
+        $powerBI = @(New-TestRefresh)
+        $done = Invoke-TestFirstRun -Fabric $fabric -PowerBI $powerBI -FollowMinutes 2
+        @($done.Again).Count | Should -Be 0
+        $powerBI[0].status | Should -Be 'Warning'
+        $powerBI[0].message | Should -Be 'The history model has no tables to read yet: NB_DatabaseHub_LiveActivity, the first history run, is still queued on the capacity after another 2 minutes. deploy.ps1''s history snapshot at the end of its run (DEPLOY.FABRIC.HISTORY) runs it again and refreshes the model.'
+        $fabric[0].status | Should -Be 'Warning'
+        $fabric[0].message | Should -Match 'DEPLOY\.FABRIC\.HISTORY'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -Times 0 -Exactly
+    }
+
+    It 'never fails the step for a first run that failed: the run and the refresh are Warnings that say what fills the model' {
+        $fabric = @(New-TestRun -Status 'Fail' -JobStatus 'Failed' -Message 'NB_DatabaseHub_LiveActivity failed: Cell 7 failed.')
+        $powerBI = @(New-TestRefresh)
+        $done = Invoke-TestFirstRun -Fabric $fabric -PowerBI $powerBI
+        $done.FirstRun.Pending | Should -BeFalse
+        $fabric[0].status | Should -Be 'Warning'
+        $fabric[0].message | Should -Be 'NB_DatabaseHub_LiveActivity failed: Cell 7 failed. It was the first history run, so the history model has no tables yet: deploy.ps1''s history snapshot at the end of its run (DEPLOY.FABRIC.HISTORY) runs it again and refreshes the model.'
+        $fabric[0].remediation | Should -Match 'Monitor hub'
+        $powerBI[0].status | Should -Be 'Warning'
+        $powerBI[0].message | Should -Match '^The history model has no tables to read yet: NB_DatabaseHub_LiveActivity, the first history run, didn''t complete'
+        @($done.Again).Count | Should -Be 0
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -Times 0 -Exactly
+    }
+
+    It 'leaves an update as it is: no first history run, so nothing waits, and a refresh that failed stays a Fail' {
+        # An update imports the notebook again but doesn't run it (configure-fabric.ps1 runs it only when it created it).
+        $fabric = @(New-DemoResult -CheckId 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Updated NB_DatabaseHub_LiveActivity.')
+        $powerBI = @(New-TestRefresh)
+        $done = Invoke-TestFirstRun -Fabric $fabric -PowerBI $powerBI
+        $done.FirstRun | Should -BeNullOrEmpty
+        $done.Waiting | Should -BeNullOrEmpty
+        $powerBI[0].status | Should -Be 'Fail'
+        # A first run that completed: the refresh's failure is its own, so it stays a Fail too.
+        $completed = @(New-TestRun -Status 'Pass' -JobStatus 'Completed' -Message 'NB_DatabaseHub_LiveActivity ran on demand and completed in about 76 seconds.')
+        (Invoke-TestFirstRun -Fabric $completed -PowerBI $powerBI).Waiting | Should -BeNullOrEmpty
+        $powerBI[0].status | Should -Be 'Fail'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricRequest -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Start-Sleep -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -Times 0 -Exactly
     }
 }
