@@ -17,8 +17,8 @@ internal sealed record SidecarIndexPage(int Page, int Pages, IReadOnlyList<Sidec
 {
     private static readonly JsonWriterOptions Options = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
 
-    /// <summary>0, or 2 when there's nothing to fetch: no sidecar is new or pending.</summary>
-    public int ExitCode => Pages == 0 ? 2 : 0;
+    /// <summary>1 for a failure (Fail); otherwise 0, or 2 when nothing is offerable, new or pending: the line prints either way.</summary>
+    public int ExitCode => Status == "Fail" ? 1 : Pages == 0 ? 2 : 0;
 
     /// <summary>The page as its one line: <c>DBHUBDEMO-RCAS-INDEX &lt;json&gt;</c>.</summary>
     public string Line()
@@ -64,8 +64,9 @@ internal sealed record SidecarIndexPage(int Page, int Pages, IReadOnlyList<Sidec
 /// <summary>
 /// <c>rca sidecar-export</c>'s index (rca/README.md, The runner's commands): the store's new and pending sidecars, the
 /// oldest sealed first, a page at a time, with ADR 0012's status and a message that also counts the sidecars that expired
-/// unread. <c>new</c> is a sidecar this call sealed; <c>pending</c> one sealed earlier and not acknowledged yet, offered
-/// again. A page past the last is empty, with the true number of pages.
+/// unread, and says what the export couldn't do. <c>new</c> is a sidecar this call sealed; <c>pending</c> one sealed
+/// earlier and not acknowledged yet, offered again. A page past the last is empty, with the true number of pages. A
+/// failure is a page of its own (<see cref="Failed"/>), whose exit code is 1, never 2's nothing to fetch.
 /// </summary>
 internal static class SidecarIndex
 {
@@ -82,8 +83,12 @@ internal static class SidecarIndex
 
     private const int MaximumMessage = 500;
 
-    /// <summary>Page <paramref name="page"/> (from 1) of the store's offerable sidecars; <paramref name="sealedNow"/> are the IDs this call sealed.</summary>
-    public static SidecarIndexPage Page(ISidecarCatalog catalog, int page, IReadOnlyCollection<string> sealedNow)
+    /// <summary>
+    /// Page <paramref name="page"/> (from 1) of the store's offerable sidecars; <paramref name="sealedNow"/> are the IDs this
+    /// call sealed, and <paramref name="problems"/> what it couldn't do (a span not sealed, the observer still capturing),
+    /// each a sentence of the message and the page a Warning.
+    /// </summary>
+    public static SidecarIndexPage Page(ISidecarCatalog catalog, int page, IReadOnlyCollection<string> sealedNow, IReadOnlyList<string>? problems = null)
     {
         ArgumentNullException.ThrowIfNull(catalog);
         ArgumentNullException.ThrowIfNull(sealedNow);
@@ -122,9 +127,23 @@ internal static class SidecarIndex
             message.Append(CultureInfo.InvariantCulture, $" {Plural(expired, "sidecar")} expired unread: sealed more than 30 days ago and never acknowledged, so {(expired == 1 ? "its" : "their")} Query Store evidence isn't in the history.");
         }
 
-        var status = expired > 0 ? "Warning" : offerable.Count == 0 ? "Not selected" : "Pass";
-        var text = Redactor.Redact(message.ToString());
-        var result = new SidecarIndexPage(page, pages, documents, status, text.Length <= MaximumMessage ? text : text[..(MaximumMessage - 3)] + "...");
+        foreach (var problem in problems ?? [])
+        {
+            message.Append(' ').Append(problem);
+        }
+
+        var status = expired > 0 || problems is { Count: > 0 } ? "Warning" : offerable.Count == 0 ? "Not selected" : "Pass";
+        return Fitted(new SidecarIndexPage(page, pages, documents, status, message.ToString()));
+    }
+
+    /// <summary>A failure's page (exit code 1): no sidecar listed, and why, so the caller never takes it for nothing to fetch.</summary>
+    public static SidecarIndexPage Failed(int page, string message) => Fitted(new SidecarIndexPage(Math.Max(1, page), 0, [], "Fail", message));
+
+    /// <summary>The page with its message redacted and cut to 500 characters, and to what keeps its line within 3,400.</summary>
+    private static SidecarIndexPage Fitted(SidecarIndexPage page)
+    {
+        var text = Redactor.Redact(page.Message);
+        var result = page with { Message = text.Length <= MaximumMessage ? text : text[..(MaximumMessage - 3)] + "..." };
 
         // The page's refs are bounded (8, IDs of at most 88 characters), so only the message can make the line too long.
         var over = result.Line().Length - RcaContract.MaximumLineLength;

@@ -433,6 +433,25 @@ public sealed class RcaSidecarCodecTests
     }
 
     [Fact]
+    public void TheIndexSaysWhatTheExportCouldntDoAndAFailureExitsWith1()
+    {
+        const string problem = "A span's sidecar rows couldn't be sealed; the next sealing tries again.";
+        var some = SidecarIndex.Page(new FakeCatalog([Sealed(0)]), 1, [], [problem]);
+        Assert.Equal(("Warning", 0), (some.Status, some.ExitCode));
+        Assert.EndsWith(problem, some.Message, StringComparison.Ordinal);
+
+        // Nothing offerable is exit code 2 whatever the status, and the line still says why.
+        var none = SidecarIndex.Page(new FakeCatalog([]), 1, [], [problem]);
+        Assert.Equal(("Warning", 2), (none.Status, none.ExitCode));
+
+        // A failure exits with 1, so a caller never reads it as nothing to fetch.
+        var failed = SidecarIndex.Failed(1, "The sidecar export failed: its store can't be read.");
+        Assert.Equal(("Fail", 1, 0), (failed.Status, failed.ExitCode, failed.Pages));
+        Assert.Empty(failed.Documents);
+        Assert.Empty(RcaSchemas.Errors(RcaSchemas.Transport, failed.Line()[(SidecarParts.IndexMarker.Length + 1)..]));
+    }
+
+    [Fact]
     public void RcaPartPrintsASealedSidecarsPartAndNothingForAnUnknownDocumentOrPart()
     {
         var draft = FixtureDraft("t3-plan-regression");
