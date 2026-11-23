@@ -115,18 +115,24 @@ public sealed class RcaSidecarWiringTests : IDisposable
     [InlineData(true)]
     public async Task SlowQueryStoreEndReadsLeaveTheSpanAndTheExportAsWithoutASidecar(bool hostStops)
     {
-        // The lane releases a target where its evidence's own end was done (TargetObserver.EndAsync's hook), not once the
-        // sidecar's end reads have returned, whether its session ends or its host stops: on the lane's clock those reads
-        // take 4 s a block here.
+        // The lane releases a target where its evidence's own end was done (TargetObserver.EndAsync's hook, on the lane's
+        // clock), not once the sidecar's end reads have returned, whether its session ends or its host stops: on the lane's
+        // clock those reads take 4 s a block here, and the evidence's end 3 s, its event session's drop.
         var without = await RunLaneAsync(Path.Combine(root, "without"), sidecar: false, hostStops);
         var with = await RunLaneAsync(Path.Combine(root, "with"), sidecar: true, hostStops);
 
         Assert.Equal(0, without.EndReads);
         Assert.InRange(with.EndReads, 1, 100);
-        Assert.True(with.ClockAfterEnd > with.ClockAtEnd, "The Query Store end reads took no time on the lane's clock.");
+        Assert.True(with.ClockAfterEnd > with.ClockAtEnd + TimeSpan.FromSeconds(3), "The Query Store end reads took no time on the lane's clock.");
         Assert.Equal(without.ClockAtEnd, with.ClockAtEnd);
         Assert.Equal(without.Span, with.Span);
         Assert.Equal(without.Export, with.Export);
+
+        // The span's end and the evidence's last watermark are where its own end was done, after the drop: not where the
+        // lane began to end the target.
+        var evidenceEnd = with.ClockAtEnd + TimeSpan.FromSeconds(3);
+        Assert.Equal<(DateTimeOffset?, DateTimeOffset?, DateTimeOffset?)>((evidenceEnd, evidenceEnd, evidenceEnd), with.Ends);
+        Assert.Equal(with.Ends, without.Ends);
     }
 
     [Fact]
@@ -163,16 +169,31 @@ public sealed class RcaSidecarWiringTests : IDisposable
     }
 
     /// <summary>
-    /// T1 observed by the real lane, on a clock only the test and a slow Query Store block move: begun at 16:50, ticked at
-    /// 16:52, then out of its session, or its host stopping (the lane cancelled). Returns its span record, its final export
-    /// as printed, how many Query Store blocks ran at its end, and the clock when its end began and once the span closed.
+    /// T1 observed by the real lane, on a clock only the test, the end's event session drop (3 s), and the Query Store
+    /// blocks after it (4 s each) move: begun at 16:50, ticked at 16:52, then out of its session, or its host stopping (the
+    /// lane cancelled). Returns its span record, its final export as printed, how many Query Store blocks ran at its end,
+    /// the clock when its end began and once the span closed, and T1's interval end, last watermark, and the span's close.
     /// </summary>
-    private static async Task<(string Span, string Export, int EndReads, DateTimeOffset ClockAtEnd, DateTimeOffset ClockAfterEnd)> RunLaneAsync(string storeRoot, bool sidecar, bool hostStops)
+    private static async Task<(string Span, string Export, int EndReads, DateTimeOffset ClockAtEnd, DateTimeOffset ClockAfterEnd, (DateTimeOffset?, DateTimeOffset?, DateTimeOffset?) Ends)> RunLaneAsync(string storeRoot, bool sidecar, bool hostStops)
     {
         var clock = new ManualTime(RcaSimulation.T1From);
         var connector = new TimedConnector(clock, RcaSimulation.T1(clock));
         var ending = new StrongBox<bool>();
-        connector.Cost = _ => Volatile.Read(ref ending.Value) ? TimeSpan.FromSeconds(4) : TimeSpan.Zero;
+        var dropped = new StrongBox<bool>();
+
+        // The drop is the evidence's last block at its end, and only Query Store's end reads come after it: a tick's own
+        // Query Store read, which may still run once the test begins the end, costs nothing.
+        connector.EvidenceCost = (block, _) =>
+        {
+            if (block != "RCA-XE-05" || !Volatile.Read(ref ending.Value))
+            {
+                return TimeSpan.Zero;
+            }
+
+            Volatile.Write(ref dropped.Value, true);
+            return TimeSpan.FromSeconds(3);
+        };
+        connector.Cost = _ => Volatile.Read(ref dropped.Value) ? TimeSpan.FromSeconds(4) : TimeSpan.Zero;
         var store = new EvidenceStore(storeRoot, clock, host: "sqlvm01");
         var gate = new Gate();
         var observer = new SqlTargetObserver("T1", DemoTarget.T1, connector, RcaV1PinTests.PinOptions, RunnerLog.Null, sidecar ? new MemorySidecarSink() : null);
@@ -210,12 +231,15 @@ public sealed class RcaSidecarWiringTests : IDisposable
         }
 
         var afterEnd = clock.Now;
+        var closed = store.Spans().Single().Span;
+        var t1 = closed.Targets["T1"];
+        var ends = (t1.Intervals[^1].To, t1.WatermarkUtc, closed.ClosedUtc);
         var span = File.ReadAllText(Path.Combine(store.Spans().Single().Directory, "span.json"));
         clock.Set(RcaSimulation.T1From.AddMinutes(10));
         var exporter = new Exporter(store, RunnerLog.Null, "1.0.0");
         var result = exporter.Export(Session, final: true, TimeSpan.Zero);
         var export = result.IndexLine() + string.Concat(result.Documents.SelectMany(d => Enumerable.Range(1, d.Parts).Select(i => "\n" + exporter.Part(d.DocumentId, i))));
-        return (span, export, Calls(connector) - before, atEnd, afterEnd);
+        return (span, export, Calls(connector) - before, atEnd, afterEnd, ends);
 
         // The lane adds calls while the test reads them: a copy, never the list itself.
         static int Calls(TimedConnector connector) => connector.Calls.ToArray().Count(c => c.BlockId is { } block && TimedConnector.QueryStoreBlocks.Contains(block));
