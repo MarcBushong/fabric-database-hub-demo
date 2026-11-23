@@ -22,6 +22,31 @@ import { APP_TOKENS, applyAppTokens, contrastRatio, FABRIC_BRAND, FLUENT_THEMES,
 import { APP_BRAND, EARTH_ACCENTS, MICROSOFT_BRAND, TERRACOTTA_BRAND } from "@/theme/identity";
 import { STAGE_TOKENS, stageStyle, stageTheme } from "@/theme/stage";
 
+/** A stylesheet's rules, comments dropped, each with the at-rules around it (its @media, @container, ...), outermost first. */
+function cssRules(css: string): Array<{ selectors: string[]; body: string; media: string[] }> {
+    const text = css.replace(/\/\*[\s\S]*?\*\//g, "");
+    const rules: Array<{ selectors: string[]; body: string; media: string[] }> = [];
+    const open: string[] = [];
+    let start = 0;
+    for (let i = 0; i < text.length; i++) {
+        if (text[i] === "}") {
+            open.pop();
+            start = i + 1;
+        } else if (text[i] === "{") {
+            const prelude = (text.slice(start, i).split(";").pop() ?? "").trim();
+            if (prelude.startsWith("@")) {
+                open.push(prelude);
+                start = i + 1;
+            } else {
+                const close = text.indexOf("}", i);
+                rules.push({ selectors: prelude.split(",").map((s) => s.trim()), body: text.slice(i + 1, close), media: [...open] });
+                i = close;
+                start = close + 1;
+            }
+        }
+    }
+    return rules;
+}
 describe("themes", () => {
     const warm = { light: FLUENT_THEMES.light, dark: FLUENT_THEMES.dark };
     // The solid colors text and controls sit on: cards, navigation, the page, and the darker panels (a stage panel in light).
@@ -88,6 +113,103 @@ describe("themes", () => {
         }
     });
 
+    it("in high contrast, gives what the app colors on a hovered or pressed fill the foreground Fluent pairs with that fill, outside Windows forced colors", () => {
+        // Fluent's high contrast fills a hovered or pressed row, subtle or transparent button, menu item, or list option in
+        // cyan, under black. The app's own colors don't switch with it: on the cyan they were 1.03:1 to 1.53:1 (the re-check
+        // of f28d6320, and the review of cc1fe148). So each place they sit on such a fill takes the foreground Fluent pairs
+        // with it (styles/app.css).
+        const hc = FLUENT_THEMES.contrast as unknown as Record<string, string>;
+        const rules = cssRules(readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8"));
+        const ruleOf = (selector: string) => rules.find((r) => r.selectors.includes(`[data-theme="contrast"] ${selector}`));
+        // Each place: what the app colors there, the property, the fill under it, and its minimum: 4.5:1 for text, 3:1 for a mark.
+        const ROW = { hover: "colorSubtleBackgroundHover", active: "colorSubtleBackgroundPressed" } as const;
+        const ITEM = { hover: "colorNeutralBackground1Hover", active: "colorNeutralBackground1Pressed" } as const;
+        const CLEAR = { hover: "colorTransparentBackgroundHover", active: "colorTransparentBackgroundPressed" } as const;
+        // Fluent drops a disabled button's, menu item's, and option's hover and pressed fill, so the black follows only an
+        // enabled one: on a disabled Ask Copilot it went black on black, and the target filter's disabled item lost its mark.
+        const ENABLED_ITEM = ':not([aria-disabled="true"])';
+        const PLACES: Array<[selector: string, property: string, fill: string, minimum: number]> = [
+            ...(["hover", "active"] as const).flatMap((s): Array<[string, string, string, number]> => [
+                [`.fui-TableRow:${s} .status-badge`, "color", ROW[s], 4.5],
+                [`.fui-TableRow:${s} .muted`, "color", ROW[s], 4.5],
+                [`.fui-TableRow:${s} a`, "color", ROW[s], 4.5],
+                [`.fui-TableRow:${s} .target-chip i`, "background", ROW[s], 3],
+                // The target filter's menu, and the Manage page's target list.
+                [`.fui-MenuItemCheckbox${ENABLED_ITEM}:${s} .target-chip i`, "background", ITEM[s], 3],
+                [`.fui-Option${ENABLED_ITEM}:${s} .target-chip i`, "background", ITEM[s], 3],
+                // The top bar's account chips, and their captions: "Fabric", the GitHub plan, and "Didn't finish".
+                [`.account-chip:enabled:${s}`, "color", ROW[s], 4.5],
+                [`.account-chip:enabled:${s} .account-text small`, "color", ROW[s], 4.5],
+                [`.ask-copilot:enabled:${s}`, "color", ROW[s], 4.5],
+                [`.ask-why:enabled:${s}`, "color", CLEAR[s], 4.5],
+                [`.copilot-account:enabled:${s} .copilot-account-plan`, "color", CLEAR[s], 4.5],
+            ]),
+            // A KPI tile's button: the app's own hover fill, which a press keeps.
+            ["button.kpi-main:hover", "color", ROW.hover, 4.5],
+            ["button.kpi-main:hover .kpi-label", "color", ROW.hover, 4.5],
+            ["button.kpi-main:hover .kpi-sub", "color", ROW.hover, 4.5],
+        ];
+        for (const [selector, property, fill, minimum] of PLACES) {
+            const rule = ruleOf(selector);
+            const name = rule?.body.match(new RegExp(`(?:^|[;\\s])${property}:\\s*var\\(--(\\w+)\\)`))?.[1] ?? "missing";
+            expect(contrastRatio(hc[name] ?? `no ${name}`, hc[fill]), `${selector}: ${name} on ${fill}`).toBeGreaterThanOrEqual(minimum);
+            // A target's mark is an inline background, and Ask's text the brand's with !important: only !important replaces them.
+            if (/target-chip i$|^\.ask-/.test(selector)) expect(rule?.body, selector).toMatch(/!important\s*;/);
+            // Not under Windows forced colors: the app picks high contrast there too, but a hovered menu item takes the system's
+            // Highlight under forced-color-adjust: none, on which Fluent's black can be 2.78:1 (the Desert theme's #903909).
+            expect(rule?.media, selector).toEqual(["@media (forced-colors: none)"]);
+        }
+        // Every high contrast rule for a hovered or pressed control is in that group, and none colors a disabled one.
+        for (const rule of rules.filter((r) => r.selectors.some((s) => s.startsWith('[data-theme="contrast"]') && /:(hover|active)\b/.test(s)))) {
+            expect(rule.media, rule.selectors.join(", ")).toEqual(["@media (forced-colors: none)"]);
+            for (const s of rule.selectors) {
+                if (/\.(ask-copilot|ask-why|account-chip|copilot-account)\b/.test(s)) expect(s).toContain(":enabled");
+                if (/\.fui-(MenuItemCheckbox|Option)\b/.test(s)) expect(s).toContain(ENABLED_ITEM);
+            }
+        }
+        // A bar chart's hovered category: the cyan band would sit under high contrast's bright bars (1.03:1 to 1.36:1), so
+        // it's an outline with no fill, at 3:1 or more on the chart's black. Under forced colors too, where the app's high
+        // contrast charts keep their colors.
+        const band = ruleOf(".chart-cursor-band rect");
+        expect(band?.body, "the band's fill").toMatch(/(?:^|[;\s])fill:\s*none\s*;/);
+        const stroke = band?.body.match(/(?:^|[;\s])stroke:\s*var\(--(\w+)\)/)?.[1] ?? "missing";
+        expect(contrastRatio(hc[stroke] ?? `no ${stroke}`, hc.colorNeutralBackground1), `the band's outline, ${stroke}`).toBeGreaterThanOrEqual(3);
+        expect(band?.media, "the band's outline").toEqual([]);
+        // Under forced colors, the browser leaves the chart's colors as they are while the card under it takes the system's
+        // Canvas, white with a light palette, where the white outline was 1:1 (the browser check): it takes CanvasText there,
+        // in a rule after the one above, so it wins. A line chart's cursor, white too, takes it with it (1.04:1 before).
+        const forcedBand = rules.find((r) => r.selectors.includes('[data-theme="contrast"] .chart-cursor-band rect') && r.media.length > 0);
+        expect(forcedBand?.media, "the band's outline under forced colors").toEqual(["@media (forced-colors: active)"]);
+        expect(forcedBand?.body, "the band's outline under forced colors").toMatch(/(?:^|[;\s])stroke:\s*CanvasText\s*;/);
+        expect(forcedBand ? rules.indexOf(forcedBand) : -1, "after the outline's own rule").toBeGreaterThan(band ? rules.indexOf(band) : Infinity);
+        expect(forcedBand?.selectors, "a line chart's cursor under forced colors").toContain('[data-theme="contrast"] .chart-cursor line');
+    });
+
+    it("under Windows forced colors, gives a hovered filter item's target mark HighlightText, the system's pair for the Highlight Fluent paints the item in, and a pressed one the pressed item's own words' color", () => {
+        // Fluent's hovered menu item takes the system's Highlight under forced-color-adjust: none, so a target's mark showed its
+        // theme color on it, as low as 1.01:1 on Night sky's Highlight (the review of cc1fe148).
+        const rules = cssRules(readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8"));
+        const selector = '.fui-MenuItemCheckbox:not([aria-disabled="true"]):hover .target-chip i';
+        const rule = rules.find((r) => r.selectors.includes(selector));
+        expect(rule?.media, selector).toEqual(["@media (forced-colors: active)"]);
+        // The mark's color is an inline background: only !important replaces it.
+        expect(rule?.body, selector).toMatch(/(?:^|[;\s])background:\s*HighlightText\s*!important\s*;/);
+        // Pressed, Fluent's pressed fill and words (:hover:active) outrank its forced-colors Highlight and stay unforced, in the
+        // theme's colors (the browser check: HighlightText on them was 1.23:1 to 1.46:1), so the mark takes the words' color,
+        // with a selector that outranks the hovered one.
+        const pressedSelector = '.fui-MenuItemCheckbox:not([aria-disabled="true"]):hover:active .target-chip i';
+        const pressed = rules.find((r) => r.selectors.includes(pressedSelector));
+        expect(pressed?.media, pressedSelector).toEqual(["@media (forced-colors: active)"]);
+        expect(pressed?.body, pressedSelector).toMatch(/(?:^|[;\s])background:\s*var\(--colorNeutralForeground2Pressed\)\s*!important\s*;/);
+        for (const id of ["light", "dark", "contrast"] as const) {
+            const theme = FLUENT_THEMES[id] as unknown as Record<string, string>;
+            expect(contrastRatio(theme.colorNeutralForeground2Pressed, theme.colorNeutralBackground1Pressed), `${id}: a pressed item's mark on its fill`).toBeGreaterThanOrEqual(3);
+        }
+        // Only there: a list option, and a disabled or focused item, have no Highlight under forced colors, and HighlightText
+        // on their Canvas would hide the mark as surely as Canvas does.
+        const marks = rules.filter((r) => r.media.includes("@media (forced-colors: active)") && r.selectors.some((s) => s.includes(".target-chip")));
+        expect(marks.flatMap((r) => r.selectors)).toEqual([selector, pressedSelector]);
+    });
     it("keeps the chart's incident band label readable (4.5:1) with the band over each surface a chart sits on, the stage's included", () => {
         // The band is translucent: its label sits on the band blended over the surface, as the browser composites it.
         const over = (rgba: string, base: string) => {
