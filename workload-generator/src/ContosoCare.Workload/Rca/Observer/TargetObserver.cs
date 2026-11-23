@@ -57,9 +57,18 @@ internal sealed record QuietResult(IReadOnlyList<CaptureValues>? Rows, CaptureFa
 {
     public bool Succeeded => Rows is not null;
 
+    /// <summary>
+    /// The failure in its own words: <see cref="Message"/> without the observer's fix that a refusal's message ends with,
+    /// so a reader can give a block its own fix (a block that needs a permission the target's general fix doesn't give).
+    /// </summary>
+    public string? Error { get; init; }
+
     public static QuietResult Of(IReadOnlyList<CaptureValues> rows) => new(rows, null, null);
 
-    public static QuietResult Failed(CaptureFailureKind kind, string message) => new(null, kind, message);
+    public static QuietResult Failed(CaptureFailureKind kind, string message) => new(null, kind, message) { Error = message };
+
+    /// <summary>A refusal: its error, and in <see cref="Message"/> the observer's fix after it.</summary>
+    public static QuietResult Refused(string error, string fix) => new(null, CaptureFailureKind.Permission, $"{error} {fix}") { Error = error };
 }
 
 /// <summary>
@@ -104,6 +113,10 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
 
     // A connection a sidecar read found lost and closed: the evidence capture's next block notes it (RunCoreAsync).
     private CaptureException? quietLoss;
+
+    // EndAsync's hook, and whether the evidence's own end has run it (EvidenceEnded).
+    private Action? evidenceEndedHook;
+    private bool evidenceEndDone;
 
     /// <summary>The target's key in the evidence: T1, T2, T3, T4, or T4-replica.</summary>
     public string Target { get; } = target;
@@ -157,20 +170,53 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
     /// <summary>Closes a connection a probe opened when observing never began (the session ended first).</summary>
     public Task ReleaseAsync() => DisconnectAsync();
 
-    /// <summary>Ends observing: the last reads, open episodes closed, the event session dropped, the connection closed.</summary>
-    public async Task EndAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    /// <summary>
+    /// Ends observing: the last reads, open episodes closed, the event session dropped, the connection closed.
+    /// <paramref name="evidenceEnded"/> runs once, when the evidence's own end is done and its last watermark written:
+    /// before a sidecar reader's end reads, which may take a while (Query Store's, up to their bound), or else as the
+    /// evidence's end returns. The lane takes its time then and releases the target at it once this returns, so the span's
+    /// end, its watermark, and RCA Coverage's window are the evidence's own, as without a sidecar, and a sidecar's last
+    /// rows still have their span.
+    /// </summary>
+    public async Task EndAsync(DateTimeOffset now, CancellationToken cancellationToken, Action? evidenceEnded = null)
     {
+        evidenceEndedHook = evidenceEnded;
+        evidenceEndDone = false;
         try
         {
             await StopAsync(now, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            Sink.Watermark(Target, now);
-            await DisconnectAsync().ConfigureAwait(false);
-            Log.Info("rca.observed", "The RCA observer stopped capturing this target.", ("target", Target));
-            Sink = NullSink.Instance;
+            try
+            {
+                EvidenceEnded(now);
+            }
+            finally
+            {
+                await DisconnectAsync().ConfigureAwait(false);
+                Log.Info("rca.observed", "The RCA observer stopped capturing this target.", ("target", Target));
+                Sink = NullSink.Instance;
+            }
         }
+    }
+
+    /// <summary>
+    /// The evidence's own end is done (StopAsync's evidence part): its last watermark, then EndAsync's hook, once. A
+    /// subclass calls it before its sidecar reads' end, so they don't move the span's end; EndAsync calls it otherwise.
+    /// </summary>
+    protected void EvidenceEnded(DateTimeOffset now)
+    {
+        if (evidenceEndDone)
+        {
+            return;
+        }
+
+        evidenceEndDone = true;
+        Sink.Watermark(Target, now);
+        var hook = evidenceEndedHook;
+        evidenceEndedHook = null;
+        hook?.Invoke();
     }
 
     protected abstract Task StartAsync(DateTimeOffset now, CancellationToken cancellationToken);
@@ -266,7 +312,7 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
     {
         if (quietRefusedUntil.TryGetValue(blockId, out var until) && now < until)
         {
-            return QuietResult.Failed(CaptureFailureKind.Permission, string.Create(CultureInfo.InvariantCulture, $"it was refused a permission on {Target}, so it's tried again at {until:HH:mm:ss} UTC. {fix}"));
+            return QuietResult.Refused(string.Create(CultureInfo.InvariantCulture, $"it was refused a permission on {Target}, so it's tried again at {until:HH:mm:ss} UTC."), fix);
         }
 
         if (connection is not { } open)
@@ -285,7 +331,7 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
             {
                 case CaptureFailureKind.Permission:
                     quietRefusedUntil[blockId] = now + Options.PermissionRetry;
-                    return QuietResult.Failed(ex.Kind, $"{ex.Message} {fix}");
+                    return QuietResult.Refused(ex.Message, fix);
                 case CaptureFailureKind.Connection:
                     await DisconnectAsync().ConfigureAwait(false);
                     quietLoss = ex;
