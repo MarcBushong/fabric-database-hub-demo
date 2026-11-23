@@ -1034,7 +1034,8 @@ function Get-DemoStopResultOutcome {
 function Get-DemoSafetyStopJobResult {
     # The result line DbHub-Stop wrote in a job's output ('DBHUB-STOP <json>'), parsed, or $null (Job - Get Output:
     # https://learn.microsoft.com/rest/api/automation/job/get-output). -JobName is the job's ID (properties.jobId), which
-    # Job - Get Output answers for as for the job's name (live, 2026-11-09). Internal.
+    # Job - Get Output answers for as for the job's name (live, 2026-11-09). -Marker DBHUB-CONTROL reads DbHub-Control's
+    # result line instead (2026-11-23). Internal.
     [CmdletBinding()]
     [OutputType([object])]
     param(
@@ -1042,7 +1043,10 @@ function Get-DemoSafetyStopJobResult {
         [pscustomobject] $Name,
 
         [Parameter(Mandatory)]
-        [string] $JobName
+        [string] $JobName,
+
+        [ValidateSet('DBHUB-STOP', 'DBHUB-CONTROL')]
+        [string] $Marker = 'DBHUB-STOP'
     )
 
     $output = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/jobs/{1}/output' -f $Name.AutomationAccountId, $JobName) -ApiVersion $script:SafetyStopAutomationApiVersion)
@@ -1050,7 +1054,7 @@ function Get-DemoSafetyStopJobResult {
         return $null
     }
     $text = if ($output.Value -is [string]) { $output.Value } else { ConvertTo-Json -InputObject $output.Value -Depth 8 -Compress }
-    $match = [regex]::Match($text, '(?m)^DBHUB-STOP (\{.*\})\s*$')
+    $match = [regex]::Match($text, ('(?m)^{0} (\{{.*\}})\s*$' -f [regex]::Escape($Marker)))
     if (-not $match.Success) {
         return $null
     }

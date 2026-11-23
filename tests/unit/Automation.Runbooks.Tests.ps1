@@ -549,11 +549,24 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         @{ Name = 'the showcase with a target off'; Body = @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'showcase' }, @{ target = 'T2'; scenario = 'off' }); durationMinutes = 120 } }
         @{ Name = 'an ru-storm on T5, at its maximum concurrency'; Body = @{ action = 'run'; activities = @(@{ target = 'T5'; scenario = 'ru-storm'; intensity = 8; concurrency = 16 }); durationMinutes = 30 } }
         @{ Name = 'a reset of T5'; Body = @{ action = 'reset'; targets = @('T5') } }
+        @{ Name = 'the golden capture''s read of the status''s lists (2026-11-23)'; Body = @{ action = 'pending'; requestedBy = 'capture-t2-golden.ps1' } }
     ) {
         $request = Test-DbHubControlRequest -WebhookData (New-Webhook $Body) -Settings $script:settings
         $request.Reason | Should -BeNullOrEmpty
         $request.Valid | Should -BeTrue
         $request.Action | Should -Be $Body.action
+    }
+
+    It 'reads WebhookData given as the JSON of its properties, as a job started through Azure Resource Manager can pass it (2026-11-23)' {
+        # capture-t2-golden.ps1 starts the pending action as a job, with WebhookData as JSON (Learn: an [object] parameter
+        # takes named values); Azure Automation gives the runbook an object, and its text reads the same.
+        $text = ConvertTo-Json -Compress -InputObject ([ordered]@{ WebhookName = 'capture-t2-golden.ps1'; RequestBody = '{"action":"pending","requestedBy":"capture-t2-golden.ps1"}' })
+        $request = Test-DbHubControlRequest -WebhookData $text -Settings $script:settings
+        $request.Valid | Should -BeTrue
+        $request.Action | Should -Be 'pending'
+        $request.RequestedBy | Should -Be 'capture-t2-golden.ps1'
+        (Test-DbHubControlRequest -WebhookData '{not json' -Settings $script:settings).Reason | Should -Match 'no body'
+        (Test-DbHubControlRequest -WebhookData (ConvertTo-Json -Compress -InputObject @{ RequestBody = '{"action":"delete"}' }) -Settings $script:settings).Reason | Should -Match 'action must be'
     }
 
     It 'keeps a one-item list a list (the pipeline would unwrap it)' {
@@ -606,6 +619,7 @@ Describe 'DbHub-Control request validation (Test-DbHubControlRequest)' {
         @{ Name = 'ru-storm on a SQL target'; Raw = '{"action":"run","activities":[{"target":"T1","scenario":"ru-storm"}],"durationMinutes":20}'; Match = 'T1' }
         @{ Name = 'an ru-storm over its maximum concurrency'; Raw = '{"action":"run","activities":[{"target":"T5","scenario":"ru-storm","concurrency":17}],"durationMinutes":20}'; Match = 'concurrency' }
         @{ Name = 'a target past T5'; Raw = '{"action":"run","activities":[{"target":"T6","scenario":"baseline"}],"durationMinutes":20}'; Match = 'target must be' }
+        @{ Name = 'a session on the read of the status''s lists'; Raw = ('{"action":"pending","sessionId":"' + ('a' * 32) + '"}'); Match = 'isn''t allowed for pending' }
     ) {
         $data = if ($null -eq $Raw) { $null } else { New-Webhook $Raw }
         $request = Test-DbHubControlRequest -WebhookData $data -Settings $script:settings
@@ -726,6 +740,52 @@ Describe 'DbHub-Control and DbHub-Stop against a mocked Azure Resource Manager' 
         $result.status | Should -Be 'Refused'
         $result.message | Should -Match 'Another DbHub-Control job'
         @($script:calls | Where-Object Method -NE 'GET') | Should -BeNullOrEmpty
+    }
+
+    It 'reads the status copy''s lists for the golden capture, encrypted or not, and only reads (pending, 2026-11-23)' {
+        # capture-t2-golden.ps1 starts this as a job when Resource Manager returns the variable with no value, as it does once a
+        # tenant's policy has encrypted it: Get-AutomationVariable reads it all the same.
+        $carry = [ordered]@{ sessionId = 'b' * 32; pending = @([ordered]@{ documentId = 'doc-earlier-t2'; parts = 1; sha256 = ('d' * 64); vm = 'archost01' }); leftVms = @('archost01'); expiresUtc = '2026-10-30T00:00:00Z'; bundles = @(('e' * 32)) }
+        $copy = [ordered]@{ schemaVersion = 1; sessionId = 'a' * 32; phase = 'stopped'; updatedUtc = '2026-10-27T14:00:00Z'; steps = @([ordered]@{ step = 'Start'; status = 'Pass'; message = 'started' }); rca = [ordered]@{ sessionId = 'a' * 32; pending = @([ordered]@{ documentId = 'doc-own-t2'; parts = 2; sha256 = ('a' * 64); vm = 'archost01' }, [ordered]@{ documentId = 'doc-own-t1'; parts = 1; sha256 = ('b' * 64); vm = 'sqlvm01' }); leftVms = @('sqlvm01') }; rcaHandoff = @([ordered]@{ documentId = 'doc-handoff-t2'; parts = 1; sha256 = ('c' * 64); vm = 'archost01' }); rcaEarlierPending = @($carry) }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $copy -Depth 8 -Compress
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'pending'; requestedBy = 'capture-t2-golden.ps1' }) -Context (New-TestContext)
+        $result.action | Should -Be 'pending'
+        $result.status | Should -Be 'Read'
+        $result.message | Should -Be ('The session''s status copy was read: session {0}, stopped, last written 2026-10-27T14:00:00Z.' -f ('a' * 32))
+        $result.pending.sessionId | Should -Be ('a' * 32)
+        $result.pending.phase | Should -Be 'stopped'
+        $result.pending.updatedUtc | Should -Be '2026-10-27T14:00:00Z'
+        @($result.pending.rca.pending | ForEach-Object { '{0} {1}' -f $_['documentId'], $_['vm'] }) | Should -Be @('doc-own-t2 archost01', 'doc-own-t1 sqlvm01')
+        @($result.pending.rcaHandoff | ForEach-Object { '{0} {1}' -f $_['documentId'], $_['vm'] }) | Should -Be @('doc-handoff-t2 archost01')
+        @($result.pending.rcaEarlierPending).Count | Should -Be 1
+        $result.pending.rcaEarlierPending[0]['sessionId'] | Should -Be ('b' * 32)
+        $result.pending.rcaEarlierPending[0]['expiresUtc'] | Should -Be '2026-10-30T00:00:00Z'
+        @($result.pending.rcaEarlierPending[0]['pending'] | ForEach-Object { $_['documentId'] }) | Should -Be @('doc-earlier-t2')
+        # Only what the capture reads: no steps, parts, checksums, or bundles.
+        @($result.pending.Keys) | Should -Be @('sessionId', 'phase', 'updatedUtc', 'rca', 'rcaHandoff', 'rcaEarlierPending')
+        @($result.pending.rca.pending[0].Keys) | Should -Be @('documentId', 'vm')
+        # The result line DbHub-Control prints keeps every list (ConvertTo-Json -Depth 6, as DbHub-Control.ps1 writes it).
+        $line = ConvertTo-Json -InputObject $result -Depth 6 -Compress
+        ($line | ConvertFrom-Json).pending.rcaEarlierPending[0].pending[0].documentId | Should -Be 'doc-earlier-t2'
+        # Read only, and before the demo group's check: no Azure Resource Manager request at all, and nothing written.
+        $script:calls | Should -BeNullOrEmpty
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly (ConvertTo-Json -InputObject $copy -Depth 8 -Compress)
+    }
+
+    It 'says when the status copy holds no status, or can''t be read, rather than listing nothing (pending, 2026-11-23)' {
+        $script:automationVariables['DbHubSessionStatus'] = '""'
+        $empty = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'pending' }) -Context (New-TestContext)
+        $empty.status | Should -Be 'Empty'
+        $empty.pending | Should -BeNullOrEmpty
+        $script:automationVariables['DbHubSessionStatus'] = '{not json'
+        $broken = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'pending' }) -Context (New-TestContext)
+        $broken.status | Should -Be 'Unread'
+        $broken.message | Should -Be 'The variable DbHubSessionStatus isn''t the JSON of a status.'
+        $script:variableMissing = $true
+        $missing = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'pending' }) -Context (New-TestContext)
+        $missing.status | Should -Be 'Unread'
+        $missing.message | Should -Be 'The variable DbHubSessionStatus couldn''t be read: Variable ''DbHubSessionStatus'' was not found.'
+        $script:calls | Should -BeNullOrEmpty
     }
 
     It 'lets the older of two jobs that started together go on' {
@@ -5083,9 +5143,11 @@ Describe 'The published runbooks' {
             '{"action":"session"}'
             '{"action":"capture","sessionId":"0123456789abcdef0123456789abcdef"}'
             '{"action":"stop","sessionId":"0123456789abcdef0123456789abcdef"}'
+            '{"action":"pending","requestedBy":"capture-t2-golden.ps1"}'
+            '{"action":"pending","sessionId":"0123456789abcdef0123456789abcdef"}'
         )
         $expected = @($bodies | ForEach-Object { (Test-DbHubControlRequest -WebhookData (New-Webhook $_) -Settings $script:settings).Valid })
-        ($expected | ForEach-Object { $_.ToString() }) -join ',' | Should -Be 'True,False,True,True,False,False,False,True,True,False,True,True'
+        ($expected | ForEach-Object { $_.ToString() }) -join ',' | Should -Be 'True,False,True,True,False,False,False,True,True,False,True,True,True,False'
         $requestFile = Join-Path -Path $TestDrive -ChildPath 'requests.json'
         Set-Content -LiteralPath $requestFile -Value (ConvertTo-Json -InputObject @{ settings = $script:settingsJson; bodies = $bodies } -Depth 4) -Encoding utf8
         $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
@@ -5137,5 +5199,42 @@ Describe 'The published runbooks' {
         $there[2] | Should -Match '"steps":\[\{"step":"Replica","state":"Pass"'
         $there[3] | Should -Be $here[3]
         $there[3] | Should -Be '{"tags":{"owner":"presenter@contoso.example","deploymentId":"abc123"},"properties":{"resource":{"id":"patient-events","partitionKey":{"paths":["/patientId"],"kind":"Hash","version":2},"indexingPolicy":{"indexingMode":"consistent","automatic":true,"includedPaths":[{"path":"/*"}],"excludedPaths":[{"path":"/payload/?"},{"path":"/\"_etag\"/?"}]}},"options":{"throughput":400}}}'
+    }
+
+    It 'prints the status copy''s lists for the golden capture the same way in Windows PowerShell 5.1 (pending, 2026-11-23)' {
+        $powershell = Get-Command -Name 'powershell.exe' -CommandType Application -ErrorAction SilentlyContinue
+        if (-not $IsWindows -or -not $powershell) {
+            Set-ItResult -Skipped -Because 'Windows PowerShell 5.1 runs on Windows only'
+            return
+        }
+        # The result line DbHub-Control prints, as DbHub-Control.ps1 writes it: Windows PowerShell 5.1's ConvertFrom-Json keeps
+        # times as strings and has no -AsHashtable, and a one-item list must stay a list in both.
+        $probe = {
+            param([string] $Common, [string] $Copy)
+            . $Common
+            # The sandbox's cmdlet, answering with the copy.
+            Set-Item -Path 'function:Get-AutomationVariable' -Value ([scriptblock]::Create(("param([string] `$Name) '{0}'" -f $Copy.Replace("'", "''"))))
+            $context = [pscustomobject]@{ Log = (New-Object -TypeName 'System.Collections.Generic.List[string]') }
+            $result = Get-DbHubRcaPendingList -Context $context
+            return ($result | ConvertTo-Json -Depth 6 -Compress)
+        }
+        $copy = ConvertTo-Json -Depth 8 -Compress -InputObject ([ordered]@{
+                sessionId = 'a' * 32; phase = 'stopped'; updatedUtc = '2026-11-20T19:00:00Z'
+                rca = [ordered]@{ pending = @([ordered]@{ documentId = 'doc-own-t2'; parts = 1; sha256 = ('a' * 64); vm = 'archost01' }) }
+                rcaHandoff = @()
+                rcaEarlierPending = @([ordered]@{ sessionId = 'b' * 32; pending = @([ordered]@{ documentId = 'doc-earlier-t2'; vm = 'archost01' }); expiresUtc = '2026-11-25T00:00:00Z' })
+            })
+        $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
+        $here = & $probe $common $copy
+        $inputFile = Join-Path -Path $TestDrive -ChildPath 'pending.json'
+        Set-Content -LiteralPath $inputFile -Value (ConvertTo-Json -InputObject @{ common = $common; copy = $copy; probe = $probe.ToString() } -Depth 4) -Encoding utf8
+        $command = "`$in = Get-Content -LiteralPath '{0}' -Raw | ConvertFrom-Json; `$probe = [scriptblock]::Create(`$in.probe); `$out = & `$probe `$in.common `$in.copy; [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes([string]`$out))" -f $inputFile
+        $output = @(& $powershell.Source -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command $command)
+        $LASTEXITCODE | Should -Be 0
+        $there = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String(([string]($output | Select-Object -Last 1)).Trim()))
+        # Windows PowerShell 5.1's ConvertTo-Json escapes an apostrophe, which any JSON reader reads back the same.
+        $there.Replace('\u0027', "'") | Should -Be $here
+        $there | Should -Match ('"rca":\{"pending":\[\{"documentId":"doc-own-t2","vm":"archost01"\}\]\},"rcaHandoff":\[\],"rcaEarlierPending":\[\{"sessionId":"b{32}","pending":\[\{"documentId":"doc-earlier-t2","vm":"archost01"\}\],"expiresUtc":"2026-11-25T00:00:00Z"\}\]')
+        $there | Should -Match '"updatedUtc":"2026-11-20T19:00:00Z"'
     }
 }

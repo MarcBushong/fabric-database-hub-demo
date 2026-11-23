@@ -389,6 +389,9 @@ function Test-DbHubControlRequest {
       minSessionMinutes to the showcase's maximum.
     - {"action": "capture", "sessionId": "..."}: T4's and its read replica's Azure Monitor metrics, and T5's (2026-11-18),
       into the control vault, for the history (Save-DbHubSessionMetric); nothing is started or stopped.
+    - {"action": "pending"}: the Incident RCA's evidence that the session's status copy lists as still on the VMs, read
+      only (2026-11-23, Get-DbHubRcaPendingList), for capture-t2-golden.ps1, which starts it as a job when it can't read
+      the copy itself; nothing is written, started, or stopped.
     - "sessionId" is also allowed on stop, whose status then names the session.
     - "requestedBy" is optional on any action: 1-64 letters, digits, or . _ @ / - (a name, never a secret).
     Unknown fields, other values, free text, and a body that isn't a JSON object are refused.
@@ -403,6 +406,17 @@ function Test-DbHubControlRequest {
 
     if ($null -eq $WebhookData) {
         return (Get-DbHubRefusal -Reason 'DbHub-Control runs only from its webhook; it has no WebhookData.')
+    }
+    if ($WebhookData -is [string]) {
+        # A job started through Azure Resource Manager passes WebhookData as the JSON of its properties, which Azure
+        # Automation gives an [object] parameter as an object; its text is read the same way (capture-t2-golden.ps1's
+        # pending action, 2026-11-23: https://learn.microsoft.com/azure/automation/start-runbooks#named-values).
+        try {
+            $WebhookData = $WebhookData | ConvertFrom-Json
+        }
+        catch {
+            return (Get-DbHubRefusal -Reason 'The webhook request has no body.')
+        }
     }
     $raw = Get-DbHubMember -InputObject $WebhookData -Name 'RequestBody'
     if ($null -eq $raw -or -not ($raw -is [string]) -or [string]::IsNullOrWhiteSpace($raw)) {
@@ -426,10 +440,10 @@ function Test-DbHubControlRequest {
         return (Get-DbHubRefusal -Reason 'The request body must be a JSON object.')
     }
     $action = Get-DbHubMember -InputObject $body -Name 'action'
-    if (-not ($action -is [string]) -or $action -cnotin @('run', 'stop', 'reset', 'session', 'capture')) {
-        return (Get-DbHubRefusal -Reason 'action must be run, session, stop, capture, or reset.')
+    if (-not ($action -is [string]) -or $action -cnotin @('run', 'stop', 'reset', 'session', 'capture', 'pending')) {
+        return (Get-DbHubRefusal -Reason 'action must be run, session, stop, capture, pending, or reset.')
     }
-    $allowedFields = @{ run = @('action', 'activities', 'durationMinutes', 'requestedBy'); stop = @('action', 'requestedBy', 'sessionId'); reset = @('action', 'targets', 'requestedBy'); session = @('action', 'durationMinutes', 'sessionId', 'requestedBy'); capture = @('action', 'sessionId', 'requestedBy') }
+    $allowedFields = @{ run = @('action', 'activities', 'durationMinutes', 'requestedBy'); stop = @('action', 'requestedBy', 'sessionId'); reset = @('action', 'targets', 'requestedBy'); session = @('action', 'durationMinutes', 'sessionId', 'requestedBy'); capture = @('action', 'sessionId', 'requestedBy'); pending = @('action', 'requestedBy') }
     foreach ($name in (Get-DbHubPropertyName -InputObject $body)) {
         if ($name -cnotin $allowedFields[$action]) {
             return (Get-DbHubRefusal -Reason ('The field ''{0}'' isn''t allowed for {1}.' -f ($name -replace '[^A-Za-z0-9_-]', '?'), $action))
@@ -456,7 +470,7 @@ function Test-DbHubControlRequest {
     }
     $targets = @($Settings.targets.PSObject.Properties | ForEach-Object { [string]$_.Name })
 
-    if ($action -in 'stop', 'capture') {
+    if ($action -in 'stop', 'capture', 'pending') {
         return [pscustomobject]@{ Valid = $true; Reason = ''; Action = $action; Activities = @(); DurationMinutes = 0; Targets = @(); RequestedBy = $requestedBy; SessionId = $sessionId }
     }
 
@@ -4431,6 +4445,94 @@ function Read-DbHubSessionStatusCopy {
         return $null
     }
     return $status
+}
+
+function Get-DbHubRcaPendingList {
+    <#
+    .SYNOPSIS
+    DbHub-Control's pending action (2026-11-23): what the session's status copy, the control account's variable
+    DbHubSessionStatus, lists of the Incident RCA's documents still on the VMs, read only, for capture-t2-golden.ps1
+    (Get-DemoGoldenControlRcaPending). That reads the copy through Azure Resource Manager, which returns no value once a
+    tenant's policy has encrypted it, while Get-AutomationVariable reads an encrypted variable as any other
+    (https://learn.microsoft.com/azure/automation/shared-resources/variables). Only the fields the capture reads: the
+    status's session, phase, and last write; its own documents (rca.pending); a re-check's handoff (rcaHandoff); and the
+    earlier sessions' carries (rcaEarlierPending: each one's session, documents, and until when the runner keeps them),
+    each document by its ID and VM. It writes, starts, and stops nothing, and needs no role. Returns action pending,
+    status (Read; Empty while the copy holds no status, as when it was just created; Unread when it can't be read, with
+    why), message, and pending (those fields, or $null).
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context
+    )
+
+    $answer = [ordered]@{ action = 'pending'; status = 'Unread'; message = ''; pending = $null }
+    $text = ''
+    if (-not (Get-Command -Name 'Get-AutomationVariable' -ErrorAction SilentlyContinue)) {
+        $answer['message'] = 'This sandbox has no Get-AutomationVariable, so the session''s status copy couldn''t be read.'
+    }
+    else {
+        try {
+            $text = [string](Get-AutomationVariable -Name $script:DbHubStatusVariable)
+            $answer['status'] = 'Empty'
+        }
+        catch {
+            $answer['message'] = 'The variable {0} couldn''t be read: {1}' -f $script:DbHubStatusVariable, (ConvertTo-DbHubSafeText -Text $_.Exception.Message)
+        }
+    }
+    $status = $null
+    if ($answer['status'] -eq 'Empty' -and $text.TrimStart().StartsWith('{')) {
+        try {
+            $status = ConvertTo-DbHubDictionary -InputObject ($text | ConvertFrom-Json)
+        }
+        catch {
+            $status = $null
+        }
+        if ($status -isnot [System.Collections.IDictionary]) {
+            $answer['status'] = 'Unread'
+            $answer['message'] = 'The variable {0} isn''t the JSON of a status.' -f $script:DbHubStatusVariable
+            $status = $null
+        }
+    }
+    elseif ($answer['status'] -eq 'Empty') {
+        $answer['message'] = 'The variable {0} holds no session''s status.' -f $script:DbHubStatusVariable
+    }
+    if ($null -ne $status) {
+        $documents = {
+            param([object] $Items)
+            $list = New-Object -TypeName 'System.Collections.Generic.List[object]'
+            foreach ($item in @($Items)) {
+                if ($null -eq $item) {
+                    continue
+                }
+                $id = [string](Get-DbHubMember -InputObject $item -Name 'documentId')
+                $vm = [string](Get-DbHubMember -InputObject $item -Name 'vm')
+                if ($id -and $vm) {
+                    $list.Add([ordered]@{ documentId = $id; vm = $vm })
+                }
+            }
+            return , $list.ToArray()
+        }
+        $carries = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        foreach ($item in @(Get-DbHubMember -InputObject $status -Name 'rcaEarlierPending')) {
+            if ($null -ne $item) {
+                $carries.Add([ordered]@{ sessionId = [string](Get-DbHubMember -InputObject $item -Name 'sessionId'); pending = (& $documents (Get-DbHubMember -InputObject $item -Name 'pending')); expiresUtc = [string](Get-DbHubMember -InputObject $item -Name 'expiresUtc') })
+            }
+        }
+        $session = [string]$status['sessionId']
+        $answer['status'] = 'Read'
+        $answer['message'] = 'The session''s status copy was read: session {0}, {1}, last written {2}.' -f $(if ($session) { $session } else { 'none' }), $(if ([string]$status['phase']) { [string]$status['phase'] } else { 'no phase' }), $(if ([string]$status['updatedUtc']) { [string]$status['updatedUtc'] } else { 'at no recorded time' })
+        $answer['pending'] = [ordered]@{
+            sessionId         = $session
+            phase             = [string]$status['phase']
+            updatedUtc        = [string]$status['updatedUtc']
+            rca               = [ordered]@{ pending = (& $documents (Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $status -Name 'rca') -Name 'pending')) }
+            rcaHandoff        = (& $documents (Get-DbHubMember -InputObject $status -Name 'rcaHandoff'))
+            rcaEarlierPending = $carries.ToArray()
+        }
+    }
+    Write-DbHubLog -Context $Context -Message $answer['message']
+    return [pscustomobject]$answer
 }
 
 function Get-DbHubDispatchFailure {
@@ -9915,6 +10017,11 @@ function Invoke-DbHubControl {
         return [pscustomobject]@{ action = ''; status = 'Refused'; message = $request.Reason }
     }
     Write-DbHubLog -Context $Context -Message ('Request: {0} by {1}.' -f $request.Action, $request.RequestedBy)
+    if ($request.Action -eq 'pending') {
+        # Read only, and only the control account's own variable (2026-11-23): before the demo group's check, which it
+        # doesn't need.
+        return (Get-DbHubRcaPendingList -Context $Context)
+    }
     $group = Get-DbHubResourceGroupTag -Context $Context
     if ($group.GroupState -ne 'Present') {
         $reasons = @{
