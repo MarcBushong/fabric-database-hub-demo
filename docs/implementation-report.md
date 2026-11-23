@@ -5714,7 +5714,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
   - One that's there is deleted as before. "Deleted" lists the deletes that succeeded, and one that Azure answers isn't there, deleted meanwhile, goes under "Already gone" too.
   - A read that fails for another reason, access for example, leaves the delete to say what happened, as before.
 - **The message:** "Deleted: ..." and "Already gone: ...", each only when it has something, or "Nothing was deleted." when neither has; then "Failed: ...", and the group's note. When the group itself is gone, the note says it's already gone, where it said nothing.
-- **Unchanged:** the order (the Automation account last), the purge (still only "the vault purge" when one was done), the group's deletion when nothing else is in it, and the statuses, except that a resource that's already gone no longer fails on a refused delete. Resource Manager checks access before it looks for a resource, so a role without the delete permission got 403 for one that was gone: a **Fail**, with the Automation account kept. Now the read's 404 lists it as already gone, the result is a **Pass**, and the account is deleted ([the review of 842a3e5c](#the-review-of-842a3e5c-the-statuses-and-three-cases-pinned-2026-11-22)).
+- **Unchanged:** the order (the Automation account last), the purge (still only "the vault purge" when one was done), the group's deletion when nothing else is in it, and the statuses, except that a resource that's already gone no longer fails on a refused delete. Resource Manager checks access before it looks for a resource, so a role without the delete permission got 403 for one that was gone: a **Fail**, with the Automation account kept. Now the read's 404 lists it as already gone, so it no longer fails the run or holds back the Automation account ([the review of 842a3e5c](#the-review-of-842a3e5c-the-statuses-and-three-cases-pinned-2026-11-22)).
 - **Docs:** the CHANGELOG, and this report.
 
 **Changed files.** `scripts/modules/DbHubDemo/Private/ActivityControlHelpers.ps1`; `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` (its fake answers a delete of what doesn't exist with 204, as Resource Manager does, and a group that's gone with 404 for everything in it); the CHANGELOG, and this report.
@@ -5782,7 +5782,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 **Work summary.**
 
 - **Two tests,** D and A, in a new group of known differences. Each pins both rules' answers from 15:15 to 15:30 through `f35Check`, and the day's 15:15 bin; its name gives the data's answer and the rule that gives it.
-- **`snapshot-value.ts`'s notes:** the header and `snapshotValues`' notes say the rule keeps each point as `finestPerInterval` does but for two known differences, which they name: a save whose bins don't show its step, and this one. Design (i)'s build aligns them. `f35Check`'s two "which must agree" now say they agree but for those.
+- **`snapshot-value.ts`'s notes:** the header and `snapshotValues`' notes say the rule keeps each point as `finestPerInterval` does but for two known differences, which they name: a save whose bins don't show its step, and this one. Design (i)'s build aligns them. `f35Check`'s two "which must agree" now say they agree but for those. [A later section](#the-review-of-b5023826-fc7ffa8d-and-51bb1aa3-two-claims-narrowed-2026-11-23) adds their condition: a window whose edges fall on every save's bin grid.
 - **This report:** the two "Why" bullets that quote the coordinator's decisions, in [4944e22d's section](#f35s-per-bin-reference-takes-every-finer-save-against-every-earlier-one-2026-11-22) and [67f08e7d's](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22), keep their words, with a note that (i)'s build still has to make them true.
 - **The groundwork branch** pins D and A in the shared cases, beside `random 11`. The design note's build-time item is in the coordinator's material for decision 3.
 - **What doesn't change:** every rule, the app's views, the model, and every doc a user reads. So there's no CHANGELOG entry.
@@ -5804,7 +5804,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 **Why.** The review of 7b1110a6, 527c386c, and 842a3e5c found no bugs or regressions: ship it. Its one Low was in the docs: [842a3e5c's section](#the-session-controls-removal-says-what-was-already-gone-2026-11-22) said the statuses are unchanged, and one changed, for the better.
 
 - **Before,** a resource that was already gone still got a delete. Resource Manager checks access before it looks for the resource, so for a role without the delete permission that was a 403: `CONTROL.REMOVE.RESOURCES` was a **Fail**, the Automation account was kept, and in `destroy.ps1`, `DESTROY.CONTROL` was a **Warning**.
-- **Now,** the read's 404 lists it as already gone, the result is a **Pass**, and the account is deleted.
+- **Now,** the read's 404 lists it as already gone, so it no longer fails the run or holds back the Automation account. What else Azure refuses still fails it: the vault's purge, for example, which is still sent ([a later section](#the-review-of-b5023826-fc7ffa8d-and-51bb1aa3-two-claims-narrowed-2026-11-23)).
 - **The reviewer also checked three cases by probe only,** which no test covered. `destroy.ps1` runs this code, so the coordinator asked to pin them in `DbHubDemo.ActivityControl`.
 
 **Work summary.**
@@ -5827,3 +5827,34 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - PSScriptAnalyzer 1.25.0 with the tests' settings: no findings in the test file. markdownlint: clean. The changed files are ASCII, with LF line endings.
 
 **Risks.** None: tests and docs.
+
+### The review of b5023826, fc7ffa8d, and 51bb1aa3: two claims narrowed (2026-11-23)
+
+**Why.** The review of b5023826, fc7ffa8d, and 51bb1aa3 found all three ready to ship: every pin, mutation, old-code, and rebase claim it checked held. Its two Lows were wording that still said more than the code does.
+
+- **`f35Check`'s agreement:** b5023826 said that its two measures agree but for the two known differences. They can also differ where a window's edge falls inside a coarser bin that holds a remainder: `snapshotValues` shows the remainder at its own bin's start, and `finestPerInterval` at the start of each uncovered stretch.
+  - **The reviewer's probe,** on the test file's own SQL fixture: LockWaitS is 0.55 s by the model and 0.396 by finest from 15:00 to 16:50, and 0.32 and 0.474 from 16:50 to 17:15, while 15:00 to 17:15 agrees at 0.87. On the replica-lag fixture, with its spikes lowered to 3, 16:00 to 16:50 peaks at 34 and 3.
+  - **Design (i) can't remove it:** a per-bin model always shows a remainder at its bin's start. So it's a condition on the comparison, not a third difference to align.
+- **The removal's statuses:** [842a3e5c's section](#the-session-controls-removal-says-what-was-already-gone-2026-11-22), [the review of 842a3e5c's](#the-review-of-842a3e5c-the-statuses-and-three-cases-pinned-2026-11-22), and the CHANGELOG said that, with a resource already gone, the run now passes and the rest is deleted. That holds only for a role that can purge the vault and delete the Automation account.
+  - The purge is still sent every time, and a refused purge still fails the run.
+  - An Automation account that's already gone is listed as already gone, not deleted.
+  - So after `destroy.ps1`, a role that can't purge still gets a **Fail**, with everything listed as already gone.
+- **The coordinator's decisions:** state the condition in both of `f35Check`'s comments and in the design note's live proof, and say the removal's change per resource, without the **Pass** and the deletions.
+
+**Work summary.**
+
+- **`snapshot-value.ts`:** `F35Check`'s measures and `f35Check`'s notes say that the two agree, but for the known differences, over a window whose edges fall on every save's bin grid: whole hours, when no save in it is coarser than an hour. An edge inside a coarser bin can set them apart, and no build changes that. Comments only.
+- **Every claim in this report that `snapshotValues`' totals and peaks agree with `finestPerInterval`'s, or that design (i) matches the app's views,** means over such windows: in [4944e22d's section](#f35s-per-bin-reference-takes-every-finer-save-against-every-earlier-one-2026-11-22), [67f08e7d's](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22), and [b5023826's](#the-review-of-67f08e7d-two-known-differences-pinned-2026-11-22), which points here, and in the groundwork's sections.
+  - The shared cases' parity already compares whole hours, and the design note's live proof now does too, in the coordinator's material for decision 3.
+  - The history helpers write an Azure Monitor save coarser than an hour only when a finer one would be too large; a window then has to fall on that save's grid as well.
+- **The removal:** the CHANGELOG's entry, 842a3e5c's section, and the review of 842a3e5c's say that a resource that's already gone is listed as already gone, so it no longer fails the run or holds back the Automation account. The latter adds that what else Azure refuses, the purge for example, still fails it.
+- **What doesn't change:** code, tests, and the app's views.
+
+**Changed files.** `fabric/app/src/data/snapshot-value.ts` (comments), the CHANGELOG, and this report.
+
+**Validation.**
+
+- **The reviewer's probe, again,** in a scratch copy of the test file's fixtures, not committed: the same figures, 0.55 and 0.396, 0.32 and 0.474, 0.87 for both, and 34 and 3. Every whole-hour window agrees: LockWaitS is 0.3 s from 15:00 to 16:00, 0.5 from 16:00 to 17:00, and 0.07 from 17:00 to 18:00, and the lag peaks at 34 from 16:00 to 17:00, by both.
+- vitest: the file's 18 tests pass. typecheck and eslint: clean. markdownlint: clean. The added lines are ASCII, and the comments keep the file's 120-column wrap.
+
+**Risks.** None: comments and docs.

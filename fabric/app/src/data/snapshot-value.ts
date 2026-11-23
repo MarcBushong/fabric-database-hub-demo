@@ -270,17 +270,21 @@ export interface F35Check {
     /** The model rule's value per series and bin in the window, by `target|analysis|metric|bin`, bin in ISO UTC. */
     bins: Record<string, number>;
     /**
-     * Each target's window measures: by this rule per bin (model) and by finestPerInterval (finest). They agree but for
-     * the known differences in snapshotValues' notes, which design (i)'s build aligns.
+     * Each target's window measures: by this rule per bin (model) and by finestPerInterval (finest). Over a window
+     * whose edges fall on every save's bin grid (whole hours, when no save in it is coarser than an hour), they agree
+     * but for the known differences in snapshotValues' notes, which design (i)'s build aligns. An edge inside a coarser
+     * bin can set them apart, and no build changes that: this rule shows a remainder at its own bin's start, as any
+     * per-bin model does, and finestPerInterval at the start of each uncovered stretch.
      */
     measures: Record<string, Record<string, { model: number | null; finest: number | null }>>;
 }
 
 /**
  * F35's check from a history's rows, as the model holds them (one per save, series, and bin, and a marker per save and
- * series): the rule's per-bin values, and each target's window totals and peaks by the rule and by finestPerInterval,
- * which agree but for the known differences in snapshotValues' notes. Bins in [from, to), by their own start, as a DAX
- * filter takes them.
+ * series): the rule's per-bin values, and each target's window totals and peaks by the rule and by finestPerInterval.
+ * Over a window whose edges fall on every save's bin grid (whole hours, when no save in it is coarser than an hour),
+ * they agree but for the known differences in snapshotValues' notes; an edge inside a coarser bin can set them apart
+ * (F35Check's measures). Bins in [from, to), by their own start, as a DAX filter takes them.
  */
 export function f35Check(rows: readonly Row[], from: Date, to: Date): F35Check {
     const inWindow = (at: number) => at >= from.getTime() && at < to.getTime();
