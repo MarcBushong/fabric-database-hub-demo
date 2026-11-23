@@ -1049,9 +1049,11 @@ function Invoke-DemoGoldenControlPendingJob {
             }
         }
         if ($status -notin $script:T4StopJobEndedStatuses) {
+            # The job only reads, and nothing ends it but itself (the review of 8ca2b39c): a capture run again meanwhile
+            # meets it as an active run (GOLDEN.CAPTURE.CONTROL), and Stop now doesn't end it.
             $answer.Status = 'TimedOut'
             $within = if ($WaitSeconds -lt 120) { '{0} seconds' -f $WaitSeconds } else { '{0} minutes' -f [int][Math]::Ceiling($WaitSeconds / 60.0) }
-            $answer.Error = 'didn''t end in {0}: its job {1} is {2}' -f $within, $answer.JobId, $(if ($status) { $status } else { 'not read' })
+            $answer.Error = 'didn''t end in {0}: its job {1} is {2}, and since it only reads, wait for it to end before you run the capture again' -f $within, $answer.JobId, $(if ($status) { $status } else { 'not read' })
             return $answer
         }
         if ($status -ne 'Completed') {
@@ -1077,9 +1079,17 @@ function Invoke-DemoGoldenControlPendingJob {
         }
         switch ($result) {
             'Read' {
-                $answer.Ok = $true
-                $answer.Status = 'Read'
-                $answer.Pending = Get-DemoMemberValue -InputObject $line -Name 'pending'
+                $lists = Get-DemoMemberValue -InputObject $line -Name 'pending'
+                if ($lists -is [System.Collections.IDictionary]) {
+                    $answer.Ok = $true
+                    $answer.Status = 'Read'
+                    $answer.Pending = $lists
+                }
+                else {
+                    # Without its lists, a Read can't say what the capture mustn't delete (the review of 8ca2b39c).
+                    $answer.Status = 'Unread'
+                    $answer.Error = 'couldn''t either: its job {0} said Read without its lists' -f $answer.JobId
+                }
             }
             'Empty' {
                 $answer.Ok = $true
