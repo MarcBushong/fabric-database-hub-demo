@@ -171,6 +171,13 @@ internal sealed class EvidenceStore : ICaptureStore
         return writer;
     }
 
+    /// <summary>
+    /// Called with a span's ID once this process has closed it and written its span.json (SpanWriter.Close): where the
+    /// sidecar seals a span at its end (rca/README.md, The sidecar). It runs on the closing thread, which may hold the
+    /// observer lane's lock, so it only hands the work off.
+    /// </summary>
+    public Action<string>? SpanClosed { get; set; }
+
     internal void Closed(SpanWriter writer)
     {
         lock (gate)
@@ -181,6 +188,8 @@ internal sealed class EvidenceStore : ICaptureStore
                 lastClosed = (writer, Time.GetUtcNow());
             }
         }
+
+        SpanClosed?.Invoke(Path.GetFileName(writer.Directory));
     }
 
     ICaptureSpan ICaptureStore.Open(DateTimeOffset at) => Open(at);

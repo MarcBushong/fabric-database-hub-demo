@@ -5789,3 +5789,86 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The harness's marks (unit H) land after the realistic names' unit A.** Until then the rules leave out the capture's own statements only.
 - **A Run all session's Query Store evidence** reaches the history with the next scripts' save, until Run all's path ships.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
+
+### Query Store's evidence: the sidecar's codec and the runner's wiring (T1c and T1b, 2026-11-23)
+
+**Why.** Unit 2's sidecar needs the runner to encode it, fit it to its budgets, list it, and print it. It also needs T1a's store, sealer, and acknowledgement wired into the runner's commands and into the observer lane that O1 changed. T1c built the codec half beside T1a, then did T1b's wiring. Commits on `marcbushong-microsoft-qs-evidence-sidecar-encoder-wiring`, from the contract's interfaces at 84d2e92c, with merges and never a rebase:
+
+- **the contract:** 61eced5d and 8afcca24;
+- **O1's reviewed heads:** 9440acf2 and d06899f6;
+- **T1a's:** the v1 pin 6f981cba, then b22fa42f, 9bc28ce4, and 5bed9395;
+- **A1's:** f6fcdafa and 7dca935f;
+- **A2's:** 83344ef0.
+
+**What each commit did.**
+
+- **387dabdc, the codec:**
+  - **the encoder:** the evidence document's encoding for the sidecar's tables, with header times to the millisecond;
+  - **the reducer:** fits a sidecar to the larger of 2 KiB and the smaller of 64 KiB and what's left of its session's budget on the host, with five cuts in order, each a gap line in its target's coverage row (rca/README.md, Limits);
+  - **the page index:** 8 sidecars a page and 3,400 characters, new and pending, with those that expired unread counted;
+  - **the part lines:** `DBHUBDEMO-RCAS`.
+- **e1dc98fc, the contract at 8afcca24 and the codec's review:**
+  - **the waits:** each plan keeps its three wait categories with the most time waited, in every interval, ties to the first ordinal;
+  - **plan summaries:** a forced plan's summary, or that of a plan an event names, is cut last.
+- **ff180c28, the re-check's Low:** the first cut counts each interval once, at its latest read.
+- **611e90ae, O1's three seams** (the review of 1ca916a9):
+  - **the export's one commit point:** it seals, then runs retention;
+  - **retention:** it keeps a span that holds unsealed rows;
+  - **the store:** its final wait, and a span's evidence end.
+- **50840d59 and 980f66f5, the evidence's end for the lane** (A1's seam):
+  - **both end paths** release a target at the end time that EndAsync's hook gives, on the lane's clock;
+  - **so slow Query Store end reads** move neither the span's end, nor its watermark, nor RCA Coverage's window.
+- **649c89d0:** the index takes what the export couldn't do as a Warning, and a failure's page exits with 1.
+- **4526abab, the merge of A2's 83344ef0:** T1a's backfill test now drives A2's new capture API. T1a took the same port.
+- **The wiring, this entry's last commit:**
+  - **`rca sidecar-export --session <id|none> [--final] [--page <n>]`:** under the export's lock, it waits (with `--final`, up to 60 s, as `rca export` does), binds, seals every span, and prints the page.
+    - It exits with 0; with 2 only when nothing is offerable, its line printed and its status standing; and with 1 for any failure, with a Fail line.
+    - A host with no store prints Not selected and creates nothing.
+  - **The bind:** a sidecar export that comes before `rca export` binds the span as that export would. A span not bound yet takes the caller's session, or none, when it's still capturing, holds unsealed rows, or has sidecars sealed before any bind. So its sidecars are sealed with that session, or take it before they're first offered, and `rca export` keeps it.
+  - **`rca ack --document <id>[,<id>...]`:** exits with 0, also for an ID the runner doesn't hold, which its one line names, so a deferred acknowledgement never fails. It exits with 1 for anything that isn't a sidecar's ID, and for a failure. A host with no store holds none.
+  - **`rca part`** prints a sidecar's parts for a `-sidecar` ID.
+  - **`rca export`** seals at its commit point, and prints what it printed before.
+  - **The construction site** (`SidecarRuntime`):
+    - T1 to T3's observers take the store's sink, so A1's reader runs;
+    - T4's take its Query Store source, A2's, with its watermark under the store's root;
+    - the replica takes the sink.
+  - **Sealing** happens at the observer's start, for spans an earlier run left, and at each span's close (`EvidenceStore.SpanClosed`). It runs in the background, one at a time, and the host's stop waits up to 30 s for the last.
+
+**Changed files.**
+
+- **New:**
+  - `Rca/Sidecar/`: `SidecarParts.cs`, `SidecarDocument.cs`, `SidecarBudget.cs`, `SidecarReducer.cs`, `SidecarIndex.cs`, `SidecarRuntime.cs`, `SidecarCommands.cs`;
+  - the tests: `RcaSidecarCodecTests.cs` and `RcaSidecarWiringTests.cs`.
+- **O1's:** `Rca/Export/Exporter.cs`, `Rca/Store/EvidenceStore.cs`, `Rca/Observer/ObserverLane.cs`, and `Cli/CommandLine.Rca.cs`.
+- **T1a's:** `RcaSidecarSealerTests.cs`, in the merge's port.
+- **This report.**
+
+**Validation.**
+
+- **The runner,** with SDK 10.0.403, one class at a time, all passed:
+  - mine: `RcaSidecarWiringTests` 17, three times in a row, and `RcaSidecarCodecTests` 19;
+  - O1's and the pin: `RcaV1PinTests` 2, `RcaLaneTests` 10, `RcaExportTests` 33, `RcaBlindTests` 5, `ProgramTests` 16, and `ProfileHostTests` 19;
+  - T1a's: `RcaSidecarStoreTests` 14, `RcaSidecarSealerTests` 25, `RcaSidecarCoverageTests` 8, `RcaSidecarEvidenceIdentityTests` 3, and `RcaSidecarRowsTests` 2;
+  - A1's and A2's: `RcaQueryStoreSeamTests` 7, `RcaObserverTests` 22, `RcaQueryStoreSqlTests` 34, and `RcaQueryStorePgTests` 103.
+- **Proven to fail without the change, by mutation:**
+  - **the codec's:** 8 at 387dabdc, then each fix's own (the waits, the kept plans, the latest read, and the index's three);
+  - **the lane's three:** either end path releasing after EndAsync, or the lane's clock left out of the hook;
+  - **the wiring's 15:**
+    - T4's evidence end taken after its sidecar reads, and T4 without its Query Store source;
+    - an unknown ID's exit code;
+    - a store made by `rca ack`, or by `rca sidecar-export`, on a host with none;
+    - `rca part` never reading a sidecar, and `rca export` sealing nothing;
+    - no bind, and a bind of open spans only;
+    - no note that the observer still captured;
+    - the start, or a span's close, sealing nothing, and the observer's end keeping the hook;
+    - a failure escaping the command;
+    - the ack line naming no ID.
+- **The leak check** prints nothing.
+
+**Risks and what the live check needs.**
+
+- **A span's sealing at its close** runs in the background of the observer's process. When the host stops before it ends, the rows wait for the next export or start, which seal them.
+- **The bind** gives a span the caller's session before `rca export` does, only where that export would: the scripts run both exports with the same session.
+- **T4's backfill during a save's `rca sidecar-export`,** optional in T1a's spec, isn't wired: the observer's next start backfills. The README should say so.
+- **`rca ack`'s line** is the runner's own, as the contract leaves it. The README's command row still says exit code 0 only; a failure exits with 1.
+- **The live check (S12):** the exit codes and the line on exit code 2 through a managed Run Command, and T1 to T4's Query Store reads through the construction site on the VMs.
