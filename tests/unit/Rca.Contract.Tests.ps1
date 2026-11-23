@@ -456,6 +456,21 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
         @($violations) | Should -BeNullOrEmpty
     }
 
+    It 'lets the list of the runner''s own statements name exactly the forbidden names those statements use (What the capture leaves out, 3)' {
+        $list = 'workload-generator/src/ContosoCare.Workload/Rca/QueryStore/HarnessStatements.cs'
+        $harnessCode = 'Sql/DemoDatabase.cs', 'Sql/SqlScripts.cs', 'Cli/CommandLine.cs'
+        # The SQL the runner's harness code sends as text: Text("...") and CommandText = "...", raw string literals included.
+        $literal = '(?:Text\(|CommandText\s*=)\s*(?:"""(?<raw>[\s\S]*?)"""|"(?<plain>(?:[^"\\]|\\.)*)")'
+        $statements = foreach ($file in $harnessCode) {
+            $source = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath ('workload-generator/src/ContosoCare.Workload/' + $file)))
+            foreach ($match in [regex]::Matches($source, $literal)) { $match.Groups['raw'].Value + $match.Groups['plain'].Value }
+        }
+        @($statements).Count | Should -BeGreaterThan 8
+        $named = @($blind.forbiddenInDetectionCode.identifiers | Where-Object { $identifier = $_; @($statements | Where-Object { $_.Contains($identifier) }).Count -gt 0 })
+        $excepted = @($blind.detectionCode.exceptions | Where-Object { $list -in $_.files } | ForEach-Object { $_.identifier })
+        @($excepted | Sort-Object) | Should -Be @($named | Sort-Object) -Because 'the list holds every such statement, and nothing else may name what blind-detection.json forbids'
+    }
+
     It 'scans every folder of the runner''s RCA code for answer-key names, or says why one is exempt' {
         # A new folder (the sidecar's store, 2026-11-23) must join blind-detection.json's runner include, or this list.
         $exempt = @{
