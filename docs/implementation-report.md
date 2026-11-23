@@ -5848,3 +5848,69 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The answer-key recorder's markers wait on A1's and A2's fixes.** Until both are merged, its one read per fault run can reach the sidecar on T1 to T4, so A1's harness head stays out of the integration until its fix is re-checked. S7's `recorder` set and its name check prove it live.
 - **A Run all session's Query Store evidence** comes through Run all's own path (T2c), which joins this release by the coordinator's decision. If it isn't reviewed by 2026-11-24 18:00, it reaches the history with the next scripts' save until Run all's path ships as its own release.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
+
+### Run all's path for the Query Store sidecars: the runbooks (T2c-1, 2026-11-23)
+
+**Why.** Demo sessions are one notebook and one action: Run all. Until now the Query Store sidecars (unit 2) reached the history only through the scripts' saves (`./scripts/stop-demo.ps1 -SaveHistory` and `deploy.ps1`'s snapshot), so a Run all session never showed them. T2c-1 is the runbooks' half of Run all's path ([the contract](../rca/README.md#run-alls-path-for-the-sidecars), 1e13e9aa and 72cd3f95, and the review's fixes in 83c87de2); T2c-2, the control notebook's half, reads what it writes.
+
+- **The fetch** (`Invoke-DbHubRcaSidecarExport`, `Invoke-DbHubRcaSidecarSession`): each export of a session, a re-check's, the stop's, and a start's, fetches the sidecars the VMs offer only after its evidence, within the same deadline (`rca.recheckMinutes`, 8; `rca.stopMinutes`, 6; `rca.startMinutes`, 6), so the sidecars never delay the evidence and get no time of their own. `RcaSidecarExport` reads the index a page at a time, the next page only after the parts of the one before (`rca part` for each), at most 16 pages; sqlvm01 takes up to `rca.maxParallel` Run Commands at once, and the T2 host one at a time, each gone before the next (R871), the first only once Azure lists none of the evidence's there. What a deadline cuts is deleted and stays on the VM, which offers it again; within a session, a sidecar already bundled isn't fetched again.
+- **Binding:** a sidecar export binds a span it finds unbound to its `--session`, as an export does. So a re-check and the stop ask with the session's ID and skip a VM an earlier session still holds, and `--final` goes only with the stop's first page; a start asks with the new session's ID, after the earlier session's evidence, and skips the VMs that session still holds.
+- **The bundles:** versions of the existing `dbhub-session-metrics` secret (`ContosoCare.RcaSidecarBundle`, tag `rca` `sidecar-bundle`), at most 6 `DBHUBDEMO-RCAS` lines and 24,000 bytes, never with an evidence line. A re-check writes none once the session's stop has begun, as for the evidence's bundles.
+- **The index and the pointer:** the stop's tail (`Invoke-DbHubRcaSidecarStop`, behind `-SidecarTail`, which only `Stop-DbHubDemo` passes, so the release's takeover end, which calls `Invoke-DbHubRcaStop` too, doesn't write it) writes `ContosoCare.RcaSidecarBundleIndex` (tag `sidecar-index`) after the session's last sidecar bundle and before the metrics' final version: at most 16 bundles, 64 parts of whole sidecars, and 24,000 bytes. The final version's `rcaSidecars` member (`ContosoCare.RcaSidecarPointer`) names it, at most 300 bytes as written (Windows PowerShell 5.1 writes `'` as `\u0027`), checked where it's built and again where it's written, out of T5's share: T4's half stays as it was, and without T5 it comes out of T4's room. With no sidecar, its index is null and its status **Not selected**. The `rca` member keeps its 4,000 bytes.
+- **The session's sidecar state** (the status's `rcaSidecar`): its bundles, its sidecars' references, what was offered, fetched, and left, whether some wait on the VMs, its status and message, and the index's version, which the stopped status keeps. Its references take at most 4,000 bytes, about 19 sidecars, so the status stays within the control vault's 25 KB; the rest wait on the VMs for the next session. When some wait, the next start fetches them after that session's evidence.
+- **The acknowledgements** (the start request's optional `rcaAcks`, `ContosoCare.RcaAckRequest`, 1 to 64 sidecar IDs, which only a session takes): one that doesn't follow the contract never refuses the session, and nothing of it is sent. After the earlier sessions' evidence and before the start's own sidecar fetch (`Invoke-DbHubRcaEarlier`, then `Invoke-DbHubRcaAck`), within the start's `rca.startMinutes`, each VM's IDs go in one `rca ack --document id1,id2,...` Run Command (`RcaAck`), one VM after the other: on the T2 host only once Azure lists no other export Run Command there, and gone before the job goes on. An ID goes only to the VM its host segment names, as the runner writes a host (`Hosts.Normalize`): the SQL VM for `sqlVmName`'s, and the T2 host for `t2GuestName`'s; any other host, the T2 host's own name included, stays in `left`. A VM that isn't running gets none. A **Pass** from the VM an ID names counts it as sent, one that VM had acknowledged before or no longer keeps included (45f947b7). The status's `rcaAcks` (`ContosoCare.RcaAckResult`) says what was sent and what wasn't, why, and, for an older runner or bundle or a request outside the contract, `./scripts/deploy.ps1`, in at most 500 characters. It's written once, when they ran or were cut short (a refused start's says so), never before (T2c-2's review), and the stopped status keeps it. The control notebook prints it as `RCA.SIDECAR.ACK` and deletes the acknowledgement files whose IDs were sent, so the runbook adds no step of its own.
+- **Anchors** (83c87de2): the sidecar code matches IDs, parts, hashes, and versions with `\z`, which a final line feed doesn't pass, as the contract's kinds end with `(?![\s\S])`.
+- **Exit codes and older pieces:** exit code 2 with the index's own **Warning** is a **Warning** (8afcca24). A runner without the sidecar command (`OldRunner`) or a VM bundle from before it (`OldBundle`) is a **Warning** that names `./scripts/deploy.ps1`, and the evidence goes on as before.
+- **Its lines:** `RCA.SIDECAR.EXPORT`, each export's fetch: a step at a re-check and a start, and at the stop a line of `rcaLines` after `RCA.CAPTURE.*`, with rows in `docs/troubleshooting.md`, where `RCA.SIDECAR.ACK`'s rows describe the notebook's line from `rcaAcks`.
+- **Its cost:** no new secret, grant, or Azure resource; the same secret and the same Run Commands. The sidecars and the acknowledgements share each export's bound, so the session control's ceiling stays 116 job-minutes a session. Nothing reads the answer key, the scenario plan, or `blind-detection.json`.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1` and `DbHub-Control.ps1`'s help, with `tests/unit/Automation.Runbooks.Tests.ps1`; `docs/troubleshooting.md`; and this report.
+
+**Validation.** On b59f75c6 with the contract through 01405847:
+
+- **The runbook's suite:** under strict mode, with the Azure CLI guard, `Automation.Runbooks` passed: 353 passed, none failed, and the guard saw no unmocked Azure CLI call. Its 17 new tests, in "the Query Store sidecars on Run all's path":
+  - the stop's tail: its sidecars after its evidence, into bundles, their index, and the pointer, written in that order and valid against `transport.schema.json`;
+  - the stop's bound shared with the evidence: nothing goes out past it, what still runs then is deleted, and the next export fetches what it cut;
+  - the T2 host's sidecars one Run Command at a time, each gone before the next, after its evidence there;
+  - the index's pages, the next after the parts of the one before, and the session's budget, the oldest first;
+  - the pointer within 300 bytes, its message cut to 120 characters, written without it when it doesn't fit, out of T5's share with T4's half unchanged, and out of T4's room without T5;
+  - the acknowledgements: one Run Command a VM once the activity went out; `arcsql01`'s ID to archost01, and the T2 host's own name and an unknown host left; a host segment normalized as the runner writes it; none to a VM that isn't running; an older runner's message naming `./scripts/deploy.ps1`; no `RCA.SIDECAR.ACK` step; and no status write carrying `rcaAcks` before they were attempted, then the same one in every write;
+  - the acknowledgements within the start's bound, which the sidecar fetch shares, and one that doesn't end cut at the bound, with none for the next VM;
+  - the acknowledgements after the earlier session's evidence on each VM and before the sidecar fetch, which then doesn't fetch the acknowledged sidecar;
+  - a start whose `rcaAcks` doesn't follow the contract, which sends none and isn't refused; the request's validation; and a trailing line feed refused;
+  - an older bundle and an older runner, each a **Warning** naming `./scripts/deploy.ps1`, with the evidence as before;
+  - the runner's own **Warning** with exit code 2;
+  - re-checks that fetch only what's new, and the stop's index listing every bundle of the session;
+  - the re-check's fence, in two cases: its Run Commands, and its bundle's write;
+  - a start fetching what the session before left, under its own session, and nothing when nothing waits;
+  - the same records, the pointer's bytes with apostrophes, and the host segments in Windows PowerShell 5.1.
+
+  Two tests changed: Stop now's Run Commands now include the sidecars' index on each VM, and the 5.1 request validation has a start with `rcaAcks` and a stop that can't take one.
+- **Mutations,** each alone, against the new tests: all 28 fail at least one.
+  - the stop's sidecars before its evidence (2 tests), or with a bound of their own (1);
+  - the T2 host's sidecar Run Commands in parallel (2), or the next before the last is gone (1);
+  - no acknowledgement (3); one before the earlier evidence (1); the start's sidecar fetch with a bound of its own after them (1); each VM's with a bound of its own (1); an early `rcaAcks` (1);
+  - a sidecar the session bundled fetched again (1); no index budget (1);
+  - the pointer not out of T5's share (1) or of T4's room (1), not cut to 120 characters (1), not cut to 300 bytes as written (the 5.1 test), or not checked where it's written (1);
+  - an older bundle not recognized (2);
+  - the re-check's Run Command fence (1) or its bundle-write fence (1) off;
+  - the start's fetch of what the session before left off (2), or always on (1);
+  - `Stop-DbHubDemo` without the sidecar tail (9);
+  - the T2 host's own name routed to it (1), the host segment not normalized (1), an acknowledgement to a VM that isn't running (1);
+  - the runbook's own `RCA.SIDECAR.ACK` step (2), no deploy fix in the message (2), and the request refusing `rcaAcks` (4).
+- **The suites the change reaches:** `Rca.Contract` passed, 78, and `DbHubDemo.Cost`, which pins the session control's job minutes, 72.
+- PSScriptAnalyzer, with the repo's settings (Windows PowerShell 5.1's for the runbooks), found nothing in the three PowerShell files this change touches, which are ASCII-only; markdownlint-cli2 0.23.3 found no issue; `Repo.Conventions` (123) and `Repo.NeutralWording` (3) passed; and the leak check finds nothing.
+
+**What only a live run can show.** A Run all session with Query Store evidence on T1 to T4, stopped with Stop now, then the next Run all:
+
+- each Run Command's time on the T2 host and on sqlvm01, so how many sidecar pages and parts each bound takes, and the job minutes each export uses;
+- Azure's listing on the T2 host while the evidence's Run Commands are deleted, before the sidecars' first one there;
+- the runner's `rca sidecar-export` and `rca ack` through the VM-side control script, and the binding at a start's sidecar export;
+- the acknowledgements' time right after the dispatch, and on the T2 host after the earlier session's evidence;
+- the status's size with a full sidecar state, and the notebook's `RCA.SIDECAR.ACK` line from it.
+
+**Risks.**
+
+- The status keeps at most about 19 sidecars' references a session, fewer than the contract's 64 parts: a long session's rest waits on the VMs for the next session's exports, which the line says.
+- A sidecar bundle whose write failed leaves its sidecars out of the index, but a bundle written before it can hold the first parts of one of them: the notebook stages only the index's documents.
+- The acknowledgements go one VM after the other, so a slow one on the T2 host shortens the start's sidecar fetch; what isn't fetched waits on the VMs.
