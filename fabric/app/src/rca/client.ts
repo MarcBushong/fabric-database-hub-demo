@@ -5,7 +5,7 @@
 import type { QueryClient } from "@/data/query-client";
 import type { QuerySpec } from "@/data/queries";
 import { isMissingInModel, retryHint, withRetry, type RetryOptions } from "@/data/retry";
-import { RCA_PRESENCE_DAX, RcaReadError, type DaxLog } from "./loader";
+import { RCA_PRESENCE_DAX, RcaReadError, SIDECAR_PRESENCE_DAX, type DaxLog } from "./loader";
 import { toDate } from "./rows";
 import { createRcaSources } from "./sources";
 import { createInvestigationTools, type InvestigationTools } from "./tools";
@@ -23,8 +23,17 @@ export type RcaCheck = { state: "present" } | { state: "absent" } | { state: "fa
  * check made Root cause say that no RCA capture was recorded, on a model with 643 RCA Sessions rows).
  */
 export async function checkRcaTables(client: QueryClient, retry?: RetryOptions): Promise<RcaCheck> {
+    return checkPresence(client, "rca-presence", "Incident RCA: are its tables in the model?", RCA_PRESENCE_DAX, retry);
+}
+
+/** Whether the history model has the sidecar's tables, Query Store's evidence, the same way: absent on a model from before them. */
+export async function checkSidecarTables(client: QueryClient, retry?: RetryOptions): Promise<RcaCheck> {
+    return checkPresence(client, "rca-sidecar-presence", "Incident RCA: are Query Store's tables in the model?", SIDECAR_PRESENCE_DAX, retry);
+}
+
+async function checkPresence(client: QueryClient, id: string, title: string, dax: string, retry?: RetryOptions): Promise<RcaCheck> {
     try {
-        await withRetry(() => client.run({ id: "rca-presence", title: "Incident RCA: are its tables in the model?", dax: RCA_PRESENCE_DAX, rowLimit: 1, columns: [] }), retry);
+        await withRetry(() => client.run({ id, title, dax, rowLimit: 1, columns: [] }), retry);
         return { state: "present" };
     } catch (err) {
         if (isMissingInModel(err)) return { state: "absent" };

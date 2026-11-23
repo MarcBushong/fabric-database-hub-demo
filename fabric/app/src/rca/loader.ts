@@ -95,6 +95,12 @@ export function sidecarDax(key: SidecarTableKey, from: Date, to: Date, targets: 
 /** Whether the model has the RCA tables: the app offers the RCA view and its tools only when it does. */
 export const RCA_PRESENCE_DAX = `EVALUATE ROW ( "Rows", COUNTROWS ( '${RCA_SPEC.coverage.model}' ) )`;
 
+/**
+ * Whether the model has the sidecar's tables, Query Store's evidence: the chat gets their guide only when it does. One query
+ * names all six, so a model without one of them answers that it doesn't know it, which loadSidecar reads as missing.
+ */
+export const SIDECAR_PRESENCE_DAX = `EVALUATE ROW ( ${SIDECAR_TABLES.map((key) => `"${key}", COUNTROWS ( '${SIDECAR_SPEC[key].model}' )`).join(", ")} )`;
+
 /** The Azure Monitor targets: T4, its read replica, and T5, whose metrics the history keeps as analyses postgresql and cosmosdb. */
 export const MONITOR_TARGETS = ["T4", "T4-replica", "T5"] as const satisfies readonly RcaTarget[];
 

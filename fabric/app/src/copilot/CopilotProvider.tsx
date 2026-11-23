@@ -175,6 +175,26 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
         }
         return rcaProbe.current;
     }, [queryClient]);
+    // Whether the model also has Query Store's evidence (the sidecar's tables), asked when a conversation with the RCA tables
+    // starts: with them, its system message holds their compact guide. Kept as the RCA check is: one that failed leaves the
+    // guide out of that conversation only, and the next one asks again.
+    const sidecarProbe = useRef<Promise<boolean> | null>(null);
+    const probeSidecar = useCallback((): Promise<boolean> => {
+        if (!queryClient) return Promise.resolve(false);
+        if (!sidecarProbe.current) {
+            const kept: Promise<boolean> = import("./investigations")
+                .then(
+                    (m) => m.checkSidecarTables(queryClient),
+                    (): RcaCheck => ({ state: "failed", error: "The chat's modules didn't load." }),
+                )
+                .then((check) => {
+                    if (check.state === "failed" && sidecarProbe.current === kept) sidecarProbe.current = null;
+                    return check.state === "present";
+                });
+            sidecarProbe.current = kept;
+        }
+        return sidecarProbe.current;
+    }, [queryClient]);
     useEffect(() => {
         if (!isOpen || !relay) return;
         let cancelled = false;
@@ -351,6 +371,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
             try {
                 const [{ buildSystemMessage }, { createToolRunner, toolSpecs }, { createInvestigations }] = await loadChatModules();
                 const rca = await probeRca();
+                const sidecar = rca && (await probeSidecar());
                 // The starters follow what this conversation's check found, also when an earlier check had failed.
                 setRcaHistory(rca);
                 if (stale()) throw newChatStarted();
@@ -388,7 +409,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 });
                 const earlier = recap(turnsRef.current.slice(0, -2));
                 const systemMessage =
-                    buildSystemMessage({ estate: settings.estate, resourceGroup: settings.resourceGroup, liveUnavailable: live ?? undefined, rca }) +
+                    buildSystemMessage({ estate: settings.estate, resourceGroup: settings.resourceGroup, liveUnavailable: live ?? undefined, rca, sidecar }) +
                     (earlier ? `\n\n# Earlier in this conversation (the previous session ended; continue from it)\n${earlier}` : "");
                 const conn = new ChatConnection(relay.chatUrl(), handleEvent);
                 try {
@@ -413,7 +434,7 @@ export function CopilotProvider({ children, initialOpen = false, settings: setti
                 if (!stale()) setConnecting(false);
             }
         },
-        [disconnect, handleEvent, probeRca, queryClient, relay, settings],
+        [disconnect, handleEvent, probeRca, probeSidecar, queryClient, relay, settings],
     );
 
     /** Sends one prompt on the conversation, starting a session when there's none; the current assistant turn gets the answer. */

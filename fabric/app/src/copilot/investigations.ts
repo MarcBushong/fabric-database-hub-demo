@@ -6,7 +6,7 @@ import { createRcaClient } from "@/rca/client";
 import { RcaReadError } from "@/rca/loader";
 import type { DaxRun, ToolOutcome } from "./tools";
 
-export { checkRcaTables, dayIn, NEWEST_BIN_DAX, type RcaCheck } from "@/rca/client";
+export { checkRcaTables, checkSidecarTables, dayIn, NEWEST_BIN_DAX, type RcaCheck } from "@/rca/client";
 
 export interface InvestigationOptions {
     /** The viewer's time zone; the browser's by default. */
