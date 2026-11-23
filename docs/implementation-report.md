@@ -5956,5 +5956,27 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 
 **Limits.**
 
-- At a start, the evidence's own parts on the T2 host (`Invoke-DbHubRcaEarlier`) still wait only for the export's `rca-` Run Commands, so they too can run beside the start's dispatch there. That code is the evidence's (ADR 0031), outside T2c-1; `-AnyBusy` is there for it.
+- At a start, the evidence's own parts on the T2 host (`Invoke-DbHubRcaEarlier`) still waited only for the export's `rca-` Run Commands, so they too could run beside the start's dispatch there: [the start's earlier evidence on the T2 host](#the-starts-earlier-evidence-on-the-t2-host-2026-11-23) closes it.
 - A Run Command with no time in its name that Azure keeps listing while it deletes it holds the T2 host's sidecars and acknowledgements to each bound's end. They wait on the VMs, and [Run Commands stuck in Deleting](troubleshooting.md#run-commands-stuck-in-deleting) has the fix.
+
+### The start's earlier evidence on the T2 host (2026-11-23)
+
+**Why.** [The review of 9d094b70](#the-review-of-9d094b70-2026-11-23) left one gap outside T2c-1's own functions: at a session's start, an earlier session's evidence parts on the T2 host waited only for the export's own `rca-` Run Commands, so they could run beside the start's own dispatch to T2's guest (R871). The coordinator asked for the same rule there, as one commit on a1521eab.
+
+- **The start's earlier evidence** (`Invoke-DbHubRcaEarlier`'s fetch, `Invoke-DbHubRcaSessionExport -AnyBusy`, then `Invoke-DbHubRcaExport -AnyBusy`): on the T2 host, the first Run Command and each part wait while Azure lists any other Run Command there, whatever its name, in flight or being deleted (`Test-DbHubRcaHostFree`), within the start's `rca.startMinutes`. The parts after the export the start sent there had no check of their own, since that export went out before the dispatch; now each part checks.
+- **At the deadline:** a host whose first Run Command couldn't go is `Busy`, and RCA.EXPORT says "another Run Command was still there". A host held between parts says "Another Run Command was on archost01 when this export's time was up". What wasn't fetched stays pending for a later start (`rcaEarlierPending`), as before, and the runner keeps it 7 days.
+- **Unchanged:** every other export, a re-check's and a stop's, keeps its rule. The read-only call for exports with no session sends no Run Command, since none of what they list is the new session's to fetch, so it needs none.
+- **Docs:** the RCA.EXPORT row of `docs/troubleshooting.md`, the review entry's limit, and this entry.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`, with `tests/unit/Automation.Runbooks.Tests.ps1`; `docs/troubleshooting.md`; and this report.
+
+**Validation.** On a1521eab with this commit:
+
+- **The runbook's suite:** under strict mode, with the Azure CLI guard, `Automation.Runbooks` passed: 359 passed, none failed, and the guard saw no unmocked Azure CLI call. Its new test has three parts:
+  - a start whose own dispatch to T2's guest runs until a minute after the start reads its export there: the earlier session's first part there waits until then, and none of the export's Run Commands goes beside the dispatch;
+  - one whose dispatch runs past the bound: the parts stay pending for a later start, and RCA.EXPORT says why;
+  - one with only a pending document there, so no export goes there: the host is `Busy`, and RCA.EXPORT says "another Run Command was still there".
+- **Mutations,** each alone: all 6 fail the new test. They are the fetch without `-AnyBusy`; `Invoke-DbHubRcaSessionExport` not passing it on; no check before each part; the first Run Command's check ignoring other Run Commands; no note when the host is held between parts; and the `Busy` message without its wording.
+- PSScriptAnalyzer, with the repo's settings (Windows PowerShell 5.1's for the runbooks), found nothing in the two PowerShell files this commit changes, which are ASCII-only; `Repo.Conventions` passed; markdownlint-cli2 0.23.3 found no issue; and the leak check finds nothing.
+
+**What its live check needs.** A session's start with an earlier session's T2 evidence on archost01: its parts go only once the start's dispatch to T2's guest has ended, and how long that dispatch runs, which the wait now takes from the start's bound.

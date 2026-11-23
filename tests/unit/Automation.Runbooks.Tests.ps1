@@ -4369,6 +4369,104 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
     }
 
+    It 'fetches an earlier session''s evidence on the T2 host at a start only once the start''s own dispatch there has ended (review of 9d094b70, R871)' {
+        # The earlier session: the nightly stop ended it, so the start exports it on each VM right before that VM's activity,
+        # and its T2 document's parts come after the dispatch to T2's guest, which runs on its own.
+        $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; steps = @(); rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @('0123456789abcdef0123456789abcdef'); documents = @(); pending = @(); leftVms = @(); final = $false; status = 'Pass'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $script:t4 = 'Stopped'
+        $script:replica = ''
+        $script:autostop = ''
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $id = '20261027T142000Z-archost01-0001'
+        Set-ServedRunner -Case @(@{ Id = $id; Session = $script:fixtureSession }) -Vm @('archost01')
+        $script:rcaListOpen = $true
+        # The dispatch, named as the control's, is listed as running until a minute after this start reads (and deletes) the
+        # export it sent there.
+        $script:runCommands['archost01'] = @({
+                $dispatch = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' }) | Select-Object -First 1
+                if ($null -ne $dispatch) {
+                    $read = @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-rca-archost01-x-\d{14}$' }) | Select-Object -First 1
+                    $state = 'Running'
+                    if ($null -ne $read -and $script:clock -ge $read.At.AddSeconds(60)) {
+                        $state = 'Succeeded'
+                    }
+                    @{ name = ($dispatch.Path -replace '^.*/runCommands/', ''); properties = @{ provisioningState = 'Succeeded'; instanceView = @{ executionState = $state } } }
+                }
+            })
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210'; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        $dispatch = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' })[0]
+        $dispatchAt = $script:calls.IndexOf($dispatch)
+        $read = @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-rca-archost01-x-\d{14}$' })[0]
+        $ended = $read.At.AddSeconds(60)
+        $exportPut = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-rca-archost01-x-\d{14}$' })[0]
+        $script:calls.IndexOf($exportPut) | Should -BeLessThan $dispatchAt -Because 'the export goes before the activity there, as before'
+        $script:calls.IndexOf($read) | Should -BeGreaterThan $dispatchAt
+        $parts = @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'part' })
+        $parts.Count | Should -Be @($script:servedParts[$id]).Count
+        $parts[0].At | Should -BeGreaterOrEqual $ended -Because 'R871: the first part waits until the dispatch has ended'
+        $afterDispatch = @($script:calls | Select-Object -Skip ($dispatchAt + 1) | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-rca-' })
+        @($afterDispatch | Where-Object { $_.At -lt $ended }) | Should -BeNullOrEmpty -Because 'nothing of the export''s goes beside the dispatch'
+        $status = Get-SessionStatus
+        @($status.rcaEarlier.documents.documentId) | Should -Contain $id
+        @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+
+        # A dispatch that runs past the start's bound: the parts stay on the VM for a later start, and RCA.EXPORT says why.
+        Reset-TestAzure
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+        $script:t4 = 'Stopped'
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        Set-ServedRunner -Case @(@{ Id = $id; Session = $script:fixtureSession }) -Vm @('archost01')
+        $script:rcaListOpen = $true
+        $script:runCommands['archost01'] = @({
+                $dispatch = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' }) | Select-Object -First 1
+                if ($null -ne $dispatch) {
+                    @{ name = ($dispatch.Path -replace '^.*/runCommands/', ''); properties = @{ provisioningState = 'Succeeded'; instanceView = @{ executionState = 'Running' } } }
+                }
+            })
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210'; requestedBy = 'presenter' }) -Context (New-TestContext)
+        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'part' }) | Should -BeNullOrEmpty
+        $status = Get-SessionStatus
+        $export = @($status.steps | Where-Object { $_.step -eq 'RCA.EXPORT' })[0]
+        $export.state | Should -Be 'Warning'
+        $export.message | Should -Match 'archost01: 0 document\(s\) in 0 part\(s\)\. 1 document\(s\) weren''t fetched whole in time; they stay on archost01 for the next export\. Another Run Command was on archost01 when this export''s time was up, so it got no more parts in this export \(R871\)\.'
+        @($status.rcaEarlierPending | ForEach-Object { $_.pending } | ForEach-Object { $_.documentId }) | Should -Contain $id -Because 'a later start fetches it'
+
+        # Only a pending document there, so the start sends archost01 no export: its first Run Command waits as an export's
+        # would, and a dispatch that runs past the bound leaves the host Busy, which RCA.EXPORT says.
+        Reset-TestAzure
+        $reference = @(($script:fixtureIndex | ConvertFrom-Json).documents | Where-Object documentId -EQ $script:fixtureIds[1])[0]
+        $pending = [ordered]@{ documentId = $reference.documentId; parts = [int]$reference.parts; sha256 = $reference.sha256; vm = 'archost01' }
+        $stopped = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @($pending); leftVms = @('sqlvm01'); final = $false; status = 'Warning'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $stopped -Depth 8 -Compress
+        $script:t4 = 'Stopped'
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $script:rcaRunner = {
+            param($Command)
+            if ($Command.Request.command -eq 'export') {
+                return (New-TestRcaView -Status 'Not selected' -Message 'runner rca export: nothing was captured since the last export.')
+            }
+            $line = @($script:fixtureParts | Where-Object { $_.Split(' ')[2] -eq $Command.Request.documentId -and $_.Split(' ')[3].StartsWith(('{0}/' -f $Command.Request.part)) }) | Select-Object -First 1
+            return (New-TestRcaView -Status 'Pass' -Message 'runner rca part: its line follows.' -Line $line)
+        }
+        $script:rcaListOpen = $true
+        $script:runCommands['archost01'] = @({
+                $dispatch = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' }) | Select-Object -First 1
+                if ($null -ne $dispatch) {
+                    @{ name = ($dispatch.Path -replace '^.*/runCommands/', ''); properties = @{ provisioningState = 'Succeeded'; instanceView = @{ executionState = 'Running' } } }
+                }
+            })
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210'; requestedBy = 'presenter' }) -Context (New-TestContext)
+        @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' }) | Should -BeNullOrEmpty
+        $messages = @((Get-SessionStatus).steps | Where-Object { $_.step -eq 'RCA.EXPORT' } | ForEach-Object { $_.message }) -join ' '
+        $messages | Should -Match 'archost01 takes one Run Command at a time \(R871\), and another Run Command was still there when this export''s time was up, so this export sent nothing there'
+    }
+
     It 'fetches at the next start an earlier session''s pending document on a VM whose final export ran, not only on the VMs it left (review of 15ad76d)' {
         # Its stop's export didn't run on sqlvm01, and left one document on archost01 that it didn't fetch whole.
         $reference = @(($script:fixtureIndex | ConvertFrom-Json).documents | Where-Object documentId -EQ $script:fixtureIds[1])[0]
