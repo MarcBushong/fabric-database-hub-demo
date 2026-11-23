@@ -9,10 +9,11 @@ namespace ContosoCare.Workload.Rca.Observer;
 /// test role), with the observer's own application name, a 1-second lock_timeout, and a 10-second statement_timeout.
 /// Every block runs after pg_stat_clear_snapshot() in the same round trip, so no statistics view repeats an earlier
 /// snapshot (rca/capture/postgresql.sql; https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-STATS-FUNCTIONS).
-/// Every connection names <see cref="ObserverSchema"/> in its search_path from its startup packet on
-/// (<see cref="StartupOptions"/>), so the session limits' SETs and Npgsql's type loading carry it too: Query Store records
-/// each statement's search_path (query_store.qs_view), and RCA-PG-14 leaves out the observer's own statements by it, and
-/// by their text (rca/README.md, What the capture leaves out).
+/// Every connection opens silently (<see cref="Startup"/>): its search_path, which names <see cref="ObserverSchema"/>,
+/// and its limits come in its startup packet, and Npgsql loads no types for it (each block returns PostgreSQL's built-in
+/// types only), so it sends nothing but the catalog's blocks and the snapshot clear before each. Query Store records each
+/// statement's search_path (query_store.qs_view), and RCA-PG-14 leaves out the observer's own statements by it, and by
+/// their text (rca/README.md, What the capture leaves out).
 /// </summary>
 internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgSessionLimits? limits = null) : ICaptureConnector
 {
@@ -32,11 +33,14 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgS
     public const string ObserverSchema = "dbhubdemo_rca_observer";
 
     /// <summary>
-    /// The startup packet's server options on every observer connection, and only there (Npgsql's Options, libpq's
-    /// options): search_path as the server's default, <c>"$user", public</c>, with <see cref="ObserverSchema"/> last. A
-    /// space in a value is escaped with a backslash (https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-OPTIONS).
+    /// The observer's search_path, a server option in its connections' startup packet, and only theirs (Npgsql's Options,
+    /// libpq's options): the server's default, <c>"$user", public</c>, with <see cref="ObserverSchema"/> last. A space in a
+    /// value is escaped with a backslash (https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-OPTIONS).
     /// </summary>
-    internal const string StartupOptions = """-c search_path="$user",\ public,\ """ + ObserverSchema;
+    internal const string SearchPathOption = """-c search_path="$user",\ public,\ """ + ObserverSchema;
+
+    /// <summary>How every observer connection opens: <see cref="SearchPathOption"/> and its limits in the startup packet, and no type loading.</summary>
+    internal static readonly PgSilentStartup Startup = new(SearchPathOption);
 
     /// <summary>What every block runs after, in the same round trip, so no statistics view repeats an earlier snapshot.</summary>
     internal const string ClearSnapshot = "SELECT pg_stat_clear_snapshot()";
@@ -59,7 +63,7 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgS
         try
         {
             // One attempt: the observer's own loop tries again later, so a replica that doesn't exist yet costs one connect.
-            var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(ApplicationNames.Observer, cancellationToken, limits ?? Limits, retry: false, StartupOptions).ConfigureAwait(false);
+            var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(ApplicationNames.Observer, cancellationToken, limits ?? Limits, retry: false, Startup).ConfigureAwait(false);
             return new PgCaptureConnection(connection);
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)

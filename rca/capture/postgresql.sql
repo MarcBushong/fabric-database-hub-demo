@@ -289,21 +289,23 @@ ORDER BY s.name;
 -- without a time zone, which the read takes as UTC and returns as such. Parameters: $1 text, the database (contosocare);
 -- $2 timestamptz, where the read starts; $3 text[], the harness's functions; $4 text[], the tables only the harness
 -- writes; $5 text[], every other table; $6 timestamptz, the end of the time read (the read's own time, or a pending
--- range's end); $7 text[], every statement the observer sends to contosocare, as it sends them. $3 to $5 come from
--- RCA-PG-16, as regular-expression literals, and $7 from the runner's own catalog and code, never from the answer key; an
--- empty array leaves out nothing. At most 600 rows, earliest intervals first: a read that gets 600 reads again from the
--- end of the last interval it got whole. A wait sample with no event is a backend on CPU, not waiting
--- (pg_stat_activity's wait_event_type, which the view's events follow), so it isn't counted. A row whose text Query
--- Store didn't keep is evidence.
+-- range's end); $7 text[], every statement the observer sends to contosocare, as it sends them (the catalog's blocks and
+-- the snapshot clear: its connections send no SET and load no types). $3 to $5 come from RCA-PG-16, as regular-expression
+-- literals, and $7 from the runner's own catalog and code, never from the answer key; an empty array leaves out nothing.
+-- At most 600 rows, earliest intervals first: a read that gets 600 reads again from the end of the last interval it got
+-- whole. A wait sample with no event is a backend on CPU, not waiting (pg_stat_activity's wait_event_type, which the
+-- view's events follow), so it isn't counted. A row whose text Query Store didn't keep is evidence.
 -- Left out, by two fixed rules and nothing else (rca/README.md, What the capture leaves out): the capture's own
 -- statements, whose connections' search_path names dbhubdemo_rca_observer (qs_view records it per row), whose text
--- carries the marker, or whose text is one of $7's once comments are stripped, white space collapsed, and a final
--- semicolon dropped, which also catches what the observer sent before either marker existed (its blocks then were these
--- same statements without the marker's comment), and a text that begins one of $7's, so normalized, when it's as long as
--- Query Store keeps a text, less one (pg_qs.max_query_text_length, which cuts longer ones short); and the harness's: a
--- call of one of its functions, or a statement that references a table only the harness writes and no other table,
--- since Query Store records a statement nested in a function without its function (pg_qs.query_capture_mode all).
--- Everything else is measured evidence.
+-- carries the marker, or, in a row of the observer's own role (current_user: the workload runs as the same role, and
+-- Query Store keeps one row per role and query, which is why $7 holds nothing the workload sends too), whose text is one
+-- of $7's once comments are stripped, white space collapsed, and a final semicolon dropped, which also catches what the
+-- observer sent before either marker existed (its blocks then were these same statements without the marker's comment),
+-- or begins one of $7's, so normalized, when it's as long as Query Store keeps a text, less one
+-- (pg_qs.max_query_text_length, which cuts longer ones short), and at least 64 characters long once normalized, so a
+-- text that's little but a comment or a common beginning stays; and the harness's: a call of one of its functions, or a
+-- statement that references a table only the harness writes and no other table, since Query Store records a statement
+-- nested in a function without its function (pg_qs.query_capture_mode all). Everything else is measured evidence.
 SELECT /* dbhubdemo:rca-observer */ clock_timestamp() AS captured_at,
        r.start_time AT TIME ZONE 'UTC' AS interval_start_utc,
        r.end_time AT TIME ZONE 'UTC' AS interval_end_utc,
@@ -363,22 +365,22 @@ FROM (SELECT s.start_time,
                          q.rows,
                          q.temp_blks_written
                   FROM query_store.qs_view AS q
+                  CROSS JOIN LATERAL (SELECT btrim(regexp_replace(regexp_replace(regexp_replace(COALESCE(q.query_sql_text, ''), '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59)) AS statement) AS n
                   WHERE q.db_id = (SELECT d.oid FROM pg_database AS d WHERE d.datname = $1)
                     AND q.end_time > ($2::timestamptz AT TIME ZONE 'UTC')
                     AND q.start_time < ($6::timestamptz AT TIME ZONE 'UTC')
                     AND COALESCE(q.search_path, '') NOT LIKE '%dbhubdemo_rca_observer%'
                     AND (q.query_sql_text IS NULL OR q.query_sql_text NOT LIKE '%dbhubdemo:rca-observer%')
-                    AND btrim(regexp_replace(regexp_replace(regexp_replace(COALESCE(q.query_sql_text, ''), '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59))
-                        <> ALL (SELECT btrim(regexp_replace(regexp_replace(regexp_replace(o.statement, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59))
-                                FROM unnest($7::text[]) AS o(statement))
-                    AND CASE WHEN octet_length(COALESCE(q.query_sql_text, '')) + 1
-                                  < COALESCE((SELECT NULLIF(m.setting, '')::integer FROM pg_settings AS m WHERE m.name = 'pg_qs.max_query_text_length'), 2147483647)
-                             THEN true
-                             ELSE NOT EXISTS (SELECT 1
+                    AND NOT CASE WHEN NOT COALESCE(q.user_id = (SELECT a.oid FROM pg_roles AS a WHERE a.rolname = current_user), false) THEN false
+                                 WHEN n.statement IN (SELECT btrim(regexp_replace(regexp_replace(regexp_replace(o.statement, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59))
+                                                      FROM unnest($7::text[]) AS o(statement)) THEN true
+                                 WHEN char_length(n.statement) < 64
+                                      OR octet_length(COALESCE(q.query_sql_text, '')) + 1
+                                         < COALESCE((SELECT NULLIF(m.setting, '')::integer FROM pg_settings AS m WHERE m.name = 'pg_qs.max_query_text_length'), 2147483647) THEN false
+                                 ELSE EXISTS (SELECT 1
                                               FROM unnest($7::text[]) AS t(statement)
-                                              WHERE starts_with(btrim(regexp_replace(regexp_replace(regexp_replace(t.statement, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59)),
-                                                                btrim(regexp_replace(regexp_replace(regexp_replace(q.query_sql_text, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59))))
-                        END
+                                              WHERE starts_with(btrim(regexp_replace(regexp_replace(regexp_replace(t.statement, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59)), n.statement))
+                            END
                     AND NOT (cardinality($3::text[]) > 0 AND COALESCE(q.query_sql_text, '') ~* ('\m(' || array_to_string($3::text[], '|') || ')\s*\('))
                     AND NOT (cardinality($4::text[]) > 0
                              AND COALESCE(q.query_sql_text, '') ~* ('\m(' || array_to_string($4::text[], '|') || ')\M')

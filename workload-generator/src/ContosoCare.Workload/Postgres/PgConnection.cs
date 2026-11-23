@@ -180,6 +180,14 @@ internal sealed record PgSessionLimits(long StatementTimeoutMs, long LockTimeout
 }
 
 /// <summary>
+/// A connection that sends no statement of its own (the RCA observer's): its session limits and <see cref="Options"/> go
+/// in its startup packet instead of SET statements, and Npgsql loads no types for it, so every statement it sends is one
+/// its caller sends.
+/// </summary>
+/// <param name="Options">More server options for the startup packet: <c>-c name=value</c>, a space in a value escaped with a backslash.</param>
+internal sealed record PgSilentStartup(string Options);
+
+/// <summary>
 /// Opens T4 connections: TLS with the server certificate and host name verified, no pooling (closing a connection
 /// ends its session and rolls back anything open), the application name every demo session carries, and per-session
 /// limits so no statement, lock wait, or idle transaction outlives the run that opened it. Transient errors (a server
@@ -205,21 +213,25 @@ internal sealed class PgConnectionOpener(PgEndpoint endpoint, RunnerLog log)
 
     /// <summary>
     /// Opens a connection, retrying transient errors unless <paramref name="retry"/> is false. Session limits are applied
-    /// right after it opens. <paramref name="startupOptions"/>, when given, go in the startup packet (Npgsql's Options), so
-    /// they're in effect before the session's first statement.
+    /// right after it opens, or, for a <paramref name="silent"/> connection, in its startup packet, so it sends no
+    /// statement of its own.
     /// </summary>
-    public async Task<NpgsqlConnection> OpenAsync(string applicationName, CancellationToken cancellationToken, PgSessionLimits? limits = null, bool retry = true, string? startupOptions = null)
+    public async Task<NpgsqlConnection> OpenAsync(string applicationName, CancellationToken cancellationToken, PgSessionLimits? limits = null, bool retry = true, PgSilentStartup? silent = null)
     {
         var started = DateTimeOffset.UtcNow;
         var delay = TimeSpan.FromSeconds(2);
+        var sessionLimits = limits ?? PgSessionLimits.Control;
         for (var attempt = 1; ; attempt++)
         {
             NpgsqlConnection? connection = null;
             try
             {
-                connection = await CreateAsync(applicationName, startupOptions, cancellationToken).ConfigureAwait(false);
+                connection = await CreateAsync(applicationName, silent, sessionLimits, cancellationToken).ConfigureAwait(false);
                 await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-                await ApplyLimitsAsync(connection, limits ?? PgSessionLimits.Control, cancellationToken).ConfigureAwait(false);
+                if (silent is null)
+                {
+                    await ApplyLimitsAsync(connection, sessionLimits, cancellationToken).ConfigureAwait(false);
+                }
                 if (attempt > 1)
                 {
                     log.Info("pg.connected", "Connected after retrying.", ("target", Target), ("attempts", attempt), ("elapsed", DateTimeOffset.UtcNow - started));
@@ -269,10 +281,13 @@ internal sealed class PgConnectionOpener(PgEndpoint endpoint, RunnerLog log)
 
     /// <summary>
     /// Builds the connection string without any credential; <see cref="CreateAsync"/> adds the token for one connection.
-    /// <paramref name="startupOptions"/> are server command-line options for the startup packet, a space in a value escaped
-    /// with a backslash (https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-OPTIONS).
+    /// A <paramref name="silent"/> connection's options and <paramref name="limits"/> go in the startup packet as server
+    /// command-line options, a space in a value escaped with a backslash
+    /// (https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-OPTIONS), and Npgsql loads no types for it
+    /// (ServerCompatibilityMode NoTypeLoading: https://www.npgsql.org/doc/connection-string-parameters.html), so it reads
+    /// only PostgreSQL's built-in types.
     /// </summary>
-    internal static NpgsqlConnectionStringBuilder Build(PgEndpoint endpoint, string applicationName, int connectTimeoutSeconds, string? startupOptions = null)
+    internal static NpgsqlConnectionStringBuilder Build(PgEndpoint endpoint, string applicationName, int connectTimeoutSeconds, PgSilentStartup? silent = null, PgSessionLimits? limits = null)
     {
         if (applicationName.Length > MaximumApplicationNameLength)
         {
@@ -294,9 +309,12 @@ internal sealed class PgConnectionOpener(PgEndpoint endpoint, RunnerLog log)
             SslMode = endpoint.Auth == PgAuthMode.ManagedIdentity ? SslMode.VerifyFull : SslMode.Prefer,
             PersistSecurityInfo = false,
         };
-        if (startupOptions is not null)
+        if (silent is not null)
         {
-            builder.Options = startupOptions;
+            builder.Options = silent.Options + " " + LimitsOptions(limits ?? PgSessionLimits.Control);
+#pragma warning disable CS0618 // Npgsql prefers a data source's ConfigureTypeLoading, but these connections are unpooled, one per token, with no data source of their own to configure; Npgsql still honours the connection string's mode.
+            builder.ServerCompatibilityMode = ServerCompatibilityMode.NoTypeLoading;
+#pragma warning restore CS0618
         }
 
         return builder;
@@ -307,9 +325,14 @@ internal sealed class PgConnectionOpener(PgEndpoint endpoint, RunnerLog log)
         CultureInfo.InvariantCulture,
         $"SET statement_timeout = {limits.StatementTimeoutMs}; SET lock_timeout = {limits.LockTimeoutMs}; SET idle_in_transaction_session_timeout = {limits.IdleInTransactionTimeoutMs};");
 
-    private async Task<NpgsqlConnection> CreateAsync(string applicationName, string? startupOptions, CancellationToken cancellationToken)
+    /// <summary>The same limits as server options for a startup packet, for a connection that sends no SET.</summary>
+    internal static string LimitsOptions(PgSessionLimits limits) => string.Create(
+        CultureInfo.InvariantCulture,
+        $"-c statement_timeout={limits.StatementTimeoutMs} -c lock_timeout={limits.LockTimeoutMs} -c idle_in_transaction_session_timeout={limits.IdleInTransactionTimeoutMs}");
+
+    private async Task<NpgsqlConnection> CreateAsync(string applicationName, PgSilentStartup? silent, PgSessionLimits limits, CancellationToken cancellationToken)
     {
-        var builder = Build(endpoint, applicationName, ConnectTimeoutSeconds, startupOptions);
+        var builder = Build(endpoint, applicationName, ConnectTimeoutSeconds, silent, limits);
         if (endpoint.Auth == PgAuthMode.PasswordFromEnvironment)
         {
             var user = Environment.GetEnvironmentVariable(PgEndpoint.UserVariable);

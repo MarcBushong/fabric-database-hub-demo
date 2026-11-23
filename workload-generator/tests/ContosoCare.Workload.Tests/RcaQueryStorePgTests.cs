@@ -991,10 +991,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             }
         }
 
-        foreach (var statement in new[] { PgCaptureConnector.ClearSnapshot, "SET statement_timeout = 10000", "SET statement_timeout = 30000", "SET lock_timeout = 1000", "SET idle_in_transaction_session_timeout = 60000" })
-        {
-            Assert.True(rule.LeftOut(statement, WorkloadPath, none), statement);
-        }
+        Assert.True(rule.LeftOut(PgCaptureConnector.ClearSnapshot, WorkloadPath, none));
     }
 
     [Fact]
@@ -1020,16 +1017,83 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
+    public void WhatTheWorkloadSendsTooStaysEvidenceEvenThoughTheObserverOnceSentIt()
+    {
+        // Before its connections opened silently, the observer sent the session limits' SETs and Npgsql's type loading, as
+        // the workload's connections still do, under the same role: Query Store keeps them in the workload's rows, so they
+        // stay evidence, and $7 holds none of them.
+        var rule = LeaveOut.FromCatalog();
+        var none = PgHarness.Parse([]);
+        foreach (var statement in new[]
+        {
+            Postgres.PgConnectionOpener.LimitsCommand(PgCaptureConnector.Limits),
+            "SET statement_timeout = 10000",
+            "SET statement_timeout = 30000",
+            "SET lock_timeout = 1000",
+            "SET idle_in_transaction_session_timeout = 60000",
+            "SELECT version()",
+        })
+        {
+            Assert.False(rule.LeftOut(statement, WorkloadPath, none), statement);
+        }
+
+        Assert.DoesNotContain(PgObserverStatements.All, s => s.StartsWith("SET ", StringComparison.Ordinal) || s.Contains("version()", StringComparison.Ordinal) || s.Contains("pg_type", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void AnObserversTextUnderAnotherRoleIsThatRolesEvidence()
+    {
+        // The text rule leaves out only the observer's own role's rows: another role that sends the same text keeps it.
+        var rule = LeaveOut.FromCatalog();
+        var none = PgHarness.Parse([]);
+        var phase1 = CaptureCatalog.Parse(RcaPgCatalogHistory.Edd01c86)["RCA-PG-01"];
+
+        Assert.True(rule.LeftOut(phase1, WorkloadPath, none));
+        Assert.True(rule.LeftOut(phase1[..120], WorkloadPath, none, maxTextLength: 120));
+        Assert.True(rule.LeftOut(PgCaptureConnector.ClearSnapshot, WorkloadPath, none));
+        Assert.False(rule.LeftOut(phase1, WorkloadPath, none, ownRole: false));
+        Assert.False(rule.LeftOut(phase1[..120], WorkloadPath, none, maxTextLength: 120, ownRole: false));
+        Assert.False(rule.LeftOut(PgCaptureConnector.ClearSnapshot, WorkloadPath, none, ownRole: false));
+
+        // The markers are the observer's alone, whatever the role.
+        Assert.True(rule.LeftOut(phase1, "\"$user\", public, dbhubdemo_rca_observer", none, ownRole: false));
+        Assert.True(rule.LeftOut(CaptureCatalog.Get("RCA-PG-01"), WorkloadPath, none, ownRole: false));
+    }
+
+    [Fact]
+    public void ACutShortTextThatIsLittleButACommentOrACommonBeginningIsKept()
+    {
+        // At Query Store's limit, but under 64 characters once its comments are stripped: no telling it from the workload's.
+        var rule = LeaveOut.FromCatalog();
+        var none = PgHarness.Parse([]);
+        var filler = new string('x', 300);
+        foreach (var text in new[]
+        {
+            "-- " + filler,
+            "/* " + new string('x', 85) + " */ SELECT clock_timestamp() AS captured_at, " + filler,
+            "SELECT clock_timestamp() AS captured_at, -- " + filler,
+            "SELECT /* " + new string('x', 60) + " */ clock_timestamp() AS captured_at, a.pid, " + filler,
+        })
+        {
+            var cut = text[..100];
+            Assert.True(rule.Normalize(cut).Length < rule.Minimum, cut);
+            Assert.Contains(PgObserverStatements.All, s => rule.Normalize(s).StartsWith(rule.Normalize(cut), StringComparison.Ordinal));
+            Assert.False(rule.LeftOut(cut, WorkloadPath, none, maxTextLength: 100), cut);
+        }
+
+        Assert.Equal(64, rule.Minimum);
+    }
+
+    [Fact]
     public void AnOwnStatementQueryStoreCutShortIsLeftOutByItsBeginning()
     {
-        // edd01c86's blocks, which carry no marker, and Npgsql's type loading, cut where Query Store cuts a text longer than
-        // pg_qs.max_query_text_length (100 to 10,000; 6,000 by default).
+        // edd01c86's blocks, which carry no marker, cut where Query Store cuts a text longer than pg_qs.max_query_text_length
+        // (100 to 10,000; 6,000 by default).
         var rule = LeaveOut.FromCatalog();
         var none = PgHarness.Parse([]);
         var statements = CaptureCatalog.Parse(RcaPgCatalogHistory.Edd01c86)
             .Where(b => b.Key.StartsWith("RCA-PG-", StringComparison.Ordinal))
             .Select(b => b.Value)
-            .Append(PgObserverStatements.NpgsqlTypeLoadingQuery)
             .ToList();
         foreach (var max in new[] { 100, 1000 })
         {
@@ -1158,58 +1222,108 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
-    public async Task OnlyTheObserversConnectionsCarryTheMarkerFromTheirStartupPacketOn()
+    public async Task OnlyTheObserversConnectionsCarryTheMarkerAndTheirLimitsInTheirStartupPacket()
     {
         using var server = new ListeningPostgres();
         var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
         using var credentials = new TestCredentials();
-        foreach (var (connector, database) in new[] { (new PgCaptureConnector(endpoint, RunnerLog.Null), "contosocare"), (PgCaptureConnector.QueryStore(endpoint, RunnerLog.Null), "azure_sys") })
+        foreach (var (connector, database, statementTimeout) in new[] { (new PgCaptureConnector(endpoint, RunnerLog.Null), "contosocare", 10_000), (PgCaptureConnector.QueryStore(endpoint, RunnerLog.Null), "azure_sys", 30_000) })
         {
+            // A silent open sends nothing before its caller's first statement, so it opens on a server that answers nothing.
             var accepted = server.AcceptAsync(TestContext.Current.CancellationToken);
-            await Assert.ThrowsAsync<CaptureException>(() => connector.OpenAsync(TestContext.Current.CancellationToken));
-            var (startup, _) = await accepted;
+            var connection = await connector.OpenAsync(TestContext.Current.CancellationToken);
+            await connection.DisposeAsync();
+            var (startup, queries) = await accepted;
 
-            Assert.Equal(PgCaptureConnector.StartupOptions, startup["options"]);
+            Assert.Empty(queries);
             Assert.Equal(ApplicationNames.Observer, startup["application_name"]);
             Assert.Equal(database, startup["database"]);
 
-            // As the server splits the options (a backslash escapes a space): the server's default with the marker last.
-            Assert.Equal(["-c", "search_path=\"$user\", public, dbhubdemo_rca_observer"], SplitOptions(startup["options"]));
+            // As the server splits the options (a backslash escapes a space): the server's default search_path with the
+            // marker last, then the session limits.
+            Assert.Equal(
+                ["-c", "search_path=\"$user\", public, dbhubdemo_rca_observer", "-c", $"statement_timeout={statementTimeout}", "-c", "lock_timeout=1000", "-c", "idle_in_transaction_session_timeout=60000"],
+                SplitOptions(startup["options"]));
         }
 
-        // Any other connection the runner opens carries no marker.
+        // Any other connection the runner opens carries no options and loads types: Npgsql's type loading comes first.
         var other = server.AcceptAsync(TestContext.Current.CancellationToken);
         await Assert.ThrowsAnyAsync<Exception>(() => new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(ApplicationNames.Program + "/control/status", TestContext.Current.CancellationToken, retry: false));
-        var (plain, _) = await other;
-        Assert.DoesNotContain(PgCaptureConnector.ObserverSchema, plain.GetValueOrDefault("options") ?? string.Empty, StringComparison.Ordinal);
+        var (plain, sent) = await other;
+        Assert.False(plain.ContainsKey("options"));
         Assert.DoesNotContain(PgCaptureConnector.ObserverSchema, plain.GetValueOrDefault("search_path") ?? string.Empty, StringComparison.Ordinal);
+        Assert.Contains(sent, q => q.Contains("SELECT version()", StringComparison.Ordinal));
     }
 
     [Fact]
-    public async Task NpgsqlsTypeLoadingIsAmongTheObserversOwnStatements()
+    public async Task TheObserversConnectionsSendOnlyTheirOwnStatementsAndReadEveryTypeWithoutLoadingTypes()
     {
-        using var server = new ListeningPostgres();
+        // A column of each type the PostgreSQL blocks return (their SELECT lists: reg* values, LSNs, and xids come as text),
+        // in binary, as Npgsql asks for it. With no type loading, Npgsql knows PostgreSQL's built-in types only.
+        var at = new DateTimeOffset(2026, 11, 20, 17, 0, 1, 250, TimeSpan.Zero);
+        var columns = new (string Name, uint Oid, byte[]? Value, object? Expected)[]
+        {
+            ("captured_at", 1184, Wire.Timestamp(at), at.UtcDateTime),
+            ("interval_start_utc", 1114, Wire.Timestamp(at), at.UtcDateTime),
+            ("pid", 23, Wire.Int32(20432), 20432),
+            ("tuple", 21, Wire.Int16(7), (short)7),
+            ("query_id", 20, Wire.Int64(-6412873301142229951), -6412873301142229951L),
+            ("usename", 19, Wire.Text("contosocare_runner"), "contosocare_runner"),
+            ("query", 25, Wire.Text("UPDATE care.work_queues SET status = $1"), "UPDATE care.work_queues SET status = $1"),
+            ("xact_age_s", 1700, Wire.Numeric(weight: 0, scale: 1, 12, 5000), 12.5m),
+            ("blk_read_time", 701, Wire.Float8(1.25), 1.25),
+            ("in_recovery", 16, [1], true),
+            ("blocked_by", 1007, Wire.Int32Array(9772, 20584), new[] { 9772, 20584 }),
+            ("relation", 25, null, null),
+        };
+        using var server = new ListeningPostgres(query => query == PgCaptureConnector.ClearSnapshot
+            ? [("pg_stat_clear_snapshot", 2278u, [])]
+            : [.. columns.Select(c => (c.Name, c.Oid, c.Value))]);
         var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
         using var credentials = new TestCredentials();
         var accepted = server.AcceptAsync(TestContext.Current.CancellationToken);
-        await Assert.ThrowsAsync<CaptureException>(() => new PgCaptureConnector(endpoint, RunnerLog.Null).OpenAsync(TestContext.Current.CancellationToken));
-        var (_, queries) = await accepted;
 
-        var rule = LeaveOut.FromCatalog();
-        var own = PgObserverStatements.All.Select(rule.Normalize).ToHashSet(StringComparer.Ordinal);
+        // RCA-PG-14 with every kind of parameter the blocks take: text, timestamptz, text[], and the list of own statements.
+        var connection = await new PgCaptureConnector(endpoint, RunnerLog.Null).OpenAsync(TestContext.Current.CancellationToken);
+        IReadOnlyList<CaptureValues> rows;
+        try
+        {
+            rows = await connection.QueryAsync(
+                "RCA-PG-14",
+                CaptureCatalog.Get("RCA-PG-14"),
+                CaptureParameters.Positional("contosocare", at, MarkedFunction, Array.Empty<string>(), OtherTable, at.AddMinutes(15), PgObserverStatements.All.ToArray()),
+                TimeSpan.FromSeconds(10),
+                TestContext.Current.CancellationToken);
+        }
+        finally
+        {
+            await connection.DisposeAsync();
+        }
 
-        // Query Store may keep a query of several statements whole, or one statement at a time: both are left out.
-        var sent = queries.Select(rule.Normalize).SelectMany(q => Statements(q).Prepend(q)).Distinct(StringComparer.Ordinal).ToList();
-        var missing = sent.Where(q => !own.Contains(q)).ToList();
-        Assert.NotEmpty(queries);
-        Assert.True(missing.Count == 0, "Npgsql sends a statement that PgObserverStatements.NpgsqlTypeLoading doesn't hold:\n" + string.Join("\n----\n", missing));
-        Assert.Contains(rule.Normalize(PgObserverStatements.NpgsqlTypeLoadingQuery), sent);
+        var (_, sent) = await accepted;
+        var row = Assert.Single(rows);
+        foreach (var (name, _, _, expected) in columns)
+        {
+            Assert.Equal(expected, row.Raw[name]);
+        }
+
+        Assert.Equal(DateTimeKind.Utc, ((DateTime)row.Raw["captured_at"]!).Kind);
+        Assert.All(server.ResultFormats, f => Assert.Equal(new short[] { 1 }, f));
+
+        // All it sent were its own statements, in $7: the snapshot clear and the block. No SET, and no type loading.
+        Assert.Equal([PgCaptureConnector.ClearSnapshot, CaptureCatalog.Get("RCA-PG-14")], sent);
+        Assert.All(sent, s => Assert.Contains(s, PgObserverStatements.All));
     }
 
     // ---- Helpers -----------------------------------------------------------------------------------------------------
 
     /// <summary>The workload's own search_path on T4: the server's default.</summary>
     private const string WorkloadPath = "\"$user\", public";
+
+    /// <summary>RCA-PG-14's text[] parameters in the wire test: a marked function, and a table others write.</summary>
+    private static readonly string[] MarkedFunction = ["fn_harness_event"];
+
+    private static readonly string[] OtherTable = ["patients"];
 
     /// <summary>
     /// database/postgresql's functions and tables as RCA-PG-16 reads them from the catalog: each function's source (its
@@ -1234,34 +1348,6 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         }
 
         return (functions, tables);
-    }
-
-    /// <summary>A normalized query's statements: split at each semicolon outside a quoted literal.</summary>
-    private static IEnumerable<string> Statements(string query)
-    {
-        var start = 0;
-        var quoted = false;
-        for (var i = 0; i < query.Length; i++)
-        {
-            if (query[i] == '\'')
-            {
-                quoted = !quoted;
-            }
-            else if (query[i] == ';' && !quoted)
-            {
-                if (query[start..i].Trim() is { Length: > 0 } statement)
-                {
-                    yield return statement;
-                }
-
-                start = i + 1;
-            }
-        }
-
-        if (query[start..].Trim() is { Length: > 0 } last)
-        {
-            yield return last;
-        }
     }
 
     /// <summary>A startup packet's options as the server splits them: at white space, a backslash escaping the next character.</summary>
@@ -1499,11 +1585,12 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     private static partial Regex TimestampParameter();
 
     /// <summary>
-    /// RCA-PG-14's leave-out, evaluated in .NET from the block's own patterns: the observer's search_path and marker, its
-    /// own statements by their text ($7, normalized as the block normalizes both sides), a call of a harness function ($3),
-    /// and a statement that names a table only the harness writes ($4) and no other ($5).
+    /// RCA-PG-14's leave-out, evaluated in .NET from the block's own patterns: the observer's search_path and marker; in a
+    /// row of the observer's own role, its own statements by their text ($7, normalized as the block normalizes both sides),
+    /// whole or, at Query Store's text limit and long enough, by their beginning; a call of a harness function ($3); and a
+    /// statement that names a table only the harness writes ($4) and no other ($5).
     /// </summary>
-    private sealed partial class LeaveOut(Dictionary<int, (string Before, string After)> patterns, string comment, string line, string space)
+    private sealed partial class LeaveOut(Dictionary<int, (string Before, string After)> patterns, string comment, string line, string space, int minimum)
     {
         public static LeaveOut FromCatalog()
         {
@@ -1512,15 +1599,18 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             Assert.Contains("q.query_sql_text NOT LIKE '%dbhubdemo:rca-observer%'", text, StringComparison.Ordinal);
             var patterns = ArrayPattern().Matches(text).ToDictionary(m => int.Parse(m.Groups["n"].Value, CultureInfo.InvariantCulture), m => (m.Groups["before"].Value, m.Groups["after"].Value));
             Assert.Equal([3, 4, 5], patterns.Keys.Order());
+            var normalized = NormalizedText().Match(text);
+            Assert.True(normalized.Success, "RCA-PG-14 no longer normalizes Query Store's text once, in the form this test reads.");
             var rule = TextRule().Match(text);
-            Assert.True(rule.Success, "RCA-PG-14 no longer compares Query Store's text with $7, both normalized alike, in the form this test reads.");
-            var truncated = TruncatedRule().Match(text);
-            Assert.True(truncated.Success, "RCA-PG-14 no longer takes a text Query Store cut short for the beginning of one of $7's, in the form this test reads.");
+            Assert.True(rule.Success, "RCA-PG-14 no longer compares Query Store's text with $7's, for the observer's own role, in the form this test reads.");
             Assert.Equal(
-                (rule.Groups["comment"].Value, rule.Groups["line"].Value, rule.Groups["space"].Value),
-                (truncated.Groups["comment"].Value, truncated.Groups["line"].Value, truncated.Groups["space"].Value));
-            return new LeaveOut(patterns, rule.Groups["comment"].Value, rule.Groups["line"].Value, rule.Groups["space"].Value);
+                (normalized.Groups["comment"].Value, normalized.Groups["line"].Value, normalized.Groups["space"].Value),
+                (rule.Groups["comment"].Value, rule.Groups["line"].Value, rule.Groups["space"].Value));
+            return new LeaveOut(patterns, rule.Groups["comment"].Value, rule.Groups["line"].Value, rule.Groups["space"].Value, int.Parse(rule.Groups["minimum"].Value, CultureInfo.InvariantCulture));
         }
+
+        /// <summary>How long a cut-short text must be, normalized, to be taken for the beginning of one of $7's.</summary>
+        public int Minimum => minimum;
 
         /// <summary>A text as RCA-PG-14 compares it: comments stripped, white space collapsed, a final semicolon dropped.</summary>
         public string Normalize(string text)
@@ -1533,25 +1623,29 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
         /// <summary>
         /// Whether RCA-PG-14 leaves the text out. <paramref name="maxTextLength"/> is pg_qs.max_query_text_length as
-        /// pg_settings has it, or null when it doesn't: a text within one byte of it was cut short.
+        /// pg_settings has it, or null when it doesn't: a text within one byte of it was cut short. <paramref name="ownRole"/>
+        /// is whether the row's role is the observer's own (current_user), as the workload's is.
         /// </summary>
-        public bool LeftOut(string text, string? searchPath, PgHarness harness, IReadOnlyList<string>? ownStatements = null, int? maxTextLength = null)
+        public bool LeftOut(string text, string? searchPath, PgHarness harness, IReadOnlyList<string>? ownStatements = null, int? maxTextLength = null, bool ownRole = true)
         {
             if ((searchPath ?? string.Empty).Contains("dbhubdemo_rca_observer", StringComparison.Ordinal) || text.Contains("dbhubdemo:rca-observer", StringComparison.Ordinal))
             {
                 return true;
             }
 
-            var normalized = Normalize(text);
-            var own = (ownStatements ?? PgObserverStatements.All).Select(Normalize).ToList();
-            if (own.Contains(normalized, StringComparer.Ordinal))
+            if (ownRole)
             {
-                return true;
-            }
+                var normalized = Normalize(text);
+                var own = (ownStatements ?? PgObserverStatements.All).Select(Normalize).ToList();
+                if (own.Contains(normalized, StringComparer.Ordinal))
+                {
+                    return true;
+                }
 
-            if (maxTextLength is { } max && System.Text.Encoding.UTF8.GetByteCount(text) + 1 >= max && own.Any(o => o.StartsWith(normalized, StringComparison.Ordinal)))
-            {
-                return true;
+                if (normalized.Length >= minimum && maxTextLength is { } max && System.Text.Encoding.UTF8.GetByteCount(text) + 1 >= max && own.Any(o => o.StartsWith(normalized, StringComparison.Ordinal)))
+                {
+                    return true;
+                }
             }
 
             return (harness.Functions.Count > 0 && Matches(3, harness.Functions, text))
@@ -1564,13 +1658,12 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         [GeneratedRegex(@"~\* \('(?<before>[^']*)' \|\| array_to_string\(\$(?<n>\d)::text\[\], '\|'\) \|\| '(?<after>[^']*)'\)")]
         private static partial Regex ArrayPattern();
 
-        [GeneratedRegex(@"btrim\(regexp_replace\(regexp_replace\(regexp_replace\(COALESCE\(q\.query_sql_text, ''\), '(?<comment>[^']*)', ' ', 'g'\), '(?<line>[^']*)', ' ', 'g'\), '(?<space>[^']*)', ' ', 'g'\), ' ' \|\| chr\(59\)\)\s*<> ALL \(SELECT btrim\(regexp_replace\(regexp_replace\(regexp_replace\(o\.statement, '\k<comment>', ' ', 'g'\), '\k<line>', ' ', 'g'\), '\k<space>', ' ', 'g'\), ' ' \|\| chr\(59\)\)\s*FROM unnest\(\$7::text\[\]\) AS o\(statement\)\)")]
+        [GeneratedRegex(@"FROM query_store\.qs_view AS q\s+CROSS JOIN LATERAL \(SELECT btrim\(regexp_replace\(regexp_replace\(regexp_replace\(COALESCE\(q\.query_sql_text, ''\), '(?<comment>[^']*)', ' ', 'g'\), '(?<line>[^']*)', ' ', 'g'\), '(?<space>[^']*)', ' ', 'g'\), ' ' \|\| chr\(59\)\) AS statement\) AS n\s+WHERE ")]
+        private static partial Regex NormalizedText();
+
+        [GeneratedRegex(@"AND NOT CASE WHEN NOT COALESCE\(q\.user_id = \(SELECT a\.oid FROM pg_roles AS a WHERE a\.rolname = current_user\), false\) THEN false\s+WHEN n\.statement IN \(SELECT btrim\(regexp_replace\(regexp_replace\(regexp_replace\(o\.statement, '(?<comment>[^']*)', ' ', 'g'\), '(?<line>[^']*)', ' ', 'g'\), '(?<space>[^']*)', ' ', 'g'\), ' ' \|\| chr\(59\)\)\s+FROM unnest\(\$7::text\[\]\) AS o\(statement\)\) THEN true\s+WHEN char_length\(n\.statement\) < (?<minimum>\d+)\s+OR octet_length\(COALESCE\(q\.query_sql_text, ''\)\) \+ 1\s+< COALESCE\(\(SELECT NULLIF\(m\.setting, ''\)::integer FROM pg_settings AS m WHERE m\.name = 'pg_qs\.max_query_text_length'\), 2147483647\) THEN false\s+ELSE EXISTS \(SELECT 1\s+FROM unnest\(\$7::text\[\]\) AS t\(statement\)\s+WHERE starts_with\(btrim\(regexp_replace\(regexp_replace\(regexp_replace\(t\.statement, '\k<comment>', ' ', 'g'\), '\k<line>', ' ', 'g'\), '\k<space>', ' ', 'g'\), ' ' \|\| chr\(59\)\), n\.statement\)\)\s+END")]
         private static partial Regex TextRule();
-
-        [GeneratedRegex(@"CASE WHEN octet_length\(COALESCE\(q\.query_sql_text, ''\)\) \+ 1\s+< COALESCE\(\(SELECT NULLIF\(m\.setting, ''\)::integer FROM pg_settings AS m WHERE m\.name = 'pg_qs\.max_query_text_length'\), 2147483647\)\s+THEN true\s+ELSE NOT EXISTS \(SELECT 1\s+FROM unnest\(\$7::text\[\]\) AS t\(statement\)\s+WHERE starts_with\(btrim\(regexp_replace\(regexp_replace\(regexp_replace\(t\.statement, '(?<comment>[^']*)', ' ', 'g'\), '(?<line>[^']*)', ' ', 'g'\), '(?<space>[^']*)', ' ', 'g'\), ' ' \|\| chr\(59\)\),\s+btrim\(regexp_replace\(regexp_replace\(regexp_replace\(q\.query_sql_text, '\k<comment>', ' ', 'g'\), '\k<line>', ' ', 'g'\), '\k<space>', ' ', 'g'\), ' ' \|\| chr\(59\)\)\)\)\s+END")]
-        private static partial Regex TruncatedRule();
     }
-
     /// <summary>
     /// RCA-PG-16's derivation, evaluated in .NET from the block's own patterns: a marked function writes a table, an
     /// unmarked one names it at all, and an unmarked one that runs dynamic SQL or keeps no source makes it unsure.
@@ -1903,12 +1996,13 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     /// <summary>
-    /// A PostgreSQL server that only listens (protocol 3: https://www.postgresql.org/docs/18/protocol-flow.html). It refuses
-    /// TLS and GSS encryption, lets the client in without a password, records the startup packet's parameters and every
-    /// query the client sends, and closes the connection once the client has been quiet for half a second, so the client's
-    /// open fails before it reaches any database.
+    /// A PostgreSQL server that listens (protocol 3: https://www.postgresql.org/docs/18/protocol-flow.html). It refuses TLS
+    /// and GSS encryption, lets the client in without a password, records the startup packet's parameters and every query
+    /// the client sends, and closes the connection once the client has been quiet for half a second. Without an answer it
+    /// answers no query, so a client that sends one before its open completes fails to open; with one, it answers the
+    /// extended protocol's statements at each Sync with the answer's columns and one row of their binary values, or none.
     /// </summary>
-    private sealed class ListeningPostgres : IDisposable
+    private sealed class ListeningPostgres(Func<string, (string Name, uint Oid, byte[]? Value)[]?>? answer = null) : IDisposable
     {
         private static readonly (string Name, string Value)[] ServerParameters =
         [
@@ -1916,11 +2010,12 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             ("IntervalStyle", "postgres"), ("integer_datetimes", "on"), ("standard_conforming_strings", "on"), ("TimeZone", "UTC"),
         ];
 
-        private readonly TcpListener listener = new(IPAddress.Loopback, 0);
-
-        public ListeningPostgres() => listener.Start();
+        private readonly TcpListener listener = Started();
 
         public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        /// <summary>The result formats each Bind asked for, in order (1 is binary).</summary>
+        public List<short[]> ResultFormats { get; } = [];
 
         public void Dispose() => listener.Dispose();
 
@@ -1960,6 +2055,8 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             await stream.WriteAsync(Message('Z', "I"u8.ToArray()), cancellationToken);
 
             var queries = new List<string>();
+            var steps = new List<(char Kind, string Query)>();
+            var parsed = string.Empty;
             while (true)
             {
                 byte[] head;
@@ -1977,13 +2074,32 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
                 }
 
                 var payload = await ReadAsync(stream, BinaryPrimitives.ReadInt32BigEndian(head.AsSpan(1)) - 4, cancellationToken);
-                switch ((char)head[0])
+                var kind = (char)head[0];
+                switch (kind)
                 {
                     case 'Q':
                         queries.Add(CStringAt(payload, 0));
                         break;
                     case 'P':
-                        queries.Add(CStringAt(payload, Array.IndexOf(payload, (byte)0) + 1));
+                        parsed = CStringAt(payload, Array.IndexOf(payload, (byte)0) + 1);
+                        queries.Add(parsed);
+                        steps.Add((kind, parsed));
+                        break;
+                    case 'B':
+                        ResultFormats.Add(BindResultFormats(payload));
+                        steps.Add((kind, parsed));
+                        break;
+                    case 'D' or 'E':
+                        steps.Add((kind, parsed));
+                        break;
+                    case 'S' when answer is not null:
+                        foreach (var (step, query) in steps)
+                        {
+                            await stream.WriteAsync(Reply(step, answer(query)), cancellationToken);
+                        }
+
+                        steps.Clear();
+                        await stream.WriteAsync(Message('Z', "I"u8.ToArray()), cancellationToken);
                         break;
                     case 'X':
                         return (startup, queries);
@@ -1991,6 +2107,62 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             }
 
             return (startup, queries);
+        }
+
+        private static TcpListener Started()
+        {
+            var listener = new TcpListener(IPAddress.Loopback, 0);
+            listener.Start();
+            return listener;
+        }
+
+        /// <summary>The result format codes at a Bind message's end, after its portal, statement, parameter formats, and values.</summary>
+        private static short[] BindResultFormats(byte[] payload)
+        {
+            var at = Array.IndexOf(payload, (byte)0) + 1;
+            at = Array.IndexOf(payload, (byte)0, at) + 1;
+            at += 2 + (2 * BinaryPrimitives.ReadInt16BigEndian(payload.AsSpan(at)));
+            var values = BinaryPrimitives.ReadInt16BigEndian(payload.AsSpan(at));
+            at += 2;
+            for (var i = 0; i < values; i++)
+            {
+                at += 4 + Math.Max(0, BinaryPrimitives.ReadInt32BigEndian(payload.AsSpan(at)));
+            }
+
+            var count = BinaryPrimitives.ReadInt16BigEndian(payload.AsSpan(at));
+            return [.. Enumerable.Range(0, count).Select(i => BinaryPrimitives.ReadInt16BigEndian(payload.AsSpan(at + 2 + (2 * i))))];
+        }
+
+        /// <summary>What a step of the extended protocol gets at Sync: Parse and Bind complete, the row's description, its row and completion.</summary>
+        private static byte[] Reply(char step, (string Name, uint Oid, byte[]? Value)[]? columns)
+        {
+            switch (step)
+            {
+                case 'P':
+                    return Message('1', []);
+                case 'B':
+                    return Message('2', []);
+                case 'D' when columns is null:
+                    return Message('n', []);
+                case 'D':
+                    var description = new List<byte>(Wire.Int16((short)columns.Length));
+                    foreach (var (name, oid, _) in columns)
+                    {
+                        description.AddRange([.. CString(name), .. Int32(0), .. Wire.Int16(0), .. Int32((int)oid), .. Wire.Int16(-1), .. Int32(-1), .. Wire.Int16(1)]);
+                    }
+
+                    return Message('T', [.. description]);
+                case 'E' when columns is null:
+                    return Message('C', CString("SELECT 0"));
+                default:
+                    var row = new List<byte>(Wire.Int16((short)columns!.Length));
+                    foreach (var (_, _, value) in columns)
+                    {
+                        row.AddRange(value is null ? Int32(-1) : [.. Int32(value.Length), .. value]);
+                    }
+
+                    return [.. Message('D', [.. row]), .. Message('C', CString("SELECT 1"))];
+            }
         }
 
         private static async Task<byte[]> ReadAsync(NetworkStream stream, int count, CancellationToken cancellationToken)
@@ -2025,5 +2197,48 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         }
     }
 
+    /// <summary>PostgreSQL's binary formats for the types the blocks return (https://www.postgresql.org/docs/18/protocol-overview.html).</summary>
+    private static class Wire
+    {
+        public static byte[] Int16(short value)
+        {
+            var bytes = new byte[2];
+            BinaryPrimitives.WriteInt16BigEndian(bytes, value);
+            return bytes;
+        }
 
+        public static byte[] Int32(int value)
+        {
+            var bytes = new byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+            return bytes;
+        }
+
+        public static byte[] Int64(long value)
+        {
+            var bytes = new byte[8];
+            BinaryPrimitives.WriteInt64BigEndian(bytes, value);
+            return bytes;
+        }
+
+        public static byte[] Float8(double value)
+        {
+            var bytes = new byte[8];
+            BinaryPrimitives.WriteDoubleBigEndian(bytes, value);
+            return bytes;
+        }
+
+        public static byte[] Text(string value) => System.Text.Encoding.UTF8.GetBytes(value);
+
+        /// <summary>A timestamp: microseconds since 2000-01-01 00:00 UTC.</summary>
+        public static byte[] Timestamp(DateTimeOffset value) => Int64((value.UtcTicks - new DateTime(2000, 1, 1, 0, 0, 0, DateTimeKind.Utc).Ticks) / 10);
+
+        /// <summary>A non-negative numeric: base-10,000 digits, the first one's weight, and the scale shown.</summary>
+        public static byte[] Numeric(short weight, short scale, params short[] digits) =>
+            [.. Int16((short)digits.Length), .. Int16(weight), .. Int16(0), .. Int16(scale), .. digits.SelectMany(Int16)];
+
+        /// <summary>A one-dimensional integer[] with no nulls.</summary>
+        public static byte[] Int32Array(params int[] values) =>
+            [.. Int32(1), .. Int32(0), .. Int32(23), .. Int32(values.Length), .. Int32(1), .. values.SelectMany(v => Int32(4).Concat(Int32(v)))];
+    }
 }
