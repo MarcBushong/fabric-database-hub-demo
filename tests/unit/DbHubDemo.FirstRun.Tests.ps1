@@ -1719,7 +1719,7 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
             $script:order | Should -Be @('Deallocate:archost01', 'Deallocate:sqlvm01', 'SaveHistory', 'KeptValues', 'Pause')
             ($results | Where-Object { $_.checkId -eq 'STOP.FABRIC.KEPTVALUE' }).status | Should -Be 'Pass'
-            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'STOP.FABRIC.KEPTVALUE' -and $TimeoutMinutes -eq 15 }
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'STOP.FABRIC.KEPTVALUE' -and $TimeoutMinutes -eq 10 -and $SessionTimeoutMinutes -eq 5 }
             $script:order.Clear()
             $script:still = $true
             $null = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
