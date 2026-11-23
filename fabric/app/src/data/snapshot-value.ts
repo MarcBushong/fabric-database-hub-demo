@@ -248,6 +248,52 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
     return out;
 }
 
+/**
+ * The kept form of the model's 'Snapshot Value' per target, analysis, metric, and bin, by snapshotValues' keys, from rows
+ * with the kept values that fabric/history/kept_value.py wrote (KeptValue, and ResolvedAt, when it worked the row out):
+ * - a bin with a row not worked out yet, a row without a bin, and an analysis off the bin grid: the release's rule, the
+ *   newest capture's sum;
+ * - otherwise a total's kept values summed, and for a maximum or an average the highest of each capture's sum.
+ * A bin whose kept values are all null isn't there. It's the DAX measure's reference
+ * (fabric/powerbi/kept-value/Snapshot Value.tmdl), and F35's live proof compares it with snapshotValues on the same rows.
+ */
+export function keptFormValues(rows: readonly Row[]): Map<string, number> {
+    const groups = new Map<string, Row[]>();
+    for (const r of rows) {
+        const at = time(r.Bucket);
+        const key = `${text(r.TargetKey)}|${text(r.AnalysisKey)}|${text(r.Metric)}|${at === null ? "" : String(at)}`;
+        const group = groups.get(key) ?? [];
+        group.push(r);
+        groups.set(key, group);
+    }
+    const out = new Map<string, number>();
+    const numberOf = (value: unknown) => (value === null || value === undefined || value === "" ? null : Number(value));
+    for (const [key, group] of groups) {
+        const [, analysis, metric, binText] = key.split("|");
+        const sums = new Map<number | null, number | null>();
+        const kept = binText !== "" && !OFF_GRID_ANALYSES.has(analysis) && group.every((r) => time(r.ResolvedAt) !== null);
+        for (const r of group) {
+            const captured = time(r.CapturedAt);
+            const value = numberOf(kept ? r.KeptValue : r.Value);
+            const before = sums.has(captured) ? (sums.get(captured) ?? null) : null;
+            sums.set(captured, value === null ? before : (before ?? 0) + value);
+        }
+        let value: number | null = null;
+        if (!kept) {
+            const times = [...sums.keys()].filter((t): t is number => t !== null);
+            value = sums.get(times.length > 0 ? Math.max(...times) : null) ?? null;
+        } else if (ADDITIVE_ANALYSES.has(analysis) || ADDITIVE_METRICS.has(metric)) {
+            const parts = [...sums.values()].filter((v): v is number => v !== null);
+            value = parts.length > 0 ? parts.reduce((a, b) => a + b, 0) : null;
+        } else {
+            const parts = [...sums.values()].filter((v): v is number => v !== null);
+            value = parts.length > 0 ? Math.max(...parts) : null;
+        }
+        if (value !== null) out.set(key, value);
+    }
+    return out;
+}
+
 /** Each target's window totals and peaks, after the model's telemetry measures: an analysis, which metrics, and whether they add up or peak. */
 export const WINDOW_MEASURES: Record<string, { analysis: string; metric: (name: string) => boolean; adds: boolean; scale?: number }> = {
     LockWaitS: { analysis: "wait_deltas", metric: (m) => m === "Lock", adds: true, scale: 1 / 1000 },

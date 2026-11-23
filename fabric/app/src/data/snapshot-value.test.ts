@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { f35Check, monitorGrain, snapshotValues, sqlGrain } from "./snapshot-value";
+import { f35Check, keptFormValues, monitorGrain, snapshotValues, sqlGrain } from "./snapshot-value";
 
 type Row = Record<string, unknown>;
 
@@ -360,5 +360,46 @@ describe("a save's declared grain", () => {
         for (const grain of [undefined, null, 0, 2.5, 1441]) {
             expect(f35Check(rows(grain), at("15:00"), at("16:00")).measures.T2.SessionsPeak).toEqual({ model: 43, finest: 7 });
         }
+    });
+});
+
+// F35 design (i): the model's kept form reads the kept values that fabric/history/kept_value.py wrote, and the release's
+// rule where they aren't all there. keptFormValues is the DAX measure's reference.
+describe("the kept form of 'Snapshot Value' (keptFormValues)", () => {
+    const SESSION = save("2026-11-21T16:00:00", "2026-11-21T15:00:00", "2026-11-21T15:40:00");
+    const DAY = save("2026-11-21T21:30:00", "2026-11-20T21:26:00", "2026-11-21T21:26:00");
+    const worked = (s: Record<string, string>, analysis: string, metric: string, kept: number | null, resolved: string | null = "2026-11-21T22:00:00") =>
+        (point: readonly [string, number]): Row => ({ ...row(s, "T1", analysis, metric)(point), KeptValue: kept, ResolvedAt: resolved });
+
+    it("sums a total's kept values, and takes the highest capture's sum of a peak's, where every row is worked out", () => {
+        const values = keptFormValues([
+            worked(SESSION, "wait_deltas", "Lock", 60)(["15:15", 60]),
+            worked(DAY, "wait_deltas", "Lock", 840)(["15:15", 900]),
+            worked(SESSION, "cpu", "MaxCPU", 40)(["15:15", 40]),
+            worked(DAY, "cpu", "MaxCPU", 70)(["15:15", 70]),
+            { ...worked(DAY, "cpu", "MaxCPU", 5)(["15:15", 5]), ResourceName: "a second instance" },
+        ]);
+        expect(values.get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(900);
+        expect(values.get(key("T1", "cpu", "MaxCPU", "15:15"))).toBe(75);
+    });
+
+    it("reads a bin with a row not worked out yet, a row without a bin, and an analysis off the grid by the release's rule", () => {
+        const values = keptFormValues([
+            worked(SESSION, "wait_deltas", "Lock", 60)(["15:15", 60]),
+            worked(DAY, "wait_deltas", "Lock", null, null)(["15:15", 900]),
+            { ...worked(SESSION, "wait_profile", "Lock", null, null)(["15:15", 5]), Bucket: null },
+            { ...worked(DAY, "wait_profile", "Lock", null)(["15:15", 7]), Bucket: null },
+            worked(SESSION, "memory_clerks", "MEMORYCLERK_SQLBUFFERPOOL", 2048)(["15:20", 2048]),
+            worked(DAY, "memory_clerks", "MEMORYCLERK_SQLBUFFERPOOL", null)(["15:20", 4096]),
+        ]);
+        // The day save's row isn't worked out, so its newest capture's 900 counts alone, as before F35.
+        expect(values.get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(900);
+        expect(values.get("T1|wait_profile|Lock|")).toBe(7);
+        expect(values.get(key("T1", "memory_clerks", "MEMORYCLERK_SQLBUFFERPOOL", "15:20"))).toBe(4096);
+    });
+
+    it("leaves out a bin whose kept values are all null, as a chart leaves it blank", () => {
+        const values = keptFormValues([worked(SESSION, "cpu", "MaxCPU", null)(["15:30", 30]), worked(DAY, "cpu", "MaxCPU", null)(["15:30", 25])]);
+        expect(values.has(key("T1", "cpu", "MaxCPU", "15:30"))).toBe(false);
     });
 });
