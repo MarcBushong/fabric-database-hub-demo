@@ -5819,3 +5819,49 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The runner's own ad hoc statements (item 3) wait on A1's build.** Until then RCA-SQL-10 and 14 keep the polled stop check, so the rehearsal's blindness check (S7) needs A1's commit. Which form Query Store keeps for a statement under simple parameterization is proven only by A1's opt-in real-engine test and by S7.
 - **A Run all session's Query Store evidence** comes through Run all's own path (T2c), which joins this release by the coordinator's decision. If it isn't reviewed by 2026-11-24 18:00, it reaches the history with the next scripts' save until Run all's path ships as its own release.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
+
+### Run all's path for the sidecars: the control notebook (T2c-2, 2026-11-23)
+
+**Why.** Demo users only ever Run all, so a Run all session's Query Store evidence must reach the history through `NB_DatabaseHub_Control` itself, not a later scripts' save. This is T2c's control notebook half, on O1's reviewed d06899f6 with the contract through 96f81133 (T2c's kinds and fixtures, 1e13e9aa). T2c-1 builds the runbooks' half; nothing here needs it to merge first.
+
+- **Staging** (cell 5, `stage_rca_sidecars`), from every history that Run all saves:
+  - `stopped_metrics`, which each save path already calls for the metrics' final version by its ID, notes the metrics' `rcaSidecars` pointer; a null `index` has nothing to stage;
+  - the save then reads the sidecar bundle index's version and its bundles by version, with the Get Secret and the Secrets User grant the evidence uses, and takes only whole sidecars: each part with the index's SHA-256 and count, from `DBHUBDEMO-RCAS` lines only;
+  - it stages one `ContosoCare.RcaSidecarParts` payload, `Files/rca/inbox/sidecar-<yyyyMMddTHHmmssZ>-runall-<8 hex>.json`, at most 64 parts and 262,144 bytes, and passes it as `RCA_SIDECAR_FILE` with the history's parameters;
+  - the session's own save, the pre-check's save of an earlier session, the RCA-only save, and Stop now's save of a stopped session all go through `save_history`, so each takes the pointers this Run all read and hasn't passed yet, whatever session it saves, since the activity notebook writes each sidecar under its own session. A pointer is passed once per Run all, and again only when its history didn't start.
+- **Only when the activity notebook declares `RCA_SIDECAR_FILE`,** read once per Run all from its definition ([Get Item Definition](https://learn.microsoft.com/rest/api/fabric/core/items/get-item-definition), and its [long-running operation](https://learn.microsoft.com/rest/api/fabric/articles/long-running-operation) when it answers 202), as the scripts check it. When it doesn't (`fabric.importNotebooks` false), nothing is read or staged, and one `RCA.SIDECAR` **Warning** names `./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity -RunLiveActivity`. A definition that can't be read counts as declaring it, as for the scripts.
+- **After the run** (`rca_sidecar_outcome`), one `RCA.SIDECAR` line from the payload's acknowledgement, `Files/rca/acks/<payload>.ack.json`, read only when it names the payload and lists exactly its sidecars:
+  - **Pass** with how many it wrote and found already written; the payload goes, as the activity notebook deletes it itself then;
+  - a **Warning** with the skipped ones and why, or with no valid acknowledgement, and the payload stays (`rca/README.md`, Acknowledgement);
+  - a **Warning** that Run all can't tell yet, for a job it doesn't wait for, which reads the payload later;
+  - a payload no run read (the job didn't start, or was deduplicated) goes, and a later save of the same Run all takes those sidecars, as the scripts do.
+- **The next start** (cell 4, `build_request`): `rcaAcks`, a `ContosoCare.RcaAckRequest` with the `written` and `already` IDs of Run all's own `-runall-` acknowledgements, oldest first, each once, at most 64 and as many as the request's 4,096 bytes hold; the rest ride on a later start. Oldest first stands until C0's contract states the order for more than 64. It never reads the scripts' `-script-` ones, or one naming another payload. `build_request` takes them from part 2's `pending_rca_acks` when it's given none; cell 8 is unchanged.
+- **Settling** (`settle_rca_acks`, from `follow_status` and the live view's status reads): the start's status's `rcaAcks` (`ContosoCare.RcaAckResult`) makes each acknowledgement whose every `written` or `already` ID was `sent` done, and it goes; `skipped` IDs never ride, so one with only skipped sidecars is done too. The rest stay for the next start. It prints `RCA.SIDECAR.ACK` once, unless the status's own steps carry it. IDs go as they come: T2's name its guest, and the runbook maps them to VMs.
+- **What doesn't change:** the evidence's index, bundles, staging, and outcomes. `stopped_metrics`, whose fallback reads the secret's latest version, now skips every `ContosoCare.Rca*` kind, the sidecars' bundles and index as well as the evidence's bundles; d06899f6 skipped only `ContosoCare.RcaBundle`. Staging, outcomes, and acknowledgements never raise, so the history and the start go on whatever happens to the sidecars. Nothing reads the answer key, the scenario plan, or `blind-detection.json`.
+
+**Changed files.** `fabric/control/NB_DatabaseHub_Control.ipynb` (cells 4 and 5), `tests/unit/Fabric.ControlNotebook.Tests.ps1`, and this entry. `fabric/notebooks/published-versions.json` isn't on d06899f6 and lists only the deployment and activity notebooks; `deploy.ps1` publishes the control notebook at every run, so it has no versions to write.
+
+**Validation.** On this branch, with Python 3.11 and pandas 3.1:
+
+- **`Fabric.ControlNotebook`:** 86 passed, none failed or skipped: the 73 before, unchanged, its pandas case included, and 13 new. The simulator now has the runbook's sidecar bundle, index, and pointer (from `rca/fixtures`), the activity notebook's definition, and its acknowledgements as B writes them. The new cases:
+  - a session's end with its evidence: both staged and passed, the reads in order, the definition through the long-running operation, the payload against `transport.schema.json`, `RCA.EVIDENCE` and `RCA.SIDECAR` Pass, and the acknowledgement kept;
+  - a skipped sidecar, no acknowledgement, a queued job, and a refused job;
+  - the pre-check's leftover save, Stop now's stopped-history save, and the RCA-only save;
+  - an activity notebook without the parameter;
+  - the next start's `rcaAcks` and the settling, with an acknowledgement of only a skipped sidecar;
+  - a sidecar bundle, and a sidecar index, as the latest version;
+  - `build_request`'s limits.
+- **Mutations,** each alone, each failing its tests: `RCA_SIDECAR_FILE` not passed (7 of 8 cases; the refused job never runs); no definition check; no `pending_rca_acks` call; settling that keeps the acknowledgements; one with only skipped sidecars kept; `-script-` acknowledgements read; a payload deleted with a skipped sidecar; an unread payload kept; a pointer passed twice in one Run all; no byte limit on `rcaAcks`; no de-duplication; an acknowledgement of another payload accepted; and d06899f6's fallback, which takes a sidecar bundle or index for the metrics.
+- PSScriptAnalyzer, with the tests' settings, found nothing in the test file, which is ASCII-only; cells 4 and 5 compile as Python 3.10 and are ASCII-only; the leak check prints nothing.
+
+**Risks and what its live check needs.**
+
+- **T2c-1's runbook must accept `rcaAcks`:** d06899f6's refuses a request field it doesn't know. `-runall-` acknowledgements exist only once a runbook with the sidecar path has written a pointer, so only runbooks published again from an older checkout would refuse a start, and `./scripts/deploy.ps1` fixes that. After T2c-1 merges, INT adds a start with `rcaAcks` to `Test-DbHubControlRequest`'s cross-check here.
+- **`RCA.SIDECAR.ACK`:** the notebook prints it from the status's `rcaAcks` unless the start adds it as a step, so it shows once either way.
+- **The activity notebook's sweep** deletes a `-runall-` acknowledgement a day after its payload is gone. A save between a session's history and the next start more than a day later can take one before it's sent: those sidecars stay pending on the VMs, and the next session's exports fetch them again and its save answers `already`.
+- **The live run (S1 and S2) shows:**
+  - Get Item Definition with the notebook user's `pbi` token, which needs read and write on the activity notebook;
+  - `notebookutils.fs.head` on an acknowledgement;
+  - T2c-1's pointer, index, and bundles staged whole;
+  - B's acknowledgement read;
+  - S2's start acknowledging S1's sidecars, the acknowledgement deleted after it, and no sidecar written twice (`already` only).
