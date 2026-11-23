@@ -386,7 +386,8 @@ internal sealed class SteppedClock(ManualTime time) : TimeProvider
 /// <see cref="EvidenceCost"/> says, by default nothing, and whose Query Store blocks can cost time (the clock moves by it;
 /// past its timeout, by the timeout, and the block fails as SqlClient's command timeout does), fail, or throw. The
 /// connection can break at a moment: a Query Store block at it, or any block after it, fails on the connection that was
-/// open then, as does every later block on it; a connection opened after the break works.
+/// open then, as does every later block on it; a connection opened after the break works. <see cref="Before"/> runs as
+/// each block starts; a block whose token is cancelled throws then, as SqlClient's command does.
 /// </summary>
 internal sealed class TimedConnector(ManualTime clock, ICaptureConnector evidence) : ICaptureConnector
 {
@@ -410,6 +411,9 @@ internal sealed class TimedConnector(ManualTime clock, ICaptureConnector evidenc
     public Func<string, CaptureParameters, IReadOnlyList<CaptureValues>> QueryStore { get; set; } = (_, _) => [];
 
     public DateTimeOffset? BreakAt { get; set; }
+
+    /// <summary>Runs as each block starts, with its ID and the time: a test can cancel the end there.</summary>
+    public Action<string, DateTimeOffset> Before { get; set; } = (_, _) => { };
 
     public string Description => "timed";
 
@@ -437,6 +441,8 @@ internal sealed class TimedConnector(ManualTime clock, ICaptureConnector evidenc
         private async Task<IReadOnlyList<CaptureValues>> RunAsync(string blockId, string text, int[]? parameter, CaptureParameters? parameters, TimeSpan timeout, CancellationToken cancellationToken)
         {
             var at = owner.Time.Now;
+            owner.Before(blockId, at);
+            cancellationToken.ThrowIfCancellationRequested();
             owner.Calls.Add((at, blockId, timeout, parameters));
             var sidecar = QueryStoreBlocks.Contains(blockId);
             if (owner.BreakAt is { } moment && opened <= moment && (at > moment || (at == moment && sidecar)))

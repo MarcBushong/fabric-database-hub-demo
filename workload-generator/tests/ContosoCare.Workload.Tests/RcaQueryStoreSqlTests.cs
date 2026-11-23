@@ -559,6 +559,37 @@ public sealed class RcaQueryStoreSqlTests
     }
 
     [Fact]
+    public async Task AnEndCancelledInTheEvidencesOwnEndStillWritesQueryStoresCoverageWithItsGap()
+    {
+        using var withoutStop = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var without = await RunT1Async(sidecar: null, CancelAtTheEndsEventRead(withoutStop), stop: withoutStop);
+        using var withStop = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var sidecar = new MemorySidecarSink();
+        var with = await RunT1Async(sidecar, CancelAtTheEndsEventRead(withStop), stop: withStop);
+
+        // The host stop's limit cancels the end while the evidence's own end reads the event session: the cancellation
+        // reaches the lane, and the last watermark is still written, as without a sink.
+        Assert.IsAssignableFrom<OperationCanceledException>(without.Failure);
+        Assert.IsAssignableFrom<OperationCanceledException>(with.Failure);
+        AssertSameEvidence(without, with);
+        Assert.Equal(RcaSimulation.T1To, with.Watermarks[^1]);
+
+        // Query Store's end reads still run, cancelled too, and write the sidecar's last coverage row with the gap that
+        // says what the end didn't read.
+        var coverage = sidecar.Table(RcaContract.QueryCoverage);
+        Assert.Equal(3, coverage.Count);
+        Assert.Contains("17:05:00 UTC: The end's Query Store reads on T1 were cut short with the observer's end, before the intervals that ended after 14:50 UTC.", ((string?)coverage[^1].Get("gaps") ?? string.Empty).Split('\n'));
+
+        static Action<TimedConnector> CancelAtTheEndsEventRead(CancellationTokenSource stop) => connector => connector.Before = (block, at) =>
+        {
+            if (block == "RCA-XE-02" && at >= RcaSimulation.T1To)
+            {
+                stop.Cancel();
+            }
+        };
+    }
+
+    [Fact]
     public async Task ARefusedRcaAz04IsAGapWithItsPermissionAndItsOwnFixWhileTheRestMatchesTheFixture()
     {
         var without = await RunT3FixtureAsync(sidecar: null, refused: "RCA-AZ-04");
@@ -657,9 +688,10 @@ public sealed class RcaQueryStoreSqlTests
     /// T1's simulated session (RcaSimulation's blocking chain), 16:50 to 17:05, driven as the lane drives it, through a
     /// TimedConnector whose Query Store blocks the test sets up: the evidence, its watermarks, its span, and the connector;
     /// with <paramref name="watermarkFailsAt"/>, the span's watermarks fail to be written from then; with
-    /// <paramref name="evidenceEnded"/>, the test's part of the end hook; and the failure that reached the lane, if either did.
+    /// <paramref name="evidenceEnded"/>, the test's part of the end hook; with <paramref name="stop"/>, the token the
+    /// lane runs with, which the test can cancel; and the failure that reached the lane, if any of them made one.
     /// </summary>
-    private static async Task<SessionRun> RunT1Async(ISidecarSink? sidecar, Action<TimedConnector>? setUp = null, DateTimeOffset? watermarkFailsAt = null, Action<DateTimeOffset>? evidenceEnded = null)
+    private static async Task<SessionRun> RunT1Async(ISidecarSink? sidecar, Action<TimedConnector>? setUp = null, DateTimeOffset? watermarkFailsAt = null, Action<DateTimeOffset>? evidenceEnded = null, CancellationTokenSource? stop = null)
     {
         var clock = new ManualTime(RcaSimulation.T1From);
         var connector = new TimedConnector(clock, RcaSimulation.T1(clock)) { QueryStore = (block, _) => block == "RCA-SQL-15" ? [StateRow(clock.Now, "READ_WRITE", 0, null)] : [] };
@@ -670,9 +702,9 @@ public sealed class RcaQueryStoreSqlTests
         Exception? failure = null;
         try
         {
-            await LaneDriver.RunAsync(observer, span, clock, RcaSimulation.T1From, RcaSimulation.T1To, TestContext.Current.CancellationToken, evidenceEnded);
+            await LaneDriver.RunAsync(observer, span, clock, RcaSimulation.T1From, RcaSimulation.T1To, stop?.Token ?? TestContext.Current.CancellationToken, evidenceEnded);
         }
-        catch (Exception ex) when (watermarkFailsAt is not null || evidenceEnded is not null)
+        catch (Exception ex) when (watermarkFailsAt is not null || evidenceEnded is not null || stop is not null)
         {
             failure = ex;
         }
