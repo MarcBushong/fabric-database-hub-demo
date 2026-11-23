@@ -5565,7 +5565,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The tests:** `APP_TOKENS` now lists each theme's hover and pressed fills (`states`) beside its surfaces at rest, and `src/lib/app.test.ts` holds the statuses, targets, and charts to their contrast on both; Fluent's text, brand text, and links on both, and a pressed or selected link on the surfaces at rest; the band's label with the band composited over each surface a chart sits on; and each badge the app's sources show (a scan of every `<Badge>`, with Fluent's tokens for its appearance and color) on its own fill or the surfaces. Each of the 9 fixes, reverted alone, fails one of them.
 - **Color vision:** the dark statuses' closest pairs are 0.135, 0.110, 0.097, and 0.115 apart (normal, protanopia, deuteranopia, tritanopia; 0.135, 0.114, 0.117, and 0.144 at 2b0e46b0), above the light statuses' 0.096, which are unchanged, as are the targets'. In dark, the brand's text and Fail are 0.067 apart in normal vision and 0.022 under deuteranopia: a status always has its icon and word.
 
-**Found, not changed: high contrast's hover fills.** The app's own **High contrast** theme is Fluent's `teamsHighContrastTheme`, whose hovered and pressed fills are cyan (`#1AEBFF`) under black text, while the app's status words keep their own colors: on a hovered row they're 1.03:1 to 1.53:1. It was so before the earth tones, high contrast is outside this change, and Windows forced colors are unaffected. `APP_TOKENS.contrast.states` is empty, so the tests above don't cover it.
+**Found, not changed: high contrast's hover fills.** The app's own **High contrast** theme is Fluent's `teamsHighContrastTheme`, whose hovered and pressed fills are cyan (`#1AEBFF`) under black text, while the app's status words keep their own colors: on a hovered row they're 1.03:1 to 1.53:1. It was so before the earth tones, high contrast is outside this change, and Windows forced colors are unaffected. `APP_TOKENS.contrast.states` is empty, so the tests above don't cover it. It's fixed on its own branch, for the next release: [its entry](#high-contrast-the-apps-colors-on-a-hovered-or-pressed-fill-2026-11-23).
 
 **Changed files.** `fabric/app/src/theme/fluent.ts` and `identity.ts`; `components/AgentPrompts.tsx`; `lib/app.test.ts`; ADR 0030, the CHANGELOG, the app's README, and this report: this entry, and a line in the earth tones' entry.
 
@@ -5595,3 +5595,30 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
 
 **What its live check needs.** The deployed app in dark: press **All findings** on the Overview page and an icon-only button such as a table's Copy; and the Readiness page's **Open** and the Links page's **Open in Fabric** in light and dark.
+
+### High contrast: the app's colors on a hovered or pressed fill (2026-11-23)
+
+**Why.** [The review of 2b0e46b0](#the-review-of-2b0e46b0-2026-11-23) found, and [its re-check](#the-re-check-of-f28d6320-2026-11-23) confirmed, that in the app's own **High contrast** theme, Fluent's `teamsHighContrastTheme`, a hovered or pressed row, subtle or transparent button, or menu item takes a cyan fill (`#1AEBFF`: `colorSubtleBackgroundHover` and `Pressed`, `colorNeutralBackground1Hover` and `Pressed`, `colorTransparentBackgroundHover` and `Pressed`), which Fluent pairs with a black foreground (14.37:1), while the app's own colors don't switch. It's older than the earth tones: the same at b059c91, with the same Fluent (9.75.2) and the same contrast tokens. The coordinator put it in Wednesday's release, on its own branch, `marcbushong-microsoft-insights-app-high-contrast-hover`, after 6da522e6, with the reviewer's smallest fix: one high contrast group in `styles/app.css`, outside the forced-colors blocks.
+
+- **What was on the cyan, and at what contrast:**
+  - a table row's status words (`.status-badge`, the statuses' high contrast colors), 1.03:1 to 1.53:1;
+  - its target marks (`.target-chip i`, an inline background), 1.03:1 to 1.36:1, and so the target filter's marks on a hovered menu item;
+  - its plain **Open** link, in the link's yellow, 1.36:1, and its captions (`.muted`, white), 1.46:1;
+  - a KPI tile's text (white), 1.46:1, the tile's own hover rule filling it with `colorSubtleBackgroundHover`;
+  - the **Ask Copilot** and **Ask why** buttons, whose text is the brand's white with `!important`, 1.46:1;
+  - and the Copilot account button's plan (`.copilot-account-plan`, white), 1.46:1.
+- **The fix:** a `[data-theme="contrast"]` group at the end of `styles/app.css` gives each of those, on a hovered or pressed row, button, or menu item, the foreground Fluent pairs with that fill: `colorNeutralForeground1Hover` and `Pressed` in a row and a KPI tile, `colorNeutralForeground2Hover` and `Pressed` in a menu item and a subtle button, and `colorNeutralForeground2BrandHover` and `Pressed` in a transparent button, all black, 14.37:1 on the cyan. A target's mark takes it as its background, with `!important` over the inline color, and Ask's buttons with `!important` over their own. The rest of the row, button, or menu item already took it from Fluent. Light and dark don't match `[data-theme="contrast"]`, and the forced-colors blocks are untouched.
+- **What's left as it was:** a KPI tile's status rail, at its edge, keeps its color beside the cyan, as the tile's status is also its word; and Fluent's components keep their own high contrast pairs.
+- **Found, not changed: a bar chart's hover hides its bar.** `ChartView` draws its cursor's band (`.chart-cursor rect`, `colorSubtleBackgroundHover`) over a bar chart's bars, not under them, and the fill is opaque, so the hovered band's bars disappear while the tooltip shows their values: in every theme, and in high contrast as a cyan band. It isn't a contrast pair, and it's older than the earth tones. A dashed outline, as a line chart's cursor is, or drawing the band before the bars, would fix it.
+
+**Changed files.** `fabric/app/src/styles/app.css` (the group), `theme/fluent.ts` (the comment on high contrast's `states`), and `lib/app.test.ts`; ADR 0030, the CHANGELOG, the app's README, and this report: this entry, and a line in the review's entry.
+
+**Validation.** On 6da522e6 with this commit, with this PC at 100 % CPU from other sessions, so targeted runs only until 2 PM:
+
+- **`src/lib/app.test.ts`, its themes:** 23 passed, the forced-colors tests (F22) among them. The new test holds each place the app colors on high contrast's hover and pressed fill (16, in a row, a menu item, a KPI tile, Ask's buttons, and the Copilot account button) to the foreground Fluent pairs with that fill, at 4.5:1 for text and 3:1 for a mark, with `!important` where it's needed.
+- **It fails without the fix:** with the group removed, with a row's target mark without its `!important`, and with the **Ask Copilot** hover rule removed: 3 of 3 fail it.
+- **The typecheck and lint:** `tsc` found no error, and ESLint none in the two TypeScript files this commit changes.
+- markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+- **Pending:** a check in the browser that each rule wins over Fluent's and the inline colors, in the sample preview's high contrast theme, after 2 PM.
+
+**What its live check needs.** The deployed app in its **High contrast** theme, not Windows forced colors: hover and press a row on the Findings and Readiness pages, the target filter's items, a KPI tile on Findings, **Ask Copilot** on a card and **Ask why** on the Estate page, and the Copilot account in the dock.

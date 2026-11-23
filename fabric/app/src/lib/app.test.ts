@@ -88,6 +88,46 @@ describe("themes", () => {
         }
     });
 
+    it("in high contrast, gives what the app colors on a hovered or pressed fill the foreground Fluent pairs with that fill, outside Windows forced colors", () => {
+        // Fluent's high contrast fills a hovered or pressed row, subtle or transparent button, or menu item in cyan, under
+        // black. The app's own colors don't switch with it: on the cyan they were 1.03:1 to 1.53:1 (the re-check of f28d6320).
+        // So each place they sit on such a fill takes the foreground Fluent pairs with it (styles/app.css).
+        const hc = FLUENT_THEMES.contrast as unknown as Record<string, string>;
+        const css = readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8")
+            .replace(/\/\*[\s\S]*?\*\//g, "")
+            .replace(/@media \(forced-colors: active\) \{[\s\S]*?\n\}/g, "");
+        const rules = [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].map((m) => ({ selectors: m[1].split(",").map((s) => s.trim()), body: m[2] }));
+        const rule = (selector: string) => rules.find((r) => r.selectors.includes(`[data-theme="contrast"] ${selector}`))?.body ?? "";
+        // Each place: what the app colors there, the property, the fill under it, and its minimum: 4.5:1 for text, 3:1 for a mark.
+        const ROW = { hover: "colorSubtleBackgroundHover", active: "colorSubtleBackgroundPressed" } as const;
+        const PLACES: Array<[selector: string, property: string, fill: string, minimum: number]> = [
+            ...(["hover", "active"] as const).flatMap((s): Array<[string, string, string, number]> => [
+                [`.fui-TableRow:${s} .status-badge`, "color", ROW[s], 4.5],
+                [`.fui-TableRow:${s} .muted`, "color", ROW[s], 4.5],
+                [`.fui-TableRow:${s} a`, "color", ROW[s], 4.5],
+                [`.fui-TableRow:${s} .target-chip i`, "background", ROW[s], 3],
+            ]),
+            [".fui-MenuItemCheckbox:hover .target-chip i", "background", "colorNeutralBackground1Hover", 3],
+            [".fui-MenuItemCheckbox:active .target-chip i", "background", "colorNeutralBackground1Pressed", 3],
+            ["button.kpi-main:hover", "color", "colorSubtleBackgroundHover", 4.5],
+            ["button.kpi-main:hover .kpi-label", "color", "colorSubtleBackgroundHover", 4.5],
+            ["button.kpi-main:hover .kpi-sub", "color", "colorSubtleBackgroundHover", 4.5],
+            [".ask-copilot:hover", "color", "colorSubtleBackgroundHover", 4.5],
+            [".ask-copilot:active", "color", "colorSubtleBackgroundPressed", 4.5],
+            [".ask-why:hover", "color", "colorTransparentBackgroundHover", 4.5],
+            [".ask-why:active", "color", "colorTransparentBackgroundPressed", 4.5],
+            [".copilot-account:hover .copilot-account-plan", "color", "colorTransparentBackgroundHover", 4.5],
+            [".copilot-account:active .copilot-account-plan", "color", "colorTransparentBackgroundPressed", 4.5],
+        ];
+        for (const [selector, property, fill, minimum] of PLACES) {
+            const body = rule(selector);
+            const name = body.match(new RegExp(`(?:^|[;\\s])${property}:\\s*var\\(--(\\w+)\\)`))?.[1] ?? "missing";
+            expect(contrastRatio(hc[name] ?? `no ${name}`, hc[fill]), `${selector}: ${name} on ${fill}`).toBeGreaterThanOrEqual(minimum);
+            // A target's mark is an inline background, and Ask's text the brand's with !important: only !important replaces them.
+            if (/target-chip i$|^\.ask-/.test(selector)) expect(body, selector).toMatch(/!important\s*;/);
+        }
+    });
+
     it("keeps the chart's incident band label readable (4.5:1) with the band over each surface a chart sits on, the stage's included", () => {
         // The band is translucent: its label sits on the band blended over the surface, as the browser composites it.
         const over = (rgba: string, base: string) => {

@@ -1888,3 +1888,60 @@ button.kpi-main:hover {
     gap: 6px;
     text-align: left;
 }
+
+/* ---------- High contrast: what sits on a hovered or pressed fill ---------- */
+
+/* Fluent's high contrast theme fills a hovered or pressed row, subtle or transparent button, or menu item in cyan, and
+   pairs the fill with a black foreground. The app's own colors don't switch with it: on the cyan, the statuses, a target's
+   mark, a link's yellow, and the brand's and the captions' white were 1.03:1 to 1.53:1. Here each takes the foreground
+   Fluent pairs with its fill, as the rest of the row, button, or menu item does. Windows forced colors have their own
+   rules (F22), which these leave alone; a target's mark is an inline background, so only !important replaces it, and Ask's
+   buttons draw their text in the brand's color with !important too. */
+[data-theme="contrast"] .fui-TableRow:hover .status-badge,
+[data-theme="contrast"] .fui-TableRow:hover .muted,
+[data-theme="contrast"] .fui-TableRow:hover a,
+[data-theme="contrast"] button.kpi-main:hover,
+[data-theme="contrast"] button.kpi-main:hover .kpi-label,
+[data-theme="contrast"] button.kpi-main:hover .kpi-sub {
+    color: var(--colorNeutralForeground1Hover);
+}
+
+[data-theme="contrast"] .fui-TableRow:active .status-badge,
+[data-theme="contrast"] .fui-TableRow:active .muted,
+[data-theme="contrast"] .fui-TableRow:active a {
+    color: var(--colorNeutralForeground1Pressed);
+}
+
+[data-theme="contrast"] .fui-TableRow:hover .target-chip i {
+    background: var(--colorNeutralForeground1Hover) !important;
+}
+
+[data-theme="contrast"] .fui-TableRow:active .target-chip i {
+    background: var(--colorNeutralForeground1Pressed) !important;
+}
+
+[data-theme="contrast"] .fui-MenuItemCheckbox:hover .target-chip i {
+    background: var(--colorNeutralForeground2Hover) !important;
+}
+
+[data-theme="contrast"] .fui-MenuItemCheckbox:active .target-chip i {
+    background: var(--colorNeutralForeground2Pressed) !important;
+}
+
+[data-theme="contrast"] .ask-copilot:hover {
+    color: var(--colorNeutralForeground2Hover) !important;
+}
+
+[data-theme="contrast"] .ask-copilot:active {
+    color: var(--colorNeutralForeground2Pressed) !important;
+}
+
+[data-theme="contrast"] .ask-why:hover,
+[data-theme="contrast"] .copilot-account:hover .copilot-account-plan {
+    color: var(--colorNeutralForeground2BrandHover) !important;
+}
+
+[data-theme="contrast"] .ask-why:active,
+[data-theme="contrast"] .copilot-account:active .copilot-account-plan {
+    color: var(--colorNeutralForeground2BrandPressed) !important;
+}
