@@ -608,7 +608,7 @@ Describe 'GuestSignInCleanup step' {
         $state = Get-DemoVmState
         $state['generation'] = 'g2'
         $state['steps']['ArcOnboarding'] = [ordered]@{ status = 'Succeeded'; setGeneration = 'g2'; completedUtc = (Get-DemoVmUtcNow) }
-        $state['steps']['GuestVm'] = [ordered]@{ status = 'Succeeded'; setGeneration = 'g1'; completedUtc = (Get-DemoVmUtcNow) }
+        $state['steps']['GuestImage'] = [ordered]@{ status = 'Succeeded'; setGeneration = 'g1'; completedUtc = (Get-DemoVmUtcNow) }
         Save-DemoVmState -State $state
         $warned = Clear-DemoHostGuestSignIn -Context $context
         $warned.Outcome | Should -Be 'Done'
@@ -622,10 +622,21 @@ Describe 'GuestSignInCleanup step' {
         $established.Outcome | Should -Be 'Done'
         $established.TransientWarningMessage[0] | Should -Match 'Windows PowerShell on archost01.*endpoint protection may report'
         @($established.NoteMessage).Count | Should -Be 0
-        # A guest built in this generation, as a rebuilt one: a note again.
-        $state['steps']['GuestVm']['setGeneration'] = 'g3'
+        # A guest that was only off, which GuestVm's Set starts again on an established host: still a one-off warning (the
+        # re-check of ea1ea20f).
+        $state['steps']['GuestVm'] = [ordered]@{ status = 'Succeeded'; setGeneration = 'g3'; completedUtc = (Get-DemoVmUtcNow) }
         Save-DemoVmState -State $state
-        @((Clear-DemoHostGuestSignIn -Context $context).NoteMessage).Count | Should -Be 1
+        $restarted = Clear-DemoHostGuestSignIn -Context $context
+        @($restarted.NoteMessage).Count | Should -Be 0 -Because 'starting a guest that was off builds nothing'
+        @($restarted.TransientWarningMessage).Count | Should -Be 1
+        # A guest whose disk was downloaded or built in this generation, as a new or rebuilt one's: a note again.
+        foreach ($build in 'GuestImage', 'GuestVhdx') {
+            $state['steps']['GuestImage']['setGeneration'] = 'g1'
+            $state['steps']['GuestVhdx'] = [ordered]@{ status = 'Succeeded'; setGeneration = 'g1'; completedUtc = (Get-DemoVmUtcNow) }
+            $state['steps'][$build]['setGeneration'] = 'g3'
+            Save-DemoVmState -State $state
+            @((Clear-DemoHostGuestSignIn -Context $context).NoteMessage).Count | Should -Be 1 -Because ('{0}''s Set ran in this generation' -f $build)
+        }
 
         Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestSweep -Pass $true -Cleaned $true -Security 2 }
         $manual = Clear-DemoHostGuestSignIn -Context $context

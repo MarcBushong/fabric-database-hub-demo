@@ -215,7 +215,7 @@ function Get-DemoSignInStepResult {
     # nothing clears on its own; Done when the cleanup cleared an event log, which endpoint protection may report;
     # nothing otherwise. Sweep and Label are parallel arrays (one per machine); VmName is the Azure VM that
     # check-sign-in-data.ps1 reaches them through. With -Expected (the caller's step follows Arc onboarding, or a guest's
-    # or SQL Server's setup, that ran in this generation), a cleared log is a note, as information, since that setup leaves
+    # build, that ran in this generation), a cleared log is a note, as information, since that setup leaves
     # sign-in data by design; otherwise a one-off warning: a token that reached an established machine's logs since (the
     # review of cb4bc479, 2026-11-23).
     [CmdletBinding()]
