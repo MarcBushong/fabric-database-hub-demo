@@ -1085,13 +1085,15 @@ function Invoke-DemoGoldenControlPendingJob {
         switch ($result) {
             'Read' {
                 $lists = Get-DemoMemberValue -InputObject $line -Name 'pending'
-                if ($lists -is [System.Collections.IDictionary]) {
+                # Without its lists, a Read can't say what the capture mustn't delete (the review of 8ca2b39c). The runbook
+                # always writes all three (Get-DbHubRcaPendingList), so one that lacks any isn't its answer (the re-check of
+                # d06899f6: {} read as nothing listed).
+                if ($lists -is [System.Collections.IDictionary] -and @('rca', 'rcaHandoff', 'rcaEarlierPending' | Where-Object { -not $lists.Contains($_) }).Count -eq 0) {
                     $answer.Ok = $true
                     $answer.Status = 'Read'
                     $answer.Pending = $lists
                 }
                 else {
-                    # Without its lists, a Read can't say what the capture mustn't delete (the review of 8ca2b39c).
                     $answer.Status = 'Unread'
                     $answer.Error = 'couldn''t either: its job {0} said Read without its lists' -f $answer.JobId
                 }

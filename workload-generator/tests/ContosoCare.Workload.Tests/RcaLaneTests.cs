@@ -304,6 +304,111 @@ public sealed class RcaLaneTests
     }
 
     [Fact]
+    public async Task ASpanWhoseCloseFailsAtASessionsEndIsClosedAgainAndTheNextSessionGetsItsOwn()
+    {
+        // The re-check of d06899f6: Release's own close, at the end of a session, wasn't guarded either. A failed write of
+        // span.json ended the note loop, or left the observe loop's span closed in memory, which the next session joined.
+        var (connector, gate, store, lane) = HoldingLane();
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            gate.Set(DemoTarget.T1, true);
+            gate.Set(DemoTarget.T5, true);
+            await Until(() => Calls(connector).Contains("RCA-SQL-09") && store.Spans.Count == 1 && store.Spans[0].Membership.Any(m => m.Target == "T5" && m.Began));
+            var span = store.Spans[0];
+            span.CloseFailures = 1;
+            gate.Set(DemoTarget.T1, false);
+            gate.Set(DemoTarget.T5, false);
+            await Until(() => span.ClosedAt is not null);
+            Assert.Equal(0, span.CloseFailures);
+            var last = span.Membership[^1];
+            Assert.False(last.Began);
+            Assert.Equal(last.At, span.ClosedAt);
+
+            gate.Set(DemoTarget.T1, true);
+            await Until(() => store.Spans.Count == 2 && store.Spans[1].Membership.Any(m => m.Target == "T1" && m.Began));
+            Assert.Equal(4, span.Membership.Count);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task ALaneWhoseHeldSpanCantBeClosedStillStopsAndSaysItLeftTheSpanOpen()
+    {
+        // The re-check of d06899f6: the stop's give-up path. Its 3 tries fail, so the lane stops anyway and leaves the span
+        // to the next export once the runner has ended.
+        using var writer = new StringWriter();
+        using var log = new RunnerLog(writer);
+        var (connector, gate, store, lane) = HoldingLane(log);
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            var (span, _) = await HoldAtTheEndAsync(connector, gate, store);
+            span.CloseFailures = 3;
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+            Assert.Null(span.ClosedAt);
+            Assert.Equal(0, span.CloseFailures);
+            var text = writer.ToString();
+            Assert.Equal(3, text.Split("rca.close-failed").Length - 1);
+            Assert.Contains("rca.span-left-open", text, StringComparison.Ordinal);
+            Assert.Contains("rca.lane-stopped", text, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task AWriteOfTheSpanThatFailsInABeginOrAnEndKeepsTheLaneGoingTheCountRightAndTheCloseAtTheLastEnd()
+    {
+        // The re-check of 60aacd7b: a target's begin and end write span.json too. A failed begin was counted although the
+        // target never joined, a failed end left the target counted, so the span never closed, and in the note loop, which
+        // had no catch of its own, either one ended the loop.
+        var (connector, gate, store, lane) = HoldingLane();
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            store.BeganFailures = 1;
+            gate.Set(DemoTarget.T5, true);
+            await Until(() => store.Spans.Count == 1 && store.Spans[0].Membership.Any(m => m.Target == "T5" && m.Began));
+            var span = store.Spans[0];
+            Assert.Equal(0, span.BeganFailures);
+            gate.Set(DemoTarget.T1, true);
+            await Until(() => Calls(connector).Contains("RCA-SQL-09") && span.Membership.Any(m => m.Target == "T1" && m.Began));
+
+            span.EndedFailures = 1;
+            gate.Set(DemoTarget.T5, false);
+            await Until(() => span.Membership.Any(m => m.Target == "T5" && !m.Began));
+            Assert.Equal(0, span.EndedFailures);
+            await Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+            Assert.Null(span.ClosedAt);
+
+            gate.Set(DemoTarget.T1, false);
+            await Until(() => span.ClosedAt is not null);
+            var last = span.Membership[^1];
+            Assert.Equal(("T1", false), (last.Target, last.Began));
+            Assert.Equal(last.At, span.ClosedAt);
+            Assert.Equal(4, span.Membership.Count);
+            Assert.Single(store.Spans);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
     public async Task TheReplicaJoinsTheSpanOnlyOnceItAnswers()
     {
         var replica = new ScriptedConnector((_, _) => []) { OpenFailure = new CaptureException(CaptureFailureKind.Connection, "No such host is known.") };
@@ -343,12 +448,12 @@ public sealed class RcaLaneTests
     }
 
     /// <summary>A lane that observes T1 and notes T5, for the held span's tests.</summary>
-    private static (ScriptedConnector Connector, Gate Gate, Store Store, ObserverLane Lane) HoldingLane()
+    private static (ScriptedConnector Connector, Gate Gate, Store Store, ObserverLane Lane) HoldingLane(RunnerLog? log = null)
     {
         var connector = RcaSimulation.T1(new ManualTime(RcaSimulation.T1From));
         var gate = new Gate();
         var store = new Store();
-        return (connector, gate, store, new ObserverLane([new SqlTargetObserver("T1", DemoTarget.T1, connector, new ObserverOptions(), RunnerLog.Null)], [DemoTarget.T5], gate, store, RunnerLog.Null, TimeProvider.System));
+        return (connector, gate, store, new ObserverLane([new SqlTargetObserver("T1", DemoTarget.T1, connector, new ObserverOptions(), RunnerLog.Null)], [DemoTarget.T5], gate, store, log ?? RunnerLog.Null, TimeProvider.System));
     }
 
     /// <summary>
@@ -488,11 +593,16 @@ public sealed class RcaLaneTests
             var span = new MemorySink();
             lock (Spans)
             {
+                span.BeganFailures = BeganFailures;
+                BeganFailures = 0;
                 Spans.Add(span);
             }
 
             return span;
         }
+
+        /// <summary>How many times the next span's first begins fail, as a write of span.json can.</summary>
+        public int BeganFailures { get; set; }
 
         public DateTimeOffset? CaptureEndedAt() => EndedAt;
     }

@@ -68,8 +68,26 @@ internal sealed class SpanWriter : ICaptureSpan
     {
         lock (gate)
         {
-            Target(target).Intervals.Add(new SpanInterval { From = at });
-            Persist(force: true);
+            var known = span.Targets.ContainsKey(target);
+            var state = Target(target);
+            var interval = new SpanInterval { From = at };
+            state.Intervals.Add(interval);
+            try
+            {
+                Persist(force: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Taken back, so the lane's next try begins it once (the re-check of 60aacd7b): an interval left open here
+                // would never end, since only a target's last one does.
+                state.Intervals.Remove(interval);
+                if (!known)
+                {
+                    span.Targets.Remove(target);
+                }
+
+                throw;
+            }
         }
     }
 

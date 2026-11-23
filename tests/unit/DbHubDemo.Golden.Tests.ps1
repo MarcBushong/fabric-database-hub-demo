@@ -1697,6 +1697,8 @@ Describe 'Invoke-DemoGoldenControlPendingJob (2026-11-23)' {
         @{ Case = 'a job with no result line'; Output = 'Request: pending by capture-t2-golden.ps1.'; Statuses = @('Completed'); CreateFail = ''; Status = 'NoResult'; Error = 'ended without a readable result: its job job-1' }
         @{ Case = 'a Read without its lists (the review of 8ca2b39c)'; Output = 'DBHUB-CONTROL {"action":"pending","status":"Read","message":"x"}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
         @{ Case = 'a Read whose lists aren''t an object (the review of 8ca2b39c)'; Output = 'DBHUB-CONTROL {"action":"pending","status":"Read","message":"x","pending":[]}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
+        @{ Case = 'a Read whose lists are an empty object (the re-check of d06899f6)'; Output = 'DBHUB-CONTROL {"action":"pending","status":"Read","message":"x","pending":{}}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
+        @{ Case = 'a Read without the earlier sessions'' list (the re-check of d06899f6)'; Output = ('DBHUB-CONTROL {"action":"pending","status":"Read","message":"x","pending":{"sessionId":"' + ('a' * 32) + '","rca":{"pending":[]},"rcaHandoff":[]}}'); Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
     ) {
         $script:output = $Output
         $script:statuses = $Statuses

@@ -5271,9 +5271,10 @@ function Send-DbHubT4ReplicaCreate {
     Asks Azure for T4's read replica at SkuName (Servers - Create, createMode Replica), as infra/replica/pgreplica01.bicep
     makes it: T4's location, delegated subnet, private DNS zone, and storage, General Purpose, no public network access,
     and storage auto-grow off, with the demo's tags and component t4-replica. Returns once Azure answered: Accepted,
-    StatusCode, Code (SkuNotAvailable, QuotaExceeded, SourceNotReady, AlreadyExists, NotGranted, or Other), and Error.
-    QuotaExceeded is Learn's refusal over the subscription's vCore quota ("exceeding approved {0} Cores quota"; F37,
-    2026-11-22), which moves the session's size fallback on as SkuNotAvailable does.
+    StatusCode, Code (SkuNotAvailable, QuotaExceeded, SourceNotReady, AlreadyExists, NotGranted, or Other), Error, and
+    Refused (the action Azure says the caller doesn't have, or ''). QuotaExceeded is Learn's refusal over the
+    subscription's vCore quota ("exceeding approved {0} Cores quota"; F37, 2026-11-22), which moves the session's size
+    fallback on as SkuNotAvailable does.
     https://learn.microsoft.com/rest/api/postgresql/flexibleserver/servers/create
     https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica
     https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors#exceeded-quota
@@ -5328,13 +5329,15 @@ function Send-DbHubT4ReplicaCreate {
     $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
     $put = Invoke-DbHubArm -Context $Context -Method PUT -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $Name) -ApiVersion $version -Body $body
     if ($put.StatusCode -in 200, 201, 202) {
-        return [pscustomobject]@{ Accepted = $true; StatusCode = $put.StatusCode; Code = ''; Error = '' }
+        return [pscustomobject]@{ Accepted = $true; StatusCode = $put.StatusCode; Code = ''; Error = ''; Refused = '' }
     }
     # The error's code and message, from Invoke-DbHubArm's text and the response body both.
     $detail = Get-DbHubMember -InputObject $put.Body -Name 'error'
     $text = ('{0} {1} {2}' -f $put.Error, [string](Get-DbHubMember -InputObject $detail -Name 'code'), [string](Get-DbHubMember -InputObject $detail -Name 'message')).Trim()
     $code = 'Other'
-    if ($put.StatusCode -eq 403 -or $text -match 'AuthorizationFailed') {
+    # LinkedResourceAccessDenied (live, 2026-11-23, West Central US): the role lacked the join of T4's subnet, which Azure
+    # checks there when the create names it; Azure answered it as a server error, retried, before the role had that join.
+    if ($put.StatusCode -eq 403 -or $text -match 'AuthorizationFailed|LinkedResourceAccessDenied') {
         $code = 'NotGranted'
     }
     elseif ($text -match 'SkuNotAvailable') {
@@ -5349,7 +5352,11 @@ function Send-DbHubT4ReplicaCreate {
     elseif ($text -match 'ReadReplicaAlreadyExistWithGivenName') {
         $code = 'AlreadyExists'
     }
-    return [pscustomobject]@{ Accepted = $false; StatusCode = $put.StatusCode; Code = $code; Error = (ConvertTo-DbHubSafeText -Text $text) }
+    # The action the caller "does not have", read before the error is cut to 400 characters: a 403
+    # LinkedAuthorizationFailed first names the write that it has, then, after the client's IDs and the scope, the join it
+    # lacks (the review of 061db648).
+    $refused = ([regex]::Match($text, 'does not have (?:permission|authorization) to perform action(?:\(s\))? ''?([A-Za-z.]+/[A-Za-z0-9./]+)').Groups[1].Value).TrimEnd('.')
+    return [pscustomobject]@{ Accepted = $false; StatusCode = $put.StatusCode; Code = $code; Error = (ConvertTo-DbHubSafeText -Text $text); Refused = $refused }
 }
 
 function Set-DbHubT4ReplicaParameter {
@@ -5723,7 +5730,10 @@ function Send-DbHubSessionReplicaAttempt {
             return $Work
         }
         if ($sent.Code -eq 'NotGranted') {
-            return (& $finish 'NotGranted' 'The control identity can''t create T4''s read replica yet: its role doesn''t have the PostgreSQL actions, so this session has none, and Database Hub''s Read replica lag stays empty.' 'An Owner runs ./scripts/grant-safety-stop.ps1 once; the next Run all creates the replica.')
+            # Azure names the action it refused (Refused): the PostgreSQL write of a role from before 2026-11-14, or the join
+            # of T4's subnet of one from before 2026-11-23 where Azure checks it (ADR 0026).
+            $lacks = if ($sent.Refused) { 'its role doesn''t allow {0}, which Azure checks for the create' -f $sent.Refused } else { 'its role doesn''t have the actions the create needs' }
+            return (& $finish 'NotGranted' ('The control identity can''t create T4''s read replica yet: {0}, so this session has none, and Database Hub''s Read replica lag stays empty.' -f $lacks) 'An Owner runs ./scripts/grant-safety-stop.ps1 once, which gives the role its approved actions; the next Run all creates the replica.')
         }
         if ($sent.Code -eq 'SourceNotReady') {
             return (& $finish 'NotCreated' ('T4 wasn''t ready for a read replica within {0} minutes: {1}' -f $RaceMinutes, $sent.Error) 'Run all again in a few minutes.')
