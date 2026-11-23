@@ -44,7 +44,7 @@ Use the diagnose-blocking-and-deadlocks skill on {target}, connected as me (Micr
 ### 3. Reconcile with the scenario record
 
 ```text
-Read the latest deadlock-storm row from demo.scenario_runs in ContosoCare on {target}: run_id, status, started_at, deadline_at, stopped_at, and parameters. Count that run's deadlock-victim events in demo.scenario_run_events per minute, compare them with the telemetry's deadlock totals for the same window, and explain any difference. Don't change anything.
+Read the latest deadlock-storm row by started_at from demo.scenario_runs in ContosoCare on {target}: run_id, status, started_at, deadline_at, stopped_at, and parameters. Count that run's deadlock-victim events in demo.scenario_run_events per minute, compare them with the telemetry's deadlock totals for the same window, and explain any difference. Don't change anything.
 ```
 
 ## Signals to look for

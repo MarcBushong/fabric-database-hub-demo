@@ -50,7 +50,7 @@ Use the diagnose-blocking-and-deadlocks skill on the ContosoCare database of {ta
 ### 4. Line it up with the scenario record
 
 ```text
-Read the latest blocking-chain row from demo.scenario_runs in ContosoCare on {target}: run_id, status, started_at, deadline_at, stopped_at, parameters, and expected_symptoms, and that run's lock-escalation events from demo.scenario_run_events. Compare the depth, branches, and escalation times in the record with what you found, and say whether every blocked session's program_name starts with ContosoCare.Demo/ and ends with that run_id. Don't change anything.
+Read the latest blocking-chain row by started_at from demo.scenario_runs in ContosoCare on {target}: run_id, status, started_at, deadline_at, stopped_at, parameters, and expected_symptoms, and that run's lock-escalation events from demo.scenario_run_events. Compare the depth, branches, and escalation times in the record with what you found, and say whether every blocked session's program_name starts with ContosoCare.Demo/ and ends with that run_id. Don't change anything.
 ```
 
 ## Signals to look for

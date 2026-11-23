@@ -5589,3 +5589,23 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - The leak check prints nothing.
 
 **What its live check needs.** A presenter's rehearsal, since an agent runs the prompts, not a script: during the showcase, prompt 3 of memory-grant-pressure on T2 while cpu-pressure runs there, and of slow-consumer on T3 while locking-blocking runs, each reading only its own run's sessions.
+
+### Realistic names, unit B: the re-check of e0966579 (2026-11-23)
+
+**Why.** The re-check of e0966579 said to ship it, with one improvement, which the coordinator asked for as a quick commit. The prompts read "the latest" row of `demo.scenario_runs` without saying which column decides. An older runner's run IDs began with their time, so even a sort by `run_id` found the latest run, but the random run IDs of unit B's entry above don't. An agent that sorts by `run_id` would pick any run, find none of its sessions, and could report mid-incident that no grant is waiting.
+
+- **The fix:** every prompt that reads the latest row of `demo.scenario_runs` says it's the latest by `started_at`. That's the four of [the review's entry](#realistic-names-unit-b-the-review-of-e21c3431-2026-11-23), blocking-chain's and locking-blocking's prompt 4, and two more that the guard found, deadlock-storm's and log-flush-waits' reads of the record: ten prompts in eight files. The showcase's and the wrap-up's reads of the record pick their rows by the incident window and by the run concluded on, not the latest, so they stay.
+- **The guard,** in `Agent.PromptPack`: wherever a prompt block that reads `demo.scenario_runs` picks the latest, most recent, or newest row or run, it says `by started_at`. It fails for exactly the eight files as e0966579 left them, and passes with the fix.
+
+**Changed files.** The eight prompts above (`blocking-chain`, `deadlock-storm`, `locking-blocking`, `log-flush-waits`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`), `tests/unit/Agent.PromptPack.Tests.ps1`, and this report.
+
+**Validation.** On e0966579 with this commit:
+
+- **Pester,** under strict mode with the Azure CLI guard:
+  - `Agent.PromptPack`: 552 passed, none failed, the new test's 40 cases among them. With the prompts as e0966579 has them and the new test copied in, 8 failed: the new test on each of the eight files, and nothing else.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - The guard saw no Azure CLI call.
+- PSScriptAnalyzer, with the repo's settings for tests, found nothing in the changed test file, which is ASCII-only, and markdownlint found no issue.
+- The leak check prints nothing.
+
+**What its live check needs.** Nothing new: the rehearsal in the entry above checks the run each prompt picks.
