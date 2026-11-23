@@ -5668,7 +5668,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 
 **What changed.**
 
-- **One rule** in `src/styles/app.css`, in its own `@media (forced-colors: active)` block after the high contrast group: an enabled, hovered item of the target filter gives its marks the system's `HighlightText`, with `!important` over the inline color: 7.96:1 on Night sky's Highlight and 7.00:1 on Desert's, as the item's name has. A press with the pointer keeps `:hover`, and no `data-theme` scopes it, so it holds when the viewer picked light or dark too.
+- **One rule** in `src/styles/app.css`, in its own `@media (forced-colors: active)` block after the high contrast group: an enabled, hovered item of the target filter gives its marks the system's `HighlightText`, with `!important` over the inline color: 7.96:1 on Night sky's Highlight and 7.00:1 on Desert's, as the item's name has. No `data-theme` scopes it, so it holds when the viewer picked light or dark too. A press keeps `:hover`, but isn't Highlight: the browser check found it, and [the next entry](#forced-colors-a-pressed-filter-items-target-marks-2026-11-23) fixes it.
 - **Only there.** A disabled item has no Highlight under forced colors: Fluent gives it `Canvas` and `forced-color-adjust: auto`. Fluent's list option has no forced-colors fill, only a disabled option's `GrayText`, so a hovered option on the Manage page is `Canvas`, where `HighlightText` would be 1.48:1 (Night sky) and 1.04:1 (Desert); its marks stay forced to `Canvas`, as every mark at rest is, beside the target's name. The app's other menus hold Fluent's icons and words, which Fluent pairs with `HighlightText` already, and the current page, scene, and incident hold words that F22's rules color.
 - F22's rules and the high contrast group are unchanged.
 
@@ -5679,3 +5679,20 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **A test in `src/lib/app.test.ts`** reads the rule and its `@media` block: it sits in `@media (forced-colors: active)`, gives the mark `HighlightText` with `!important`, and is the only forced-colors rule on a target mark. It fails without the rule, outside the block, without `!important`, with `Highlight`, with the list options added, and without `:not([aria-disabled="true"])`: 6 of 6. The themes in `src/lib/app.test.ts`: 24 passed.
 - `tsc` found no error, and ESLint none in `lib/app.test.ts`; markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
 - **Pending, after 2 PM:** in the browser check, under Chromium's emulated forced colors with a light and a dark palette, a hovered filter item's marks are `HighlightText` on its Highlight, and a hovered option on the Manage page is `Canvas`, with its marks forced to it. Night sky's and Desert's palettes can't be emulated, so their ratios above are computed from those themes' colors.
+
+### Forced colors: a pressed filter item's target marks (2026-11-23)
+
+**Why.** The browser check after 2 PM found it, under Chromium's emulated forced colors: [the hovered item's rule](#forced-colors-a-hovered-filter-items-target-marks-2026-11-23) held on every hovered item, but not on a pressed one. Fluent's pressed menu item (`:hover:active`) outranks its own forced-colors Highlight and keeps that rule's `forced-color-adjust: none`, so a pressed item shows the app theme's own pressed fill and words, unforced. `HighlightText` on them was 1.23:1 (white on the light theme's `#EFE7D7`, with a light palette), 1.35:1 (black on the dark theme's `#2A221D`, with a dark palette), and 1.46:1 (white on high contrast's cyan, with a light palette). Before 320bacb9, the light and dark themes' marks kept their own colors there, at 3:1 or more, so that commit made a press worse; it hasn't shipped.
+
+**What changed.**
+
+- **One more rule** in the same `@media (forced-colors: active)` block: a pressed, enabled item of the target filter gives its marks `colorNeutralForeground2Pressed`, the color Fluent gives its words, with `!important` over the inline color and a selector that outranks the hovered one: 10.08:1 on the light theme's pressed fill, 12.91:1 on the dark theme's, and 14.37:1 on high contrast's. High contrast's pressed marks were 1.03:1 to 1.36:1 under forced colors before 320bacb9 too, since the high contrast group stays out of forced colors.
+- A hovered item keeps `HighlightText`, and the Manage page's options stay forced to `Canvas`, pressed too.
+
+**Changed files.** `fabric/app/src/styles/app.css` and `src/lib/app.test.ts`; the CHANGELOG, ADR 0030, and this report: this entry and one line in the entry before it.
+
+**Validation.**
+
+- **The forced-colors test in `src/lib/app.test.ts`** reads the pressed rule too: in `@media (forced-colors: active)`, `colorNeutralForeground2Pressed` with `!important`, at 3:1 or more on `colorNeutralBackground1Pressed` in each theme, and the two rules are the only forced-colors rules on a mark. It fails without the pressed rule, with `HighlightText` or the hover color in it, without its `!important`, on `:active` alone, or outside the block, and still with each of the hovered rule's five: 11 of 11. The themes in `src/lib/app.test.ts`: 24 passed.
+- **In the browser**, under Chromium's emulated forced colors with a light and a dark palette, with the System choice and with light or dark picked: each enabled item of the target filter, hovered, has `HighlightText` marks on Highlight (14.37:1 with the dark palette, 15.13:1 with the light one); the first one, pressed, has marks in its words' color on the theme's pressed fill (10.08:1, 12.91:1, and 14.37:1), read from the computed style and from the screenshot's pixels; a disabled item and a hovered or pressed option on the Manage page show no Highlight, `Canvas` on screen.
+- `tsc` found no error, and ESLint none in `lib/app.test.ts`; markdownlint found no issue, and the leak check finds no identifier in what this commit adds.

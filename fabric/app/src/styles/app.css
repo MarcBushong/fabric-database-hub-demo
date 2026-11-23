@@ -1969,12 +1969,19 @@ button.kpi-main:hover {
 
 /* Under Windows forced colors, Fluent paints a hovered menu item in the system's Highlight under forced-color-adjust: none,
    so a target's mark in the target filter's menu showed its theme color on it, as low as 1.01:1 on the Night sky theme's
-   Highlight. It takes HighlightText there, the system's own pair for Highlight, in any of the app's themes. A press with the
-   pointer keeps :hover. Nothing else: a disabled or keyboard-focused item, and a list option, which Fluent leaves without
-   a forced-colors fill, have no Highlight, and their marks are forced to Canvas, as every other mark is. */
+   Highlight. It takes HighlightText there, the system's own pair for Highlight, in any of the app's themes. Nothing else:
+   a disabled or keyboard-focused item, and a list option, which Fluent leaves without a forced-colors fill, have no
+   Highlight, and their marks are forced to Canvas, as every other mark is. */
 @media (forced-colors: active) {
     .fui-MenuItemCheckbox:not([aria-disabled="true"]):hover .target-chip i {
         background: HighlightText !important;
+    }
+
+    /* Pressed, Fluent's own pressed fill and words outrank its Highlight, and stay in the theme's colors, unforced: the
+       mark takes the words' color, as high contrast's group does outside forced colors. HighlightText on that fill was
+       as low as 1.23:1. */
+    .fui-MenuItemCheckbox:not([aria-disabled="true"]):hover:active .target-chip i {
+        background: var(--colorNeutralForeground2Pressed) !important;
     }
 }
 

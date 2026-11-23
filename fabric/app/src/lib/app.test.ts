@@ -177,7 +177,7 @@ describe("themes", () => {
         expect(band?.media, "the band's outline").toEqual([]);
     });
 
-    it("under Windows forced colors, gives a hovered filter item's target mark HighlightText, the system's pair for the Highlight Fluent paints the item in", () => {
+    it("under Windows forced colors, gives a hovered filter item's target mark HighlightText, the system's pair for the Highlight Fluent paints the item in, and a pressed one the pressed item's own words' color", () => {
         // Fluent's hovered menu item takes the system's Highlight under forced-color-adjust: none, so a target's mark showed its
         // theme color on it, as low as 1.01:1 on Night sky's Highlight (the review of cc1fe148).
         const rules = cssRules(readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8"));
@@ -186,10 +186,21 @@ describe("themes", () => {
         expect(rule?.media, selector).toEqual(["@media (forced-colors: active)"]);
         // The mark's color is an inline background: only !important replaces it.
         expect(rule?.body, selector).toMatch(/(?:^|[;\s])background:\s*HighlightText\s*!important\s*;/);
+        // Pressed, Fluent's pressed fill and words (:hover:active) outrank its forced-colors Highlight and stay unforced, in the
+        // theme's colors (the browser check: HighlightText on them was 1.23:1 to 1.46:1), so the mark takes the words' color,
+        // with a selector that outranks the hovered one.
+        const pressedSelector = '.fui-MenuItemCheckbox:not([aria-disabled="true"]):hover:active .target-chip i';
+        const pressed = rules.find((r) => r.selectors.includes(pressedSelector));
+        expect(pressed?.media, pressedSelector).toEqual(["@media (forced-colors: active)"]);
+        expect(pressed?.body, pressedSelector).toMatch(/(?:^|[;\s])background:\s*var\(--colorNeutralForeground2Pressed\)\s*!important\s*;/);
+        for (const id of ["light", "dark", "contrast"] as const) {
+            const theme = FLUENT_THEMES[id] as unknown as Record<string, string>;
+            expect(contrastRatio(theme.colorNeutralForeground2Pressed, theme.colorNeutralBackground1Pressed), `${id}: a pressed item's mark on its fill`).toBeGreaterThanOrEqual(3);
+        }
         // Only there: a list option, and a disabled or focused item, have no Highlight under forced colors, and HighlightText
         // on their Canvas would hide the mark as surely as Canvas does.
         const marks = rules.filter((r) => r.media.includes("@media (forced-colors: active)") && r.selectors.some((s) => s.includes(".target-chip")));
-        expect(marks.flatMap((r) => r.selectors)).toEqual([selector]);
+        expect(marks.flatMap((r) => r.selectors)).toEqual([selector, pressedSelector]);
     });
     it("keeps the chart's incident band label readable (4.5:1) with the band over each surface a chart sits on, the stage's included", () => {
         // The band is translucent: its label sits on the band blended over the surface, as the browser composites it.
