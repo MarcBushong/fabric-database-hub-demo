@@ -1,0 +1,708 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/rca/sidecar.schema.json",
+  "title": "Incident RCA sidecar document, version 1 (ADR 0031)",
+  "description": "What the runner's observer exports beside the evidence documents for one host and one slice of a session: Query Store's statistics, waits, plans, events, and coverage on T1 to T4, and who holds T4's connections, in columns, with one string dictionary. It never holds the answer key, and the evidence document never holds these tables, so a consumer that knows only the evidence document never sees one (rca/README.md, The sidecar). Generated from rca/history-tables.json; rca/README.md explains every rule this schema can't express (equal column lengths, dictionary indexes in range, time offsets, the latest read of an interval, and the limits).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "version",
+    "documentId",
+    "sessionId",
+    "producer",
+    "exportedUtc",
+    "sequence",
+    "final",
+    "windowStartUtc",
+    "windowEndUtc",
+    "targets",
+    "epochUtc",
+    "strings",
+    "tables"
+  ],
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "kind": {
+      "const": "ContosoCare.RcaSidecar"
+    },
+    "version": {
+      "const": 1
+    },
+    "documentId": {
+      "$ref": "#/$defs/documentId"
+    },
+    "sessionId": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{32}$",
+      "description": "The control's session ID (DbHubSessionId), or null when the runner ran outside a control session."
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "host",
+        "lane"
+      ],
+      "properties": {
+        "name": {
+          "const": "ContosoCare.Workload"
+        },
+        "version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "host": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9-]{0,39}$",
+          "description": "The host that ran the observer, lowercase: sqlvm01 (T1's VM) or arcsql01 (T2's guest)."
+        },
+        "lane": {
+          "const": "observer"
+        }
+      }
+    },
+    "exportedUtc": {
+      "$ref": "#/$defs/utc"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9999,
+      "description": "The export's number for this host and session, from 1."
+    },
+    "final": {
+      "type": "boolean",
+      "description": "True for the export at the session's end."
+    },
+    "windowStartUtc": {
+      "$ref": "#/$defs/utc"
+    },
+    "windowEndUtc": {
+      "$ref": "#/$defs/utc"
+    },
+    "targets": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/target"
+      },
+      "description": "The targets this document covers, each with an RCA Query Coverage row."
+    },
+    "epochUtc": {
+      "$ref": "#/$defs/utc"
+    },
+    "strings": {
+      "$ref": "#/$defs/strings"
+    },
+    "tables": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rca_query_coverage"
+      ],
+      "description": "The sidecar's tables (history-tables.json, document sidecar), by lakehouse name. A table with no rows is left out; rca_query_coverage never is.",
+      "properties": {
+        "rca_query_stats": {
+          "description": "RCA Query Stats (rca_query_stats): One Query Store plan's runtime statistics over one Query Store interval on one target, as one read saw it (on PostgreSQL, one role's query: its rows are per query). A later read of the same interval holds the same plan's counts or more, so readers keep the latest read of each target, interval, login, query, and plan (rca/README.md, Query Store).",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "captured_at_utc",
+                "target",
+                "interval_start_utc",
+                "interval_end_utc",
+                "query_id",
+                "plan_id",
+                "executions"
+              ],
+              "properties": {
+                "captured_at_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "interval_start_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "interval_end_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "query_id": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "plan_id": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "login_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "query_hash": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "plan_hash": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "module_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "statement_text": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "executions": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "aborted_executions": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "cpu_ms": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "duration_ms": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "max_duration_ms": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "logical_reads": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "physical_reads": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "row_count": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "log_bytes": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "tempdb_kb": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "max_used_memory_kb": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "max_dop": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "wait_ms": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "first_execution_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "last_execution_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_query_waits": {
+          "description": "RCA Query Waits (rca_query_waits): One wait category (SQL Server) or wait event (PostgreSQL) of one Query Store plan (on PostgreSQL, one role's query) over one interval, as one read saw it: each plan's or query's three largest in the interval. Readers keep the latest read, as for RCA Query Stats.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "captured_at_utc",
+                "target",
+                "interval_start_utc",
+                "interval_end_utc",
+                "query_id",
+                "plan_id",
+                "wait_category",
+                "wait_ms"
+              ],
+              "properties": {
+                "captured_at_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "interval_start_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "interval_end_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "query_id": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "plan_id": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "login_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "wait_category": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "wait_event": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "wait_ms": {
+                  "$ref": "#/$defs/doubleRequiredColumn"
+                },
+                "max_wait_ms": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "samples": {
+                  "$ref": "#/$defs/longColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_query_plans": {
+          "description": "RCA Query Plans (rca_query_plans): One Query Store plan as one read saw it: when it was compiled and last ran, whether it was forced and how, its forcing failures, and its shape. A read lists the plans of the queries in its RCA Query Stats rows and every forced plan.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "captured_at_utc",
+                "target",
+                "query_id",
+                "plan_id"
+              ],
+              "properties": {
+                "captured_at_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "query_id": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "plan_id": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "query_hash": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "plan_hash": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "module_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "statement_text": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "compiled_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "last_compiled_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "last_execution_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "compiles": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "is_forced_plan": {
+                  "$ref": "#/$defs/booleanColumn"
+                },
+                "forcing_type": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "force_failures": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "last_force_failure": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "plans_for_query": {
+                  "$ref": "#/$defs/integerColumn"
+                },
+                "estimated_cost": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "is_parallel": {
+                  "$ref": "#/$defs/booleanColumn"
+                },
+                "plan_summary": {
+                  "$ref": "#/$defs/stringColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_query_events": {
+          "description": "RCA Query Events (rca_query_events): One change in Query Store or in automatic tuning that the capture saw on one target: a plan forced or unforced, Query Store's state changing, automatic tuning's option, or a tuning recommendation's state.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "event_time_utc",
+                "target",
+                "kind"
+              ],
+              "properties": {
+                "event_time_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "time_from_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "kind": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "query_id": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "plan_id": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "forcing_type": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "state": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "previous_state": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "detail": {
+                  "$ref": "#/$defs/stringColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_query_coverage": {
+          "description": "RCA Query Coverage (rca_query_coverage): What the capture read of Query Store for one target over one sidecar's window, and what it couldn't, with why: Query Store's state and settings, the intervals it read, and on PostgreSQL the intervals still pending publication.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "target",
+                "window_start_utc",
+                "window_end_utc",
+                "backfill"
+              ],
+              "properties": {
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "window_start_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "window_end_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "state": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "capture_mode": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "interval_minutes": {
+                  "$ref": "#/$defs/integerColumn"
+                },
+                "read_from_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "read_to_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "pending_from_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "pending_to_utc": {
+                  "$ref": "#/$defs/timestampColumn"
+                },
+                "backfill": {
+                  "$ref": "#/$defs/booleanRequiredColumn"
+                },
+                "sources": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "gaps": {
+                  "$ref": "#/$defs/stringColumn"
+                }
+              }
+            }
+          }
+        },
+        "rca_connections": {
+          "description": "RCA Connections (rca_connections): One group of T4's client connections in one sample of a connection episode: those of one program, login, and state, counted, idle ones included; never the observer's own connection.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rows",
+            "columns"
+          ],
+          "properties": {
+            "rows": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 20000
+            },
+            "columns": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "captured_at_utc",
+                "target",
+                "state",
+                "connections",
+                "is_demo"
+              ],
+              "properties": {
+                "captured_at_utc": {
+                  "$ref": "#/$defs/timestampRequiredColumn"
+                },
+                "target": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "program_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "run_token": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "login_name": {
+                  "$ref": "#/$defs/stringColumn"
+                },
+                "state": {
+                  "$ref": "#/$defs/stringRequiredColumn"
+                },
+                "connections": {
+                  "$ref": "#/$defs/longRequiredColumn"
+                },
+                "waiting_lock": {
+                  "$ref": "#/$defs/longColumn"
+                },
+                "oldest_state_s": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "oldest_connection_s": {
+                  "$ref": "#/$defs/doubleColumn"
+                },
+                "is_demo": {
+                  "$ref": "#/$defs/booleanRequiredColumn"
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "utc": {
+      "description": "ISO 8601 UTC with milliseconds, as the runner writes the header's times: 2026-11-20T16:50:00.000Z (rca/README.md).",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
+    },
+    "documentId": {
+      "type": "string",
+      "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar$",
+      "maxLength": 88,
+      "description": "<windowStartUtc as yyyyMMddTHHmmssZ>-<host>-<sequence, 4 digits>-sidecar: an evidence document's form with -sidecar after it, so the two kinds' IDs never meet."
+    },
+    "target": {
+      "enum": [
+        "T1",
+        "T2",
+        "T3",
+        "T4",
+        "T4-replica",
+        "T5"
+      ]
+    },
+    "strings": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "string",
+        "maxLength": 4000
+      }
+    },
+    "stringColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": 0
+      }
+    },
+    "stringRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "integer",
+        "minimum": 0
+      }
+    },
+    "timestampColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "timestampRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "integer"
+      }
+    },
+    "longColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ]
+      }
+    },
+    "longRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "integer"
+      }
+    },
+    "integerColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "integer",
+          "null"
+        ],
+        "minimum": -2147483648,
+        "maximum": 2147483647
+      }
+    },
+    "integerRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "integer",
+        "minimum": -2147483648,
+        "maximum": 2147483647
+      }
+    },
+    "doubleColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "number",
+          "null"
+        ]
+      }
+    },
+    "doubleRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "number"
+      }
+    },
+    "booleanColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      }
+    },
+    "booleanRequiredColumn": {
+      "type": "array",
+      "maxItems": 20000,
+      "items": {
+        "type": "boolean"
+      }
+    }
+  }
+}

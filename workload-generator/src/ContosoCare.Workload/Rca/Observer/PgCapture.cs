@@ -56,17 +56,27 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : I
 
     private sealed class PgCaptureConnection(NpgsqlConnection connection) : ICaptureConnection
     {
-        public async Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken)
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken) =>
+            // RCA-PG-11's $1: a positional parameter, so the block runs exactly as the catalog has it.
+            RunAsync(text, parameter is null ? CaptureParameters.None : CaptureParameters.Positional(parameter), timeout, cancellationToken);
+
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken) =>
+            parameters.IsNamed
+                ? throw new NotSupportedException($"{blockId} is PostgreSQL's, whose parameters are bound by position.")
+                : RunAsync(text, parameters, timeout, cancellationToken);
+
+        public ValueTask DisposeAsync() => connection.DisposeAsync();
+
+        private async Task<IReadOnlyList<CaptureValues>> RunAsync(string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken)
         {
             try
             {
                 await using var batch = new NpgsqlBatch(connection) { Timeout = Math.Max(1, (int)Math.Ceiling(timeout.TotalSeconds)) };
                 batch.BatchCommands.Add(new NpgsqlBatchCommand("SELECT pg_stat_clear_snapshot()"));
                 var command = new NpgsqlBatchCommand(text);
-                if (parameter is not null)
+                foreach (var parameter in parameters)
                 {
-                    // RCA-PG-11's $1: a positional parameter, so the block runs exactly as the catalog has it.
-                    command.Parameters.Add(new NpgsqlParameter { Value = parameter });
+                    command.Parameters.Add(new NpgsqlParameter { Value = parameter.Value is DateTimeOffset time ? time.ToUniversalTime() : parameter.Value ?? DBNull.Value });
                 }
 
                 batch.BatchCommands.Add(command);
@@ -95,7 +105,5 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : I
                 throw Translate(ex, connecting: false);
             }
         }
-
-        public ValueTask DisposeAsync() => connection.DisposeAsync();
     }
 }
