@@ -1021,6 +1021,7 @@ Describe 'configure-fabric.ps1' {
         $withheld.status | Should -Be 'Warning'
         $withheld.message | Should -Be 'The RCA evidence wasn''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA (2026-11-20), so it would ignore it.'
         $withheld.remediation | Should -Match 'with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook alone' -Because 'the fix leaves NB_DatabaseHub_Deployment, which fabric.importNotebooks false keeps as the person left it (the review of e113eab)'
+        $withheld.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which updates the notebook unless someone edited it, ' -Because 'deploy.ps1 updates an unedited notebook while fabric.importNotebooks is false (follow-ups decision 2a)'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 1 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -Times 1 -Exactly -ParameterFilter { -not $Saved -and $Why -match 'from before the Incident RCA' }
 

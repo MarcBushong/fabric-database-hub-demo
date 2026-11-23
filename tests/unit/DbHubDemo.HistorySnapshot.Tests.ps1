@@ -930,7 +930,7 @@ Describe 'deploy.ps1''s history snapshot with the Incident RCA''s evidence (2026
         $record.evidence.outcome | Should -Be 'Saved' -Because 'the history itself was saved and framed'
         $record.evidence.parameters.RCA_EVIDENCE_FILE | Should -Be ''
         $record.message | Should -Match 'aren''t in the history yet: the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA \(2026-11-20\), so it would ignore it\.'
-        $record.remediation | Should -Be 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which updates that notebook alone (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copies); the next history save then adds them.' -Because 'the fix leaves NB_DatabaseHub_Deployment as the person left it (the review of e716ff8)'
+        $record.remediation | Should -Be 'Run ./scripts/deploy.ps1, which updates the notebook unless someone edited it; ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates that notebook alone, edited or not; the next history save then adds them.' -Because 'decision 2a''s one fix: deploy.ps1 updates an unedited notebook, and the command updates that notebook alone, leaving NB_DatabaseHub_Deployment as the person left it (the review of e716ff8)'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { -not $Parameter.Contains('RCA_EVIDENCE_FILE') }
         # Never in DONE's way.
