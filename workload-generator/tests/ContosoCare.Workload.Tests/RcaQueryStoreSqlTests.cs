@@ -752,23 +752,28 @@ public sealed class RcaQueryStoreSqlTests
     public async Task ARunnersStatementRcaSql16DidntReturnIsMatchedByItsOwnTextAndItsPageReadAgain(bool honorsLeftOut)
     {
         // RCA-SQL-16 didn't return the stop check: its interval ended between the two reads, or it was past the bound.
-        // RCA-SQL-10 returns it, with its text, as its interval's top plan by CPU; eleven of the workload's statements follow.
-        const long StopCheck = 501;
+        // RCA-SQL-10 returns it, with its text, as its interval's top plan by CPU. A statement inside a workload module, with
+        // the warmup's text, comes second, and eleven of the workload's ad hoc statements follow.
+        const long StopCheck = 501, InModule = 700;
         var start = RcaSimulation.At(16, 50, 0);
         var interval = RcaSimulation.At(16, 30, 0);
-        var texts = new Dictionary<long, string> { [StopCheck] = "(@run_id varchar(64))SELECT demo.fn_run_stop_requested(@run_id);" };
+        var texts = new Dictionary<long, string>
+        {
+            [StopCheck] = "(@run_id varchar(64))SELECT demo.fn_run_stop_requested(@run_id);",
+            [InModule] = "SELECT COUNT_BIG(*) FROM care.facilities;",
+        };
         for (var n = 1; n <= 11; n++)
         {
             texts[600 + n] = string.Create(CultureInfo.InvariantCulture, $"(@p int)SELECT a.appointment_id FROM care.appointments AS a WHERE a.clinic_id = @p AND a.slot = {n}");
         }
 
-        double Cpu(long query) => query == StopCheck ? 1000 : 100 - (query - 600);
+        double Cpu(long query) => query switch { StopCheck => 1000, InModule => 950, _ => 100 - (query - 600) };
         var access = new FakeSidecarAccess("T1", (block, parameters) => block switch
         {
-            "RCA-SQL-16" => [.. texts.Where(t => t.Key != StopCheck).Select(t => Row(("query_id", t.Key), ("query_sql_text", t.Value)))],
+            "RCA-SQL-16" => [.. texts.Where(t => t.Key is not StopCheck and not InModule).Select(t => Row(("query_id", t.Key), ("query_sql_text", t.Value)))],
             "RCA-SQL-10" => (DateTimeOffset)parameters.Value("@since")! >= interval.AddMinutes(15) ? [] :
                 [.. texts.Keys.Except(honorsLeftOut ? T3QueryStore.LeftOut(parameters) : []).OrderByDescending(Cpu).ThenBy(q => q).Take(10)
-                    .Select(q => Row(("captured_at_utc", start.UtcDateTime), ("interval_start_utc", interval), ("interval_end_utc", interval.AddMinutes(15)), ("query_id", q), ("plan_id", q * 10), ("query_sql_text", texts[q]), ("executions", q == StopCheck ? 900L : 10L), ("cpu_ms", Cpu(q))))],
+                    .Select(q => Row(("captured_at_utc", start.UtcDateTime), ("interval_start_utc", interval), ("interval_end_utc", interval.AddMinutes(15)), ("query_id", q), ("plan_id", q * 10), ("module_name", q == InModule ? "[care].[usp_census_counts]" : null), ("query_sql_text", texts[q]), ("executions", q == StopCheck ? 900L : 10L), ("cpu_ms", Cpu(q))))],
             "RCA-SQL-15" => [StateRow(start, "READ_WRITE", 0, null)],
             _ => [],
         });
@@ -780,13 +785,17 @@ public sealed class RcaQueryStoreSqlTests
 
         // Nothing of the stop check's reaches the sidecar, by its query_id or by its text.
         Assert.DoesNotContain(sink.Rows, r => r.Get("query_id") is StopCheck);
-        Assert.DoesNotContain(sink.Rows, r => r.Get("statement_text") is string text && HarnessStatements.IsRunners(text));
+        Assert.DoesNotContain(sink.Rows, r => r.Get("statement_text") is string text && r.Get("module_name") is null && HarnessStatements.IsRunners(text));
 
-        // Its page was read again, the read's next block, with the stop check in @left_out: the top 10 are the workload's
-        // next ten. A block that ignored @left_out is read twice all the same, and the row it returned again is dropped.
+        // Its page was read again, the read's next block, with the stop check in @left_out and never the module's statement:
+        // the top 10 are the module's statement and the workload's next nine. A block that ignored @left_out is read twice
+        // all the same, and the row it returned again is dropped.
         var reads = access.Calls.Where(c => c.BlockId == "RCA-SQL-10").Select(c => ((string)c.Parameters.Value("@left_out")!, c.At)).ToList();
         Assert.Equal([("[]", RcaSimulation.At(16, 50, 1)), ("[501]", RcaSimulation.At(16, 50, 2))], reads);
-        Assert.Equal(Enumerable.Range(601, honorsLeftOut ? 10 : 9).Select(q => (long)q), sink.Table(RcaContract.QueryStats).Select(r => (long)r.Get("query_id")!).Order());
+        Assert.Equal([.. Enumerable.Range(601, honorsLeftOut ? 9 : 8).Select(q => (long)q), InModule], sink.Table(RcaContract.QueryStats).Select(r => (long)r.Get("query_id")!).Order());
+
+        // The module's statement is evidence, whatever its text: the list is of statements outside any module.
+        Assert.Contains(sink.Table(RcaContract.QueryStats), r => r.Get("query_id") is InModule && r.Get("module_name") is string);
         Assert.All(sink.Table(RcaContract.QueryCoverage), c => Assert.Null(c.Get("gaps")));
     }
 

@@ -813,7 +813,8 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
     private bool IsRunners(long query) => adHoc.TryGetValue(query, out var known) && known.Runners;
 
     /// <summary>
-    /// The list's backstop on a row RCA-SQL-10 or 14 returned: whether its text is one of the runner's own statements
+    /// The list's backstop on a row RCA-SQL-10 or 14 returned: whether it's one of the runner's own statements, a statement
+    /// outside any module (no module_name, as RCA-SQL-16's object_id 0) whose text is on the list
     /// (<see cref="HarnessStatements"/>), which RCA-SQL-16 didn't return when its interval ended between the two reads or
     /// it was past the bound. Its query_id is recorded as the runner's, for @left_out and the events, and
     /// <paramref name="recorded"/> says it wasn't already.
@@ -821,7 +822,7 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
     private bool IsRunnersRow(CaptureValues row, out bool recorded)
     {
         recorded = false;
-        if (row.Text("query_sql_text") is not { Length: <= SqlQueryStoreRows.AdHocTextLength } text || !HarnessStatements.IsRunners(text))
+        if (row.Text("module_name") is not null || row.Text("query_sql_text") is not { Length: <= SqlQueryStoreRows.AdHocTextLength } text || !HarnessStatements.IsRunners(text))
         {
             return false;
         }
