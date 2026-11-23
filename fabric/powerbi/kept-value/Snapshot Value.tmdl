@@ -1,0 +1,52 @@
+/// One value per notebook run, analysis, target, resource, instance, database, metric, and bin, from dbo.telemetry_snapshots. Overlapping notebook runs store the same bin more than once, at different intervals; every measure reads each row's kept value, so a minute that overlapping saves hold counts once, and a bin's most recent capture where its kept values aren't all worked out yet (Snapshot Value, F35).
+table 'Telemetry Snapshots'
+
+    /// Base measure. Per target, analysis, metric, and bin: where every row has its kept value (F35, design (i): kept_value and resolved_at_utc, which the live-activity notebook and the operator's history steps work out when history is saved), a total's kept values summed, and a maximum's or an average's highest capture sum, so a minute that saves at different intervals hold counts once. A bin with a row not worked out yet, a row without a bin, and an analysis off the bin grid keep the most recent capture, summed across instances and files, as before. Every telemetry measure builds on it.
+    measure 'Snapshot Value' =
+            SUMX (
+                SUMMARIZE (
+                    'Telemetry Snapshots',
+                    'Telemetry Snapshots'[Target Key],
+                    'Telemetry Snapshots'[Analysis Key],
+                    'Telemetry Snapshots'[Metric],
+                    'Telemetry Snapshots'[Bucket UTC]
+                ),
+                VAR OnGrid =
+                    NOT ISBLANK ( 'Telemetry Snapshots'[Bucket UTC] )
+                        && NOT ( 'Telemetry Snapshots'[Analysis Key] IN { "database_growth", "estate_pulse", "memory_clerks", "telemetry_coverage", "wait_profile" } )
+                VAR WorkedOut =
+                    OnGrid
+                        && ISEMPTY ( CALCULATETABLE ( 'Telemetry Snapshots', ISBLANK ( 'Telemetry Snapshots'[Resolved At UTC] ) ) )
+                VAR Adds =
+                    'Telemetry Snapshots'[Analysis Key] IN { "counter_deltas", "storage_io", "wait_deltas" }
+                        || 'Telemetry Snapshots'[Metric] IN { "ThrottledRequests", "TotalRequestUnits", "TotalRequests", "connections_failed" }
+                RETURN
+                    IF (
+                        WorkedOut,
+                        IF (
+                            Adds,
+                            CALCULATE ( SUM ( 'Telemetry Snapshots'[Kept Value] ) ),
+                            CALCULATE ( MAXX ( VALUES ( 'Telemetry Snapshots'[Captured At UTC] ), CALCULATE ( SUM ( 'Telemetry Snapshots'[Kept Value] ) ) ) )
+                        ),
+                        VAR LatestCapture = CALCULATE ( MAX ( 'Telemetry Snapshots'[Captured At UTC] ) )
+                        RETURN
+                            CALCULATE ( SUM ( 'Telemetry Snapshots'[Value] ), 'Telemetry Snapshots'[Captured At UTC] = LatestCapture )
+                    )
+            )
+        formatString: #,0.##
+        isHidden
+        displayFolder: Base
+
+    /// The row's share of its interval where saves at different intervals hold the same minutes (F35, design (i)): what's left of a total after its finer saves' rows, or a maximum or an average only where it's higher than theirs; blank where the row keeps nothing. Snapshot Value reads it.
+    column 'Kept Value'
+        dataType: double
+        isHidden
+        summarizeBy: none
+        sourceColumn: kept_value
+
+    /// When the row's kept value was worked out; blank while it isn't yet, and for rows off the bin grid, which Snapshot Value reads by their most recent capture.
+    column 'Resolved At UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: resolved_at_utc

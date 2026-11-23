@@ -185,11 +185,74 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
     }
 
     It 'uses spaces, LF line endings, and UTF-8 without a byte order mark' {
-        foreach ($file in Get-ChildItem -LiteralPath $modelRoot -Recurse -File) {
+        foreach ($file in @(Get-ChildItem -LiteralPath $modelRoot -Recurse -File) + @(Get-ChildItem -LiteralPath (Join-Path -Path $powerbi -ChildPath 'kept-value') -File)) {
             $bytes = [System.IO.File]::ReadAllBytes($file.FullName)
             $bytes -contains 13 | Should -BeFalse -Because $file.Name
             $bytes -contains 9 | Should -BeFalse -Because $file.Name
             ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeFalse -Because $file.Name
+        }
+    }
+}
+
+Describe 'Snapshot Value''s kept form (F35, design (i))' {
+    BeforeAll {
+        $script:kept = [System.IO.File]::ReadAllText((Join-Path -Path $powerbi -ChildPath 'kept-value/Snapshot Value.tmdl'))
+        $script:keptMeasure = [regex]::Match($script:kept, "(?ms)^    measure 'Snapshot Value' =\n.*?^        displayFolder: Base\n").Value
+        $script:releaseMeasure = [regex]::Match([System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Telemetry Snapshots.tmdl')), "(?ms)^    measure 'Snapshot Value' =\n.*?^        displayFolder: Base\n").Value
+        $script:sharedLists = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/history/kept-value-cases.json') -Raw | ConvertFrom-Json -AsHashtable)['lists']
+        $script:inList = {
+            param([string] $Column)
+            $list = [regex]::Match($script:keptMeasure, ("'Telemetry Snapshots'\[{0}\] IN \{{ ([^}}]*) \}}" -f [regex]::Escape($Column)))
+            return @([regex]::Matches($list.Groups[1].Value, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value })
+        }
+    }
+
+    It 'takes the shared rule''s lists: totals by analysis and by metric, and the analyses off the bin grid' {
+        $script:keptMeasure | Should -Not -BeNullOrEmpty
+        # The shared cases list them sorted as JavaScript sorts, by code unit.
+        $ordinal = {
+            param([string[]] $Items)
+            $sorted = [string[]]@($Items)
+            [System.Array]::Sort($sorted, [System.StringComparer]::Ordinal)
+            $sorted
+        }
+        # Two IN lists on Analysis Key: the grid's exceptions, then the totals.
+        $analysisLists = @([regex]::Matches($script:keptMeasure, "'Telemetry Snapshots'\[Analysis Key\] IN \{ ([^}]*) \}") | ForEach-Object { , @([regex]::Matches($_.Groups[1].Value, '"([^"]+)"') | ForEach-Object { $_.Groups[1].Value }) })
+        $analysisLists.Count | Should -Be 2
+        @(& $ordinal $analysisLists[0]) | Should -Be @($script:sharedLists['offGridAnalyses'])
+        @(& $ordinal $analysisLists[1]) | Should -Be @($script:sharedLists['additiveAnalyses'])
+        @(& $ordinal (& $script:inList 'Metric')) | Should -Be @($script:sharedLists['additiveMetrics'])
+    }
+
+    It 'reads the kept values only where every row of a bin on the grid is worked out, and the release''s rule everywhere else' {
+        $script:keptMeasure | Should -Match ([regex]::Escape("NOT ISBLANK ( 'Telemetry Snapshots'[Bucket UTC] )"))
+        $script:keptMeasure | Should -Match ([regex]::Escape("ISEMPTY ( CALCULATETABLE ( 'Telemetry Snapshots', ISBLANK ( 'Telemetry Snapshots'[Resolved At UTC] ) ) )"))
+        # A total sums its kept values; a maximum or an average takes the highest capture's sum, as bin_values reads them.
+        $script:keptMeasure | Should -Match ([regex]::Escape("CALCULATE ( SUM ( 'Telemetry Snapshots'[Kept Value] ) ),"))
+        $script:keptMeasure | Should -Match ([regex]::Escape("CALCULATE ( MAXX ( VALUES ( 'Telemetry Snapshots'[Captured At UTC] ), CALCULATE ( SUM ( 'Telemetry Snapshots'[Kept Value] ) ) ) )"))
+        # The fallback is the release's measure, word for word: the most recent capture's sum.
+        $release = [regex]::Match($script:releaseMeasure, '(?s)VAR LatestCapture = (.*?)\n\s+RETURN\n\s+(CALCULATE \( SUM [^\n]+)')
+        $release.Success | Should -BeTrue
+        $script:keptMeasure | Should -Match ([regex]::Escape('VAR LatestCapture = ' + $release.Groups[1].Value))
+        $script:keptMeasure | Should -Match ([regex]::Escape($release.Groups[2].Value))
+        # Same grouping as the release's, and the same format, visibility, and folder.
+        $script:keptMeasure | Should -Match ([regex]::Escape("SUMMARIZE (`n                    'Telemetry Snapshots',`n                    'Telemetry Snapshots'[Target Key],`n                    'Telemetry Snapshots'[Analysis Key],`n                    'Telemetry Snapshots'[Metric],`n                    'Telemetry Snapshots'[Bucket UTC]`n                )"))
+        $script:releaseMeasure | Should -Match ([regex]::Escape("SUMMARIZE (`n                    'Telemetry Snapshots',`n                    'Telemetry Snapshots'[Target Key],`n                    'Telemetry Snapshots'[Analysis Key],`n                    'Telemetry Snapshots'[Metric],`n                    'Telemetry Snapshots'[Bucket UTC]`n                )"))
+        ($script:keptMeasure -split "`n")[-4..-2] | Should -Be @('        formatString: #,0.##', '        isHidden', '        displayFolder: Base')
+    }
+
+    It 'reads its two columns from the columns the notebooks write, hidden' {
+        $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        $code = (@($notebook['cells'] | Where-Object { $_['cell_type'] -eq 'code' } | ForEach-Object { @($_['source']) -join '' })) -join "`n"
+        $code | Should -Match '\("kept_value", "double"\), \("resolved_at_utc", "timestamp"\)'
+        $columns = @([regex]::Matches($script:kept, "(?ms)^    column '([^']+)'\n(.*?)(?=\n\n|\z)") | ForEach-Object { [pscustomobject]@{ Name = $_.Groups[1].Value; Body = $_.Groups[2].Value } })
+        @($columns.Name) | Should -Be @('Kept Value', 'Resolved At UTC')
+        $columns[0].Body | Should -Match '(?m)^        dataType: double$'
+        $columns[0].Body | Should -Match '(?m)^        sourceColumn: kept_value$'
+        $columns[1].Body | Should -Match '(?m)^        dataType: dateTime$'
+        $columns[1].Body | Should -Match '(?m)^        sourceColumn: resolved_at_utc$'
+        foreach ($column in $columns) {
+            $column.Body | Should -Match '(?m)^        isHidden$' -Because $column.Name
         }
     }
 }
@@ -208,8 +271,9 @@ Describe 'DAX variable names' {
         $script:tableNames = @($tableFiles | ForEach-Object {
                 [regex]::Match([System.IO.File]::ReadAllText($_.FullName), "(?m)^table\s+('(?:[^']|'')+'|\S+)").Groups[1].Value.Trim("'").Replace("''", "'")
             })
-        # The model's measures, every DAX file in fabric/powerbi, and the Insights app's queries.
-        $script:daxSources = @($tableFiles) + @(Get-ChildItem -LiteralPath $powerbi -Filter '*.dax' -File -Recurse) +
+        # The model's measures, Snapshot Value's kept form (F35), every DAX file in fabric/powerbi, and the Insights app's queries.
+        $script:daxSources = @($tableFiles) + @(Get-ChildItem -LiteralPath (Join-Path -Path $powerbi -ChildPath 'kept-value') -Filter '*.tmdl' -File) +
+            @(Get-ChildItem -LiteralPath $powerbi -Filter '*.dax' -File -Recurse) +
             @(Get-Item -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/data/queries.ts'))
     }
 

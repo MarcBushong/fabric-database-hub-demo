@@ -163,6 +163,53 @@ Describe 'Get-DemoFabricSemanticModelDefinition' {
         (Get-Content -LiteralPath $expressions -Raw).Replace('00000000-0000-0000-0000-000000000000/00000000-0000-0000-0000-000000000000', "$script:workspaceId/$script:lakehouseId") | Set-Content -LiteralPath $expressions -NoNewline
         { Get-DemoFabricSemanticModelDefinition -Path $copy -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId } | Should -Throw '*placeholder exactly once*'
     }
+
+    It 'sends Snapshot Value''s kept form and its two columns only with -SnapshotValueForm Kept, and every other part as committed (F35)' {
+        $part = {
+            param($Model, [string] $Path)
+            [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String((@($Model.Definition.parts) | Where-Object { $_.path -eq $Path }).payload))
+        }
+        $table = 'definition/tables/Telemetry Snapshots.tmdl'
+        $release = Get-DemoFabricSemanticModelDefinition -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId
+        $kept = Get-DemoFabricSemanticModelDefinition -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -SnapshotValueForm Kept
+        $release.Evidence.snapshotValueForm | Should -Be 'Release'
+        $kept.Evidence.snapshotValueForm | Should -Be 'Kept'
+        $kept.Evidence.measures | Should -Be 114
+        (& $part $release $table) | Should -BeExactly ([System.IO.File]::ReadAllText((Join-Path -Path $script:modelPath -ChildPath $table)))
+        @($kept.Definition.parts | ForEach-Object { $_.path }) | Should -Be @($release.Definition.parts | ForEach-Object { $_.path })
+        foreach ($path in @($release.Definition.parts | ForEach-Object { $_.path } | Where-Object { $_ -ne $table })) {
+            (& $part $kept $path) | Should -BeExactly (& $part $release $path) -Because $path
+        }
+        $text = & $part $kept $table
+        $fragment = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'fabric/powerbi/kept-value/Snapshot Value.tmdl'))
+        $text.StartsWith(($fragment -split "`n")[0] + "`ntable 'Telemetry Snapshots'`n") | Should -BeTrue
+        ([regex]::Matches($text, "(?m)^    measure 'Snapshot Value' =$")).Count | Should -Be 1
+        $text | Should -Match ([regex]::Escape("CALCULATE ( SUM ( 'Telemetry Snapshots'[Kept Value] ) )"))
+        # The columns go last, before the partition, so every column the release reads keeps its place.
+        $text | Should -Match "(?s)    sourceColumn: report_date_utc\n\n    /// [^\n]+\n    column 'Kept Value'\n.*?sourceColumn: kept_value\n\n    /// [^\n]+\n    column 'Resolved At UTC'\n.*?sourceColumn: resolved_at_utc\n\n    partition 'Telemetry Snapshots' = entity\n"
+        # Without the kept form's description, measure, and columns, the table is the release's but for its own measure.
+        $strip = {
+            param([string] $Text)
+            $Text = [regex]::Replace($Text, '\A(?:///[^\n]*\n)+', '')
+            $Text = [regex]::Replace($Text, "(?ms)^    /// Base measure\.[^\n]*\n    measure 'Snapshot Value' =\n.*?^        displayFolder: Base\n", '')
+            [regex]::Replace($Text, "(?ms)^    /// [^\n]*\n    column '(Kept Value|Resolved At UTC)'\n.*?(?=\n\n)\n\n", '')
+        }
+        (& $strip $text) | Should -BeExactly (& $strip (& $part $release $table))
+    }
+
+    It 'refuses a kept form that doesn''t fit the table: a changed measure, or a fragment without its columns (F35)' {
+        $copy = Join-Path -Path $TestDrive -ChildPath 'model-kept'
+        Copy-Item -LiteralPath $script:modelPath -Destination $copy -Recurse
+        $table = Join-Path -Path $copy -ChildPath 'definition/tables/Telemetry Snapshots.tmdl'
+        [System.IO.File]::WriteAllText($table, [System.IO.File]::ReadAllText($table).Replace('    /// Base measure. Per target', '    /// The base measure. Per target'))
+        { Get-DemoFabricSemanticModelDefinition -Path $copy -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -SnapshotValueForm Kept } | Should -Throw '*the table''s Snapshot Value is there 0 time(s)*'
+        # The release's form doesn't read the fragment, so the folder still builds without it.
+        (Get-DemoFabricSemanticModelDefinition -Path $copy -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId).Evidence.snapshotValueForm | Should -Be 'Release'
+        $fragment = Join-Path -Path $TestDrive -ChildPath 'kept-without-columns.tmdl'
+        $text = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'fabric/powerbi/kept-value/Snapshot Value.tmdl'))
+        [System.IO.File]::WriteAllText($fragment, $text.Substring(0, $text.IndexOf("`n    /// The row's share")))
+        { Get-DemoFabricSemanticModelDefinition -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -SnapshotValueForm Kept -KeptValuePath $fragment } | Should -Throw '*columns Kept Value and Resolved At UTC*'
+    }
 }
 
 Describe 'Get-DemoFabricReportDefinition' {
@@ -398,6 +445,15 @@ Describe 'configure-powerbi.ps1' {
         @($records.checkId) | Should -Contain 'FABRIC.IMPORT.RPT_DATABASEHUB_HISTORY'
         @($records.checkId | Where-Object { $_ -match 'ORGAPP|WORKSPACEAPP' }) | Should -BeNullOrEmpty
         @($records | Where-Object { $_.status -ne 'Not selected' }) | Should -BeNullOrEmpty
+        # F35: the release's form of Snapshot Value unless the caller says the lakehouse has the kept-value columns.
+        ($records | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.FORM' }).evidence.form | Should -Be 'Release'
+        $kept = Join-Path -Path $TestDrive -ChildPath 'whatif-kept.jsonl'
+        $null = & $script:configurePowerBI -ConfigPath (New-TestConfigFile) -OutputPath $kept -WhatIf -SnapshotValueForm Kept 6>&1
+        $formRecords = @(Get-Content -LiteralPath $kept | ConvertFrom-Json | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.FORM' })
+        $formRecords.Count | Should -Be 1
+        $formRecords[0].status | Should -Be 'Not selected'
+        $formRecords[0].message | Should -Be 'Would deploy Snapshot Value''s Kept form (-SnapshotValueForm).'
+        $script:requests.Count | Should -Be 0
     }
 
     It 'stops with Fail and sends nothing when the subscription guard fails' {
@@ -411,7 +467,10 @@ Describe 'configure-powerbi.ps1' {
         ($records | Where-Object { $_.checkId -eq 'PREFLIGHT.GUARD.CONTEXT' }).status | Should -Be 'Fail'
     }
 
-    It 'deploys the model and the report, refreshes, and checks the data in one unattended run, and creates no app' {
+    It 'deploys the model and the report, refreshes, and checks the data in one unattended run, and creates no app, with Snapshot Value''s <Form> form' -ForEach @(
+        @{ Form = 'Release'; Status = 'Warning' }
+        @{ Form = 'Kept'; Status = 'Pass' }
+    ) {
         $modelList = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items?type=SemanticModel")
         $reportList = [regex]::Escape("$script:fabricApi/workspaces/$script:workspaceId/items?type=Report")
         $refreshes = "$script:pbiApi/groups/$script:workspaceId/datasets/$script:modelId/refreshes"
@@ -427,8 +486,9 @@ Describe 'configure-powerbi.ps1' {
             @{ Method = 'Get'; Match = ('^' + [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/reports/$script:reportId") + '$'); Responses = @(New-WebResponse 200 @{ datasetId = $script:modelId }) }
             @{ Method = 'Get'; Match = [regex]::Escape("$script:pbiApi/groups/$script:workspaceId/reports/$script:reportId/pages"); Responses = @(New-WebResponse 200 @{ value = @(for ($i = 0; $i -lt 4; $i++) { @{ name = "p$i"; displayName = $pages[$i]; order = $i } }) }) }
         )
-        $output = Join-Path -Path $TestDrive -ChildPath 'deploy.jsonl'
-        $null = & $script:configurePowerBI -ConfigPath (New-TestConfigFile) -OutputPath $output -FabricToken $script:token -PowerBIToken $script:token 6>&1
+        $output = Join-Path -Path $TestDrive -ChildPath ('deploy-{0}.jsonl' -f $Form)
+        $formArgument = if ($Form -eq 'Kept') { @{ SnapshotValueForm = 'Kept' } } else { @{} }
+        $null = & $script:configurePowerBI -ConfigPath (New-TestConfigFile) -OutputPath $output -FabricToken $script:token -PowerBIToken $script:token @formArgument 6>&1
         $LASTEXITCODE | Should -Be 0
         $records = @(Get-Content -LiteralPath $output | ConvertFrom-Json)
         foreach ($checkId in 'FABRIC.IMPORT.SM_DATABASEHUB_HISTORY', 'FABRIC.SEMANTICMODEL.REFRESH', 'FABRIC.SEMANTICMODEL.ROWS', 'FABRIC.SEMANTICMODEL.DATA', 'FABRIC.IMPORT.RPT_DATABASEHUB_HISTORY', 'FABRIC.REPORT.BINDING', 'FABRIC.REPORT.PAGES') {
@@ -441,6 +501,21 @@ Describe 'configure-powerbi.ps1' {
         @($script:requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -match $script:itemsUri }).Count | Should -Be 2
         @($script:requests | Where-Object { $_.Uri -match 'OrgApp|/apps' -or [string]$_.Body -match 'OrgApp' }) | Should -BeNullOrEmpty
         @($script:requests | Where-Object { $_.Uri -notmatch '^https://api\.(fabric\.microsoft\.com/v1|powerbi\.com/v1\.0/myorg)/' }) | Should -BeNullOrEmpty
+        # F35: the form sent is the one asked for, and FABRIC.SEMANTICMODEL.FORM says which: the release's form is a Warning,
+        # because its totals count a minute twice where saves overlap, with ./scripts/deploy.ps1 as the fix.
+        $modelCreate = $script:requests | Where-Object { $_.Uri -match $script:itemsUri -and $_.Body -match '"type":"SemanticModel"' } | Select-Object -First 1
+        $table = Get-SentDefinition $modelCreate 'definition/tables/Telemetry Snapshots.tmdl'
+        ($table -match "(?m)^    column 'Kept Value'$") | Should -Be ($Form -eq 'Kept')
+        $formRecords = @($records | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.FORM' })
+        $formRecords.Count | Should -Be 1
+        $formRecords[0].status | Should -Be $Status
+        $formRecords[0].evidence.form | Should -Be $Form
+        if ($Form -eq 'Release') {
+            $formRecords[0].remediation | Should -Match '\./scripts/deploy\.ps1'
+        }
+        else {
+            @($formRecords[0].evidence.keptColumns) | Should -Be @('kept_value', 'resolved_at_utc')
+        }
     }
 
     It 'checks the deployed model alone with -CheckModelData: finds it by name with public functions and imports nothing' {

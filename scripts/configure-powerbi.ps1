@@ -22,7 +22,10 @@ capacity is Manual action required.
    fabric.createIfMissing is true (FABRIC.RESOLVE.*). The repo stores no Fabric ID.
 1. Semantic model: Get-DemoFabricSemanticModelDefinition reads the TMDL in fabric/powerbi and fills in the resolved
    lakehouse; Import-DemoFabricItem (Phase 18) creates the model or updates its definition
-   (FABRIC.IMPORT.SM_DATABASEHUB_HISTORY).
+   (FABRIC.IMPORT.SM_DATABASEHUB_HISTORY). -SnapshotValueForm picks Snapshot Value's form (F35, design (i)): Kept reads
+   the kept values that the history's steps write in telemetry_snapshots, and needs their columns, which a Direct Lake
+   model can't frame without; Release, the default, is the release's rule. FABRIC.SEMANTICMODEL.FORM says which was
+   deployed: Pass for Kept, a Warning for Release, whose totals count a minute twice where saves overlap.
 2. Refresh: Invoke-DemoSemanticModelRefresh frames the Direct Lake model on the lakehouse's current tables
    (FABRIC.SEMANTICMODEL.REFRESH). Tables that a notebook has just created take a while to reach Direct Lake, so a
    refresh that can't see some of them (0xC14700DF) is sent again every 2 minutes for up to -RefreshRetryMinutes.
@@ -65,6 +68,12 @@ subscription guard.
 .PARAMETER PowerBIToken
 A Power BI REST API token you already have, as a SecureString (audience https://analysis.windows.net/powerbi/api).
 
+.PARAMETER SnapshotValueForm
+Snapshot Value's form (F35, design (i)). Kept: it reads the kept values in telemetry_snapshots (kept_value and
+resolved_at_utc), so a minute that saves at different intervals hold counts once. Pass it only when the lakehouse has
+those columns, as deploy.ps1 does after its Fabric track's step reports them; a model that reads a column the lakehouse
+lacks can't be framed. Release (the default): the release's rule, each bin's most recent capture.
+
 .PARAMETER CheckModelData
 Run step 3 alone: evaluate every measure of the deployed model, without importing anything.
 
@@ -101,6 +110,9 @@ Exit with code 2 when a check is Manual action required and none failed.
 
 .EXAMPLE
 ./scripts/configure-powerbi.ps1 -CheckModelData
+
+.EXAMPLE
+./scripts/configure-powerbi.ps1 -SnapshotValueForm Kept
 #>
 [CmdletBinding(SupportsShouldProcess, ConfirmImpact = 'Medium')]
 param(
@@ -115,6 +127,9 @@ param(
     [securestring] $FabricToken,
 
     [securestring] $PowerBIToken,
+
+    [ValidateSet('Release', 'Kept')]
+    [string] $SnapshotValueForm = 'Release',
 
     [switch] $CheckModelData,
 
@@ -188,9 +203,32 @@ elseif (-not ($WorkspaceId -and $LakehouseId -and $FabricToken -and $PowerBIToke
 # The definitions are built and validated from the files first, so a broken TMDL or PBIR folder stops the run before
 # any request. The report's model ID is a placeholder until step 1 returns the real one, and the model is built again
 # with the lakehouse once it's resolved; until then it's built with obviously fake IDs, which are never sent.
-$modelCheck = Get-DemoFabricSemanticModelDefinition -WorkspaceId '11111111-1111-1111-1111-111111111111' -LakehouseId '22222222-2222-2222-2222-222222222222' -DisplayName $modelName
+$modelCheck = Get-DemoFabricSemanticModelDefinition -WorkspaceId '11111111-1111-1111-1111-111111111111' -LakehouseId '22222222-2222-2222-2222-222222222222' -DisplayName $modelName -SnapshotValueForm $SnapshotValueForm
 $reportCheck = Get-DemoFabricReportDefinition -SemanticModelId $placeholderId -DisplayName $reportName
-Write-DemoLog -Message ('Semantic model {0}: {1} parts, {2} tables, {3} measures. Report {4}: {5} pages, {6} visuals.' -f $modelName, $modelCheck.Evidence.parts, $modelCheck.Evidence.tables, $modelCheck.Evidence.measures, $reportName, $reportCheck.Evidence.pages, $reportCheck.Evidence.visuals)
+Write-DemoLog -Message ('Semantic model {0}: {1} parts, {2} tables, {3} measures, Snapshot Value''s {7} form. Report {4}: {5} pages, {6} visuals.' -f $modelName, $modelCheck.Evidence.parts, $modelCheck.Evidence.tables, $modelCheck.Evidence.measures, $reportName, $reportCheck.Evidence.pages, $reportCheck.Evidence.visuals, $SnapshotValueForm)
+
+# F35, design (i): which form of Snapshot Value the model got (-SnapshotValueForm). Pass for the kept form; the release's
+# is a Warning, because its totals count a minute twice where saves at different intervals hold it.
+$formResult = {
+    param([switch] $Planned)
+    $evidence = [ordered]@{ form = $SnapshotValueForm }
+    if ($SnapshotValueForm -eq 'Kept') {
+        $evidence['keptColumns'] = @('kept_value', 'resolved_at_utc')
+    }
+    if ($Planned) {
+        return (New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.FORM' -Area 'fabric' -Target 'fabric' -Status 'Not selected' `
+                -Message ('Would deploy Snapshot Value''s {0} form (-SnapshotValueForm).' -f $SnapshotValueForm) -Evidence $evidence)
+    }
+    if ($SnapshotValueForm -eq 'Kept') {
+        return (New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.FORM' -Area 'fabric' -Target 'fabric' -Status 'Pass' `
+                -Message 'Snapshot Value reads the kept values in telemetry_snapshots (F35): a minute that saves at different intervals hold counts once in the history''s totals, and a bin not worked out yet reads its most recent capture, as before.' `
+                -Evidence $evidence)
+    }
+    New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.FORM' -Area 'fabric' -Target 'fabric' -Status 'Warning' `
+        -Message 'Snapshot Value has the release''s form: telemetry_snapshots didn''t have the kept-value columns, or the step that adds them couldn''t tell, so the history''s totals count a minute twice where saves at different intervals hold it (F35).' `
+        -Remediation 'Run ./scripts/deploy.ps1: its Fabric track adds the columns and works the history out, then deploys the kept form.' `
+        -DocUrl 'https://learn.microsoft.com/fabric/fundamentals/direct-lake-how-it-works' -Evidence $evidence
+}
 
 # The workspace and the lakehouse by name (Phase 26a, ADR 0021): the configuration holds names, and the IDs are
 # resolved here (created when missing and fabric.createIfMissing is true), or taken from the ID overrides.
@@ -223,13 +261,14 @@ if ($WhatIfPreference) {
     $target = & $targets
     $targetWorkspaceId = if ($target.Workspace -match $guidPattern) { $target.Workspace } else { $placeholderId }
     $model = if ($target.LakehouseWorkspace -match $guidPattern -and $target.Lakehouse -match $guidPattern) {
-        Get-DemoFabricSemanticModelDefinition -WorkspaceId $target.LakehouseWorkspace -LakehouseId $target.Lakehouse -DisplayName $modelName
+        Get-DemoFabricSemanticModelDefinition -WorkspaceId $target.LakehouseWorkspace -LakehouseId $target.Lakehouse -DisplayName $modelName -SnapshotValueForm $SnapshotValueForm
     }
     else {
         $modelCheck
     }
     if (-not $CheckModelData -and -not $SkipModel) {
         $results.Add((Import-DemoFabricItem -WorkspaceId $targetWorkspaceId -Item $model -WhatIf))
+        $results.Add((& $formResult -Planned))
         if (-not $SkipRefresh) {
             $results.Add((Invoke-DemoSemanticModelRefresh -WorkspaceId $targetWorkspaceId -SemanticModelId $placeholderId -WhatIf))
         }
@@ -277,7 +316,7 @@ if ($targetWorkspaceId -notmatch $guidPattern -or $targetLakehouseId -notmatch $
     & $skip 'FABRIC.SEMANTICMODEL.DEPLOY' 'The Fabric workspace and lakehouse aren''t resolved (FABRIC.RESOLVE.* says why) or passed, so nothing was deployed.'
     & $finish
 }
-$model = Get-DemoFabricSemanticModelDefinition -WorkspaceId $lakehouseWorkspaceId -LakehouseId $targetLakehouseId -DisplayName $modelName
+$model = Get-DemoFabricSemanticModelDefinition -WorkspaceId $lakehouseWorkspaceId -LakehouseId $targetLakehouseId -DisplayName $modelName -SnapshotValueForm $SnapshotValueForm
 
 #region Step 1-3: semantic model, refresh, and data
 $modelId = ''
@@ -304,6 +343,7 @@ elseif ($PSCmdlet.ShouldProcess("semantic model '$modelName' in Fabric workspace
     if ($modelResult.status -eq 'Pass') {
         $modelId = [string]$modelResult.evidence['itemId']
         $modelReady = $modelId -match $guidPattern
+        $results.Add((& $formResult))
     }
     if ($modelReady -and -not $SkipRefresh) {
         $refresh = Invoke-DemoSemanticModelRefresh -WorkspaceId $targetWorkspaceId -SemanticModelId $modelId -Token $PowerBIToken -TimeoutSeconds $TimeoutSeconds -TableRetryMinutes $RefreshRetryMinutes -Confirm:$false
