@@ -40,6 +40,12 @@ internal sealed class PendingRange
 
     /// <summary>When the range was last recorded: each read moves it on, and the observer's end closes it.</summary>
     public DateTimeOffset RecordedUtc { get; set; }
+
+    /// <summary>
+    /// When T4 had started (pg_postmaster_start_time()) as of the range's last record: a backfill that finds it started
+    /// since knows the window Query Store held in memory at the stop shows by now or never will.
+    /// </summary>
+    public DateTimeOffset? ServerStartedUtc { get; set; }
 }
 
 /// <summary>What <c>rca\query-watermark\&lt;target&gt;.json</c> holds.</summary>
@@ -51,6 +57,9 @@ internal sealed class QueryWatermarkState
 
     /// <summary>The end of the newest interval any read took, on this host.</summary>
     public DateTimeOffset? ThroughUtc { get; set; }
+
+    /// <summary>When T4 had started as of the newest read on this host.</summary>
+    public DateTimeOffset? ServerStartedUtc { get; set; }
 
     public List<PendingRange> Pending { get; set; } = [];
 }

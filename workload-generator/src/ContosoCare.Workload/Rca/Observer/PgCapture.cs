@@ -9,9 +9,11 @@ namespace ContosoCare.Workload.Rca.Observer;
 /// test role), with the observer's own application name, a 1-second lock_timeout, and a 10-second statement_timeout.
 /// Every block runs after pg_stat_clear_snapshot() in the same round trip, so no statistics view repeats an earlier
 /// snapshot (rca/capture/postgresql.sql; https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-STATS-FUNCTIONS).
-/// Every connection sets search_path to name <see cref="ObserverSchema"/> right after it opens: Query Store records each
-/// statement's search_path (query_store.qs_view), so RCA-PG-14 leaves out the observer's own statements by it, whatever
-/// text Query Store kept for them (rca/README.md, What the capture leaves out).
+/// Every connection opens silently (<see cref="Startup"/>): its search_path, which names <see cref="ObserverSchema"/>,
+/// and its limits come in its startup packet, and Npgsql loads no types for it (each block returns PostgreSQL's built-in
+/// types only), so it sends nothing but the catalog's blocks and the snapshot clear before each. Query Store records each
+/// statement's search_path (query_store.qs_view), and RCA-PG-14 leaves out the observer's own statements by it, and by
+/// their text (rca/README.md, What the capture leaves out).
 /// </summary>
 internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgSessionLimits? limits = null) : ICaptureConnector
 {
@@ -31,10 +33,17 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgS
     public const string ObserverSchema = "dbhubdemo_rca_observer";
 
     /// <summary>
-    /// Sets the observer's search_path for its session: the one it had, with <see cref="ObserverSchema"/> last (on T4,
-    /// <c>"$user", public, dbhubdemo_rca_observer</c>), so nothing resolves differently. Marked as the catalog's statements are.
+    /// The observer's search_path, a server option in its connections' startup packet, and only theirs (Npgsql's Options,
+    /// libpq's options): the server's default, <c>"$user", public</c>, with <see cref="ObserverSchema"/> last. A space in a
+    /// value is escaped with a backslash (https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-OPTIONS).
     /// </summary>
-    internal const string SearchPathStatement = """SELECT /* dbhubdemo:rca-observer */ set_config('search_path', concat_ws(', ', NULLIF(current_setting('search_path'), ''), 'dbhubdemo_rca_observer'), false)""";
+    internal const string SearchPathOption = """-c search_path="$user",\ public,\ """ + ObserverSchema;
+
+    /// <summary>How every observer connection opens: <see cref="SearchPathOption"/> and its limits in the startup packet, and no type loading.</summary>
+    internal static readonly PgSilentStartup Startup = new(SearchPathOption);
+
+    /// <summary>What every block runs after, in the same round trip, so no statistics view repeats an earlier snapshot.</summary>
+    internal const string ClearSnapshot = "SELECT pg_stat_clear_snapshot()";
 
     // insufficient_privilege.
     private static readonly HashSet<string> PermissionStates = ["42501"];
@@ -51,27 +60,14 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgS
 
     public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken)
     {
-        NpgsqlConnection? connection = null;
         try
         {
             // One attempt: the observer's own loop tries again later, so a replica that doesn't exist yet costs one connect.
-            connection = await new PgConnectionOpener(endpoint, log).OpenAsync(ApplicationNames.Observer, cancellationToken, limits ?? Limits, retry: false).ConfigureAwait(false);
-            await using (var command = connection.CreateCommand())
-            {
-                command.CommandText = SearchPathStatement;
-                command.CommandTimeout = 30;
-                await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
-            }
-
+            var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(ApplicationNames.Observer, cancellationToken, limits ?? Limits, retry: false, Startup).ConfigureAwait(false);
             return new PgCaptureConnection(connection);
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
         {
-            if (connection is not null)
-            {
-                await connection.DisposeAsync().ConfigureAwait(false);
-            }
-
             throw Translate(ex, connecting: true);
         }
     }
@@ -110,7 +106,7 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgS
             try
             {
                 await using var batch = new NpgsqlBatch(connection) { Timeout = Math.Max(1, (int)Math.Ceiling(timeout.TotalSeconds)) };
-                batch.BatchCommands.Add(new NpgsqlBatchCommand("SELECT pg_stat_clear_snapshot()"));
+                batch.BatchCommands.Add(new NpgsqlBatchCommand(ClearSnapshot));
                 var command = new NpgsqlBatchCommand(text);
                 foreach (var parameter in parameters)
                 {

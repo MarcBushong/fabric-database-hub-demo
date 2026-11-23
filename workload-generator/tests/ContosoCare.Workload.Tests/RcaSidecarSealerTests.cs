@@ -237,21 +237,19 @@ public sealed class RcaSidecarSealerTests : IDisposable
         // with its folder gone, T4's backfill still has a sink for it and writes its range as expired, instead of the
         // range being forgotten with "pending publication" left forever.
         var rig = new SidecarRig(root, T0);
-        var queryStore = new ScriptedConnector((_, _) => []) { ParameterAnswer = (_, _) => [] };
-        var source = new PgQueryStoreSource(queryStore, new QueryWatermark(root, "T4"), rig.Sink);
-        PgQueryStoreCapture.BlockRunner observer = (block, _) => Task.FromResult<IReadOnlyList<CaptureValues>?>(block switch
-        {
-            "RCA-PG-13" => T4Settings(rig.Clock.Now),
-            "RCA-PG-16" => [Row(("captured_at", null), ("kind", "function"), ("name", "fn_harness_event"))],
-            _ => null,
-        });
+
+        // A2's T4 fake (83344ef0's API): azure_sys answers nothing, and the observer's quiet path answers RCA-PG-13 (Query
+        // Store's 7 days) and RCA-PG-16 (the harness) at the rig's clock; T4 last started before T0.
+        var t4 = new T4QueryStore([], []);
+        t4.Follow(rig.Clock);
+        var source = new PgQueryStoreSource(t4.Connector, new QueryWatermark(root, "T4"), rig.Sink);
 
         var first = rig.Open(T0, "T4");
-        var capture = new PgQueryStoreCapture("T4", source, rig.Sink, RcaSimulation.Options(), RunnerLog.Null);
+        var capture = new PgQueryStoreCapture(t4.Access, source, rig.Sink, new PgSidecarOptions(), RunnerLog.Null);
         capture.Begin(T0);
-        await capture.ReadAsync(T0, observer, TestContext.Current.CancellationToken);
+        await ReadAsync(capture, T0);
         rig.Clock.Set(T0.AddMinutes(20));
-        await capture.EndAsync(T0.AddMinutes(20), observer, TestContext.Current.CancellationToken);
+        await capture.EndAsync(T0.AddMinutes(20), TestContext.Current.CancellationToken);
         first.Close(T0.AddMinutes(20));
         Assert.Equal(first.Id, Assert.Single(source.Watermark.Read().Pending).SpanId);
         Assert.True(rig.Store.ReadLedger().Spans.ContainsKey(first.Id));
@@ -259,9 +257,9 @@ public sealed class RcaSidecarSealerTests : IDisposable
 
         var later = T0.AddDays(8);
         rig.Open(later, "T4");
-        var next = new PgQueryStoreCapture("T4", source, rig.Sink, RcaSimulation.Options(), RunnerLog.Null);
+        var next = new PgQueryStoreCapture(t4.Access, source, rig.Sink, new PgSidecarOptions(), RunnerLog.Null);
         next.Begin(later);
-        await next.ReadAsync(later, observer, TestContext.Current.CancellationToken);
+        await ReadAsync(next, later);
 
         Assert.DoesNotContain(source.Watermark.Read().Pending, p => p.SpanId == first.Id);
         var entry = Assert.Single(rig.Store.ReadLedger().Sidecars);
@@ -631,13 +629,13 @@ public sealed class RcaSidecarSealerTests : IDisposable
     /// <summary>The ledger as the file has it, read without the store, so nothing a read does can change what's checked.</summary>
     private SidecarLedger ReadLedgerFile() => JsonSerializer.Deserialize(File.ReadAllText(Path.Combine(root, "sidecars", "ledger.json")), SidecarJsonContext.Default.SidecarLedger)!;
 
-    private static List<CaptureValues> T4Settings(DateTimeOffset now) =>
-    [
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", false), ("name", "pg_qs.interval_length_minutes"), ("setting", "15"), ("unit", "min")),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", false), ("name", "pg_qs.query_capture_mode"), ("setting", "all"), ("unit", null)),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", false), ("name", "pg_qs.retention_period_in_days"), ("setting", "7"), ("unit", null)),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", false), ("name", "pg_qs.store_query_plans"), ("setting", "off"), ("unit", null)),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", false), ("name", "pgms_wait_sampling.history_period"), ("setting", "100"), ("unit", "ms")),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", false), ("name", "pgms_wait_sampling.query_capture_mode"), ("setting", "all"), ("unit", null)),
-    ];
+    /// <summary>One whole Query Store read at <paramref name="at"/>, a block a tick, as A2's tests drive it (RcaQueryStorePgTests.ReadAtAsync).</summary>
+    private static async Task ReadAsync(PgQueryStoreCapture capture, DateTimeOffset at)
+    {
+        do
+        {
+            await capture.TickAsync(at, capture.Timestamp(), at.AddSeconds(30), TestContext.Current.CancellationToken);
+        }
+        while (capture.Reading);
+    }
 }

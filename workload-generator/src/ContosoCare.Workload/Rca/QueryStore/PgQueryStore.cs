@@ -7,8 +7,9 @@ namespace ContosoCare.Workload.Rca.QueryStore;
 /// <summary>
 /// Query Store's settings on a PostgreSQL server, as RCA-PG-13 read them from pg_settings
 /// (https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store): what it records, whether wait sampling
-/// records and how often it samples, its interval and retention, and whether the server is in recovery, where Query Store
-/// records nothing.
+/// records and how often it samples, its interval and retention, whether the server is in recovery, where Query Store
+/// records nothing, and when the server started (pg_postmaster_start_time()), which tells a backfill whether T4 stopped
+/// since a range was recorded.
 /// </summary>
 internal sealed record PgQueryStoreSettings(
     DateTimeOffset At,
@@ -18,7 +19,8 @@ internal sealed record PgQueryStoreSettings(
     TimeSpan? HistoryPeriod,
     TimeSpan? Interval,
     TimeSpan? Retention,
-    IReadOnlyList<string> Missing)
+    IReadOnlyList<string> Missing,
+    DateTimeOffset? ServerStarted = null)
 {
     public const string CaptureModeSetting = "pg_qs.query_capture_mode";
 
@@ -59,7 +61,8 @@ internal sealed record PgQueryStoreSettings(
             Duration(byName, "pgms_wait_sampling.history_period", "ms"),
             Duration(byName, "pg_qs.interval_length_minutes", "min"),
             Duration(byName, "pg_qs.retention_period_in_days", "d"),
-            [.. Read.Where(n => !byName.ContainsKey(n))]);
+            [.. Read.Where(n => !byName.ContainsKey(n))],
+            rows.Select(r => r.Time("server_started")).FirstOrDefault(t => t is not null));
     }
 
     /// <summary>What these settings keep out of the capture, one gap per line (rca/README.md, Query Store).</summary>
@@ -123,17 +126,37 @@ internal sealed record PgQueryStoreSettings(
 
 /// <summary>
 /// The harness, as RCA-PG-16 read it from contosocare's own catalog: the functions the demo marks as its harness, the
-/// tables only they write, and every other table, each as a regular-expression literal for RCA-PG-14's leave-out. With no
-/// function marked, every list but the other tables is empty, and RCA-PG-14 leaves out nothing as the harness's.
+/// tables only they write, and every other table, each as a regular-expression literal for RCA-PG-14's leave-out; and
+/// why no table is the harness's alone, when RCA-PG-16 was unsure (an unmarked function that runs dynamic SQL, or keeps
+/// no source in pg_proc). With no function marked, every list but the other tables is empty, and RCA-PG-14 leaves out
+/// nothing as the harness's.
 /// </summary>
-internal sealed record PgHarness(IReadOnlyList<string> Functions, IReadOnlyList<string> HarnessTables, IReadOnlyList<string> OtherTables)
+internal sealed record PgHarness(IReadOnlyList<string> Functions, IReadOnlyList<string> HarnessTables, IReadOnlyList<string> OtherTables, IReadOnlyList<string> Unsure)
 {
     public static PgHarness Parse(IReadOnlyList<CaptureValues> rows)
     {
         List<string> Names(string kind) =>
-            [.. rows.Where(r => string.Equals(r.Text("kind"), kind, StringComparison.Ordinal)).Select(r => r.Text("name")).OfType<string>().Where(n => n.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).Select(Literal)];
+            [.. rows.Where(r => string.Equals(r.Text("kind"), kind, StringComparison.Ordinal)).Select(r => r.Text("name")).OfType<string>().Where(n => n.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)];
 
-        return new PgHarness(Names("function"), Names("harness_table"), Names("table"));
+        var unsure = Names("unsure");
+        return new PgHarness([.. Names("function").Select(Literal)], unsure.Count > 0 ? [] : [.. Names("harness_table").Select(Literal)], [.. Names("table").Select(Literal)], unsure);
+    }
+
+    /// <summary>What RCA-PG-16's unsure rows mean, in the coverage's words; null when it was sure.</summary>
+    public string? UnsureGap(string database)
+    {
+        if (Unsure.Count == 0)
+        {
+            return null;
+        }
+
+        var why = Unsure.Select(u => u switch
+        {
+            "dynamic_sql" => "runs dynamic SQL (EXECUTE)",
+            "no_source" => "keeps no source in pg_proc (a BEGIN ATOMIC body)",
+            _ => "can't be read (" + u + ")",
+        });
+        return $"A function in {database} that isn't the harness's {string.Join(", and one ", why)}, so it could write any table: no table is left out as only the harness's, and the statements the harness's functions run stay in the evidence.";
     }
 
     /// <summary>
@@ -294,15 +317,42 @@ internal static class PgQueryStoreRows
     public static string ReplicaGap(string target) => $"{target} is a read replica, which records nothing in Query Store.";
 
     /// <summary>
-    /// T4's read replica's RCA Query Coverage row from RCA-PG-13 (null when it failed): a server in recovery records nothing
-    /// in Query Store, and the observer reads Query Store on T4 alone.
+    /// Why a quiet block on the observer's connection didn't return rows: its failure in its own words, and for a refusal,
+    /// what the block reads and who may (<see cref="RefusalFix"/>), rather than the observer's general fix.
     /// </summary>
-    public static CaptureRow ReplicaCoverage(string target, DateTimeOffset windowStart, DateTimeOffset now, IReadOnlyList<CaptureValues>? rows)
+    public static string Why(string target, string block, QuietResult result)
+    {
+        ArgumentNullException.ThrowIfNull(result);
+        return result.Failure == CaptureFailureKind.Permission
+            ? $"{result.Error ?? result.Message} {RefusalFix(target, block)}"
+            : result.Message ?? "the block failed.";
+    }
+
+    /// <summary>A quiet block's own fix when T4, or its replica, refuses it a permission.</summary>
+    public static string RefusalFix(string target, string block)
+    {
+        var again = target == "T4-replica"
+            ? "./scripts/deploy.ps1 sets T4's runner role up again, and the replica copies T4's roles."
+            : "./scripts/deploy.ps1 sets T4's runner role up again.";
+        return block switch
+        {
+            Settings => $"{Settings} reads pg_settings, pg_is_in_recovery(), and pg_postmaster_start_time(), which every role may: {again}",
+            Harness => $"{Harness} reads pg_proc, pg_class, pg_namespace, and the functions' descriptions, which every role may: {again}",
+            ConnectionHolders.Block => $"{ConnectionHolders.Block} reads pg_stat_activity, where another role's connections show their state only to a member of pg_read_all_stats, which T4's setup grants T4's runner role: {again}",
+            _ => again,
+        };
+    }
+
+    /// <summary>
+    /// T4's read replica's RCA Query Coverage row from RCA-PG-13 (null when it failed, and <paramref name="failure"/> says
+    /// why): a server in recovery records nothing in Query Store, and the observer reads Query Store on T4 alone.
+    /// </summary>
+    public static CaptureRow ReplicaCoverage(string target, DateTimeOffset windowStart, DateTimeOffset now, IReadOnlyList<CaptureValues>? rows, string? failure = null)
     {
         var coverage = new QueryCoverage(windowStart, now);
         if (rows is null)
         {
-            coverage.Gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{Settings} couldn't be read on {target} at {now:HH:mm} UTC; RCA Coverage's gaps say why."));
+            coverage.Gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{Settings} couldn't be read on {target} at {now:HH:mm} UTC: {failure ?? "the block failed."}"));
             return Coverage(target, coverage);
         }
 
