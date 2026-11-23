@@ -2854,7 +2854,16 @@ report["newerFile"] = dict(run(Lake(), files, sidecar_file=name)[0], file=name)
 files = Files()
 files.add("Files/other.json", json.dumps(PARAMETER))
 report["outside"] = run(Lake(), files, sidecar_file="Files/other.json")[0]
+# An evidence file's name in the inbox isn't a sidecar's (transport.schema.json, sidecarFile).
+files = Files()
+evidence_name = "Files/rca/inbox/%s-script-1a2b3c4d.json" % stamp()
+files.add(evidence_name, json.dumps(PARAMETER))
+report["wrongName"] = dict(run(Lake(), files, sidecar_file=evidence_name)[0], file=evidence_name)
 report["unread"] = run(Lake(), Files(), sidecar_file="Files/rca/inbox/sidecar-20261121T102531Z.json")[0]
+# A file that isn't JSON names no sidecar: no acknowledgement, so whatever it held stays pending.
+files = Files()
+name = stage(files, "{not json")
+report["notJson"] = dict(run(Lake(), files, sidecar_file=name)[0], file=name)
 
 # Nothing passed: Not selected, no finding, and the six tables all the same, so the history model frames them.
 lake = Lake()
@@ -2873,6 +2882,7 @@ report["rcaOnly"] = dict(only, telemetry=len(lake.tables.get("telemetry_snapshot
 lake, files = Lake(), Files()
 run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER)))
 names = {"ancient": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta(days=31), suffix="-ancient"),
+         "ancientNamed": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta(days=32), suffix="-Save.Run_1"),
          "written": stage(files, json.dumps(PARAMETER), delta=dt.timedelta(hours=2), suffix="-written"),
          "pending": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta(hours=3), suffix="-pending"),
          "dayOld": stage(files, parameter(encode(T4_LATER)), delta=dt.timedelta(days=2), suffix="-dayold"),
@@ -3127,14 +3137,26 @@ print(json.dumps(report, default=str))
         Assert-SidecarAck -Result $mixed -Payload $mixed['file'] -Status @{ $fixtureIds[0] = 'written'; $fixtureIds[1] = 'written'; $fixtureIds[2] = 'written' }
         $outside = $sidecarReport['outside']
         $outside['status'] | Should -Be 'Warning'
-        $outside['message'] | Should -Match 'RCA_SIDECAR_FILE must name a file in Files/rca/inbox'
+        $outside['message'] | Should -Match 'RCA_SIDECAR_FILE must name a file Files/rca/inbox/sidecar-<time>\[-<name>\]\.json'
         @($outside['reads']) | Should -BeNullOrEmpty
         @($outside['left']) | Should -Be @('Files/other.json')
         $outside['ackPath'] | Should -BeNullOrEmpty
+        $wrongName = $sidecarReport['wrongName']
+        $wrongName['status'] | Should -Be 'Warning'
+        $wrongName['message'] | Should -Match 'RCA_SIDECAR_FILE must name a file Files/rca/inbox/sidecar-'
+        @($wrongName['reads']) | Should -BeNullOrEmpty
+        @($wrongName['left']) | Should -Contain $wrongName['file']
         $unread = $sidecarReport['unread']
         $unread['status'] | Should -Be 'Warning'
         $unread['message'] | Should -Match 'the staged file couldn''t be read'
         $unread['ackPath'] | Should -BeNullOrEmpty
+        # A file it read that names no sidecar is one it can't read: no acknowledgement, and the file stays.
+        $notJson = $sidecarReport['notJson']
+        $notJson['status'] | Should -Be 'Warning'
+        $notJson['message'] | Should -Match 'wasn''t used: it isn''t JSON'
+        $notJson['ackPath'] | Should -BeNullOrEmpty
+        @($notJson['left'] | Where-Object { $_ -like 'Files/rca/acks/*.json' }) | Should -BeNullOrEmpty
+        @($notJson['left']) | Should -Contain $notJson['file']
     }
 
     It 'is Not selected without a sidecar and still creates the six tables; with SAVE_RESULTS False it writes, acknowledges, and deletes nothing' {
@@ -3177,6 +3199,7 @@ print(json.dumps(report, default=str))
         $sweep = $sidecarReport['sweep']
         $left = @($sweep['left'])
         $left | Should -Not -Contain $sweep['names']['ancient']
+        $left | Should -Not -Contain $sweep['names']['ancientNamed'] -Because 'a name may carry capitals, dots, and underscores after its time (transport.schema.json, sidecarFile)'
         $left | Should -Not -Contain $sweep['names']['written']
         $left | Should -Contain $sweep['names']['pending']
         $left | Should -Contain $sweep['names']['dayOld'] -Because 'part 4 deletes staged evidence a day old, never a sidecar file'

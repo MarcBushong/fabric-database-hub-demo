@@ -13,7 +13,7 @@ table 'RCA Query Coverage'
         isHidden
         sourceColumn: document_id
 
-    /// T1, T2, T3, or T4.
+    /// T1, T2, T3, T4, or T4-replica, whose row says the replica records nothing in Query Store.
     column 'Target Key'
         dataType: string
         isHidden
@@ -81,7 +81,7 @@ table 'RCA Query Coverage'
         dataType: string
         sourceColumn: sources
 
-    /// One gap per line: what wasn't read and why (Query Store off or read-only, a permission, a timeout, pending publication that expired, the sidecar's budget).
+    /// One gap per line: what wasn't read and why (Query Store off or read-only, a permission, a timeout, pending publication that expired or was lost when T4 stopped, the sidecar's budget).
     column Gaps
         dataType: string
         sourceColumn: gaps
