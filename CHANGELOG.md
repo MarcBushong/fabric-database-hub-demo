@@ -140,7 +140,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 
 - The Ask relay passes on GitHub's device sign-in page only when it's exactly `https://github.com/login/device` (https, origin `https://github.com`), and that page otherwise, as defense in depth: the Insights app already links only that page. It takes effect with the next relay image, which `config/versions.json` (`askRelay.image`) pins once CI has published it.
 
-## [2026-11-20] - The Ignite updates
+## [2026-11-23] - The Ignite updates
 
 **The Ignite updates.** Microsoft Fabric Database Hub is generally available since 2026-11-17, and the demo follows it.
 

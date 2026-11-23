@@ -278,6 +278,33 @@ Describe 'Restart-DemoSqlVmIaasAgent' {
 }
 
 Describe 'T1 sysadmin recovery (SqlAdminAccess)' {
+    BeforeAll {
+        # The service cmdlets exist only on Windows: elsewhere (CI on Linux), or where another test file left a narrower
+        # stub, stubs with the parameters the recovery uses are defined before they're mocked, as for the IaaS agent's
+        # restart above, and the earlier definitions come back afterwards.
+        $script:previousRecoveryStubs = @{}
+        foreach ($stub in @(
+                @{ Name = 'Stop-Service'; Parameters = 'param([string] $Name, [switch] $Force)' },
+                @{ Name = 'Start-Service'; Parameters = 'param([string] $Name)' })) {
+            $existing = Get-Command -Name $stub.Name -ErrorAction SilentlyContinue
+            if ($null -eq $existing -or $existing.CommandType -eq 'Function') {
+                $script:previousRecoveryStubs[$stub.Name] = if ($null -ne $existing) { $existing.ScriptBlock } else { $null }
+                Set-Item -Path ('function:global:' + $stub.Name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stub.Parameters))
+            }
+        }
+    }
+
+    AfterAll {
+        foreach ($name in $script:previousRecoveryStubs.Keys) {
+            if ($null -ne $script:previousRecoveryStubs[$name]) {
+                Set-Item -Path ('function:global:' + $name) -Value $script:previousRecoveryStubs[$name]
+            }
+            else {
+                Remove-Item -Path ('function:global:' + $name) -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
     BeforeEach {
         $script:context = New-TestSqlVmContext -DataDiskTier 'None'
         Mock -CommandName Stop-Service -MockWith { }
