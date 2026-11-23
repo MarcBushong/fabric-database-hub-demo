@@ -7437,6 +7437,22 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **What its live check needs.** The chat on a live history: a 24-hour `find_incidents`, whole or cut, as JSON that parses; a triage filtered by a target beside incidents on others; and a shared Root cause link opening as it was shared.
 
+### A recommendation that named the demo's plan (2026-11-23)
+
+**Why.** The recommendation catalog's CPU-AUTO-CORRECT said its risk was "None for Azure SQL Database's default; it was held off on purpose in this demo beat": the RCA's own words naming what the demo planned, which breaks blind detection (ADR 0031). Building Query Store's rules (unit 2's C2) found it. No rule on this line returns it yet, but the catalog ships in tonight's release, and unit 2's rules recommend it for T3 when automatic tuning hasn't forced a plan. The chat and the report quote a recommendation as it stands.
+
+- **The fix:** its risk now says what a DBA checks: "None where it's on, as Azure SQL Database's default has it; where someone turned it off, find out why before turning it back on." These are C2's words, so the two branches agree.
+- **A test,** `rca/catalog.test.ts`: no recommendation's title, why, risk, or Learn title says "demo", "on purpose", "beat", "scenario", "inject", or "held off". It leaves out the Learn URLs, since one of Learn's anchors starts `#scenario-2-`.
+- **The sweep** of `src/rca`'s other output, here and at the release's integration head (the rules' statements, the playbook, the tools' descriptions, the view, and the Root cause page), found nothing else that names a plan or an injection. What mentions the demo stays:
+  - "the demo's saved history" (the tools) and "the demo's deterministic rules" (the playbook): where the facts come from;
+  - "You don't know what the demo planned or ran" (the playbook) and "with nothing about what anyone planned" (the page): blindness itself;
+  - "in this demo's live check Azure Monitor's failed connections counted none of the refusals at the connection limit" (the connection rules): a measurement of Azure Monitor's metric, from Final tests' live check, not of a plan;
+  - captured names such as `usp_scenario_chain_acquire`: the evidence, as the capture recorded it.
+
+**Changed files.** `fabric/app/src/rca/catalog.ts`, the test `rca/catalog.test.ts` (new), and this report.
+
+**Validation.** Targeted, as asked while this PC is at full load: `catalog.test.ts` and `rules.test.ts` passed (57 tests), and the new test fails with 62e5a18f's catalog. The typecheck and eslint are clean, markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+
 ### The RCA release: the Incident RCA merged onto the release's follow-ups (2026-11-23)
 
 **Why.** The owner wants the releases after the Ignite release out as soon as possible: the release's follow-ups first (PR #67), then the Incident RCA. This branch is the RCA release: the RCA line merged onto the follow-ups, proven live by Final tests before it merges, right after the follow-ups.
