@@ -7480,15 +7480,31 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
   - **The gap:** review-h found that the stop check the runner polls during every run, an ad hoc statement with `object_id` 0, was kept.
   - **The list:** in `Rca/QueryStore/HarnessStatements.cs`, which unit A1 builds. `blind-detection.json` excepts its two forbidden names there only, and a contract test ties the exceptions to the names the runner's statements use.
 - **b1c12d23:** the README's wording for A2's and T1c's review fixes: a backfill splits a range at T4's start, cut texts need 64 characters, and T4's text rule covers only the observer's own statements and role.
+- **0347ad56, T1a's re-check:** a session's sidecar budget is soft at a bind, with a gap line and a Warning; a lost ledger offers acknowledged sidecars again.
+- **1e13e9aa, Run all's path (T2c's contract):** the coordinator's decision for the owner, who runs demos only through Run all.
+  - the runbooks fetch the sidecars within each export's bounds, after the evidence, into bundles and an index of their own;
+  - the final metrics carry a pointer of at most 300 bytes;
+  - the control notebook stages them, and the next start acknowledges them;
+  - five new kinds in `transport.schema.json`, with fixtures.
+- **72cd3f95:** the start's acknowledgements share its bound, so the session control's job-minute ceiling, 116 a session, holds.
+- **96f81133:** older notebooks leave the sidecar's tables and files alone. That's matrix M4's N0 and M5, from INT's harness over edd01c86's notebooks, 12 checks of 12.
+- **dd4fd393:** RCA-PG-17 reads T4's primary only, and the backfill always waits after T4's start.
+- **45f947b7:** `rca ack` is idempotent, and Run all counts an ID acknowledged before as sent.
 
 **The integration,** `marcbushong-microsoft-qs-evidence-integration`, takes only reviewed heads:
 
 - **B,** the notebook and the model, at e968004d (d6a77fa9), with two of its test expectations fixed (d8207618).
-- **A1,** SQL Server's reads, at f6fcdafa (893a3bf3).
-- **The contract,** through b1c12d23.
+- **A1,** SQL Server's reads, at f6fcdafa (893a3bf3), then its seam's hardening at 4fbd21b2 (ca66a103), which A2's head needed.
+- **T2a,** the scripts' transport, at 8e2ada18 (d76a028b).
+  - It brings the RCA release integration's 83a6fcb1, T2a's approved base.
+  - The generated model guide was rebuilt with the app's pinned `tsx`.
+  - `published-versions.json` lists the merged notebooks' versions (abd30713).
+- **A2,** PostgreSQL's reads and the holders, at 83344ef0 (41645fa9). Its `TargetObserver.cs` is A1's 3cea6ac9, cherry-picked.
+- **The contract,** through 45f947b7.
 - **INT's own commits:**
-  - the live probes (`tests/integration/rca-query-store.md`), with S7's blindness sets, S10's and S11's review checks, and H's checks deployed twice;
-  - a guard that RCA Query Waits, which has no measure, is totaled nowhere but through the latest read (review-qs-b's caveat).
+  - the live probes (`tests/integration/rca-query-store.md`): S7's blindness sets, the runner's own statements among them; S10's and S11's review checks; H's checks deployed twice; and S12, the scripts' transport's checks;
+  - a guard that RCA Query Waits, which has no measure, is totaled nowhere but through the latest read (review-qs-b's caveat);
+  - the cost estimate's comment and `docs/cost-management.md`: the sidecars share the export's limits, so the ceiling holds.
 - **H, the harness's marks** (dc5735a8 on `marcbushong-microsoft-harness-marks`), merges after the realistic names' release. Its SQL Server block sits just before `110-demo-control.sql`'s last step, setup's `EXEC demo.usp_release_auto_tuning_hold`, which `SqlScriptTests` pins as the script's end, and counts down with `@remaining`. Its PostgreSQL block follows a `-- @batch` line after `usp_restore_seed`.
 
 **Changed files.**
@@ -7503,8 +7519,8 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **Validation.**
 
-- **Pester,** under strict mode with the Azure CLI guard: `Rca.Contract` 64 passed; `Fabric.PowerBI` 17 passed and 1 skipped; `DbHubDemo.PowerBI` 30 passed; `DbHubDemo.Fabric` 42 passed; `Fabric.Notebooks` 152 of 152 on the integration, its pandas cases in a session-local Python 3.12; `Repo.Conventions` 123 and `Repo.NeutralWording` 3 passed.
-- **The runner,** with SDK 10.0.403, on the integration: `RcaQueryStoreSqlTests`, `RcaQueryStoreSeamTests`, `RcaLaneTests`, `RcaObserverTests`, `RcaBlindTests`, `RcaSidecarRowsTests`, `SqlScriptTests`, and `RcaIntegrationTests`: 98 passed, and the 2 real-engine tests skip without a server, as before. ScriptDom parses every T-SQL block, and the PostgreSQL blocks only read.
+- **Pester,** under strict mode with the Azure CLI guard: `Rca.Contract` 70 passed; `DbHubDemo.RcaSidecar` 28 and `DbHubDemo.Cost` 74 passed; `Fabric.PowerBI` 17 passed and 1 skipped; `DbHubDemo.PowerBI` 30 passed; `DbHubDemo.Fabric` 42 passed; `Fabric.Notebooks` 152 of 152 on the integration, its pandas cases in a session-local Python 3.12; `Repo.Conventions` 123 and `Repo.NeutralWording` 3 passed.
+- **The runner,** with SDK 10.0.403, on the integration with A1, A2, and T2a: the whole suite, 961 tests, 940 passed, and the 21 real-engine tests skip without a server, as before. ScriptDom parses every T-SQL block, and the PostgreSQL blocks only read.
 - **Proven to fail without the change:**
   - the folder guard, with a temporary unscanned folder;
   - the plan rules, on the previous T3 fixture;
