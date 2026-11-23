@@ -1008,10 +1008,15 @@ function Get-DemoGoldenControlRcaPending {
     An encrypted variable is unreadable here (2026-11-23): a tenant's policy can re-create Automation variables encrypted,
     and then only a runbook's Get-AutomationVariable reads the value, while Resource Manager returns the variable with no
     value, which would otherwise read as a status that lists nothing. So isEncrypted, or a variable with no value, is an
-    Error, and Encrypted says why.
+    Error, and Encrypted says why. So is a variable that's missing from an account that exists (the review of 40124992):
+    since 2026-11-23 deploy.ps1 creates it only when it's missing, so a deletion, or a deployment that couldn't create it,
+    can leave it missing while sessions run, and their stops' lists are then only in the control vault, which the runbooks
+    can't read back; Missing says so. Only a control whose account doesn't exist has had no session that listed any.
     Returns Read (a status was read), Documents, Error (a read that failed), Encrypted (Resource Manager returned no value:
-    the variable is encrypted, or came with none), Variable, and Notebook. Never throws. Internal.
+    the variable is encrypted, or came with none), Missing (the variable doesn't exist, though its account does),
+    Variable, and Notebook. Never throws. Internal.
     https://learn.microsoft.com/rest/api/automation/variable/get,
+    https://learn.microsoft.com/rest/api/automation/automation-account/get,
     https://learn.microsoft.com/azure/automation/shared-resources/variables
     #>
     [CmdletBinding()]
@@ -1024,15 +1029,28 @@ function Get-DemoGoldenControlRcaPending {
     )
 
     $name = Get-DemoActivityControlName -Config $Config
-    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
+    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Missing = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
     if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
         return $answer
     }
     $read = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/variables/DbHubSessionStatus' -f $name.AutomationAccountId) -ApiVersion '2024-10-23')
     if (-not $read.Ok) {
-        # A control from before 2026-11-16 has no such variable, and so no session that listed any.
         if (-not $read.Missing) {
             $answer.Error = [string]$read.Error
+            return $answer
+        }
+        # Missing: from an account that doesn't exist, which has had no session, or from one that does, whose sessions' stops
+        # can have listed evidence the runbooks couldn't keep there (the review of 40124992), so the capture fails closed.
+        $account = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $name.AutomationAccountId -ApiVersion '2024-10-23')
+        if ($account.Missing) {
+            return $answer
+        }
+        $answer.Missing = $true
+        $answer.Error = if ($account.Ok) {
+            'it doesn''t exist, though {0} does' -f $name.AutomationAccount
+        }
+        else {
+            'it doesn''t exist, and whether {0} does couldn''t be read: {1}' -f $name.AutomationAccount, ([string]$account.Error).TrimEnd('.')
         }
         return $answer
     }

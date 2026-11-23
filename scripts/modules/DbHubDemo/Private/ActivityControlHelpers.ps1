@@ -95,6 +95,9 @@ $script:ActivityControlActiveJobStatuses = @('New', 'Activating', 'Running', 'Re
 # with this marker, so the control's runbook lets a later Run all, the Insights app's Start, or a run replace it with its own
 # plan ($script:DbHubStartDemoMarker in DbHubControl.Common.ps1, which must match), and status.ps1 says whose it is.
 $script:ActivityControlStartDemoMarker = '[start-demo.ps1]'
+# The session's status variable as infra/control/control.bicep creates it (its description, which must match), for the
+# template step's own creation when a read after the deployment finds none (the review of 40124992).
+$script:ActivityControlStatusVariableDescription = 'The demo session''s last status (JSON), which the DbHub-Control runbook keeps and DbHub-Monitor reads back. Never a credential.'
 # What STOP.CONTROL.AUTOSTOP says stops the demo once stop-demo.ps1 removed a pending auto-stop: stop-demo.ps1 itself, or,
 # once a Run all session's stop went to the session control and its job stopped the session, that job
 # (Invoke-DemoStopHandoff; Final tests' live round at d7df4f9f, O3).
@@ -1287,12 +1290,62 @@ function Initialize-DemoActivityControlGroup {
     return $results.ToArray()
 }
 
+function Get-DemoActivityControlStatusVariable {
+    <#
+    .SYNOPSIS
+    Whether the control account has its variable DbHubSessionStatus, for infra/control/control.bicep's createSessionStatus
+    (2026-11-23): Variable - Get through Azure Resource Manager, which answers for an encrypted variable too, without its
+    value. A read that fails for another reason than a missing variable or account is tried once more. Returns State
+    (Present, Missing, or Unknown), Encrypted, and Error. Internal.
+    https://learn.microsoft.com/rest/api/automation/variable/get
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name
+    )
+
+    $url = Get-DemoActivityControlUrl -Id ('{0}/variables/DbHubSessionStatus' -f $Name.AutomationAccountId) -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts')
+    $read = $null
+    foreach ($attempt in 1, 2) {
+        $read = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url $url
+        if ($read.Ok -or $read.Missing) {
+            break
+        }
+        if ($attempt -eq 1) {
+            Start-Sleep -Seconds 5
+        }
+    }
+    if ($read.Missing) {
+        return [pscustomobject]@{ State = 'Missing'; Encrypted = $false; Error = '' }
+    }
+    if (-not $read.Ok) {
+        return [pscustomobject]@{ State = 'Unknown'; Encrypted = $false; Error = [string]$read.Error }
+    }
+    $properties = Get-DemoMemberValue -InputObject $read.Value -Name 'properties'
+    return [pscustomobject]@{ State = 'Present'; Encrypted = ((Get-DemoMemberValue -InputObject $properties -Name 'isEncrypted') -eq $true); Error = '' }
+}
+
 function Invoke-DemoActivityControlTemplate {
     <#
     .SYNOPSIS
     Deploys infra/control/control.bicep (the identity, the Automation account, and the vault in the resolved mode) and
     returns Result (CONTROL.RESOURCES) and Outputs (identityClientId, identityPrincipalId, keyVaultId, keyVaultUri).
     The parameters go in a file in a private directory. Internal.
+
+    .DESCRIPTION
+    The account's variable DbHubSessionStatus, the session's last status, is created only when Azure has none
+    (Get-DemoActivityControlStatusVariable; 2026-11-23): a session's next start reads the status it replaces from it, with
+    the lists of the Incident RCA's evidence still on the VMs, which an update that wrote it again empty lost (ADR 0031).
+    An existing one is left as it is, encrypted or not, since the deployment is incremental
+    (https://learn.microsoft.com/azure/azure-resource-manager/templates/deployment-modes). One that can't be read before
+    the deployment is read again after it, when the account exists (the review of 40124992): a missing one is then created
+    as the template creates it (Variable - Create Or Update,
+    https://learn.microsoft.com/rest/api/automation/variable/create-or-update), so a new environment's first deployment, or
+    one after the variable's deletion, doesn't leave the runbooks without it. One still unread is left as it is, never
+    emptied, and CONTROL.RESOURCES is a Warning that says so. The evidence's sessionStatus says "to create" until the
+    deployment succeeds, and "created" only then.
     #>
     [CmdletBinding(SupportsShouldProcess)]
     [OutputType([pscustomobject])]
@@ -1313,6 +1366,13 @@ function Invoke-DemoActivityControlTemplate {
     if (-not $PSCmdlet.ShouldProcess($Name.ResourceGroup, ('Deploy infra/control/control.bicep: {0}, {1}, and {2} ({3})' -f $Name.Identity, $Name.AutomationAccount, $Name.KeyVault, $Mode))) {
         return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0}, {1} (Basic, public network access and local authentication on for webhooks), and {2} ({3} network access, Azure RBAC, 7-day soft delete, purge protection off) would be deployed in {4}.' -f $Name.Identity, $Name.AutomationAccount, $Name.KeyVault, $Mode, $Name.ResourceGroup) -Evidence $evidence -DocUrl $doc); Outputs = $null }
     }
+    $statusVariable = Get-DemoActivityControlStatusVariable -Name $Name
+    # "created" only once the deployment that creates it succeeded (the review of 40124992).
+    $evidence['sessionStatus'] = switch ($statusVariable.State) {
+        'Missing' { 'to create' }
+        'Present' { if ($statusVariable.Encrypted) { 'kept, encrypted' } else { 'kept' } }
+        default { 'unread, left as it is' }
+    }
     $parameters = [ordered]@{
         '$schema'      = 'https://schema.management.azure.com/schemas/2019-04-01/deploymentParameters.json#'
         contentVersion = '1.0.0.0'
@@ -1323,6 +1383,7 @@ function Invoke-DemoActivityControlTemplate {
             keyVaultName          = @{ value = $Name.KeyVault }
             vaultNetworkMode      = @{ value = $Mode }
             tags                  = @{ value = (Get-DemoActivityControlTag -Config $Config) }
+            createSessionStatus   = @{ value = ($statusVariable.State -eq 'Missing') }
         }
     }
     $directory = Initialize-DemoPrivateDirectory -Prefix 'dbhub-control'
@@ -1346,6 +1407,9 @@ function Invoke-DemoActivityControlTemplate {
         }
         return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('infra/control/control.bicep couldn''t be deployed: {0}' -f $errorText) -Evidence $evidence -Remediation 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.' -DocUrl $doc); Outputs = $null }
     }
+    if ($statusVariable.State -eq 'Missing') {
+        $evidence['sessionStatus'] = 'created'
+    }
     $raw = [string]$run.StdOut | ConvertFrom-Json -AsHashtable -Depth 16
     $outputs = [ordered]@{}
     foreach ($key in 'identityClientId', 'identityPrincipalId', 'keyVaultId', 'keyVaultUri', 'automationAccountId') {
@@ -1357,7 +1421,39 @@ function Invoke-DemoActivityControlTemplate {
     if ($Mode -eq 'public' -and $actual -and $actual -ne 'Enabled') {
         return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Fail' -Message ('{0} was deployed with public network access, but it''s {1} now: a policy changed it, so the notebook in the shared workspace can''t read it.' -f $Name.KeyVault, $actual) -Evidence $evidence -Remediation 'Set control.vaultNetworkMode to auto or private, then run ./scripts/deploy.ps1 again; it never adds a policy''s exclusion tag.' -DocUrl $doc); Outputs = $outputs }
     }
-    return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('{0}, {1}, and {2} ({3} network access) are deployed in {4}.' -f $Name.Identity, $Name.AutomationAccount, $Name.KeyVault, $(if ($actual) { $actual } else { $Mode }), $Name.ResourceGroup) -Evidence $evidence -DocUrl $doc); Outputs = $outputs }
+    $deployed = '{0}, {1}, and {2} ({3} network access) are deployed in {4}.' -f $Name.Identity, $Name.AutomationAccount, $Name.KeyVault, $(if ($actual) { $actual } else { $Mode }), $Name.ResourceGroup
+    if ($statusVariable.State -eq 'Unknown') {
+        # The account exists now, so a read after the deployment, which left the variable alone, tells a missing one from
+        # one it kept (the review of 40124992: a missing variable that a failed read left missing, on a new environment's
+        # first deployment or after its deletion, kept the runbooks from keeping the session's status).
+        $firstError = $statusVariable.Error
+        $after = Get-DemoActivityControlStatusVariable -Name $Name
+        if ($after.State -eq 'Missing') {
+            $url = Get-DemoActivityControlUrl -Id ('{0}/variables/DbHubSessionStatus' -f $Name.AutomationAccountId) -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts')
+            $body = [ordered]@{ name = 'DbHubSessionStatus'; properties = [ordered]@{ description = $script:ActivityControlStatusVariableDescription; isEncrypted = $false; value = '""' } }
+            $created = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method put -Url $url -Body $body
+            if (-not $created.Ok) {
+                $evidence['sessionStatus'] = 'missing, not created'
+                $message = '{0} Its variable DbHubSessionStatus couldn''t be read before the deployment ({1}), and it was missing after it, but it couldn''t be created ({2}): the runbooks can''t keep the session''s status until it exists.' -f $deployed, $firstError.TrimEnd('.'), $created.Error.TrimEnd('.')
+                return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'Run ./scripts/deploy.ps1 again.' -DocUrl $doc); Outputs = $outputs }
+            }
+            $evidence['sessionStatus'] = 'created'
+            $deployed = '{0} Its variable DbHubSessionStatus couldn''t be read before the deployment ({1}), and it was missing after it, so it was created, empty, as the template creates it.' -f $deployed, $firstError.TrimEnd('.')
+        }
+        elseif ($after.State -eq 'Present') {
+            $statusVariable = $after
+            $evidence['sessionStatus'] = if ($after.Encrypted) { 'kept, encrypted' } else { 'kept' }
+        }
+        else {
+            $message = '{0} Its variable DbHubSessionStatus couldn''t be read ({1}), so it was left as it was, never emptied: if it''s missing, the runbooks can''t keep the session''s status until a run of ./scripts/deploy.ps1 reads that and creates it.' -f $deployed, $after.Error.TrimEnd('.')
+            return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation 'Run ./scripts/deploy.ps1 again.' -DocUrl $doc); Outputs = $outputs }
+        }
+    }
+    if ($statusVariable.State -eq 'Present') {
+        $encrypted = if ($statusVariable.Encrypted) { ', encrypted' } else { '' }
+        $deployed = '{0} Its variable DbHubSessionStatus was kept as it was{1}: the last session''s status, which the next session''s start reads.' -f $deployed, $encrypted
+    }
+    return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'CONTROL.RESOURCES' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message $deployed -Evidence $evidence -DocUrl $doc); Outputs = $outputs }
 }
 
 function Publish-DemoActivityControlRunbook {

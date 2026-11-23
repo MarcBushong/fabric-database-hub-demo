@@ -7,7 +7,7 @@
 //   (docs/permissions.md).
 // - aa-<prefix>-control: the Automation account (Basic; public network access and local authentication on, because
 //   webhooks need both), with only that identity and no system-assigned identity, and its variable DbHubSessionStatus
-//   (2026-11-16), the session's last status, which DbHub-Monitor reads back.
+//   (2026-11-16), the session's last status, which DbHub-Monitor reads back, created only when it's missing (2026-11-23).
 // - kv-<prefix>-ctl-<suffix>: the vault for the webhook URL (Azure RBAC, Standard, 7-day soft delete, purge protection
 //   off so setup-activity-control.ps1 -Remove can purge it), public or private by vaultNetworkMode, which the setup
 //   script resolves from the tenant's policy. No diagnostic settings.
@@ -48,6 +48,9 @@ param softDeleteRetentionDays int = 7
 @description('Tags for every resource: the demo\'s tags without its environment and deploymentId, plus component activity-control.')
 param tags object
 
+@description('Whether to create the variable DbHubSessionStatus. deploy.ps1 passes false when Azure already has it, encrypted or not, so an update keeps the status a session\'s stop wrote, with its lists of evidence still on the VMs, and the tenant\'s encryption of it.')
+param createSessionStatus bool = true
+
 resource identity 'Microsoft.ManagedIdentity/userAssignedIdentities@2024-11-30' = {
   name: identityName
   location: location
@@ -78,8 +81,11 @@ resource account 'Microsoft.Automation/automationAccounts@2024-10-23' = {
 
 // The session's last status for DbHub-Monitor (2026-11-16, ADR 0026): DbHub-Control keeps a copy of what it writes to
 // the vault here (Set-AutomationVariable), and DbHub-Monitor's re-checks read it back to add a host's failure, because
-// the identity can't read the vault's value through Azure Resource Manager. Never a credential; a redeploy empties it.
-resource sessionStatus 'Microsoft.Automation/automationAccounts/variables@2024-10-23' = {
+// the identity can't read the vault's value through Azure Resource Manager. Never a credential. Created only when it's
+// missing (2026-11-23, ADR 0031): a session's next start reads the status it replaces from here, the lists of the Incident
+// RCA's evidence still on the VMs included, so an update that wrote it again empty lost them. A deployment in incremental
+// mode leaves a resource the template doesn't deploy as it is.
+resource sessionStatus 'Microsoft.Automation/automationAccounts/variables@2024-10-23' = if (createSessionStatus) {
   parent: account
   name: 'DbHubSessionStatus'
   properties: {
