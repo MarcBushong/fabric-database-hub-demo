@@ -201,7 +201,8 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $script:controlPending = @()
         $script:controlError = ''
         $script:controlEncrypted = $false
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Encrypted = $script:controlEncrypted; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
+        $script:controlMissing = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Encrypted = $script:controlEncrypted; Missing = $script:controlMissing; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
         # The demo workspace's NB_DatabaseHub_LiveActivity, read only when T2's documents are listed: this release's copy,
         # unless a test sets another.
         $script:notebookState = [pscustomobject]@{ Known = $true; Current = $true; Error = '' }
@@ -450,6 +451,22 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $rca.status | Should -Be 'Fail'
         $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (Forbidden), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
         $rca.remediation | Should -Be 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+    }
+
+    It 'captures nothing when the session control''s status variable is missing from its account, and names ./scripts/deploy.ps1, which creates it (the review of 40124992)' {
+        # Since 2026-11-23 deploy.ps1 creates the variable only when it's missing, so a deletion, or a deployment that couldn't
+        # create it, can leave it missing while sessions run: their stops' lists are then only in the control vault.
+        $script:controlError = 'it doesn''t exist, though aa-dbhub-control does'
+        $script:controlMissing = $true
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (it doesn''t exist, though aa-dbhub-control does), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
+        $rca.remediation | Should -Be 'Run ./scripts/deploy.ps1, which creates it (CONTROL.RESOURCES says so), then ./scripts/capture-t2-golden.ps1 again. Until it exists, the runbooks keep each session''s status only in the control vault, which they can''t read back, so a session''s start doesn''t fetch what the last stop left on the VMs.'
+        $rca.evidence.missing | Should -BeTrue
         foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
             $script:calls | Should -Not -Contain $step
         }
@@ -1416,10 +1433,18 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $script:variable = $null
         $script:readFail = ''
         $script:missing = $false
+        $script:accountMissing = $false
+        $script:accountReadFail = ''
         $script:url = ''
         # The variable's properties as Resource Manager returns them, when a test sets them (an encrypted variable's).
         $script:properties = $null
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            if ($Url -notmatch '/variables/') {
+                # The control's account (Automation Account - Get), read only when the variable is missing.
+                if ($script:accountMissing) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
+                if ($script:accountReadFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = $script:accountReadFail } }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'aa-dbhub-control' }; Error = '' }
+            }
             $script:url = $Url
             if ($script:readFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = $script:readFail } }
             if ($script:missing) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
@@ -1461,16 +1486,19 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         @($answer.Documents) | Should -BeNullOrEmpty
     }
 
-    It 'lists nothing for a status the runbooks haven''t written, or a control with no such variable, and says when the read failed' {
+    It 'lists nothing for a status the runbooks haven''t written, or a control whose account doesn''t exist, and says when the read failed' {
         $script:variable = '""'
         $empty = Get-ControlPending
         $empty.Read | Should -BeTrue
         @($empty.Documents) | Should -BeNullOrEmpty
         $script:missing = $true
+        $script:accountMissing = $true
         $missing = Get-ControlPending
         $missing.Read | Should -BeFalse
-        $missing.Error | Should -BeNullOrEmpty -Because 'a control from before 2026-11-16 has no such variable, and so no session that listed any'
+        $missing.Missing | Should -BeFalse
+        $missing.Error | Should -BeNullOrEmpty -Because 'a control whose account doesn''t exist has had no session that listed any'
         $script:missing = $false
+        $script:accountMissing = $false
         $script:readFail = 'Forbidden'
         $failed = Get-ControlPending
         $failed.Read | Should -BeFalse
@@ -1478,6 +1506,22 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $script:readFail = ''
         $script:variable = '{not json'
         (Get-ControlPending).Error | Should -Be 'its value isn''t the JSON of a status'
+    }
+
+    It 'fails closed on a variable that''s missing from an account that exists, which sessions can run without (the review of 40124992)' {
+        # Since 2026-11-23 deploy.ps1 creates the variable only when it's missing: a deletion, or a deployment that couldn't
+        # create it, leaves it missing while sessions run, and their stops' lists are then only in the control vault.
+        $script:missing = $true
+        $missing = Get-ControlPending
+        $missing.Read | Should -BeFalse
+        $missing.Missing | Should -BeTrue
+        $missing.Error | Should -Be 'it doesn''t exist, though aa-dbhub-control does'
+        @($missing.Documents) | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -Times 1 -Exactly -ParameterFilter { $Method -eq 'get' -and $Url -match '/automationAccounts/aa-dbhub-control\?api-version=2024-10-23$' }
+        $script:accountReadFail = 'Timeout'
+        $unknown = Get-ControlPending
+        $unknown.Missing | Should -BeTrue
+        $unknown.Error | Should -Be 'it doesn''t exist, and whether aa-dbhub-control does couldn''t be read: Timeout'
     }
 
     It 'can''t read a variable a tenant''s policy encrypted, which Resource Manager returns with no value, rather than reading it as a status that lists nothing (2026-11-23)' {

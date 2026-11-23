@@ -20,7 +20,10 @@ function New-DemoT2GoldenSnapshot {
        workspace's NB_DatabaseHub_LiveActivity, so when its copy is from before the Incident RCA (Get-DemoGoldenRcaNotebookState,
        read only then), the fix updates it first (./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook
        NB_DatabaseHub_LiveActivity, which leaves the workspace's other notebook as it is). A status that can't be read
-       captures nothing; one that's encrypted (a tenant's policy can re-create the variable so, and Resource Manager then
+       captures nothing, and neither does a variable missing from the control's account, which exists (the review of
+       40124992: since 2026-11-23 deploy.ps1 creates it only when it's missing, so a deletion, or a deployment that couldn't
+       create it, can leave it missing while sessions run), with ./scripts/deploy.ps1, which creates it, as the fix; one
+       that's encrypted (a tenant's policy can re-create the variable so, and Resource Manager then
        returns no value) gets the fix for a governed tenant: Run all sessions, each to its planned end, until one has no
        RCA.EARLIER line at its start about evidence still left, no RCA.EXPORT line about another session's documents, and
        no RCA.PENDING line at its end; then, the same day, the variable deleted, deploy.ps1, which creates it again
@@ -224,7 +227,14 @@ function New-DemoT2GoldenSnapshot {
     if ($controlPending.Error) {
         $readFix = 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
         $readEvidence = [ordered]@{ status = $controlPending.Variable }
-        if ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Encrypted')) {
+        if ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Missing')) {
+            # Missing from an account that exists (the review of 40124992): deploy.ps1 creates it only when it's missing, so a
+            # deletion, or a deployment that couldn't create it, can leave it so while sessions run, and their stops' lists
+            # are then only in the control vault, which the runbooks can't read back.
+            $readEvidence['missing'] = $true
+            $readFix = 'Run ./scripts/deploy.ps1, which creates it (CONTROL.RESOURCES says so), then ./scripts/capture-t2-golden.ps1 again. Until it exists, the runbooks keep each session''s status only in the control vault, which they can''t read back, so a session''s start doesn''t fetch what the last stop left on the VMs.'
+        }
+        elseif ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Encrypted')) {
             # A tenant's policy can re-create the variable encrypted (2026-11-23): then only the runbooks read it, and since
             # 2026-11-23 deploy.ps1 keeps an existing variable as it is, so that an update no longer loses what it lists; it
             # creates one only when there's none. So it reads again only once deleted and created again, empty, which loses

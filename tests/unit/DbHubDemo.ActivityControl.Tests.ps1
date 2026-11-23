@@ -190,11 +190,20 @@ BeforeAll {
             }
             '/automationAccounts/aa-dbhub-control/variables/DbHubSessionStatus$' {
                 # The session's status variable (2026-11-23): '' when there's none, Plain or Encrypted as Variable - Get
-                # answers (an encrypted one without its value), or Forbidden.
+                # answers (an encrypted one without its value), Forbidden, or Throttled. A put creates it (the review of
+                # 40124992), unless $script:statusVariablePutFails.
+                if ($Method -eq 'put') {
+                    if ($script:statusVariablePutFails) {
+                        return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (RequestDisallowedByPolicy) A policy denied the variable.')
+                    }
+                    $script:statusVariable = 'Plain'
+                    return (New-AzResult -StdOut '{"name":"DbHubSessionStatus","properties":{"isEncrypted":false}}')
+                }
                 switch ($script:statusVariable) {
                     'Plain' { return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ name = 'DbHubSessionStatus'; properties = @{ isEncrypted = $false; value = (ConvertTo-Json -InputObject '{"sessionId":"5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21","phase":"stopped"}') } } -Depth 4)) }
                     'Encrypted' { return (New-AzResult -StdOut '{"name":"DbHubSessionStatus","properties":{"isEncrypted":true}}') }
                     'Forbidden' { return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to read the variable.') }
+                    'Throttled' { return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (TooManyRequests) The request was throttled.') }
                     default { return (Get-NotFound 'DbHubSessionStatus') }
                 }
             }
@@ -396,6 +405,11 @@ BeforeAll {
         $script:safetyStopReadFails = $false
         $script:connections = [System.Collections.Generic.List[object]]::new()
         $script:statusVariable = ''
+        # What the variable is once a deployment ran ($null: as it was), whether creating it fails, and whether the
+        # deployment fails (the review of 40124992).
+        $script:statusVariableAfterDeploy = $null
+        $script:statusVariablePutFails = $false
+        $script:deployFails = $false
     }
 
     function Register-FakeAzure {
@@ -438,6 +452,12 @@ BeforeAll {
                 'deployment group create*' {
                     $file = (Get-ArgumentValue $words '--parameters').Substring(1)
                     $script:deployments.Add([pscustomobject]@{ Text = $text; File = $file; Parameters = (Get-Content -LiteralPath $file -Raw) })
+                    if ($script:deployFails) {
+                        return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (InvalidTemplateDeployment) The template deployment failed.')
+                    }
+                    if ($null -ne $script:statusVariableAfterDeploy) {
+                        $script:statusVariable = $script:statusVariableAfterDeploy
+                    }
                     return (New-AzResult -StdOut '{"identityClientId":{"value":"99999999-9999-9999-9999-999999999999"}}')
                 }
                 'deployment group delete*' { return (New-AzResult) }
@@ -1280,7 +1300,8 @@ Describe 'Setting up the control (setup-activity-control.ps1)' {
         $encrypted.Result.message | Should -Match 'was kept as it was, encrypted:'
         @($script:rest | Where-Object { $_.Url -match '/variables/' } | ForEach-Object Method | Select-Object -Unique) | Should -Be @('get') -Because 'the variable is only read: the template creates it'
 
-        # One that can't be read, read twice, is left as it is, never emptied, and says so.
+        # One that can't be read, read twice before the deployment and twice after it, is left as it is, never emptied, and
+        # says so.
         $script:statusVariable = 'Forbidden'
         $script:rest.Clear()
         $unread = & $deploy
@@ -1289,7 +1310,62 @@ Describe 'Setting up the control (setup-activity-control.ps1)' {
         $unread.Result.evidence.sessionStatus | Should -Be 'unread, left as it is'
         $unread.Result.message | Should -Match 'Its variable DbHubSessionStatus couldn''t be read \(ERROR: \(AuthorizationFailed\) The client has no access to read the variable\), so it was left as it was, never emptied'
         $unread.Result.remediation | Should -Be 'Run ./scripts/deploy.ps1 again.'
-        @($script:rest | Where-Object { $_.Url -match '/variables/DbHubSessionStatus\?api-version=2024-10-23$' }).Count | Should -Be 2
+        @($script:rest | Where-Object { $_.Url -match '/variables/DbHubSessionStatus\?api-version=2024-10-23$' }).Count | Should -Be 4
+        @($script:rest | Where-Object { $_.Url -match '/variables/' } | ForEach-Object Method | Select-Object -Unique) | Should -Be @('get')
+    }
+
+    It 'reads a variable it couldn''t read again after the deployment, and creates it then when it''s missing, as the template does (the review of 40124992)' {
+        # A new environment's first deployment, or one after the variable's deletion, whose read failed twice (throttling,
+        # a 5xx, the network) left createSessionStatus false, and the runbooks without the variable.
+        $deploy = {
+            $script:deployments.Clear()
+            $script:rest.Clear()
+            InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { (Invoke-DemoActivityControlTemplate -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -Mode 'public' -Confirm:$false).Result }
+        }
+        $script:statusVariable = 'Throttled'
+        $script:statusVariableAfterDeploy = ''
+        $created = & $deploy
+        ($script:deployments[0].Parameters | ConvertFrom-Json -AsHashtable)['parameters']['createSessionStatus']['value'] | Should -BeFalse
+        $created.status | Should -Be 'Pass'
+        $created.evidence.sessionStatus | Should -Be 'created'
+        $created.message | Should -Match 'Its variable DbHubSessionStatus couldn''t be read before the deployment \(ERROR: \(TooManyRequests\) The request was throttled\), and it was missing after it, so it was created, empty, as the template creates it\.$'
+        $puts = @($script:rest | Where-Object { $_.Method -eq 'put' -and $_.Url -match '/automationAccounts/aa-dbhub-control/variables/DbHubSessionStatus\?api-version=2024-10-23$' })
+        $puts.Count | Should -Be 1
+        $body = $puts[0].Body | ConvertFrom-Json -AsHashtable
+        $body['name'] | Should -Be 'DbHubSessionStatus'
+        $body['properties']['isEncrypted'] | Should -BeFalse
+        $body['properties']['value'] | Should -Be '""'
+        $template = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/control/control.bicep') -Raw
+        $template | Should -Match ([regex]::Escape(("description: '{0}'" -f $body['properties']['description'].Replace("'", "\'")))) -Because 'it''s created as the template creates it'
+        $script:statusVariable | Should -Be 'Plain'
+
+        # Kept when the read after the deployment finds it, and created by nothing.
+        $script:statusVariable = 'Throttled'
+        $script:statusVariableAfterDeploy = 'Encrypted'
+        $kept = & $deploy
+        $kept.status | Should -Be 'Pass'
+        $kept.evidence.sessionStatus | Should -Be 'kept, encrypted'
+        $kept.message | Should -Match 'was kept as it was, encrypted:'
+        @($script:rest | Where-Object { $_.Method -ne 'get' -and $_.Url -match '/variables/' }) | Should -BeNullOrEmpty
+
+        # Missing, and refused: a Warning, with deploy.ps1 again.
+        $script:statusVariable = 'Throttled'
+        $script:statusVariableAfterDeploy = ''
+        $script:statusVariablePutFails = $true
+        $refused = & $deploy
+        $refused.status | Should -Be 'Warning'
+        $refused.evidence.sessionStatus | Should -Be 'missing, not created'
+        $refused.message | Should -Match 'it was missing after it, but it couldn''t be created \(ERROR: \(RequestDisallowedByPolicy\) A policy denied the variable\): the runbooks can''t keep the session''s status until it exists\.$'
+        $refused.remediation | Should -Be 'Run ./scripts/deploy.ps1 again.'
+    }
+
+    It 'says the variable was created only once the deployment that creates it succeeded (the review of 40124992)' {
+        $script:statusVariable = ''
+        $script:deployFails = $true
+        $result = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { (Invoke-DemoActivityControlTemplate -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -Mode 'public' -Confirm:$false).Result }
+        $result.status | Should -Be 'Fail'
+        $result.evidence.sessionStatus | Should -Be 'to create'
+        $result.message | Should -Match 'control\.bicep couldn''t be deployed'
     }
 
     It 'makes the template create the variable only when asked' {
