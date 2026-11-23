@@ -16,7 +16,10 @@ at the control account (A2), and DbHub Demo Session Writer at the control vault'
   showcase's maximum and before the VMs' next auto-shutdown. It also marks the demo busy until the auto-stop (so the
   nightly stop waits), creates T4's read replica once T4 is Ready (at T4's size or the next documented size Azure
   accepts), plans the replica-lag beat's windows, adds a backup auto-stop 30 minutes after the auto-stop, and writes
-  each step, in plain words with its fix, to the control vault's session status for the notebook.
+  each step, in plain words with its fix, to the control vault's session status for the notebook. Its request's
+  optional rcaAcks (2026-11-23, rca/README.md, Run all's path for the sidecars) names the Query Store sidecars the
+  history holds: the start acknowledges each on the VM its ID names, before any export there and within the start's
+  rca.startMinutes, and the status's rcaAcks says what it sent, so the notebook can delete its acknowledgement files.
 - run: refuses while another run is active; caps each activity's minutes at its scenario's maximum and before the
   VMs' next auto-shutdown; creates the one-time auto-stop schedule (and, for a run that uses sqlvm01, the monitoring
   re-checks that start DbHub-Monitor) before anything starts; starts the VMs (and T4) when they're stopped; and sets
