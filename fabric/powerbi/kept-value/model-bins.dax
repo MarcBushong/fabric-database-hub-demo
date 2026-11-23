@@ -1,0 +1,23 @@
+// F35, design (i): the deployed model's Snapshot Value per target, analysis, metric, and bin, for the live proof's check
+// of the kept form's DAX against its reference, keptFormValues (in fabric/app: npx tsx scripts/f35-proof.ts
+// <export.jsonl> --from <instant> --to <instant> --model <response.json>). Run it on the model with the Power BI REST
+// API's Execute Queries (https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group), and save its
+// response as it is. BinsFrom and BinsTo are --from and --to, in UTC: a response holds at most 100,000 rows, about four
+// days of a demo's history. Rows without a bin aren't in it, and f35-proof.ts leaves them out too.
+DEFINE
+    VAR BinsFrom = DATE ( 2026, 11, 18 ) + TIME ( 0, 0, 0 )
+    VAR BinsTo = DATE ( 2026, 11, 22 ) + TIME ( 0, 0, 0 )
+
+EVALUATE
+SUMMARIZECOLUMNS (
+    'Telemetry Snapshots'[Target Key],
+    'Telemetry Snapshots'[Analysis Key],
+    'Telemetry Snapshots'[Metric],
+    'Telemetry Snapshots'[Bucket UTC],
+    FILTER (
+        ALL ( 'Telemetry Snapshots'[Bucket UTC] ),
+        'Telemetry Snapshots'[Bucket UTC] >= BinsFrom
+            && 'Telemetry Snapshots'[Bucket UTC] < BinsTo
+    ),
+    "snapshot_value", [Snapshot Value]
+)

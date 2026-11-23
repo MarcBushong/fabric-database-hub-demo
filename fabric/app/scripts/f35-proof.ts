@@ -1,5 +1,5 @@
 // F35 design (i)'s live proof, from an export of telemetry_snapshots after kept_value_step resolved it (fabric/history/kept_value.py).
-// Usage: tsx scripts/f35-proof.ts <export.jsonl> [--from <instant>] [--to <instant>]
+// Usage: tsx scripts/f35-proof.ts <export.jsonl> [--from <instant>] [--to <instant>] [--model <response.json>]
 // The export holds one JSON object a line with the table's columns: target, analysis, metric, bucket_utc,
 // captured_at_utc, window_start_utc, window_end_utc (ISO 8601 UTC), value, grain_minutes, kept_value, and resolved_at_utc.
 // It prints one JSON object, and fails (exit 1) on any check that doesn't hold:
@@ -8,7 +8,12 @@
 // - hours: each series' total or peak in each whole hour, from those bins and from finestPerInterval's kept points on the
 //   raw rows, one per save, series, and bin, as the shared cases compare them (kept-value-cases.test.ts); the release's
 //   newest-per-bin totals beside them show what the double count was;
-// - steps: each save's step in both rules, its declared grain or, for a save written before F35, each rule's reading.
+// - steps: each save's step in both rules, its declared grain or, for a save written before F35, each rule's reading;
+// - model, with --model and both --from and --to: the deployed model's Snapshot Value per bin, from
+//   fabric/powerbi/kept-value/model-bins.dax with the same instants, against keptFormValues on the export's rows, in every
+//   bin with a bin time from --from to --to, worked out or not. The export and the model must read the same version of
+//   the table: nothing written to it between the export and the model's refresh. The file is Execute Queries' response
+//   as saved, a JSON array of its rows, or JSON lines.
 import { readFileSync } from "node:fs";
 import { declaredGrain, finestPerInterval, HOURLY_METRICS, OFF_GRID_ANALYSES, addsUp } from "../src/data/finest-per-interval";
 import { keptFormValues, monitorGrain, snapshotValues, sqlGrain } from "../src/data/snapshot-value";
@@ -19,19 +24,29 @@ const HOUR = 3_600_000;
 const MINUTE = 60_000;
 const MONITOR_ANALYSES = new Set(["postgresql", "cosmosdb"]);
 
-function option(name: string): number | null {
+function argument(name: string): string | null {
     const at = process.argv.indexOf(name, 3);
-    const value = at > 0 ? toDate(process.argv[at + 1]) : null;
+    return at > 0 && at + 1 < process.argv.length ? process.argv[at + 1] : null;
+}
+
+function option(name: string): number | null {
+    const value = toDate(argument(name));
     return value ? value.getTime() : null;
 }
 
+const USAGE = "Usage: tsx scripts/f35-proof.ts <export.jsonl> [--from <instant>] [--to <instant>] [--model <response.json>]";
 const path = process.argv[2];
 if (!path) {
-    console.error("Usage: tsx scripts/f35-proof.ts <export.jsonl> [--from <instant>] [--to <instant>]");
+    console.error(USAGE);
     process.exit(2);
 }
 const from = option("--from") ?? -Infinity;
 const to = option("--to") ?? Infinity;
+const modelPath = argument("--model");
+if (modelPath !== null && (from === -Infinity || to === Infinity)) {
+    console.error(`${USAGE}\n--model needs --from and --to, the instants model-bins.dax's BinsFrom and BinsTo bound its bins with.`);
+    process.exit(2);
+}
 const rows: Row[] = readFileSync(path, "utf8")
     .split(/\r?\n/)
     .filter((line) => line.trim() !== "")
@@ -171,6 +186,72 @@ for (const r of rows) {
     saves.set(key, { declared, rule, finest });
     if (finest !== null && finest !== rule) stepDiffers.push(`${key}: the rule's ${rule} and finestPerInterval's ${finest} minutes${declared === null ? " (written before F35)" : ""}`);
 }
+// Model: the deployed model's Snapshot Value per bin (model-bins.dax) against keptFormValues, the DAX measure's reference.
+// Execute Queries names a row's values "Telemetry Snapshots[Target Key]" and "[snapshot_value]"; plain names work too.
+const objectOf = (value: unknown): Record<string, unknown> => (value !== null && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {});
+const listOf = (value: unknown): unknown[] => (Array.isArray(value) ? (value as unknown[]) : []);
+function deployedRows(file: string): Row[] {
+    const content = readFileSync(file, "utf8").replace(/^\uFEFF/, "");
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(content) as unknown;
+    } catch {
+        parsed = content
+            .split(/\r?\n/)
+            .filter((line) => line.trim() !== "")
+            .map((line) => JSON.parse(line) as unknown);
+    }
+    const results = objectOf(parsed).results;
+    const list = Array.isArray(results)
+        ? listOf(results).flatMap((result) => listOf(objectOf(result).tables).flatMap((table) => listOf(objectOf(table).rows)))
+        : Array.isArray(parsed)
+          ? listOf(parsed)
+          : [parsed];
+    return list.map((row) =>
+        Object.fromEntries(Object.entries(objectOf(row)).map(([name, value]) => [name.replace(/^[^[]*\[/, "").replace(/\]$/, "").toLowerCase().replace(/[\s_]/g, ""), value])),
+    );
+}
+let deployed: { file: string; rows: number; from: string; to: string; compared: number; differ: number; missing: number; extra: number; first: string[] } | null = null;
+if (modelPath !== null) {
+    const textOf = (value: unknown) => (value === null || value === undefined ? "" : String(value));
+    const numberOrNull = (value: unknown) => (value === null || value === undefined || value === "" ? null : Number(value));
+    const expected = new Map<string, number>();
+    for (const [key, value] of model) {
+        const binText = key.slice(key.lastIndexOf("|") + 1);
+        if (binText !== "" && Number(binText) >= from && Number(binText) < to) expected.set(key, value);
+    }
+    const found = deployedRows(modelPath);
+    const seen = new Set<string>();
+    const differs: string[] = [];
+    const extras: string[] = [];
+    for (const row of found) {
+        const at = time(row.bucketutc ?? row.bucket);
+        if (at === null || at < from || at >= to) continue;
+        const series = `${textOf(row.target ?? row.targetkey)}|${textOf(row.analysis ?? row.analysiskey)}|${textOf(row.metric)}`;
+        const value = numberOrNull(row.snapshotvalue ?? row.value);
+        // A bin time finer than a millisecond (off the grid, a capture's time) can round either way in the model.
+        const key = [at, at - 1, at + 1].map((t) => `${series}|${t}`).find((k) => expected.has(k) && !seen.has(k));
+        if (key === undefined) {
+            extras.push(`${series}|${at}: the model's ${value}, where keptFormValues has none`);
+            continue;
+        }
+        seen.add(key);
+        const want = expected.get(key) ?? Number.NaN;
+        if (value === null || !close(value, want)) differs.push(`${key}: the model's ${value} and keptFormValues' ${want}`);
+    }
+    const missing = [...expected.keys()].filter((key) => !seen.has(key)).map((key) => `${key}: keptFormValues' ${expected.get(key)}, where the model has none`);
+    deployed = {
+        file: modelPath,
+        rows: found.length,
+        from: new Date(from).toISOString(),
+        to: new Date(to).toISOString(),
+        compared: seen.size,
+        differ: differs.length,
+        missing: missing.length,
+        extra: extras.length,
+        first: [...differs, ...missing, ...extras].slice(0, 20),
+    };
+}
 
 const result = {
     rows: rows.length,
@@ -183,6 +264,8 @@ const result = {
             return [series, { kept: sum(hoursKept), finest: sum(hoursFinest), release: sum(hoursRelease) }];
         }),
     ),
+    ...(deployed ? { model: deployed } : {}),
 };
 console.log(JSON.stringify(result, null, 2));
-process.exit(binDiffers.length + hourDiffers.length > 0 ? 1 : 0);
+const deployedProblems = deployed ? deployed.differ + deployed.missing + deployed.extra : 0;
+process.exit(binDiffers.length + hourDiffers.length + deployedProblems > 0 ? 1 : 0);
