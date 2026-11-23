@@ -18,9 +18,6 @@ export function targetLabel(target: string, names: ServerNames): string {
     return `${target} · ${n.server}${n.database ? ` / ${n.database}` : ""}`;
 }
 
-/** The longest window the Root cause page reads: wider ones are the chat's, a question at a time. */
-export const MAX_WINDOW_HOURS = 24;
-
 export interface EpisodeFacts {
     key: string;
     target: string;

@@ -135,12 +135,14 @@ describe("filtering, counting, grouping, and sorting the list", () => {
 });
 
 describe("the chat's filters", () => {
-    it("reads categories and severities, in the facets' order, and refuses a value that isn't one", () => {
+    it("reads categories, severities, and targets, in the facets' order, and refuses a value that isn't one", () => {
         expect(facetArgs({})).toBeNull();
-        expect(facetArgs({ categories: [], severities: [] })).toBeNull();
-        expect(facetArgs({ severities: ["low", "high"], categories: ["io", "blocking"] })).toEqual({ categories: ["blocking", "io"], severities: ["high", "low"] });
-        expect(facetArgs({ severities: "high" })).toEqual({ categories: [], severities: ["high"] });
+        expect(facetArgs({ categories: [], severities: [], targets: [] })).toBeNull();
+        expect(facetArgs({ severities: ["low", "high"], categories: ["io", "blocking"] })).toEqual({ categories: ["blocking", "io"], severities: ["high", "low"], targets: [] });
+        expect(facetArgs({ severities: "high" })).toEqual({ categories: [], severities: ["high"], targets: [] });
+        expect(facetArgs({ targets: ["T5", "T4-replica"] })).toEqual({ categories: [], severities: [], targets: ["T4-replica", "T5"] });
         expect(facetArgs({ categories: ["locking"] })).toBe('categories takes blocking, deadlocks, cpu, waits, errors, connections, replica_lag, throttling, io; ["locking"] isn\'t one of them.');
         expect(facetArgs({ severities: ["critical"] })).toBe('severities takes high, medium, low; ["critical"] isn\'t one of them.');
+        expect(facetArgs({ targets: ["T9"] })).toBe('targets takes T1, T2, T3, T4, T4-replica, T5; ["T9"] isn\'t one of them.');
     });
 });

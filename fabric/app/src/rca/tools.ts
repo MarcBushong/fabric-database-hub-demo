@@ -44,8 +44,9 @@ const COMMON =
     " It reads the demo's saved history (what the capture recorded, and the telemetry from Database Hub and Azure Monitor), never the live estate, as the signed-in viewer. " +
     "It returns JSON: window (UTC and the viewer's local time), episodes (what the detector found, each with its support and source), findings with evidence rows (table, target, time), " +
     "rootCause with its confidence, recommendations (each with its Microsoft Learn page), nextSteps, and notCaptured. Quote its facts and times; don't add causes it doesn't give.";
-/** The Root cause page's facets, as find_incidents and triage_window take them beside targets (facets.ts). */
+/** The Root cause page's facets, as find_incidents and triage_window take them (facets.ts): targets among them, which narrow the list, never the read. */
 const FACET_PROPS = {
+    targets: { ...TARGETS, description: "Only incidents on these targets. The window is read on every target all the same, so nothingAbnormal and quiet stay the whole window's. All of them when omitted." },
     categories: {
         type: "array",
         items: { type: "string", enum: RCA_CATEGORY_IDS },
@@ -60,7 +61,7 @@ const FACET_PROPS = {
 };
 const FACETS_NOTE =
     " Each episode has its category, its severity (high, medium, or low), and severityReason, the measurements behind it; details.servers names the servers the telemetry reported. " +
-    "With categories or severities, details.filters says which, and details.leftOut how many episodes they left out, by category: nothingAbnormal and quiet stay about every incident in the window.";
+    "With targets, categories, or severities, details.filters says which, and details.leftOut what they left out, on every target: episodes, hypotheses, and lines of notCaptured about other targets, by category and target. The window is read on every target, so nothingAbnormal and quiet stay about every incident in it.";
 
 export const INVESTIGATION_TOOL_SPECS: ToolSpec[] = [
     {
@@ -300,12 +301,81 @@ function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarge
     };
 }
 
-function bounded(result: InvestigationResult): string {
-    let text = JSON.stringify(result);
-    if (text.length <= RESULT_CHARS) return text;
-    const trimmed = { ...result, details: { note: "Details cut to fit; ask a narrower question." }, findings: result.findings.slice(0, 8).map((f) => ({ ...f, evidence: f.evidence.slice(0, 3) })) };
-    text = JSON.stringify(trimmed);
-    return text.length <= RESULT_CHARS ? text : `${text.slice(0, RESULT_CHARS)} [cut]`;
+/** What a result's details keep however it's cut: the verdicts, where a read stopped, the servers, and the filters with what they left out. */
+const KEPT_DETAILS = ["nothingAbnormal", "nothingAbnormalUpTo", "quiet", "quietUpTo", "readStoppedAt", "servers", "filters", "leftOut"] as const;
+
+const SEVERITY_ORDER: Readonly<Record<string, number>> = { high: 0, medium: 1, low: 2 };
+
+/** A list without each item's severityReason: its episode's, which explain_incident gives with its key. */
+function withoutReasons(list: unknown): unknown {
+    if (!Array.isArray(list)) return list;
+    return list.map((item: unknown) => {
+        if (!item || typeof item !== "object" || !("severityReason" in item)) return item;
+        const rest: Record<string, unknown> = { ...(item as Record<string, unknown>) };
+        delete rest.severityReason;
+        return rest;
+    });
+}
+
+/**
+ * A result as the text Copilot reads: within `limit` characters, and always JSON that parses (the review of 90e9d914: a
+ * 24-hour list ended " [cut]", invalid, with notCaptured and nextSteps gone, yet answered ok). Past the limit it leaves out,
+ * in turn: each episode's severityReason; the details but the verdicts, the servers, and the filters with what they left
+ * out (KEPT_DETAILS) and triage's hypotheses; then the least severe episodes, and the last findings and hypotheses, saying
+ * how many more there were. notCaptured, nextSteps, and the root cause are always kept.
+ */
+export function bounded(result: InvestigationResult, limit = RESULT_CHARS): string {
+    const fit = (r: unknown) => {
+        const text = JSON.stringify(r);
+        return text.length <= limit ? text : null;
+    };
+    const whole = fit(result);
+    if (whole) return whole;
+    const details = (result.details ?? {}) as Record<string, unknown>;
+    const reasons = "Each episode's severityReason is left out to fit: explain_incident with its key gives it.";
+    const lean: InvestigationResult = {
+        ...result,
+        episodes: withoutReasons(result.episodes) as InvestigationResult["episodes"],
+        details: { ...details, ...("hypotheses" in details ? { hypotheses: withoutReasons(details.hypotheses) } : {}), ...("episodes" in details ? { episodes: withoutReasons(details.episodes) } : {}), cut: reasons },
+    };
+    const leanText = fit(lean);
+    if (leanText) return leanText;
+    const kept: Record<string, unknown> = Object.fromEntries(KEPT_DETAILS.filter((k) => k in details).map((k) => [k, details[k]]));
+    const hypotheses = Array.isArray(lean.details?.hypotheses) ? (lean.details.hypotheses as unknown[]) : null;
+    const findings = result.findings.map((f) => ({ ...f, evidence: f.evidence.slice(0, 3) }));
+    // The most severe episodes first, in their order otherwise.
+    const episodes = lean.episodes.map((e, i) => ({ e, i })).sort((a, b) => (SEVERITY_ORDER[a.e.severity] ?? 3) - (SEVERITY_ORDER[b.e.severity] ?? 3) || a.i - b.i);
+    const shaped = (n: number): InvestigationResult => {
+        const keep = episodes.slice(0, n).sort((a, b) => a.i - b.i).map((x) => x.e);
+        const more = { episodes: lean.episodes.length - keep.length, findings: Math.max(0, findings.length - n), hypotheses: hypotheses ? Math.max(0, hypotheses.length - n) : 0 };
+        const left = Object.entries(more).filter(([, count]) => count > 0);
+        const note = left.length
+            ? `Cut to fit: ${left.map(([what, count]) => `${count} more ${what}`).join(", ")}, the least severe and the last, are left out. Ask about a narrower window, or filter find_incidents and triage_window by targets, categories, or severities.`
+            : "Details cut to fit; ask a narrower question.";
+        return {
+            ...lean,
+            episodes: keep,
+            findings: findings.slice(0, n),
+            details: { ...kept, ...(hypotheses ? { hypotheses: hypotheses.slice(0, n) } : {}), cut: `${reasons} ${note}`, ...(left.length ? { more: Object.fromEntries(left) } : {}) },
+        };
+    };
+    // The most of each list that fits, at most each list's length.
+    let lo = 0;
+    let hi = Math.max(lean.episodes.length, findings.length, hypotheses?.length ?? 0);
+    while (lo < hi) {
+        const mid = Math.ceil((lo + hi) / 2);
+        if (fit(shaped(mid))) lo = mid;
+        else hi = mid - 1;
+    }
+    const best = fit(shaped(lo));
+    if (best) return best;
+    // Not even without every list (never seen): as many of what wasn't captured's lines as fit, still as JSON.
+    const bare = shaped(0);
+    for (let n = bare.notCaptured.length - 1; n >= 0; n--) {
+        const text = fit({ ...bare, notCaptured: [...bare.notCaptured.slice(0, n), `${bare.notCaptured.length - n} more lines of what wasn't captured are left out to fit.`] });
+        if (text) return text;
+    }
+    return JSON.stringify({ tool: result.tool, version: result.version, window: result.window, targets: result.targets, episodes: [], findings: [], rootCause: null, recommendations: [], nextSteps: [], notCaptured: ["The result is too large to return: ask about a narrower window."] });
 }
 
 const RANK: Record<Confidence, number> = { high: 3, medium: 2, low: 1 };
@@ -539,10 +609,13 @@ export function createInvestigationTools(deps: InvestigationDeps) {
     async function triage(args: Record<string, unknown>, tool = "triage_window"): Promise<InvestigationResult | string> {
         const w = windowOf(args, deps);
         if (typeof w === "string") return w;
-        // The Root cause page's facets (facets.ts): what they leave out is counted, and the window's own verdicts stay whole.
+        // The Root cause page's facets (facets.ts), targets among them: the window is read on every target, as the page reads
+        // it, so the verdicts (nothingAbnormal, quiet) are the whole window's, and what the facets leave out is counted on
+        // every target (the review of 90e9d914: targets narrowed the read, so a triage of the replica's high incidents said
+        // nothing abnormal, and none left out, beside 10 incidents on other targets).
         const facets = facetArgs(args);
         if (typeof facets === "string") return facets;
-        const targets = targetsOf(args);
+        const targets = [...RCA_TARGETS];
         const g = await gather(w.from, w.to, targets);
         const stop = readStoppedAt(g.evidence);
         const t = triageWindow(g, w.from, w.to, targets, stop ?? undefined);
@@ -553,20 +626,33 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const episodes = facets ? base.episodes.filter((e) => matches(e, facets)) : base.episodes;
         const leftOut = base.episodes.filter((e) => !episodes.includes(e));
         const byCategory: Partial<Record<RcaCategory, number>> = {};
-        for (const e of leftOut) byCategory[e.category] = (byCategory[e.category] ?? 0) + 1;
+        const byTarget: Partial<Record<RcaTarget, number>> = {};
+        for (const e of leftOut) {
+            byCategory[e.category] = (byCategory[e.category] ?? 0) + 1;
+            byTarget[e.target] = (byTarget[e.target] ?? 0) + 1;
+        }
+        // The servers of the targets asked about; every target's without them (the page names each facet value).
+        const servers = Object.fromEntries(Object.entries(g.servers ?? {}).filter(([target]) => !facets?.targets.length || facets.targets.includes(target)));
+        // What wasn't captured on the targets asked about, and what's about no one target (a read cut short); the rest is counted.
+        const asked = facets?.targets.length ? facets.targets : null;
+        const otherTarget = (line: string) => !!asked && RCA_TARGETS.some((target) => !asked.includes(target) && line.startsWith(`${target}: `));
+        const notCaptured = base.notCaptured.filter((line) => !otherTarget(line));
         return {
             ...base,
             episodes,
+            notCaptured,
             findings: hypotheses.map((h) => ({ ruleId: `TRIAGE-${h.family.toUpperCase()}`, target: h.target, severity: FINDING_SEVERITY[h.severity], title: h.summary, detail: `Next: ${h.nextTool}${h.episodeKey ? ` (episodeKey ${h.episodeKey})` : ""}.`, evidence: [] })),
             rootCause: null,
             nextSteps: hypotheses.slice(0, 3).map((h) => `${h.nextTool} for ${h.target}${h.episodeKey ? ` (episode ${h.episodeKey})` : ""}`),
             details: {
-                hypotheses,
+                // An episode's severityReason is in the episode list once: a hypothesis with its key doesn't repeat it (the
+                // review of 90e9d914: each reason twice pushed results past what one answer holds).
+                hypotheses: hypotheses.map(({ severityReason, ...h }) => (h.episodeKey ? h : { ...h, severityReason })),
                 quiet: t.quiet,
                 nothingAbnormal: t.hypotheses.length === 0 && !stop,
                 ...upTo,
-                ...(Object.keys(g.servers ?? {}).length ? { servers: g.servers } : {}),
-                ...(facets ? { filters: facets, leftOut: { episodes: leftOut.length, byCategory } } : {}),
+                ...(Object.keys(servers).length ? { servers } : {}),
+                ...(facets ? { filters: facets, leftOut: { episodes: leftOut.length, hypotheses: t.hypotheses.length - hypotheses.length, notCaptured: base.notCaptured.length - notCaptured.length, byCategory, byTarget } } : {}),
             },
         };
     }

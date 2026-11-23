@@ -2,7 +2,7 @@
 // Inside the Fabric portal the app runs in a frame without its own address bar, so the state lives in the app (and in
 // the frame's hash for reloads), and the last view is remembered per browser.
 
-import { DEFAULT_RCA_FILTERS, RCA_CATEGORY_IDS, RCA_FACET_TARGETS, RCA_GROUPS, RCA_NEWEST_MINUTES, RCA_SEVERITY_IDS, RCA_SORTS, type RcaFilters, type RcaNewest, type RcaWindow } from "../rca/facet-ids";
+import { DEFAULT_RCA_FILTERS, isReadableWindow, RCA_CATEGORY_IDS, RCA_FACET_TARGETS, RCA_GROUPS, RCA_NEWEST_MINUTES, RCA_SEVERITY_IDS, RCA_SORTS, type RcaFilters, type RcaNewest, type RcaWindow } from "../rca/facet-ids";
 import type { DateWindow } from "./dax";
 
 export type PageId = "mission" | "overview" | "estate" | "performance" | "incidents" | "rca" | "scoreboard" | "replay" | "findings" | "readiness" | "trends" | "manage" | "links" | "kiosk";
@@ -129,7 +129,8 @@ function parseWindow(text: string | null): RcaWindow | undefined {
     const [a, b, rest] = text.split(".");
     const from = a ? fromStamp(a) : null;
     const to = b ? fromStamp(b) : null;
-    return rest === undefined && from && to && to > from ? { from, to } : undefined;
+    // At most the page's MAX_WINDOW_HOURS: a longer one isn't the page's to read (the review of 90e9d914).
+    return rest === undefined && from && to && isReadableWindow(from, to) ? { from, to } : undefined;
 }
 
 /** Reads the Root cause page's filters from its address's query (cat, sev, tg, win, group, sort), or null without any. */
@@ -216,6 +217,15 @@ export function toHash(state: ViewState): string {
 
 export function mergeView(...parts: Array<Partial<ViewState>>): ViewState {
     return Object.assign({}, DEFAULT_VIEW, ...parts) as ViewState;
+}
+
+/**
+ * The view the app opens with: the browser's saved view under the address's. The Root cause page's filters come from its
+ * address alone, so a link without them opens with the page's defaults, as whoever shared it saw, never the recipient's
+ * last filters, which could hide the incident it shares (the review of 90e9d914).
+ */
+export function openView(saved: Partial<ViewState>, fromHash: Partial<ViewState>): ViewState {
+    return mergeView(saved, fromHash, fromHash.page === "rca" ? { rcaFilters: fromHash.rcaFilters ?? null } : {});
 }
 
 const STORAGE_KEY = "dbhub-insights.view.v2";

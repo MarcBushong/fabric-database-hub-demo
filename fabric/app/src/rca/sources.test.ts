@@ -149,6 +149,8 @@ describe("the investigations' sources", () => {
                 ).map(([Metric, Value]) => ({ Bucket: new Date(start + m * 60_000).toISOString().slice(0, 19), TargetKey: "T5", ResourceName: "cosmos01", Metric, Value, Unit: "Count", WindowStart: "2026-11-20T00:00:00", WindowEnd: "2026-11-24T04:00:00", CapturedAt: "2026-11-24T04:05:00" })),
             ).flat();
         const pager = (all: ReturnType<typeof rows>) => async (spec: QuerySpec) => {
+            // A history with T5's Azure Monitor metrics only: Database Hub's bins of T1 to T3 have nothing.
+            if (!spec.dax.includes("'Telemetry Snapshots'[Analysis Key]")) return [];
             const m = /\[Bucket UTC\] >= DATE \( (\d+), (\d+), (\d+) \) \+ TIME \( (\d+), (\d+), (\d+) \)/.exec(spec.dax);
             const from = m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : 0;
             return all.filter((r) => Date.parse(`${r.Bucket}Z`) >= from).slice(0, spec.rowLimit);
@@ -157,7 +159,8 @@ describe("the investigations' sources", () => {
         const window = { from: "2026-11-20T00:00:00Z", to: "2026-11-24T04:00:00Z", targets: ["T5"] };
         const late = tools(5400);
         const listed = (await late.investigate("find_incidents", window)) as InvestigationResult;
-        expect(listed.details).toMatchObject({ nothingAbnormal: false, nothingAbnormalUpTo: "2026-11-23T11:16:00Z", quiet: ["T5"], quietUpTo: "2026-11-23T11:16:00Z" });
+        // Quiet is the whole window's (the review of 90e9d914): every target, read on all of them, T5 asked about.
+        expect(listed.details).toMatchObject({ nothingAbnormal: false, nothingAbnormalUpTo: "2026-11-23T11:16:00Z", quiet: ["T1", "T2", "T3", "T4", "T4-replica", "T5"], quietUpTo: "2026-11-23T11:16:00Z" });
         const errors = (await late.investigate("explain_errors", window)) as InvestigationResult;
         expect(errors.notCaptured).toContain("No errors, cancels, failed connections, or 429s were recorded up to 11:16:00 UTC, where the read stopped; what came after it wasn't read.");
         expect(errors.notCaptured.join(" ")).not.toMatch(/recorded in the window/);
@@ -175,7 +178,8 @@ describe("the investigations' sources", () => {
         expect(storm.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(at least 48000, 09:40:00 through 11:16:00 UTC, where the read stopped, mostly the container's clients\)/);
         // And the view says nothing abnormal only up to there (the review of eb89acbb: "Nothing abnormal in these minutes").
         expect(emptyListNote(listed, "America/New_York")).toBe("Nothing abnormal up to 06:16 EST (11:16 UTC), where the read stopped: the detector found no episode there, and what came after it wasn't read.");
-    });
+        // Its 24,000 rows a read, five reads: 7 to 14 s alone on a loaded PC, past the 15 s default (the review of 90e9d914's run).
+    }, 60_000);
 
     // The review of eb89acbb: T1 to T3's bins and their waits by category, at most 5,000 rows a query and oldest first, lost
     // their newest minutes with no note. The reviewer's probe: T1 with 10 wait categories a minute over 1,000 minutes, and
@@ -192,7 +196,8 @@ describe("the investigations' sources", () => {
             vi.fn(async (spec: QuerySpec) => {
                 const m = /\[Bucket UTC\] >= DATE \( (\d+), (\d+), (\d+) \) \+ TIME \( (\d+), (\d+), (\d+) \)/.exec(spec.dax);
                 const from = m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : 0;
-                const rows: Array<Record<string, unknown>> = spec.id.startsWith("spotlight-") ? all.waits : spec.id.startsWith("replay-") ? all.series : [];
+                // A history with T1's bins and waits only.
+                const rows: Array<Record<string, unknown>> = spec.id === "spotlight-T1" ? all.waits : spec.id === "replay-T1" ? all.series : [];
                 return rows.filter((r) => Date.parse(`${String(r["Bucket UTC"])}Z`) >= from).slice(0, spec.rowLimit);
             });
         const tools = (run: RunQuery) => createInvestigationTools({ load: async () => emptyEvidence(), telemetry: createRcaSources(run).telemetry, timeZone: "UTC", latestDay: new Date(start), latest: new Date(start + 3000 * 60_000) });
@@ -203,11 +208,11 @@ describe("the investigations' sources", () => {
         expect(listed.details?.readStoppedAt).toBeUndefined();
         expect(listed.notCaptured.join(" ")).not.toMatch(/wasn't read/);
         // The waits read three pages, each from the last minute the one before had, whole: 10,000 rows, none twice.
-        expect(whole.mock.calls.filter(([spec]) => spec.id.startsWith("spotlight-"))).toHaveLength(3);
+        expect(whole.mock.calls.filter(([spec]) => spec.id === "spotlight-T1")).toHaveLength(3);
         // Longer than its pages hold: what they didn't read is said, and nothing is called quiet past where they stopped.
         const long = (await tools(pager(history(3000, 2700))).investigate("find_incidents", { from: "2026-11-20T00:00:00Z", to: "2026-11-22T02:00:00Z", targets: ["T1"] })) as InvestigationResult;
         expect((long.episodes ?? []).map((e) => e.key)).not.toContain("T1-tran_log-20261121T210000Z");
-        expect(long.details).toMatchObject({ nothingAbnormal: false, nothingAbnormalUpTo: "2026-11-21T09:16:00Z", quiet: ["T1"], quietUpTo: "2026-11-21T09:16:00Z" });
+        expect(long.details).toMatchObject({ nothingAbnormal: false, nothingAbnormalUpTo: "2026-11-21T09:16:00Z", quiet: ["T1", "T2", "T3", "T4", "T4-replica", "T5"], quietUpTo: "2026-11-21T09:16:00Z" });
         expect(long.notCaptured).toContain(`Telemetry Snapshots (T1's waits): the window holds more rows than its ${MONITOR_PAGES} reads of ${MONITOR_ROW_LIMIT} return, so what it holds from 09:16:00 UTC on wasn't read; ask about a narrower window`);
     });
 

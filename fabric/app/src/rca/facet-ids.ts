@@ -47,6 +47,16 @@ export type RcaNewest = (typeof RCA_NEWEST_MINUTES)[number];
 /** The minutes the page reads: the history's newest ones, or a window of their own (a link's, or the viewer's). */
 export type RcaWindow = { newest: RcaNewest } | { from: Date; to: Date };
 
+/** The longest window the Root cause page reads: wider ones are the chat's, a question at a time. */
+export const MAX_WINDOW_HOURS = 24;
+
+/**
+ * Whether the page reads a window of its own: its end after its start, and at most MAX_WINDOW_HOURS long. Its address,
+ * an older link's window key, and the Incidents page's and the scoreboard's links all pass through this (the review of
+ * 90e9d914: an address's 528 hours were read on all six targets at once).
+ */
+export const isReadableWindow = (from: Date, to: Date) => to.getTime() > from.getTime() && to.getTime() - from.getTime() <= MAX_WINDOW_HOURS * 3_600_000;
+
 /** The Root cause page's filters, as the app's address keeps them: an empty list is every value. */
 export interface RcaFilters {
     categories: RcaCategory[];

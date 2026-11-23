@@ -179,10 +179,10 @@ export function groupIncidents<T extends Faceted & { start: string }>(items: rea
 }
 
 /**
- * The categories and severities a tool's arguments ask for: null when they ask for neither, and a message when a value
- * isn't one of them, so the chat never takes an unfiltered list for a filtered one.
+ * The categories, severities, and targets a tool's arguments ask for, as facets: null when they ask for none, and a
+ * message when a value isn't one of them, so the chat never takes an unfiltered list for a filtered one.
  */
-export function facetArgs(args: Record<string, unknown>): { categories: RcaCategory[]; severities: RcaSeverity[] } | string | null {
+export function facetArgs(args: Record<string, unknown>): { categories: RcaCategory[]; severities: RcaSeverity[]; targets: string[] } | string | null {
     const read = <K extends string>(name: string, allowed: readonly K[]): K[] | string => {
         const value = args[name];
         if (value === undefined || value === null) return [];
@@ -195,5 +195,7 @@ export function facetArgs(args: Record<string, unknown>): { categories: RcaCateg
     if (typeof categories === "string") return categories;
     const severities = read("severities", RCA_SEVERITY_IDS);
     if (typeof severities === "string") return severities;
-    return categories.length || severities.length ? { categories, severities } : null;
+    const targets = read("targets", RCA_FACET_TARGETS);
+    if (typeof targets === "string") return targets;
+    return categories.length || severities.length || targets.length ? { categories, severities, targets } : null;
 }
