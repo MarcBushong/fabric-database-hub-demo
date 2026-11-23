@@ -1,4 +1,4 @@
-# F35's kept values (fabric/history/kept_value.py), the same text in NB_DatabaseHub_LiveActivity: overlapping saves, resolved when history is saved.
+# Helpers, part 4: F35's kept values (fabric/history/kept_value.py, word for word). Run it after part 3. Lakehouse data only.
 """F35, design (i): the kept value of each row of the history's telemetry snapshots, worked out when history is saved.
 
 The history keeps every save, each at its own interval (1 to 1,440 minutes), so one minute can be in several saves. Each
@@ -506,7 +506,11 @@ KEPT_ATTEMPTS = 5
 # The days a chunk works out at once, and about how many rows a batch reads (a demo's day of history is about 31,000).
 KEPT_CHUNK_DAYS = 7
 KEPT_BATCH_ROWS = 400_000
-# Delta's exceptions when a concurrent commit conflicts with this one (https://docs.delta.io/latest/concurrency-control.html).
+# Delta's exceptions when a concurrent commit conflicts with this one (conflict exceptions:
+# https://learn.microsoft.com/azure/databricks/optimizations/isolation/row-level-concurrency#conflict-exceptions). Under
+# Delta's default WriteSerializable isolation, another run's blind append doesn't conflict with the MERGE: its rows are new
+# and not worked out, so its own run or the next step works them and their neighbors out, and the MERGE's guard keeps a
+# later step's values.
 _CONCURRENT_WRITES = ("ConcurrentAppendException", "ConcurrentDeleteReadException", "ConcurrentDeleteDeleteException",
                       "ConcurrentTransactionException", "MetadataChangedException")
 _DAY_US = 86_400_000_000
