@@ -378,11 +378,12 @@ For the owner's decision: neither is in Phase 2's scope above until it's decided
 
 A first design put Query Store's tables into a version 2 of the evidence document. An independent review answered RETHINK, and the coordinator decided (decisions 1 to 7 of 2026-11-23):
 
-1. **The capture never reads the answer key.** It leaves out exactly two things, by fixed rules in the demo's own code, and nothing by schema:
+1. **The capture never reads the answer key.** It leaves out exactly three things, by fixed rules in the demo's own code, and nothing by schema:
    - **its own statements:**
      - on SQL Server, a marker in each catalog statement's text;
-     - on T4, its connections' `search_path`, which Query Store records per row, and the catalog's own statement texts, today's and edd01c86's. Query Store keeps the first text it saw per query, and the first update's look-back reaches the windows where the earlier runner's statements ran without a marker;
-   - **the harness's bookkeeping and control modules:** marked where `110-demo-control.sql` defines them, with an extended property on SQL Server and a comment on PostgreSQL. On T4, which records statements nested in functions without their function, it also leaves out a statement that touches only tables that nothing but the harness writes.
+     - on T4, its connections' `search_path`, which Query Store records per row, and, for its own role only, its own specific statements: the catalog's blocks, today's and edd01c86's, and its snapshot clear. Query Store keeps the first text it saw per query, and the first update's look-back reaches the windows where the earlier runner's statements ran without a marker;
+   - **the harness's bookkeeping and control modules:** marked where `110-demo-control.sql` defines them, with an extended property on SQL Server and a comment on PostgreSQL. On T4, which records statements nested in functions without their function, it also leaves out a statement that touches only tables that nothing but the harness writes;
+   - **the runner's own statements outside any module,** on T1 to T3: the ad hoc statements of its harness code, such as the stop check it polls during every run, which no module's mark reaches. They're matched by their normalized text against a list in the runner's code, kept complete by a test (added after review-h).
 
    Everything else is measured evidence: the scenario modules' writes to `demo`'s scratch tables, other applications' statements, and monitoring. Editing `blind-detection.json` changes no captured byte.
 2. **The evidence document stays version 1, byte for byte.** Query Store's evidence and T4's connection holders travel in a **sidecar**, kind `ContosoCare.RcaSidecar`, version 1, which pieces that predate it never meet: its own command (`rca sidecar-export`, a paginated index), part marker (`DBHUBDEMO-RCAS`), Run Command actions, and notebook parameter (`RCA_SIDECAR_FILE`). Index versions are separate from document versions.
