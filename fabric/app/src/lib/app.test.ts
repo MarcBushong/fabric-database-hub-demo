@@ -210,6 +210,30 @@ describe("view state", () => {
         expect(parseHash("#/estate/T9")).toEqual({ page: "estate" });
         expect(parseHash("#/incidents/%E0%A4%A")).toEqual({ page: "incidents" });
     });
+
+    // The owner's feedback on the Root cause page (2026-11-23): its filters stay in the address, so a view can be shared.
+    it("keeps the Root cause page's filters in the address, only those that aren't its defaults, and drops unknown values", () => {
+        const window = { from: new Date("2026-11-17T14:00:00Z"), to: new Date("2026-11-17T15:30:00Z") };
+        const sliced = mergeView({ page: "rca", incident: "T1-blocking-20261117T140230Z", rcaFilters: { categories: ["blocking", "deadlocks"], severities: ["high"], targets: ["T1", "T4-replica"], window, group: "target", sort: "time" } });
+        expect(toHash(sliced)).toBe("#/rca/T1-blocking-20261117T140230Z?cat=blocking%2Cdeadlocks&sev=high&tg=T1%2CT4-replica&win=20261117T140000Z.20261117T153000Z&group=target&sort=time");
+        expect(mergeView(parseHash(toHash(sliced)))).toEqual(sliced);
+        const newest = mergeView({ page: "rca", rcaFilters: { categories: [], severities: [], targets: [], window: { newest: 360 }, group: "category", sort: "severity" } });
+        expect(toHash(newest)).toBe("#/rca?win=6h");
+        expect(mergeView(parseHash(toHash(newest)))).toEqual(newest);
+        // The defaults write nothing, and only the Root cause page reads them.
+        expect(toHash(mergeView({ page: "rca", rcaFilters: { categories: [], severities: [], targets: [], window: { newest: 90 }, group: "category", sort: "severity" } }))).toBe("#/rca");
+        expect(parseHash("#/estate?cat=blocking&sev=high").rcaFilters).toBeUndefined();
+        // Unknown values go, and a window that's backward or not a time is ignored.
+        expect(parseHash("#/rca?cat=blocking,locking&sev=critical&tg=T9,T5&win=20261117T153000Z.20261117T140000Z&group=server&sort=size").rcaFilters).toEqual({
+            categories: ["blocking"],
+            severities: [],
+            targets: ["T5"],
+            window: { newest: 90 },
+            group: "category",
+            sort: "severity",
+        });
+        expect(parseHash("#/rca?win=1y").rcaFilters).toBeUndefined();
+    });
 });
 
 describe("Ask Copilot's context", () => {

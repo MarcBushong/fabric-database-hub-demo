@@ -3,6 +3,8 @@
 // carries what the demo planned or ran; a workload session is known only by its program and an opaque run token.
 // Every time is UTC. Text fields hold normalized text only, and only for the workload's own sessions.
 
+import type { RcaCategory, RcaSeverity } from "./facet-ids";
+
 export type RcaTarget = "T1" | "T2" | "T3" | "T4" | "T4-replica" | "T5";
 
 export const RCA_TARGETS: readonly RcaTarget[] = ["T1", "T2", "T3", "T4", "T4-replica", "T5"];
@@ -302,6 +304,12 @@ export interface Episode {
     readStopped?: boolean;
     /** A single sample that opened it by being far over its level (twice the level, and the rule's points over its baseline), where its rule asks for more than one. */
     severe?: boolean;
+    /**
+     * The time it spent at or over its far mark (facets.ts, farMark: four times its level, or 90 % of a capacity), in
+     * milliseconds: each sample there counts until the next sample read, at most two steps. Its severity reads this as how
+     * long it stayed far over its level.
+     */
+    farMs?: number;
     /** Where it was seen: the RCA capture, Database Hub's telemetry, or Azure Monitor. */
     source: string;
     confidence: Confidence;
@@ -313,8 +321,8 @@ export interface InvestigationResult {
     version: 1;
     window: { fromUtc: string; toUtc: string; local?: string; asked?: string };
     targets: RcaTarget[];
-    /** The blind detector's episodes in the window. */
-    episodes: Array<Pick<Episode, "key" | "target" | "family" | "signal" | "support" | "source"> & { start: string; end: string | null; peak: string }>;
+    /** The blind detector's episodes in the window, each with its facets (facets.ts): its category, and its severity with why. */
+    episodes: Array<Pick<Episode, "key" | "target" | "family" | "signal" | "support" | "source"> & { start: string; end: string | null; peak: string; category: RcaCategory; severity: RcaSeverity; severityReason: string }>;
     findings: Finding[];
     rootCause: { statement: string; confidence: Confidence; ruleIds: string[]; evidence: EvidenceRef[] } | null;
     recommendations: Recommendation[];

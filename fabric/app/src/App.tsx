@@ -165,7 +165,7 @@ export default function App({ runtime, provenance = "history", manage: fixedMana
     const setView = useCallback((patch: Partial<ViewState>) => setViewState((v) => ({ ...v, ...patch })), []);
     const navigate = useCallback(
         (page: PageId, patch: Partial<ViewState> = {}) => {
-            setViewState((v) => ({ ...v, page, target: null, incident: null, replay: null, category: null, ...patch }));
+            setViewState((v) => ({ ...v, page, target: null, incident: null, replay: null, category: null, rcaFilters: null, ...patch }));
             document.getElementById("main")?.scrollTo?.({ top: 0 });
         },
         [],

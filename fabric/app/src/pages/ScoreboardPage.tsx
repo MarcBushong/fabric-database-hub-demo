@@ -28,7 +28,7 @@ import { Stage } from "@/mission/Stage";
 import { useMission } from "@/mission/use-mission";
 import { triageAsk } from "@/rca/entry";
 import { isRcaTarget } from "@/rca/types";
-import { windowKey } from "@/rca/view/selection";
+import { DEFAULT_RCA_FILTERS } from "@/rca/facet-ids";
 
 import "@/mission/mission.css";
 
@@ -186,8 +186,8 @@ export default function ScoreboardPage() {
                                 <strong>{`${picked.target} ${picked.fault}`}</strong>
                                 <span>{picked.score.impact?.sentence ?? picked.score.note}</span>
                                 {rca === true && pickedRca ? (
-                                    // One way only: the Root cause view gets the target and the minutes, and investigates them blind (ADR 0031).
-                                    <Button size="small" appearance="subtle" icon={<TextBulletListTree16Regular />} onClick={() => navigate("rca", { incident: windowKey(pickedRca.target, pickedRca.from, pickedRca.to) })}>
+                                    // One way only: the Root cause view gets the target and the minutes, never the fault or its family, and investigates them blind (ADR 0031).
+                                    <Button size="small" appearance="subtle" icon={<TextBulletListTree16Regular />} onClick={() => navigate("rca", { rcaFilters: { ...DEFAULT_RCA_FILTERS, targets: [pickedRca.target], window: { from: pickedRca.from, to: pickedRca.to } } })}>
                                         Root cause
                                     </Button>
                                 ) : null}

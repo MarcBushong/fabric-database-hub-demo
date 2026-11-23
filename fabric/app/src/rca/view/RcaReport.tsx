@@ -8,6 +8,7 @@ import type { ChainNodeView } from "../tools";
 import type { InvestigationResult, Recommendation } from "../types";
 import { ChainTree } from "./ChainTree";
 import { episodeOf, errorClassCells, errorsWindowNote, type ErrorClassRow } from "./facts";
+import { SeverityMark } from "./IncidentList";
 
 interface Tree {
     target: string;
@@ -118,13 +119,17 @@ export function RcaReport({ incident, errors, timeZone, logs }: RcaReportProps) 
             <section className="rca-panel" aria-labelledby="rca-cause-title">
                 <h2 id="rca-cause-title">Root cause</h2>
                 {episode ? (
-                    <p className="rca-muted" style={{ margin: "0 0 8px" }}>
-                        <span className="rca-chip accent">{episode.target}</span>
-                        <span className="rca-chip">{episode.signal}</span>
-                        <span className="rca-chip">{episode.support}</span>
-                        <span className="rca-chip">seen in {episode.source}</span>
-                        {incident.window.local}
-                    </p>
+                    <>
+                        <p className="rca-muted" style={{ margin: "0 0 8px" }}>
+                            {episode.severity ? <SeverityMark severity={episode.severity} reason={episode.severityReason} /> : null}
+                            <span className="rca-chip accent">{episode.target}</span>
+                            <span className="rca-chip">{episode.signal}</span>
+                            <span className="rca-chip">{episode.support}</span>
+                            <span className="rca-chip">seen in {episode.source}</span>
+                            {incident.window.local}
+                        </p>
+                        {episode.severityReason ? <p className="rca-muted rca-sev-reason">{`Severity ${episode.severityReason}`}</p> : null}
+                    </>
                 ) : null}
                 {cause ? (
                     <>
