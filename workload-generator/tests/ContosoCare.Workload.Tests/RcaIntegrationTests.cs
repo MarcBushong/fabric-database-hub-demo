@@ -254,6 +254,54 @@ public sealed class RcaIntegrationTests : IDisposable
         return Convert.ToInt32(await command.ExecuteScalarAsync(token), System.Globalization.CultureInfo.InvariantCulture) > 0;
     }
 
+    /// <summary>
+    /// RCA-XE-00 reads sys.dm_xe_object_columns alone (2026-11-23): its earlier join to sys.dm_xe_objects took about 8 s
+    /// of CPU at each observer start on SQL Server 2022 CU25. Against a disposable SQL Server (CONTOSOCARE_TEST_SQL_SERVER,
+    /// as SqlIntegrationTests), both forms return the same fields for the five events. CI doesn't set it.
+    /// </summary>
+    [Fact]
+    public async Task OnSqlServerTheEventsFieldsReadAloneAreTheJoinedFormsFields()
+    {
+        await SqlIntegrationTests.PrepareAsync();
+        var token = TestContext.Current.CancellationToken;
+        var alone = await ReadRowsAsync(SqlIntegrationTests.Endpoint, CaptureCatalog.Get("RCA-XE-00"), token);
+        var joined = await ReadRowsAsync(SqlIntegrationTests.Endpoint, JoinedEventFields, token);
+        Assert.Contains(alone, row => row.StartsWith("xml_deadlock_report|xml_report|", StringComparison.Ordinal));
+        Assert.Equal(joined.Order(StringComparer.Ordinal), alone.Order(StringComparer.Ordinal));
+    }
+
+    // RCA-XE-00 as it was until 2026-11-23, joined to sys.dm_xe_objects.
+    private const string JoinedEventFields = """
+        SET NOCOUNT ON;
+        SELECT
+            event_name  = o.name,
+            column_name = c.name,
+            c.type_name,
+            c.column_type
+        FROM sys.dm_xe_objects AS o
+        JOIN sys.dm_xe_object_columns AS c ON c.object_name = o.name AND c.object_package_guid = o.package_guid
+        WHERE o.object_type = N'event'
+          AND o.name IN (N'error_reported', N'attention', N'lock_escalation', N'xml_deadlock_report', N'database_xml_deadlock_report')
+          AND c.column_type = N'data'
+        ORDER BY o.name, c.name;
+        """;
+
+    private static async Task<List<string>> ReadRowsAsync(TargetEndpoint endpoint, string text, CancellationToken token)
+    {
+        await using var connection = await new SqlConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(SessionNames.ForControl("test"), token);
+        await using var command = connection.CreateCommand();
+        command.CommandText = text;
+        command.CommandTimeout = 120;
+        var rows = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync(token);
+        while (await reader.ReadAsync(token))
+        {
+            rows.Add(string.Join('|', Enumerable.Range(0, reader.FieldCount).Select(i => Convert.ToString(reader.GetValue(i), System.Globalization.CultureInfo.InvariantCulture))));
+        }
+
+        return rows;
+    }
+
     private sealed class Gate(DemoTarget target = DemoTarget.T4) : IObservationGate
     {
         private volatile bool active = true;
