@@ -400,6 +400,10 @@ A first design put Query Store's tables into a version 2 of the evidence documen
 5. **Precision:** execution-weighted interval totals; a 2-hour first read and a 60-minute baseline; claims qualified at Query Store's 15-minute granularity; the latest read of an interval counts once, in the notebook and in the model's measures. On T4: `all`, the source keys kept, and the identity's `azure_sys` access and UTC proven live.
 6. **Ownership:** parallel builders by file. The runner's and the VM control script's wiring waits for the stop tail's changes; the app and its report wait for the Root cause page's facets.
 7. **The estimate, rebaselined:** about 23 builder-days. The scripts' path first (`stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s snapshot, `configure-fabric.ps1 -RunLiveActivity`); Run all's path in a later release. One release, with T1 to T3's evidence shipping alone, and T4's right after, if T4's part isn't proven by the cut-off.
+   - **Revised the same day:** Run all's path joins this release (rca/README.md, Run all's path for the sidecars), because demos run only through Run all.
+   - **How:** the runbooks fetch the sidecars at each export, within the evidence's bounds, and write them as their own bundles with an index of their own. The final metrics carry only a pointer. The control notebook stages them, and the next start acknowledges them.
+   - **Cost:** two builders, about 16 to 20 builder-hours, and about 6 to 10 more job minutes a session.
+   - **The cut line:** if it isn't reviewed by 2026-11-24 18:00, the scripts' path ships first, and Run all's path follows as its own release.
 
 **Older runners.** A rollback isn't a supported path: `deploy.ps1` moves an environment forward. An older runner deletes neither the store's `sidecars\`, where the runner seals a span's rows at each export, at the span's end, and at its start, nor T4's watermark. Two losses are accepted limits (the coordinator's decision for the owner, who can reverse it):
 
