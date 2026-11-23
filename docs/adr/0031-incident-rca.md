@@ -370,7 +370,52 @@ Phase 2 (waits by class, `explain_waits`, the view's waits and plans) and Phase 
 For the owner's decision: neither is in Phase 2's scope above until it's decided. Each is a capture change, with a runner update, a deploy, and its own live proof.
 
 - **Each cancel count's span** (the review of b29d733d): the capture stamps each `conflicts_cancelled` count with the time of the reading it's measured from, so the app can tell when a count reaches back before a stall, across a read of the counter that failed, and say so rather than count it as the stall's ([the replica's cause](#6-investigations-rules-and-recommendations)). The span is a new column in the contract's `rca_replica`, which the runner writes, the notebook and the model carry, and the app reads.
-- **Who held T4's idle connections:** RCA-PG-10 counts them by state, and RCA-PG-01 samples only sessions that aren't idle, and only while a client waits on a lock, so a surge that idle connections held names no program that held them ([the implementation report](../implementation-report.md#the-incident-rca-phase-1-2026-11-20)).
+- **Who held T4's idle connections:** approved with decision 6 on 2026-11-23, and built in [the sidecar](#amendment-2026-11-23-query-stores-evidence-in-a-sidecar) as `rca_connections`. RCA-PG-10 counts connections by state, and RCA-PG-01 samples only sessions that aren't idle, and only while a client waits on a lock, so a surge that idle connections held named no program that held them ([the implementation report](../implementation-report.md#the-incident-rca-phase-1-2026-11-20)). The refused attempts (SQLSTATE 53300) need the server's log and a role, and follow later.
+
+### Amendment (2026-11-23): Query Store's evidence in a sidecar
+
+**Why.** The owner, investigating with the chat in the Insights app, was told that T1 had no Query Store, so it couldn't go further. T1 to T3 have had Query Store on since their deployment: the capture just never read it. And T3's plan regression got only a telemetry-only finding, at low confidence. The owner also asked for Query Store "wherever possible". Unit 1, a release of its own, turns on T4's Query Store and its wait sampling at every size but Burstable, checks T1 to T4 in `validate.ps1`, and stops the chat from saying a target lacks it. This amendment is unit 2: query-level evidence for the RCA.
+
+A first design put Query Store's tables into a version 2 of the evidence document. An independent review answered RETHINK, and the coordinator decided (decisions 1 to 7 of 2026-11-23):
+
+1. **The capture never reads the answer key.** It leaves out exactly two things, by fixed rules in the demo's own code, and nothing by schema:
+   - **its own statements:**
+     - on SQL Server, a marker in each catalog statement's text;
+     - on T4, its connections' `search_path`, which Query Store records per row, and the catalog's own statement texts, today's and edd01c86's. Query Store keeps the first text it saw per query, and the first update's look-back reaches the windows where the earlier runner's statements ran without a marker;
+   - **the harness's bookkeeping and control modules:** marked where `110-demo-control.sql` defines them, with an extended property on SQL Server and a comment on PostgreSQL. On T4, which records statements nested in functions without their function, it also leaves out a statement that touches only tables that nothing but the harness writes.
+
+   Everything else is measured evidence: the scenario modules' writes to `demo`'s scratch tables, other applications' statements, and monitoring. Editing `blind-detection.json` changes no captured byte.
+2. **The evidence document stays version 1, byte for byte.** Query Store's evidence and T4's connection holders travel in a **sidecar**, kind `ContosoCare.RcaSidecar`, version 1, which pieces that predate it never meet: its own command (`rca sidecar-export`, a paginated index), part marker (`DBHUBDEMO-RCAS`), Run Command actions, and notebook parameter (`RCA_SIDECAR_FILE`). Index versions are separate from document versions.
+3. **Acknowledgement by document ID, for sidecars.**
+   - **Exactly once:** the notebook replaces a document's rows table by table, its coverage rows last, and says `already` only when those are there.
+   - **What the scripts do:** they read what the notebook did with each document, never a payload's disappearance, and run `rca ack`: at once when the VMs run, or, after `stop-demo.ps1 -SaveHistory`, whose notebook runs once the VMs are deallocated, first thing at the next export with the VMs running.
+   - **What's kept:** the runner keeps a sidecar until it's acknowledged, or for 30 days, and a payload with a skipped document is never deleted.
+   - **The evidence document** keeps its live-proven transport; acknowledging it is a later change.
+4. **T4's last window:** PostgreSQL shows an interval only once it ends.
+   - **The backfill:** a persisted watermark brings the session's last 0 to 15 minutes into the original session's history at the next run with T4 up. Until then, the analysis says "pending publication", never "not captured". A sidecar's rows always go under their own session's run.
+   - **A stop in the window:** Learn doesn't say whether stopping a server keeps the window it still holds in memory, and the demo's stops stop T4 mid-window. A live check (L0) measures it. A window lost that way is worded so, from T4's restart time.
+5. **Precision:** execution-weighted interval totals; a 2-hour first read and a 60-minute baseline; claims qualified at Query Store's 15-minute granularity; the latest read of an interval counts once, in the notebook and in the model's measures. On T4: `all`, the source keys kept, and the identity's `azure_sys` access and UTC proven live.
+6. **Ownership:** parallel builders by file. The runner's and the VM control script's wiring waits for the stop tail's changes; the app and its report wait for the Root cause page's facets.
+7. **The estimate, rebaselined:** about 23 builder-days. The scripts' path first (`stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s snapshot, `configure-fabric.ps1 -RunLiveActivity`); Run all's path in a later release. One release, with T1 to T3's evidence shipping alone, and T4's right after, if T4's part isn't proven by the cut-off.
+
+**Older runners.** A rollback isn't a supported path: `deploy.ps1` moves an environment forward. An older runner deletes neither the store's `sidecars\`, where the runner seals a span's rows at each export, at the span's end, and at its start, nor T4's watermark. Two losses are accepted limits (the coordinator's decision for the owner, who can reverse it):
+
+- sidecars sealed more than 30 days before a newer runner comes back;
+- the rows of a session whose runner was replaced mid-session.
+
+[The deployment guide](../deployment.md#older-code-over-a-newer-demo-2026-11-23) gives the drain before older code is deployed.
+
+The contract is [rca/README.md](../../rca/README.md#the-sidecar), [history-tables.json](../../rca/history-tables.json), [sidecar.schema.json](../../rca/sidecar.schema.json), and the capture catalog's RCA-SQL-10, 11, 14, 15 and RCA-PG-13 to 17 ([capture/README.md](../../rca/capture/README.md)).
+
+**The upgrade matrix, for the sidecar:**
+
+| The older piece | Beside | What happens | It says so | The fix |
+|---|---|---|---|---|
+| The VM's runner, or its control script, without the sidecar's actions | Newer scripts | No sidecar; the evidence document as before | The scripts' `OldBundle` **Warning** | `./scripts/deploy.ps1` |
+| The scripts, or the control's runbook, without the sidecar | A newer runner | The evidence document as before; the sidecars wait on the VM, offered again for 30 days, until a newer save fetches them under their own sessions | None until a newer save | `./scripts/deploy.ps1`, then `./scripts/stop-demo.ps1 -SaveHistory` |
+| `NB_DatabaseHub_LiveActivity` without `RCA_SIDECAR_FILE`: an edited one, which decision 2a keeps | Newer scripts | They stage no sidecar; the sidecars stay pending | A **Warning** naming the notebook and its command | `./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity` |
+| The model or the app without the sidecar's tables | A newer lakehouse or model | The new tables are ignored; a newer app says the history has no Query Store evidence yet, never that a target lacks Query Store | The app's Root cause view | `./scripts/deploy.ps1` |
+| An older runner, installed by an older checkout (not supported) | Sealed sidecars from a newer one | It neither offers nor deletes them; a newer runner offers them again until 30 days after their sealing | None | Drain first: `./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity` |
 
 ### The upgrade matrix
 

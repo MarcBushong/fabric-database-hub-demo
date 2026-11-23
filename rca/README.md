@@ -73,10 +73,20 @@ Query Store records every statement a database runs, the capture's and the harne
 
 1. **The capture's own statements.**
    - **SQL Server and Azure SQL Database:** every catalog statement carries the marker `/* dbhubdemo:rca-observer */` inside its text, which Query Store keeps ("Comments and spaces inside text aren't ignored", [sys.query_store_query_text](https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-query-text-transact-sql)). RCA-SQL-10 and 14 leave out texts that carry it.
-   - **PostgreSQL:** Query Store keeps one text per `query_id`, the first it saw, and `query_id` ignores comments, so a marker in the text isn't enough: T4 recorded the observer's statements before they carried one. The observer's T4 connections set `search_path` to `"$user", public, dbhubdemo_rca_observer`, a schema that doesn't exist, so names resolve as before; `query_store.qs_view` records `search_path` per row, and RCA-PG-14 leaves out the rows that name it, and the texts that carry the marker.
+   - **PostgreSQL:** Query Store keeps one text per `query_id`, the first it saw, and `query_id` ignores comments, so a marker in the text isn't enough: T4 recorded the observer's statements before they carried one. So RCA-PG-14 has two rules:
+     - **the `search_path`:** the observer's T4 connections, and only those, carry `search_path` `"$user", public, dbhubdemo_rca_observer` in their startup packet (`Options=-c search_path=...`); the schema doesn't exist, so names resolve as before. `query_store.qs_view` records `search_path` per row, and RCA-PG-14 leaves out the rows that name it, and the texts that carry the marker;
+     - **the catalog's own texts:** it also leaves out a row whose text equals one of the observer's own statements (RCA-PG-14's `$7`, `PgObserverStatements`):
+       - the catalog's PostgreSQL blocks, today's and edd01c86's;
+       - the observer's snapshot clear, and its limits' `SET` statements;
+       - Npgsql 10.0.3's type loading.
+
+       Both sides are compared with comments stripped, white space collapsed, and a final semicolon dropped. A row whose text Query Store didn't keep stays as evidence. The rule covers the windows where an earlier runner's statements ran without the marker, which the first read after an update reaches. It also covers a `search_path` that Query Store kept from a query's first capture, which the live check L0c measures.
 2. **The harness's bookkeeping and control modules,** which the demo marks where it defines them, so a rename carries the mark:
    - **SQL Server:** the extended property `dbhubdemo.role` = `harness` on every module `database/common/110-demo-control.sql` creates. RCA-SQL-10 and 14 leave out every statement whose `object_id` carries it.
-   - **PostgreSQL:** `COMMENT ON FUNCTION ... IS 'dbhubdemo:harness'` on its control functions. Query Store records a statement nested in a function without its function (`pg_qs.query_capture_mode` `all`), so RCA-PG-16 reads, at the observer's start, the marked functions and the tables only marked functions write; RCA-PG-14 leaves out a call of a marked function, and a statement whose tables are all ones only the harness writes. A scenario function's own read of a run table is then left out too: it's bookkeeping.
+   - **PostgreSQL:** `COMMENT ON ROUTINE ... IS 'dbhubdemo:harness'` on its control routines. Query Store records a statement nested in a function without its function (`pg_qs.query_capture_mode` `all`). So, at the observer's start, RCA-PG-16 reads the marked routines and the tables they write.
+     - **A table is the workload's** when any unmarked routine mentions it at all.
+     - **When the rule turns off:** a routine with `EXECUTE` (dynamic SQL), or with no source, makes RCA-PG-16 report it as unsure (`dynamic_sql`, `no_source`). It then names no harness table, and the sidecar's coverage says why.
+     - **What RCA-PG-14 leaves out:** a call of a marked routine, and a statement whose tables are all harness tables.
 
 Everything else is measured evidence, normalized as RCA Sessions' text is: the scenario modules' reads and writes, other applications' statements, and monitoring queries (Database Hub's among them). Modules keep their database names ([Names](#names)).
 
@@ -149,7 +159,7 @@ What the observer captures beyond the evidence document, in documents of their o
 | Everything else | As the evidence document's (`sessionId`, `producer`, the window, `sequence`, `final`, `targets`, `epochUtc`, `strings`, `tables`), with no `answerKey`. Each target has an `rca_query_coverage` row |
 
 - **Its tables** ([history-tables.json](history-tables.json), document `sidecar`): `rca_query_stats`, `rca_query_waits`, `rca_query_plans`, `rca_query_events`, `rca_query_coverage`, and `rca_connections`, encoded as the evidence document's tables are. The evidence document never holds one, and a sidecar never holds an evidence table.
-- **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.jsonl`, beside its evidence files, which the evidence export never reads.
+- **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.rows` (`RcaContract.SidecarRowsFile`), beside its evidence files. Never `.jsonl`: every evidence export, an older runner's included, reads each `*.jsonl` in a span as a target's file, so sidecar rows there would end up in an evidence document.
 - **Sealed outside the spans:** the runner seals a span's rows into the store's `sidecars\` folder:
   - at every export that reads the span, the evidence document's included, whose output doesn't change;
   - at the span's end;
@@ -166,7 +176,7 @@ What the observer captures beyond the evidence document, in documents of their o
 
 - **What's read:** RCA-SQL-10, 11, 14, and 15 on T1 to T3, and RCA-AZ-03 and 04 for T3's automatic tuning; RCA-PG-13 to 16 on T4. T4's replica records nothing in Query Store ([Learn](https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store)), which its coverage says.
 - **When:**
-  - every 15 minutes, 2 minutes after a Query Store interval ends. The intervals are 15 minutes on every target: `database/*/030-configure.sql`, and T4's `pg_qs.interval_length_minutes` default;
+  - every 15 minutes, 2 minutes after a Query Store interval ends. The intervals are 15 minutes on every target: `database/*/030-configure.sql`, and T4's `pg_qs.interval_length_minutes` default. On T4, each read takes again the intervals that ended in the last 20 minutes, until they've settled, and writes a row again only when it changed;
   - at the observer's start, the 2 hours before it (8 intervals), so a rule has a baseline;
   - at its end, with SQL Server's open interval: Query Store unifies its in-memory and on-disk data when it's read;
   - RCA-SQL-15 every 60 s; RCA-PG-13 with each read.
@@ -314,10 +324,10 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 - A consumer accepts only the versions it knows and reports any other as a **Warning** whose fix is `./scripts/deploy.ps1`, which updates the runner, the runbook, the notebooks, the model, and the app in one run.
 - Older pieces degrade and say so: an older runner has no `rca` commands (`RCA.EXPORT` **Warning**); an older notebook ignores `RCA_EVIDENCE`; a session saved before the feature has no RCA rows, and the app says "no RCA capture recorded" for its windows.
 - **A sidecar is invisible to the pieces that predate it:** its own command, part marker, and notebook parameter. They never reject or lose one; they leave it pending on the VM, where the runner keeps it until a newer piece acknowledges it.
-- **An older runner installed over a newer one:**
-  - it neither deletes nor offers the sealed sidecars, and a newer runner offers them again, until 30 days after their sealing;
+- **An older runner installed over a newer one** isn't a supported path: `deploy.ps1` moves an environment forward ([updates from GitHub](../docs/deployment.md#updates-from-github-2026-11-09)). An older checkout that can't update itself can still install its runner. Then:
+  - the older runner neither deletes nor offers the sealed sidecars, and a newer runner offers them again until 30 days after their sealing;
   - T4's pending ranges wait in `query-watermark\` within T4's retention;
-  - only the rows of a session whose runner was replaced mid-session can go, with their span.
+  - **two losses are accepted limits** (the coordinator's decision for the owner, 2026-11-23): sidecars sealed more than 30 days before a newer runner returns, which it deletes unread; and the rows of a session whose runner was replaced mid-session, which go with their span.
 
   Before installing an older runner, a scripts' save with the VMs running takes every sealed sidecar into the history: `./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity`, again while its line says sidecars still wait.
 
@@ -335,11 +345,13 @@ The scripts' path first; Run all's path (the runbook's bundles and the control n
 
 | Unit | Builds | Owns | Tests against this contract |
 |---|---|---|---|
-| A1, SQL Server's reads | RCA-SQL-10, 11, 14, and 15 (and RCA-AZ-03 and 04's events) on T1 to T3: the cadence, the plan summary, the events, the sidecar rows | New files under `Rca/QueryStore/` (`Sql*.cs`, `PlanSummary.cs`), its wiring in `Rca/Observer/SqlTargetObserver.cs` and `SqlCapture.cs`, their tests | Its rows type-check against history-tables.json; the catalog's blocks run as they are; the leave-out rules ([above](#what-the-capture-leaves-out)) |
-| A2, PostgreSQL's reads and the holders | RCA-PG-13 to 17 on T4: the `azure_sys` connection and its `search_path`, the watermark and backfill, the holders | New files under `Rca/QueryStore/` (`Pg*.cs`, `QueryWatermark.cs`, `ConnectionHolders.cs`), its wiring in `Rca/Observer/PgTargetObserver.cs` and `PgCapture.cs`, their tests | As A1's |
+| A1, SQL Server's reads | RCA-SQL-10, 11, 14, and 15 (and RCA-AZ-03 and 04's events) on T1 to T3: the cadence, the plan summary, the events, the sidecar rows | Those blocks in `capture/sqlserver.sql`, their comments included; new files under `Rca/QueryStore/` (`Sql*.cs`, `PlanSummary.cs`); its wiring in `Rca/Observer/SqlTargetObserver.cs`, `SqlCapture.cs`, and the shared `TargetObserver.cs` seam that turns a failed Query Store read into a sidecar gap; their tests | Its rows type-check against history-tables.json; the catalog's blocks run as they are; the leave-out rules ([above](#what-the-capture-leaves-out)) |
+| A2, PostgreSQL's reads and the holders | RCA-PG-13 to 17 on T4: the `azure_sys` connection and its `search_path`, the watermark and backfill, the holders | Those blocks in `capture/postgresql.sql`; new files under `Rca/QueryStore/` (`Pg*.cs`, `QueryWatermark.cs`, `ConnectionHolders.cs`); its wiring in `Rca/Observer/PgTargetObserver.cs` and `PgCapture.cs`; their tests | As A1's |
 | H, the harness's marks | The extended property and the comments the leave-out reads | Its own block in `database/common/110-demo-control.sql` and the PostgreSQL control script, after the realistic names' changes there | Every control module carries the mark, and no other module does |
-| T1, the runner's sidecar transport | The sidecar export, `rca sidecar-export`, `rca part` for sidecars, `rca ack`, the store's keeping and retention | `Rca/Export/`, `Rca/Store/`, the `rca` commands, after the stop tail's changes land | Its sidecars validate against sidecar.schema.json and round trip through the part lines; the evidence documents stay byte for byte |
-| T2, the scripts' transport | `RcaSidecarExport` and `RcaAck` in the VM's control script; the scripts' fetch, staging of `RCA_SIDECAR_FILE`, reading of the acknowledgement, and `rca ack` | `vm/bootstrap/Invoke-DemoWorkloadControl.ps1`, `scripts/modules/DbHubDemo/Private/RcaExportHelpers.ps1`, after the stop tail's changes land | The sidecar fixtures' parts and the acknowledgement fixture; the mixed-version combinations |
+| T1a, the runner's sidecar store | The store in `sidecars\`, sealing, the reducer and its budgets, the page index and part lines, acknowledgement, retention; the evidence documents' pinned hashes | New files under `Rca/Sidecar/`, their tests | Its sidecars validate against sidecar.schema.json and round trip through the part lines; the evidence documents stay byte for byte |
+| T1b, the runner's wiring | `rca sidecar-export`, `rca part` for sidecars, `rca ack`; sealing at each export, a span's end, and the observer's start | `Cli/CommandLine.Rca.cs`, `Rca/Export/Exporter.cs`, `Rca/Store/EvidenceStore.cs`, after the stop tail's changes land | As T1a's |
+| T2a, the scripts' transport | The fetch, staging `RCA_SIDECAR_FILE`, reading the acknowledgement, `rca ack` at once or deferred, the PC's lists, and the golden capture's guard | `scripts/modules/DbHubDemo/Private/RcaExportHelpers.ps1`, the save paths, and the golden capture's files | The sidecar fixtures' parts and the acknowledgement fixture; the mixed-version combinations |
+| T2b, the VM's control script | `RcaSidecarExport` and `RcaAck`, and the sidecar's part lines through T2's relay | `vm/bootstrap/Invoke-DemoWorkloadControl.ps1`, after the stop tail's changes land | As T2a's |
 | B, the notebook and the model | The sidecar's decoder, its six tables, the latest read per interval, the acknowledgement file and the cleanup rule, `RCA.SIDECAR`; the model's six tables and measures | `NB_DatabaseHub_LiveActivity`'s RCA cells, the semantic model's RCA tables, `OneLakeHelpers.ps1`'s RCA functions | The notebook's tables and the model's TMDL match history-tables.json; the sidecar fixtures decode and write once |
 | C, the app | The Query Store rules and claims, the tool for a window's top queries and a query's plans, "pending publication" | `fabric/app/src/rca/` (not the page, its view, or its CSS) | Its loader's names match history-tables.json; its rules find the sidecar fixtures' facts |
 | D, the report | The Root cause report's Query Store sections | The report's components, after the reorganized page | The sidecar fixtures' facts as the report shows them |
