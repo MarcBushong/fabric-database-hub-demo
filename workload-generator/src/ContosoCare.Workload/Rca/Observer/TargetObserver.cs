@@ -114,8 +114,9 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
     // A connection a sidecar read found lost and closed: the evidence capture's next block notes it (RunCoreAsync).
     private CaptureException? quietLoss;
 
-    // EndAsync's hook, and whether the evidence's own end has run it (EvidenceEnded).
-    private Action? evidenceEndedHook;
+    // EndAsync's hook and the lane's clock, and whether the evidence's own end has run (EvidenceEnded).
+    private Action<DateTimeOffset>? evidenceEndedHook;
+    private TimeProvider? evidenceEndClock;
     private bool evidenceEndDone;
 
     /// <summary>The target's key in the evidence: T1, T2, T3, T4, or T4-replica.</summary>
@@ -171,16 +172,19 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
     public Task ReleaseAsync() => DisconnectAsync();
 
     /// <summary>
-    /// Ends observing: the last reads, open episodes closed, the event session dropped, the connection closed.
-    /// <paramref name="evidenceEnded"/> runs once, when the evidence's own end is done and its last watermark written:
-    /// before a sidecar reader's end reads, which may take a while (Query Store's, up to their bound), or else as the
-    /// evidence's end returns. The lane takes its time then and releases the target at it once this returns, so the span's
+    /// Ends observing: the last reads, open episodes closed, the event session dropped, the connection closed. When the
+    /// evidence's own end is done, before a sidecar reader's end reads, which may take a while (Query Store's, up to their
+    /// bound), or else as the evidence's end returns, its end time is taken once: <paramref name="clock"/>'s, the lane's,
+    /// or else <paramref name="now"/>. The evidence's last watermark is written at it and <paramref name="evidenceEnded"/>
+    /// gets it, each once, whichever of them fails. The lane releases the target at it once this returns, so the span's
     /// end, its watermark, and RCA Coverage's window are the evidence's own, as without a sidecar, and a sidecar's last
-    /// rows still have their span.
+    /// rows still have their span. The lane passes its clock with the hook: the end's event read keeps events up to when
+    /// it ran, after <paramref name="now"/>.
     /// </summary>
-    public async Task EndAsync(DateTimeOffset now, CancellationToken cancellationToken, Action? evidenceEnded = null)
+    public async Task EndAsync(DateTimeOffset now, CancellationToken cancellationToken, Action<DateTimeOffset>? evidenceEnded = null, TimeProvider? clock = null)
     {
         evidenceEndedHook = evidenceEnded;
+        evidenceEndClock = clock;
         evidenceEndDone = false;
         try
         {
@@ -194,6 +198,7 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
             }
             finally
             {
+                evidenceEndClock = null;
                 await DisconnectAsync().ConfigureAwait(false);
                 Log.Info("rca.observed", "The RCA observer stopped capturing this target.", ("target", Target));
                 Sink = NullSink.Instance;
@@ -202,8 +207,10 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
     }
 
     /// <summary>
-    /// The evidence's own end is done (StopAsync's evidence part): its last watermark, then EndAsync's hook, once. A
-    /// subclass calls it before its sidecar reads' end, so they don't move the span's end; EndAsync calls it otherwise.
+    /// The evidence's own end is done (StopAsync's evidence part): its end time, taken once (EndAsync's clock, or else
+    /// <paramref name="now"/>); its last watermark at it; then EndAsync's hook with it, in a finally, so each runs once
+    /// whichever fails, and a failure follows them (the hook's, when both fail). A subclass calls it before its sidecar
+    /// reads' end, so they don't move the span's end; EndAsync calls it otherwise.
     /// </summary>
     protected void EvidenceEnded(DateTimeOffset now)
     {
@@ -213,10 +220,17 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
         }
 
         evidenceEndDone = true;
-        Sink.Watermark(Target, now);
         var hook = evidenceEndedHook;
         evidenceEndedHook = null;
-        hook?.Invoke();
+        var end = evidenceEndClock?.GetUtcNow() ?? now;
+        try
+        {
+            Sink.Watermark(Target, end);
+        }
+        finally
+        {
+            hook?.Invoke(end);
+        }
     }
 
     protected abstract Task StartAsync(DateTimeOffset now, CancellationToken cancellationToken);
