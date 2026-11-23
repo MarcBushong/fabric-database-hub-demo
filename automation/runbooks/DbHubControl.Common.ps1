@@ -9562,8 +9562,8 @@ function Invoke-DbHubRcaStop {
 # evidence is fetched and before its own sidecar fetch, within the same bound. What a bound cuts stays on the VM, which
 # offers it again. Nothing new is granted: the same secret, the same Run Commands.
 
-$script:DbHubRcaSidecarPartPattern = '^DBHUBDEMO-RCAS 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}$'
-$script:DbHubRcaSidecarIdPattern = '^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar$'
+$script:DbHubRcaSidecarPartPattern = '^DBHUBDEMO-RCAS 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}\z'
+$script:DbHubRcaSidecarIdPattern = '^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar\z'
 # What one session's sidecar bundle index takes (rca/transport.schema.json, sidecarBundleIndex): 16 bundles, and 64 parts,
 # RCA_SIDECAR_FILE's limit.
 $script:DbHubRcaSidecarMostBundles = 16
@@ -9662,10 +9662,10 @@ function ConvertTo-DbHubRcaSidecarRef {
     $parts = Get-DbHubMember -InputObject $InputObject -Name 'parts'
     $sha = [string](Get-DbHubMember -InputObject $InputObject -Name 'sha256')
     $state = [string](Get-DbHubMember -InputObject $InputObject -Name 'state')
-    if (-not (Test-DbHubRcaSidecarId -Value $id) -or -not (Test-DbHubInteger -Value $parts -Minimum 1 -Maximum 99) -or $sha.Length -ne 64 -or $sha -cnotmatch '^[0-9a-f]{64}$' -or $state -cnotin 'new', 'pending') {
+    if (-not (Test-DbHubRcaSidecarId -Value $id) -or -not (Test-DbHubInteger -Value $parts -Minimum 1 -Maximum 99) -or $sha.Length -ne 64 -or $sha -cnotmatch '^[0-9a-f]{64}\z' -or $state -cnotin 'new', 'pending') {
         return $null
     }
-    if ($null -ne $session -and ($session -isnot [string] -or $session.Length -ne 32 -or $session -cnotmatch '^[0-9a-f]{32}$')) {
+    if ($null -ne $session -and ($session -isnot [string] -or $session.Length -ne 32 -or $session -cnotmatch '^[0-9a-f]{32}\z')) {
         return $null
     }
     return [ordered]@{ documentId = [string]$id; sessionId = $session; parts = [int]$parts; sha256 = $sha; state = $state }
@@ -9752,7 +9752,7 @@ function ConvertTo-DbHubRcaSidecarState {
     }
     $bundles = New-Object -TypeName 'System.Collections.Generic.List[string]'
     foreach ($item in @(Get-DbHubMember -InputObject $State -Name 'bundles')) {
-        if ($item -is [string] -and $item.Length -eq 32 -and $item -cmatch '^[0-9a-f]{32}$' -and -not $bundles.Contains($item)) {
+        if ($item -is [string] -and $item.Length -eq 32 -and $item -cmatch '^[0-9a-f]{32}\z' -and -not $bundles.Contains($item)) {
             $bundles.Add($item)
         }
     }
@@ -9776,7 +9776,7 @@ function ConvertTo-DbHubRcaSidecarState {
     $answer['status'] = [string](Get-DbHubMember -InputObject $State -Name 'status')
     $answer['message'] = [string](Get-DbHubMember -InputObject $State -Name 'message')
     $index = [string](Get-DbHubMember -InputObject $State -Name 'index')
-    if ($index.Length -eq 32 -and $index -cmatch '^[0-9a-f]{32}$') {
+    if ($index.Length -eq 32 -and $index -cmatch '^[0-9a-f]{32}\z') {
         $answer['index'] = $index
     }
     return $answer
@@ -10500,7 +10500,7 @@ function New-DbHubRcaSidecarPointer {
     )
 
     $version = $null
-    if ($Index.Length -eq 32 -and $Index -cmatch '^[0-9a-f]{32}$') {
+    if ($Index.Length -eq 32 -and $Index -cmatch '^[0-9a-f]{32}\z') {
         $version = $Index
     }
     $text = ConvertTo-DbHubSafeText -Text $Message

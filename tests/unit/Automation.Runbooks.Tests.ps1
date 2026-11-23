@@ -5584,6 +5584,7 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             $valid.RcaAcks.Problem | Should -BeNullOrEmpty
             (ConvertFrom-DbHubRcaAckRequest -Body ([pscustomobject]@{ rcaAcks = [pscustomobject]@{ kind = 'ContosoCare.RcaAckRequest'; version = 1; documents = @($ids[0], $ids[0]) } })).Problem | Should -Match 'each once'
             (ConvertFrom-DbHubRcaAckRequest -Body ([pscustomobject]@{ rcaAcks = [pscustomobject]@{ kind = 'ContosoCare.RcaAckRequest'; version = 1; documents = @('20261120T165000Z-sqlvm01-0001') } })).Problem | Should -Match 'sidecar IDs' -Because 'an evidence document''s ID is no sidecar''s'
+            Test-DbHubRcaSidecarId -Value "$($ids[0])`n" | Should -BeFalse -Because '.NET''s $ lets a final line feed through; \z doesn''t (83c87de2)'
         }
 
         It 'says a VM''s older <Old> is updated by deploy.ps1, as a Warning, and the evidence goes on as before' -ForEach @(
