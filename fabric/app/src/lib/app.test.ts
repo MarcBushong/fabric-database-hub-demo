@@ -175,6 +175,13 @@ describe("themes", () => {
         const stroke = band?.body.match(/(?:^|[;\s])stroke:\s*var\(--(\w+)\)/)?.[1] ?? "missing";
         expect(contrastRatio(hc[stroke] ?? `no ${stroke}`, hc.colorNeutralBackground1), `the band's outline, ${stroke}`).toBeGreaterThanOrEqual(3);
         expect(band?.media, "the band's outline").toEqual([]);
+        // Under forced colors, the browser leaves the chart's colors as they are while the card under it takes the system's
+        // Canvas, white with a light palette, where the white outline was 1:1 (the browser check): it takes CanvasText there,
+        // in a rule after the one above, so it wins.
+        const forcedBand = rules.find((r) => r.selectors.includes('[data-theme="contrast"] .chart-cursor-band rect') && r.media.length > 0);
+        expect(forcedBand?.media, "the band's outline under forced colors").toEqual(["@media (forced-colors: active)"]);
+        expect(forcedBand?.body, "the band's outline under forced colors").toMatch(/(?:^|[;\s])stroke:\s*CanvasText\s*;/);
+        expect(forcedBand ? rules.indexOf(forcedBand) : -1, "after the outline's own rule").toBeGreaterThan(band ? rules.indexOf(band) : Infinity);
     });
 
     it("under Windows forced colors, gives a hovered filter item's target mark HighlightText, the system's pair for the Highlight Fluent paints the item in, and a pressed one the pressed item's own words' color", () => {
