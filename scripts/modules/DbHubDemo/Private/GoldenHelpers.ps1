@@ -1000,8 +1000,14 @@ function Get-DemoGoldenControlRcaPending {
     DbHubSessionStatus, the runbooks' copy of the status, which infra/control/control.bicep creates unencrypted, through Azure
     Resource Manager with the read access the scripts already use on the control's account: no new grant, and the vault's
     copy isn't read. Documents past the 7 days the runner keeps them are left out, since no start fetches them any more.
-    Returns Read (a status was read), Documents, Error (a read that failed), Variable, and Notebook. Never throws. Internal.
-    https://learn.microsoft.com/rest/api/automation/variable/get
+    An encrypted variable is unreadable here (2026-11-23): a tenant's policy can re-create Automation variables encrypted,
+    and then only a runbook's Get-AutomationVariable reads the value, while Resource Manager returns the variable with no
+    value, which would otherwise read as a status that lists nothing. So isEncrypted, or a variable with no value, is an
+    Error, and Encrypted says why.
+    Returns Read (a status was read), Documents, Error (a read that failed), Encrypted (Resource Manager returned no value:
+    the variable is encrypted, or came with none), Variable, and Notebook. Never throws. Internal.
+    https://learn.microsoft.com/rest/api/automation/variable/get,
+    https://learn.microsoft.com/azure/automation/shared-resources/variables
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1013,7 +1019,7 @@ function Get-DemoGoldenControlRcaPending {
     )
 
     $name = Get-DemoActivityControlName -Config $Config
-    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
+    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
     if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
         return $answer
     }
@@ -1025,8 +1031,28 @@ function Get-DemoGoldenControlRcaPending {
         }
         return $answer
     }
+    # An encrypted variable's value only a runbook reads: Resource Manager leaves it out, and an empty value would read as
+    # a status that lists nothing, so the capture would delete what it lists (2026-11-23).
+    $properties = Get-DemoMemberValue -InputObject $read.Value -Name 'properties'
+    $hasValue = $false
+    if ($properties -is [System.Collections.IDictionary]) {
+        $hasValue = @($properties.Keys | Where-Object { [string]$_ -eq 'value' }).Count -gt 0
+    }
+    elseif ($null -ne $properties) {
+        $hasValue = $null -ne $properties.PSObject.Properties['value']
+    }
+    if ((Get-DemoMemberValue -InputObject $properties -Name 'isEncrypted') -eq $true) {
+        $answer.Encrypted = $true
+        $answer.Error = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
+        return $answer
+    }
+    if (-not $hasValue) {
+        $answer.Encrypted = $true
+        $answer.Error = 'Azure Resource Manager returned it with no value, as it does for an encrypted variable'
+        return $answer
+    }
     # A variable's value is its JSON, so the status's JSON comes as a JSON string ('""' until the runbooks write one).
-    $text = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $read.Value -Name 'properties') -Name 'value')
+    $text = [string](Get-DemoMemberValue -InputObject $properties -Name 'value')
     $status = $null
     try {
         if (-not [string]::IsNullOrWhiteSpace($text)) {

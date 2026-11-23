@@ -200,7 +200,8 @@ Describe 'New-DemoT2GoldenSnapshot' {
         # The session control's status: read, and listing nothing, unless a test sets some.
         $script:controlPending = @()
         $script:controlError = ''
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
+        $script:controlEncrypted = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Encrypted = $script:controlEncrypted; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
         # The demo workspace's NB_DatabaseHub_LiveActivity, read only when T2's documents are listed: this release's copy,
         # unless a test sets another.
         $script:notebookState = [pscustomobject]@{ Known = $true; Current = $true; Error = '' }
@@ -449,6 +450,20 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $rca.status | Should -Be 'Fail'
         $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (Forbidden), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
         $rca.remediation | Should -Be 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+    }
+
+    It 'captures nothing when a tenant''s policy encrypted the session control''s status, and says how to save what it lists first, since running it again can''t help (2026-11-23)' {
+        $script:controlError = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
+        $script:controlEncrypted = $true
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
+        $rca.remediation | Should -Be 'Running the capture again won''t help while Azure Resource Manager returns no value, since only the control''s runbooks read an encrypted variable. To keep what it lists, run sessions with Run all in NB_DatabaseHub_Control until one has no RCA.EARLIER line about evidence still on the VMs or in the control vault at its start, and no RCA.PENDING line at its end: each start fetches one session''s documents, and its end saves them with its history. Then run ./scripts/deploy.ps1, which re-creates the variable unencrypted but empty, so no start fetches what it still lists, and ./scripts/capture-t2-golden.ps1 again before it''s encrypted again.' -Because 'deploy.ps1 makes the variable readable again only by emptying it, so the evidence it lists goes first'
+        $rca.evidence.encrypted | Should -BeTrue
         foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
             $script:calls | Should -Not -Contain $step
         }
@@ -1400,10 +1415,13 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $script:readFail = ''
         $script:missing = $false
         $script:url = ''
+        # The variable's properties as Resource Manager returns them, when a test sets them (an encrypted variable's).
+        $script:properties = $null
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
             $script:url = $Url
             if ($script:readFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = $script:readFail } }
             if ($script:missing) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
+            if ($null -ne $script:properties) { return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'DbHubSessionStatus'; properties = $script:properties }; Error = '' } }
             # A variable's value is its JSON, so the runbooks' status JSON comes as a JSON string.
             $value = if ($script:variable -is [string]) { $script:variable } else { ConvertTo-Json -InputObject (ConvertTo-Json -InputObject $script:variable -Depth 8 -Compress) }
             return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'DbHubSessionStatus'; properties = @{ value = $value; isEncrypted = $false } }; Error = '' }
@@ -1458,6 +1476,34 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $script:readFail = ''
         $script:variable = '{not json'
         (Get-ControlPending).Error | Should -Be 'its value isn''t the JSON of a status'
+    }
+
+    It 'can''t read a variable a tenant''s policy encrypted, which Resource Manager returns with no value, rather than reading it as a status that lists nothing (2026-11-23)' {
+        $script:properties = @{ isEncrypted = $true; description = 'The demo session''s last status (JSON)' }
+        $encrypted = Get-ControlPending
+        $encrypted.Read | Should -BeFalse
+        $encrypted.Encrypted | Should -BeTrue
+        $encrypted.Error | Should -Be 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
+        @($encrypted.Documents) | Should -BeNullOrEmpty
+        # The flag alone decides it: a value that came with it isn't the status the runbooks read.
+        $script:properties = @{ isEncrypted = $true; value = (ConvertTo-Json -InputObject (ConvertTo-Json -InputObject ([ordered]@{ sessionId = 'a' * 32; phase = 'stopped'; updatedUtc = '2026-11-20T19:00:00Z'; rca = [ordered]@{ pending = @([ordered]@{ documentId = 'doc-own-t2'; vm = 'archost01' }) } }) -Depth 8 -Compress)) }
+        $flagged = Get-ControlPending
+        $flagged.Read | Should -BeFalse
+        $flagged.Encrypted | Should -BeTrue
+        $flagged.Error | Should -Match '^it''s encrypted'
+        # No value, and no flag: read as Resource Manager returns an encrypted variable.
+        $script:properties = @{ isEncrypted = $false; description = 'The demo session''s last status (JSON)' }
+        $none = Get-ControlPending
+        $none.Read | Should -BeFalse
+        $none.Encrypted | Should -BeTrue
+        $none.Error | Should -Be 'Azure Resource Manager returned it with no value, as it does for an encrypted variable'
+        # The runbooks' unencrypted copy still reads, with no Error.
+        $script:properties = $null
+        $script:variable = '""'
+        $plain = Get-ControlPending
+        $plain.Read | Should -BeTrue
+        $plain.Encrypted | Should -BeFalse
+        $plain.Error | Should -BeNullOrEmpty
     }
 }
 

@@ -19,7 +19,11 @@ function New-DemoT2GoldenSnapshot {
        fetches one session's on any VM, and the capture again after each (ADR 0031); both save them with the demo
        workspace's NB_DatabaseHub_LiveActivity, so when its copy is from before the Incident RCA (Get-DemoGoldenRcaNotebookState,
        read only then), the fix updates it first (./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook
-       NB_DatabaseHub_LiveActivity, which leaves the workspace's other notebook as it is).
+       NB_DatabaseHub_LiveActivity, which leaves the workspace's other notebook as it is). A status that can't be read
+       captures nothing; one that's encrypted (a tenant's policy can re-create the variable so, and Resource Manager then
+       returns no value) gets the fix for a governed tenant: Run all sessions until their RCA.EARLIER and RCA.PENDING lines
+       list no evidence, then deploy.ps1, which re-creates it unencrypted and empty, and the capture before it's encrypted
+       again (2026-11-23).
     3. Starts archost01 when it's deallocated, and releases an air gap that an interrupted capture left (the
        host's Azure VM ID matches the capture record, so only the guest's network and start action return).
     4. Inspects the host and guest (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Inspect, read-only) and
@@ -216,7 +220,16 @@ function New-DemoT2GoldenSnapshot {
     $t2Pending = @(@($pending.Documents) | Where-Object { $null -ne $_ -and [string]$_['vm'] -eq 'archost01' })
     $controlPending = Get-DemoGoldenControlRcaPending -Config $Config -NowUtc $NowUtc
     if ($controlPending.Error) {
-        & $add 'GOLDEN.CAPTURE.RCA' 'Fail' ('The session control''s status ({0}) couldn''t be read ({1}), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.' -f $controlPending.Variable, $controlPending.Error) ([ordered]@{ status = $controlPending.Variable }) 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
+        $readFix = 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
+        $readEvidence = [ordered]@{ status = $controlPending.Variable }
+        if ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Encrypted')) {
+            # A tenant's policy can re-create the variable encrypted (2026-11-23): then only the runbooks read it, and
+            # deploy.ps1's control.bicep makes it readable again only by re-creating it empty, which loses what it lists.
+            # Run all's own lines still say what's left, since the notebook reads the vault's copy of the status.
+            $readEvidence['encrypted'] = $true
+            $readFix = 'Running the capture again won''t help while Azure Resource Manager returns no value, since only the control''s runbooks read an encrypted variable. To keep what it lists, run sessions with Run all in {0} until one has no RCA.EARLIER line about evidence still on the VMs or in the control vault at its start, and no RCA.PENDING line at its end: each start fetches one session''s documents, and its end saves them with its history. Then run ./scripts/deploy.ps1, which re-creates the variable unencrypted but empty, so no start fetches what it still lists, and ./scripts/capture-t2-golden.ps1 again before it''s encrypted again.' -f $controlPending.Notebook
+        }
+        & $add 'GOLDEN.CAPTURE.RCA' 'Fail' ('The session control''s status ({0}) couldn''t be read ({1}), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.' -f $controlPending.Variable, $controlPending.Error) $readEvidence $readFix
         return $results.ToArray()
     }
     $t2Control = @(@($controlPending.Documents) | Where-Object { $null -ne $_ -and [string]$_['vm'] -eq 'archost01' })
