@@ -48,6 +48,19 @@ BeforeAll {
                 ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
     }
 
+    # Any schema, as schema.name: the scenario modules live in the application schemas (ADR 0031, decision 6).
+    function Get-SqlServerQualifiedModule {
+        param([string] $Text)
+        return @([regex]::Matches((Remove-SqlComment -Text $Text), '(?i)\bCREATE\s+(?:OR\s+ALTER\s+)?(?:PROCEDURE|PROC|FUNCTION)\s+\[?(\w+)\]?\.\[?(\w+)\]?') |
+                ForEach-Object { '{0}.{1}' -f $_.Groups[1].Value.ToLowerInvariant(), $_.Groups[2].Value } | Sort-Object -Unique)
+    }
+
+    function Get-PostgresQualifiedRoutine {
+        param([string] $Text)
+        return @([regex]::Matches((Remove-SqlComment -Text $Text), '(?i)\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:FUNCTION|PROCEDURE)\s+(\w+)\.(\w+)') |
+                ForEach-Object { '{0}.{1}' -f $_.Groups[1].Value.ToLowerInvariant(), $_.Groups[2].Value } | Sort-Object -Unique)
+    }
+
     function Get-WrittenTable {
         param([string] $Text)
         return @([regex]::Matches((Remove-SqlComment -Text $Text), '(?i)\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM|TRUNCATE(?:\s+TABLE)?|MERGE\s+INTO)\s+([a-z_][a-z0-9_]*\.[a-z_][a-z0-9_]*)') |
@@ -87,10 +100,16 @@ Describe 'The harness''s marks (ADR 0031, the sidecar''s leave-out)' {
     }
 
     It 'marks no scenario module on either engine' {
+        # Every module the scenario scripts create, in any schema: none may be one the marks reach (demo.<a listed name>),
+        # nor share a listed name, since RCA-PG-16 lists a marked routine by its name alone.
         $sqlServerMarked = Get-SqlServerMarked -Text $sqlServerText
-        foreach ($module in (Get-SqlServerModule -Text ([System.IO.File]::ReadAllText($sqlServerScenarios)))) { $module | Should -Not -BeIn $sqlServerMarked }
+        $sqlServerModules = Get-SqlServerQualifiedModule -Text ([System.IO.File]::ReadAllText($sqlServerScenarios))
+        $sqlServerModules.Count | Should -Be 26
+        foreach ($module in $sqlServerModules) { $module.Split('.')[1] | Should -Not -BeIn $sqlServerMarked -Because $module }
         $postgresMarked = Get-PostgresMarked -Text $postgresText
-        foreach ($routine in (Get-PostgresRoutine -Text ([System.IO.File]::ReadAllText($postgresScenarios)))) { $routine | Should -Not -BeIn $postgresMarked }
+        $postgresRoutines = Get-PostgresQualifiedRoutine -Text ([System.IO.File]::ReadAllText($postgresScenarios))
+        $postgresRoutines.Count | Should -Be 16
+        foreach ($routine in $postgresRoutines) { $routine.Split('.')[1] | Should -Not -BeIn $postgresMarked -Because $routine }
     }
 
     It 'leaves PostgreSQL exactly the harness-only tables the leave-out expects' {
