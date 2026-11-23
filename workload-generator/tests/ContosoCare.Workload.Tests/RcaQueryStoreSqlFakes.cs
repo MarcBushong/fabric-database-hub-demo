@@ -86,10 +86,10 @@ internal sealed class SidecarView
 /// <summary>
 /// T3's Query Store during the fixture's plan regression (rca/fixtures/t3-plan-regression.sidecar.json and its README),
 /// as the catalog's blocks would return it at each simulated time: RCA-SQL-10 and 11 from the fixture's own statistics
-/// and waits, RCA-SQL-14 from its plans as each read saw them (and query 902's plan, which the fixture leaves out), with
-/// showplans whose costs are the fixture's; RCA-SQL-15 with plan 31 forced at 17:09:41.12; RCA-AZ-03 with
-/// FORCE_LAST_GOOD_PLAN on; and RCA-AZ-04's recommendation for query 412, Active from 17:06, Executing from 17:09:15,
-/// and Verifying from 17:10:15. The observer sees only these DMV-shaped results.
+/// and waits, RCA-SQL-14 from its plans as each read saw them, with showplans whose costs are the fixture's; RCA-SQL-15
+/// with plan 31 forced at 17:09:41.12; RCA-AZ-03 with FORCE_LAST_GOOD_PLAN on; and RCA-AZ-04's recommendation for query
+/// 412, Active from 17:06, Executing from 17:09:15, and Verifying from 17:10:15. The observer sees only these DMV-shaped
+/// results.
 /// </summary>
 internal sealed class T3QueryStore
 {
@@ -102,7 +102,8 @@ internal sealed class T3QueryStore
 
     private static readonly DateTimeOffset Forced = RcaSimulation.At(17, 9, 41, 120);
 
-    // The server's time of each Query Store read, by the observer's time of the read (the fixture's captured_at_utc).
+    // The server's time of each Query Store read (the fixture's captured_at_utc), by the minute in which the observer
+    // made it: an interval read's blocks run on consecutive ticks.
     private static readonly Dictionary<DateTimeOffset, DateTimeOffset> Stamps = new()
     {
         [RcaSimulation.At(16, 50, 0)] = RcaSimulation.At(16, 50, 5, 210),
@@ -123,23 +124,6 @@ internal sealed class T3QueryStore
         stats = Fixture.Table(RcaContract.QueryStats);
         waits = Fixture.Table(RcaContract.QueryWaits);
         plans = Fixture.Table(RcaContract.QueryPlans);
-        plans.Add(new Dictionary<string, object?>(StringComparer.Ordinal)
-        {
-            ["captured_at_utc"] = Fixture.Epoch.AddHours(-12),
-            ["query_id"] = 902L,
-            ["plan_id"] = 40L,
-            ["query_hash"] = "0x6C5D4E3F2A1B0C9D",
-            ["plan_hash"] = "0x44E2A90B17C3D5F6",
-            ["statement_text"] = stats.First(s => (long)s["query_id"]! == 902)["statement_text"],
-            ["compiled_utc"] = RcaSimulation.At(8, 0, 0),
-            ["last_compiled_utc"] = RcaSimulation.At(8, 0, 0),
-            ["compiles"] = 1L,
-            ["is_forced_plan"] = false,
-            ["forcing_type"] = "NONE",
-            ["force_failures"] = 0L,
-            ["plans_for_query"] = 1L,
-            ["is_parallel"] = false,
-        });
     }
 
     public SidecarView Fixture { get; }
@@ -164,7 +148,7 @@ internal sealed class T3QueryStore
     public IReadOnlyList<CaptureValues> Answer(string block, CaptureParameters parameters)
     {
         var now = clock.Now;
-        var stamp = Stamps.GetValueOrDefault(now, now);
+        var stamp = Stamps.Where(s => s.Key <= now && now < s.Key.AddMinutes(1)).Select(s => (DateTimeOffset?)s.Value).FirstOrDefault() ?? now;
         return block switch
         {
             "RCA-SQL-10" => [.. Intervals(stats, parameters, now).Select(s => StatsRow(s, stamp))],
@@ -233,14 +217,13 @@ internal sealed class T3QueryStore
         var rows = new List<CaptureValues>();
         foreach (var plan in plans.Select(p => (long)p["plan_id"]!).Distinct().Order())
         {
-            // A plan as the latest of the fixture's reads up to this one saw it; query 902's plan is always there.
+            // A plan as the latest of the fixture's reads up to this one saw it.
             var seen = plans.Where(p => (long)p["plan_id"]! == plan && (DateTimeOffset)p["captured_at_utc"]! <= stamp).MaxBy(p => (DateTimeOffset)p["captured_at_utc"]!);
             if (seen is null || !(queries.Contains((long)seen["query_id"]!) || asked.Contains(plan) || (bool)seen["is_forced_plan"]!))
             {
                 continue;
             }
 
-            var lastRun = stats.Where(s => (long)s["plan_id"]! == plan && (DateTimeOffset)s["last_execution_utc"]! <= stamp).Select(s => (DateTimeOffset)s["last_execution_utc"]!).DefaultIfEmpty(RcaSimulation.At(8, 0, 1)).Max();
             rows.Add(Row(
                 ("captured_at_utc", stamp.UtcDateTime),
                 ("query_id", seen["query_id"]),
@@ -251,7 +234,7 @@ internal sealed class T3QueryStore
                 ("query_sql_text", Raw((string?)seen["statement_text"])),
                 ("compiled_utc", seen["compiled_utc"]),
                 ("last_compiled_utc", seen["last_compiled_utc"]),
-                ("last_execution_utc", lastRun),
+                ("last_execution_utc", seen["last_execution_utc"]),
                 ("compiles", seen["compiles"]),
                 ("is_forced_plan", seen["is_forced_plan"]),
                 ("forcing_type", seen["forcing_type"]),
@@ -259,7 +242,8 @@ internal sealed class T3QueryStore
                 ("last_force_failure", null),
                 ("plans_for_query", (int)(long)seen["plans_for_query"]!),
                 ("is_parallel", seen["is_parallel"]),
-                ("query_plan", withPlan.Contains(plan) ? Showplans.ForPlan(plan) : null)));
+                ("query_plan", withPlan.Contains(plan) ? Showplans.ForPlan(plan) : null),
+                ("query_plan_bytes", withPlan.Contains(plan) ? (object)((long)Showplans.ForPlan(plan).Length * 2) : null)));
         }
 
         return rows;
@@ -290,8 +274,8 @@ internal sealed class T3QueryStore
                 ("query_id", "412"),
                 ("regressed_plan_id", "58"),
                 ("recommended_plan_id", "31"),
-                ("regressed_plan_cpu_ms", "176000"),
-                ("recommended_plan_cpu_ms", "2100")),
+                ("regressed_plan_cpu_us", "176000"),
+                ("recommended_plan_cpu_us", "2100")),
         ];
     }
 
@@ -350,4 +334,207 @@ internal static class Showplans
 
     private static string Scan(string index, params string[] columns) =>
         $"""<IndexScan Ordered="0"><Object Database="[ContosoCare]" Schema="[care]" Table="[appointments]" Index="{index}" IndexKind="Clustered"/><Predicate><ScalarOperator ScalarString="[a].[patient_id]&gt;=[@first_patient] AND [a].[status]&lt;&gt;N'{CompiledValue}'">{string.Concat(columns.Select(c => Column("[appointments]", c)))}<Const ConstValue="N'{CompiledValue}'"/></ScalarOperator></Predicate></IndexScan>""";
+}
+
+/// <summary>
+/// A sidecar reader's access to a scripted observer: the blocks answer from <c>answer</c> (null is a failure), each moves
+/// <see cref="Clock"/> by what <see cref="Cost"/> says, and a cost past its timeout fails as SqlClient's command timeout
+/// does, after the timeout. The throttle's state is the test's to set.
+/// </summary>
+internal sealed class FakeSidecarAccess(string target, Func<string, CaptureParameters, IReadOnlyList<CaptureValues>?> answer) : ISidecarAccess
+{
+    public string Target { get; } = target;
+
+    public int Factor { get; set; } = 1;
+
+    public bool DetailStopped { get; set; }
+
+    public ManualTime? Clock { get; init; }
+
+    public Func<string, TimeSpan> Cost { get; set; } = _ => TimeSpan.Zero;
+
+    public string FailureMessage { get; set; } = "SQL error 50000: a test's failure.";
+
+    public List<(DateTimeOffset At, string BlockId, CaptureParameters Parameters, TimeSpan Timeout)> Calls { get; } = [];
+
+    public Task<QuietResult> RunAsync(string blockId, DateTimeOffset now, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        Calls.Add((now, blockId, parameters, timeout));
+        var cost = Cost(blockId);
+        Clock?.Advance(cost > timeout ? timeout : cost);
+        if (cost > timeout)
+        {
+            return Task.FromResult(QuietResult.Failed(CaptureFailureKind.Timeout, "The statement was cancelled at its timeout."));
+        }
+
+        return Task.FromResult(answer(blockId, parameters) is { } rows ? QuietResult.Of(rows) : QuietResult.Failed(CaptureFailureKind.Other, FailureMessage));
+    }
+}
+
+/// <summary>A clock whose timestamps follow a <see cref="ManualTime"/>, so a reader measures what the test's blocks cost.</summary>
+internal sealed class SteppedClock(ManualTime time) : TimeProvider
+{
+    public override long TimestampFrequency => TimeSpan.TicksPerSecond;
+
+    public override DateTimeOffset GetUtcNow() => time.GetUtcNow();
+
+    public override long GetTimestamp() => time.GetUtcNow().UtcTicks;
+}
+
+/// <summary>
+/// A target whose evidence blocks answer as <c>evidence</c>'s connection does (RcaSimulation's T1) and take no time, and
+/// whose Query Store blocks can cost time (the clock moves by it; past its timeout, by the timeout, and the block fails
+/// as SqlClient's command timeout does), fail, or throw. The connection can break at a moment: a Query Store block at it,
+/// or any block after it, fails on the connection that was open then, as does every later block on it; a connection
+/// opened after the break works.
+/// </summary>
+internal sealed class TimedConnector(ManualTime clock, ICaptureConnector evidence) : ICaptureConnector
+{
+    public const string TransportError = "SQL error 10054: A transport-level error has occurred when receiving results from the server.";
+
+    public static readonly HashSet<string> QueryStoreBlocks = new(StringComparer.Ordinal) { "RCA-SQL-10", "RCA-SQL-11", "RCA-SQL-14", "RCA-SQL-15", "RCA-AZ-03", "RCA-AZ-04" };
+
+    public List<(DateTimeOffset At, string BlockId, TimeSpan Timeout, CaptureParameters? Parameters)> Calls { get; } = [];
+
+    public List<(DateTimeOffset At, string BlockId)> Failures { get; } = [];
+
+    public int Opens { get; private set; }
+
+    public Func<string, TimeSpan> Cost { get; set; } = _ => TimeSpan.Zero;
+
+    public Func<string, Exception?> Failure { get; set; } = _ => null;
+
+    public Func<string, CaptureParameters, IReadOnlyList<CaptureValues>> QueryStore { get; set; } = (_, _) => [];
+
+    public DateTimeOffset? BreakAt { get; set; }
+
+    public string Description => "timed";
+
+    private ManualTime Time => clock;
+
+    public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken)
+    {
+        var inner = await evidence.OpenAsync(cancellationToken);
+        Opens++;
+        return new Connection(this, clock.Now, inner);
+    }
+
+    private sealed class Connection(TimedConnector owner, DateTimeOffset opened, ICaptureConnection inner) : ICaptureConnection
+    {
+        private bool broken;
+
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken) =>
+            RunAsync(blockId, text, parameter, null, timeout, cancellationToken);
+
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken) =>
+            RunAsync(blockId, text, null, parameters, timeout, cancellationToken);
+
+        public ValueTask DisposeAsync() => inner.DisposeAsync();
+
+        private async Task<IReadOnlyList<CaptureValues>> RunAsync(string blockId, string text, int[]? parameter, CaptureParameters? parameters, TimeSpan timeout, CancellationToken cancellationToken)
+        {
+            var at = owner.Time.Now;
+            owner.Calls.Add((at, blockId, timeout, parameters));
+            var sidecar = QueryStoreBlocks.Contains(blockId);
+            if (owner.BreakAt is { } moment && opened <= moment && (at > moment || (at == moment && sidecar)))
+            {
+                broken = true;
+            }
+
+            if (broken)
+            {
+                owner.Failures.Add((at, blockId));
+                throw new CaptureException(CaptureFailureKind.Connection, TransportError);
+            }
+
+            if (!sidecar)
+            {
+                return parameters is null
+                    ? await inner.QueryAsync(blockId, text, parameter, timeout, cancellationToken)
+                    : await inner.QueryAsync(blockId, text, parameters, timeout, cancellationToken);
+            }
+
+            var cost = owner.Cost(blockId);
+            owner.Time.Advance(cost > timeout ? timeout : cost);
+            if (cost > timeout)
+            {
+                owner.Failures.Add((at, blockId));
+                throw new CaptureException(CaptureFailureKind.Timeout, "SQL error -2: Execution Timeout Expired.");
+            }
+
+            if (owner.Failure(blockId) is { } failure)
+            {
+                owner.Failures.Add((at, blockId));
+                throw failure;
+            }
+
+            return owner.QueryStore(blockId, parameters ?? CaptureParameters.None);
+        }
+    }
+}
+/// <summary>A sidecar sink whose store refuses every row: what a reader that throws looks like to its observer.</summary>
+internal sealed class ThrowingSidecarSink : ISidecarSink
+{
+    public int Attempts { get; private set; }
+
+    public void Write(CaptureRow row)
+    {
+        Attempts++;
+        throw new IOException("The sidecar's store refused the row (a test's failure).");
+    }
+}
+
+/// <summary>A span that keeps what a <see cref="MemorySink"/> keeps, and every watermark in order.</summary>
+internal sealed class WatermarkLog(MemorySink inner) : ICaptureSpan
+{
+    public MemorySink Inner => inner;
+
+    public List<DateTimeOffset> Marks { get; } = [];
+
+    public void Write(CaptureRow row) => inner.Write(row);
+
+    public void Note(CaptureNote note) => inner.Note(note);
+
+    public void Watermark(string target, DateTimeOffset complete)
+    {
+        Marks.Add(complete);
+        inner.Watermark(target, complete);
+    }
+
+    public void Began(string target, DateTimeOffset at) => inner.Began(target, at);
+
+    public void Ended(string target, DateTimeOffset at) => inner.Ended(target, at);
+
+    public void Close(DateTimeOffset at) => inner.Close(at);
+}
+
+/// <summary>Drives one observer as the observer lane does, by a clock a slow block can move.</summary>
+internal static class LaneDriver
+{
+    /// <summary>
+    /// Begins the observer at <paramref name="from"/>; ticks it when it says, 50 ms to 1 s after the last tick ended, as
+    /// ObserverLane does; and ends it at <paramref name="to"/>.
+    /// </summary>
+    public static async Task RunAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
+    {
+        clock.Set(from);
+        span.Began(observer.Target, from);
+        await observer.BeginAsync(span, from, cancellationToken);
+        while (clock.Now < to)
+        {
+            var next = await observer.TickAsync(clock.Now, cancellationToken);
+            var after = clock.Now;
+            var delay = next - after;
+            delay = delay < TimeSpan.FromMilliseconds(50) ? TimeSpan.FromMilliseconds(50) : delay > TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : delay;
+            clock.Set(after + delay);
+        }
+
+        if (clock.Now < to)
+        {
+            clock.Set(to);
+        }
+
+        await observer.EndAsync(to, cancellationToken);
+        span.Ended(observer.Target, to);
+    }
 }

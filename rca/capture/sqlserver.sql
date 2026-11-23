@@ -516,10 +516,11 @@ ORDER BY s.avg_total_user_cost * s.avg_user_impact * (s.user_seeks + s.user_scan
 -- last, every plan RCA-SQL-10 returned (so each of its rows has its plan), and every forced plan: when each was compiled
 -- and last ran, whether it's forced and how, and its forcing failures; and, for the plans named in @with_plan only, its
 -- showplan XML, which the observer reduces to the plan's shape (its costliest operators with their objects and indexes,
--- its warnings, a missing index) and never keeps a parameter's value from. Read with RCA-SQL-10. Parameters: @queries
--- nvarchar(max), RCA-SQL-10's query_ids, comma-separated; @plans nvarchar(max), its plan_ids; @with_plan nvarchar(max),
--- the plan_ids whose XML the observer hasn't reduced yet. It leaves out what RCA-SQL-10 leaves out, by the same two
--- rules. T1, T2, T3.
+-- its warnings, a missing index) and never keeps a parameter's value from. A showplan over 16,777,216 bytes (8,388,608
+-- characters, the most the observer reduces) isn't returned: query_plan_bytes says its size, so the coverage says why
+-- the plan has no summary. Read with RCA-SQL-10. Parameters: @queries nvarchar(max), RCA-SQL-10's query_ids,
+-- comma-separated; @plans nvarchar(max), its plan_ids; @with_plan nvarchar(max), the plan_ids whose XML the observer
+-- hasn't reduced yet. It leaves out what RCA-SQL-10 leaves out, by the same two rules. T1, T2, T3.
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 1000;
@@ -561,7 +562,9 @@ SELECT
     last_force_failure = CASE WHEN p.force_failure_count > 0 THEN p.last_force_failure_reason_desc END,
     plans_for_query    = (SELECT COUNT(*) FROM sys.query_store_plan AS p2 WHERE p2.query_id = p.query_id),
     is_parallel        = p.is_parallel_plan,
-    query_plan         = CASE WHEN p.plan_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@with_plan, N',') AS v) THEN p.query_plan END
+    query_plan         = CASE WHEN p.plan_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@with_plan, N',') AS v)
+                               AND DATALENGTH(p.query_plan) <= 16777216 THEN p.query_plan END,
+    query_plan_bytes   = CASE WHEN p.plan_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@with_plan, N',') AS v) THEN DATALENGTH(p.query_plan) END
 FROM chosen AS c
 JOIN sys.query_store_plan AS p ON p.plan_id = c.plan_id
 JOIN sys.query_store_query AS q ON q.query_id = p.query_id
@@ -630,7 +633,7 @@ WHERE ws.waiting_tasks_count > 0;
 
 -- name: RCA-AZ-03
 -- T3 only: automatic plan correction: the option's desired and actual state and why, as a DBA would check it. Every
--- 30 s with the sentinel; a change of state is recorded as a tuning event (RCA Events).
+-- 30 s with the sentinel; a change of state is an RCA Query Events row of kind tuning (the sidecar).
 SET NOCOUNT ON;
 SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
@@ -642,7 +645,11 @@ FROM sys.database_automatic_tuning_options AS o;
 
 -- name: RCA-AZ-04
 -- T3 only: the tuning recommendations with their state and plan IDs: the regressed and the recommended plan of each
--- query, when the recommendation was valid, and who forced it (system or user).
+-- query, when the recommendation was valid, and who forced it (system or user). A recommendation that appears, or whose
+-- state changes, is an RCA Query Events row of kind tuning (the sidecar). The plans' CPU averages are Learn's
+-- microseconds (regressedPlanCpuTimeAverage, recommendedPlanCpuTimeAverage), as the recommendation measured them when
+-- it detected the regression; the observer writes them in milliseconds. Learn lists VIEW SERVER PERFORMANCE STATE for
+-- this view on SQL Server 2022 and Azure SQL Database.
 SET NOCOUNT ON;
 SELECT /* dbhubdemo:rca-observer */
     captured_at_utc            = SYSUTCDATETIME(),
@@ -662,9 +669,8 @@ SELECT /* dbhubdemo:rca-observer */
     query_id                   = JSON_VALUE(tr.details, N'$.planForceDetails.queryId'),
     regressed_plan_id          = JSON_VALUE(tr.details, N'$.planForceDetails.regressedPlanId'),
     recommended_plan_id        = JSON_VALUE(tr.details, N'$.planForceDetails.recommendedPlanId'),
-    regressed_plan_cpu_ms      = JSON_VALUE(tr.details, N'$.planForceDetails.regressedPlanCpuTimeAverage'),
-    recommended_plan_cpu_ms    = JSON_VALUE(tr.details, N'$.planForceDetails.recommendedPlanCpuTimeAverage'),
-    estimated_gain             = JSON_VALUE(tr.details, N'$.estimatedGain')
+    regressed_plan_cpu_us      = JSON_VALUE(tr.details, N'$.planForceDetails.regressedPlanCpuTimeAverage'),
+    recommended_plan_cpu_us    = JSON_VALUE(tr.details, N'$.planForceDetails.recommendedPlanCpuTimeAverage')
 FROM sys.dm_db_tuning_recommendations AS tr;
 
 -- name: RCA-AZ-05

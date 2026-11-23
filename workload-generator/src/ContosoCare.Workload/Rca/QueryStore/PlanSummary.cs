@@ -12,16 +12,20 @@ internal sealed record PlanShape(string? Summary, double? EstimatedCost, bool Pa
 /// <summary>
 /// Reduces a showplan (sys.query_store_plan.query_plan, which Query Store keeps as text) to its shape in words
 /// (rca/README.md, Query Store): its three costliest operators by their own estimated cost, each with the object and
-/// index it reads or writes and its share of the statement's cost; parallel or not; its warnings; and the missing index
-/// with the highest impact. It reads only operator, object, index, and column names, costs, flags, and the kinds of the
-/// warnings: never a statement's text, a scalar expression, or a parameter's compiled value, so no value a query ran
-/// with reaches the evidence. The showplan schema:
+/// index it reads or writes and its share of the statement's cost (an operator under 1 % isn't named); its warnings;
+/// and the missing index with the highest impact. Whether it's parallel is RCA Query Plans' is_parallel, not part of
+/// the words. It reads only operator, object, index, and column names, costs, flags, and the kinds of the warnings:
+/// never a statement's text, a scalar expression, or a parameter's compiled value, so no value a query ran with reaches
+/// the evidence. The showplan schema:
 /// https://learn.microsoft.com/sql/relational-databases/showplan-logical-and-physical-operators-reference.
 /// </summary>
 internal static partial class PlanSummary
 {
     /// <summary>A showplan longer than this (in characters) isn't reduced.</summary>
     public const int MaximumXmlLength = 8 * 1024 * 1024;
+
+    /// <summary>The same limit in bytes of nvarchar, which RCA-SQL-14 checks (DATALENGTH) before it returns a showplan.</summary>
+    public const long MaximumXmlBytes = MaximumXmlLength * 2L;
 
     private const int TopOperators = 3;
 
@@ -86,15 +90,6 @@ internal static partial class PlanSummary
             parts.Add(costliest);
         }
 
-        if (parallel)
-        {
-            parts.Add("Parallel");
-        }
-        else if (plans.Select(p => (string?)p.Attribute("NonParallelPlanReason")).FirstOrDefault(r => !string.IsNullOrWhiteSpace(r)) is { } reason)
-        {
-            parts.Add("Serial: " + Words(reason));
-        }
-
         var warnings = Warnings(plans, operators);
         if (warnings.Count > 0)
         {
@@ -149,7 +144,7 @@ internal static partial class PlanSummary
     {
         var shares = total is > 0;
         var top = operators
-            .Where(o => !shares || o.Own > 0)
+            .Where(o => !shares || Math.Round(o.Own / total!.Value * 100, MidpointRounding.AwayFromZero) >= 1)
             .OrderByDescending(o => shares ? o.Own : 0)
             .ThenBy(o => o.Node)
             .Take(TopOperators)

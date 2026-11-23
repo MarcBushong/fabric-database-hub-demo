@@ -4,28 +4,32 @@ using ContosoCare.Workload.Rca.Observer;
 
 namespace ContosoCare.Workload.Rca.QueryStore;
 
-/// <summary>
-/// Runs one capture block for the Query Store reader through its observer, which handles a refusal, a timeout, or a lost
-/// connection as for every block: null when the block failed, after the observer noted why in RCA Coverage (and, for a
-/// permission, the RCA.CAPTURE.&lt;target&gt; Warning with its fix). A <paramref name="heavy"/> read takes the long
-/// statement timeout.
-/// </summary>
-internal delegate Task<IReadOnlyList<CaptureValues>?> QueryStoreRun(string blockId, DateTimeOffset now, CaptureParameters parameters, bool heavy, CancellationToken cancellationToken);
-
-/// <summary>The Query Store reader's timings and bounds (rca/README.md, Query Store). Tests shorten the look-back.</summary>
+/// <summary>The Query Store reader's timings and bounds (rca/README.md, Query Store). Tests shorten or measure them.</summary>
 internal sealed record SqlQueryStoreOptions
 {
     /// <summary>2 minutes after each interval ends, and the 2 hours before the observer's start.</summary>
     public QueryStoreSchedule Schedule { get; init; } = QueryStoreSchedule.Default;
 
-    /// <summary>RCA-SQL-15, Query Store's state and forced plans.</summary>
+    /// <summary>RCA-SQL-15, Query Store's state and forced plans: every 60 s, times the self-throttling's factor.</summary>
     public TimeSpan StateEvery { get; init; } = TimeSpan.FromSeconds(60);
 
-    /// <summary>RCA-AZ-03 and 04, T3's automatic tuning.</summary>
+    /// <summary>RCA-AZ-03 and 04, T3's automatic tuning: every 30 s, times the self-throttling's factor.</summary>
     public TimeSpan TuningEvery { get; init; } = TimeSpan.FromSeconds(30);
 
-    /// <summary>How soon a read that failed is tried again, at the latest by the next scheduled read.</summary>
+    /// <summary>How soon an interval read that failed, or waited for a slowed observer, is tried again: at the latest, the next scheduled read.</summary>
     public TimeSpan Retry { get; init; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>The timeout of RCA-SQL-15 and of RCA-AZ-03 and 04, which read a few rows.</summary>
+    public TimeSpan LightTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>The timeout of one block of an interval read: RCA-SQL-10, 11, or 14.</summary>
+    public TimeSpan ReadTimeout { get; init; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>A block runs in a tick only when its timeout would end at least this long before the evidence capture's next work.</summary>
+    public TimeSpan Margin { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>The observer's end: its Query Store reads together, each block's timeout cut to what's left of this.</summary>
+    public TimeSpan EndBudget { get; init; } = TimeSpan.FromSeconds(10);
 
     /// <summary>RCA-SQL-10's TOP: a read that returns this many rows may have been cut, so the next page reads on.</summary>
     public int RowCap { get; init; } = 600;
@@ -36,29 +40,37 @@ internal sealed record SqlQueryStoreOptions
     /// <summary>Plans whose showplan one read fetches: forced plans first, then by their CPU in the read.</summary>
     public int PlansWithXml { get; init; } = 40;
 
-    /// <summary>IDs carried to the next read when RCA-SQL-14 failed.</summary>
+    /// <summary>IDs carried to the next read when RCA-SQL-14 failed or didn't run.</summary>
     public int MaximumCarried { get; init; } = 2000;
+
+    /// <summary>Measures how long a tick's work and the end's reads have taken: durations only, never the time of day.</summary>
+    public TimeProvider Clock { get; init; } = TimeProvider.System;
 }
 
 /// <summary>
-/// Query Store's evidence on T1, T2, and T3 (rca/README.md, The sidecar and Query Store), read by the target's observer
-/// on its one connection and written to the sidecar's sink, never to the evidence document's store:
+/// Query Store's evidence on T1, T2, and T3 (rca/README.md, The sidecar and Query Store), read on the target's observer
+/// connection and written to the sidecar's sink, never to the evidence document's store:
 /// <list type="bullet">
 /// <item>RCA-SQL-15 every 60 s: Query Store's state, and a plan forced or unforced (RCA Query Events);</item>
 /// <item>on T3, RCA-AZ-03 and 04 every 30 s: automatic tuning's options and recommendations (RCA Query Events);</item>
-/// <item>RCA-SQL-10, 11, and 14 at the observer's first tick for the 2 hours before its start, then 2 minutes after each
-/// interval ends for the intervals that ended since, and at its end with the interval still open: each interval's top
-/// queries (RCA Query Stats), their plans' three largest wait categories (RCA Query Waits), and their plans (RCA Query
-/// Plans), each plan's showplan reduced once per observation;</item>
-/// <item>after each of those reads and at the end, one RCA Query Coverage row for the time since the previous one: the
-/// state and capture mode as last read, the intervals read, the blocks that returned rows, and the gaps. The sidecar's
-/// export makes one row a target of a sidecar's rows: the earliest start and latest end, the latest state, capture mode,
-/// and interval, the first interval read and the last, every source, and every gap in time order.</item>
+/// <item>an interval read of RCA-SQL-10, 11, and 14, at the observer's first tick for the 2 hours before its start, then
+/// 2 minutes after each interval ends for the intervals that ended since, and at its end with the interval still open:
+/// each interval's top queries (RCA Query Stats), their plans' three largest wait categories (RCA Query Waits), and their
+/// plans (RCA Query Plans), each plan's showplan reduced once per observation;</item>
+/// <item>after each interval read, one RCA Query Coverage row for the time since the previous one: the state and capture
+/// mode as last read, the intervals read, the blocks that returned rows, and the gaps. The sidecar's export makes one row
+/// a target of a sidecar's rows: the earliest start and latest end, the latest state, capture mode, and interval, the
+/// first interval read and the last, every source, and every gap in time order.</item>
 /// </list>
+/// The reads leave the evidence document as it would be without them (<see cref="ISidecarAccess"/>): a failure is a
+/// sidecar gap; they run last in a tick, a block only when its timeout ends before the evidence capture's next work, and
+/// at most one block of an interval read a tick; the state's and tuning's cadence is multiplied by the self-throttling's
+/// factor, and while the observer is slowed or has stopped its detail capture, no interval read starts (Query Store keeps
+/// the intervals, and the next read takes them); the end's reads together take at most <see cref="SqlQueryStoreOptions.EndBudget"/>.
 /// The capture leaves out its own statements and the harness's by the blocks' two fixed rules (rca/README.md, What the
 /// capture leaves out), and nothing else; the reader takes no list from anywhere to leave something out.
 /// </summary>
-internal sealed class SqlQueryStoreReader(string target, bool automaticTuning, ISidecarSink sink, QueryStoreRun run, SqlQueryStoreOptions? options = null)
+internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticTuning, ISidecarSink sink, SqlQueryStoreOptions? options = null)
 {
     private static readonly string[] SourceOrder =
     [
@@ -66,8 +78,9 @@ internal sealed class SqlQueryStoreReader(string target, bool automaticTuning, I
         SqlAutomaticTuning.OptionsBlock, SqlAutomaticTuning.RecommendationsBlock,
     ];
 
+    private readonly string target = access.Target;
     private readonly SqlQueryStoreOptions settings = options ?? new SqlQueryStoreOptions();
-    private readonly SqlAutomaticTuning tuning = new(target);
+    private readonly SqlAutomaticTuning tuning = new(access.Target);
     private readonly Dictionary<long, SentPlan> sent = [];
     private readonly Dictionary<long, PlanShape?> reduced = [];
     private readonly HashSet<long> carriedQueries = [];
@@ -77,6 +90,7 @@ internal sealed class SqlQueryStoreReader(string target, bool automaticTuning, I
     private readonly Dictionary<string, DateTimeOffset> noted = new(StringComparer.Ordinal);
     private QueryStoreSchedule schedule = QueryStoreSchedule.Default;
     private SqlQueryStoreState? state;
+    private IntervalRead? read;
     private DateTimeOffset since;
     private DateTimeOffset nextState;
     private DateTimeOffset nextTuning;
@@ -85,17 +99,26 @@ internal sealed class SqlQueryStoreReader(string target, bool automaticTuning, I
     private DateTimeOffset? readFrom;
     private DateTimeOffset? readTo;
 
-    /// <summary>When the reader next has work.</summary>
-    public DateTimeOffset NextDue => new[] { nextState, automaticTuning ? nextTuning : DateTimeOffset.MaxValue, nextRead }.Min();
+    private enum Phase
+    {
+        Stats,
+        Waits,
+        Plans,
+        Done,
+    }
 
     /// <summary>The end of the last interval read: the next read asks for the intervals that ended after it.</summary>
     public DateTimeOffset Since => since;
+
+    /// <summary>A timestamp of the reader's clock, which the observer takes at its tick's start, so the tick's evidence work counts against the reads' room.</summary>
+    public long Timestamp() => settings.Clock.GetTimestamp();
 
     /// <summary>A new observation: nothing read yet, and every read due at the first tick.</summary>
     public void Begin(DateTimeOffset now)
     {
         schedule = settings.Schedule;
         state = null;
+        read = null;
         tuning.Reset();
         sent.Clear();
         reduced.Clear();
@@ -113,49 +136,151 @@ internal sealed class SqlQueryStoreReader(string target, bool automaticTuning, I
         readTo = null;
     }
 
-    /// <summary>Runs the reads that are due; returns when the next is.</summary>
-    public async Task<DateTimeOffset> TickAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    /// <summary>
+    /// The reads that are due and fit before <paramref name="evidenceDue"/>, the evidence capture's next work, counting
+    /// from <paramref name="tickStarted"/> (<see cref="Timestamp"/>): the state, T3's tuning, and one block of the interval
+    /// read. Each read's next time is set before it runs, so one that fails or throws waits its turn. Returns when the
+    /// reader next has work it could do.
+    /// </summary>
+    public async Task<DateTimeOffset> TickAsync(DateTimeOffset now, long tickStarted, DateTimeOffset evidenceDue, CancellationToken cancellationToken)
     {
-        if (now >= nextState)
+        var room = evidenceDue - now;
+        bool Fits(TimeSpan timeout) => room - settings.Clock.GetElapsedTime(tickStarted) >= timeout + settings.Margin;
+
+        if (now >= nextState && Fits(settings.LightTimeout))
         {
-            await ReadStateAsync(now, cancellationToken).ConfigureAwait(false);
-            nextState = now + settings.StateEvery;
+            nextState = now + Scaled(settings.StateEvery);
+            await ReadStateAsync(now, () => settings.LightTimeout, cancellationToken).ConfigureAwait(false);
         }
 
-        if (automaticTuning && now >= nextTuning)
+        if (automaticTuning && now >= nextTuning && Fits(settings.LightTimeout + settings.LightTimeout))
         {
-            await ReadTuningAsync(now, cancellationToken).ConfigureAwait(false);
-            nextTuning = now + settings.TuningEvery;
+            nextTuning = now + Scaled(settings.TuningEvery);
+            await ReadTuningAsync(now, () => settings.LightTimeout, cancellationToken).ConfigureAwait(false);
         }
 
-        if (now >= nextRead)
+        if (read is null && now >= nextRead)
         {
-            var complete = await ReadIntervalsAsync(now, final: false, cancellationToken).ConfigureAwait(false);
-            var scheduled = schedule.NextRead(now);
-            nextRead = complete || now + settings.Retry >= scheduled ? scheduled : now + settings.Retry;
+            if (Held(now))
+            {
+                nextRead = now + settings.Retry;
+            }
+            else if (Fits(settings.ReadTimeout))
+            {
+                read = new IntervalRead(final: false, carriedQueries, carriedPlans);
+            }
         }
 
-        return NextDue;
-    }
+        if (read is { } current && Fits(settings.ReadTimeout))
+        {
+            try
+            {
+                await AdvanceAsync(current, now, () => settings.ReadTimeout, oneBlock: true, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                // It starts again later from the same since; the IDs it had read wait for the next read's plans.
+                Abandon(current);
+                nextRead = now + settings.Retry;
+                throw;
+            }
+        }
 
-    /// <summary>The observer's end: the state, T3's tuning, and the intervals since the last read with the one still open.</summary>
-    public async Task EndAsync(DateTimeOffset now, CancellationToken cancellationToken)
-    {
-        await ReadStateAsync(now, cancellationToken).ConfigureAwait(false);
+        // A read that's due but doesn't fit runs once the evidence capture's next work is done.
+        DateTimeOffset When(DateTimeOffset due, TimeSpan timeout) => due > now ? due : Fits(timeout) ? now : evidenceDue;
+        var wake = When(nextState, settings.LightTimeout);
         if (automaticTuning)
         {
-            await ReadTuningAsync(now, cancellationToken).ConfigureAwait(false);
+            wake = Earliest(wake, When(nextTuning, settings.LightTimeout + settings.LightTimeout));
         }
 
-        await ReadIntervalsAsync(now, final: true, cancellationToken).ConfigureAwait(false);
+        return Earliest(wake, When(read is null ? nextRead : now, settings.ReadTimeout));
     }
 
-    private async Task ReadStateAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    /// <summary>
+    /// The observer's end, after the evidence capture's own: the state, T3's tuning, and the intervals since the last read
+    /// with the one still open, within <see cref="SqlQueryStoreOptions.EndBudget"/>. A read the end cut short, by its
+    /// budget or the observer's cancellation, is a gap that says which intervals weren't read.
+    /// </summary>
+    public async Task EndAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
-        var rows = await run(SqlQueryStoreRows.StateBlock, now, CaptureParameters.None, false, cancellationToken).ConfigureAwait(false);
-        if (rows is null)
+        var started = settings.Clock.GetTimestamp();
+        TimeSpan? Left(TimeSpan own)
         {
-            GapOnce(now, "state", $"Query Store's state (RCA-SQL-15) wasn't read on {target}: the read failed, and RCA Coverage says why.");
+            var left = settings.EndBudget - settings.Clock.GetElapsedTime(started);
+            return left < TimeSpan.FromSeconds(1) ? null : left < own ? left : own;
+        }
+
+        if (read is { } open)
+        {
+            Abandon(open);
+        }
+
+        var final = read = new IntervalRead(final: true, carriedQueries, carriedPlans);
+        try
+        {
+            await ReadStateAsync(now, () => Left(settings.LightTimeout), cancellationToken).ConfigureAwait(false);
+            if (automaticTuning)
+            {
+                await ReadTuningAsync(now, () => Left(settings.LightTimeout), cancellationToken).ConfigureAwait(false);
+            }
+
+            await AdvanceAsync(final, now, () => Left(settings.ReadTimeout), oneBlock: false, cancellationToken).ConfigureAwait(false);
+            if (final.Phase != Phase.Done)
+            {
+                Gap(now, string.Create(CultureInfo.InvariantCulture, $"The end's Query Store reads on {target} stopped at their bound of {settings.EndBudget.TotalSeconds:0} s, before {Unread(final)}."));
+                Finish(final, now);
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Gap(now, $"The end's Query Store reads on {target} were cut short with the observer's end, before {Unread(final)}.");
+            if (final.Phase != Phase.Done)
+            {
+                Finish(final, now);
+            }
+        }
+    }
+
+    private static DateTimeOffset Earliest(DateTimeOffset first, DateTimeOffset second) => first <= second ? first : second;
+
+    /// <summary>What an interval read cut short didn't reach.</summary>
+    private string Unread(IntervalRead current) => current.Phase switch
+    {
+        Phase.Waits => "the waits of the last intervals they read",
+        Phase.Plans => "the plans of the queries they read",
+        _ => string.Create(CultureInfo.InvariantCulture, $"the intervals that ended after {since:HH:mm} UTC"),
+    };
+
+    /// <summary>While the observer is slowed or has stopped its detail capture, no interval read starts: Query Store keeps the intervals.</summary>
+    private bool Held(DateTimeOffset now)
+    {
+        if (access.Factor <= 1 && !access.DetailStopped)
+        {
+            return false;
+        }
+
+        var why = access.DetailStopped
+            ? "the observer stopped its detail capture for the rest of the session, so the end's read takes them"
+            : string.Create(CultureInfo.InvariantCulture, $"the observer's samples are slow (its cadence is {access.Factor} times longer), so a read takes them once they're quick again, or the end's read");
+        GapOnce(now, "held", string.Create(CultureInfo.InvariantCulture, $"Query Store's interval reads on {target} wait from {now:HH:mm:ss} UTC: {why}. Query Store keeps the intervals that ended after {since:HH:mm} UTC."));
+        return true;
+    }
+
+    private TimeSpan Scaled(TimeSpan every) => every * Math.Max(1, access.Factor);
+
+    private async Task ReadStateAsync(DateTimeOffset now, Func<TimeSpan?> timeout, CancellationToken cancellationToken)
+    {
+        if (timeout() is not { } limit)
+        {
+            Gap(now, $"Query Store's state (RCA-SQL-15) wasn't read on {target} at the end: the end's reads had no time left.");
+            return;
+        }
+
+        var result = await access.RunAsync(SqlQueryStoreRows.StateBlock, now, CaptureParameters.None, limit, cancellationToken).ConfigureAwait(false);
+        if (result.Rows is not { } rows)
+        {
+            GapOnce(now, "state", $"Query Store's state (RCA-SQL-15) wasn't read on {target}: {result.Message}");
             return;
         }
 
@@ -193,162 +318,208 @@ internal sealed class SqlQueryStoreReader(string target, bool automaticTuning, I
         state = current;
     }
 
-    private async Task ReadTuningAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    private async Task ReadTuningAsync(DateTimeOffset now, Func<TimeSpan?> timeout, CancellationToken cancellationToken)
     {
-        var options = await run(SqlAutomaticTuning.OptionsBlock, now, CaptureParameters.None, false, cancellationToken).ConfigureAwait(false);
-        if (options is null)
+        if (timeout() is not { } first)
         {
-            GapOnce(now, "tuning-options", $"Automatic tuning's options (RCA-AZ-03) weren't read on {target}: the read failed, and RCA Coverage says why.");
-        }
-        else
-        {
-            Returned(SqlAutomaticTuning.OptionsBlock, options);
-            tuning.Options(options, now).ForEach(sink.Write);
-        }
-
-        var recommendations = await run(SqlAutomaticTuning.RecommendationsBlock, now, CaptureParameters.None, false, cancellationToken).ConfigureAwait(false);
-        if (recommendations is null)
-        {
-            GapOnce(now, "tuning-recommendations", $"Automatic tuning's recommendations (RCA-AZ-04) weren't read on {target}: the read failed, and RCA Coverage says why.");
-        }
-        else
-        {
-            Returned(SqlAutomaticTuning.RecommendationsBlock, recommendations);
-            tuning.Recommendations(recommendations, now).ForEach(sink.Write);
-        }
-    }
-
-    /// <summary>RCA-SQL-10 (in pages, when a read hits its cap) and RCA-SQL-11, then RCA-SQL-14, then a coverage row. False when a read failed.</summary>
-    private async Task<bool> ReadIntervalsAsync(DateTimeOffset now, bool final, CancellationToken cancellationToken)
-    {
-        var queries = new HashSet<long>(carriedQueries);
-        var plans = new HashSet<long>(carriedPlans);
-        var cpu = new Dictionary<long, double>();
-        var complete = true;
-        for (var page = 1; ; page++)
-        {
-            var from = since;
-            var rows = await run(SqlQueryStoreRows.StatsBlock, now, CaptureParameters.Named(("@since", from), ("@final", final)), true, cancellationToken).ConfigureAwait(false);
-            if (rows is null)
-            {
-                Gap(now, string.Create(CultureInfo.InvariantCulture, $"Query Store's statistics (RCA-SQL-10) weren't read on {target}: the read failed, and RCA Coverage says why. {(final ? "The next observation's first read takes those of its intervals that ended in its look-back" : "The next read takes the intervals that ended after " + from.ToString("HH:mm", CultureInfo.InvariantCulture) + " UTC")}."));
-                complete = false;
-                break;
-            }
-
-            Returned(SqlQueryStoreRows.StatsBlock, rows);
-            var kept = rows.Select(r => SqlQueryStoreRows.Stats(target, r, now)).OfType<CaptureRow>().ToList();
-            var intervals = kept.Select(SqlQueryStoreRows.Interval).Distinct().OrderBy(i => i.Start).ToList();
-            var capped = rows.Count >= settings.RowCap;
-            if (capped && intervals.Count > 1)
-            {
-                // The block returns the oldest intervals first: its last one may have been cut, so the next page reads it whole.
-                var cut = intervals[^1];
-                kept.RemoveAll(r => SqlQueryStoreRows.Interval(r) == cut);
-                intervals.RemoveAt(intervals.Count - 1);
-            }
-            else if (capped && intervals.Count == 1)
-            {
-                Gap(now, string.Create(CultureInfo.InvariantCulture, $"Query Store's interval from {intervals[0].Start:HH:mm} to {intervals[0].End:HH:mm} UTC on {target} had more than {settings.RowCap} rows in its top lists; the observer kept the {settings.RowCap} that used the most CPU."));
-            }
-
-            if (kept.Count == 0)
-            {
-                break;
-            }
-
-            foreach (var row in kept)
-            {
-                sink.Write(row);
-                var plan = (long)row.Get("plan_id")!;
-                queries.Add((long)row.Get("query_id")!);
-                plans.Add(plan);
-                cpu[plan] = cpu.GetValueOrDefault(plan) + (row.Get("cpu_ms") as double? ?? 0);
-            }
-
-            readFrom = readFrom is { } first && first <= intervals[0].Start ? first : intervals[0].Start;
-            var newest = intervals.Max(i => i.End);
-            readTo = readTo is { } last && last >= newest ? last : newest;
-            await ReadWaitsAsync(now, from, final, kept, cancellationToken).ConfigureAwait(false);
-            since = newest > since ? newest : since;
-            if (!capped)
-            {
-                break;
-            }
-
-            if (page >= settings.MaximumPages)
-            {
-                Gap(now, string.Create(CultureInfo.InvariantCulture, $"Query Store on {target} had more top-list rows than {settings.MaximumPages} pages of {settings.RowCap} take; {(final ? "the next observation's first read takes those that ended in its look-back" : "the next read takes the intervals that ended after " + since.ToString("HH:mm", CultureInfo.InvariantCulture) + " UTC")}."));
-                break;
-            }
-        }
-
-        await ReadPlansAsync(now, queries, plans, cpu, cancellationToken).ConfigureAwait(false);
-        WriteCoverage(now);
-        return complete;
-    }
-
-    /// <summary>RCA-SQL-11 for the plans one page returned: only the waits of the intervals and plans the page kept.</summary>
-    private async Task ReadWaitsAsync(DateTimeOffset now, DateTimeOffset from, bool final, List<CaptureRow> kept, CancellationToken cancellationToken)
-    {
-        var pairs = kept.Select(r => (SqlQueryStoreRows.Interval(r).Start, (long)r.Get("plan_id")!)).ToHashSet();
-        var parameters = CaptureParameters.Named(("@since", from), ("@final", final), ("@plans", SqlQueryStoreRows.Ids(pairs.Select(p => p.Item2))));
-        var rows = await run(SqlQueryStoreRows.WaitsBlock, now, parameters, true, cancellationToken).ConfigureAwait(false);
-        if (rows is null)
-        {
-            Gap(now, $"Query Store's waits (RCA-SQL-11) weren't read on {target}: the read failed, and RCA Coverage says why; the statistics' wait_ms holds each plan's total.");
+            Gap(now, $"Automatic tuning (RCA-AZ-03, 04) wasn't read on {target} at the end: the end's reads had no time left.");
             return;
         }
 
-        Returned(SqlQueryStoreRows.WaitsBlock, rows);
-        foreach (var row in rows)
+        var options = await access.RunAsync(SqlAutomaticTuning.OptionsBlock, now, CaptureParameters.None, first, cancellationToken).ConfigureAwait(false);
+        if (options.Rows is { } optionRows)
         {
-            if (SqlQueryStoreRows.Wait(target, row, now) is { } wait && pairs.Contains((SqlQueryStoreRows.Interval(wait).Start, (long)wait.Get("plan_id")!)))
-            {
-                sink.Write(wait);
-            }
+            Returned(SqlAutomaticTuning.OptionsBlock, optionRows);
+            tuning.Options(optionRows, now).ForEach(sink.Write);
+        }
+        else
+        {
+            GapOnce(now, "tuning-options", $"Automatic tuning's options (RCA-AZ-03) weren't read on {target}: {options.Message}");
+        }
+
+        if (timeout() is not { } second)
+        {
+            Gap(now, $"Automatic tuning's recommendations (RCA-AZ-04) weren't read on {target} at the end: the end's reads had no time left.");
+            return;
+        }
+
+        var recommendations = await access.RunAsync(SqlAutomaticTuning.RecommendationsBlock, now, CaptureParameters.None, second, cancellationToken).ConfigureAwait(false);
+        if (recommendations.Rows is { } recommendationRows)
+        {
+            Returned(SqlAutomaticTuning.RecommendationsBlock, recommendationRows);
+            tuning.Recommendations(recommendationRows, now).ForEach(sink.Write);
+        }
+        else
+        {
+            GapOnce(now, "tuning-recommendations", $"Automatic tuning's recommendations (RCA-AZ-04) weren't read on {target}: {recommendations.Message}");
         }
     }
 
     /// <summary>
-    /// RCA-SQL-14 for the read's queries and plans: a plan's row when it wasn't written in this observation, or when its
-    /// forcing, its forcing failures, or its last compile changed, or its summary is new. A plan's showplan is fetched
-    /// once per observation, at most <see cref="SqlQueryStoreOptions.PlansWithXml"/> a read.
+    /// Runs the interval read's blocks in order, RCA-SQL-10 and 11 page by page, then RCA-SQL-14, then its coverage row:
+    /// one block at most with <paramref name="oneBlock"/>, and none once <paramref name="timeout"/> has no time left. A step
+    /// with no block to run, such as RCA-SQL-14 with nothing to ask, doesn't count.
     /// </summary>
-    private async Task ReadPlansAsync(DateTimeOffset now, HashSet<long> queries, HashSet<long> plans, Dictionary<long, double> cpu, CancellationToken cancellationToken)
+    private async Task AdvanceAsync(IntervalRead current, DateTimeOffset now, Func<TimeSpan?> timeout, bool oneBlock, CancellationToken cancellationToken)
     {
-        var forced = state?.Forced.Keys.Select(k => k.Plan).ToHashSet() ?? [];
-        var unsentForcing = forced.Any(p => !sent.TryGetValue(p, out var s) || s.Forced != true);
-        if (queries.Count == 0 && plans.Count == 0 && !unsentForcing)
+        var blocks = 0;
+        while (current.Phase != Phase.Done)
         {
+            if (current.Phase == Phase.Plans && !HasPlansToRead(current))
+            {
+                Finish(current, now);
+                return;
+            }
+
+            if ((oneBlock && blocks > 0) || timeout() is not { } limit)
+            {
+                return;
+            }
+
+            blocks++;
+            switch (current.Phase)
+            {
+                case Phase.Stats:
+                    await StatsAsync(current, now, limit, cancellationToken).ConfigureAwait(false);
+                    break;
+                case Phase.Waits:
+                    await WaitsAsync(current, now, limit, cancellationToken).ConfigureAwait(false);
+                    break;
+                default:
+                    await PlansAsync(current, now, limit, cancellationToken).ConfigureAwait(false);
+                    Finish(current, now);
+                    break;
+            }
+        }
+    }
+
+    /// <summary>One page of RCA-SQL-10: the intervals that ended after <see cref="since"/>, the oldest first.</summary>
+    private async Task StatsAsync(IntervalRead current, DateTimeOffset now, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        current.From = since;
+        current.Pages++;
+        var result = await access.RunAsync(SqlQueryStoreRows.StatsBlock, now, CaptureParameters.Named(("@since", current.From), ("@final", current.Final)), timeout, cancellationToken).ConfigureAwait(false);
+        if (result.Rows is not { } rows)
+        {
+            current.Complete = false;
+            current.Phase = Phase.Plans;
+            GapOnce(now, "stats", $"Query Store's statistics (RCA-SQL-10) weren't read on {target}: {result.Message} {Then(current.Final, current.From)}");
             return;
         }
 
-        var withPlan = plans.Union(forced)
+        Returned(SqlQueryStoreRows.StatsBlock, rows);
+        var kept = rows.Select(r => SqlQueryStoreRows.Stats(target, r, now)).OfType<CaptureRow>().ToList();
+        var intervals = kept.Select(SqlQueryStoreRows.Interval).Distinct().OrderBy(i => i.Start).ToList();
+        current.Capped = rows.Count >= settings.RowCap;
+        if (current.Capped && intervals.Count > 1)
+        {
+            // The block returns the oldest intervals first: its last one may have been cut, so the next page reads it whole.
+            var cut = intervals[^1];
+            kept.RemoveAll(r => SqlQueryStoreRows.Interval(r) == cut);
+            intervals.RemoveAt(intervals.Count - 1);
+        }
+        else if (current.Capped && intervals.Count == 1)
+        {
+            Gap(now, string.Create(CultureInfo.InvariantCulture, $"Query Store's interval from {intervals[0].Start:HH:mm} to {intervals[0].End:HH:mm} UTC on {target} had more than {settings.RowCap} rows in its top lists; the observer kept the {settings.RowCap} that used the most CPU."));
+        }
+
+        if (kept.Count == 0)
+        {
+            current.Phase = Phase.Plans;
+            return;
+        }
+
+        foreach (var row in kept)
+        {
+            sink.Write(row);
+            var plan = (long)row.Get("plan_id")!;
+            current.Queries.Add((long)row.Get("query_id")!);
+            current.Plans.Add(plan);
+            current.Cpu[plan] = current.Cpu.GetValueOrDefault(plan) + (row.Get("cpu_ms") as double? ?? 0);
+        }
+
+        readFrom = readFrom is { } first && first <= intervals[0].Start ? first : intervals[0].Start;
+        var newest = intervals.Max(i => i.End);
+        readTo = readTo is { } last && last >= newest ? last : newest;
+        current.Kept = kept;
+        current.Phase = Phase.Waits;
+    }
+
+    /// <summary>RCA-SQL-11 for the plans the page kept: only the waits of the intervals and plans it kept. Then the next page, or the plans.</summary>
+    private async Task WaitsAsync(IntervalRead current, DateTimeOffset now, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var kept = current.Kept;
+        var pairs = kept.Select(r => (SqlQueryStoreRows.Interval(r).Start, (long)r.Get("plan_id")!)).ToHashSet();
+        var parameters = CaptureParameters.Named(("@since", current.From), ("@final", current.Final), ("@plans", SqlQueryStoreRows.Ids(pairs.Select(p => p.Item2))));
+        var result = await access.RunAsync(SqlQueryStoreRows.WaitsBlock, now, parameters, timeout, cancellationToken).ConfigureAwait(false);
+        if (result.Rows is { } rows)
+        {
+            Returned(SqlQueryStoreRows.WaitsBlock, rows);
+            foreach (var row in rows)
+            {
+                if (SqlQueryStoreRows.Wait(target, row, now) is { } wait && pairs.Contains((SqlQueryStoreRows.Interval(wait).Start, (long)wait.Get("plan_id")!)))
+                {
+                    sink.Write(wait);
+                }
+            }
+        }
+        else
+        {
+            GapOnce(now, "waits", $"Query Store's waits (RCA-SQL-11) weren't read on {target}: {result.Message} The statistics' wait_ms holds each plan's total.");
+        }
+
+        var newest = kept.Max(r => SqlQueryStoreRows.Interval(r).End);
+        since = newest > since ? newest : since;
+        current.Kept = [];
+        if (!current.Capped)
+        {
+            current.Phase = Phase.Plans;
+        }
+        else if (current.Pages >= settings.MaximumPages)
+        {
+            Gap(now, string.Create(CultureInfo.InvariantCulture, $"Query Store on {target} had more top-list rows than {settings.MaximumPages} pages of {settings.RowCap} take. {Then(current.Final, since)}"));
+            current.Phase = Phase.Plans;
+        }
+        else
+        {
+            current.Phase = Phase.Stats;
+        }
+    }
+
+    private bool HasPlansToRead(IntervalRead current) =>
+        current.Queries.Count > 0 || current.Plans.Count > 0 || ForcedPlans().Any(p => !sent.TryGetValue(p, out var s) || s.Forced != true);
+
+    private HashSet<long> ForcedPlans() => state?.Forced.Keys.Select(k => k.Plan).ToHashSet() ?? [];
+
+    /// <summary>
+    /// RCA-SQL-14 for the read's queries and plans: a plan's row when it wasn't written in this observation, or when its
+    /// forcing, its forcing failures, or its last compile changed, or its summary is new. A plan's showplan is fetched
+    /// once per observation, at most <see cref="SqlQueryStoreOptions.PlansWithXml"/> a read, and only up to
+    /// <see cref="PlanSummary.MaximumXmlBytes"/>; one past that is a gap that says its size.
+    /// </summary>
+    private async Task PlansAsync(IntervalRead current, DateTimeOffset now, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var forced = ForcedPlans();
+        var withPlan = current.Plans.Union(forced)
             .Where(p => !reduced.ContainsKey(p))
             .OrderByDescending(forced.Contains)
-            .ThenByDescending(p => cpu.GetValueOrDefault(p))
+            .ThenByDescending(p => current.Cpu.GetValueOrDefault(p))
             .ThenBy(p => p)
             .Take(settings.PlansWithXml)
-            .ToList();
-        var parameters = CaptureParameters.Named(("@queries", SqlQueryStoreRows.Ids(queries)), ("@plans", SqlQueryStoreRows.Ids(plans)), ("@with_plan", SqlQueryStoreRows.Ids(withPlan)));
-        var rows = await run(SqlQueryStoreRows.PlansBlock, now, parameters, true, cancellationToken).ConfigureAwait(false);
-        if (rows is null)
+            .ToHashSet();
+        var parameters = CaptureParameters.Named(("@queries", SqlQueryStoreRows.Ids(current.Queries)), ("@plans", SqlQueryStoreRows.Ids(current.Plans)), ("@with_plan", SqlQueryStoreRows.Ids(withPlan)));
+        var result = await access.RunAsync(SqlQueryStoreRows.PlansBlock, now, parameters, timeout, cancellationToken).ConfigureAwait(false);
+        if (result.Rows is not { } rows)
         {
-            Carry(carriedQueries, queries);
-            Carry(carriedPlans, plans);
-            Gap(now, $"Query Store's plans (RCA-SQL-14) weren't read on {target}: the read failed, and RCA Coverage says why; the next read asks for them again.");
+            Carry(carriedQueries, current.Queries);
+            Carry(carriedPlans, current.Plans);
+            GapOnce(now, "plans", $"Query Store's plans (RCA-SQL-14) weren't read on {target}: {result.Message} The next read asks for them again.");
             return;
         }
 
         Returned(SqlQueryStoreRows.PlansBlock, rows);
         carriedQueries.Clear();
         carriedPlans.Clear();
-        foreach (var plan in withPlan)
-        {
-            reduced.TryAdd(plan, null);
-        }
-
         foreach (var row in rows)
         {
             if (row.Long("plan_id") is not { } plan)
@@ -356,13 +527,9 @@ internal sealed class SqlQueryStoreReader(string target, bool automaticTuning, I
                 continue;
             }
 
-            if (row.Text("query_plan") is { Length: > 0 } xml)
+            if (withPlan.Contains(plan) && !reduced.ContainsKey(plan))
             {
-                reduced[plan] = PlanSummary.Reduce(xml, out var problem);
-                if (problem is not null)
-                {
-                    Gap(now, string.Create(CultureInfo.InvariantCulture, $"Plan {plan} on {target} has no summary: {problem}."));
-                }
+                reduced[plan] = Summarize(row, plan, now);
             }
 
             var shape = reduced.GetValueOrDefault(plan);
@@ -378,7 +545,66 @@ internal sealed class SqlQueryStoreReader(string target, bool automaticTuning, I
                 sent[plan] = key;
             }
         }
+
+        // A plan asked for with its showplan that the read didn't return isn't asked for again in this observation.
+        foreach (var plan in withPlan)
+        {
+            reduced.TryAdd(plan, null);
+        }
     }
+
+    /// <summary>A plan's shape from the showplan RCA-SQL-14 returned, or null with a gap that says why it has none.</summary>
+    private PlanShape? Summarize(CaptureValues row, long plan, DateTimeOffset now)
+    {
+        string? problem;
+        PlanShape? shape = null;
+        if (row.Text("query_plan") is { Length: > 0 } xml)
+        {
+            shape = PlanSummary.Reduce(xml, out problem);
+        }
+        else if (row.Long("query_plan_bytes") is { } bytes && bytes > PlanSummary.MaximumXmlBytes)
+        {
+            problem = string.Create(CultureInfo.InvariantCulture, $"its showplan has {bytes:N0} bytes, more than the {PlanSummary.MaximumXmlBytes:N0} the observer reads");
+        }
+        else
+        {
+            PlanSummary.Reduce(null, out problem);
+        }
+
+        if (problem is not null)
+        {
+            Gap(now, string.Create(CultureInfo.InvariantCulture, $"Plan {plan} on {target} has no summary: {problem}."));
+        }
+
+        return shape;
+    }
+
+    /// <summary>The read is done: its coverage row, and when the next one starts.</summary>
+    private void Finish(IntervalRead current, DateTimeOffset now)
+    {
+        current.Phase = Phase.Done;
+        WriteCoverage(now);
+        if (!current.Final)
+        {
+            var scheduled = schedule.NextRead(now);
+            nextRead = current.Complete || now + settings.Retry >= scheduled ? scheduled : now + settings.Retry;
+        }
+
+        read = null;
+    }
+
+    /// <summary>A read given up before its plans: the IDs it had read wait for the next read's.</summary>
+    private void Abandon(IntervalRead current)
+    {
+        Carry(carriedQueries, current.Queries);
+        Carry(carriedPlans, current.Plans);
+        read = null;
+    }
+
+    /// <summary>What happens to the intervals a failed read didn't take.</summary>
+    private static string Then(bool final, DateTimeOffset from) => final
+        ? "The next observation's first read takes those of them that ended in its look-back."
+        : string.Create(CultureInfo.InvariantCulture, $"The next read takes the intervals that ended after {from:HH:mm} UTC.");
 
     /// <summary>One RCA Query Coverage row for the time since the previous one; the next row starts where it ends.</summary>
     private void WriteCoverage(DateTimeOffset now)
@@ -454,4 +680,31 @@ internal sealed class SqlQueryStoreReader(string target, bool automaticTuning, I
 
     /// <summary>What a plan's last written row said: a change to any of it writes the plan again.</summary>
     private sealed record SentPlan(bool? Forced, string? ForcingType, long? Failures, DateTimeOffset? LastCompiled, bool Summarized);
+
+    /// <summary>One interval read: RCA-SQL-10 and 11 page by page, then RCA-SQL-14, then its coverage row.</summary>
+    private sealed class IntervalRead(bool final, IEnumerable<long> queries, IEnumerable<long> plans)
+    {
+        public bool Final { get; } = final;
+
+        public Phase Phase { get; set; } = Phase.Stats;
+
+        public int Pages { get; set; }
+
+        /// <summary>The since of the page being read.</summary>
+        public DateTimeOffset From { get; set; }
+
+        public bool Capped { get; set; }
+
+        /// <summary>The page's statistics, whose waits come next.</summary>
+        public List<CaptureRow> Kept { get; set; } = [];
+
+        public HashSet<long> Queries { get; } = [.. queries];
+
+        public HashSet<long> Plans { get; } = [.. plans];
+
+        public Dictionary<long, double> Cpu { get; } = [];
+
+        /// <summary>False once RCA-SQL-10 failed: the next read comes sooner.</summary>
+        public bool Complete { get; set; } = true;
+    }
 }

@@ -15,8 +15,9 @@ namespace ContosoCare.Workload.Rca.Observer;
 /// minutes and at the end. The event session ContosoCare_RCA is created at the start (after dropping one left behind)
 /// and dropped at the end (ADR 0010's amendment). On T3 it's database-scoped
 /// (https://learn.microsoft.com/azure/azure-sql/database/xevent-db-diff-from-svr). With a sidecar sink, Query Store's
-/// reads too (<see cref="SqlQueryStoreReader"/>), after the sentinel in each tick, and their last read after the event
-/// session's drop; the default sink keeps nothing, so then Query Store isn't read at all.
+/// reads too (<see cref="SqlQueryStoreReader"/>), last in each tick, quietly on the observer's connection, and only when
+/// they fit before the evidence's next work; their last read follows the event session's drop. The default sink keeps
+/// nothing, so then Query Store isn't read at all.
 /// </summary>
 internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, ICaptureConnector connector, ObserverOptions options, RunnerLog log, ISidecarSink? sidecar = null, SqlQueryStoreOptions? queryStoreOptions = null)
     : TargetObserver(target, gate, connector, options, log, FixFor(gate))
@@ -69,6 +70,7 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
     public override async Task<DateTimeOffset> TickAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
         var tickStarted = now;
+        var queryStoreStarted = queryStore?.Timestamp() ?? 0;
         if (now >= nextSentinel)
         {
             await SentinelAsync(now, cancellationToken).ConfigureAwait(false);
@@ -87,11 +89,11 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
             nextResourceStats = now + Options.ResourceStats;
         }
 
-        DateTimeOffset? queryStoreDue = queryStore is null ? null : await queryStore.TickAsync(now, cancellationToken).ConfigureAwait(false);
         FlushEscalations();
 
         Sink.Watermark(Target, Earliest(tickStarted - Options.ClockSkew, eventSession ? lastEventRead - Options.EventLatency : null, databaseScoped ? resourceStatsRead - Options.EventLatency - TimeSpan.FromSeconds(15) : null));
-        return Earliest(nextSentinel, blocking.Current is not null && !Cadence.DetailStopped ? nextDetail : null, databaseScoped ? nextResourceStats : null, queryStoreDue);
+        var evidenceDue = Earliest(nextSentinel, blocking.Current is not null && !Cadence.DetailStopped ? nextDetail : null, databaseScoped ? nextResourceStats : null);
+        return queryStore is null ? evidenceDue : Earliest(evidenceDue, await QueryStoreAsync(now, queryStoreStarted, evidenceDue, cancellationToken).ConfigureAwait(false));
     }
 
     protected override async Task StartAsync(DateTimeOffset now, CancellationToken cancellationToken)
@@ -117,7 +119,7 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         if (sidecarSink is not NullSidecarSink)
         {
             // Query Store's first read waits for the first tick, so the sentinel samples first.
-            queryStore ??= new SqlQueryStoreReader(Target, databaseScoped, sidecarSink, RunQueryStoreAsync, queryStoreOptions);
+            queryStore ??= new SqlQueryStoreReader(SidecarAccess, databaseScoped, sidecarSink, queryStoreOptions);
             queryStore.Begin(now);
         }
     }
@@ -140,16 +142,41 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         await DropEventSessionAsync(now, cancellationToken).ConfigureAwait(false);
         if (queryStore is not null)
         {
-            await queryStore.EndAsync(now, cancellationToken).ConfigureAwait(false);
+            // After the evidence capture's end, so its last reads come first; bounded by the reader's own budget.
+            try
+            {
+                await queryStore.EndAsync(now, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+            {
+                QueryStoreFailed(ex);
+            }
         }
     }
 
     /// <summary>
-    /// One of Query Store's reads, through the observer's own handling of a refusal, a timeout, or a lost connection. It
-    /// doesn't feed the self-throttling: the sidecar's reads never change the evidence document's cadence.
+    /// Query Store's reads, last in the tick, after the evidence's rows, their flush, and the watermark: the reads that are
+    /// due and fit before the evidence capture's next work (<see cref="SqlQueryStoreReader"/>). A failure is logged and
+    /// reaches neither the evidence nor the lane; the reader has already set when it reads again.
     /// </summary>
-    private Task<IReadOnlyList<CaptureValues>?> RunQueryStoreAsync(string blockId, DateTimeOffset now, CaptureParameters parameters, bool heavy, CancellationToken cancellationToken) =>
-        RunAsync(blockId, now, parameters, cancellationToken, timed: false, longRunning: heavy);
+    private async Task<DateTimeOffset> QueryStoreAsync(DateTimeOffset now, long started, DateTimeOffset evidenceDue, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await queryStore!.TickAsync(now, started, evidenceDue, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+        {
+            QueryStoreFailed(ex);
+            return evidenceDue;
+        }
+    }
+
+    private void QueryStoreFailed(Exception ex)
+    {
+        Log.Warn("rca.querystore-failed", "Query Store's read failed on this target; the evidence capture goes on, and the read is tried again later.", ("target", Target), ("error", Redactor.Redact(ex.GetType().Name + ": " + ex.Message)));
+        Log.Debug("rca.querystore-failed-detail", ex.ToString(), ("target", Target));
+    }
 
     private static string FixFor(DemoTarget target) => target switch
     {
