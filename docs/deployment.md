@@ -177,6 +177,8 @@ For the Incident RCA's Query Store evidence, which waits on the VMs in sidecars 
 
 [rca/README.md](../rca/README.md#versioning) says what an older runner keeps. Before you deploy older code, take every sidecar into the history with the VMs running: `./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity`, and run it again while its line says sidecars still wait.
 
+Older notebooks leave the sidecar's own tables and files alone. An older activity notebook never writes, reads, or sweeps them. An older deployment notebook's purge drops only the tables it names, so the six `rca_query_*` and `rca_connections` tables and `Files/rca/acks` stay until a newer purge. The sidecars staged in `Files/rca/inbox`, which it removes, stay pending on the VMs, and the next save writes them again.
+
 ## Day to day
 
 ### Run a session: Run all

@@ -126,31 +126,37 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
 
     protected override async Task StopAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
-        if (eventSession)
-        {
-            await ReadEventsAsync(now, cancellationToken).ConfigureAwait(false);
-        }
-
-        if (databaseScoped)
-        {
-            await ResourceStatsAsync(now, cancellationToken).ConfigureAwait(false);
-        }
-
-        FlushEscalations();
-        Close(blocking, now);
-        Close(errors, now);
-        await DropEventSessionAsync(now, cancellationToken).ConfigureAwait(false);
-
-        // The evidence's own end is done: its end time is taken now, for its last watermark and the lane, so Query Store's end
-        // reads don't move the span's end. They run even when the watermark or the lane's hook failed, whose failure then
-        // follows them.
         try
         {
-            EvidenceEnded(now);
+            if (eventSession)
+            {
+                await ReadEventsAsync(now, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (databaseScoped)
+            {
+                await ResourceStatsAsync(now, cancellationToken).ConfigureAwait(false);
+            }
+
+            FlushEscalations();
+            Close(blocking, now);
+            Close(errors, now);
+            await DropEventSessionAsync(now, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            await EndQueryStoreAsync(now, cancellationToken).ConfigureAwait(false);
+            // The evidence's own end is done, or failed (the host stop's limit can cancel it): its end time is taken now,
+            // for its last watermark and the lane, so Query Store's end reads don't move the span's end. They run even when
+            // the evidence's end, the watermark, or the lane's hook failed, and write the sidecar's coverage row, with the
+            // gap that says what a cancelled end didn't read; the failure then follows them.
+            try
+            {
+                EvidenceEnded(now);
+            }
+            finally
+            {
+                await EndQueryStoreAsync(now, cancellationToken).ConfigureAwait(false);
+            }
         }
     }
 

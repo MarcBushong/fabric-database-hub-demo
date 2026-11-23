@@ -1,0 +1,11 @@
+{
+  "kind": "ContosoCare.RcaAckResult",
+  "version": 1,
+  "sent": [
+    "20261120T165000Z-sqlvm01-0001-sidecar",
+    "20261120T170000Z-sqlvm01-0002-sidecar"
+  ],
+  "left": [],
+  "status": "Pass",
+  "message": "2 sidecars acknowledged on sqlvm01, before the start's exports."
+}

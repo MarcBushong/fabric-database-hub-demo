@@ -295,15 +295,16 @@ WHERE pc.counter_name IN (N'Processes blocked', N'Table Lock Escalations/sec', N
 -- an interval ends, for the intervals that ended since the previous read; at the observer's start for the 2 hours before
 -- it; and at its end with @final = 1, which adds the interval still open (Query Store unifies its in-memory and on-disk
 -- data when it's read). T1, T2, T3: Query Store is on in ContosoCare on each, at 15-minute intervals
--- (database/*/030-configure.sql). Parameters: @since datetimeoffset, the end of the last interval read; @final bit.
--- Left out, by two fixed rules and nothing else (rca/README.md, What the capture leaves out): the capture's own
--- statements, which carry the marker dbhubdemo:rca-observer in their text, as this one does; and every statement of a
+-- (database/*/030-configure.sql). Parameters: @since datetimeoffset, the end of the last interval read; @final bit;
+-- @left_out nvarchar(max), a JSON array of the query_ids RCA-SQL-16 found to be the runner's own.
+-- Left out, by three fixed rules and nothing else (rca/README.md, What the capture leaves out): the capture's own
+-- statements, which carry the marker dbhubdemo:rca-observer in their text, as this one does; every statement of a
 -- module the demo marks as its harness (the extended property dbhubdemo.role = harness, which database/common's control
--- script sets on its own modules). Everything else is measured evidence: the scenario modules' reads and writes, other
--- applications' statements, and monitoring queries alike. The top lists are ranked after those leave-outs, a plan is in
--- one only when it used what the list ranks (CPU, time, reads, or waits above 0), and ties go to the lower plan_id, so
--- two reads of an interval rank it alike. At most 600 rows, the oldest intervals first: the runner reads again from the
--- last whole interval it got.
+-- script sets on its own modules); and the runner's own ad hoc statements, @left_out. Everything else is measured
+-- evidence: the scenario modules' reads and writes, other applications' statements, and monitoring queries alike. The
+-- top lists are ranked after those leave-outs, a plan is in one only when it used what the list ranks (CPU, time,
+-- reads, or waits above 0), and ties go to the lower plan_id, so two reads of an interval rank it alike. At most 600
+-- rows, the oldest intervals first: the runner reads again from the last whole interval it got.
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 1000;
@@ -389,6 +390,7 @@ kept AS (
     LEFT JOIN waits AS w ON w.runtime_stats_interval_id = pl.runtime_stats_interval_id AND w.plan_id = pl.plan_id
     WHERE q.object_id NOT IN (SELECT h.object_id FROM harness AS h)
       AND qt.query_sql_text NOT LIKE N'%dbhubdemo:rca-observer%'
+      AND q.query_id NOT IN (SELECT CAST(j.[value] AS bigint) FROM OPENJSON(@left_out) AS j)
 ),
 chosen AS (
     SELECT DISTINCT k.runtime_stats_interval_id, k.query_id
@@ -524,7 +526,8 @@ ORDER BY s.avg_total_user_cost * s.avg_user_impact * (s.user_seeks + s.user_scan
 -- characters, the most the observer reduces) isn't returned: query_plan_bytes says its size, so the coverage says why
 -- the plan has no summary. Read with RCA-SQL-10. Parameters: @queries nvarchar(max), RCA-SQL-10's query_ids,
 -- comma-separated; @plans nvarchar(max), its plan_ids; @with_plan nvarchar(max), the plan_ids whose XML the observer
--- hasn't reduced yet. It leaves out what RCA-SQL-10 leaves out, by the same two rules. T1, T2, T3.
+-- hasn't reduced yet; @left_out nvarchar(max), RCA-SQL-10's. It leaves out what RCA-SQL-10 leaves out, by the same three
+-- rules, so a forced plan of the runner's own statements isn't returned either. T1, T2, T3.
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 1000;
@@ -575,6 +578,7 @@ JOIN sys.query_store_query AS q ON q.query_id = p.query_id
 JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
 WHERE q.object_id NOT IN (SELECT h.object_id FROM harness AS h)
   AND qt.query_sql_text NOT LIKE N'%dbhubdemo:rca-observer%'
+  AND q.query_id NOT IN (SELECT CAST(j.[value] AS bigint) FROM OPENJSON(@left_out) AS j)
 ORDER BY p.query_id, p.plan_id;
 
 -- name: RCA-SQL-15
@@ -600,6 +604,45 @@ SELECT /* dbhubdemo:rca-observer */
                           FROM sys.query_store_plan AS f
                           WHERE f.is_forced_plan = 1)
 FROM sys.database_query_store_options AS o;
+
+-- name: RCA-SQL-16
+-- The ad hoc statements (object_id 0) that ran in the intervals RCA-SQL-10 is about to read, with their text, so that the
+-- runner leaves out its own (rca/README.md, What the capture leaves out, 3): it compares each text, normalized, with its
+-- list of the statements it sends outside a module (Rca/QueryStore/HarnessStatements.cs), and passes the query_ids that
+-- match to RCA-SQL-10 and 14 as @left_out. Read before each RCA-SQL-10 read, with its @since and @final. Not returned: a
+-- text over 4,000 characters (the runner's are much shorter), a query the engine generated itself (is_internal_query,
+-- such as an automatic statistics update), and the capture's own statements, which carry the marker. At most 2,000
+-- rows, the most executed first: the stop check every run polls is always near the top, and the read's coverage says
+-- when the bound was hit. A statement of the runner's that this block doesn't return, past the bound or in an interval
+-- that ended between this read and RCA-SQL-10's, is matched by the text RCA-SQL-10 and 14 return: the runner drops its
+-- rows and reads RCA-SQL-10's page again without it. The texts are only compared, never kept. T1, T2, T3.
+SET NOCOUNT ON;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET LOCK_TIMEOUT 1000;
+WITH /* dbhubdemo:rca-observer */ intervals AS (
+    SELECT i.runtime_stats_interval_id
+    FROM sys.query_store_runtime_stats_interval AS i
+    WHERE i.end_time > @since
+      AND (i.end_time <= SYSDATETIMEOFFSET() OR @final = 1)
+),
+ran AS (
+    SELECT p.query_id, executions = SUM(rs.count_executions)
+    FROM intervals AS i
+    JOIN sys.query_store_runtime_stats AS rs ON rs.runtime_stats_interval_id = i.runtime_stats_interval_id
+    JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id
+    GROUP BY p.query_id
+)
+SELECT TOP (2000)
+    r.query_id,
+    qt.query_sql_text
+FROM ran AS r
+JOIN sys.query_store_query AS q ON q.query_id = r.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+WHERE q.object_id = 0
+  AND q.is_internal_query = 0
+  AND LEN(qt.query_sql_text) <= 4000
+  AND qt.query_sql_text NOT LIKE N'%dbhubdemo:rca-observer%'
+ORDER BY r.executions DESC, r.query_id;
 
 -- name: RCA-AZ-01
 -- T3 only: resource governance, 15-second averages for the last hour (Azure SQL Database keeps them that long): CPU

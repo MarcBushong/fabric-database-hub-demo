@@ -118,7 +118,8 @@ internal sealed class AnswerKeyRecorder(EvidenceStore store, IReadOnlyDictionary
         await using var command = connection.CreateCommand();
         command.CommandType = CommandType.Text;
         command.CommandTimeout = 30;
-        command.CommandText = "SELECT TOP (200) event_time, event_name, session_id, detail FROM demo.scenario_run_events WHERE run_id = @run_id ORDER BY event_time;";
+        // The observer's marker, after the first keyword: Query Store's reads leave it out (rca/README.md, What the capture leaves out, 1).
+        command.CommandText = "SELECT /* dbhubdemo:rca-observer */ TOP (200) event_time, event_name, session_id, detail FROM demo.scenario_run_events WHERE run_id = @run_id ORDER BY event_time;";
         command.Parameters.Add("@run_id", SqlDbType.VarChar, 64).Value = runId;
         var events = new List<RunEvent>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);

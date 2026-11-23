@@ -92,7 +92,7 @@ public sealed partial class RcaBlindTests
     public void EveryTSqlBlockParsesAndOnlyReadsOrManagesItsOwnEventSession()
     {
         var blocks = CaptureCatalog.All.Where(b => !b.Key.StartsWith("RCA-PG-", StringComparison.Ordinal)).ToList();
-        Assert.Equal(26, blocks.Count);
+        Assert.Equal(27, blocks.Count);
 
         var findings = new List<string>();
         foreach (var (id, text) in blocks.Append(new("RCA-XE-05 (T3, database-scoped)", CaptureCatalog.DatabaseScopedDrop())))

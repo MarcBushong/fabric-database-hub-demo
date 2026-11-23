@@ -9,7 +9,7 @@ BeforeDiscovery {
         @(Get-ChildItem -Path $fixtureRoot -Filter '*.sidecar.json' -File -ErrorAction SilentlyContinue | Sort-Object -Property Name |
                 ForEach-Object { @{ Name = $_.Name; Path = $_.FullName; Parts = $_.FullName -replace '\.sidecar\.json$', '.sidecar-parts.txt'; Kind = 'sidecar' } })
     )
-    $transportFixtures = @('rca-evidence.parameter.json', 'metrics-bundle.json', 'metrics-rca-member.json', 'export-index.json', 'rca-sidecar.parameter.json', 'sidecar-index.json', 'rca-ack.json') |
+    $transportFixtures = @('rca-evidence.parameter.json', 'metrics-bundle.json', 'metrics-rca-member.json', 'export-index.json', 'rca-sidecar.parameter.json', 'sidecar-index.json', 'rca-ack.json', 'sidecar-bundle.json', 'sidecar-bundle-index.json', 'metrics-rca-sidecars-member.json', 'rca-ack-request.json', 'rca-ack-result.json') |
         ForEach-Object { @{ Name = $_; Path = (Join-Path -Path $repoRootForDiscovery -ChildPath "rca/fixtures/$_") } }
 }
 
@@ -344,6 +344,36 @@ Describe 'The Incident RCA contract: transport fixtures (ADR 0031)' {
         $valid | Should -BeTrue -Because ($schemaErrors | Out-String)
     }
 
+    It 'carries Run all''s sidecars whole: the bundle, its index, the metrics'' pointer, and the next start''s acknowledgements agree' {
+        $read = { param($Name) Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath "fixtures/$Name") -Raw | ConvertFrom-Json }
+        $bytes = { param($Name) [System.Text.Encoding]::UTF8.GetByteCount((& $read $Name | ConvertTo-Json -Depth 10 -Compress)) }
+        $bundle = & $read 'sidecar-bundle.json'
+        $index = & $read 'sidecar-bundle-index.json'
+        $pointer = & $read 'metrics-rca-sidecars-member.json'
+        $request = & $read 'rca-ack-request.json'
+        $result = & $read 'rca-ack-result.json'
+        (& $bytes 'sidecar-bundle.json') | Should -BeLessOrEqual 24000
+        (& $bytes 'sidecar-bundle-index.json') | Should -BeLessOrEqual 24000
+        (& $bytes 'metrics-rca-sidecars-member.json') | Should -BeLessOrEqual 300 -Because 'the pointer comes out of T5''s share of the metrics document'
+        # Whole sidecars: every part of every listed document is in the bundles, with the index's SHA-256, and nothing else.
+        $lines = @($bundle.parts)
+        @($index.documents | Measure-Object -Property parts -Sum).Sum | Should -BeLessOrEqual 64 -Because 'RCA_SIDECAR_FILE takes at most 64 parts'
+        foreach ($document in $index.documents) {
+            $mine = @($lines | Where-Object { ($_ -split ' ')[2] -eq $document.documentId })
+            $mine.Count | Should -Be $document.parts -Because $document.documentId
+            @($mine | ForEach-Object { ($_ -split ' ')[4] } | Select-Object -Unique) | Should -Be @($document.sha256)
+            @($mine | ForEach-Object { [int](($_ -split ' ')[3] -split '/')[0] } | Sort-Object) | Should -Be @(1..$document.parts)
+        }
+        @($lines | ForEach-Object { ($_ -split ' ')[2] } | Select-Object -Unique | Sort-Object) | Should -Be @($index.documents.documentId | Sort-Object)
+        # An evidence reader takes only lines that start with DBHUBDEMO-RCA and a space: none of these.
+        @($lines | Where-Object { $_.StartsWith('DBHUBDEMO-RCA ', [System.StringComparison]::Ordinal) }) | Should -BeNullOrEmpty
+        $pointer.documents | Should -Be @($index.documents).Count
+        $pointer.index | Should -Match '^[0-9a-f]{32}$'
+        @($index.bundles) | Should -Not -Contain $pointer.index -Because 'the index is a version of its own'
+        # The next start acknowledges only what the history holds, and accounts for every ID it was given.
+        @($request.documents | Where-Object { $_ -notin @($index.documents.documentId) }) | Should -BeNullOrEmpty
+        @(@($result.sent) + @($result.left) | Sort-Object) | Should -Be @($request.documents | Sort-Object)
+    }
     It 'keeps a bundle within 24,000 bytes and the bundle index within 4,000' {
         [System.Text.Encoding]::UTF8.GetByteCount((Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures/metrics-bundle.json') -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10 -Compress)) | Should -BeLessOrEqual 24000
         [System.Text.Encoding]::UTF8.GetByteCount((Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures/metrics-rca-member.json') -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10 -Compress)) | Should -BeLessOrEqual 4000
@@ -508,13 +538,13 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         $captureReadme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'capture/README.md'))
     }
 
-    It 'names 43 blocks, each once: RCA-SQL-01 to 15, RCA-AZ-01 to 05, RCA-XE-00 to 05, RCA-PG-01 to 17' {
-        $expected = @(1..15 | ForEach-Object { 'RCA-SQL-{0:d2}' -f $_ }) + @(1..5 | ForEach-Object { 'RCA-AZ-{0:d2}' -f $_ }) + @(0..5 | ForEach-Object { 'RCA-XE-{0:d2}' -f $_ }) + @(1..17 | ForEach-Object { 'RCA-PG-{0:d2}' -f $_ })
+    It 'names 44 blocks, each once: RCA-SQL-01 to 16, RCA-AZ-01 to 05, RCA-XE-00 to 05, RCA-PG-01 to 17' {
+        $expected = @(1..16 | ForEach-Object { 'RCA-SQL-{0:d2}' -f $_ }) + @(1..5 | ForEach-Object { 'RCA-AZ-{0:d2}' -f $_ }) + @(0..5 | ForEach-Object { 'RCA-XE-{0:d2}' -f $_ }) + @(1..17 | ForEach-Object { 'RCA-PG-{0:d2}' -f $_ })
         @($blocks | Sort-Object) | Should -Be @($expected | Sort-Object)
     }
 
     It 'lists every block in capture/README.md, each row with its documentation' {
-        $blocks.Count | Should -Be 43
+        $blocks.Count | Should -Be 44
         $rows = @($captureReadme -split "`n" | Where-Object { $_ -match '^\| RCA-' })
         foreach ($block in $blocks) {
             $family, $number = $block -replace '^RCA-', '' -split '-'
