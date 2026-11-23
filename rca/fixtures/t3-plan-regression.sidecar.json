@@ -12,12 +12,12 @@
   "exportedUtc": "2026-11-20T17:22:06.230Z",
   "sequence": 1,
   "final": true,
-  "windowStartUtc": "2026-11-20T16:50:00Z",
-  "windowEndUtc": "2026-11-20T17:20:00Z",
+  "windowStartUtc": "2026-11-20T16:50:00.000Z",
+  "windowEndUtc": "2026-11-20T17:20:00.000Z",
   "targets": [
     "T3"
   ],
-  "epochUtc": "2026-11-20T16:50:00Z",
+  "epochUtc": "2026-11-20T16:50:00.000Z",
   "strings": [
     "T3",
     "0x5A1C3E7F9B2D4C60",
