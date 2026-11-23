@@ -1216,6 +1216,59 @@ BEGIN
 END;
 GO
 
+-- The harness's marks (ADR 0031, the sidecar's leave-out): every module this script creates carries the extended
+-- property dbhubdemo.role = harness, which the Incident RCA's Query Store reads (RCA-SQL-10 and 14) leave out. No other
+-- script sets it, so a scenario module never carries it. The list sits here, beside the modules, and
+-- tests/unit/Database.HarnessMarks.Tests.ps1 checks it against them. Every deployment runs it again. It comes before
+-- setup's last step, which SqlScriptTests keeps at the script's end, and counts down, as every loop here does.
+SET NOCOUNT ON;
+DECLARE @harness TABLE (module_name sysname NOT NULL PRIMARY KEY);
+INSERT INTO @harness (module_name) VALUES
+    (N'fn_scenario_catalog'),
+    (N'fn_workload_procedures'),
+    (N'fn_run_stop_requested'),
+    (N'fn_run_should_stop'),
+    (N'fn_pause'),
+    (N'fn_can_view_sessions'),
+    (N'fn_demo_sessions'),
+    (N'usp_release_auto_tuning_hold'),
+    (N'usp_recover_stale_runs'),
+    (N'usp_run_begin'),
+    (N'usp_run_assert_running'),
+    (N'usp_run_event'),
+    (N'usp_run_end'),
+    (N'usp_stop'),
+    (N'usp_profile_set'),
+    (N'usp_profile_get'),
+    (N'usp_check_space'),
+    (N'usp_kill_demo_sessions'),
+    (N'usp_cleanup_scenario'),
+    (N'usp_undo_missing_index_remediation'),
+    (N'usp_reset');
+DECLARE @marks TABLE (n int IDENTITY(1, 1) PRIMARY KEY, module_name sysname NOT NULL, module_type varchar(128) NOT NULL, marked bit NOT NULL);
+DECLARE @remaining int, @name sysname, @type varchar(128), @marked bit;
+INSERT INTO @marks (module_name, module_type, marked)
+SELECT o.name,
+       CASE WHEN o.type IN ('P', 'PC') THEN 'PROCEDURE' ELSE 'FUNCTION' END,
+       CASE WHEN EXISTS (SELECT 1 FROM sys.extended_properties AS ep
+                         WHERE ep.class = 1 AND ep.major_id = o.object_id AND ep.minor_id = 0 AND ep.name = N'dbhubdemo.role')
+            THEN 1 ELSE 0 END
+FROM @harness AS h
+JOIN sys.objects AS o ON o.name = h.module_name AND o.schema_id = SCHEMA_ID(N'demo')
+WHERE o.type IN ('P', 'PC', 'FN', 'IF', 'TF', 'FS', 'FT');
+SET @remaining = @@ROWCOUNT;
+WHILE @remaining > 0
+BEGIN
+    SELECT @name = module_name, @type = module_type, @marked = marked FROM @marks WHERE n = @remaining;
+    IF @marked = 1
+        EXEC sys.sp_updateextendedproperty @name = N'dbhubdemo.role', @value = N'harness',
+            @level0type = 'SCHEMA', @level0name = N'demo', @level1type = @type, @level1name = @name;
+    ELSE
+        EXEC sys.sp_addextendedproperty @name = N'dbhubdemo.role', @value = N'harness',
+            @level0type = 'SCHEMA', @level0name = N'demo', @level1type = @type, @level1name = @name;
+    SET @remaining -= 1;
+END;
+GO
 -- Setup (deploy.ps1 runs it on every deployment) puts FORCE_LAST_GOOD_PLAN back when a plan-regression run left it off
 -- and isn't Running any more (2026-11-18); a run that's still going keeps its hold.
 EXEC demo.usp_release_auto_tuning_hold @by = N'setup (deploy.ps1)';
