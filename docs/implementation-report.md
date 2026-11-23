@@ -5580,6 +5580,16 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **dd4fd393:** RCA-PG-17 reads T4's primary only, and the backfill always waits after T4's start.
 - **45f947b7:** `rca ack` is idempotent, and Run all counts an ID acknowledged before as sent.
 - **7050b882, the answer-key recorder** (the review of A1's harness statements, a High): its reads of the harness's run events reached Query Store on T1 to T4, and no leave-out covered them. They now carry the observer's markers, so item 1 leaves them out on every engine. Its reads from before then fall under T4's harness-table rule, and on T1 to T3 under item 3 by the SHA-256 of their normalized text, so no detection code names the table.
+- **83c87de2, the contract's review** (53d0272e..45f947b7, SHIP WITH FIXES):
+  - **High, T2's acknowledgements:** an ID's host segment names T2's guest, but Run Commands go to the T2 host. The start now maps the normalized `sqlVmName` to that VM and the normalized `t2GuestName` to `hostVmName`; any other host is left, never sent elsewhere. The fixtures carry a T2 ID.
+  - **Medium:** the start acknowledges in its step for earlier sessions, which `rca.startMinutes` bounds, after the evidence parts and before the sidecar fetch.
+  - **Lows:**
+    - cleanup counts only `written` and `already` IDs, and the oldest acknowledgements ride first;
+    - the pointer's 300 bytes are counted as written, Windows PowerShell 5.1's escapes included;
+    - the sidecar's patterns refuse a trailing line feed;
+    - no `ContosoCare.Rca*` kind is ever the metrics;
+    - the harness exceptions name one file.
+  - **With it:** T1c's `rca ack` exit code and the backfill's timing, and A1's backstop for item 3.
 
 **The integration,** `marcbushong-microsoft-qs-evidence-integration`, takes only reviewed heads:
 
@@ -5590,7 +5600,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
   - The generated model guide was rebuilt with the app's pinned `tsx`.
   - `published-versions.json` lists the merged notebooks' versions (abd30713).
 - **A2,** PostgreSQL's reads and the holders, at 83344ef0 (41645fa9). Its `TargetObserver.cs` is A1's 3cea6ac9, cherry-picked.
-- **The contract,** through 7050b882.
+- **The contract,** through 83c87de2.
 - **INT's own commits:**
   - the live probes (`tests/integration/rca-query-store.md`): S7's blindness sets, the runner's own statements and the answer-key recorder's reads among them, with a check that no sidecar row names the recorder's table; S10's and S11's review checks; H's checks deployed twice; and S12, the scripts' transport's checks;
   - a guard that RCA Query Waits, which has no measure, is totaled nowhere but through the latest read (review-qs-b's caveat);
@@ -5609,7 +5619,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 
 **Validation.**
 
-- **Pester,** under strict mode with the Azure CLI guard: `Rca.Contract` 70 passed; `DbHubDemo.RcaSidecar` 28 and `DbHubDemo.Cost` 74 passed; `Fabric.PowerBI` 17 passed and 1 skipped; `DbHubDemo.PowerBI` 30 passed; `DbHubDemo.Fabric` 42 passed; `Fabric.Notebooks` 152 of 152 on the integration, its pandas cases in a session-local Python 3.12; `Repo.Conventions` 123 and `Repo.NeutralWording` 3 passed.
+- **Pester,** under strict mode with the Azure CLI guard: `Rca.Contract` 78 passed; `DbHubDemo.RcaSidecar` 28 and `DbHubDemo.Cost` 74 passed; `Fabric.PowerBI` 17 passed and 1 skipped; `DbHubDemo.PowerBI` 30 passed; `DbHubDemo.Fabric` 42 passed; `Fabric.Notebooks` 152 of 152 on the integration, its pandas cases in a session-local Python 3.12; `Repo.Conventions` 123 and `Repo.NeutralWording` 3 passed.
 - **The runner,** with SDK 10.0.403, on the integration with A1, A2, and T2a: the whole suite, 961 tests, 940 passed, and the 21 real-engine tests skip without a server, as before. ScriptDom parses every T-SQL block, and the PostgreSQL blocks only read.
 - **Proven to fail without the change:**
   - the folder guard, with a temporary unscanned folder;
@@ -5617,7 +5627,8 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
   - the `.rows` name, with `.jsonl`;
   - the header's milliseconds, on the previous fixtures and schema;
   - the guard's exceptions for item 3;
-  - RCA Query Waits' guard, with a SUM measure added.
+  - RCA Query Waits' guard, with a SUM measure added;
+  - the contract review's fixes (83c87de2): the acknowledgements' routing, the anchors, the five line-feed cases, and the pointer's bytes, each on the previous schema, fixtures, or README; the harness exceptions' one file, with a second file added.
 - **The schemas:** `evidence.schema.json` is byte-identical to edd01c86's, and both schemas regenerate byte for byte.
 - **Lint and checks:** PSScriptAnalyzer found nothing; markdownlint 0.23.3 found no issue; the leak check prints nothing.
 
