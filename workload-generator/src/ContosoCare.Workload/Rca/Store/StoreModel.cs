@@ -68,6 +68,20 @@ internal sealed class TargetExport
     public long ReadBytes { get; set; }
 }
 
+/// <summary>
+/// The capture's end (capture-end.json), which a session's stop records with <c>rca export --end-capture</c>: the observer
+/// captures nothing from then on, until a profile is set after it. Only the export writes it, under the store's lock.
+/// </summary>
+internal sealed class CaptureEndFile
+{
+    public int Version { get; set; } = 1;
+
+    public DateTimeOffset EndedUtc { get; set; }
+
+    /// <summary>The control session whose stop recorded it, or null outside one.</summary>
+    public string? SessionId { get; set; }
+}
+
 /// <summary>Each session's exports from this host (sessions.json): the next sequence and the gzip already exported, for the budget.</summary>
 internal sealed class SessionLedger
 {
@@ -95,4 +109,5 @@ internal sealed class SessionUse
 [JsonSerializable(typeof(SpanFile))]
 [JsonSerializable(typeof(SpanExport))]
 [JsonSerializable(typeof(SessionLedger))]
+[JsonSerializable(typeof(CaptureEndFile))]
 internal sealed partial class RcaStoreJsonContext : JsonSerializerContext;

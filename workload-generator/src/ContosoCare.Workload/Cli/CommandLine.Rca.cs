@@ -31,10 +31,12 @@ internal static partial class CommandLine
         var session = new Option<string>("--session") { Description = "The control session's ID (32 lowercase hex, the resource group's DbHubSessionId), or none outside a control session.", Required = true };
         var final = new Option<bool>("--final") { Description = "The session's end: wait for the observer to end its capture (at most --wait-seconds), and mark the documents final." };
         var wait = new Option<int>("--wait-seconds") { Description = "With --final, how long to wait for the observer to end its capture (0 to 300).", DefaultValueFactory = _ => 60 };
+        var endCapture = new Option<bool>("--end-capture") { Description = "A session's stop, which stops nothing on the VM: first record the capture's end, under the store's lock, so the observer lane of 'profile run' ends its capture within a second, as a profile's end does, while the workload runs on until the VM stops; only a profile set after it is captured again. Implies --final, whose wait then sees the capture end." };
         var exportStore = RcaStoreOption();
         export.Options.Add(session);
         export.Options.Add(final);
         export.Options.Add(wait);
+        export.Options.Add(endCapture);
         export.Options.Add(exportStore);
         export.SetAction((parseResult, cancellationToken) =>
         {
@@ -50,7 +52,7 @@ internal static partial class CommandLine
             try
             {
                 var store = new EvidenceStore(parseResult.GetValue(exportStore) ?? EvidenceStore.DefaultRoot, TimeProvider.System, secure: parseResult.GetValue(exportStore) is null);
-                var result = new Exporter(store, log, Program.GetVersion()).Export(text == "none" ? null : text, parseResult.GetValue(final), TimeSpan.FromSeconds(Math.Clamp(parseResult.GetValue(wait), 0, 300)));
+                var result = new Exporter(store, log, Program.GetVersion()).Export(text == "none" ? null : text, parseResult.GetValue(final), TimeSpan.FromSeconds(Math.Clamp(parseResult.GetValue(wait), 0, 300)), parseResult.GetValue(endCapture));
                 output.WriteLine(result.IndexLine());
                 return Task.FromResult(result.Status == "Fail" ? ExitCodes.Failure : result.Documents.Count > 0 ? ExitCodes.Success : ExitCodes.ManualActionRequired);
             }

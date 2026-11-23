@@ -279,7 +279,9 @@ internal sealed class ProfileHost(
     private readonly ProfileHostOptions options = options ?? ProfileHostOptions.From(definitions, null);
     private readonly Func<ProfileTarget, ILaneWork> workFactory = workFactory ?? (t => new ExecutorLaneWork(t.Executor));
     private readonly ConcurrentDictionary<DemoTarget, bool> profileActive = new();
+    private readonly ConcurrentDictionary<DemoTarget, DateTimeOffset> profileSetAt = new();
     private readonly ConcurrentDictionary<DemoTarget, int> runningRuns = new();
+    private IReadOnlyList<Lane> servedLanes = [];
     private int stateWriteFailures;
     private string? processPriority;
 
@@ -292,6 +294,24 @@ internal sealed class ProfileHost(
         (profileActive.TryGetValue(target, out var active) && active)
         || (runningRuns.TryGetValue(target, out var running) && running > 0)
         || answerKey?.IsPending(target) == true;
+
+    /// <summary>
+    /// The gate after the capture's end that a session's stop recorded (rca export --end-capture): only a session that began
+    /// after it, whose profile was set after it, which <see cref="IsActive"/> then follows. The stopped session's runs go on
+    /// until the VM stops, uncaptured: the review of 1ca916a9 ended every target's capture at the end, and only the span's
+    /// close waits for the answer key (<see cref="HoldsAfter"/>).
+    /// </summary>
+    public bool IsActiveAfter(DemoTarget target, DateTimeOffset end) =>
+        profileSetAt.TryGetValue(target, out var set) && set > end && IsActive(target);
+
+    /// <summary>
+    /// Whether the span that the stop's export takes waits to close, capturing nothing, for a fault run of the target that
+    /// ended by the capture's end and that the answer key records (<see cref="AnswerKeyRecorder.Records"/>): one its lane
+    /// hasn't handed over yet (it does at its next poll), or one being recorded. A refused start never counts, so a fault
+    /// the plan still tries after the stop can't hold the span (the review of 1ca916a9).
+    /// </summary>
+    public bool HoldsAfter(DemoTarget target, DateTimeOffset end) =>
+        EndedUnrecorded(target, end) || answerKey?.IsPending(target, end) == true;
 
     public async Task RunAsync(IReadOnlyList<ProfileTarget> targets, DateTimeOffset? notAfter, CancellationToken cancellationToken)
     {
@@ -311,6 +331,7 @@ internal sealed class ProfileHost(
             ("stallLimit", options.StallLimit),
             ("stateFile", options.StateFilePath));
         var lanes = targets.Select(t => new Lane(t, workFactory(t), hostStarted)).ToList();
+        Volatile.Write(ref servedLanes, lanes);
         foreach (var lane in lanes)
         {
             lock (lane.Gate)
@@ -345,6 +366,38 @@ internal sealed class ProfileHost(
         await StopLanesAsync(lanes).ConfigureAwait(false);
         WriteState(lanes, processId, processStarted, hostStarted, notAfter, time.GetUtcNow(), reason);
         log.Info("profile.host-stopped", "Profile host stopped.", ("reason", reason));
+    }
+
+    /// <summary>
+    /// A fault run of the target that ended by <paramref name="end"/>, that the answer key records, and that its lane hasn't
+    /// handed over yet: the lane does at its next poll (Reap). Baseline chunks never go to the answer key, and neither does a
+    /// refused start, which has no end of its own (the review of 1ca916a9: one counted as ended by any end, and a start
+    /// refused after the stop opened capture again).
+    /// </summary>
+    private bool EndedUnrecorded(DemoTarget target, DateTimeOffset end)
+    {
+        if (answerKey is null)
+        {
+            return false;
+        }
+
+        foreach (var lane in Volatile.Read(ref servedLanes))
+        {
+            if (lane.Target.Target != target)
+            {
+                continue;
+            }
+
+            lock (lane.Gate)
+            {
+                if (lane.Running.Values.Any(r => !r.IsBaseline && r.Task.IsCompletedSuccessfully && AnswerKeyRecorder.Records(r.Task.Result) && r.Task.Result.EndedAt is { } ended && ended <= end))
+                {
+                    return true;
+                }
+            }
+        }
+
+        return false;
     }
 
     /// <summary>Restarts a lane whose loop ended, or that hasn't finished a poll within the stall limit (outside a bounded reset).</summary>
@@ -511,6 +564,7 @@ internal sealed class ProfileHost(
 
         now = time.GetUtcNow();
         profileActive[target] = IsActive(state, now, definitions, catalog);
+        profileSetAt[target] = state.SetAt;
         IReadOnlyList<PlannedActivity> planned;
         try
         {

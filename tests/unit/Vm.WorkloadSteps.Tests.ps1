@@ -917,6 +917,61 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
             $result.message | Should -Match 'predates the RCA export .* \./scripts/deploy\.ps1 updates it'
         }
 
+        It 'asks the runner to end the capture at a session''s stop, and only when the request says true (O1, 2026-11-23)' {
+            $root = New-ControlRoot
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:rcaIndexLine; StdErr = '' } }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession; final = $true; endCapture = $true }) -StateRoot $root
+            $result = Get-RcaResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.PSObject.Properties['endCaptureUnsupported'] | Should -BeNullOrEmpty
+            $result.evidence.endCapture | Should -BeTrue -Because 'the runbook tells a control script that predates the option by its absence'
+            $script:lines[1] | Should -BeExactly $script:rcaIndexLine
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq ('rca export --session {0} --final --end-capture' -f $script:rcaSession) }
+            $script:lines.Clear()
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession; final = $true; endCapture = 'yes' }) -StateRoot $root
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq ('rca export --session {0} --final' -f $script:rcaSession) }
+            (Get-RcaResult).evidence.PSObject.Properties['endCapture'] | Should -BeNullOrEmpty
+        }
+
+        It 'exports again without --end-capture on a runner that predates it (O1, 2026-11-23)' {
+            $root = New-ControlRoot
+            # A runner from before it refuses the option before it exports anything: the same export again, without it.
+            Mock -CommandName Invoke-DemoVmRunnerProcess -ParameterFilter { $ArgumentList -contains '--end-capture' } -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "Unrecognized command or argument '--end-capture'." } }
+            Mock -CommandName Invoke-DemoVmRunnerProcess -ParameterFilter { $ArgumentList -notcontains '--end-capture' } -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:rcaIndexLine; StdErr = '' } }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession; final = $true; endCapture = $true }) -StateRoot $root
+            $result = Get-RcaResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.endCaptureUnsupported | Should -BeTrue
+            $result.evidence.PSObject.Properties['endCapture'] | Should -BeNullOrEmpty
+            $script:lines[1] | Should -BeExactly $script:rcaIndexLine
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 2 -Exactly
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq ('rca export --session {0} --final' -f $script:rcaSession) -and $TimeoutSeconds -eq 600 }
+        }
+
+        It 'is Not supported, as before, on a runner without the RCA export, which refuses the export with --end-capture and without it' {
+            $root = New-ControlRoot
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ("Unrecognized command or argument 'rca'.`nUnrecognized command or argument 'export'.`nUnrecognized command or argument '--end-capture'.") } }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession; final = $true; endCapture = $true }) -StateRoot $root
+            $result = Get-RcaResult
+            $result.status | Should -Be 'Not supported'
+            $result.evidence.oldRunner | Should -BeTrue
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 2 -Exactly
+        }
+
+        It 'exports T2''s evidence without --end-capture in the guest when its runner predates it' {
+            $root = New-ControlRoot -Role 'ArcHost' -NoInstall
+            Mock -CommandName Invoke-DemoControlT2Attempt -ParameterFilter { $Arguments -contains '--end-capture' } -MockWith { [pscustomobject]@{ Run = [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "Unrecognized command or argument '--end-capture'." }; ReadyNote = [ordered]@{}; Failure = $null } }
+            Mock -CommandName Invoke-DemoControlT2Attempt -ParameterFilter { $Arguments -notcontains '--end-capture' } -MockWith { [pscustomobject]@{ Run = [pscustomobject]@{ ExitCode = 0; StdOut = $script:rcaIndexLine; StdErr = '' }; ReadyNote = [ordered]@{}; Failure = $null } }
+            Mock -CommandName Invoke-DemoControlT2Recovery -MockWith { throw 'must not restart the guest' }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession; final = $true; endCapture = $true }) -StateRoot $root
+            $result = Get-RcaResult
+            $result.status | Should -Be 'Pass'
+            $result.evidence.endCaptureUnsupported | Should -BeTrue
+            $script:lines[1] | Should -BeExactly $script:rcaIndexLine
+            Should -Invoke -CommandName Invoke-DemoControlT2Attempt -Times 2 -Exactly
+            Should -Invoke -CommandName Invoke-DemoControlT2Attempt -Times 1 -Exactly -ParameterFilter { -not $Activity -and ($Arguments -join ' ') -eq ('rca export --session {0} --final' -f $script:rcaSession) -and $LockSeconds -eq 30 }
+        }
+
         It 'refuses a request outside the contract without running the runner' {
             $root = New-ControlRoot
             Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { throw 'must not run' }

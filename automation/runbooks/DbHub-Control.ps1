@@ -1,8 +1,9 @@
 <#
 .SYNOPSIS
-The DbHub-Control runbook (ADR 0020, ADR 0026): started only by its webhook, it validates the request against the
-allow-lists, then runs a control session, runs, stops, or resets the demo's activity, or saves T4's and T5's metrics,
-and exits.
+The DbHub-Control runbook (ADR 0020, ADR 0026): started by its webhook (and, for its read-only pending action, as a job
+by capture-t2-golden.ps1), it validates the request against the allow-lists, then runs a control session, runs, stops,
+or resets the demo's activity, saves T4's and T5's metrics, or reads the session's status for the golden capture, and
+exits.
 
 .DESCRIPTION
 Windows PowerShell 5.1 in Azure Automation. scripts/setup-activity-control.ps1 publishes this file with
@@ -34,13 +35,18 @@ at the control account (A2), and DbHub Demo Session Writer at the control vault'
   result says why), deletes T4's read replica (or stops it where the control can't delete it), and stops T4, through
   Azure Resource Manager only.
 - reset: the runner's reset on the targets whose VM runs (T5's only while its container is there).
+- pending (2026-11-23): reads the session's status copy, the account's variable DbHubSessionStatus, with
+  Get-AutomationVariable, encrypted or not, and prints what it lists of the Incident RCA's documents still on the VMs.
+  It writes, starts, and stops nothing. capture-t2-golden.ps1 starts it as a job when Azure Resource Manager can't give
+  it the variable's value, as once a tenant's policy has encrypted it.
 
 The job output holds the log and one result line, 'DBHUB-CONTROL <json>'. The webhook URL never reaches the runbook.
 Webhooks: https://learn.microsoft.com/azure/automation/automation-webhooks
 
 .PARAMETER WebhookData
 Set by Azure Automation when the webhook starts the runbook: WebhookName, RequestBody, and RequestHeader. Only
-RequestBody is read; the notebook sends no credential header.
+RequestBody is read; the notebook sends no credential header. capture-t2-golden.ps1 passes the same properties, as JSON,
+when it starts the pending action as a job (https://learn.microsoft.com/azure/automation/automation-webhooks).
 #>
 param(
     [Parameter(Mandatory = $false)]
