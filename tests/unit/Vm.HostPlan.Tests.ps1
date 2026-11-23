@@ -604,10 +604,28 @@ Describe 'GuestSignInCleanup step' {
         Should -Invoke -CommandName Invoke-DemoSignInSweep -Times 1 -Exactly -ParameterFilter { $Clean }
 
         Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestSweep -Pass $true -Cleaned $true -Cleared @('Windows PowerShell') }
+        # After Arc onboarding in this generation, as on a new host: a note, as information, by design.
+        $state = Get-DemoVmState
+        $state['generation'] = 'g2'
+        $state['steps']['ArcOnboarding'] = [ordered]@{ status = 'Succeeded'; setGeneration = 'g2'; completedUtc = (Get-DemoVmUtcNow) }
+        $state['steps']['GuestVm'] = [ordered]@{ status = 'Succeeded'; setGeneration = 'g1'; completedUtc = (Get-DemoVmUtcNow) }
+        Save-DemoVmState -State $state
         $warned = Clear-DemoHostGuestSignIn -Context $context
         $warned.Outcome | Should -Be 'Done'
         $warned.NoteMessage[0] | Should -Match 'Windows PowerShell on archost01.*endpoint protection may report' -Because 'what the cleanup did after Arc onboarding is a one-off note, by design, recorded as information (2026-11-23)'
         @($warned.TransientWarningMessage).Count | Should -Be 0 -Because 'it isn''t a warning'
+        # An established host's later generation, whose onboarding and guest stood: a token that reached a log since is a
+        # one-off warning (the review of cb4bc479).
+        $state['generation'] = 'g3'
+        Save-DemoVmState -State $state
+        $established = Clear-DemoHostGuestSignIn -Context $context
+        $established.Outcome | Should -Be 'Done'
+        $established.TransientWarningMessage[0] | Should -Match 'Windows PowerShell on archost01.*endpoint protection may report'
+        @($established.NoteMessage).Count | Should -Be 0
+        # A guest built in this generation, as a rebuilt one: a note again.
+        $state['steps']['GuestVm']['setGeneration'] = 'g3'
+        Save-DemoVmState -State $state
+        @((Clear-DemoHostGuestSignIn -Context $context).NoteMessage).Count | Should -Be 1
 
         Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestSweep -Pass $true -Cleaned $true -Security 2 }
         $manual = Clear-DemoHostGuestSignIn -Context $context

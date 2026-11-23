@@ -145,6 +145,70 @@ function Add-DemoVmNote {
     }
 }
 
+function Test-DemoVmStepSetThisGeneration {
+    <#
+    .SYNOPSIS
+    True when the Set of one of the named steps ran in the current bootstrap generation: the step had something to do in
+    this generation, as on a new VM or for a rebuilt guest, where an established VM's later generation finds it in the
+    desired state (its Test passes). False otherwise, without a generation, or when the state can't be read, so a caller
+    that labels a note expected falls back to a warning (the review of cb4bc479, 2026-11-23). Reads state.json, which the
+    runner saves before each step, and each step record's setGeneration, which it writes before each Set. Never throws.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]] $Name
+    )
+
+    try {
+        $state = Get-DemoVmState
+        $generation = [string]$state['generation']
+        if (-not $generation -or $null -eq $state['steps']) {
+            return $false
+        }
+        foreach ($step in $Name) {
+            $record = $state['steps'][$step]
+            if ($record -is [System.Collections.IDictionary] -and [string]$record['setGeneration'] -ceq $generation) {
+                return $true
+            }
+        }
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('Reading which steps ran in this generation: {0}' -f $_.Exception.Message)
+    }
+    return $false
+}
+
+function Test-DemoVmStepFirstSetup {
+    <#
+    .SYNOPSIS
+    True when the named step has never completed on this VM (its record has no completedUtc, which the runner keeps
+    across generations): its Set is the VM's first setup. False when it completed before, as on an established VM whose
+    step has something to do again, or when the state can't be read, so a caller that labels a note expected falls back to
+    a warning (the review of cb4bc479, 2026-11-23). Reads state.json. Never throws.
+    #>
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Name
+    )
+
+    try {
+        $state = Get-DemoVmState
+        if ($null -eq $state['steps']) {
+            return $true
+        }
+        $record = $state['steps'][$Name]
+        return (-not ($record -is [System.Collections.IDictionary] -and $record['completedUtc']))
+    }
+    catch {
+        Write-DemoVmLog -Level 'Warning' -Message ('Reading whether step {0} completed before: {1}' -f $Name, $_.Exception.Message)
+        return $false
+    }
+}
+
 function Remove-DemoVmStepWarning {
     # A step's own warnings ("<Step>: ..."), dropped once its Set has run to its end, Done or NotSelected, which says again
     # what still holds (the F24 reviews, 2026-11-20). A Set that throws, or stops early (InProgress, Waiting, a restart),

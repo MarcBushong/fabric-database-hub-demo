@@ -235,6 +235,31 @@ Describe 'VM step runner' {
         @($health.warnings) | Should -Be @('Media: Trusted on first use.')
     }
 
+    It 'records the generation in which each step''s Set ran, so a step can tell a new VM''s setup from an established VM''s (the review of cb4bc479)' {
+        New-TestRoot | Out-Null
+        $script:built = $false
+        $script:adminDone = $false
+        $script:seen = @()
+        $steps = @(
+            @{ Name = 'Build'; Test = { $script:built }; Set = { $script:built = $true } }
+            @{ Name = 'Admin'; Test = { $script:adminDone }; Set = {
+                    $script:seen += [pscustomobject]@{ Built = (Test-DemoVmStepSetThisGeneration -Name 'Other', 'Build'); First = (Test-DemoVmStepFirstSetup -Name 'Admin') }
+                    $script:adminDone = $true
+                } }
+        )
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        # A later generation: Build stands, so its Test passes, and Admin has something to do again.
+        $script:adminDone = $false
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Should -Be 'Ready'
+        $script:seen.Count | Should -Be 2
+        $script:seen[0].Built | Should -BeTrue -Because 'Build''s Set ran in g1'
+        $script:seen[0].First | Should -BeTrue -Because 'Admin had never completed'
+        $script:seen[1].Built | Should -BeFalse -Because 'Build stood in g2'
+        $script:seen[1].First | Should -BeFalse -Because 'Admin completed in g1'
+        (Get-DemoVmState)['steps']['Build']['setGeneration'] | Should -Be 'g1'
+        (Get-DemoVmState)['steps']['Admin']['setGeneration'] | Should -Be 'g2'
+    }
+
     It 'keeps a lasting cause''s warning across a generation while its step passes its Test, and lets a one-off note and a fixed cause go (F24 review)' {
         $root = New-TestRoot
         $script:restartDone = $false

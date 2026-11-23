@@ -431,7 +431,10 @@ function Get-DemoValidationQuietReason {
 # Warning can have no other cause, so validate.ps1 and status.ps1 say these are expected. They're vm/bootstrap/lib/State.ps1's
 # legacy one-off notes, less two that aren't by design: a download without a pinned SHA-256, the repository's to fix, and
 # automatic sign-in left armed, which nothing in the demo does. Since 2026-11-23 a bundle records these as information,
-# in health.json's notes, which leave a Ready VM a Pass (Get-DemoHealthNoteText); an older bundle's are still warnings.
+# in health.json's notes, which leave a Ready VM a Pass (Get-DemoHealthNoteText), but only where they're by design: the
+# cleanup after Arc onboarding, or a guest's or SQL Server's setup, in the same generation, and the restart and the
+# sysadmin recovery on a T1's first setup; on an established VM they're warnings, which nothing calls expected (the review
+# of cb4bc479). An older bundle's are all warnings, and called expected, as F32 did.
 $script:DemoHealthExpectedNote = [ordered]@{
     '^The sign-in cleanup cleared '                                                             = 'a sign-in cleanup that clears an event log follows T2''s Arc onboarding, on a new host or a rebuilt guest (ADR 0009)'
     '^SQL Server setup asked for a restart'                                                     = 'SQL Server setup asks for a restart when it removes Analysis Services and Integration Services from a new T1'
@@ -456,6 +459,8 @@ function Get-DemoHealthWarningNote {
     stay while their cause does), and the summary view prints the first two (warnings, warningCount). Since 2026-11-22
     (F32: live on dbhubra, a new host's sign-in cleanup was its only cause), a one-off note that a new VM's bootstrap gives
     by design ($script:DemoHealthExpectedNote) is called expected, with why; when every warning is one, the fix is nothing.
+    Since 2026-11-23 a bundle gives those as notes instead (Get-DemoHealthNoteText), and a summary that has noteCount is
+    from such a bundle, so none of its warnings is called expected (the review of cb4bc479).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -487,11 +492,14 @@ function Get-DemoHealthWarningNote {
     $more = if ($total -gt $shown.Count) { ' ({0} more)' -f ($total - $shown.Count) } else { '' }
     $noun = if ($total -eq 1) { 'a warning' } else { '{0} warnings' -f $total }
     # Which of them a new VM's bootstrap gives by design, and why (F32, 2026-11-22: live on dbhubra, a new host's sign-in
-    # cleanup was the Warning's only cause, and the result didn't say it was expected).
+    # cleanup was the Warning's only cause, and the result didn't say it was expected). Only for a bundle from before
+    # 2026-11-23: one since gives those as notes (noteCount, which its summary always has), so a warning with the same text
+    # is an established VM's, which isn't expected (the review of cb4bc479).
     $reasons = [System.Collections.Generic.List[string]]::new()
     $expected = 0
+    $givesNotes = $null -ne (Get-DemoMemberValue -InputObject $Health -Name 'noteCount')
     foreach ($warning in @($shown)) {
-        $reason = Get-DemoHealthExpectedReason -Text ([string]$warning)
+        $reason = if ($givesNotes) { '' } else { Get-DemoHealthExpectedReason -Text ([string]$warning) }
         if ($reason) {
             $expected++
             if (-not $reasons.Contains($reason)) {

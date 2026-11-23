@@ -112,14 +112,21 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
         $script:versionsPath = Join-Path -Path $notebookFolder -ChildPath 'published-versions.json'
         $script:names = @(Get-ChildItem -Path $notebookFolder -Filter '*.ipynb' -File | Sort-Object -Property Name | ForEach-Object BaseName)
         $script:current = @{}
+        $script:currentParameters = @{}
+        # A version's parameter values as one text, whatever the order of its keys.
+        $script:parameterText = { param($Map) (@($Map.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive | ForEach-Object { '{0}={1}' -f $_, [string]$Map[$_] }) -join ';') }
         foreach ($name in $names) {
             $text = [System.IO.File]::ReadAllText((Join-Path -Path $notebookFolder -ChildPath "$name.ipynb"))
-            $current[$name] = (InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }).Sha256
+            $fingerprint = InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }
+            $current[$name] = $fingerprint.Sha256
+            $currentParameters[$name] = $fingerprint.Bindings
         }
 
         # DBHUB_WRITE_NOTEBOOK_VERSIONS=1 writes the file: what it lists, every version of each notebook in this checkout's
         # git history (when git answers, with the day each first appeared), and the current one (today, when it's new),
-        # oldest first. CI never sets it; a change to a notebook needs it once, and the file committed with the change.
+        # oldest first, each with its file's values in the parameters the fingerprint leaves out (the review of 42acec35:
+        # deploy.ps1 counts a copy with another value in a parameter it doesn't set as edited). CI never sets it; a change to
+        # a notebook needs it once, and the file committed with the change.
         if ($env:DBHUB_WRITE_NOTEBOOK_VERSIONS -eq '1') {
             $known = @{}
             foreach ($name in $names) {
@@ -130,7 +137,7 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
                 foreach ($name in $names) {
                     foreach ($entry in @($existing['notebooks'][$name])) {
                         if ($entry) {
-                            $known[$name][[string]$entry['sha256']] = [string]$entry['since']
+                            $known[$name][[string]$entry['sha256']] = @{ since = [string]$entry['since']; parameters = $entry['parameters'] }
                         }
                     }
                 }
@@ -149,13 +156,26 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
                         if ($LASTEXITCODE -ne 0 -or -not $text) {
                             continue
                         }
-                        $sha = (InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }).Sha256
-                        if ($sha -and (-not $known[$name].ContainsKey($sha) -or [string]::CompareOrdinal($day, $known[$name][$sha]) -lt 0)) {
-                            $known[$name][$sha] = $day
+                        $fingerprint = InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }
+                        $sha = $fingerprint.Sha256
+                        if (-not $sha) {
+                            continue
+                        }
+                        $values = & $parameterText $fingerprint.Bindings
+                        if (-not $known[$name].ContainsKey($sha)) {
+                            $known[$name][$sha] = @{ since = $day; parameters = $fingerprint.Bindings }
+                            continue
+                        }
+                        if ($null -ne $known[$name][$sha]['parameters'] -and (& $parameterText $known[$name][$sha]['parameters']) -cne $values) {
+                            throw ('{0}''s version {1} has other parameter values at {2} than elsewhere in the history: list it by hand, with each.' -f $name, $sha, $commit)
+                        }
+                        $known[$name][$sha]['parameters'] = $fingerprint.Bindings
+                        if ([string]::CompareOrdinal($day, [string]$known[$name][$sha]['since']) -lt 0) {
+                            $known[$name][$sha]['since'] = $day
                         }
                     }
                     if (-not $known[$name].ContainsKey($current[$name])) {
-                        $known[$name][$current[$name]] = [DateTime]::UtcNow.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+                        $known[$name][$current[$name]] = @{ since = [DateTime]::UtcNow.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture); parameters = $currentParameters[$name] }
                     }
                 }
             }
@@ -163,13 +183,13 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
                 [Console]::OutputEncoding = $consoleEncoding
             }
             $document = [ordered]@{
-                about     = 'Every version of the demo''s notebooks in this repository''s history, oldest first, by fingerprint: each cell''s type and code, without outputs, metadata, line endings, trailing spaces, or the workspace, lakehouse, and GitHub values the import sets (Get-DemoNotebookFingerprint). deploy.ps1 brings a workspace''s copy that matches one of them up to date, since nobody edited it, and keeps one that matches none, while fabric.importNotebooks is false. Written by tests/unit/Fabric.Notebooks.Tests.ps1 with DBHUB_WRITE_NOTEBOOK_VERSIONS=1; don''t edit.'
+                about     = 'Every version of the demo''s notebooks in this repository''s history, oldest first, by fingerprint: each cell''s type and code, without outputs, metadata, line endings, trailing spaces, or the workspace, lakehouse, and GitHub values the import sets (Get-DemoNotebookFingerprint), with the values its file has there (parameters). deploy.ps1 brings a workspace''s copy that matches one of them up to date, since nobody edited it, and keeps one that matches none, or that has another value in a parameter the import doesn''t set, while fabric.importNotebooks is false. Written by tests/unit/Fabric.Notebooks.Tests.ps1 with DBHUB_WRITE_NOTEBOOK_VERSIONS=1; don''t edit.'
                 notebooks = [ordered]@{}
             }
             foreach ($name in $names) {
-                $document['notebooks'][$name] = @($known[$name].GetEnumerator() | Sort-Object -Property @{ Expression = { $_.Value } }, @{ Expression = { $_.Key } } | ForEach-Object { [ordered]@{ sha256 = $_.Key; since = $_.Value } })
+                $document['notebooks'][$name] = @($known[$name].GetEnumerator() | Sort-Object -Property @{ Expression = { [string]$_.Value['since'] } }, @{ Expression = { $_.Key } } | ForEach-Object { [ordered]@{ sha256 = $_.Key; since = [string]$_.Value['since']; parameters = $_.Value['parameters'] } })
             }
-            $json = (ConvertTo-Json -InputObject $document -Depth 5) -replace "`r`n", "`n"
+            $json = (ConvertTo-Json -InputObject $document -Depth 6) -replace "`r`n", "`n"
             [System.IO.File]::WriteAllText($versionsPath, $json + "`n", [System.Text.UTF8Encoding]::new($false))
         }
     }
@@ -184,11 +204,19 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
             foreach ($entry in $entries) {
                 [string]$entry['sha256'] | Should -Match '^[0-9a-f]{64}$'
                 [string]$entry['since'] | Should -Match '^\d{4}-\d{2}-\d{2}$'
+                # Each version's own values in the parameters the import may set, which deploy.ps1 compares a copy's with
+                # where this run doesn't set them (the review of 42acec35).
+                $entry['parameters'] | Should -BeOfType [System.Collections.IDictionary] -Because 'deploy.ps1 counts a version without them as edited'
+                foreach ($key in @($entry['parameters'].Keys)) {
+                    $key | Should -BeIn @('WORKSPACE_ID', 'LAKEHOUSE_ID', 'LAKEHOUSE_NAME', 'GITHUB_REPOSITORY', 'GITHUB_ENVIRONMENT')
+                }
             }
             @($entries | ForEach-Object { [string]$_['sha256'] } | Select-Object -Unique).Count | Should -Be $entries.Count -Because 'each version is listed once'
             $days = @($entries | ForEach-Object { [string]$_['since'] })
             ($days -join ' ') | Should -BeExactly ((@($days | Sort-Object -CaseSensitive) -join ' ')) -Because 'the versions go oldest first'
             @($entries | ForEach-Object { [string]$_['sha256'] }) | Should -Contain $current[$name] -Because ('{0}''s current version must be listed, or deploy.ps1 counts a copy of it as edited: run this test with DBHUB_WRITE_NOTEBOOK_VERSIONS=1, and commit the file' -f $name)
+            $listed = @($entries | Where-Object { [string]$_['sha256'] -eq $current[$name] })[0]
+            (& $parameterText $listed['parameters']) | Should -BeExactly (& $parameterText $currentParameters[$name]) -Because 'the current version lists its own file''s values'
         }
     }
 
