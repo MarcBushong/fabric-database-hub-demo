@@ -56,11 +56,13 @@ The sidecars name no scenario: their statements are the procedures' own, normali
   - **Plan 58:** a parallel Clustered Index Scan of `pk_appointments` at DOP 4, estimated cost 38.6, compiled at 17:03:11; its first execution ended at 17:03:12.6. It ran 524 times, to 17:09:40.2, at 176 ms of CPU each (92,224 ms), with 4,100 logical reads each and 31,440 ms of waits: CPU 18,900, Parallelism 11,620, and Buffer IO 920.
 - **The 17:00 interval is mixed:** plan 31 also ran 668 times in it (1,403 ms). Plan 58 used 96 % of the captured top queries' CPU in that interval (92,224 of 95,644 ms).
 - **The response, as measured:**
-  - automatic tuning's FORCE_LAST_GOOD_PLAN for query 412 was Executing at 17:09:30;
+  - automatic tuning's recommendation for query 412 appeared, Active, between 17:05:30 and 17:06:00: force plan 31 over plan 58, CPU time per execution 2.1 ms against 176 ms;
+  - FORCE_LAST_GOOD_PLAN was Executing at 17:09:30;
   - plan 31 was forced (AUTO) between 17:09:00 and 17:10:00; its last compile was 17:09:41;
   - the recommendation was Verifying at 17:10:30;
   - from 17:15 (the interval still open at the final read, 17:20:10), plan 31 ran alone, at 2.1 ms each.
-- **Other statements are evidence too:** query 377 (an ad hoc patient list), and query 902, another application's read of `sys.dm_exec_requests`.
+- **Other statements are evidence too:** query 377 (an ad hoc patient list), and query 902, another application's read of `sys.dm_exec_requests`, with its plan 40.
+- **Plans:** a plan's row is written when a read first returns it, and again when it changes. So plan 31 has a row at 16:50 and one at 17:17, forced; plans 58 and 40 one each, at 17:17; and the final read writes none.
 - **Coverage:** READ_WRITE, capture mode AUTO, 15-minute intervals, intervals read from 16:15 to 17:30.
 
 **T4 (t4-query-store):**

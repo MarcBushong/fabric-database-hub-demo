@@ -261,7 +261,7 @@
         { "name": "plan_id", "type": "long", "model": { "column": "Plan ID" }, "description": "The plan forced or unforced; null for a state change." },
         { "name": "forcing_type", "type": "string", "model": { "column": "Forcing Type" }, "description": "MANUAL or AUTO for a forcing (plan_forcing_type_desc): forced by a person (sys.sp_query_store_force_plan) or by automatic plan correction." },
         { "name": "state", "type": "string", "model": { "column": "State" }, "description": "The state after the change: Query Store's actual state (READ_WRITE, READ_ONLY, OFF, ERROR) or capture mode on PostgreSQL (top, all, none), automatic tuning's actual state, or the recommendation's state." },
-        { "name": "previous_state", "type": "string", "model": { "column": "Previous State" }, "description": "The state the read before saw." },
+        { "name": "previous_state", "type": "string", "model": { "column": "Previous State" }, "description": "The state the read before saw; null when a recommendation first appears." },
         { "name": "detail", "type": "string", "model": { "column": "Detail" }, "description": "The change in plain words, normalized: for READ_ONLY, its readonly_reason in words (for example, the storage limit); for a recommendation, its reason." }
       ]
     },
