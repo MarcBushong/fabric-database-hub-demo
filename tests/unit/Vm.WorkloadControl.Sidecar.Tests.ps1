@@ -324,8 +324,9 @@ Describe 'Invoke-DemoWorkloadControl.ps1: the Query Store sidecar''s actions (rc
             Mock -CommandName Invoke-DemoControlGuestReady -MockWith { throw 'must not make the guest ready' }
             Mock -CommandName Invoke-DemoControlT2Recovery -MockWith { throw 'must not restart the guest' }
             $script:guestRuns = [System.Collections.Generic.List[string]]::new()
-            Mock -CommandName Invoke-DemoControlGuestCommand -MockWith {
-                $script:guestRuns.Add((@($ArgumentList[1]) -join ' '))
+            # PowerShell Direct itself (Invoke-Command -VMName), as the deepest of v1's export tests mocks it.
+            Mock -CommandName Invoke-Command -MockWith {
+                $script:guestRuns.Add(('{0} as {1}: {2}' -f (@($VMName) -join ','), $Credential.UserName, (@($ArgumentList[1]) -join ' ')))
                 # The runner's own log lines around its one line, so the line is in neither the first nor the last 1,800
                 # characters; then serialized and rebuilt, as PowerShell Direct hands the guest's object back.
                 $before = @(1..30 | ForEach-Object { 'observer: sealed span {0:00} of T2 into sidecars' -f $_ }) -join "`r`n"
@@ -358,7 +359,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: the Query Store sidecar''s actions (rc
                 $result.evidence.guest | Should -Be 'arcsql01'
                 $script:lines[1] | Should -BeExactly $case.Line
                 $script:guestRuns.Count | Should -Be 1
-                $script:guestRuns[0] | Should -BeExactly $case.Arguments
+                $script:guestRuns[0] | Should -BeExactly ('arcsql01 as Administrator: ' + $case.Arguments)
                 # A managed Run Command keeps the last 4,096 bytes of output: both lines, as the VM writes them.
                 [System.Text.Encoding]::UTF8.GetByteCount((($script:lines | ForEach-Object { $_ + "`r`n" }) -join '')) | Should -BeLessOrEqual 4096
             }
