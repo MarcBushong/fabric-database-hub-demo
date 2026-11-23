@@ -177,7 +177,17 @@ public sealed class SqlScriptTests
 
         Assert.Equal(RetiredTSqlNames.Order(StringComparer.Ordinal), drops.Order(StringComparer.Ordinal));
         Assert.True(text.LastIndexOf("CREATE OR ALTER ", StringComparison.Ordinal) < text.IndexOf("DROP PROCEDURE IF EXISTS", StringComparison.Ordinal), "every replacement exists before the first drop");
-        Assert.True(text.IndexOf("EXEC sys.sp_query_store_unforce_plan", text.LastIndexOf("CREATE OR ALTER ", StringComparison.Ordinal), StringComparison.Ordinal) < text.IndexOf("DROP PROCEDURE IF EXISTS", StringComparison.Ordinal), "the old lookup's forced plans are unforced before it's dropped");
+
+        // The unforce of the retired block itself, on Azure SQL Database only, in TRY, and before the first drop: the last
+        // module (frontdesk.usp_refresh_visit_summaries) has an unforce of its own, which mustn't stand in for this one.
+        var retiredStart = text.IndexOf("-- Retired names", StringComparison.Ordinal);
+        Assert.True(retiredStart > text.LastIndexOf("CREATE OR ALTER ", StringComparison.Ordinal), "the retired names come after every module");
+        var retiredBlock = text[retiredStart..text.IndexOf("DROP PROCEDURE IF EXISTS", StringComparison.Ordinal)];
+        var unforce = retiredBlock.IndexOf("EXEC sys.sp_query_store_unforce_plan @query_id = @query_id, @plan_id = @plan_id;", StringComparison.Ordinal);
+        Assert.True(unforce >= 0, "the old lookup's forced plans are unforced before it's dropped");
+        Assert.Contains("IF CAST(SERVERPROPERTY('EngineEdition') AS int) = 5 AND OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') IS NOT NULL", retiredBlock, StringComparison.Ordinal);
+        Assert.Contains("WHERE q.object_id = OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') AND p.is_forced_plan = 1;", retiredBlock, StringComparison.Ordinal);
+        Assert.True(retiredBlock.IndexOf("BEGIN TRY", StringComparison.Ordinal) is >= 0 and var tryStart && tryStart < unforce && unforce < retiredBlock.IndexOf("END TRY", StringComparison.Ordinal), "a failed unforce never stops setup");
         foreach (var (path, _, script) in DemoScripts.Value)
         {
             Assert.All(RetiredTSqlNames, retired => Assert.DoesNotContain("CREATE OR ALTER " + retired.Split(' ')[0] + " " + retired.Split(' ')[1], script, StringComparison.Ordinal));

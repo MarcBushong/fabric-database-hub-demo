@@ -147,7 +147,7 @@ internal static class OutOfStep
     public const string RefusalReason = "out-of-step";
 
     public static string Reason(DemoTarget target, string module) =>
-        $"{target}'s workload modules are older than this runner: {module} isn't there yet. ./scripts/deploy.ps1 updates them; the run is tried again.";
+        $"{target}'s workload modules aren't set up for this runner yet: it can't run {module}. ./scripts/deploy.ps1 sets them up; the run is tried again.";
 }
 
 /// <summary>Runs bounded scenarios on one target and resets it: the T-SQL runner for T1 to T3, the PostgreSQL runner for T4, the Cosmos DB runner for T5.</summary>

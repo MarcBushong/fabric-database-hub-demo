@@ -5566,3 +5566,32 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - A Run all, then `./scripts/validate.ps1`.
 - On T3, plan-regression's beat runs on `frontdesk.usp_visit_summary`, and reset unforces its plans.
 - Query Store and Database Hub show the new names.
+
+### Realistic names, unit A: the review of 45f37c4c (2026-11-23)
+
+**Why.** The review of 59d9dfb7 and 45f37c4c said ship with fixes. It found nothing that would fail on a real server or on a second run, and asked for two fixes, in one follow-up commit.
+
+- **Medium: the test that guards T3's unforce of the old lookup checked nothing.** It searched from the last `CREATE OR ALTER`, so it found the unforce inside `frontdesk.usp_refresh_visit_summaries` instead of the retired block's, and a missing call, -1, still passed.
+  - **The fix:** the test reads the retired block alone, from `-- Retired names` to the first drop. It requires the unforce there, inside `BEGIN TRY`, under the Azure SQL Database condition, for `OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P')`'s forced plans.
+  - **Proved:** with the block removed from the script, the test fails ("the old lookup's forced plans are unforced before it's dropped"). The script was restored after.
+- **Low: on T4, the runner's check before a run tested that the step existed, not that it could call it.** `setup --target T4` creates the steps in their new schemas before `GrantRunnerAsync` grants the runner's role `USAGE` on them. A run in between would have passed the check, registered, and failed at its first step with SQLSTATE 42501: Failed, where the design says Refused and tried again. T-SQL has no such gap, because `120` grants `EXECUTE` on the schemas before it creates a module.
+  - **The fix:** the runner checks with `PgScripts.FunctionCallableAsync`, which also requires `has_schema_privilege(n.oid, 'USAGE')` and `has_function_privilege(p.oid, 'EXECUTE')` for the signed-in role. Setup's own check stays existence-only, as an administrator's.
+  - **The reason now covers both cases:** "T4's workload modules aren't set up for this runner yet: it can't run scheduling.usp_find_double_bookings. ./scripts/deploy.ps1 sets them up; the run is tried again."
+  - **A new opt-in test,** `PostgresTests.TheRunnersCheckWantsAStepItCanCall`, against a disposable server: a function in a schema the role has no `USAGE` on exists, but isn't callable, until the grant.
+
+**Changed files.** `workload-generator/src/ContosoCare.Workload/Postgres/PgScripts.cs`, `Postgres/PgScenarioRunner.cs`, and `Runs/ScenarioRunner.cs` (the reason's words); `tests/ContosoCare.Workload.Tests/SqlScriptTests.cs` and `PostgresTests.cs`; and this report.
+
+**Validation.**
+
+- **The runner's test classes for these files** (`RunnerTests`, `SqlScriptTests`, `CatalogTests`, `PostgresTests`, `ReplicaLagTests`, `SqlIntegrationTests`, and `RcaBlindTests`): 304 tests, of which 282 passed, 22 were skipped, and none failed. The skipped ones are the integration tests.
+- **The two PostgreSQL opt-in tests** passed against the local PostgreSQL 18.6: `SetupRunAndResetAgainstALocalServer`, and the new `TheRunnersCheckWantsAStepItCanCall`.
+- **In setup's own gap, on the local server:**
+  - The base commit's scripts and grants, then this branch's scripts without their grants: the runner, signed in as `contosocare_runner`, refused a cpu-pressure run with the reason above, and registered no run.
+  - After `GrantRunnerAsync`'s two new grants, the same run completed: 2 workers ran `scheduling.usp_find_double_bookings` 53 times.
+
+**What its live check needs, added to the review's list for Final tests:**
+
+- **On T4:** `./scripts/deploy.ps1` while T4's profile is running. A T4 run in the minutes of its setup is Refused with the reason above and then tried again; none ends Failed with 42501.
+- **On T1 and T2:** the runner's `setup` applies `120`'s comment-only batches, one before each module, with no error.
+- **On T3:** `sp_helptext 'billing.usp_claim_work_item'` shows no header comment and no scenario ID.
+- **The RCA's capture of a 50111:** an `error_reported` event names a module and a run, never a scenario.

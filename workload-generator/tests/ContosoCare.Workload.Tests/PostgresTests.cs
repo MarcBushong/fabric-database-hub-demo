@@ -391,6 +391,45 @@ public sealed partial class PostgresTests
         Assert.Contains(reset, c => c.CheckId == "workload-rows-removed" && c.Status == "Pass");
     }
 
+    /// <summary>
+    /// The runner's check before a run (ADR 0031, decision 6) wants a step it can call, not one that only exists: setup
+    /// creates the steps in their new schemas before it grants the runner's role USAGE on them, so a run in between is
+    /// refused and tried again, never registered and failed at its first step. Against the same disposable server, whose
+    /// user may create a role (a superuser, as in the local container).
+    /// </summary>
+    [Fact]
+    public async Task TheRunnersCheckWantsAStepItCanCall()
+    {
+        var server = Environment.GetEnvironmentVariable(ServerVariable);
+        Assert.SkipUnless(server is not null, $"Set {ServerVariable}, {PgEndpoint.UserVariable}, and {PgEndpoint.PasswordVariable} to a disposable PostgreSQL server to run this test.");
+        var token = TestContext.Current.CancellationToken;
+        var endpoint = PgEndpoint.Create(server, null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        await using var connection = await new PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(SessionNames.ForControl("test-callable"), token, PgSessionLimits.Setup);
+
+        async Task ExecuteAsync(string sql)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            await command.ExecuteNonQueryAsync(token);
+        }
+
+        await ExecuteAsync("DROP SCHEMA IF EXISTS zz_callable_probe CASCADE; CREATE SCHEMA zz_callable_probe; CREATE FUNCTION zz_callable_probe.usp_probe() RETURNS integer LANGUAGE sql AS 'SELECT 1'; DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'zz_callable_probe_role') THEN CREATE ROLE zz_callable_probe_role NOLOGIN; END IF; END $$;");
+        try
+        {
+            await ExecuteAsync("SET ROLE zz_callable_probe_role;");
+            Assert.True(await PgScripts.FunctionExistsAsync(connection, "zz_callable_probe.usp_probe", token));
+            Assert.False(await PgScripts.FunctionCallableAsync(connection, "zz_callable_probe.usp_probe", token));
+            Assert.False(await PgScripts.FunctionCallableAsync(connection, "zz_callable_probe.usp_not_there", token));
+
+            await ExecuteAsync("RESET ROLE; GRANT USAGE ON SCHEMA zz_callable_probe TO zz_callable_probe_role; SET ROLE zz_callable_probe_role;");
+            Assert.True(await PgScripts.FunctionCallableAsync(connection, "zz_callable_probe.usp_probe", token));
+        }
+        finally
+        {
+            await ExecuteAsync("RESET ROLE; DROP SCHEMA IF EXISTS zz_callable_probe CASCADE; DROP ROLE IF EXISTS zz_callable_probe_role;");
+        }
+    }
+
     private static PgEndpoint Endpoint() => PgEndpoint.Create("pgflex01-abc123", null, passwordFromEnvironment: false, managedIdentityClientId: null);
 
     [Theory]

@@ -101,7 +101,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
             RunRegistration registration;
             try
             {
-                if (!await PgScripts.FunctionExistsAsync(control, plan.Scenario.Procedure, cancellationToken).ConfigureAwait(false))
+                if (!await PgScripts.FunctionCallableAsync(control, plan.Scenario.Procedure, cancellationToken).ConfigureAwait(false))
                 {
                     return Refused(plan, runId, parameters, OutOfStep.Reason(plan.Target, plan.Scenario.Procedure), checks, OutOfStep.RefusalReason);
                 }

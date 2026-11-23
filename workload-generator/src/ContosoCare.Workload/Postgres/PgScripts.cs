@@ -169,7 +169,22 @@ internal static partial class PgScripts
     }
 
     /// <summary>True when a function of that schema-qualified name exists, whatever its arguments.</summary>
-    public static async Task<bool> FunctionExistsAsync(NpgsqlConnection connection, string qualifiedName, CancellationToken cancellationToken)
+    public static Task<bool> FunctionExistsAsync(NpgsqlConnection connection, string qualifiedName, CancellationToken cancellationToken) =>
+        FunctionCheckAsync(connection, ExistsSql, qualifiedName, cancellationToken);
+
+    /// <summary>
+    /// True when the signed-in role can call a function of that schema-qualified name: it exists, and the role has USAGE
+    /// on its schema and EXECUTE on it. The runner's check before a run (ADR 0031, decision 6): setup creates the steps
+    /// before it grants the runner's role the new schemas, so a run in between is refused, not failed at its first step.
+    /// </summary>
+    public static Task<bool> FunctionCallableAsync(NpgsqlConnection connection, string qualifiedName, CancellationToken cancellationToken) =>
+        FunctionCheckAsync(connection, CallableSql, qualifiedName, cancellationToken);
+
+    internal const string ExistsSql = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = @schema AND p.proname = @name);";
+
+    internal const string CallableSql = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = @schema AND p.proname = @name AND has_schema_privilege(n.oid, 'USAGE') AND has_function_privilege(p.oid, 'EXECUTE'));";
+
+    private static async Task<bool> FunctionCheckAsync(NpgsqlConnection connection, string sql, string qualifiedName, CancellationToken cancellationToken)
     {
         var separator = qualifiedName.IndexOf('.', StringComparison.Ordinal);
         if (separator <= 0 || separator == qualifiedName.Length - 1)
@@ -178,7 +193,9 @@ internal static partial class PgScripts
         }
 
         await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = @schema AND p.proname = @name);";
+#pragma warning disable CA2100 // One of the two constant statements above; the names travel as parameters.
+        command.CommandText = sql;
+#pragma warning restore CA2100
         command.Parameters.Add(new NpgsqlParameter<string>("schema", NpgsqlDbType.Text) { TypedValue = qualifiedName[..separator] });
         command.Parameters.Add(new NpgsqlParameter<string>("name", NpgsqlDbType.Text) { TypedValue = qualifiedName[(separator + 1)..] });
         return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is true;
