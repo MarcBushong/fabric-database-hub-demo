@@ -190,7 +190,10 @@ for (const r of rows) {
 }
 // A declared grain against the save's bins: the app's T4 and T5 views read the step from the bins, so there the two must
 // be the same; a SQL save's views read the model, and its bins must be on its grid, sparser only where its analysis saves
-// bins with activity alone (sessions, wait_deltas), which declaredSparse counts per analysis.
+// bins with activity alone, which declaredSparse counts per analysis: sessions keeps the demo database's sessions, and
+// wait_deltas the bins with waits (WaitMs > 0). A save that declares a grain finer than its bins elsewhere counts the rest
+// of each bin's minutes twice where another save holds them too.
+const ACTIVITY_ONLY = new Set(["sessions", "wait_deltas"]);
 const stepDiffers: string[] = [];
 const declaredDiffers: string[] = [];
 const declaredSparse: Record<string, number> = {};
@@ -216,8 +219,12 @@ for (const r of rows) {
         declaredOneBin += 1;
     } else if (fromBins < declared || fromBins % declared !== 0) {
         declaredDiffers.push(`${key}: declares ${declared} minutes, where its bins are ${fromBins} minutes apart`);
-    } else if (fromBins !== declared && family !== "sql") {
-        declaredDiffers.push(`${key}: declares ${declared} minutes, where the app's ${family === "cosmos" ? "T5" : "T4"} views read ${fromBins} from its bins`);
+    } else if (fromBins !== declared && (family !== "sql" || !ACTIVITY_ONLY.has(analysis))) {
+        declaredDiffers.push(
+            family === "sql"
+                ? `${key}: declares ${declared} minutes, where its bins are ${fromBins} minutes apart`
+                : `${key}: declares ${declared} minutes, where the app's ${family === "cosmos" ? "T5" : "T4"} views read ${fromBins} from its bins`,
+        );
     } else if (fromBins !== declared) {
         declaredSparse[analysis] = (declaredSparse[analysis] ?? 0) + 1;
     }
