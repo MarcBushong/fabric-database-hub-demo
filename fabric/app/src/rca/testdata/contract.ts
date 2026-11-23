@@ -4,6 +4,7 @@
 import { readdirSync, readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { decodeEvidence, mergeEvidence } from "../evidence";
+import { decodeSidecar, mergeSidecars, parseExact, type SidecarEvidence } from "../sidecar";
 import type { Evidence } from "../types";
 
 export const CONTRACT_DIR = resolve(import.meta.dirname, "../../../../../rca");
@@ -12,13 +13,34 @@ export function readContract<T = unknown>(relative: string): T {
     return JSON.parse(readFileSync(resolve(CONTRACT_DIR, relative), "utf8")) as T;
 }
 
+/** A contract file's text: its README's rules, which a test can hold the app's words to. */
+export function readContractText(relative: string): string {
+    return readFileSync(resolve(CONTRACT_DIR, relative), "utf8");
+}
+
+/** A contract file read with its 64-bit integers' exact digits (sidecar.ts's parseExact). */
+export function readContractExact<T = unknown>(relative: string): T {
+    return parseExact(readFileSync(resolve(CONTRACT_DIR, relative), "utf8")) as T;
+}
+
 export const FIXTURES = {
     t1: "fixtures/t1-blocking-chain.evidence.json",
     t4: "fixtures/t4-replica-lag.evidence.json",
 } as const;
 
+/** The sidecar fixtures (rca/fixtures/README.md, What a blind RCA finds in the sidecars). */
+export const SIDECAR_FIXTURES = {
+    t3: "fixtures/t3-plan-regression.sidecar.json",
+    t4: "fixtures/t4-query-store.sidecar.json",
+    surge: "fixtures/t4-connection-surge.sidecar.json",
+} as const;
+
 export function fixtureEvidence(...names: Array<keyof typeof FIXTURES>): Evidence {
     return mergeEvidence(names.map((name) => decodeEvidence(readContract(FIXTURES[name])).evidence));
+}
+
+export function fixtureSidecar(...names: Array<keyof typeof SIDECAR_FIXTURES>): SidecarEvidence {
+    return mergeSidecars(names.map((name) => decodeSidecar(readContractExact(SIDECAR_FIXTURES[name])).sidecar));
 }
 
 export interface AnswerKeyRow {

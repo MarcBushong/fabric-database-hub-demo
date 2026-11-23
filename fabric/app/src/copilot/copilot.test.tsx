@@ -5,12 +5,13 @@ import { QueryClientContext } from "@/data/use-query";
 import { createQueryClient, describeFailure, QueryFailure, type ConnectorResult, type Execute, type QueryClient } from "@/data/query-client";
 import { setLiveEstateReader, useLiveEstate, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
 import { retryClock } from "@/data/retry";
-import { RCA_PRESENCE_DAX } from "@/rca/loader";
+import { RCA_PRESENCE_DAX, SIDECAR_PRESENCE_DAX } from "@/rca/loader";
 import { INVESTIGATION_TOOL_NAMES } from "@/rca/tools";
 import { AccountChips } from "@/shell/AccountChips";
 import { CopilotDock } from "./CopilotDock";
 import { CopilotProvider } from "./CopilotProvider";
 import { NEWEST_BIN_DAX } from "./investigations";
+import { SIDECAR_GUIDE } from "./model-guide.generated";
 import { COSMOS_PROBE_DAX } from "./starters";
 import { useCopilot, useCopilotAccount, useCopilotDock } from "./use-copilot";
 
@@ -151,6 +152,8 @@ const signedInNineHoursAgo = () => ({ accessToken: fakeToken(), expiresAt: Date.
 let hasCosmos = 0;
 /** Whether the history model has the Incident RCA's tables: without them, the presence check fails, as on a model from before the feature. */
 let hasRca = false;
+/** Whether it also has Query Store's (the sidecar's): without them, their check fails as on a model from before them. */
+let hasSidecar = false;
 /** How many more presence checks Power BI throttles, as it answers past 120 queries a minute (live, 2026-11-21). */
 let rcaThrottled = 0;
 const queryClient: QueryClient = {
@@ -161,6 +164,7 @@ const queryClient: QueryClient = {
         }
         // Execute Queries' answer on a model from before the Incident RCA (live, 2026-11-21), as the history source reports it.
         if (spec.dax === RCA_PRESENCE_DAX && !hasRca) throw new QueryFailure(describeFailure("api", "Query (1, 32) Cannot find table '<oii>RCA Coverage</oii>'."), "api", "400");
+        if (spec.dax === SIDECAR_PRESENCE_DAX && !hasSidecar) throw new QueryFailure(describeFailure("api", "Query (1, 40) Cannot find table '<oii>RCA Query Stats</oii>'."), "api", "400");
         const rows =
             spec.dax === COSMOS_PROBE_DAX
                 ? [{ HasCosmos: hasCosmos }]
@@ -190,6 +194,7 @@ function renderDock(initialOpen = true, estate = false) {
 beforeEach(() => {
     hasCosmos = 0;
     hasRca = false;
+    hasSidecar = false;
     rcaThrottled = 0;
     FakeSocket.startError = null;
     FakeSocket.script = null;
@@ -264,6 +269,9 @@ describe("the Copilot dock", () => {
         const toolResult = socket.sent.find((m) => m.type === "tool_result");
         expect(toolResult).toMatchObject({ callId: "c1", ok: true });
         expect(JSON.parse(String(toolResult?.result))).toMatchObject({ columns: ["CpuPct"], rows: [[88.2]] });
+        // Without the RCA tables, Query Store's aren't asked about.
+        expect(vi.mocked(queryClient.run).mock.calls.filter(([spec]) => spec.dax === SIDECAR_PRESENCE_DAX)).toHaveLength(0);
+        expect(String(socket.sent[0].systemMessage)).not.toContain(SIDECAR_GUIDE);
         fireEvent.click(screen.getByRole("button", { name: /Show the source/ }));
         expect(screen.getByLabelText("DAX: Peak CPU")).toHaveTextContent("EVALUATE");
         await act(async () => {
@@ -318,12 +326,42 @@ describe("the Copilot dock", () => {
         expect((start.tools as Array<{ name: string }>).map((t) => t.name)).toEqual(["run_dax", "show_chart", "suggest_followups", ...INVESTIGATION_TOOL_NAMES]);
         const system = String(start.systemMessage);
         expect(system).toContain("# Investigating incidents");
+        // A model with the RCA tables but not Query Store's: their compact guide stays out, asked about once.
+        expect(system).not.toContain(SIDECAR_GUIDE);
+        expect(vi.mocked(queryClient.run).mock.calls.filter(([spec]) => spec.dax === SIDECAR_PRESENCE_DAX)).toHaveLength(1);
         for (const key of ["Incident Windows", "Scenario Runs", "Analysis Findings", "[In Incident Window]", "fixed minutes"]) expect(system).not.toContain(key);
         const result = FakeSocket.last!.sent.find((m) => m.type === "tool_result");
         expect(result).toMatchObject({ callId: "c1", ok: true });
         const answer = JSON.parse(String(result?.result)) as { tool: string; window: { fromUtc: string; toUtc: string } };
         expect(answer).toMatchObject({ tool: "find_incidents", window: { fromUtc: "2026-11-20T15:50:00Z", toUtc: "2026-11-20T17:20:00Z" } });
         expect(vi.mocked(queryClient.run).mock.calls.filter(([spec]) => spec.dax === RCA_PRESENCE_DAX)).toHaveLength(1);
+    });
+
+    // The coordinator's decision (review-qs-b): Query Store's six tables are left out of the always-on guide, and a
+    // conversation gets their compact section only when the model has them.
+    it("gives a conversation Query Store's compact guide once the model has its tables too, before the playbook", async () => {
+        hasRca = true;
+        hasSidecar = true;
+        window.localStorage.setItem(SESSION, JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+            }),
+        );
+        FakeSocket.script = (socket, message) => {
+            if (message.type === "user") {
+                socket.emit({ type: "message", messageId: "m1", text: "Nothing abnormal was captured in the newest 90 minutes." });
+                socket.emit({ type: "idle" });
+            }
+        };
+        renderDock();
+        fireEvent.click(await screen.findByRole("button", { name: "What caused the latest incident?" }));
+        expect(await screen.findByText(/Nothing abnormal was captured/)).toBeInTheDocument();
+        expect(String(FakeSocket.last!.sent[0].systemMessage)).toContain(`${SIDECAR_GUIDE}\n\n# Investigating incidents`);
+        expect(vi.mocked(queryClient.run).mock.calls.filter(([spec]) => spec.dax === SIDECAR_PRESENCE_DAX)).toHaveLength(1);
     });
 
     // Live, 2026-11-21: a check that Power BI throttled said nothing about the model, but the dock kept "no RCA tables" for

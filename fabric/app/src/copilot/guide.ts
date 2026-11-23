@@ -4,7 +4,7 @@
 // demo injects or when, so Copilot investigates from the telemetry and the capture, the way a DBA's tools would.
 
 import { INVESTIGATION_PLAYBOOK } from "@/rca/playbook";
-import { MODEL_GUIDE } from "./model-guide.generated";
+import { MODEL_GUIDE, SIDECAR_GUIDE } from "./model-guide.generated";
 
 export interface GuideOptions {
     /** True when the live estate tool is available in this deployment. */
@@ -17,6 +17,8 @@ export interface GuideOptions {
     liveUnavailable?: string;
     /** True when the history model has the Incident RCA's tables, so the investigation tools are offered. */
     rca?: boolean;
+    /** True when it also has Query Store's evidence (the sidecar's tables): with rca, the chat gets their compact guide. */
+    sidecar?: boolean;
 }
 
 export function buildSystemMessage(options: GuideOptions): string {
@@ -61,5 +63,5 @@ ${live}
 - The model guide below is everything you can query. run_dax refuses tables and measures that aren't in it.
 
 # The history model (generated from its TMDL)
-${MODEL_GUIDE}${options.rca ? `\n\n${INVESTIGATION_PLAYBOOK}` : ""}`;
+${MODEL_GUIDE}${options.rca && options.sidecar ? `\n\n${SIDECAR_GUIDE}` : ""}${options.rca ? `\n\n${INVESTIGATION_PLAYBOOK}` : ""}`;
 }

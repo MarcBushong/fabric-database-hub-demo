@@ -7371,6 +7371,67 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **What its live check needs.** As the summary above lists: the facets and their counts on a live session's incidents, 6 and 24 hours, a shared address, the links landing filtered, T4's and T5's names, the severities, and the chat's filters.
 
+### The review of 90e9d914 (2026-11-23)
+
+**Why.** The review said SHIP WITH FIXES: the Root cause page is sound, and its blindness, severity rule, counts, and address held. It found two Highs on the chat's side and two Mediums in the address. The coordinator asked for one commit after 90e9d914 before tonight's release.
+
+- **High: large chat results were cut, which dropped the caveats and broke the JSON.** Each episode's `severityReason`, repeated in triage's hypotheses, pushed common windows past what one answer holds, 60,000 characters. On the preview, 6 hours lost `details`, with the verdicts, and 24 hours ended " [cut]": invalid JSON, without what wasn't captured or the next steps, yet answered ok.
+  - **The fix:**
+    - a hypothesis with an episode's key no longer repeats its `severityReason`, which is in the episode list once;
+    - `bounded()` cuts in stages, never as text: each episode's `severityReason` first; then the details but the verdicts, the servers, and the filters with what they left out; then the least severe episodes and the last findings and hypotheses, saying how many more (`details.cut`, `details.more`);
+    - what wasn't captured, the next steps, and the root cause always stay; a last resort, never seen, keeps as many lines of what wasn't captured as fit, still as JSON.
+  - **Sizes on the preview,** this commit's, against the 60,000 one answer holds (`find_incidents`; `triage_window` is within a character of it):
+    - the newest 90 minutes: 49 incidents, 49,466 characters, whole;
+    - 6 hours: 66 incidents, 68,897 whole, answered in 57,942 with every incident, without their reasons (the reviewer's 90e9d914 lost its details at 78,788);
+    - 24 hours: 138 incidents, 151,271 whole, answered in 59,140 with the 64 most severe, and 74 more episodes, 70 findings, and 70 hypotheses counted (the reviewer's 90e9d914 ended " [cut]" at 60,006). Every answer parses.
+    - Triage's findings repeat its hypotheses' summaries: leaving one of them out first would keep about twice as many incidents in a 24-hour answer, a later change if the chat needs it.
+- **High: a target-filtered "nothing abnormal" read as the whole window's.** `targets` narrowed what `find_incidents` and `triage_window` read, so their verdicts and `leftOut` covered only those targets, while the playbook said the verdicts covered the whole window. The reviewer's case, on the preview from 14:50 to 15:00 UTC: with `targets` `["T4-replica"]` and `severities` `["high"]`, `nothingAbnormal` true and nothing left out, beside 10 incidents unfiltered.
+  - **The fix, as the page does:** the window is read on every target, and `targets` is a facet beside categories and severities. So `nothingAbnormal` and `quiet` are the whole window's, and `leftOut` counts what the filters left out on every target: episodes, hypotheses (errors without an episode among them), and other targets' lines of what wasn't captured, by category and target. A target they don't have is refused, as a category is. What wasn't captured lists the targets asked about, and lines about no one target, such as a read cut short; the servers are the targets asked about. The reviewer's case now reads `nothingAbnormal` false, with `quiet` T4-replica alone and 10 episodes, 9 hypotheses, and 5 lines of what wasn't captured left out, by category and target.
+  - **Its cost:** a triage asked about T4 alone now also reads T1 to T3's bins and waits, as the page's list does: about twice the queries of such a call, within Power BI's 120 a minute.
+- **Medium: the address took windows longer than 24 hours.** `MAX_WINDOW_HOURS` is in `facet-ids.ts`, with `isReadableWindow`, which the address's `parseWindow` and the page's filters apply. So a longer window, from the address, an older link's `T1.<from>.<to>`, or the Incidents page's or the scoreboard's links, reads the newest 90 minutes, keeping its target.
+- **Medium: a shared link without filters opened with the recipient's saved ones.** When the address names the Root cause page, the app takes its filters from the address alone (`openView`), and the page's defaults when it has none. Other pages keep the saved view under the address, as before.
+- **The playbook and the tools' specs** say `targets` is a facet, what `leftOut` counts, and that a cut result says what it left out, which the chat says.
+
+**Changed files.** `fabric/app/src/rca/tools.ts` (`triage`, `bounded`, the facets' spec text), `rca/facets.ts` (`facetArgs` takes targets), `rca/facet-ids.ts` (`MAX_WINDOW_HOURS`, `isReadableWindow`), `rca/view/facts.ts` and `rca/view/IncidentList.tsx` (the constant's move), `rca/playbook.ts`, `lib/view-state.ts` (`parseWindow`, `openView`), `App.tsx`, and `pages/RcaPage.tsx`; the tests `rca/bounded.test.ts` (new), `rca/tools.test.ts`, `rca/facets.test.ts`, `rca/sources.test.ts`, `lib/app.test.ts`, and `rca/view/rca-view.test.tsx`; ADR 0031, and this report.
+
+**Validation.** On 90e9d914 with this commit:
+
+- **The app:** `npm run verify` passed, run alone: typecheck, lint, Vitest's 705 tests in 38 files, the license check (136 production packages), and the build, whose main chunk is 940.87 kB, as at 90e9d914.
+- **The new tests fail without the fix:** with 90e9d914's code and this commit's tests, 11 fail: the preview's 6 and 24 hours (at 90e9d914, 6 hours' details were only a note), `bounded`'s 4, the chat's targets as a facet and its filters' echo, `facetArgs`'s targets, the address's 24 hours and its filters alone, and the page's longer older link.
+- **Test stubs:** two of `sources.test.ts`'s stubs answered every SQL target's bins with T1's rows, or every query with T5's metrics. Read on every target, they stand for what they meant: a history of T1's bins, or of T5's metrics, alone. Their `quiet` is now the whole window's. The read cut short takes 10 to 14 seconds alone at 100 % CPU, with or without this change, past the 15-second default, so it gets 60.
+- **The answers on B's and A's rows** weren't swept again: this commit changes every triage's hypotheses (their reasons), and the answers that pass `targets` (their verdicts, what wasn't captured, and `leftOut`), by design. The suites that ask those questions (`tools`, `sources`, `client`, `eval`, `live-accuracy`) pass.
+- **The suites that read the docs and the app:** under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Rca.Contract`, `Agent.PromptPack`, `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks; no unit test reached the Azure CLI, and `Rca.Contract`'s blind scan is clean.
+- markdownlint found no issue in 152 files, every link this commit adds resolves, and the leak check finds no identifier or secret in what it adds.
+
+**What its live check needs.** The chat on a live history: a 24-hour `find_incidents`, whole or cut, as JSON that parses; a triage filtered by a target beside incidents on others; and a shared Root cause link opening as it was shared.
+
+### A recommendation that named the demo's plan (2026-11-23)
+
+**Why.** The recommendation catalog's CPU-AUTO-CORRECT said its risk was "None for Azure SQL Database's default; it was held off on purpose in this demo beat": the RCA's own words naming what the demo planned, which breaks blind detection (ADR 0031). Building Query Store's rules (unit 2's C2) found it. No rule on this line returns it yet, but the catalog ships in tonight's release, and unit 2's rules recommend it for T3 when automatic tuning hasn't forced a plan. The chat and the report quote a recommendation as it stands.
+
+- **The fix:** its risk now says what a DBA checks: "None where it's on, as Azure SQL Database's default has it; where someone turned it off, find out why before turning it back on." These are C2's words, so the two branches agree.
+- **A test,** `rca/catalog.test.ts`: no recommendation's title, why, risk, or Learn title says "demo", "on purpose", "beat", "scenario", "inject", or "held off". It leaves out the Learn URLs, since one of Learn's anchors starts `#scenario-2-`.
+- **The sweep** of `src/rca`'s other output, here and at the release's integration head (the rules' statements, the playbook, the tools' descriptions, the view, and the Root cause page), found nothing else that names a plan or an injection. What mentions the demo stays:
+  - "the demo's saved history" (the tools) and "the demo's deterministic rules" (the playbook): where the facts come from;
+  - "You don't know what the demo planned or ran" (the playbook) and "with nothing about what anyone planned" (the page): blindness itself;
+  - "in this demo's live check Azure Monitor's failed connections counted none of the refusals at the connection limit" (the connection rules): a measurement of Azure Monitor's metric, from Final tests' live check, not of a plan;
+  - captured names such as `usp_scenario_chain_acquire`: the evidence, as the capture recorded it.
+
+**Changed files.** `fabric/app/src/rca/catalog.ts`, the test `rca/catalog.test.ts` (new), and this report.
+
+**Validation.** Targeted, as asked while this PC is at full load: `catalog.test.ts` and `rules.test.ts` passed (57 tests), and the new test fails with 62e5a18f's catalog. The typecheck and eslint are clean, markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+
+### The re-check of 62e5a18f: a shared link's incident (2026-11-23)
+
+**Why.** The re-check said SHIP, with one Low older than 62e5a18f: a shared `#/rca` link without an incident still opened on the recipient's saved incident, because `openView` reset only the filters from the address. A saved older window key, `T1.<from>.<to>`, also became the recipient's filters, since the Root cause page reads such a key's target and minutes as filters when the address has none.
+
+- **The fix:** when the address names the Root cause page, `openView` takes its incident from the address too, and none when it has none. Other pages keep the saved incident under the address, as before.
+- **The test,** in `lib/app.test.ts`: a link with no incident opens with none and the page's default filters; one with filters keeps them and still opens with no incident; an incident in the path or in `i=` is the one it opens; a saved older window key goes too; the Incidents page keeps the saved incident.
+
+**Changed files.** `fabric/app/src/lib/view-state.ts` (`openView`), the test `lib/app.test.ts`, ADR 0031, and this report.
+
+**Validation.** Targeted: `lib/app.test.ts` and the Root cause view's three suites (`app-rca`, `rca-retry`, `rca-view`) passed, 57 tests, and the new test fails with 96bf9ff7's `openView`. The typecheck and eslint are clean, markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+
 ### The re-review of bbdcd05c and 8e2cb06b (2026-11-23)
 
 **Why.** The re-review said **SHIP** for both, with one Low: past a target's retention, the note gave the minutes' age rounded down, so for the whole day after the retention ran out it said Query Store "no longer keeps those minutes ... it keeps 7 days, and they're 7 days old". One commit, after 8e2cb06b.
@@ -7676,6 +7737,23 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 - **The runner, all of it:** `dotnet test`: 831 tests, 810 passed, none failed, and 21 skipped, the integration tests that need a disposable SQL Server or PostgreSQL.
 
 **What its live check needs.** Nothing more than O1's: these paths take a failed write of the store.
+
+### A ready-to-run Query Store query in the RCA's next step (2026-11-23, for the release after the RCA's)
+
+**Why.** The coordinator, for Wednesday's release: the capture's Query Store evidence (unit 2) can't ship before about December 1, so meanwhile the chat's next step should be query-level, a ready-to-run, read-only query for the target and those minutes, built only from the incident's measured target and times, never from the answer key, with a copy button in the app.
+
+- **The query** (`rca/query-store.ts`, `queryStoreQuery`), for each `TELEMETRY-ONLY` episode while its target's Query Store keeps its minutes (the retention rule of [the review of 319b3ae1](#the-review-of-319b3ae1-and-a2f776db-2026-11-23)):
+  - **T1 to T3,** T-SQL in ContosoCare: `sys.query_store_runtime_stats` with `sys.query_store_runtime_stats_interval`, the plan, query, and text, for the intervals that overlap the incident's minutes (`end_time > @from AND start_time <= @to`, with `datetimeoffset` literals in UTC), the top 20 plans by CPU, then duration, with their query and plan IDs, executions, module, and the first 300 characters of their text. For a wait class, those plans' waits in its category (`sys.query_store_wait_stats`, `wait_category_desc`, the names the detector's wait families map to).
+  - **T4,** PostgreSQL in `azure_sys`: `query_store.qs_view` for ContosoCare's database and no system queries, the top 20 queries by total time, with calls, the longest run, blocks read, and their text; then `query_store.pgms_wait_sampling_view`'s samples by query and event. Never `query_parameters`, which can hold a parameter's values. Its comment says the times are the server's, UTC unless its TimeZone was changed, and that an interval shows once it has ended, as Learn says.
+  - **None** for T4's read replica, whose queries Query Store doesn't record, for T5, or past the retention.
+- **Where it goes:** `explain_incident`'s `details.queryStoreQueries` (the target, language, database, the minutes in UTC, and the text), and the playbook's step 3 tells the chat to give it as is, in a code block, naming its target, database, and minutes. **The Root cause view's copy button** waits for the reorganized page, which owns `rca/view/**` today.
+- **Tests:** the times and targets come out exactly, to the second, for T1's CPU, T2's buffer latch waits, and T4; across UTC midnight with both dates; one instant from the interval that starts at it; none for the replica or past the retention; read-only (no statement that writes or changes a setting); and no scenario's name, in any case.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts`, `rca/tools.ts`, `rca/playbook.ts`, and `rca/tools.test.ts`; ADR 0031, `CHANGELOG.md`, and this report.
+
+**Validation.** `npm run verify`'s steps, one at a time on a PC at 100 % CPU: the typecheck, lint, license check, and build pass, and the tests (vitest with two workers) 686 of 687; the one failure is a `waitFor` timeout in `pages/mission.test.tsx`'s Session replay, which this change doesn't touch, and it passes run alone (3 of 3). `rca/tools.test.ts` alone, after blank lines between its tests: 42 of 42; ESLint on the four files: clean. markdownlint: no issues. Pester in strict mode with the Azure CLI guard: `Repo.Conventions.Tests.ps1`, with the documents' links and their fragments, 123 of 123; `Repo.NeutralWording.Tests.ps1` and `Repo.Gitleaks.Tests.ps1`, 10 passed, and the 3 that need gitleaks installed skipped. The leak check prints nothing.
+
+**What its live check needs.** The query, copied from a CPU incident's next step on T1 and on T4 in a live history, runs in SQL Server Management Studio on ContosoCare and in `azure_sys` (from T1, as the runner signs in), and lists those minutes' queries.
 
 ### Query Store's evidence: the sidecar's contract (2026-11-23)
 

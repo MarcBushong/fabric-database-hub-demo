@@ -9,7 +9,7 @@ import { LAG_METRIC } from "./replica";
 import { monitorTelemetry } from "./sources";
 import { emptyListNote } from "./view/facts";
 import { INVESTIGATION_PLAYBOOK } from "./playbook";
-import { QUERY_STORE_RETENTION_DAYS } from "./query-store";
+import { QUERY_STORE_RETENTION_DAYS, queryStoreQuery, type QueryStoreQuery } from "./query-store";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { live, liveSources } from "./testdata/live-rb-2233e0ae";
 import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
@@ -78,11 +78,11 @@ async function ask(name: string, args: Record<string, unknown>, deps = tools()):
 }
 
 describe("the investigation tools in the dock", () => {
-    it("are six, and with the dock's own four they fit the relay's limits", () => {
-        expect(INVESTIGATION_TOOL_NAMES).toEqual(["find_incidents", "triage_window", "explain_incident", "explain_locking", "explain_errors", "explain_replica_lag"]);
+    it("are seven, and with the dock's own four they fit the relay's limits", () => {
+        expect(INVESTIGATION_TOOL_NAMES).toEqual(["find_incidents", "triage_window", "explain_incident", "explain_locking", "explain_errors", "explain_replica_lag", "explain_queries"]);
         const all = [...toolSpecs({ estate: true }), ...INVESTIGATION_TOOL_SPECS];
-        expect(all).toHaveLength(10);
-        expect(validateTools(all)).toHaveLength(10);
+        expect(all).toHaveLength(11);
+        expect(validateTools(all)).toHaveLength(11);
         // Blind: no spec mentions what was planned.
         expect(JSON.stringify(INVESTIGATION_TOOL_SPECS)).not.toMatch(/inject|Scenario|scenario/);
     });
@@ -197,7 +197,7 @@ describe("the Root cause page's facets, in the chat", () => {
         const all = await ask("triage_window", { from: "11:50", to: "12:20" });
         const replica = await ask("find_incidents", { from: "11:50", to: "12:20", categories: ["replica_lag"] });
         expect(replica.episodes.map((e) => e.key)).toEqual(["T4-replica-replica_lag-20261120T171200Z"]);
-        expect(replica.details!.filters).toEqual({ categories: ["replica_lag"], severities: [] });
+        expect(replica.details!.filters).toEqual({ categories: ["replica_lag"], severities: [], targets: [] });
         const leftOut = replica.details!.leftOut as { episodes: number; byCategory: Record<string, number> };
         expect(leftOut.episodes).toBe(all.episodes.length - 1);
         expect(Object.values(leftOut.byCategory).reduce((a, b) => a + b, 0)).toBe(leftOut.episodes);
@@ -212,6 +212,28 @@ describe("the Root cause page's facets, in the chat", () => {
         expect(hypotheses.find((h) => h.family === "blocking")).toMatchObject({ category: "blocking", severity: "high" });
         const high = await ask("triage_window", { from: "11:50", to: "12:20", severities: ["high"], targets: ["T1", "T5"] });
         expect((high.details!.hypotheses as Array<{ severity: string; target: string }>).every((h) => h.severity === "high" && ["T1", "T5"].includes(h.target))).toBe(true);
+        // An episode's severityReason is in the episode list once, never again in its hypothesis (the review of 90e9d914).
+        expect((all.details!.hypotheses as Array<Record<string, unknown>>).filter((h) => h.episodeKey && "severityReason" in h)).toEqual([]);
+    });
+
+    // The review of 90e9d914: targets narrowed the read, so a triage of the replica's high incidents said nothing abnormal,
+    // and none left out, beside the window's incidents on other targets.
+    it("takes targets as a facet too: the verdicts stay the whole window's, and what it leaves out on other targets is counted", async () => {
+        const all = await ask("triage_window", { from: "11:50", to: "12:20" });
+        const replicaHigh = await ask("triage_window", { from: "11:50", to: "12:20", targets: ["T4-replica"], severities: ["high"] });
+        const kept = all.episodes.filter((e) => e.target === "T4-replica" && e.severity === "high");
+        expect(replicaHigh.episodes.map((e) => e.key)).toEqual(kept.map((e) => e.key));
+        expect(replicaHigh.details).toMatchObject({ nothingAbnormal: all.details!.nothingAbnormal, quiet: all.details!.quiet, filters: { categories: [], severities: ["high"], targets: ["T4-replica"] } });
+        expect(all.details!.nothingAbnormal).toBe(false);
+        const leftOut = replicaHigh.details!.leftOut as { episodes: number; hypotheses: number; notCaptured: number; byTarget: Record<string, number> };
+        expect(leftOut.episodes).toBe(all.episodes.length - kept.length);
+        expect(leftOut.byTarget.T1).toBe(all.episodes.filter((e) => e.target === "T1").length);
+        expect(leftOut.hypotheses).toBe((all.details!.hypotheses as unknown[]).length - (replicaHigh.details!.hypotheses as unknown[]).length);
+        // What wasn't captured is the targets' asked about; the other targets' lines are counted.
+        expect(replicaHigh.notCaptured.filter((line) => /^T(1|2|3|4|5): /.test(line))).toEqual([]);
+        expect(leftOut.notCaptured).toBe(all.notCaptured.length - replicaHigh.notCaptured.length);
+        // A target it doesn't have is refused, as a category is.
+        expect(await tools().run("triage_window", { from: "11:50", to: "12:20", targets: ["T9"] })).toEqual({ ok: false, text: 'targets takes T1, T2, T3, T4, T4-replica, T5; ["T9"] isn\'t one of them.' });
     });
 
     it("refuses a category or a severity it doesn't have, so a filtered list is never taken for the whole one", async () => {
@@ -854,6 +876,50 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         expect(QUERY_STORE_RETENTION_DAYS.postgresql).toBe(7);
         expect(readFileSync(resolve(import.meta.dirname, "../../../../infra/modules/pgflex01.bicep"), "utf8")).not.toMatch(/retention_period_in_days/);
     });
+
+    // Wednesday's release: the next step's ready-to-run, read-only query, built from the incident's measured target, family,
+    // and times only, which the view copies and the chat gives as is.
+    it("gives each next step a read-only query of the target's own Query Store for the incident's exact minutes", async () => {
+        const queries = async (target: RcaTarget, family: string, tools = deps) => ((await incidentOn(target, family, tools)).details?.queryStoreQueries ?? []) as QueryStoreQuery[];
+        const [t1] = await queries("T1", "cpu");
+        expect(t1).toMatchObject({ target: "T1", language: "tsql", database: "ContosoCare", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" });
+        expect(t1.text).toContain("-- Read-only: Query Store's top plans on T1 from 15:40:00 to 15:50:00 UTC, by CPU, then duration, with their plan IDs.");
+        expect(t1.text).toContain("DECLARE @from datetimeoffset = '2026-11-20T15:40:00+00:00', @to datetimeoffset = '2026-11-20T15:50:00+00:00';");
+        expect(t1.text).toContain("ORDER BY cpu_ms DESC, duration_ms DESC;");
+        expect(t1.text).toMatch(/\bp\.plan_id\b/);
+        expect(t1.text).not.toMatch(/wait_category_desc/);
+        const [t2] = await queries("T2", "latch");
+        expect(t2).toMatchObject({ target: "T2", database: "ContosoCare" });
+        expect(t2.text).toContain("AND ws.wait_category_desc = N'Buffer Latch'");
+        const [t4] = await queries("T4", "cpu");
+        expect(t4).toMatchObject({ target: "T4", language: "postgresql", database: "azure_sys", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" });
+        expect(t4.text).toContain("WHERE q.end_time > '2026-11-20 15:40:00' AND q.start_time <= '2026-11-20 15:50:00'");
+        expect(t4.text).toContain("WHERE w.end_time > '2026-11-20 15:40:00' AND w.start_time <= '2026-11-20 15:50:00'");
+        expect(t4.text).toContain("FROM query_store.qs_view AS q");
+        expect(t4.text).toContain("FROM query_store.pgms_wait_sampling_view AS w");
+        expect(t4.text).not.toMatch(/query_parameters/);
+        // None where Query Store doesn't record the queries, and none past its retention, as for the next step.
+        expect(await queries("T4-replica", "cpu")).toEqual([]);
+        expect(await queries("T4", "cpu", toolsAt(new Date("2026-11-28T16:00:00Z")))).toEqual([]);
+        for (const q of [t1, t2, t4]) {
+            // Read-only, and blind: it names no scenario and nothing the demo planned.
+            expect(q.text).not.toMatch(/\b(INSERT|UPDATE|DELETE|MERGE|ALTER|CREATE|DROP|EXEC|EXECUTE|TRUNCATE|GRANT|SET\s+QUERY_STORE)\b/i);
+            expect(namesAScenario(q.text)).toEqual([]);
+            expect(namesAScenario(q.text.toLowerCase())).toEqual([]);
+            expect(q.text).not.toMatch(/scenario|inject|demo\./i);
+        }
+    });
+
+    it("reads an incident across UTC midnight with both dates, and one instant from its interval", () => {
+        const across = queryStoreQuery({ target: "T3", family: "cpu", start: new Date("2026-11-19T23:52:00Z"), end: new Date("2026-11-20T00:07:30Z"), last: new Date("2026-11-20T00:07:00Z") }, new Date("2026-11-20T01:00:00Z"));
+        expect(across?.text).toContain("DECLARE @from datetimeoffset = '2026-11-19T23:52:00+00:00', @to datetimeoffset = '2026-11-20T00:07:30+00:00';");
+        expect(across?.text).toContain("on T3 from 2026-11-19 23:52:00 to 2026-11-20 00:07:30 UTC");
+        const instant = queryStoreQuery({ target: "T4", family: "cpu", start: new Date("2026-11-20T15:45:00Z"), end: null, last: new Date("2026-11-20T15:45:00Z") }, new Date("2026-11-20T16:00:00Z"));
+        // An interval that starts at the instant holds it: start_time <= the instant.
+        expect(instant?.text).toContain("WHERE q.end_time > '2026-11-20 15:45:00' AND q.start_time <= '2026-11-20 15:45:00'");
+        expect(instant?.text).toContain("on T4 at 15:45:00 UTC");
+    });
+
     it("never says that a target has no Query Store, in any tool's result or in the playbook, and drops the old words", async () => {
         const results = [
             ...(await Promise.all([incidentOn("T1", "cpu"), incidentOn("T2", "latch"), incidentOn("T3", "cpu"), incidentOn("T4", "cpu"), incidentOn("T4-replica", "cpu")])),
@@ -868,7 +934,7 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         const sentences = INVESTIGATION_PLAYBOOK.split(/(?<=[.:])\s+/).filter((s) => LACKS.test(s));
         expect(sentences.length).toBeGreaterThan(0);
         for (const s of sentences) expect(s, s).toMatch(/^Never say that a target has no Query Store|Azure Cosmos DB \(T5\) has no Query Store/);
-        expect(INVESTIGATION_PLAYBOOK).toContain("this history doesn't hold Query Store's per-query statistics yet, which is the capture's limit, not the target's");
-        expect(INVESTIGATION_PLAYBOOK).not.toMatch(/comes later/);
+        expect(INVESTIGATION_PLAYBOOK).toContain("it names the queries and plans behind the incident from Query Store's evidence when this history holds it (details.queryStore), and otherwise says why, about this history, never the target");
+        expect(INVESTIGATION_PLAYBOOK).not.toMatch(/comes later|doesn't hold Query Store's per-query statistics yet/);
     });
 });

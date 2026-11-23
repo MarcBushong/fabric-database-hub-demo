@@ -106,3 +106,131 @@ export function queryStoreNextStep(e: Pick<Episode, "target" | "family" | "start
             return `Read Query Store on ${e.target} for the queries that took the most time ${minutes}, at every size but Burstable: query_store.qs_view in its azure_sys database, and query_store.pgms_wait_sampling_view for what they waited on, for the intervals that hold those minutes (${PG_QUERY_STORE_LEARN}).`;
     }
 }
+
+/** A ready-to-run, read-only query of a target's Query Store for an incident's minutes, for the next step's copy button. */
+export interface QueryStoreQuery {
+    target: RcaTarget;
+    /** T-SQL for T1 to T3, PostgreSQL for T4. */
+    language: "tsql" | "postgresql";
+    /** Where to run it: ContosoCare on T1 to T3, azure_sys on T4. */
+    database: string;
+    /** The minutes it reads, in UTC, as the incident's own. */
+    fromUtc: string;
+    toUtc: string;
+    text: string;
+}
+
+/** "2026-11-20T15:40:00+00:00": a T-SQL datetimeoffset literal, to the second, in UTC. */
+const tsqlTime = (d: Date) => `${d.toISOString().slice(0, 19)}+00:00`;
+/** "2026-11-20 15:40:00": a PostgreSQL timestamp literal, to the second, UTC, as qs_view's start_time and end_time hold it. */
+const pgTime = (d: Date) => d.toISOString().slice(0, 19).replace("T", " ");
+
+/**
+ * The read-only query a DBA runs for the episode's minutes on its target's own Query Store, built only from the episode's
+ * measured target, family, and times, never from what the demo planned: the top plans by CPU, then duration, with their
+ * plan IDs, on T1 to T3 (and their waits in the episode's wait category, for a wait class); the top queries by total time,
+ * then their sampled waits, in azure_sys on T4. An interval counts when it overlaps the minutes, since Query Store keeps
+ * them by interval (15 minutes by default). Null where there's no Query Store to read (a read replica, T5), or once the
+ * minutes are past its retention (queryStoreAge), as for the next step.
+ * Sources: https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-runtime-stats-transact-sql,
+ * https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-wait-stats-transact-sql,
+ * https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store
+ */
+export function queryStoreQuery(e: Pick<Episode, "target" | "family" | "start" | "end" | "last" | "readEnd">, now: Date): QueryStoreQuery | null {
+    const age = queryStoreAge(e, now);
+    if (!age || !age.kept) return null;
+    const from = e.start;
+    const to = e.end ?? e.readEnd ?? e.last;
+    const span = `${fromTo(from, to)} UTC`;
+    const fromUtc = from.toISOString().replace(".000Z", "Z");
+    const toUtc = to.toISOString().replace(".000Z", "Z");
+    if (queryStoreKind(e.target) === "sql") {
+        const category = WAIT_CATEGORY[e.family];
+        const window = [
+            `DECLARE @from datetimeoffset = '${tsqlTime(from)}', @to datetimeoffset = '${tsqlTime(to)}';`,
+        ];
+        const plans = [
+            "SELECT TOP (20)",
+            "    q.query_id,",
+            "    p.plan_id,",
+            "    OBJECT_SCHEMA_NAME(q.object_id) + N'.' + OBJECT_NAME(q.object_id) AS module_name,",
+            "    SUM(rs.count_executions) AS executions,",
+            "    CAST(SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0 AS decimal(18, 1)) AS cpu_ms,",
+            "    CAST(SUM(rs.avg_duration * rs.count_executions) / 1000.0 AS decimal(18, 1)) AS duration_ms,",
+            "    MIN(i.start_time) AS first_interval_start_utc,",
+            "    MAX(i.end_time) AS last_interval_end_utc,",
+            "    LEFT(t.query_sql_text, 300) AS query_text",
+            "FROM sys.query_store_runtime_stats AS rs",
+            "JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id",
+            "JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id",
+            "JOIN sys.query_store_query AS q ON q.query_id = p.query_id",
+            "JOIN sys.query_store_query_text AS t ON t.query_text_id = q.query_text_id",
+            "WHERE i.end_time > @from AND i.start_time <= @to",
+            "GROUP BY q.query_id, p.plan_id, q.object_id, t.query_sql_text",
+            "ORDER BY cpu_ms DESC, duration_ms DESC;",
+        ];
+        const waits = category
+            ? [
+                  "",
+                  `-- The same plans' waits in the ${category} category.`,
+                  "SELECT TOP (20)",
+                  "    q.query_id,",
+                  "    p.plan_id,",
+                  "    ws.wait_category_desc,",
+                  "    CAST(SUM(ws.total_query_wait_time_ms) AS decimal(18, 1)) AS wait_ms,",
+                  "    LEFT(t.query_sql_text, 300) AS query_text",
+                  "FROM sys.query_store_wait_stats AS ws",
+                  "JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = ws.runtime_stats_interval_id",
+                  "JOIN sys.query_store_plan AS p ON p.plan_id = ws.plan_id",
+                  "JOIN sys.query_store_query AS q ON q.query_id = p.query_id",
+                  "JOIN sys.query_store_query_text AS t ON t.query_text_id = q.query_text_id",
+                  `WHERE i.end_time > @from AND i.start_time <= @to AND ws.wait_category_desc = N'${category}'`,
+                  "GROUP BY q.query_id, p.plan_id, ws.wait_category_desc, t.query_sql_text",
+                  "ORDER BY wait_ms DESC;",
+              ]
+            : [];
+        const text = [
+            `-- Read-only: Query Store's top plans on ${e.target} ${span}, by CPU, then duration, with their plan IDs.`,
+            "-- Run it in the ContosoCare database. Query Store keeps them by interval, so the intervals that overlap those minutes count.",
+            ...window,
+            ...plans,
+            ...waits,
+        ].join("\n");
+        return { target: e.target, language: "tsql", database: "ContosoCare", fromUtc, toUtc, text };
+    }
+    const where = `WHERE q.end_time > '${pgTime(from)}' AND q.start_time <= '${pgTime(to)}'`;
+    const text = [
+        `-- Read-only: Query Store's top queries on ${e.target} ${span}, by total time, then their sampled waits.`,
+        "-- Run it in the azure_sys database. Its times are the server's, UTC unless its TimeZone was changed, and an interval shows once it has ended.",
+        "SELECT",
+        "    q.query_id,",
+        "    sum(q.calls) AS calls,",
+        "    round(sum(q.total_time)::numeric, 1) AS total_time_ms,",
+        "    round(max(q.max_time)::numeric, 1) AS max_time_ms,",
+        "    sum(q.shared_blks_read) AS shared_blks_read,",
+        "    min(q.start_time) AS first_interval_start,",
+        "    max(q.end_time) AS last_interval_end,",
+        "    left(min(q.query_sql_text), 300) AS query_text",
+        "FROM query_store.qs_view AS q",
+        where,
+        "  AND q.db_id = (SELECT oid FROM pg_database WHERE datname = 'contosocare')",
+        "  AND NOT q.is_system_query",
+        "GROUP BY q.query_id",
+        "ORDER BY total_time_ms DESC",
+        "LIMIT 20;",
+        "",
+        "-- Those minutes' sampled waits, by query.",
+        "SELECT",
+        "    w.query_id,",
+        "    w.event_type,",
+        "    w.event,",
+        "    sum(w.calls) AS samples",
+        "FROM query_store.pgms_wait_sampling_view AS w",
+        where.replaceAll("q.", "w."),
+        "  AND w.db_id = (SELECT oid FROM pg_database WHERE datname = 'contosocare')",
+        "GROUP BY w.query_id, w.event_type, w.event",
+        "ORDER BY samples DESC",
+        "LIMIT 20;",
+    ].join("\n");
+    return { target: e.target, language: "postgresql", database: "azure_sys", fromUtc, toUtc, text };
+}

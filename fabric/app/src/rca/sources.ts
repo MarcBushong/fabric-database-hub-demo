@@ -9,8 +9,10 @@ import { incidentSeriesQuery, incidentWaitsQuery, type QuerySpec } from "@/data/
 import { isMissingInModel } from "@/data/retry";
 import { SQL_TARGETS } from "@/lib/dax";
 import { toDate as toInstant } from "@/lib/format";
-import { binsTable, loadEvidence, MONITOR_PAGES, MONITOR_ROW_LIMIT, MONITOR_TABLE, RcaReadError, rcaMonitorDax, waitsTable, type DaxLog } from "./loader";
+import { binsTable, loadEvidence, loadSidecar, MONITOR_PAGES, MONITOR_ROW_LIMIT, MONITOR_TABLE, RcaReadError, rcaMonitorDax, waitsTable, type DaxLog } from "./loader";
 import { toDate } from "./rows";
+import type { SidecarEvidence } from "./sidecar";
+import type { SidecarTableKey } from "./spec";
 import type { Telemetry } from "./tools";
 import { pointKey, type Evidence, type RcaTarget, type WholeReading } from "./types";
 
@@ -22,6 +24,8 @@ export type RunQuery = (spec: QuerySpec) => Promise<Row[]>;
 export interface RcaSources {
     load(from: Date, to: Date, targets: readonly RcaTarget[]): Promise<Evidence>;
     telemetry(from: Date, to: Date, targets: readonly RcaTarget[]): Promise<Telemetry>;
+    /** The sidecar's rows of a window: Query Store's evidence on T1 to T4 and who held T4's connections (loader.ts's loadSidecar), from the given tables or all six. */
+    sidecar(from: Date, to: Date, targets: readonly RcaTarget[], tables?: readonly SidecarTableKey[]): Promise<SidecarEvidence>;
 }
 
 // One point per interval, from the history's overlapping saves: the shared finestPerInterval (F35, from the release's
@@ -235,6 +239,7 @@ export function createRcaSources(run: RunQuery, onDax?: (log: DaxLog) => void): 
 
     return {
         load: (from, to, targets) => loadEvidence((dax, rowLimit) => run(spec("RCA evidence", dax, rowLimit)), from, to, targets, { onDax }),
+        sidecar: (from, to, targets, tables) => loadSidecar((dax, rowLimit) => run(spec("RCA Query Store evidence", dax, rowLimit)), from, to, targets, { onDax, tables }),
         async telemetry(from, to, targets) {
             const sql = SQL_TARGETS.filter((t) => targets.includes(t));
             const bucketOf = (row: Row) => toDate(row["Bucket UTC"]);
