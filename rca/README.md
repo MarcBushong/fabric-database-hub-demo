@@ -73,7 +73,9 @@ Query Store records every statement a database runs, the capture's and the harne
 
 1. **The capture's own statements.**
    - **SQL Server and Azure SQL Database:** every catalog statement carries the marker `/* dbhubdemo:rca-observer */` inside its text, which Query Store keeps ("Comments and spaces inside text aren't ignored", [sys.query_store_query_text](https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-query-text-transact-sql)). RCA-SQL-10 and 14 leave out texts that carry it.
-   - **PostgreSQL:** Query Store keeps one text per `query_id`, the first it saw, and `query_id` ignores comments, so a marker in the text isn't enough: T4 recorded the observer's statements before they carried one. The observer's T4 connections set `search_path` to `"$user", public, dbhubdemo_rca_observer`, a schema that doesn't exist, so names resolve as before; `query_store.qs_view` records `search_path` per row, and RCA-PG-14 leaves out the rows that name it, and the texts that carry the marker.
+   - **PostgreSQL:** Query Store keeps one text per `query_id`, the first it saw, and `query_id` ignores comments, so a marker in the text isn't enough: T4 recorded the observer's statements before they carried one. So RCA-PG-14 has two rules:
+     - **the `search_path`:** the observer's T4 connections set `search_path` to `"$user", public, dbhubdemo_rca_observer`, a schema that doesn't exist, so names resolve as before. `query_store.qs_view` records `search_path` per row, and RCA-PG-14 leaves out the rows that name it, and the texts that carry the marker;
+     - **the catalog's own texts:** it also leaves out a row whose text equals one of the catalog's own PostgreSQL statements, today's or edd01c86's, once comments are stripped and white space is collapsed on both sides, prefix-matched where Query Store truncated the text (`pg_qs.max_query_text_length`). This covers the windows where an earlier runner's statements ran without the marker, which the first read after an update reaches. It also covers a `search_path` that Query Store kept from a query's first capture, which the live check L0c measures.
 2. **The harness's bookkeeping and control modules,** which the demo marks where it defines them, so a rename carries the mark:
    - **SQL Server:** the extended property `dbhubdemo.role` = `harness` on every module `database/common/110-demo-control.sql` creates. RCA-SQL-10 and 14 leave out every statement whose `object_id` carries it.
    - **PostgreSQL:** `COMMENT ON FUNCTION ... IS 'dbhubdemo:harness'` on its control functions. Query Store records a statement nested in a function without its function (`pg_qs.query_capture_mode` `all`), so RCA-PG-16 reads, at the observer's start, the marked functions and the tables only marked functions write; RCA-PG-14 leaves out a call of a marked function, and a statement whose tables are all ones only the harness writes. A scenario function's own read of a run table is then left out too: it's bookkeeping.
@@ -149,9 +151,18 @@ What the observer captures beyond the evidence document, in documents of their o
 | Everything else | As the evidence document's (`sessionId`, `producer`, the window, `sequence`, `final`, `targets`, `epochUtc`, `strings`, `tables`), with no `answerKey`. Each target has an `rca_query_coverage` row |
 
 - **Its tables** ([history-tables.json](history-tables.json), document `sidecar`): `rca_query_stats`, `rca_query_waits`, `rca_query_plans`, `rca_query_events`, `rca_query_coverage`, and `rca_connections`, encoded as the evidence document's tables are. The evidence document never holds one, and a sidecar never holds an evidence table.
-- **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.jsonl`, beside its evidence files, which the evidence export never reads. A span stays until its sidecars are acknowledged, or for 30 days.
+- **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.jsonl`, beside its evidence files, which the evidence export never reads.
+- **Sealed outside the spans:** the runner seals a span's rows into the store's `sidecars\` folder:
+  - at every export that reads the span, the evidence document's included, whose output doesn't change;
+  - at the span's end;
+  - at the observer's start, for a span left unsealed.
+
+  It never keeps them in `exports\`, which an older runner's retention empties after 7 days. It doesn't delete a span whose rows aren't sealed. A sealed sidecar stays until it's acknowledged, or for 30 days after its sealing.
 - **One per span per export:** `rca sidecar-export` makes one sidecar for each span with new rows, and offers a sidecar not yet acknowledged again (state `pending`) at every later call.
-- **Its session:** a sidecar keeps its span's session, as the evidence document does, a backfill's included ([pending publication](#pending-publication)), and the notebook applies [`RCA_EVIDENCE`](#rca_evidence)'s session rule to it.
+- **Its session:** a sidecar keeps its span's session, as the evidence document does, a backfill's included ([pending publication](#pending-publication)).
+  - **Binding:** the first export of either kind that takes from a span binds it to its caller's session, as `rca export` does.
+  - **Its run:** the notebook writes a sidecar's rows under that session's run, `session-<sessionId>`, whichever run reads it, and a sidecar with no session under the reading run's `RUN_ID`.
+  - **On the scripts' path,** which fetches a Run all session's sidecars at a later save, the evidence lands with its session, never with the save.
 
 ### Query Store
 
@@ -167,20 +178,22 @@ What the observer captures beyond the evidence document, in documents of their o
 - **The latest read wins.** An interval read twice (open, then closed; or by two sessions' baselines) is in both reads' rows. The notebook writes the latest read of each target, interval, login, query, and plan. The model's measures take the latest read too, so a history written otherwise still counts each interval once.
 - **The top lists:**
   - each interval's top 10 by CPU (on T4, total time), and top 5 by duration, by logical reads (on T4, blocks), and by waits;
-  - with every plan of those queries that ran in it; at most 600 rows a read.
+  - ranked after the leave-outs ([what the capture leaves out](#what-the-capture-leaves-out)); a plan is in a list only when it used what the list ranks, more than 0, and ties go to the lower `plan_id`, so two reads of an interval rank it alike;
+  - with every plan of those queries that ran in it; at most 600 rows a read, the oldest intervals first, and the next read starts from the last whole interval it got.
   - A query missing from earlier top lists isn't necessarily new: a reader says "new" only when its plan's compile time (RCA-SQL-14) is in the window, and otherwise "not in the top lists before".
 - **What a reader may claim,** at Query Store's 15-minute granularity, which every claim names:
   - before and after a plan change come from intervals wholly before or after the new plan's first execution; an interval with both plans is mixed, and named so;
   - a CPU share is of the captured top queries, or of the target's measured CPU (RCA Resource) when that's in the window;
   - a baseline is the same query's intervals in the 60 minutes before an incident, at least 2 with executions; otherwise the claim says there's none.
 - **Plans:**
-  - at most the 5 that ran last per query, and every forced plan;
+  - every plan the statistics rows name, so each row has its plan (RCA-SQL-14's `@plans`); at most the 5 that ran last per query besides; and every forced plan;
+  - a plan's row is written when a read first returns it, and again when its forcing, compiles, or compile time change. So its `last_execution_utc` is as of that row's read;
   - a showplan's XML is read once and reduced to `plan_summary` and `estimated_cost`: its costliest operators with their objects and indexes, its warnings, and a missing index. It's never stored whole and never keeps a parameter's value;
   - T4 stores no plans (`pg_qs.store_query_plans` stays off).
 - **Events:** `rca_query_events` records:
   - a plan forced or unforced;
   - Query Store's state changing, with READ_ONLY's reason in words;
-  - automatic tuning's option or a recommendation's state.
+  - automatic tuning's option, or a recommendation's state, from its first appearance (with no previous state).
 
   Each is timed within its read's period (`time_from_utc` to `event_time_utc`).
 - **Coverage:** `rca_query_coverage` holds one row per target per sidecar: Query Store's state and capture mode as read, the intervals read, PostgreSQL's pending publication, and the gaps:
@@ -195,6 +208,7 @@ PostgreSQL shows an interval only once it ends and is persisted ("Data that the 
 - **The watermark:** `rca\query-watermark\T4.json` in the store, outside the spans: the newest persisted interval end read, and the pending ranges, each with its session and span.
 - **The backfill:** whenever the observer runs with T4 reachable (the next session's start, or a save's `rca sidecar-export` while T4 runs), it reads the pending ranges' intervals into a sidecar of the original session and span, with `rca_query_coverage.backfill` true.
 - **Until then,** the coverage says "pending publication", never "not captured". A range older than T4's retention (`pg_qs.retention_period_in_days`, 7 by default) expires as a gap that says so.
+- **A stop in the window:** the demo's stops stop T4 mid-window, and Learn doesn't say whether a stop keeps the window that's still in memory. So the observer records T4's start time (`pg_postmaster_start_time()`) with each read and pending range. A backfill that finds no rows for a range T4 restarted after says it was lost when T4 stopped, never pending or not captured.
 
 ### Who holds T4's connections
 
@@ -204,11 +218,18 @@ PostgreSQL shows an interval only once it ends and is persisted ("Data that the 
 
 ### Acknowledgement
 
-The notebook acknowledges every sidecar payload it reads, by document ID, in `Files/rca/acks/<payload's name>.ack.json` (transport.schema.json, `ack`). Each document is `written` (by this run), `already` (an earlier run wrote it), or `skipped`, with the reason.
+The notebook acknowledges every sidecar payload it reads, by document ID, in `Files/rca/acks/<the payload's name without .json>.ack.json` (transport.schema.json, `ack`; for the payload `Files/rca/inbox/sidecar-20261121T102531Z.json`, `Files/rca/acks/sidecar-20261121T102531Z.ack.json`). Each document is `written` (by this run), `already` (an earlier run wrote it), or `skipped`, with the reason.
 
+- **Exactly once:**
+  - the notebook writes a sidecar's rows table by table, replacing any rows of its `document_id` that an earlier run wrote, and its `rca_query_coverage` rows last;
+  - a document is `already` only when its coverage rows are there, so a run that stopped halfway through a document is completed by the next, never skipped;
+  - `written` and `already` both mean every table holds the document's rows.
+- **The acknowledgement file** names its payload and lists exactly that payload's documents. The notebook writes it once every one of them is committed. A reader treats one whose payload or documents differ from what it staged as missing.
+- **No acknowledgement** when the run doesn't save its results (`SAVE_RESULTS` false, outside `RCA_ONLY`), or can't read the payload: a missing acknowledgement, so everything in the payload stays pending.
 - **It deletes a payload** only when every document in it is `written` or `already`. A payload that holds a skipped document stays until its documents are acknowledged, or for 30 days.
 - **The scripts read the acknowledgement,** never the payload's disappearance. They run `rca ack` for the written documents on the VMs that hold them, and keep the rest pending with the reason.
-- **The runner** keeps an unacknowledged sidecar, and offers it again, until it's acknowledged or 30 days have passed.
+- **When the VMs are already stopped:** `stop-demo.ps1 -SaveHistory` runs the notebook after the VMs deallocate. So it keeps the written IDs per VM in `out/history-pending/`, and the next export with that VM running sends `rca ack` first. `deploy.ps1`'s snapshot and `configure-fabric.ps1 -RunLiveActivity` run the notebook while the VMs run, and acknowledge at once.
+- **The runner** keeps an unacknowledged sidecar, and offers it again, until it's acknowledged or 30 days have passed. A sidecar offered again after it was written is `already`, so nothing is written twice.
 - **The evidence document** keeps today's transport: acknowledging it by ID is a later change, with its own proof.
 
 ## Transport
@@ -267,10 +288,10 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 
 ### `RCA_SIDECAR_FILE`
 
-`NB_DatabaseHub_LiveActivity`'s parameter for sidecars: a path in the demo's lakehouse, `Files/rca/inbox/<name>.json` (transport.schema.json, `sidecarFile`), to a file that holds exactly one `ContosoCare.RcaSidecarParts` document (`sidecarParameter`): every part line of the sidecars a save fetched, at most 64.
+`NB_DatabaseHub_LiveActivity`'s parameter for sidecars: a path in the demo's lakehouse, `Files/rca/inbox/sidecar-<yyyyMMddTHHmmssZ>[-<name>].json` (transport.schema.json, `sidecarFile`), to a file that holds exactly one `ContosoCare.RcaSidecarParts` document (`sidecarParameter`): every part line of the sidecars a save fetched, at most 64.
 
-- **Staging:** the scripts write it as they write `RCA_EVIDENCE_FILE`, and only when the workspace's notebook declares the parameter (`Test-DemoFabricNotebookParameter`). For an older or edited notebook they stage none, leave the sidecars pending, and say so in a Warning with the fix.
-- **Reading:** as `RCA_EVIDENCE_FILE` (`notebookutils.fs.head`, 262,144 bytes), with `RCA_EVIDENCE`'s session rule. It writes each sidecar once (by `documentId`), acknowledges the payload ([acknowledgement](#acknowledgement)), and reports `RCA.SIDECAR` with ADR 0012's statuses, as `RCA_EVIDENCE` reports `RCA.EVIDENCE`.
+- **Staging:** the scripts write it as they write `RCA_EVIDENCE_FILE`, and only when the workspace's notebook declares the parameter (`Test-DemoFabricNotebookParameter`). For an older or edited notebook they stage none, leave the sidecars pending, and say so in a Warning with the fix. Its name starts with `sidecar-`, which the sweep of evidence files staged more than a day ago never matches: a sidecar payload goes by [acknowledgement](#acknowledgement).
+- **Reading:** as `RCA_EVIDENCE_FILE` (`notebookutils.fs.head`, 262,144 bytes). It writes each sidecar once, by `documentId`, replacing that document's earlier rows, under its session's run ([the sidecar](#the-sidecar)), acknowledges the payload ([acknowledgement](#acknowledgement)), and reports `RCA.SIDECAR` with ADR 0012's statuses, as `RCA_EVIDENCE` reports `RCA.EVIDENCE`.
 - **The deployment notebook's purge** removes the sidecar's six tables with the others, and `Files/rca/acks` with `Files/rca/inbox` (history-tables.json, `purge` and `purgeFiles`).
 
 ### Limits
@@ -284,7 +305,8 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 | A bundle | 6 parts, 24,000 bytes | The runbook's existing bound for the metrics secret |
 | The bundle index | 16 bundles, 4,000 bytes | Inside the metrics document's 24,000 bytes |
 | A sidecar | 64 KiB of gzip (at most 28 parts), as a document | The reducer cuts waits past each plan's first three, then plan summaries, then the lowest-ranked queries, each cut a gap in `rca_query_coverage` |
-| A session's sidecars | 96 KiB of gzip, apart from the evidence documents' (at most 64 parts in `RCA_SIDECAR_FILE`) | A budget of their own, so Query Store never crowds out the evidence document |
+| A session's sidecars | 96 KiB of gzip, apart from the evidence documents': 64 KiB on T1's VM and 32 KiB in T2's guest, the evidence documents' split | A budget of their own, so Query Store never crowds out the evidence document. Each host's reducer cuts across its spans by priority |
+| `RCA_SIDECAR_FILE` | 64 parts and 262,144 bytes, of whole documents | The rest waits on the VMs for the next save, which the save's line says |
 | `rca sidecar-export`'s index | 8 sidecars a page, 3,400 characters | A managed Run Command keeps the last 4 KB of output |
 
 ## Versioning
@@ -294,6 +316,12 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 - A consumer accepts only the versions it knows and reports any other as a **Warning** whose fix is `./scripts/deploy.ps1`, which updates the runner, the runbook, the notebooks, the model, and the app in one run.
 - Older pieces degrade and say so: an older runner has no `rca` commands (`RCA.EXPORT` **Warning**); an older notebook ignores `RCA_EVIDENCE`; a session saved before the feature has no RCA rows, and the app says "no RCA capture recorded" for its windows.
 - **A sidecar is invisible to the pieces that predate it:** its own command, part marker, and notebook parameter. They never reject or lose one; they leave it pending on the VM, where the runner keeps it until a newer piece acknowledges it.
+- **An older runner installed over a newer one** isn't a supported path: `deploy.ps1` moves an environment forward ([updates from GitHub](../docs/deployment.md#updates-from-github-2026-11-09)). An older checkout that can't update itself can still install its runner. Then:
+  - the older runner neither deletes nor offers the sealed sidecars, and a newer runner offers them again until 30 days after their sealing;
+  - T4's pending ranges wait in `query-watermark\` within T4's retention;
+  - **two losses are accepted limits** (the coordinator's decision for the owner, 2026-11-23): sidecars sealed more than 30 days before a newer runner returns, which it deletes unread; and the rows of a session whose runner was replaced mid-session, which go with their span.
+
+  Before installing an older runner, a scripts' save with the VMs running takes every sealed sidecar into the history: `./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity`, again while its line says sidecars still wait.
 
 ## Who builds what in Phase 1
 
@@ -309,11 +337,13 @@ The scripts' path first; Run all's path (the runbook's bundles and the control n
 
 | Unit | Builds | Owns | Tests against this contract |
 |---|---|---|---|
-| A1, SQL Server's reads | RCA-SQL-10, 11, 14, and 15 (and RCA-AZ-03 and 04's events) on T1 to T3: the cadence, the plan summary, the events, the sidecar rows | New files under `Rca/QueryStore/` (`Sql*.cs`, `PlanSummary.cs`), its wiring in `Rca/Observer/SqlTargetObserver.cs` and `SqlCapture.cs`, their tests | Its rows type-check against history-tables.json; the catalog's blocks run as they are; the leave-out rules ([above](#what-the-capture-leaves-out)) |
-| A2, PostgreSQL's reads and the holders | RCA-PG-13 to 17 on T4: the `azure_sys` connection and its `search_path`, the watermark and backfill, the holders | New files under `Rca/QueryStore/` (`Pg*.cs`, `QueryWatermark.cs`, `ConnectionHolders.cs`), its wiring in `Rca/Observer/PgTargetObserver.cs` and `PgCapture.cs`, their tests | As A1's |
+| A1, SQL Server's reads | RCA-SQL-10, 11, 14, and 15 (and RCA-AZ-03 and 04's events) on T1 to T3: the cadence, the plan summary, the events, the sidecar rows | Those blocks in `capture/sqlserver.sql`, their comments included; new files under `Rca/QueryStore/` (`Sql*.cs`, `PlanSummary.cs`); its wiring in `Rca/Observer/SqlTargetObserver.cs`, `SqlCapture.cs`, and the shared `TargetObserver.cs` seam that turns a failed Query Store read into a sidecar gap; their tests | Its rows type-check against history-tables.json; the catalog's blocks run as they are; the leave-out rules ([above](#what-the-capture-leaves-out)) |
+| A2, PostgreSQL's reads and the holders | RCA-PG-13 to 17 on T4: the `azure_sys` connection and its `search_path`, the watermark and backfill, the holders | Those blocks in `capture/postgresql.sql`; new files under `Rca/QueryStore/` (`Pg*.cs`, `QueryWatermark.cs`, `ConnectionHolders.cs`); its wiring in `Rca/Observer/PgTargetObserver.cs` and `PgCapture.cs`; their tests | As A1's |
 | H, the harness's marks | The extended property and the comments the leave-out reads | Its own block in `database/common/110-demo-control.sql` and the PostgreSQL control script, after the realistic names' changes there | Every control module carries the mark, and no other module does |
-| T1, the runner's sidecar transport | The sidecar export, `rca sidecar-export`, `rca part` for sidecars, `rca ack`, the store's keeping and retention | `Rca/Export/`, `Rca/Store/`, the `rca` commands, after the stop tail's changes land | Its sidecars validate against sidecar.schema.json and round trip through the part lines; the evidence documents stay byte for byte |
-| T2, the scripts' transport | `RcaSidecarExport` and `RcaAck` in the VM's control script; the scripts' fetch, staging of `RCA_SIDECAR_FILE`, reading of the acknowledgement, and `rca ack` | `vm/bootstrap/Invoke-DemoWorkloadControl.ps1`, `scripts/modules/DbHubDemo/Private/RcaExportHelpers.ps1`, after the stop tail's changes land | The sidecar fixtures' parts and the acknowledgement fixture; the mixed-version combinations |
+| T1a, the runner's sidecar store | The store in `sidecars\`, sealing, the reducer and its budgets, the page index and part lines, acknowledgement, retention; the evidence documents' pinned hashes | New files under `Rca/Sidecar/`, their tests | Its sidecars validate against sidecar.schema.json and round trip through the part lines; the evidence documents stay byte for byte |
+| T1b, the runner's wiring | `rca sidecar-export`, `rca part` for sidecars, `rca ack`; sealing at each export, a span's end, and the observer's start | `Cli/CommandLine.Rca.cs`, `Rca/Export/Exporter.cs`, `Rca/Store/EvidenceStore.cs`, after the stop tail's changes land | As T1a's |
+| T2a, the scripts' transport | The fetch, staging `RCA_SIDECAR_FILE`, reading the acknowledgement, `rca ack` at once or deferred, the PC's lists, and the golden capture's guard | `scripts/modules/DbHubDemo/Private/RcaExportHelpers.ps1`, the save paths, and the golden capture's files | The sidecar fixtures' parts and the acknowledgement fixture; the mixed-version combinations |
+| T2b, the VM's control script | `RcaSidecarExport` and `RcaAck`, and the sidecar's part lines through T2's relay | `vm/bootstrap/Invoke-DemoWorkloadControl.ps1`, after the stop tail's changes land | As T2a's |
 | B, the notebook and the model | The sidecar's decoder, its six tables, the latest read per interval, the acknowledgement file and the cleanup rule, `RCA.SIDECAR`; the model's six tables and measures | `NB_DatabaseHub_LiveActivity`'s RCA cells, the semantic model's RCA tables, `OneLakeHelpers.ps1`'s RCA functions | The notebook's tables and the model's TMDL match history-tables.json; the sidecar fixtures decode and write once |
 | C, the app | The Query Store rules and claims, the tool for a window's top queries and a query's plans, "pending publication" | `fabric/app/src/rca/` (not the page, its view, or its CSS) | Its loader's names match history-tables.json; its rules find the sidecar fixtures' facts |
 | D, the report | The Root cause report's Query Store sections | The report's components, after the reorganized page | The sidecar fixtures' facts as the report shows them |

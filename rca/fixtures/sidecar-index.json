@@ -7,8 +7,8 @@
     {
       "documentId": "20261120T165000Z-sqlvm01-0001-sidecar",
       "sessionId": "5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21",
-      "parts": 1,
-      "sha256": "7702530f79233c2e1d807d8b32f1496bf94588f1bbae8056a33581cd05b83ec9",
+      "parts": 2,
+      "sha256": "b8758a1f4a46a629a250bb748d35e3f180f7a77589a6e5795b150af50a1d180e",
       "state": "pending"
     },
     {
