@@ -115,7 +115,8 @@ internal sealed record RunResult
 
     /// <summary>
     /// Why a Refused run never started: <c>connect</c>, <c>running-run</c> (demo.usp_run_begin's 50108: its scenario
-    /// already has a Running run), <c>run-limit</c> (50109: four runs are Running in the database), <c>sql</c>, or <c>request</c>.
+    /// already has a Running run), <c>run-limit</c> (50109: four runs are Running in the database), <c>out-of-step</c> (the
+    /// database doesn't have the scenario's entry module yet: <see cref="OutOfStep"/>), <c>sql</c>, or <c>request</c>.
     /// T5's run store refuses with the same reasons, a T5 account that can't be reached, or whose data-plane role isn't
     /// effective yet (HTTP 401 or 403), is <c>connect</c>, and a T5 container that doesn't exist now is <c>request</c> with
     /// <see cref="RefusalPasses"/>.
@@ -132,7 +133,21 @@ internal sealed record RunResult
     public int? SqlErrorNumber { get; init; }
 
     /// <summary>True for a refusal that passes by itself, so the profile host tries the activity again, bounded (Phase 25b).</summary>
-    public bool CanRetryRefusal => Status == "Refused" && (RefusalReason is "connect" or "running-run" or "run-limit" || RefusalPasses);
+    public bool CanRetryRefusal => Status == "Refused" && (RefusalReason is "connect" or "running-run" or "run-limit" or OutOfStep.RefusalReason || RefusalPasses);
+}
+
+/// <summary>
+/// A runner and a database out of step for a moment (ADR 0031, decision 6): deploy.ps1 installs the runner on T1 before
+/// it updates T3's and T4's workload modules, so for a few minutes a new runner can meet modules with their earlier names.
+/// The runner then refuses the run before it registers anything or opens a session, and the profile host tries it again,
+/// bounded, until setup has run. An older runner meeting newer modules fails at its first call instead: nothing runs.
+/// </summary>
+internal static class OutOfStep
+{
+    public const string RefusalReason = "out-of-step";
+
+    public static string Reason(DemoTarget target, string module) =>
+        $"{target}'s workload modules aren't set up for this runner yet: it can't run {module}. ./scripts/deploy.ps1 sets them up; the run is tried again.";
 }
 
 /// <summary>Runs bounded scenarios on one target and resets it: the T-SQL runner for T1 to T3, the PostgreSQL runner for T4, the Cosmos DB runner for T5.</summary>
@@ -183,8 +198,8 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
 
     public async Task<RunResult> RunAsync(RunPlan plan, CancellationToken cancellationToken)
     {
-        var runId = SessionNames.NewRunId(time.GetUtcNow(), plan.Target);
-        var applicationName = SessionNames.ForRun(plan.Scenario.Id, runId);
+        var runId = SessionNames.NewRunId();
+        var applicationName = SessionNames.ForRun(plan.Scenario.Service, runId);
         var parameters = plan.Parameters.ToDictionary(p => p.Key, p => p.Value.ToString(), StringComparer.Ordinal);
         log.Info(
             "run.planned",
@@ -219,6 +234,11 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
             RunRegistration registration;
             try
             {
+                if (await SqlScripts.FindMissingProceduresAsync(control, [plan.Scenario.Procedure], cancellationToken).ConfigureAwait(false) is [var missing, ..])
+                {
+                    return Refused(plan, runId, parameters, OutOfStep.Reason(plan.Target, missing), checks, OutOfStep.RefusalReason, null);
+                }
+
                 if (plan.ResetBefore)
                 {
                     var reset = await database.ResetAsync(new ResetOptions(plan.RequestedBy, 30, KillSessions: true, KeepProfile: true, UndoRemediation: false, Reseed: false), cancellationToken).ConfigureAwait(false);
@@ -529,7 +549,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
         var normalWorkers = (int)plan.Parameters["normalWorkers"].Integer;
         var deadlockRounds = plan.Parameters["deadlock"].Boolean ? (int)plan.Parameters["deadlockRounds"].Integer : 0;
         var holder = new IdleHolder(
-            "SET XACT_ABORT ON; BEGIN TRANSACTION; EXEC demo.usp_scenario_locking_acquire @run_id = @run_id, @hot_rows = @hot_rows;",
+            "SET XACT_ABORT ON; BEGIN TRANSACTION; EXEC billing.usp_reprioritize_queue @run_id = @run_id, @hot_rows = @hot_rows;",
             () => [Parameter("@run_id", SqlDbType.VarChar, context.RunId, 64), Parameter("@hot_rows", SqlDbType.Int, hotRows)],
             "Head blocker session (idle open transaction).",
             lockedRows => string.Create(CultureInfo.InvariantCulture, $"{lockedRows} hot Billing work items locked; the session now sits idle with its transaction open."));
@@ -548,7 +568,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
                 context,
                 "contender",
                 worker,
-                "demo.usp_scenario_locking_contend",
+                "billing.usp_claim_work_item",
                 [Parameter("@run_id", SqlDbType.VarChar, context.RunId, 64), Parameter("@worker", SqlDbType.Int, worker), Parameter("@hot_rows", SqlDbType.Int, hotRows)],
                 TimeSpan.FromSeconds(2)));
         }
@@ -559,7 +579,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
                 context,
                 "normal",
                 worker,
-                "demo.usp_scenario_healthy_baseline",
+                "frontdesk.usp_process_requests",
                 [Parameter("@run_id", SqlDbType.VarChar, context.RunId, 64), Parameter("@worker", SqlDbType.Int, worker), Parameter("@intensity", SqlDbType.TinyInt, (byte)plan.Intensity)],
                 TimeSpan.Zero));
         }
@@ -572,7 +592,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
                     context,
                     "deadlock",
                     side,
-                    "demo.usp_scenario_locking_deadlock",
+                    "supply.usp_transfer_stock",
                     [Parameter("@run_id", SqlDbType.VarChar, context.RunId, 64), Parameter("@side", SqlDbType.TinyInt, side), Parameter("@rounds", SqlDbType.Int, deadlockRounds)],
                     TimeSpan.FromSeconds(5)));
             }
@@ -594,7 +614,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
         var pauseSeconds = (int)plan.Parameters["pauseSeconds"].Integer;
         var normalWorkers = (int)plan.Parameters["normalWorkers"].Integer;
         var holder = new IdleHolder(
-            "SET XACT_ABORT ON; BEGIN TRANSACTION; EXEC demo.usp_scenario_chain_acquire @run_id = @run_id;",
+            "SET XACT_ABORT ON; BEGIN TRANSACTION; EXEC scheduling.usp_assign_work_item @run_id = @run_id;",
             () => [Parameter("@run_id", SqlDbType.VarChar, context.RunId, 64)],
             "Head blocker of the chain (idle open transaction).",
             _ => "The chain's head row is locked; the session now sits idle with its transaction open, and the links queue behind it.");
@@ -606,7 +626,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
                 context,
                 "link",
                 link.Index,
-                "demo.usp_scenario_chain_link",
+                "scheduling.usp_route_work_item",
                 [Parameter("@run_id", SqlDbType.VarChar, context.RunId, 64), Parameter("@level", SqlDbType.Int, link.Level), Parameter("@branch", SqlDbType.Int, link.Branch)],
                 link.StartDelay));
         }
@@ -617,7 +637,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
                 context,
                 "escalator",
                 1,
-                "demo.usp_scenario_chain_escalate",
+                "scheduling.usp_bulk_reschedule",
                 [
                     Parameter("@run_id", SqlDbType.VarChar, context.RunId, 64),
                     Parameter("@rows", SqlDbType.Int, (int)plan.Parameters["escalationRows"].Integer),
@@ -633,7 +653,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
                 context,
                 "normal",
                 worker,
-                "demo.usp_scenario_healthy_baseline",
+                "frontdesk.usp_process_requests",
                 [Parameter("@run_id", SqlDbType.VarChar, context.RunId, 64), Parameter("@worker", SqlDbType.Int, worker), Parameter("@intensity", SqlDbType.TinyInt, (byte)plan.Intensity)],
                 TimeSpan.Zero));
         }
@@ -739,7 +759,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
                 await using (var command = connection.CreateCommand())
                 {
                     command.CommandType = CommandType.StoredProcedure;
-#pragma warning disable CA2100 // The procedure name comes from the embedded scenario catalog, validated against ^demo\.usp_scenario_.
+#pragma warning disable CA2100 // The procedure name comes from the embedded scenario catalog, whose schema allows only <application schema>.usp_<name>.
                     command.CommandText = plan.Scenario.Procedure;
 #pragma warning restore CA2100
                     command.CommandTimeout = CommandTimeoutSeconds(context);
@@ -895,7 +915,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
         }
     }
 
-    /// <summary>The head blocker as one T-SQL call per cycle (demo.usp_scenario_locking_hold): the procedure itself holds and rolls back.</summary>
+    /// <summary>The head blocker as one T-SQL call per cycle (billing.usp_reprioritize_queue_batch): the procedure itself holds and rolls back.</summary>
     private Task<WorkerOutcome> RunActiveHolderAsync(RunContext context, int hotRows, int holdSeconds, int pauseSeconds) =>
         context.Workers.Track("holder", 1, RunActiveHolderCoreAsync(context, hotRows, holdSeconds, pauseSeconds));
 
@@ -915,7 +935,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
                 await using (var hold = connection.CreateCommand())
                 {
                     hold.CommandType = CommandType.StoredProcedure;
-                    hold.CommandText = "demo.usp_scenario_locking_hold";
+                    hold.CommandText = "billing.usp_reprioritize_queue_batch";
                     hold.CommandTimeout = CommandTimeoutSeconds(context);
                     hold.Parameters.Add(Parameter("@run_id", SqlDbType.VarChar, context.RunId, 64));
                     hold.Parameters.Add(Parameter("@hold_seconds", SqlDbType.Int, holdSeconds));
@@ -974,7 +994,7 @@ internal sealed class ScenarioRunner(SqlConnectionOpener opener, RunnerLog log, 
             context.Events.Enqueue(new RunEvent(time.GetUtcNow(), role + "-started", sessionId, string.Create(CultureInfo.InvariantCulture, $"{role} {index}: {procedure}")));
             await using var command = connection.CreateCommand();
             command.CommandType = CommandType.StoredProcedure;
-#pragma warning disable CA2100 // The procedure name comes from the embedded scenario catalog, validated against ^demo\.usp_scenario_.
+#pragma warning disable CA2100 // The procedure name comes from the embedded scenario catalog, whose schema allows only <application schema>.usp_<name>.
             command.CommandText = procedure;
 #pragma warning restore CA2100
             command.CommandTimeout = CommandTimeoutSeconds(context);

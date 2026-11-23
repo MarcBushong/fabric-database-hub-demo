@@ -68,7 +68,7 @@ ALTER TABLE demo.io_scratch ALTER COLUMN filler SET STORAGE PLAIN;
 -- @batch
 -- replica-lag's marks (ADR 0025): the runner commits one small row every markIntervalMs, and once a cycle takes an
 -- ACCESS EXCLUSIVE lock on this table, which T4's read replica has to replay while a demo report there holds the table
--- (demo.usp_scenario_replica_lag). Only replica-lag reads or writes it; the auto-cleanup and reset delete its rows.
+-- (reporting.usp_publish_feed_checkpoint). Only replica-lag reads or writes it; the auto-cleanup and reset delete its rows.
 CREATE TABLE IF NOT EXISTS demo.replica_lag_marks
 (
     mark_id    bigint      GENERATED ALWAYS AS IDENTITY CONSTRAINT pk_replica_lag_marks PRIMARY KEY,
@@ -163,7 +163,7 @@ BEGIN
 END;
 $$;
 -- @batch
--- Demo sessions in this database: application name ContosoCare.Demo/<scenario>/<run>, never the runner's control
+-- Demo sessions in this database: application name ContosoCare.Demo/<service>/<run>, never the runner's control
 -- sessions (ContosoCare.Demo/control/...), never the caller. Optionally one run only. The statistics snapshot is
 -- cleared first, so a caller that asks again in the same transaction sees current sessions.
 CREATE OR REPLACE FUNCTION demo.fn_demo_sessions(p_run_id varchar)
@@ -402,7 +402,8 @@ BEGIN
            OR EXISTS (
                 SELECT 1
                 FROM demo.scenario_runs AS r
-                WHERE s.application_name = 'ContosoCare.Demo/' || r.scenario_id || '/' || r.run_id
+                -- By the run alone, as fn_demo_sessions: whatever precedes it (the service, or an older runner's scenario).
+                WHERE s.application_name LIKE 'ContosoCare.Demo/%/' || r.run_id
                   AND clock_timestamp() > r.deadline_at)
     LOOP
         BEGIN

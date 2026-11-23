@@ -22,6 +22,14 @@ internal sealed record ScenarioDefinition
 
     public required string Title { get; init; }
 
+    /// <summary>
+    /// The ContosoCare client service whose sessions run the scenario: the middle segment of their application name,
+    /// <c>ContosoCare.Demo/&lt;service&gt;/&lt;runId&gt;</c> (<see cref="Sql.SessionNames.ForRun"/>), and on T5 its requests'
+    /// tag. Services are shared across scenarios, as a real estate's client apps are, so it never stands for one fault, and
+    /// it's never a scenario ID (ADR 0031, decision 6).
+    /// </summary>
+    public required string Service { get; init; }
+
     public required string Summary { get; init; }
 
     /// <summary>
@@ -180,6 +188,16 @@ internal sealed class ScenarioCatalog
                 throw new InvalidOperationException($"Scenario '{definition.Id}' is defined twice.");
             }
         }
+
+        foreach (var definition in scenarios.Values)
+        {
+            // A service names a client app, never a fault: no scenario ID, whole or as hyphen-separated words of it.
+            var named = scenarios.Keys.Where(id => ("-" + definition.Service + "-").Contains("-" + id + "-", StringComparison.Ordinal)).Order(StringComparer.Ordinal).ToList();
+            if (named.Count > 0)
+            {
+                throw new InvalidOperationException($"Scenario '{definition.Id}' has the service '{definition.Service}', which names the scenario '{named[0]}'.");
+            }
+        }
     }
 
     public static ScenarioCatalog Default => Embedded.Value;
@@ -329,6 +347,11 @@ internal sealed class ScenarioCatalog
         if (definition.Orchestration is not ("workers" or "locking" or "chain" or "pairs" or "slow-consumer" or "capacity"))
         {
             throw new InvalidOperationException($"Scenario '{definition.Id}' has an unknown orchestration '{definition.Orchestration}'.");
+        }
+
+        if (!Sql.SessionNames.IsValidService(definition.Service))
+        {
+            throw new InvalidOperationException($"Scenario '{definition.Id}' has the service '{definition.Service}': a service is lowercase words joined by hyphens, at most {Sql.SessionNames.MaximumServiceLength} characters, and never '{Sql.SessionNames.ControlScenario}'.");
         }
 
         foreach (var (name, parameter) in definition.Parameters)

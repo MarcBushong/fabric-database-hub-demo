@@ -79,9 +79,9 @@ A new lane in the runner's `profile run`: on T1's VM for T1, T3, T4, and T4's re
 
 **What the observer records** ([Names](../../rca/README.md#names)):
 
-- A workload session's application name today is `ContosoCare.Demo/<scenario>/<run>`, which names the fault. The observer keeps only `ContosoCare.Demo`, plus `run_token`: an opaque hash of the run segment that groups a run's sessions and names nothing. A scenario ID never reaches the evidence.
-- Modules and statements are recorded as the DMVs return them, because a DBA sees them too and the owner asked for them. Rules never branch on a name, and a test checks that detection code contains no procedure-name pattern.
-- The procedures' own names (`demo.usp_scenario_chain_acquire`) still show the demo's script to a viewer who reads them.
+- A workload session's application name is `ContosoCare.Demo/<service>/<run>` since 2026-11-23 ([decision 6](#decisions-and-open-items)); before, it was `ContosoCare.Demo/<scenario>/<run>`, which named the fault. The observer keeps only `ContosoCare.Demo`, plus `run_token`: an opaque hash of the run segment that groups a run's sessions and names nothing. A scenario ID never reaches the evidence.
+- Modules and statements are recorded as the DMVs return them, because a DBA sees them too and the owner asked for them. Rules never branch on a name, and a test checks that detection code contains no procedure-name pattern and none of the workload's names.
+- The procedures' own names are a real application's since 2026-11-23 (`scheduling.usp_assign_work_item`, which was `demo.usp_scenario_chain_acquire`), so a viewer who reads them sees a clinic's apps, not the demo's script.
 
 **More realistic names, assessed:**
 
@@ -93,6 +93,14 @@ A new lane in the runner's `profile run`: on T1's VM for T1, T3, T4, and T4's re
 | (c) Realistic procedure names (`scheduling.usp_book_slot`) | 22 T-SQL procedures and 14 PostgreSQL functions, their callers, the scenario schema's procedure pattern, and `SqlScriptTests`' allow-lists | 5 to 10 days | Medium |
 
 **Decided for Phase 1: (b),** with rules that never use names. **Recommended as a Wave 2 follow-up, for the owner to approve: (a′) and (c),** which change what a viewer reads without touching the bounds. They're not in Phase 1 because they change ADR 0010's tagging and the agent prompts, and the fixtures and evaluation set would change twice.
+
+**(a′) and (c), approved by the owner on 2026-11-23** ([decision 6](#decisions-and-open-items); [ADR 0010's amendment](0010-workload-generator-technology.md#amendment-realistic-workload-names-2026-11-23) records the tagging, the schemas, and the upgrade):
+
+- **Application names:** `ContosoCare.Demo/<service>/<runId>`. The service is one of nine ContosoCare client services, each scenario's `service` in its `scenario.json`, shared across scenarios as a real estate's client apps are (`billing-worker` runs `locking-blocking`, `log-rate-pressure`, and T4's `idle-in-transaction`). The run ID is 16 random hex characters that `demo.scenario_runs` maps back. The prefix stays, so every bound does.
+- **Module names:** 26 T-SQL modules and 15 PostgreSQL functions in six application schemas (`billing`, `frontdesk`, `records`, `reporting`, `scheduling`, `supply`), one name on both engines where a scenario runs on both, and T5's label `events.usp_ingest_readings`. No stored definition names a scenario or narrates its fault.
+- **The answer key maps them back, for grading only:** `answerKey.workloadNames` in [blind-detection.json](../../rca/blind-detection.json) maps each service and module to the scenarios it can stand for. Every one of those names is forbidden in detection code, so the three blind-detection tests fail when detection code names one; `demo.fn_workload_procedures`, which lets the control plane check a module's run, is an answer-key object.
+- **Honest detection, unchanged:** detection reads evidence only; the observer drops the service with the run; and the evaluation set still fails an output that names a scenario. A module name in the evidence is what a DBA would read, and rules never branch on it. The fixtures and the evaluation set carry the new module names, and their facts are otherwise the same.
+- **Still readable as a demo, though none names a scenario** (a next step, not in this change): the scratch and mark tables (`demo.io_scratch`, `demo.log_rate_scratch`, `demo.commit_scratch`, `demo.replica_lag_marks`), parameter names and values (`@hold_seconds`, `@variant = 'problem'`), PostgreSQL result columns (`locked_rows`), run-event names, the `demo.` helpers that module bodies call, the baseline's audit actor, and T5's storm document kind.
 
 ### 3. Redaction and privacy
 
@@ -297,9 +305,7 @@ Also decided: errors (INV-12, INV-13) in Phase 1; blind detection, with the answ
     - A range's second time after a day and month: of a draft's "from 20 Oct 2026 13:00 to 15:10 UTC", it reads only 13:00. A draft is a session's, so its end is the session's own.
     - An episode key's time ("…-20261020T151000Z"), which only the Root cause view's own Ask hands the chat. The key is the blind detector's, so that Ask is outside this test by design, and `rca-view.test.tsx` checks it.
 
-**Open for the owner, numbered after the decisions:**
-
-- **6. Names** ([§2](#2-names)): **recommended,** (a′) and (c) as a Wave 2 follow-up; Phase 1 does (b).
+**6. Names, decided by the owner on 2026-11-23** ([§2](#2-names)): (a′) and (c), the realistic workload names, the follow-up recommended after Phase 1's (b). Its (b) stands: the observer still keeps only `ContosoCare.Demo` and the run token. Nothing is open for the owner now.
 
 **Done in the release:** 8, the wording that read as blind detection ([the audit](#wave-1-audit-where-it-reads-the-answer-key)), fixed by the release's own commits (R927). Wave 2's detector then makes "caught" true as written.
 

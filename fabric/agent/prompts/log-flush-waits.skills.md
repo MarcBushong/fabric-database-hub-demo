@@ -50,7 +50,7 @@ Use the diagnose-resource-pressure skill on the ContosoCare database of {target}
 ### 4. Line it up with the scenario record
 
 ```text
-Read the latest log-flush-waits row from demo.scenario_runs in ContosoCare on {target}: run_id, status, started_at, deadline_at, stopped_at, and parameters, and the current row count of demo.commit_scratch. Compare that window with the waits you found. Don't change anything.
+Read the latest log-flush-waits row by started_at from demo.scenario_runs in ContosoCare on {target}: run_id, status, started_at, deadline_at, stopped_at, and parameters, and the current row count of demo.commit_scratch. Compare that window with the waits you found. Don't change anything.
 ```
 
 ## Signals to look for

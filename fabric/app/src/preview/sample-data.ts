@@ -163,7 +163,7 @@ function binsFor(spec: QuerySpec): BinRow[] {
 
 const FINDINGS: Array<[string, string, string, string, number, string, number]> = [
     ["cpu.T3.peak", "cpu", "CPU", "T3", 3, "CPU peaked at 97.5 % at 14:05 UTC, 3.4 times its 7-day median, during the plan-regression beat.", 6],
-    ["blocking.T1.chain", "blocking", "Blocking", "T1", 3, "A blocking chain held 12 sessions for 18 minutes; the head blocker ran ContosoCare.Demo/blocking-chain.", 4],
+    ["blocking.T1.chain", "blocking", "Blocking", "T1", 3, "A blocking chain held 12 sessions for 18 minutes; the head blocker ran ContosoCare.Demo/scheduling-service.", 4],
     ["storage_io.T2.pageiolatch", "storage_io", "Storage IO", "T2", 3, "Buffer IO (PAGEIOLATCH) waits ran at 6.2 times their baseline for 30 minutes with no scenario running.", 5],
     ["postgresql.T4-replica.lag", "postgresql", "PostgreSQL", "T4-replica", 3, "Read replica lag on pgreplica01 peaked at 241.4 s at 14:25 UTC (a Warning at 60 s or more).", 6],
     ["telemetry_coverage.T2", "telemetry_coverage", "Telemetry coverage", "T2", 2, "T2 sent 8 of 9 telemetry tables; query store telemetry needs the Arc extension's monitoring setting.", 6],

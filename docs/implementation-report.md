@@ -7091,7 +7091,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 **Risks.**
 
 - **Not run live:** that Fabric's ipynb export of an imported notebook gives the repository file's fingerprint. A normalization this doesn't cover makes every copy count as edited, so `deploy.ps1` keeps it, as before this change: safe, but the update then doesn't happen. The live round on an update should see `FABRIC.IMPORT.*` **Pass** "It was the demo's version of ..." for a workspace an earlier version imported, **Pass** "is this version already" on the next run, and **Not selected** after an edit in Fabric.
-- **An edit only to what the fingerprint leaves out,** a cell's metadata or outputs for example, is replaced by an update. An edit to the code is always kept.
+- **An edit only to what the fingerprint leaves out,** a cell's metadata or outputs for example, is replaced by an update. An edit to the code is kept, unless it makes the code exactly a listed version's, a hand edit that undoes a change for example: that copy counts as that version and is updated ([the review's Low](#the-review-of-42acec35-and-cb4bc479-two-mediums-fixed-one-low-narrowed-2026-11-23)).
 - **A notebook changed without the writer** makes copies of its version count as edited; the unit test fails first.
 - **One Get Item Definition per notebook per run,** a long-running operation when Fabric answers 202, bounded by the import's timeout.
 
@@ -7482,6 +7482,72 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 **Changed files.** `fabric/app/src/lib/view-state.ts` (`openView`), the test `lib/app.test.ts`, ADR 0031, and this report.
 
 **Validation.** Targeted: `lib/app.test.ts` and the Root cause view's three suites (`app-rca`, `rca-retry`, `rca-view`) passed, 57 tests, and the new test fails with 96bf9ff7's `openView`. The typecheck and eslint are clean, markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+
+### The review of 42acec35 and cb4bc479: two Mediums fixed, one Low narrowed (2026-11-23)
+
+**Why.** The review of 42acec35 (decision 2a) and cb4bc479 (the expected notes) said ship with fixes: one Medium in each commit, and one Low. The coordinator put both Mediums in today's release, as one commit ahead of the F35 work, and the Low's docs with them.
+
+**Work summary.**
+
+1. **Medium (2a): a hand edit of `GITHUB_REPOSITORY` was replaced as a rebind.** `configure-fabric.ps1` sets the GitHub values only when `github.repository` isn't the example configuration's placeholder, so with the placeholder, an edit of that line alone read as Rebind and was replaced, and the Older path never compared the values. That broke 2a's promise that an edited notebook is kept. Now:
+   - `Get-DemoFabricNotebookDefinition` returns `BoundKeys`, the parameters it set.
+   - `Get-DemoFabricNotebookState`: another value in a key the run sets is still a rebind, which an update makes. Another value in a key it doesn't set is Edited, with `EditedKeys`, in both paths. An earlier version's values are compared with that version's own, which `fabric/notebooks/published-versions.json` now records (`parameters`, written by the same writer; the 26 versions and their days are unchanged), since the live-activity notebook dropped its GitHub values on 2026-11-14. A version without them counts as edited.
+   - `FABRIC.IMPORT.<notebook>` **Not selected** says "Kept notebook ... as it is: its `GITHUB_REPOSITORY` isn't the value the demo publishes there, and this run doesn't set it, so it counts as an edit", with the fix any edit has, and its evidence names the keys (`editedParameters`).
+2. **Medium (expected notes): the notes weren't limited to a new VM.** Every generation runs every step's Test again, so a token that reached an established host's logs after its setup, or a sysadmin recovery on a T1 that already had access, became a note and a **Pass**, labeled as a new VM's by-design event; before cb4bc479, they were warnings. Now:
+   - The runner records the generation on a step's record before its Set runs (`setGeneration`). `Test-DemoVmStepSetThisGeneration` says whether any named step's Set ran in this generation, and `Test-DemoVmStepFirstSetup` whether a step never completed before. Both read state.json and say false when they can't tell, so a doubt gives a warning.
+   - The sign-in cleanup gives a note only after a setup in this generation (`Get-DemoSignInStepResult -Expected`): on T2's host, Arc onboarding (before or after the wizard), the guest's build, or its setup wizard; on the evaluation-only Arc VM, Arc onboarding or SQL Server's setup. T1's sysadmin recovery and the restart setup asks for give a note only on their step's first setup. Otherwise each is a one-off warning, as before cb4bc479.
+   - The image check needs no condition: its note is about the download its own Set just made.
+   - `Get-DemoHealthWarningNote` doesn't call a warning expected when the summary has `noteCount`: a bundle that records notes gives these events as warnings only on an established VM, where they aren't expected. An older bundle's warnings keep F32's text.
+3. **Low (2a): an edit that reproduces a published version counts as that version and is updated,** a hand edit that undoes one of the live-activity notebook's one-cell changes for example. A later release whose notebook goes back to a listed version would also let an older checkout replace it. That contradicted ADR 0021's "No downgrade" and this report's "An edit to the code is always kept". For today, both state the limit, with the way to keep such an edit (change anything else in the code); the Fabric guide, troubleshooting, and the CHANGELOG say it too. The full fix, recording the version each environment last uploaded, is left for a decision.
+
+- **Docs:** [ADR 0021's amendment](adr/0021-fabric-resources-by-name.md#amendment-2026-11-23-an-update-brings-the-notebooks-that-nobody-edited-up-to-date-follow-ups-decision-2a) (the values, the outcome, and "No downgrade, with one limit"), [ADR 0012's amendment](adr/0012-validation-model.md#2026-11-23-a-new-vms-by-design-notes-are-information-so-a-ready-vm-is-a-pass) ("Only a new VM's"), the [Fabric guide](../fabric/README.md#import-or-update-the-notebooks), `vm/health/README.md`, three troubleshooting rows, both CHANGELOG entries, decision 2a's risk above, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Get-DemoFabricNotebookDefinition.ps1`, `Private/FabricNotebookVersionHelpers.ps1`, `Public/Import-DemoFabricNotebook.ps1`, `fabric/notebooks/published-versions.json`, `Private/ValidationHelpers.ps1`; `vm/bootstrap/lib/Runner.ps1`, `vm/bootstrap/lib/State.ps1`, `vm/bootstrap/DbHubDemo.Vm.psm1` and `.psd1`, `vm/bootstrap/HostSteps.ps1`, `vm/bootstrap/Invoke-EvalArcVmBootstrap.ps1`, `vm/bootstrap/Invoke-SqlVmBootstrap.ps1`, `vm/hyperv-guest/GuestSql.ps1`; tests in `tests/unit/DbHubDemo.Fabric.Tests.ps1`, `Fabric.Notebooks.Tests.ps1`, `Vm.StateMachine.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, `Vm.SqlVmPlan.Tests.ps1`, and `DbHubDemo.Validation.Tests.ps1`; the docs above.
+
+**Validation.**
+
+- **New tests:**
+  - `DbHubDemo.Fabric.Tests.ps1`: a `GITHUB_REPOSITORY` changed by hand while the run doesn't set it is kept, in this version and in an earlier one, naming the key; the same value is bound again when the run sets it; and, with the list read as `deploy.ps1` reads it, a version from before 2026-11-14 with its own GitHub values is updated, and the same version with `GITHUB_REPOSITORY` changed is kept.
+  - `Fabric.Notebooks.Tests.ps1`: each listed version has its file's values, and the current one's are the file's.
+  - `Vm.StateMachine.Tests.ps1`: the runner records `setGeneration` for the steps whose Set ran, generation by generation.
+  - `Vm.HostPlan.Tests.ps1`: the host's sign-in cleanup is a note after Arc onboarding or the guest's build in this generation, and a one-off warning when the onboarding ran in an earlier one.
+  - `Vm.SqlVmPlan.Tests.ps1`: the sysadmin recovery is a note on T1's first setup and a one-off warning when the step completed before; the restart is a one-off warning on an established T1.
+  - `DbHubDemo.Validation.Tests.ps1`: a warning with the cleanup's text from a bundle that records notes isn't called expected.
+- **On cb4bc479's code with the new tests:** in the six test files, 10 fail and 321 pass. The 10 are each new or changed test: the four `GITHUB_REPOSITORY` tests, the list's values, the runner's `setGeneration`, the host's sign-in cleanup, T1's restart and its sysadmin recovery, and the warning that isn't called expected.
+- Pester with StrictMode, one run at a time: every `Vm.*.Tests.ps1` with DbHubDemo.Validation, 669 passed, 0 failed; DbHubDemo.Fabric, FabricItem, FabricTrack, FirstRun, HistorySnapshot, Lifecycle, OneCommand, Tracks, and JumpstartStatus with Fabric.Notebooks and Fabric.ControlNotebook, 1,036 passed, 0 failed, 69 skipped; and Repo.Conventions, FunctionNames, LifecycleScripts, NeutralWording, and TestAzGuard, 200 passed, 0 failed; 0 az calls.
+- PSScriptAnalyzer 1.25.0 with the repository's settings: 0 findings on the 18 changed PowerShell files. markdownlint: clean. The PowerShell files are ASCII, every changed file has LF line endings, and the VM files keep to Windows PowerShell 5.1's syntax (`Repo.Conventions`).
+
+**Risks.**
+
+- **Not run live:** a net-new deployment's first `validate.ps1` should show `INFRA.HEALTH.ARCHOST01` and `INFRA.HEALTH.SQLVM01` as **Pass**, naming the notes, and an update with no new setup none. That `deploy.ps1` keeps a notebook whose `GITHUB_REPOSITORY` someone changed needs the 2a live proof first, that Fabric's ipynb export gives the file's fingerprint.
+- **A state.json from before this commit** has no `setGeneration`, so the first bundle with this commit gives the cleanup's event as a warning, not a note, on a host whose onboarding ran before it: the safe side. A new host records it from its first Set.
+- **The Low stays open:** an edit that makes a notebook's code exactly a listed version's is still updated.
+
+### The re-check of ea1ea20f: the notes' bundle told apart by health.json, and the cleanup's gate narrowed (2026-11-23)
+
+**Why.** The re-check of ea1ea20f said ship with fixes: the bindings' Medium and the Low's docs are closed, and two findings remained in the expected notes' gate, both for tonight's release.
+
+**Work summary.**
+
+1. **Medium: `status.ps1 -Detail` still called an established VM's warnings expected.** `Get-DemoHealthWarningNote` told a bundle that gives the by-design notes as notes by the summary's `noteCount`, but that tells the view, not the bundle: `Get-DemoVmHealth` sends the repository's own `Get-DemoHealth.ps1`, whose summary had `noteCount` for an older health.json too, 0, and whose full view, which `status.ps1 -Detail` reads, never has it. So the full view said "That's expected" and "Nothing to do" for an established host's sign-in cleanup and a later T1 sysadmin recovery or restart, and the summary didn't say it for an older bundle's own expected warnings. The reviewer ran the real script over both formats in both views. Now:
+   - `Get-DemoHealth.ps1 -View Summary` prints `notes` and `noteCount` only when health.json has `notes`, which every bundle since cb4bc479 writes, even empty, and an older one never does. It runs from the repository on every read, so this holds for every VM at once.
+   - `Get-DemoHealthWarningNote` takes health.json's `notes`, in the full view, or the summary's `noteCount` as a bundle that records notes.
+2. **Low: the cleanup's gate counted `GuestVm`,** whose Test fails while the guest isn't running with automatic start, so its Set also starts a guest that was only off, on an established host, and a token cleared later in that pass became a note and a **Pass**. The reviewer ran the real runner through three generations. Now the host's gate is Arc onboarding (before or after the wizard), `GuestImage`, and `GuestVhdx`, whose Tests read only files and the Arc marker: their Sets run only on a new host or a rebuilt guest. Two more members had the same flaw, so they're out too: `SqlSetupWizard`, whose Set waits for a guest that's off, which matters on a host that kept a finished `PaygWizard` guest; and, on the evaluation-only Arc VM, `SqlUnattendedInstall` and `SqlSetupWizard`, whose Tests fail while SQL Server's service is stopped. That VM's gate is Arc onboarding alone, which leaves the sign-in data and runs on every new one before the cleanup.
+
+- **Docs:** [ADR 0012's amendment](adr/0012-validation-model.md#2026-11-23-a-new-vms-by-design-notes-are-information-so-a-ready-vm-is-a-pass) ("Only a new VM's"), `vm/health/README.md`, and this report.
+
+**Changed files.** `vm/health/Get-DemoHealth.ps1`, `scripts/modules/DbHubDemo/Private/ValidationHelpers.ps1`, `vm/bootstrap/HostSteps.ps1`, `vm/bootstrap/Invoke-EvalArcVmBootstrap.ps1`, `vm/hyperv-guest/GuestSql.ps1` (a comment); tests in `tests/unit/DbHubDemo.Validation.Tests.ps1`, `Vm.WorkloadSteps.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, and `Vm.EvalArcVm.Tests.ps1`; the docs above.
+
+**Validation.**
+
+- **New tests:** the real `Get-DemoHealth.ps1` over an older health.json and a newer one, in both views, through `Get-DemoHealthWarningNote`: the older bundle's T1 recovery is expected in both, and the newer one's in neither; the summary of an older health.json has no `notes` or `noteCount`, and a newer one's with no notes has `noteCount` 0; the host's cleanup is a warning when only `GuestVm` ran in the generation, and a note when `GuestImage` or `GuestVhdx` did; the evaluation VM's cleanup is a warning when only `SqlUnattendedInstall` ran in it, and a note after its Arc onboarding.
+- **On ea1ea20f's code with the new tests:** in the four test files, 4 fail and 232 pass: each new or changed test.
+- Pester with StrictMode, targeted: Vm.HostPlan, Vm.EvalArcVm, Vm.WorkloadSteps, and DbHubDemo.Validation, 236 passed, 0 failed, 0 az calls.
+- PSScriptAnalyzer 1.25.0 with the repository's settings: 0 findings on the 9 changed PowerShell files. markdownlint: clean. The PowerShell files are ASCII, every changed file has LF line endings, and the VM files keep to Windows PowerShell 5.1's syntax.
+
+**Risks.**
+
+- **Not run live,** as before: a net-new deployment's first `validate.ps1` and `status.ps1 -Detail` should show the notes in a **Pass**, and an established VM's later events as warnings that aren't called expected.
 
 ### The RCA release: the Incident RCA merged onto the release's follow-ups (2026-11-23)
 
@@ -7999,3 +8065,292 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - **The model stays on the release's form** after the Fabric track's Warning, until `deploy.ps1 -FromStage Fabric` or a later run of the track. The end's step and DONE now say so. Its first-run follow-up (#68) deploys the release's form too; it reads as today.
 - **A first deployment whose first history run is still queued** at the track's step finds no table, so the model gets the release's form. The end's step then works out the snapshot's rows and is a Warning (`ModelOnRelease`), with `./scripts/deploy.ps1 -FromStage Fabric`. That's accurate, but it asks for one more step on such a first deployment.
 - **The one-time ALTER and a concurrent save:** the step's `ALTER TABLE ... ADD COLUMNS` changes the table's metadata, so a notebook save that started before it and commits after it fails with Delta's `MetadataChangedException` ([concurrency control for Delta tables](https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control)). The step's updates and a save's `DELETE` of its own run's rows can conflict the same way, but only when both write at the same moment. The step says so (`NoColumns` or `Partial`), and a later run finishes. Recommended for the notebook's session: `write_delta` retries the whole save once or twice on Delta's concurrent-modification exceptions, which is safe because it deletes its own `RUN_ID`'s rows before it appends. Done in def8f09b: the save runs its delete and append again together, at most 5 tries. An older notebook doesn't retry; the next save, or a rerun, writes what that one didn't.
+
+### Realistic names, unit A: procedure and function names on both engines (2026-11-23)
+
+**Why.** The owner approved ADR 0031's decision 6 on 2026-11-23: the workload reads like a real system, so the Incident RCA's evidence, Query Store, and Database Hub don't give away the demo's scenario. The coordinator split it into three units from one design: a base commit with the name mapping as data, unit A (option (c), realistic procedure and function names, on both engines), unit B (option (a'), application names), and unit C (the fixtures, the app's tests, and the docs). This entry is unit A's, two commits after edd01c86.
+
+- **The base (59d9dfb7): the mapping as data.** Each `scenario.json` gets its `service`, the middle segment of its sessions' application name, required by the schema. `rca/blind-detection.json` gets `answerKey.workloadNames`: every service, T-SQL module, PostgreSQL function, and T5 label, with the scenarios each can stand for, for grading only. Every one of those names, and `demo.fn_workload_procedures`, joins `forbiddenInDetectionCode.identifiers`, so the three blind tests fail when detection code names one.
+- **The names.** The 26 T-SQL modules of `database/common/120-scenario-procedures.sql` and the 15 step functions of `database/postgresql/120-scenario-functions.sql` move from `demo.usp_scenario_*` into six application schemas: `billing`, `frontdesk`, `records`, `reporting`, `scheduling`, and `supply`. They're named for what they do, for example `billing.usp_claim_work_item` for the blocked billing clerk and `scheduling.usp_assign_work_item` for the chain's head blocker, with one name per module on both engines. `demo` keeps the control objects and `demo.fn_seed_scale`. The runner's callers and each scenario's entry follow, and the schema's procedure pattern allows only those schemas, plus `events` for T5's label.
+- **No stored definition names a scenario.** SQL Server stores a module's whole batch, header comments included, and a DBA reads it with `sp_helptext`:
+  - Each module checks its run with `@procid = @@PROCID`. `demo.fn_workload_procedures()`, in `110-demo-control.sql` and part of the answer key, says which scenario's runs may run it, so the bound of ADR 0010 holds without a scenario ID in the module.
+  - Each header comment is a batch of its own, before a `GO`, so SQL Server never stores it with the module.
+  - The two modules that read `demo.scenario_runs` take its concurrency and start from `demo.usp_run_assert_running` instead.
+  - The in-body comments, messages, and event details that narrated the fault are neutral: no scenario ID, no "the head blocker", no "the Database Agent beat".
+  - PostgreSQL stores only a function's body, and no body names a scenario.
+- **One click.** `./scripts/deploy.ps1` changes nothing in how it updates the databases. The runner's `setup` applies `110` then `120`, as an administrator, on T1 to T3. On T4, `Enable-DemoT4Workload` runs `setup --target T4`.
+  - **T1 to T3:** `120` creates the schemas, owned by `dbo`, and grants `contosocare_runner` `EXECUTE` on them. It creates the new modules, then drops every earlier name once all of them exist, after it first unforces any Query Store plan forced for `demo.usp_visit_summary_lookup` on Azure SQL Database. `usp_reset` unforces the new lookup's plans.
+  - **T4:** `120` creates the schemas and functions, then drops every function of `demo` that has an earlier name, whatever its argument list. `PgScripts.GrantRunnerAsync` grants `USAGE` and `EXECUTE` on `PgScripts.ApplicationSchemas`. `VerifyScenarioFunctionsAsync` reads each step's schema from its name.
+- **Fail-safe while a runner and its database are out of step.** `deploy.ps1` installs the runner on T1 before it updates T3's and T4's modules:
+  - **A new runner, an old database:** the runner checks the scenario's entry module first. If it's missing, the run is **Refused**, with the reason `out-of-step` and the missing name. Nothing is registered and no session opens, and the profile host tries again, bounded, as for `connect`.
+  - **An old runner, a new database:** its first call to an earlier name fails (error 2812, or SQLSTATE 42883), and its run ends **Failed**. The run check still takes `@scenario_id` for a module that setup hasn't replaced yet.
+
+**Changed files.** `database/common/110-demo-control.sql` and `120-scenario-procedures.sql`; `database/postgresql/110-demo-control.sql` (a comment) and `120-scenario-functions.sql`; each `scenarios/*/scenario.json`'s `service` (base) and `procedure` lines, and `scenarios/scenario.schema.json`; `rca/blind-detection.json` (base); in the runner, `Runs/ScenarioRunner.cs`, `Postgres/PgScenarioRunner.cs`, `Postgres/ReplicaLag.cs`, `Postgres/PgScripts.cs`, and `Sql/SqlScripts.cs`; and the tests `SqlScriptTests`, `CatalogTests`, `PostgresTests`, `ReplicaLagTests`, `RunnerTests`, and `SqlIntegrationTests`.
+
+**Validation.** On edd01c86 with the two commits, on this PC (ARM64, with a .NET 10.0.403 SDK in the session's own folder):
+
+- **The runner's tests:** 817 tests, of which 795 passed, 22 were skipped, and none failed. The skipped ones are the integration tests, which need a disposable SQL Server or PostgreSQL server.
+- **New checks:**
+  - Every module the T-SQL script creates is in the answer key's map and forbidden in detection code.
+  - Every module that checks its run has its row in `demo.fn_workload_procedures()`, which agrees with the map.
+  - No stored module text, and no PostgreSQL function body, names a scenario or says "scenario".
+  - Each retired name is dropped once, after every replacement exists.
+  - The T4 steps live in the schemas that setup grants.
+  - An `out-of-step` refusal is retried.
+  - Two integration tests: the T-SQL upgrade, from earlier names to new ones with the run check following the module, and the refusal, which registers nothing.
+- **Pester:** under strict mode, with the Azure CLI guard, the eight suites that read the scripts or the catalog passed, with none failing: `Rca.Contract`, `Agent.PromptPack`, `Automation.Runbooks`, `DbHubDemo.Lifecycle`, `DbHubDemo.T3`, `DbHubDemo.T3Agent`, `DbHubDemo.T4`, and `DbHubDemo.Workload`, 1,341 in all.
+- **T4's upgrade on a real PostgreSQL 18.6,** a disposable local server in the session's own folder, with trust authentication on 127.0.0.1 only:
+  - The base commit's scripts, seed, and grants, then this branch's scripts and grants, as setup applies them: the 15 earlier functions are gone, the 15 new ones are in their schemas (`billing` 8, `frontdesk` 2, and one each in the others), and `demo.fn_seed_scale` stays. A second setup changes nothing.
+  - As `contosocare_runner`, each of the 13 steps ran under a run of its scenario, and the two helper functions through them. An earlier name failed with SQLSTATE 42883, and a stopped run's step with CC001.
+  - `PostgresTests.SetupRunAndResetAgainstALocalServer` passed: the runner's setup, a baseline run, and reset.
+  - The runner, against a database at the base commit, refused a cpu-pressure run with the out-of-step reason, and registered no run.
+- **The leak check** finds no identifier in what these commits add.
+- **Not run here:** this PC has no SQL Server, so the new T-SQL is checked by the parser (ScriptDom) and the static tests, not by an engine.
+
+**Risks.**
+
+- The T-SQL runs on an engine for the first time in its live check, or under the integration tests on a disposable SQL Server. The PostgreSQL ran on one here.
+- Run IDs keep their form until unit B lands.
+- What's still readable as a demo, though it names no scenario, is listed for a follow-up in the design: the scratch and mark tables, parameter names and values such as `@variant = 'problem'`, PostgreSQL result columns, run-event names, and the `demo.` control helpers inside the bodies.
+
+**What its live check needs.** `./scripts/deploy.ps1` over an environment from before the rename, while its profile host runs.
+
+- `setup` passes on T1 to T4, and no `demo.usp_scenario_*` module is left.
+- In the minutes between the runner's install and T3's and T4's setup, a run on T3 or T4 is refused as `out-of-step`, and tried again after setup.
+- A Run all, then `./scripts/validate.ps1`.
+- On T3, plan-regression's beat runs on `frontdesk.usp_visit_summary`, and reset unforces its plans.
+- Query Store and Database Hub show the new names.
+
+### Realistic names, unit A: the review of 45f37c4c (2026-11-23)
+
+**Why.** The review of 59d9dfb7 and 45f37c4c said ship with fixes. It found nothing that would fail on a real server or on a second run, and asked for two fixes, in one follow-up commit.
+
+- **Medium: the test that guards T3's unforce of the old lookup checked nothing.** It searched from the last `CREATE OR ALTER`, so it found the unforce inside `frontdesk.usp_refresh_visit_summaries` instead of the retired block's, and a missing call, -1, still passed.
+  - **The fix:** the test reads the retired block alone, from `-- Retired names` to the first drop. It requires the unforce there, inside `BEGIN TRY`, under the Azure SQL Database condition, for `OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P')`'s forced plans.
+  - **Proved:** with the block removed from the script, the test fails ("the old lookup's forced plans are unforced before it's dropped"). The script was restored after.
+- **Low: on T4, the runner's check before a run tested that the step existed, not that it could call it.** `setup --target T4` creates the steps in their new schemas before `GrantRunnerAsync` grants the runner's role `USAGE` on them. A run in between would have passed the check, registered, and failed at its first step with SQLSTATE 42501: Failed, where the design says Refused and tried again. T-SQL has no such gap, because `120` grants `EXECUTE` on the schemas before it creates a module.
+  - **The fix:** the runner checks with `PgScripts.FunctionCallableAsync`, which also requires `has_schema_privilege(n.oid, 'USAGE')` and `has_function_privilege(p.oid, 'EXECUTE')` for the signed-in role. Setup's own check stays existence-only, as an administrator's.
+  - **The reason now covers both cases:** "T4's workload modules aren't set up for this runner yet: it can't run scheduling.usp_find_double_bookings. ./scripts/deploy.ps1 sets them up; the run is tried again."
+  - **A new opt-in test,** `PostgresTests.TheRunnersCheckWantsAStepItCanCall`, against a disposable server: a function in a schema the role has no `USAGE` on exists, but isn't callable, until the grant.
+
+**Changed files.** `workload-generator/src/ContosoCare.Workload/Postgres/PgScripts.cs`, `Postgres/PgScenarioRunner.cs`, and `Runs/ScenarioRunner.cs` (the reason's words); `tests/ContosoCare.Workload.Tests/SqlScriptTests.cs` and `PostgresTests.cs`; and this report.
+
+**Validation.**
+
+- **The runner's test classes for these files** (`RunnerTests`, `SqlScriptTests`, `CatalogTests`, `PostgresTests`, `ReplicaLagTests`, `SqlIntegrationTests`, and `RcaBlindTests`): 304 tests, of which 282 passed, 22 were skipped, and none failed. The skipped ones are the integration tests.
+- **The two PostgreSQL opt-in tests** passed against the local PostgreSQL 18.6: `SetupRunAndResetAgainstALocalServer`, and the new `TheRunnersCheckWantsAStepItCanCall`.
+- **In setup's own gap, on the local server:**
+  - The base commit's scripts and grants, then this branch's scripts without their grants: the runner, signed in as `contosocare_runner`, refused a cpu-pressure run with the reason above, and registered no run.
+  - After `GrantRunnerAsync`'s two new grants, the same run completed: 2 workers ran `scheduling.usp_find_double_bookings` 53 times.
+
+**What its live check needs, added to the review's list for Final tests:**
+
+- **On T4:** `./scripts/deploy.ps1` while T4's profile is running. A T4 run in the minutes of its setup is Refused with the reason above and then tried again; none ends Failed with 42501.
+- **On T1 and T2:** the runner's `setup` applies `120`'s comment-only batches, one before each module, with no error.
+- **On T3:** `sp_helptext 'billing.usp_claim_work_item'` shows no header comment and no scenario ID.
+- **The RCA's capture of a 50111:** an `error_reported` event names a module and a run, never a scenario.
+
+### Realistic names, unit B: application names `ContosoCare.Demo/<service>/<run>` (2026-11-23)
+
+**Why.** On 2026-11-23 the owner approved [ADR 0031's decision 6](adr/0031-incident-rca.md#2-names), the realistic workload names, (a′) and (c). A session's application name, which the DMVs, `pg_stat_activity`, and Database Hub's session lists show, named the fault it played: `ContosoCare.Demo/locking-blocking/20261120170200-t1-9b7c1d`. This is unit B, (a′): the name becomes `ContosoCare.Demo/<service>/<run>`, the ContosoCare client service that runs the scenario and an opaque run ID. It builds on unit A's shared base, 59d9dfb7: each `scenario.json`'s `service`, the schema's `service`, and the answer key's `workloadNames`. Unit A renames the modules, (c), and unit C the fixtures and docs. One commit.
+
+- **The run ID says nothing about the run.** `SessionNames.NewRunId()` returns 16 lowercase hex characters, 64 random bits, with no time and no target. `demo.scenario_runs`, or T5's run store, maps it to its scenario, target, and times, as before. It fits `IsValidRunId`, `demo.usp_run_begin`'s rule on both engines, which an older runner's IDs (`20261120170200-t1-9b7c1d`) still fit. The observer hashes a name's last segment and the answer key hashes the run ID, so they still agree, and nothing under `Rca/**` changes.
+- **The middle segment is the service.** `ScenarioDefinition.Service` is required. The catalog refuses a service that isn't lowercase words joined by hyphens, 32 characters at most; `control`, which would hide a run's sessions from the session tools; and one that names a scenario, whole or as hyphen-separated words (`cpu-pressure-api`). `SessionNames.ForRun(service, runId)` refuses the same services, and a run ID with a LIKE wildcard, since the session tools now match by the run alone. The three runners name runs `ForRun(plan.Scenario.Service, runId)`: on T5 that's each request's User-Agent prefix and each document's `source`. The run command's JSON `applicationName` says the same.
+- **The kill tools match a run's sessions by the run ID alone.** `demo.usp_kill_demo_sessions`' past-deadline match, on both engines, built `ContosoCare.Demo/<scenario_id>/<run_id>`, which a new name never equals. It's `LIKE 'ContosoCare.Demo/%/' + run_id` now, as `demo.fn_demo_sessions` already was. A run ID has no LIKE wildcard, so the match is exact, and it matches an older runner's names too.
+  - **Out of step** (the design's 5.2): the runner's watchdog, reset, and stop call the kill tool by run with `past_deadline_only` off, which goes through `fn_demo_sessions`' match, so a new runner on an old database, and an older runner on a new one, still end their runs' sessions.
+  - **Unchanged:** the prefix filters, `ContosoCare.Demo/control/`, and ADR 0010's bounds.
+- **T4's read replica: a scenario stop matches by run, not by service.** The design proposed the service, with a by-run match as the alternative if the service could reach another run's session. It can: on T4, missing-index and replica-lag share `reporting-jobs`, so a stop of missing-index would end a replica-lag report on the replica. The coordinator accepted the by-run match.
+  - **How:** with a replica, `stop --target T4 --scenario <id>` reads T4's Running runs before it stops them, then ends the replica's sessions of that scenario's runs among them (`ReplicaSessionScope.ForStop`; the statements take `@run_ids`, matched through `unnest`). A run's own last check, by its run, and reset, of all, are as before.
+  - **What changes:** a scenario stop no longer ends a replica session of that scenario's run that had already ended. The run's own last check ends those, and reset ends them all. A run that begins between the read and the stop is stopped but isn't in the replica scope: its runner ends its sessions within seconds of the stop, and its last check ends any left.
+- **Readers:** the agent prompts that picked the workload's sessions by a scenario segment (`blocking-chain`, `locking-blocking`, `deadlock-storm`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`) pick a run's sessions instead: they read its `run_id` from `demo.scenario_runs` and match the sessions whose names start with `ContosoCare.Demo/` and end with it (corrected by [the review of e21c3431](#realistic-names-unit-b-the-review-of-e21c3431-2026-11-23), below: at e21c3431, four of them read every `ContosoCare.Demo/` session). The deployment notebook's Workload paragraph, the runner's root description, and `stop --run-id`'s example say the new form.
+- **Left to the other units, as agreed with the coordinator:** the comments in `database/postgresql/120-scenario-functions.sql` that still say `ContosoCare.Demo/<scenario>/<run>` and `ContosoCare.Demo/replica-lag` (A); and the docs, scenario READMEs, and `scenario.json` prose that quote a tag (C). A's `SqlIntegrationTests` still pass a scenario ID as the service in two `ForRun` calls, which now stand for an older runner's names; the kill tools match them by run.
+
+**Changed files.**
+
+- **Runner:** `Sql/TargetEndpoint.cs` (`SessionNames`), `Catalog/ScenarioCatalog.cs`, `Runs/ScenarioRunner.cs`, `Postgres/PgScenarioRunner.cs`, `Cosmos/CosmosScenarioRunner.cs`, `Cosmos/CosmosRestClient.cs` (a comment), `Postgres/PgReplica.cs`, and `Cli/CommandLine.cs`.
+- **Scripts:** the kill tool's run match, with a comment, and the `fn_demo_sessions` header in `database/common/110-demo-control.sql` and `database/postgresql/110-demo-control.sql`.
+- **Tests:** `ConnectionTests`; `CatalogTests`' service cases, the refusals and the answer key (every service in `workloadNames.services` with exactly its scenarios, and in `forbiddenInDetectionCode`); `CosmosClientTests`; `CosmosRunnerTests`; `ReplicaLagTests`; `RcaSimulation`'s application names, whose middle segment only changes, since C's fixtures bind their run segments; and two lines of `PostgresTests`, agreed with A.
+- **Readers:** the seven agent prompts above, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, and this report.
+
+**Validation.** On 59d9dfb7 with this commit, on this PC:
+
+- **The runner's tests** (`dotnet test` in `workload-generator`): 828, none failed, 21 skipped, the opt-in integration tests that need a disposable SQL Server or PostgreSQL. At 59d9dfb7: 808, none failed, 21 skipped. The build has no warning.
+- **The new tests fail without the change:** with five mutations in one build (the old exact kill-tool match on both engines, the replica's scenario scope by service, no scenario check of a service in the catalog, no checks in `ForRun`, and T5's tag by scenario), 16 of the 21 targeted cases fail, each on its own mutation. The other 5 are the catalog's format cases, which no mutation touches. Restored, the 12 test classes that cover what changed pass: 529, with 2 skipped.
+- **The replica's statements parse:** PostgreSQL 17's parser (libpg_query) parses `PgReplicaSessions.Sql`'s three statements, with the positional parameters Npgsql sends, and reads the kill tool's match as `LIKE ('ContosoCare.Demo/%/' || r.run_id)`. No test runs them offline; the live check does.
+- **Pester,** under strict mode with the Azure CLI guard, one suite at a time:
+  - `Agent.PromptPack`: 472 passed, none failed.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - `Fabric.Notebooks`, for the deployment notebook: 121 passed, 1 failed, 8 skipped, as at 59d9dfb7 without this commit. The failure is a date bomb in `NB_DatabaseHub_LiveActivity`'s staged evidence case (`stagedOtherSession`): the test stages a file named for 2026-11-20 17:25 UTC, and the notebook's inbox sweep deletes a file staged more than 24 hours earlier, so the test has failed on every branch since 2026-11-21 17:25 UTC. The RCA release's integration fixes the test in 5633c574, with no notebook change. With 5633c574 applied, the suite passes: 122, with 8 skipped.
+  - The guard saw no Azure CLI call in any of them.
+- markdownlint found no issue in 152 files. The notebook parses, 31 cells, with one line changed.
+- No PowerShell changed, so PSScriptAnalyzer has nothing new to read.
+- The leak check prints nothing.
+
+**Risks.**
+
+- Run IDs lose their readable time and target. No code parses them: the design checked the runner, scripts, runbooks, notebooks, and app, and a search here found no slice or split of a run ID. Wherever a run ID is shown, its scenario, target, and start are shown with it.
+- A scenario stop on T4's replica covers that scenario's Running runs only (above).
+
+**What its live check needs.** In the Final tests session, with A and C:
+
+- A Run all, with the runs' sessions in `sys.dm_exec_sessions` and `pg_stat_activity` as `ContosoCare.Demo/<service>/<16 hex characters>`, and T5's requests' User-Agent and documents' `source` the same.
+- A run's sessions ended at its deadline or stop on every target, including a run an older runner started before the update (the design's 5.2).
+- `stop --target T4 --scenario replica-lag` during a replica-lag run: `replica-sessions-ended` passes, with the report's sessions ended. And `stop --target T4 --scenario missing-index` during one leaves the report running.
+
+### Realistic names, unit B: the review of e21c3431 (2026-11-23)
+
+**Why.** A fresh reviewer said to ship e21c3431 with fixes: the bounds, the kill tools, the run IDs, the names' lengths, and the replica's scenario stop are sound, with one Medium, in the agent prompts. The coordinator asked for its fix in a follow-up commit.
+
+- **Medium: four incident prompts read every demo session, not their incident's run.** e21c3431 took the scenario out of their prompt 3's filter, a `program_name` that starts with `ContosoCare.Demo/` and the scenario, and put no run in its place: `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`.
+  - **The effect:** each also read the healthy baseline's sessions and those of any incident at the same time, and the showcase runs exactly these with another (`scenarios/activity-profiles.json`): memory-grant-pressure with cpu-pressure on T2, parallel-scans and tempdb-contention with io-pressure, and slow-consumer with locking-blocking on T3. An agent would have reported another run's plans, grants, or waits as the incident's, such as a blocking incident's `LCK_M_*` in the slow client's answer. And memory-grant-pressure's way to judge the answer asked for the run's `run_id`, which none of its prompts read.
+  - **The fix:** each prompt 3 first reads the `run_id` of the scenario's latest row in `demo.scenario_runs`, then reads only that run's sessions: those whose `program_name` starts with `ContosoCare.Demo/` and ends with that `run_id`, as blocking-chain's and locking-blocking's prompt 4 match them. It tells the agent why, since other runs can be active at the same time, and to say so when it can't read the row, instead of reading other sessions. memory-grant-pressure's prompt 4 reads that run's statement, and each file's way to judge the answer says the sessions are the run's.
+  - **slow-consumer by its run, not by its `session_ids`:** the reviewer offered the `session_ids` that its prompt 2 reads. But `demo.usp_run_end` writes them when the run ends, so they're empty while the incident runs, when prompt 3 reads its live sessions; and once the run's sessions close, another session can take one of their IDs.
+  - **Front matter:** memory-grant-pressure and parallel-scans now read the scenario record, so their `dataSources` add `scenario-record`, and their `capability` says they read the run's sessions. Their `permission` stays the other scenario-record prompts'. `reviewed` stays as it was, since it dates a check of the prompt's sources too, which this didn't redo.
+  - **A test,** in `Agent.PromptPack`: a prompt block that names `ContosoCare.Demo/` reads `demo.scenario_runs` and matches a session's name by its end, the run. It fails for exactly the four prompts as e21c3431 left them, and passes with the fix.
+- **The review's live checks,** which the coordinator gives to Final tests, beside the entry above's:
+  - the past-deadline kill, `EXEC demo.usp_kill_demo_sessions;` with its defaults, on T1 to T3, with a session of each name form and a run past its deadline, and no collation conflict (Msg 468) between `program_name` and `run_id`;
+  - T4's, `SELECT * FROM demo.usp_kill_demo_sessions(NULL, true, 'check')`;
+  - the replica's statements through Npgsql, with an empty, a null, and a one-element run list;
+  - an older runner's session, ended by the new runner's watchdog and by reset.
+
+**Changed files.** The four prompts above, `tests/unit/Agent.PromptPack.Tests.ps1`, and this report: the entry above's Readers, and this entry.
+
+**Validation.** On 7c8272ba with this commit:
+
+- **The sweep:** every prompt block that names `ContosoCare.Demo/` reads `demo.scenario_runs` and matches the run: blocking-chain's, locking-blocking's, and the four above.
+- **Pester,** under strict mode with the Azure CLI guard:
+  - `Agent.PromptPack`: 512 passed, none failed, the new test's 40 cases among them. With the four prompts as 7c8272ba has them and the new test copied in, 4 failed, the new test on each of the four prompts, and nothing else.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - The guard saw no Azure CLI call.
+- PSScriptAnalyzer, with the repo's settings for tests, found nothing in the changed test file, which is ASCII-only, and markdownlint found no issue.
+- No runner code or SQL changed, so the runner's tests stand as at e21c3431.
+- The leak check prints nothing.
+
+**What its live check needs.** A presenter's rehearsal, since an agent runs the prompts, not a script: during the showcase, prompt 3 of memory-grant-pressure on T2 while cpu-pressure runs there, and of slow-consumer on T3 while locking-blocking runs, each reading only its own run's sessions.
+
+### Realistic names, unit B: the re-check of e0966579 (2026-11-23)
+
+**Why.** The re-check of e0966579 said to ship it, with one improvement, which the coordinator asked for as a quick commit. The prompts read "the latest" row of `demo.scenario_runs` without saying which column decides. An older runner's run IDs began with their time, so even a sort by `run_id` found the latest run, but the random run IDs of unit B's entry above don't. An agent that sorts by `run_id` would pick any run, find none of its sessions, and could report mid-incident that no grant is waiting.
+
+- **The fix:** every prompt that reads the latest row of `demo.scenario_runs` says it's the latest by `started_at`. That's the four of [the review's entry](#realistic-names-unit-b-the-review-of-e21c3431-2026-11-23), blocking-chain's and locking-blocking's prompt 4, and two more that the guard found, deadlock-storm's and log-flush-waits' reads of the record: ten prompts in eight files. The showcase's and the wrap-up's reads of the record pick their rows by the incident window and by the run concluded on, not the latest, so they stay.
+- **The guard,** in `Agent.PromptPack`: wherever a prompt block that reads `demo.scenario_runs` picks the latest, most recent, or newest row or run, it says `by started_at`. It fails for exactly the eight files as e0966579 left them, and passes with the fix.
+
+**Changed files.** The eight prompts above (`blocking-chain`, `deadlock-storm`, `locking-blocking`, `log-flush-waits`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`), `tests/unit/Agent.PromptPack.Tests.ps1`, and this report.
+
+**Validation.** On e0966579 with this commit:
+
+- **Pester,** under strict mode with the Azure CLI guard:
+  - `Agent.PromptPack`: 552 passed, none failed, the new test's 40 cases among them. With the prompts as e0966579 has them and the new test copied in, 8 failed: the new test on each of the eight files, and nothing else.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - The guard saw no Azure CLI call.
+- PSScriptAnalyzer, with the repo's settings for tests, found nothing in the changed test file, which is ASCII-only, and markdownlint found no issue.
+- The leak check prints nothing.
+
+**What its live check needs.** Nothing new: the rehearsal in the entry above checks the run each prompt picks.
+
+### Realistic names, unit C: the readers and the docs (2026-11-23)
+
+**Why.** Unit C of ADR 0031's decision 6, which the owner approved on 2026-11-23: what reads the workload's names, besides the code. It was built from the design's tables on the shared base (59d9dfb7) and checked against units A's and B's heads (186dfccb and d53e62d0). Two commits after the base: the change, and its docs following A's and B's review fixes.
+
+- **The RCA fixtures carry the new module names.** Only their string dictionaries change, so every row, index, and fact stays:
+  - **T1's document:** `[scheduling].[usp_assign_work_item]`, the head blocker, whose last call is now `scheduling.usp_assign_work_item;1`; `[scheduling].[usp_route_work_item]`; `[scheduling].[usp_bulk_reschedule]`; and `[frontdesk].[usp_process_requests]`.
+  - **T4's document:** `billing.usp_reprioritize_queue` and `billing.usp_claim_work_item`, with their top-level statements.
+  - **The transport forms, regenerated:** each document's compact JSON, as the runner wrote it in the committed parts, with the same renames, was checked equal to the edited document. It was then gzipped at `SmallestSize` and cut into 2,400-byte parts, as `PartCodec` does, and each document still has 2 parts. `rca-evidence.parameter.json` and `metrics-bundle.json` carry the new lines, and `export-index.json` and `metrics-rca-member.json` the new SHA-256s.
+  - **The run IDs and their tokens stay,** as the coordinator settled with unit B: `RcaSimulation`'s application names keep their run segments, which `RcaExportTests` binds to the fixtures' tokens, and an older runner's run ID is still a valid one. The fixtures' README says so.
+- **The runner's RCA tests:** `RcaSimulation` and `RcaObserverTests` give and expect the new module names, input buffer, and Extended Events statements. Their synthetic deadlock frame is `supply.usp_transfer_stock`, since `demo` now keeps only the control plane.
+- **The app:** the evaluation set's `mustContain` for P01, P02, and P04, and the rules', postmortem's, Root cause view's, and Mission Control's tests. The preview's T4 evidence, `pg-local.evidence.json`, a real capture, has its four module strings renamed in place, and its code comment says so. The preview's sample finding names a service.
+- **The docs:**
+  - **`scenarios/`:** every scenario page's sessions and procedures; every `scenario.json`'s prose, never its `procedure` line, which is unit A's; and the scenarios README, with a new rule, **Named as an application's**, and its SSMS example.
+  - **`rca/README.md`'s Names:** the observer drops the service with the run segment. It said that it would keep a per-service name, which decision 6 leaves for later. Its deadlock example names `[supply].[usp_transfer_stock]`.
+  - **The ADRs:** ADR 0031's §2 and decision 6, now decided, with what changed and what still reads as a demo; ADR 0010's amendment, with the tagging, the schemas, the match by run, and the upgrade; and ADRs 0019 and 0025's tags.
+  - **The rest:** `workload-generator/README.md`; the `database/common`, `database/postgresql`, and `database/cosmosdb` READMEs; `docs/architecture.md`; `docs/security-model.md`; `docs/deployment.md`, with the upgrade's row and the schemas; `docs/demo-walkthrough.md`, whose cheat sheet now names each scenario's service, so a presenter can tell whose sessions are whose; the report spec's option D; and the CHANGELOG.
+  - **Left as history:** earlier CHANGELOG entries, this report's earlier entries, and ADR 0010's dated phase notes, which name the tags and procedures as they were then.
+- **Rerunnable** (the coordinator asked for it, since the Query Store work adds fixtures that still name the earlier modules, such as `t3-plan-regression.sidecar.json`'s `[demo].[usp_visit_summary_lookup]`):
+  - **`./tests/Update-RcaFixtures.ps1 -RenameWorkloadModules -Path <files>`** renames every retired module name in the fixture documents and in the files given, with the design's 33 old and new pairs. It then writes the part lines of each document whose parts no longer decode to it, evidence and sidecar alike, and puts the new lines and SHA-256 in the other fixture files. A second run changes nothing.
+  - **Checked both ways:** from the base, it reproduces this commit's fixtures byte for byte, SHA-256s included. On the Query Store branch's dabe263c, it renamed the plan-regression sidecar, wrote its part again, and updated `sidecar-index.json` and `rca-sidecar.parameter.json`, and that branch's own `Rca.Contract` passed, 59 tests.
+  - **A new contract test,** in `Rca.Contract.Tests.ps1`, fails while a fixture, an app RCA test or its data, the preview's data, or a runner `Rca*` test names a retired module. It fails at the base and passes here.
+- **Honest detection holds:** no detection file changed. The evaluation set's questions still name no scenario; its `mustContain` names the modules a DBA reads, and only its `key` names a scenario, for grading.
+
+**Changed files.** In `rca/fixtures/`: both documents and their parts, `rca-evidence.parameter.json`, `metrics-bundle.json`, `metrics-rca-member.json`, `export-index.json`, and the README; and `rca/README.md`. In the runner's tests, `RcaSimulation.cs` and `RcaObserverTests.cs`. In `fabric/app/src`: `rca/testdata/eval-set.ts`, `rca/rules.test.ts`, `rca/postmortem.test.ts`, `rca/view/rca-view.test.tsx`, `pages/mission.test.tsx`, `lib/mission.test.ts`, `preview/data/pg-local.evidence.json`, `preview/sample-data.ts`, and `preview/sample-rca.ts`, a comment. Every scenario README, every `scenario.json`'s prose, and `scenarios/README.md`. The docs above, `CHANGELOG.md`, and this entry. New: `tests/Update-RcaFixtures.ps1`, and one test in `tests/unit/Rca.Contract.Tests.ps1`.
+
+**Validation.** On 59d9dfb7 with these commits, on this PC (ARM64, with a .NET 10.0.403 SDK and an npm cache in the session's own folder):
+
+- **The runner's tests:** 808, of which 787 passed, 21 were skipped, and none failed. The skipped ones are the integration tests, which need a disposable SQL Server or PostgreSQL server.
+- **The app's suites that read what changed,** in one process with one worker, as the coordinator asked until 2 PM: 13 files and 281 tests, all passed.
+- **Pester,** under strict mode, with the Azure CLI guard, none failing:
+  - `Rca.Contract`, whose 31 include the fixtures' blind checks, their parts' decode, and the new test of retired names, with the doc suites `Repo.Conventions` (every relative link and fragment), `Repo.NeutralWording`, and `Docs.Walkthrough`: 225 passed.
+  - The fixtures' other readers, `DbHubDemo.HistorySnapshot`, `Vm.WorkloadSteps`, `Automation.Runbooks`, `Fabric.ControlNotebook`, and `Fabric.Notebooks`: 582 passed and 88 skipped, the notebook cases that need Python with pandas, which this PC lacks.
+- **markdownlint** found no issue, and PSScriptAnalyzer, with the repo's settings, found nothing in `tests/Update-RcaFixtures.ps1` or the changed test file, both ASCII-only.
+- **Merges:** `git merge-tree` of these commits with A's head and with B's head conflicts only at this report's end, where each unit appends its own entry: keep both. `RcaSimulation.cs` and the `scenario.json` files, which A or B change too, merge by hunk.
+- **The leak check** prints nothing.
+
+**Risks.**
+
+- The fixtures' module names postdate their 2026-11-20 session, and their run IDs are in the earlier form; their README says both.
+- A module renamed again in unit A's review means the same rename here: one more pair in `Update-RcaFixtures.ps1`'s table and in the contract test's list, then the script. The Query Store session's fixtures and app tests take the script as they are, whichever branch lands second.
+- The docs describe A's and B's behavior as of their heads above: the refusal `out-of-step`, which on T4 also covers a step the runner's role can't run yet; setup's drops; the match by run; and the prompts that read an incident's sessions by its run. A review that changes one changes its sentence here.
+
+**What its live check needs.** Nothing of its own: the fixtures and tests are offline. A's and B's live round shows what the docs describe: Database Hub's sessions as `ContosoCare.Demo/<service>/<run>`, Query Store's modules in the application schemas, and the cheat sheet's services matching what Database Hub shows.
+
+### Realistic names, unit C: the review of 25df4696 (2026-11-23)
+
+**Why.** The review of 25df4696 and 2c1d2411 was **ship with fixes**. 2c1d2411 had already fixed the four doc contradictions it found, and its High concerns the merge into the release, which unit A resolves. The coordinator asked for the other three fixes on 2c1d2411, in one commit.
+
+- **Medium: the rename tool half-renamed the forms it didn't know, and succeeded.** Its bare-name fallback renamed an old name inside a qualified one and kept `demo` as the schema:
+  - `\\[demo\\]\\.\\[usp_scenario_chain_acquire\\]`, the evaluation set's form, became `\\[demo\\]\\.\\[usp_assign_work_item\\]`;
+  - `"demo"."usp_scenario_cpu_pressure"` became `"demo"."usp_find_double_bookings"`;
+  - and it didn't see an old name in upper case.
+  - **Now one form renames every name that `demo` qualifies,** whatever quotes, brackets, backticks, backslashes, or spaces stand around its dot, to its new schema and name. The bare form takes only a name that nothing qualifies, and both match in any case.
+  - **And it stops, before writing anything,** naming the file and the text, when an old name is left, qualified some other way, or a new name is still qualified by `demo`, half renamed by hand.
+- **Low: a run that stopped left a state the tool couldn't repair.** It wrote each document's parts as it went, so when a later document's part count changed, the earlier documents' parts were already written while their indexes and parameters kept the old lines and SHA-256, and a rerun found those documents unchanged. Now it plans every rename, part, and reference in memory, and checks every document: its part count, and that its new parts decode to it. Only then does it write.
+- **Low: the contract test** scans all of `fabric/app/src`, not only `rca` and `preview`, and matches in any case. It's clean today.
+- **Tests:** `tests/unit/Rca.UpdateFixtures.Tests.ps1`, new, runs the tool on copies of the fixtures under `TestDrive`, through its new `-RepositoryRoot`:
+  - the two forms the review found, with eight more, in any case;
+  - five ways it stops, each writing nothing, though a fixture and another file held names it would have renamed;
+  - a scenario.json's procedure line, left as it is;
+  - `-Path` without `-RenameWorkloadModules`, which it refuses;
+  - and a part count that would change. That run writes nothing; once the change is undone, the next run writes every part, index, and parameter, and a run after it changes nothing.
+
+**Changed files.** `tests/Update-RcaFixtures.ps1`; `tests/unit/Rca.UpdateFixtures.Tests.ps1`, new; `tests/unit/Rca.Contract.Tests.ps1`; `rca/fixtures/README.md`; and this entry.
+
+**Validation.** On 2c1d2411 with this commit:
+
+- **Pester,** under strict mode, with the Azure CLI guard: `Rca.UpdateFixtures` and `Rca.Contract`, 40 passed, none failed.
+- **Each new test fails without its fix:** four mutations of the tool each fail the tests aimed at them:
+  - without the two checks for what's left, the five tests of where it stops;
+  - matching only in lower case, the forms test and the upper-case stop;
+  - the earlier bare form, the stop for an old name that another schema qualifies;
+  - writing each document's parts as it goes, the part-count test.
+- **The widened contract test** fails on an upper-case old name in `fabric/app/src/lib`, outside the two folders it scanned before.
+- **On this branch,** the tool changes nothing.
+- **On the Query Store branch's aafee3e2,** it renamed 42 names: 10 in its 3 fixture documents, 18 in 7 app files, and 14 in 2 runner tests. It wrote the parts of the T1, T4, and T3 sidecar documents again, and put the new lines and SHA-256s in its indexes and parameters. No old name was left there in any case, a second run changed nothing, and that branch's own `Rca.Contract` passed: 63 tests.
+- **Static checks:** `Repo.Conventions` and `Repo.NeutralWording`, under strict mode with the Azure CLI guard, passed: 126 tests. PSScriptAnalyzer, with the repo's settings, found nothing in the three PowerShell files, which are ASCII-only, and markdownlint found no issue. The leak check prints nothing.
+
+**Risks.** None new. Unchanged: a part count that would change still needs its indexes, parameters, and messages edited by hand, which the tool now refuses before it writes anything.
+
+### Realistic names: merged with the RCA release, and plan-regression's stored text (2026-11-23)
+
+**Why.** Wednesday's release takes the names as one branch, `marcbushong-microsoft-names-integration`: units A, B, and C merged onto the RCA release. The release's checked switch for plan-regression (F26) came with the old names and wording, after unit A had made every stored module neutral.
+
+- **The merge's resolutions** (0bf5d4cd, onto the release's 32a2dcac; the release's later heads merged with no conflict):
+  - **`120-scenario-procedures.sql`:** the release's checked switch, without `@quiet_until`, under unit A's names. Its retry block, which merged with no conflict marker, ran the dropped `demo.usp_visit_summary_lookup`; it runs `frontdesk.usp_visit_summary` now.
+  - **The release's test,** `SqlScriptTests.PlanRegressionsSwitchIsQuietCheckedAndTriedAgainBounded`, reads `frontdesk.usp_refresh_visit_summaries`.
+  - **Eight docs** keep the release's text with the renames, and the walkthrough's cheat sheet keeps its service column. `Agent.PromptPack.Tests.ps1` keeps both sides.
+- **Unit C's review fixes** (517db85c, re-checked ship) merged with a conflict only at this report's end, where both entries stay. Their contract test, which now reads all of `fabric/app/src`, passes with the release's app files: none names a retired module.
+- **The stored text no longer narrates the fault** (the resolution re-check's one Low). SQL Server stores the procedure's whole body, where a DBA or Database Agents reads it in `sys.sql_modules`, and the release's comments and event details there said "plan A", "plan B", "the regression runs", "ran and was corrected", and "didn't start". The RCA strips comments and literals, so its evidence wasn't affected.
+  - **The comments:** their explanations moved to the header above the `GO`, which isn't stored. The body's comments say "attempt", "the seek plan", and "the scan plan".
+  - **The event details say what the check read:** "The lookup's cached plan scans care.appointments (attempt 1 of 3).", "... still seeks ix_appointments_patient after 3 attempts. The next run tries again.", or "... couldn't be read: ...".
+  - **The event names stay:** `plan-switch`, `plan-switch-retry`, and `plan-switch-unverified`. The control notebook reads the last, and ADR 0031 leaves event names to a follow-up.
+  - **The test:** `SqlScriptTests.NoStoredModuleNamesAScenario` also refuses "regression", "plan A" or "plan B", "corrected", and "didn't start" in every stored module. It failed on 0bf5d4cd's text, at "the regression runs", and passes here. PostgreSQL's function bodies have none of these words.
+
+**Changed files.** `database/common/120-scenario-procedures.sql`, `workload-generator/tests/ContosoCare.Workload.Tests/SqlScriptTests.cs`, and this report.
+
+**Validation.** Before 2 PM, targeted, one suite at a time, as the coordinator asked:
+
+- **The runner's tests that read the script:** `SqlScriptTests`, 33 passed, with ScriptDom's parse of every script; `CatalogTests`, 160 passed; `RcaBlindTests`, 4 passed. `SqlIntegrationTests`' 19 were skipped: they need a disposable SQL Server.
+- **After unit C's fixes merged,** Pester under strict mode with the Azure CLI guard: `Rca.Contract`, 31 passed, and `Rca.UpdateFixtures`, 9 passed. PSScriptAnalyzer, with the repo's settings for each file, found nothing in their three scripts.
+- **markdownlint** found no issue in this report, and the leak check prints nothing.
+
+**Risks.** The details' new words reach `demo.scenario_run_events` only, and nothing parses them: the control notebook reads the event's name, and the plan-regression README and the troubleshooting page say what the events mean, not their words.
+
+**What its live check needs.** T3's plan-regression run in Wednesday's proof: its `plan-switch` event reads as above, and `sp_helptext 'frontdesk.usp_refresh_visit_summaries'` shows none of the header.

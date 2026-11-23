@@ -2,9 +2,10 @@
   "$schema": "../scenario.schema.json",
   "id": "log-flush-waits",
   "title": "Log flush waits",
+  "service": "checkin-kiosk",
   "summary": "Commit-heavy singleton inserts: every session inserts one small row per transaction into demo.commit_scratch, so every commit waits for its log flush (WRITELOG). Each session deletes its rows every 1,000 inserts, so the table stays small, and stops after maxRows commits, at the deadline, or on a stop request. Business data is never touched.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_commit_flood",
+  "procedure": "frontdesk.usp_log_checkin",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
   "concurrency": { "default": 8, "min": 1, "max": 16, "description": "Sessions committing at once; more sessions mean more commits waiting on each log flush." },
   "intensity": { "default": 10, "min": 1, "max": 10, "description": "Commit pace: a pause of about 200 ms after every 20 commits at 1, none at 10." },
@@ -32,7 +33,7 @@
   ],
   "queryLevelEvidence": [
     "sys.dm_io_virtual_file_stats for the log file: writes and write stall (needs VIEW SERVER STATE)",
-    "sys.dm_exec_requests: wait_type WRITELOG on the ContosoCare.Demo/log-flush-waits sessions"
+    "sys.dm_exec_requests: wait_type WRITELOG on the ContosoCare.Demo/checkin-kiosk sessions"
   ],
   "reset": "Each session deletes its rows when it ends; auto-cleanup and reset truncate demo.commit_scratch. Business data is never touched."
 }
