@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { COSMOS_METRICS, POSTGRES_METRICS, type Bin, type PostgresCapture } from "@/data/model";
-import { describeEpisode, detect, episodesFromBins, findEpisodes, levelOf, RULES, type Sample } from "./detector";
+import { describeEpisode, detect, episodesFromBins, farTimeMs, findEpisodes, levelOf, RULES, type Sample } from "./detector";
 import { monitorTelemetry } from "./sources";
 import { answerKeyOf, fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { emptyEvidence, pointKey } from "./types";
@@ -15,6 +15,26 @@ function cpuBins(cpu: (minute: number) => number | null): Bin[] {
     return Array.from({ length: 56 }, (_, i) => ({ at: m(i), target: "T3", cpu: cpu(i), blocked: 0, lockWaitS: 0, bufferIoS: 0, logRateS: 0, waitS: 0, ioMb: 0, batch: 0, sessions: 0 }));
 }
 const cpuOf = (bins: Bin[]) => episodesFromBins(bins).filter((e) => e.family === "cpu");
+
+// The Root cause page's severity (facets.ts) reads how long an episode stayed at its far mark (the owner's feedback,
+// 2026-11-23), measured here from the samples the detector already reads.
+describe("the time an episode spent far over its level", () => {
+    const s = (minute: number, value: number | null): Sample => ({ at: m(minute), value });
+
+    it("counts each sample at the far mark until the next one, so waves count each time, and an unknown sample nothing", () => {
+        // At 4 or more at 0, 2, 3, and 5 (one step past the last); under at 1; unknown at 4.
+        expect(farTimeMs([s(0, 7), s(1, 2), s(2, 7), s(3, 6), s(4, null), s(5, 5)], 0, 5, 4, MIN)).toBe(4 * MIN);
+        // A gap where the capture stopped counts two steps at most.
+        expect(farTimeMs([s(0, 7), s(30, 7)], 0, 0, 4, MIN)).toBe(2 * MIN);
+        expect(farTimeMs([s(0, 3), s(1, 3)], 0, 1, 4, MIN)).toBe(0);
+    });
+
+    it("is each episode's own: a chain that re-formed every other minute for 10 minutes was far for 5", () => {
+        const bins: Bin[] = Array.from({ length: 30 }, (_, i) => ({ at: m(i), target: "T1", cpu: 10, blocked: i >= 10 && i < 20 ? (i % 2 === 0 ? 7 : 2) : 0, lockWaitS: 0, bufferIoS: 0, logRateS: 0, waitS: 0, ioMb: 0, batch: 0, sessions: 0 }));
+        const [chain] = episodesFromBins(bins).filter((e) => e.family === "blocking");
+        expect(chain).toMatchObject({ start: m(10), end: m(20), peak: 7, farMs: 5 * MIN });
+    });
+});
 
 describe("the blind detector's rule", () => {
     it("finds the regression Wave 1 missed on dbhubfn's session 81446b84: bins at 65.95 % with empty bins between them", () => {

@@ -1,8 +1,25 @@
 // What the Root cause view reads off an investigation's result (ADR 0031), apart from its components.
 
+import type { RcaSeverity } from "../facet-ids";
 import { bothTimes } from "../time";
 import { EXPLAINED_FAMILIES } from "../tools";
 import type { InvestigationResult } from "../types";
+
+/** One incident of find_incidents' list, with its facets. */
+export type ListedIncident = InvestigationResult["episodes"][number];
+
+/** A target's server and its database, as the telemetry names them, for its label. */
+export type ServerNames = Partial<Record<string, { server: string; database?: string | null }>>;
+
+/** "T1 · sqlvm01 / ContosoCare", or the target alone while its names aren't known. */
+export function targetLabel(target: string, names: ServerNames): string {
+    const n = names[target];
+    if (!n?.server) return target;
+    return `${target} · ${n.server}${n.database ? ` / ${n.database}` : ""}`;
+}
+
+/** The longest window the Root cause page reads: wider ones are the chat's, a question at a time. */
+export const MAX_WINDOW_HOURS = 24;
 
 export interface EpisodeFacts {
     key: string;
@@ -14,6 +31,9 @@ export interface EpisodeFacts {
     end: string | null;
     peak: string;
     text?: string;
+    /** Its facets (facets.ts): its severity, and the measurements behind it. */
+    severity?: RcaSeverity;
+    severityReason?: string;
 }
 
 /** The incident explain_incident explained: the first of its episodes. */
@@ -37,13 +57,17 @@ export function errorsWindowNote(errors: InvestigationResult, timeZone: string):
 }
 
 /**
- * The incidents with the richest evidence first, as the Root cause view lists them and the postmortem explains them: the
- * capture's own (a blocking chain, the replica's stall), then the others the investigations explain (errors, throttling),
- * then the telemetry-only ones, each group in time order.
+ * How rich an incident's evidence is: the capture's own (a blocking chain, the replica's stall) first, then the others the
+ * investigations explain (errors, throttling), then the telemetry-only ones.
+ */
+export const evidenceRank = (e: { family: string; source: string }) => (e.source === "the RCA capture" ? 2 : EXPLAINED_FAMILIES.includes(e.family) ? 1 : 0);
+
+/**
+ * The incidents with the richest evidence first (evidenceRank), each group in time order: the order the postmortem explains
+ * them in, and the Root cause page's within a severity.
  */
 export function incidentsByEvidence<E extends { family: string; source: string; start: string }>(episodes: readonly E[]): E[] {
-    const rank = (e: E) => (e.source === "the RCA capture" ? 2 : EXPLAINED_FAMILIES.includes(e.family) ? 1 : 0);
-    return [...episodes].sort((a, b) => rank(b) - rank(a) || a.start.localeCompare(b.start));
+    return [...episodes].sort((a, b) => evidenceRank(b) - evidenceRank(a) || a.start.localeCompare(b.start));
 }
 
 /**

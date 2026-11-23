@@ -3,7 +3,7 @@
 
 .rca-page .rca-layout {
     display: grid;
-    grid-template-columns: minmax(230px, 300px) minmax(0, 1fr);
+    grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
     gap: 16px;
     align-items: start;
 }
@@ -230,6 +230,157 @@
     display: flex;
     flex-wrap: wrap;
     gap: 8px;
+}
+
+/* The list's facets (the owner's feedback, 2026-11-23): one row per facet, each value a toggle with its count. */
+.rca-facets {
+    display: grid;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.rca-facet {
+    display: grid;
+    grid-template-columns: 150px minmax(0, 1fr);
+    align-items: center;
+    gap: 6px 8px;
+}
+
+.rca-facet-values,
+.rca-facet-view {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+}
+
+.rca-facet-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--stage-ink-2);
+}
+
+.rca-facet-view > .rca-facet-name:first-child {
+    min-width: 150px;
+}
+
+@media (max-width: 700px) {
+    .rca-facet {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.rca-facet-chip {
+    gap: 6px;
+}
+
+.rca-count {
+    margin-inline-start: 6px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: var(--stage-ink-2);
+}
+
+.rca-facet-summary {
+    margin: 0;
+    font-size: 13px;
+}
+
+/* Severity: a word and bars, never color alone. */
+.rca-sev {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-inline-end: 6px;
+}
+
+.rca-sev svg {
+    width: 14px;
+    height: 12px;
+}
+
+.rca-sev rect {
+    stroke: currentColor;
+    stroke-width: 1;
+}
+
+.rca-sev rect.on {
+    fill: currentColor;
+}
+
+.rca-sev rect.off {
+    fill: none;
+}
+
+.rca-sev-high {
+    color: var(--stage-alert-ink);
+}
+
+.rca-sev-medium {
+    color: var(--status-warning);
+}
+
+.rca-sev-low {
+    color: var(--stage-ink-2);
+}
+
+.rca-sev-reason {
+    margin: 0 0 8px;
+    font-size: 13px;
+}
+
+/* Each target's mark, as the rest of the app colors it. */
+.rca-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-inline-end: 6px;
+    background: var(--target-t1);
+}
+
+.rca-dot-t2 {
+    background: var(--target-t2);
+}
+
+.rca-dot-t3 {
+    background: var(--target-t3);
+}
+
+.rca-dot-t4 {
+    background: var(--target-t4);
+}
+
+.rca-dot-t4-replica {
+    background: var(--target-t4r);
+}
+
+.rca-dot-t5 {
+    background: var(--target-t5);
+}
+
+.rca-groups {
+    display: grid;
+    gap: 14px;
+}
+
+.rca-group h3 {
+    display: flex;
+    align-items: center;
+    font-size: 13px;
+    font-weight: 600;
+    margin: 0 0 6px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--stage-line);
+}
+
+.rca-episode-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px 4px;
 }
 
 /* Windows forced colors (F22): the stage's marks, a border's color and an inset shadow, give way. The current incident takes
