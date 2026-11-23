@@ -10,9 +10,15 @@ import { useApp } from "@/app-context";
 import { copyText } from "@/lib/clipboard";
 import type { QueryStoreQuery } from "../query-store";
 import { bothTimes } from "../time";
-import type { InvestigationResult } from "../types";
+import { plural, type InvestigationResult } from "../types";
 
 const FIELDS = ["target", "database", "fromUtc", "toUtc", "text"] as const;
+
+/** How many more the tools left out (query-store.ts, QUERY_STORE_QUERIES_MAX), or 0 for anything but a whole number. */
+function leftOutOf(result: InvestigationResult): number {
+    const n = result.details?.queryStoreQueriesLeftOut;
+    return typeof n === "number" && Number.isInteger(n) && n > 0 ? n : 0;
+}
 
 /** The result's queries, each as the tools built it: anything else in its place is left out. */
 function queriesOf(result: InvestigationResult): QueryStoreQuery[] {
@@ -37,6 +43,7 @@ export function QueryStoreQueries({ incident, timeZone }: { incident: Investigat
 
     const queries = queriesOf(incident);
     if (queries.length === 0) return null;
+    const leftOut = leftOutOf(incident);
 
     const copy = async (i: number, q: QueryStoreQuery) => {
         const ok = await copyText(q.text);
@@ -63,6 +70,7 @@ export function QueryStoreQueries({ incident, timeZone }: { incident: Investigat
                     </figure>
                 );
             })}
+            {leftOut > 0 ? <p className="rca-muted rca-query-more">{`${plural(leftOut, "more query", "more queries")} for these minutes ${leftOut === 1 ? "isn't" : "aren't"} shown here: select each incident in the list for its own.`}</p> : null}
         </>
     );
 }

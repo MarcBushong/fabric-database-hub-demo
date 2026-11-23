@@ -120,6 +120,12 @@ export interface QueryStoreQuery {
     text: string;
 }
 
+/**
+ * At most this many queries in one result, the root cause's first, with the others counted (the review of 0b922f37): each
+ * is 2 to 3 KB, and a result cut to fit the chat's answer keeps them.
+ */
+export const QUERY_STORE_QUERIES_MAX = 3;
+
 /** "2026-11-20T15:40:00+00:00": a T-SQL datetimeoffset literal, to the second, in UTC. */
 const tsqlTime = (d: Date) => `${d.toISOString().slice(0, 19)}+00:00`;
 /** "2026-11-20 15:40:00": a PostgreSQL timestamp literal, to the second, UTC, as qs_view's start_time and end_time hold it. */
@@ -127,28 +133,39 @@ const pgTime = (d: Date) => d.toISOString().slice(0, 19).replace("T", " ");
 
 /**
  * The read-only query a DBA runs for the episode's minutes on its target's own Query Store, built only from the episode's
- * measured target, family, and times, never from what the demo planned: the top plans by CPU, then duration, with their
- * plan IDs, on T1 to T3 (and their waits in the episode's wait category, for a wait class); the top queries by total time,
- * then their sampled waits, in azure_sys on T4. An interval counts when it overlaps the minutes, since Query Store keeps
- * them by interval (15 minutes by default). Null where there's no Query Store to read (a read replica, T5), or once the
- * minutes are past its retention (queryStoreAge), as for the next step.
- * Sources: https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-runtime-stats-transact-sql,
+ * measured target, family, and times, never from what the demo planned: on T1 to T3, the top plans by CPU, then duration,
+ * with their plan IDs, and for a wait class the top plans by their wait time in its category; on T4, in azure_sys, the top
+ * queries by total time, then their sampled waits. Each starts with Query Store's state (T1 to T3) or capture modes (T4),
+ * so an empty result reads right, and breaks its ties by IDs (the review of 0b922f37). An interval counts when it overlaps
+ * the minutes, since Query Store keeps them by interval (15 minutes by default). Null where there's no Query Store to read
+ * (a read replica, T5), or once the minutes are past its retention (queryStoreAge), as for the next step.
+ * Sources: https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-database-query-store-options-transact-sql,
+ * https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-runtime-stats-transact-sql,
  * https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-wait-stats-transact-sql,
- * https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store
+ * https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store, and current_setting's missing_ok:
+ * https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SET
  */
 export function queryStoreQuery(e: Pick<Episode, "target" | "family" | "start" | "end" | "last" | "readEnd">, now: Date): QueryStoreQuery | null {
     const age = queryStoreAge(e, now);
     if (!age || !age.kept) return null;
     const from = e.start;
     const to = e.end ?? e.readEnd ?? e.last;
+    // An interval holds the minutes when it ends after their start and starts before their end. An episode's end is the
+    // first sample back under its level, so the interval that starts there holds none of it (the review of 0b922f37: on
+    // 15-minute points, every incident read an interval more). Its last sample at the level, and readEnd, where the
+    // minutes read ended with it still on, are in it, so the interval that starts at either holds some of it.
+    const before = e.end ? "<" : "<=";
     const span = `${fromTo(from, to)} UTC`;
     const fromUtc = from.toISOString().replace(".000Z", "Z");
     const toUtc = to.toISOString().replace(".000Z", "Z");
     if (queryStoreKind(e.target) === "sql") {
         const category = WAIT_CATEGORY[e.family];
-        const window = [
-            `DECLARE @from datetimeoffset = '${tsqlTime(from)}', @to datetimeoffset = '${tsqlTime(to)}';`,
+        const overlap = `i.end_time > @from AND i.start_time ${before} @to`;
+        const state = [
+            "-- Its state first, so an empty result below reads right: READ_WRITE records; READ_ONLY doesn't, and readonly_reason says why.",
+            "SELECT actual_state_desc, readonly_reason FROM sys.database_query_store_options;",
         ];
+        const window = [`DECLARE @from datetimeoffset = '${tsqlTime(from)}', @to datetimeoffset = '${tsqlTime(to)}';`];
         const plans = [
             "SELECT TOP (20)",
             "    q.query_id,",
@@ -165,14 +182,14 @@ export function queryStoreQuery(e: Pick<Episode, "target" | "family" | "start" |
             "JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id",
             "JOIN sys.query_store_query AS q ON q.query_id = p.query_id",
             "JOIN sys.query_store_query_text AS t ON t.query_text_id = q.query_text_id",
-            "WHERE i.end_time > @from AND i.start_time <= @to",
+            `WHERE ${overlap}`,
             "GROUP BY q.query_id, p.plan_id, q.object_id, t.query_sql_text",
-            "ORDER BY cpu_ms DESC, duration_ms DESC;",
+            "ORDER BY cpu_ms DESC, duration_ms DESC, p.plan_id;",
         ];
         const waits = category
             ? [
                   "",
-                  `-- The same plans' waits in the ${category} category.`,
+                  `-- The top plans by their wait time in the ${category} category, in the same intervals.`,
                   "SELECT TOP (20)",
                   "    q.query_id,",
                   "    p.plan_id,",
@@ -184,24 +201,27 @@ export function queryStoreQuery(e: Pick<Episode, "target" | "family" | "start" |
                   "JOIN sys.query_store_plan AS p ON p.plan_id = ws.plan_id",
                   "JOIN sys.query_store_query AS q ON q.query_id = p.query_id",
                   "JOIN sys.query_store_query_text AS t ON t.query_text_id = q.query_text_id",
-                  `WHERE i.end_time > @from AND i.start_time <= @to AND ws.wait_category_desc = N'${category}'`,
+                  `WHERE ${overlap} AND ws.wait_category_desc = N'${category}'`,
                   "GROUP BY q.query_id, p.plan_id, ws.wait_category_desc, t.query_sql_text",
-                  "ORDER BY wait_ms DESC;",
+                  "ORDER BY wait_ms DESC, p.plan_id;",
               ]
             : [];
         const text = [
             `-- Read-only: Query Store's top plans on ${e.target} ${span}, by CPU, then duration, with their plan IDs.`,
             "-- Run it in the ContosoCare database. Query Store keeps them by interval, so the intervals that overlap those minutes count.",
+            ...state,
             ...window,
             ...plans,
             ...waits,
         ].join("\n");
         return { target: e.target, language: "tsql", database: "ContosoCare", fromUtc, toUtc, text };
     }
-    const where = `WHERE q.end_time > '${pgTime(from)}' AND q.start_time <= '${pgTime(to)}'`;
+    const where = (view: "q" | "w") => `WHERE ${view}.end_time > '${pgTime(from)}' AND ${view}.start_time ${before} '${pgTime(to)}'`;
     const text = [
-        `-- Read-only: Query Store's top queries on ${e.target} ${span}, by total time, then their sampled waits.`,
+        `-- Read-only: Query Store's top queries on ${e.target} ${span}, by total time, then their sampled waits, at every size but Burstable.`,
         "-- Run it in the azure_sys database. Its times are the server's, UTC unless its TimeZone was changed, and an interval shows once it has ended.",
+        "-- Its capture modes first, so an empty result below reads right: none records nothing.",
+        "SELECT current_setting('pg_qs.query_capture_mode', true) AS query_capture_mode, current_setting('pgms_wait_sampling.query_capture_mode', true) AS wait_sampling_capture_mode;",
         "SELECT",
         "    q.query_id,",
         "    sum(q.calls) AS calls,",
@@ -212,11 +232,11 @@ export function queryStoreQuery(e: Pick<Episode, "target" | "family" | "start" |
         "    max(q.end_time) AS last_interval_end,",
         "    left(min(q.query_sql_text), 300) AS query_text",
         "FROM query_store.qs_view AS q",
-        where,
+        where("q"),
         "  AND q.db_id = (SELECT oid FROM pg_database WHERE datname = 'contosocare')",
         "  AND NOT q.is_system_query",
         "GROUP BY q.query_id",
-        "ORDER BY total_time_ms DESC",
+        "ORDER BY total_time_ms DESC, q.query_id",
         "LIMIT 20;",
         "",
         "-- Those minutes' sampled waits, by query.",
@@ -226,10 +246,10 @@ export function queryStoreQuery(e: Pick<Episode, "target" | "family" | "start" |
         "    w.event,",
         "    sum(w.calls) AS samples",
         "FROM query_store.pgms_wait_sampling_view AS w",
-        where.replaceAll("q.", "w."),
+        where("w"),
         "  AND w.db_id = (SELECT oid FROM pg_database WHERE datname = 'contosocare')",
         "GROUP BY w.query_id, w.event_type, w.event",
-        "ORDER BY samples DESC",
+        "ORDER BY samples DESC, w.query_id, w.event_type, w.event",
         "LIMIT 20;",
     ].join("\n");
     return { target: e.target, language: "postgresql", database: "azure_sys", fromUtc, toUtc, text };

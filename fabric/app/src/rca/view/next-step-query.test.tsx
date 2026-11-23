@@ -75,6 +75,20 @@ describe("the next steps' Query Store queries", () => {
         expect(screen.getByText("Read-only query of T3's Query Store in ContosoCare, at 10:45 EST (15:45 UTC)")).toBeInTheDocument();
     });
 
+    it("says how many more the tools left out, and nothing for anything but a whole count", () => {
+        renderWithApp(<RcaReport incident={incidentWith({ queryStoreQueries: [t1, t4], queryStoreQueriesLeftOut: 2 })} errors={null} timeZone="UTC" logs={[]} />);
+        expect(within(screen.getByRole("region", { name: "Next steps" })).getByText("2 more queries for these minutes aren't shown here: select each incident in the list for its own.")).toBeInTheDocument();
+        cleanup();
+        renderWithApp(<RcaReport incident={incidentWith({ queryStoreQueries: [t1], queryStoreQueriesLeftOut: 1 })} errors={null} timeZone="UTC" logs={[]} />);
+        expect(screen.getByText("1 more query for these minutes isn't shown here: select each incident in the list for its own.")).toBeInTheDocument();
+        cleanup();
+        for (const leftOut of [0, -1, 1.5, "2", null]) {
+            renderWithApp(<RcaReport incident={incidentWith({ queryStoreQueries: [t1], queryStoreQueriesLeftOut: leftOut })} errors={null} timeZone="UTC" logs={[]} />);
+            expect(screen.queryByText(/ more quer/), String(leftOut)).toBeNull();
+            cleanup();
+        }
+    });
+
     it("asks the viewer to copy it by hand when the browser blocks the clipboard", async () => {
         writeText.mockRejectedValue(new Error("Write permission denied."));
         const execCommand = vi.fn(() => false);
