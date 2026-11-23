@@ -506,13 +506,14 @@ KEPT_ATTEMPTS = 5
 # The days a chunk works out at once, and about how many rows a batch reads (a demo's day of history is about 31,000).
 KEPT_CHUNK_DAYS = 7
 KEPT_BATCH_ROWS = 400_000
-# Delta's exceptions when a concurrent commit conflicts with this one (conflict exceptions:
-# https://learn.microsoft.com/azure/databricks/optimizations/isolation/row-level-concurrency#conflict-exceptions). Under
-# Delta's default WriteSerializable isolation, another run's blind append doesn't conflict with the MERGE: its rows are new
-# and not worked out, so its own run or the next step works them and their neighbors out, and the MERGE's guard keeps a
-# later step's values.
+# Delta's exceptions when a concurrent commit conflicts with this one (Fabric's concurrency control for Delta tables:
+# https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control). Fabric's Delta tables are
+# Serializable, and telemetry_snapshots has no partitions, so a save appended while a step's MERGE runs makes the MERGE fail
+# (ConcurrentAppendException), not the append: the step reads its batch again, with the save's rows where they're in its
+# days, and MERGEs again. A failed transaction writes nothing, so trying it again is safe; the MERGE's guard keeps a later
+# step's values; and rows of the save outside the batch's days stay for its own run's step, or the next one.
 _CONCURRENT_WRITES = ("ConcurrentAppendException", "ConcurrentDeleteReadException", "ConcurrentDeleteDeleteException",
-                      "ConcurrentTransactionException", "MetadataChangedException")
+                      "ConcurrentTransactionException", "ConcurrentWriteException", "MetadataChangedException")
 _DAY_US = 86_400_000_000
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9:._-]{0,199}")
 _TABLE_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}(\.[A-Za-z_][A-Za-z0-9_]{0,127}){0,2}")

@@ -286,6 +286,161 @@ Describe 'Notebook <_>' -ForEach $notebookNames {
         $flagged | Should -BeGreaterThan 0
     }
 
+    It 'saves again, the delete and the append together, after Delta reports a concurrent commit, at most 5 times (F35, needs pandas)' {
+        # Fabric's Delta tables are Serializable (https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control),
+        # and F35's kept-value step MERGEs into telemetry_snapshots and adds its columns while a save may run: its MERGE can
+        # fail a save's DELETE, and its ALTER TABLE a save's append. A failed Delta transaction writes nothing.
+        $python = $pandasPython
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & $python -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath ('save_retry_{0}.py' -f $name)
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, importlib.util, io, json, sys, types
+import pandas as pd
+
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+spark_types = types.ModuleType("pyspark.sql.types")
+for type_name in ("StringType", "BooleanType", "TimestampType", "DoubleType", "LongType", "IntegerType", "DateType"):
+    setattr(spark_types, type_name, type(type_name, (), {}))
+spark_types.StructField = lambda field, kind, nullable: field
+spark_types.StructType = list
+pyspark_sql = types.ModuleType("pyspark.sql")
+pyspark_sql.types = spark_types
+sys.modules.update({"pyspark": types.ModuleType("pyspark"), "pyspark.sql": pyspark_sql, "pyspark.sql.types": spark_types})
+
+code = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+with contextlib.redirect_stdout(io.StringIO()):
+    for cell in code:
+        if cell.startswith(("# Parameters", "# Helpers")):
+            exec(cell, ns)
+sleeps = []
+real_time = ns["time"]
+ns["time"] = types.SimpleNamespace(**{key: getattr(real_time, key) for key in dir(real_time) if not key.startswith("_")})
+ns["time"].sleep = sleeps.append
+spec = importlib.util.spec_from_file_location("kept_value", sys.argv[2])
+kept_value = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(kept_value)
+
+
+class ConcurrentAppendException(Exception):
+    """Delta's errors name their Java exception in their class or in their text."""
+
+
+class Session:
+    """The default lakehouse's telemetry_snapshots with this run's rows, whose delete or append fails as queued."""
+
+    def __init__(self, failures):
+        self.failures, self.log, self.rows = list(failures), [], []
+        self.catalog = types.SimpleNamespace(tableExists=lambda table: True)
+
+    def fail(self, step):
+        if self.failures and self.failures[0][0] == step:
+            self.log.append(step + " failed")
+            error = self.failures.pop(0)[1]
+            raise error if isinstance(error, Exception) else RuntimeError(error)
+
+    def sql(self, statement):
+        assert statement == "DELETE FROM telemetry_snapshots WHERE run_id = '%s'" % ns["RUN_ID"], statement
+        self.fail("delete")
+        self.log.append("delete")
+        self.rows = []
+        return types.SimpleNamespace(collect=lambda: [])
+
+    def createDataFrame(self, data, schema):
+        session = self
+
+        class Writer:
+            def format(self, name):
+                return self
+
+            def mode(self, name):
+                return self
+
+            def option(self, key, value):
+                return self
+
+            def saveAsTable(self, table):
+                session.fail("append")
+                session.log.append("append %d" % len(data))
+                session.rows.extend(data)
+
+        return types.SimpleNamespace(coalesce=lambda count: types.SimpleNamespace(write=Writer()))
+
+
+ROWS = [{"run_id": ns["RUN_ID"], "analysis": "cpu", "target": "T1", "metric": "AvgCPU", "value": float(value), "grain_minutes": 1,
+         "bucket_utc": pd.Timestamp("2026-11-23T14:00:00Z") + pd.Timedelta(minutes=minute)} for minute, value in enumerate((20, 85, 90))]
+MERGE = "[DELTA_CONCURRENT_DELETE_READ] ConcurrentDeleteReadException: This transaction attempted to read one or more files that were deleted by a concurrent update."
+ALTER = "[DELTA_METADATA_CHANGED] MetadataChangedException: The metadata of the Delta table has been changed by a concurrent update."
+OTHER = "[TABLE_OR_VIEW_NOT_FOUND] The table or view `telemetry_snapshots` cannot be found."
+
+
+def run(failures):
+    session = Session(failures)
+    ns.update(_spark=lambda: session, runtime_context=lambda: {"defaultLakehouseId": "lakehouse"})
+    del sleeps[:]
+    printed, error, saved = io.StringIO(), None, None
+    with contextlib.redirect_stdout(printed):
+        try:
+            saved = ns["write_delta"]("telemetry_snapshots", ROWS)
+        except Exception as caught:
+            error = str(caught)
+    return {"saved": saved, "log": session.log, "rows": len(session.rows), "sleeps": len(sleeps),
+            "printed": printed.getvalue().strip().splitlines(), "error": error}
+
+
+print(json.dumps({
+    "first": run([]),
+    "merge": run([("delete", MERGE)]),
+    "alter": run([("append", ALTER)]),
+    "named": run([("append", ConcurrentAppendException("Files were added to the root of the table by a concurrent update."))]),
+    "always": run([("append", ALTER)] * 5),
+    "other": run([("append", OTHER)]),
+    "runId": ns["RUN_ID"],
+    "attempts": ns["SAVE_ATTEMPTS"],
+    "conflicts": list(ns["DELTA_CONFLICTS"]),
+    "stepConflicts": list(kept_value._CONCURRENT_WRITES),
+}))
+'@
+        $output = & $python $script $nb.Path (Join-Path -Path $repoRoot -ChildPath 'fabric/history/kept_value.py') 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+        $saved = 'telemetry_snapshots: saved 3 row(s) for run {0}' -f $report['runId']
+        @($report['first']['log']) | Should -Be @('delete', 'append 3')
+        @($report['first']['printed']) | Should -Be @("$saved.")
+        $report['first']['sleeps'] | Should -Be 0
+        # The step's MERGE fails the save's delete, and its ALTER TABLE the append: either way, both run again, once.
+        @($report['merge']['log']) | Should -Be @('delete failed', 'delete', 'append 3')
+        @($report['alter']['log']) | Should -Be @('delete', 'append failed', 'delete', 'append 3')
+        @($report['named']['log']) | Should -Be @('delete', 'append failed', 'delete', 'append 3')
+        foreach ($case in 'merge', 'alter', 'named') {
+            $report[$case]['saved'] | Should -Be 3 -Because $case
+            $report[$case]['rows'] | Should -Be 3 -Because $case
+            $report[$case]['sleeps'] | Should -Be 1 -Because $case
+            @($report[$case]['printed']) | Should -Be @("$saved, on try 2 after another writer's commit.") -Because $case
+        }
+        # At most SAVE_ATTEMPTS tries, then the last error stops the cell, as any other error does at once.
+        $report['attempts'] | Should -Be 5
+        @($report['always']['log']) | Should -Be @(1..5 | ForEach-Object { 'delete', 'append failed' })
+        $report['always']['sleeps'] | Should -Be 4
+        $report['always']['saved'] | Should -BeNullOrEmpty
+        $report['always']['error'] | Should -Match 'MetadataChangedException'
+        @($report['other']['log']) | Should -Be @('delete', 'append failed')
+        $report['other']['sleeps'] | Should -Be 0
+        $report['other']['error'] | Should -Match 'TABLE_OR_VIEW_NOT_FOUND'
+        # The kept-value step's conflicts (fabric/history/kept_value.py), ConcurrentWriteException among them.
+        @($report['conflicts']) | Should -Be @($report['stepConflicts'])
+        @($report['conflicts']) | Should -Contain 'ConcurrentWriteException'
+    }
+
     It 'sends requests only to documented hosts' {
         $allowed = '^(api\.fabric\.microsoft\.com|adx\.centralus\.arcdataservices\.com|api\.github\.com|github\.com|docs\.github\.com|powerbi\.com|dataexplorer\.azure\.com|learn\.microsoft\.com|kusto\.kusto\.windows\.net|.+\.vault\\?\.azure\\?\.net)$'
         foreach ($url in [regex]::Matches($allCode, 'https://([^/"''\s:]+)')) {
