@@ -4352,6 +4352,13 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 
 **Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `DbHubDemo.Validation`, `Vm.WorkloadSteps`, and `DbHubDemo.Workload` (216), with the suites that load the relay, the bundle, or the control (`Vm.Loader`, `Vm.Compatibility`, `Vm.Workload`, `Automation.Runbooks`, `DbHubDemo.ActivityControl`, `ActivityProfile`, `Lifecycle`, and `Golden`) and the `Repo` and `Docs` conventions: 1,330 passed, none failed; no unit test reached the Azure CLI. PSScriptAnalyzer (the VM settings for the relay) found nothing in the changed files, and markdownlint no issue. The relay's bounds checked under Windows PowerShell 5.1 too (a single running run stays an array, and an empty list is `[]`). The new cases fail without the change. No live run: next week's `validate.ps1` during a session shows it.
 
+**Live evidence, on code without this fix (2026-11-22).** The final tests found the same **Warnings** again, and the coordinator asked for the cause and when the release shows them:
+
+- **When:** every `validate.ps1` of a running demo in the final tests, four from 2026-11-20 to 22 on code without this fix (two of the release's own commits and two of the RCA branch's), had all five `WORKLOAD.<target>.BOUNDS` as this **Warning**, and none had a **Pass**. The seven of a stopped demo had none: with its VMs stopped, the check doesn't run. `deploy.ps1` doesn't run it either (22 runs' results). So on the release, every `validate.ps1` of a running demo shows the five **Warnings** once a target's status lists two or more runs, which a deploy's interim baseline and its switch to business-day already make.
+- **The cause is this section's:** the relay's tail of 1,800 characters, under the Run Command's 4,096 bytes that the message names.
+- **It fits with this fix:** each target's kept tail and profile from the last of those runs, with its one or two running runs, make this relay's line 2,539 to 2,746 characters with the bounds, measured with `Get-DemoControlResultLine` on Windows PowerShell 5.1, as on the VMs; the budget is 3,900, so none would be cut. The whole-output parse the bounds share with the profile read the profile live from all five statuses.
+- **Still the live proof:** `validate.ps1` during a session, once the update's `deploy.ps1` has sent the VMs this relay.
+
 **Risks.** A VM keeps its older relay until its next `deploy.ps1`; until then, the check is the **Warning** it was. Five running runs with the longest messages leave the bounds out (`boundsCut`), also a **Warning**.
 
 ### A Ready VM's Warning names its step (F24, 2026-11-20)
