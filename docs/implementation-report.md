@@ -7472,6 +7472,17 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **What its live check needs.** The deployed app in dark: press **All findings** on the Overview page and an icon-only button such as a table's Copy; and the Readiness page's **Open** and the Links page's **Open in Fabric** in light and dark.
 
+### The re-check of 62e5a18f: a shared link's incident (2026-11-23)
+
+**Why.** The re-check said SHIP, with one Low older than 62e5a18f: a shared `#/rca` link without an incident still opened on the recipient's saved incident, because `openView` reset only the filters from the address. A saved older window key, `T1.<from>.<to>`, also became the recipient's filters, since the Root cause page reads such a key's target and minutes as filters when the address has none.
+
+- **The fix:** when the address names the Root cause page, `openView` takes its incident from the address too, and none when it has none. Other pages keep the saved incident under the address, as before.
+- **The test,** in `lib/app.test.ts`: a link with no incident opens with none and the page's default filters; one with filters keeps them and still opens with no incident; an incident in the path or in `i=` is the one it opens; a saved older window key goes too; the Incidents page keeps the saved incident.
+
+**Changed files.** `fabric/app/src/lib/view-state.ts` (`openView`), the test `lib/app.test.ts`, ADR 0031, and this report.
+
+**Validation.** Targeted: `lib/app.test.ts` and the Root cause view's three suites (`app-rca`, `rca-retry`, `rca-view`) passed, 57 tests, and the new test fails with 96bf9ff7's `openView`. The typecheck and eslint are clean, markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+
 ### The RCA release: the Incident RCA merged onto the release's follow-ups (2026-11-23)
 
 **Why.** The owner wants the releases after the Ignite release out as soon as possible: the release's follow-ups first (PR #67), then the Incident RCA. This branch is the RCA release: the RCA line merged onto the follow-ups, proven live by Final tests before it merges, right after the follow-ups.

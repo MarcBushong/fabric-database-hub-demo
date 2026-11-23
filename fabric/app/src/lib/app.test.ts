@@ -476,6 +476,22 @@ describe("view state", () => {
         // Another page keeps the saved view under its address, as before.
         expect(openView(saved, parseHash("#/mission")).rcaFilters?.severities).toEqual(["high"]);
     });
+
+    // The re-check of 62e5a18f: a link without an incident opened on the recipient's saved one, and a saved older window
+    // key became their filters (RcaPage reads a window key's target and minutes as filters when the address has none).
+    it("opens the Root cause page on its address's incident alone, never the browser's saved one", () => {
+        const saved = parseHash("#/rca/T1-blocking-20261117T140230Z?sev=high");
+        expect(saved.incident).toBe("T1-blocking-20261117T140230Z");
+        expect(openView(saved, parseHash("#/rca"))).toMatchObject({ page: "rca", incident: null, rcaFilters: null });
+        expect(openView(saved, parseHash("#/rca?sev=low"))).toMatchObject({ incident: null, rcaFilters: { severities: ["low"] } });
+        expect(openView(saved, parseHash("#/rca/T3-cpu-20261120T170400Z")).incident).toBe("T3-cpu-20261120T170400Z");
+        expect(openView(saved, parseHash("#/rca?i=T3-cpu-20261120T170400Z")).incident).toBe("T3-cpu-20261120T170400Z");
+        const olderKey = parseHash("#/rca/T1.20261117T140000Z.20261117T153000Z");
+        expect(olderKey.incident).toBe("T1.20261117T140000Z.20261117T153000Z");
+        expect(openView(olderKey, parseHash("#/rca"))).toMatchObject({ incident: null, rcaFilters: null });
+        // Another page keeps the saved incident under its address, as before.
+        expect(openView(saved, parseHash("#/incidents")).incident).toBe("T1-blocking-20261117T140230Z");
+    });
 });
 
 describe("Ask Copilot's context", () => {
