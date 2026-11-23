@@ -844,6 +844,14 @@ function Get-DemoOwnerGrantNote {
     if ($stopRole.Count -eq 0 -and $controlRoles.Count -eq 0) {
         return [pscustomobject]@{ Text = ''; SessionWaits = $false; StopCovered = $false }
     }
+    # An operator role that lacks only its network join actions (2026-11-23): Run all runs a whole session, and only T4's
+    # read replica waits for the grant, where Azure checks those joins.
+    $joinOnly = {
+        param($Item)
+        $lacking = @(Get-DemoActivityControlList -InputObject (Get-DemoMemberValue -InputObject $Item -Name 'evidence') -Name 'lacking')
+        [string]$Item.checkId -eq 'CONTROL.ROLE.DEFINITION' -and $lacking.Count -gt 0 -and @($lacking | Where-Object { [string]$_ -notlike 'Microsoft.Network/*' }).Count -eq 0
+    }
+    $sessionRoles = @($controlRoles | Where-Object { -not (& $joinOnly $_) })
     $command = if ($stopRole.Count) { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $stopRole[0] -Name 'evidence') -Name 'command') } else { '' }
     if (-not $command) {
         $source = @($stopRole) + @($controlRoles) | Select-Object -First 1
@@ -853,8 +861,11 @@ function Get-DemoOwnerGrantNote {
         $command = Get-DemoSafetyStopCommand
     }
     $waits = [System.Collections.Generic.List[string]]::new()
-    if ($controlRoles.Count) {
+    if ($sessionRoles.Count) {
         $waits.Add('Run all can''t run a whole session (from a PC, ./scripts/start-demo.ps1 works)')
+    }
+    elseif ($controlRoles.Count) {
+        $waits.Add('Run all can''t create T4''s read replica where Azure checks that it may join T4''s subnet, as in West Central US (from a PC, ./scripts/start-demo.ps1 creates it)')
     }
     if ($stopRole.Count) {
         $waits.Add('nothing stops T4 when Azure starts it again 7 days after a stop')
@@ -865,7 +876,7 @@ function Get-DemoOwnerGrantNote {
     }
     $list = if ($waits.Count -le 2) { $waits -join ' and ' } else { '{0}, and {1}' -f ($waits[0..($waits.Count - 2)] -join ', '), $waits[-1] }
     $text = 'First, once: an Owner of the subscription runs {0}, which grants the nightly safety stop''s and the session control''s roles. Until then, {1}.' -f $command, $list
-    return [pscustomobject]@{ Text = $text; SessionWaits = [bool]$controlRoles.Count; StopCovered = [bool]$stopRole.Count }
+    return [pscustomobject]@{ Text = $text; SessionWaits = [bool]$sessionRoles.Count; StopCovered = [bool]$stopRole.Count }
 }
 
 function Get-DemoT4OffReason {

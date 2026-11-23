@@ -11,8 +11,14 @@
 #   it's a read replica).
 # - flexibleServers/configurations/write: the replica's max_standby_streaming_delay; it could change any server
 #   parameter of T4 or the replica.
-# - No network join action: the replica's create names T4's delegated subnet and private DNS zone, and Azure created it
-#   without virtualNetworks/subnets/join/action or privateDnsZones/join/action (live, 2026-11-14), so neither is granted.
+# - Microsoft.Network/virtualNetworks/subnets/join/action and Microsoft.Network/privateDnsZones/join/action (2026-11-23,
+#   approved for the owner by the coordinator, reversing R846): the replica's create names T4's delegated subnet and
+#   private DNS zone. Azure created it without them on 2026-11-14, and still did in West US 3 on 2026-11-23, but that day
+#   in West Central US it refused the create (LinkedResourceAccessDenied on the subnet's join), and it names only the first
+#   linked resource it refuses, so both are granted. At the demo resource group, they let a server the identity creates, a
+#   PostgreSQL flexible server, the only resource it can create that joins a network, join snet-pg, the only subnet there
+#   delegated to PostgreSQL, and use T4's private DNS zone, the only PostgreSQL zone there.
+#   https://learn.microsoft.com/azure/virtual-network/virtual-network-manage-subnet#permissions
 # - Microsoft.Insights/metrics/read: T4's and the replica's Azure Monitor metrics for the history; read-only. Since
 #   2026-11-18 it reads T5's (ADR 0027) too, at the same demo resource group: no new action.
 # - Microsoft.Resources/tags/write: the busy marker and the session's ID on the demo resource group (the safety stop
@@ -45,6 +51,8 @@ $script:ActivityControlRoleActions = @(
     'Microsoft.DBforPostgreSQL/flexibleServers/write'
     'Microsoft.DBforPostgreSQL/flexibleServers/delete'
     'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'
+    'Microsoft.Network/virtualNetworks/subnets/join/action'
+    'Microsoft.Network/privateDnsZones/join/action'
     'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
     'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'
     'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete'
@@ -76,6 +84,8 @@ $script:ActivityControlActionReach = [ordered]@{
     'Microsoft.DBforPostgreSQL/flexibleServers/write'                      = 'creates T4''s read replica; it could also change T4, which the runbook never does'
     'Microsoft.DBforPostgreSQL/flexibleServers/delete'                     = 'deletes T4''s read replica after a session; it could also delete T4, which the runbook never does (it deletes only a server whose replicationRole says it''s a read replica)'
     'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'       = 'sets the replica''s max_standby_streaming_delay; it could change any server parameter of T4 or the replica'
+    'Microsoft.Network/virtualNetworks/subnets/join/action'                = 'puts the read replica in T4''s delegated subnet; it could put a PostgreSQL server it creates in snet-pg, the only subnet in the demo resource group delegated to PostgreSQL, and joins nothing else'
+    'Microsoft.Network/privateDnsZones/join/action'                        = 'gives the read replica T4''s private DNS zone; it could give a PostgreSQL server it creates any private DNS zone in the demo resource group, where T4''s is the only PostgreSQL zone'
     'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'   = 'reads whether T5''s container is there; it could read any Azure Cosmos DB container''s settings in the demo resource group, where T5''s account is the only account, never its documents'
     'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'  = 'creates T5''s container for a session, so its throughput bills only then; it could change any container in the demo resource group, which the runbook never does (it creates contosocare/patient-events only)'
     'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete' = 'deletes T5''s container after a session; it could delete any container in the demo resource group, which the runbook never does (it deletes contosocare/patient-events only); nothing of the account, its keys, its network, or its data plane'
@@ -283,6 +293,33 @@ function Get-DemoActivityControlTag {
         }
     }
     return $tags
+}
+
+function Get-DemoActivityControlLackingText {
+    <#
+    .SYNOPSIS
+    What a session can't do while the operator role lacks the given approved actions, as a clause that follows "so": the
+    session's PostgreSQL, metrics, and tag actions (from 2026-11-14), T5's container actions (2026-11-19), or only the network
+    join actions that T4's read replica needs where Azure checks them (2026-11-23). Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [string[]] $Lacking = @()
+    )
+
+    $without = [System.Collections.Generic.List[string]]::new()
+    if (@($Lacking | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' -and $_ -notlike 'Microsoft.Network/*' }).Count -gt 0) {
+        $without.Add('a session in the control notebook runs without T4''s read replica, the busy marker, or the history''s metrics')
+    }
+    elseif (@($Lacking | Where-Object { $_ -like 'Microsoft.Network/*' }).Count -gt 0) {
+        $without.Add('Run all can''t create T4''s read replica where Azure checks that it may join T4''s subnet and private DNS zone, as in West Central US since 2026-11-23: a session there runs without it, and Database Hub''s Read replica lag stays empty')
+    }
+    if (@($Lacking | Where-Object { $_ -like 'Microsoft.DocumentDB/*' }).Count -gt 0) {
+        $without.Add('T5''s container can''t exist only during a session: it stays between sessions, and its throughput keeps billing')
+    }
+    return ($without -join '; and ')
 }
 
 function Get-DemoActivityControlRoleDefinition {
@@ -1150,7 +1187,19 @@ function Grant-DemoActivityControlRole {
                 continue
             }
             if (-not $canDefine) {
-                $results.Add((& $manual $checkId ('The custom role "{0}" {1}, and writing it needs Microsoft.Authorization/roleDefinitions/write, which the signed-in caller doesn''t have.' -f $roleName, $(if ($roleIds[$kind]) { 'lacks some of its approved actions' } else { 'doesn''t exist yet' })) $evidence))
+                # What it lacks, and for the operator role what a session can't do until an Owner writes it (2026-11-23:
+                # an update that adds actions, by someone who isn't an Owner, is never a silent skip).
+                $why = 'doesn''t exist yet'
+                $until = ''
+                if ($roleIds[$kind]) {
+                    $lacking = @($actions | Where-Object { $_ -cnotin $current })
+                    $evidence['lacking'] = $lacking
+                    $why = if ($lacking.Count) { 'lacks {0} of its approved actions ({1})' -f $lacking.Count, ($lacking -join ', ') } else { 'has other actions than its approved ones' }
+                    if (-not $writer -and $lacking.Count) {
+                        $until = ' Until an Owner writes it, {0}.' -f (Get-DemoActivityControlLackingText -Lacking $lacking)
+                    }
+                }
+                $results.Add((& $manual $checkId ('The custom role "{0}" {1}, and writing it needs Microsoft.Authorization/roleDefinitions/write, which the signed-in caller doesn''t have.{2}' -f $roleName, $why, $until) $evidence))
             }
             elseif (-not $PSCmdlet.ShouldProcess(('/subscriptions/{0}' -f $subscriptionId), ('{0} the custom role "{1}" with exactly the {2} approved actions' -f $(if ($roleIds[$kind]) { 'Update' } else { 'Create' }), $roleName, $actions.Count))) {
                 $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message ('What if: the custom role "{0}" would be {1} with exactly these actions: {2}.' -f $roleName, $(if ($roleIds[$kind]) { 'updated' } else { 'created' }), ($actions -join ', ')) -Evidence $evidence -DocUrl $doc))
@@ -2441,7 +2490,7 @@ function Test-DemoActivityControlRole {
     $name = Get-DemoActivityControlName -Config $Config
     $command = Get-DemoActivityControlGrantCommand -ConfigPath $ConfigPath
     $doc = 'https://learn.microsoft.com/azure/role-based-access-control/role-assignments-list-rest'
-    $missing = { param([string] $CheckId, [string] $Message) $results.Add((New-DemoResult -CheckId $CheckId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message $Message -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $command) -DocUrl $doc)) }
+    $missing = { param([string] $CheckId, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}) $results.Add((New-DemoResult -CheckId $CheckId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message $Message -Evidence $Evidence -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $command) -DocUrl $doc)) }
     $operator = $null
     $writerId = ''
     try {
@@ -2461,16 +2510,10 @@ function Test-DemoActivityControlRole {
         # An environment set up before 2026-11-14 has the role with its first 22 actions: the session then runs without its
         # read replica, the busy marker, and the history's metrics, and says so. One set up before 2026-11-19 lacks T5's
         # container actions: its container then stays between sessions (DbHubT5Container AlwaysOn), and its throughput bills.
+        # One set up before 2026-11-23 lacks the network join actions, which T4's read replica needs where Azure checks them.
         $lacking = @($script:ActivityControlRoleActions | Where-Object { $_ -notin @($operator.Actions) })
         if ($lacking.Count -gt 0) {
-            $without = [System.Collections.Generic.List[string]]::new()
-            if (@($lacking | Where-Object { $_ -notlike 'Microsoft.DocumentDB/*' }).Count -gt 0) {
-                $without.Add('a session in the control notebook runs without T4''s read replica, the busy marker, or the history''s metrics')
-            }
-            if (@($lacking | Where-Object { $_ -like 'Microsoft.DocumentDB/*' }).Count -gt 0) {
-                $without.Add('T5''s container can''t exist only during a session: it stays between sessions, and its throughput keeps billing')
-            }
-            & $missing 'CONTROL.ROLE.DEFINITION' ('The custom role "{0}" lacks {1} of its approved actions ({2}), so {3}.' -f $name.RoleName, $lacking.Count, ($lacking -join ', '), ($without -join '; and '))
+            & $missing 'CONTROL.ROLE.DEFINITION' ('The custom role "{0}" lacks {1} of its approved actions ({2}), so {3}.' -f $name.RoleName, $lacking.Count, ($lacking -join ', '), (Get-DemoActivityControlLackingText -Lacking $lacking)) ([ordered]@{ role = $name.RoleName; lacking = $lacking })
         }
     }
     $principalId = Get-DemoActivityControlPrincipalId -Name $name

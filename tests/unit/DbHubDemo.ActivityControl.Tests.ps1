@@ -28,6 +28,9 @@ BeforeAll {
         'Microsoft.DBforPostgreSQL/flexibleServers/write'
         'Microsoft.DBforPostgreSQL/flexibleServers/delete'
         'Microsoft.DBforPostgreSQL/flexibleServers/configurations/write'
+        # T4's read replica's join of T4's subnet and private DNS zone, which Azure checks in West Central US (2026-11-23).
+        'Microsoft.Network/virtualNetworks/subnets/join/action'
+        'Microsoft.Network/privateDnsZones/join/action'
         # T5's container, which exists only during a session (2026-11-19, ADR 0027).
         'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read'
         'Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write'
@@ -946,11 +949,38 @@ Describe 'Granting the roles (setup-activity-control.ps1 -GrantRole)' {
         @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
         $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
         $definition.status | Should -Be 'Warning'
-        $definition.message | Should -Match 'lacks some of its approved actions, and writing it needs Microsoft\.Authorization/roleDefinitions/write'
+        $definition.message | Should -Match ('lacks {0} of its approved actions \(.+\), and writing it needs Microsoft\.Authorization/roleDefinitions/write, which the signed-in caller doesn''t have\. Until an Owner writes it, a session in the control notebook runs without T4''s read replica' -f ($script:approvedActions.Count - 22))
+        @($definition.evidence['lacking']).Count | Should -Be ($script:approvedActions.Count - 22)
         $writer = $results | Where-Object checkId -EQ 'CONTROL.ROLE.WRITER'
         $writer.status | Should -Be 'Warning'
         $writer.message | Should -Match 'doesn''t exist yet'
         $writer.remediation | Should -Match ([regex]::Escape('./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
+    }
+
+    It 'updates a role from before 2026-11-23 in place with the network join actions that T4''s read replica needs where Azure checks them' {
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notlike 'Microsoft.Network/*' })
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
+        $puts = @($script:rest | Where-Object { $_.Method -eq 'put' -and $_.Url -match '/roleDefinitions/' })
+        $puts.Count | Should -Be 1 -Because 'only the operator role changes'
+        $puts[0].Url | Should -Match ('/roleDefinitions/{0}\?' -f [regex]::Escape($script:customRoleId)) -Because 'the role is updated under its own ID, so its assignments stay'
+        @(($puts[0].Body | ConvertFrom-Json -AsHashtable)['properties']['permissions'][0]['actions']) | Should -Be $script:approvedActions
+        @(($puts[0].Body | ConvertFrom-Json -AsHashtable)['properties']['assignableScopes']) | Should -Be @(('/subscriptions/{0}' -f $script:sub))
+        $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
+        $definition.status | Should -Be 'Pass'
+        $definition.message | Should -Match ('^The custom role "DbHub Demo Activity Operator" was updated in place, under the same ID, so its assignments stay, from {0} to exactly the {1} approved actions; added: Microsoft\.Network/virtualNetworks/subnets/join/action, Microsoft\.Network/privateDnsZones/join/action, assignable in this subscription only\.' -f ($script:approvedActions.Count - 2), $script:approvedActions.Count)
+        $definition.message | Should -Match 'Microsoft\.Network/virtualNetworks/subnets/join/action: puts the read replica in T4''s delegated subnet'
+    }
+
+    It 'says what a role without the network join actions can''t do when the caller can''t write it, rather than skip it (2026-11-23)' {
+        $script:canAssign = $false
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notlike 'Microsoft.Network/*' })
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -GrantRole -Confirm:$false)
+        @($script:rest | Where-Object Method -NE 'get') | Should -BeNullOrEmpty
+        $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
+        $definition.status | Should -Be 'Warning'
+        $definition.message | Should -Be 'The custom role "DbHub Demo Activity Operator" lacks 2 of its approved actions (Microsoft.Network/virtualNetworks/subnets/join/action, Microsoft.Network/privateDnsZones/join/action), and writing it needs Microsoft.Authorization/roleDefinitions/write, which the signed-in caller doesn''t have. Until an Owner writes it, Run all can''t create T4''s read replica where Azure checks that it may join T4''s subnet and private DNS zone, as in West Central US since 2026-11-23: a session there runs without it, and Database Hub''s Read replica lag stays empty.'
+        @($definition.evidence['lacking']) | Should -Be @('Microsoft.Network/virtualNetworks/subnets/join/action', 'Microsoft.Network/privateDnsZones/join/action')
+        $definition.remediation | Should -Match ([regex]::Escape('./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
     }
 }
 
@@ -1808,7 +1838,7 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -NowUtc $script:now)
         $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
         $definition.status | Should -Be 'Warning'
-        $definition.message | Should -Match 'lacks 5 of its approved actions'
+        $definition.message | Should -Match 'lacks 7 of its approved actions'
         $definition.message | Should -Match 'runs without T4''s read replica'
         $a4 = $results | Where-Object checkId -EQ 'CONTROL.ROLE.A4'
         $a4.status | Should -Be 'Warning'
@@ -1821,8 +1851,17 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -NowUtc $script:now)
         $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
         $definition.status | Should -Be 'Warning'
-        $definition.message | Should -Be 'The custom role "DbHub Demo Activity Operator" lacks 3 of its approved actions (Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write, Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete), so T5''s container can''t exist only during a session: it stays between sessions, and its throughput keeps billing.'
         $definition.remediation | Should -Match 'grant-safety-stop\.ps1'
+    }
+
+    It 'reports an operator role from before 2026-11-23, without the network join actions: Run all can''t create T4''s read replica where Azure checks them' {
+        $script:roleActions = @($script:approvedActions | Where-Object { $_ -notlike 'Microsoft.Network/*' })
+        $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -NowUtc $script:now)
+        $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
+        $definition.status | Should -Be 'Warning'
+        $definition.message | Should -Be 'The custom role "DbHub Demo Activity Operator" lacks 2 of its approved actions (Microsoft.Network/virtualNetworks/subnets/join/action, Microsoft.Network/privateDnsZones/join/action), so Run all can''t create T4''s read replica where Azure checks that it may join T4''s subnet and private DNS zone, as in West Central US since 2026-11-23: a session there runs without it, and Database Hub''s Read replica lag stays empty.'
+        @($definition.evidence['lacking']) | Should -Be @('Microsoft.Network/virtualNetworks/subnets/join/action', 'Microsoft.Network/privateDnsZones/join/action')
+        $definition.remediation | Should -Match ([regex]::Escape('./scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'))
     }
 
     It 'warns 14 days before the webhook expires, and needs a rotation once it has' -ForEach @(

@@ -5053,7 +5053,9 @@ function Send-DbHubT4ReplicaCreate {
     $detail = Get-DbHubMember -InputObject $put.Body -Name 'error'
     $text = ('{0} {1} {2}' -f $put.Error, [string](Get-DbHubMember -InputObject $detail -Name 'code'), [string](Get-DbHubMember -InputObject $detail -Name 'message')).Trim()
     $code = 'Other'
-    if ($put.StatusCode -eq 403 -or $text -match 'AuthorizationFailed') {
+    # LinkedResourceAccessDenied (live, 2026-11-23, West Central US): the role lacked the join of T4's subnet, which Azure
+    # checks there when the create names it; Azure answered it as a server error, retried, before the role had that join.
+    if ($put.StatusCode -eq 403 -or $text -match 'AuthorizationFailed|LinkedResourceAccessDenied') {
         $code = 'NotGranted'
     }
     elseif ($text -match 'SkuNotAvailable') {
@@ -5438,7 +5440,11 @@ function Send-DbHubSessionReplicaAttempt {
             return $Work
         }
         if ($sent.Code -eq 'NotGranted') {
-            return (& $finish 'NotGranted' 'The control identity can''t create T4''s read replica yet: its role doesn''t have the PostgreSQL actions, so this session has none, and Database Hub''s Read replica lag stays empty.' 'An Owner runs ./scripts/grant-safety-stop.ps1 once; the next Run all creates the replica.')
+            # Azure names the action it refused: the PostgreSQL write of a role from before 2026-11-14, or the join of T4's
+            # subnet of one from before 2026-11-23 where Azure checks it (ADR 0026).
+            $refused = [regex]::Match([string]$sent.Error, 'perform action ''?([A-Za-z.]+/[A-Za-z0-9./]+)').Groups[1].Value
+            $lacks = if ($refused) { 'its role doesn''t allow {0}, which Azure checks for the create' -f $refused.TrimEnd('.') } else { 'its role doesn''t have the actions the create needs' }
+            return (& $finish 'NotGranted' ('The control identity can''t create T4''s read replica yet: {0}, so this session has none, and Database Hub''s Read replica lag stays empty.' -f $lacks) 'An Owner runs ./scripts/grant-safety-stop.ps1 once, which gives the role its approved actions; the next Run all creates the replica.')
         }
         if ($sent.Code -eq 'SourceNotReady') {
             return (& $finish 'NotCreated' ('T4 wasn''t ready for a read replica within {0} minutes: {1}' -f $RaceMinutes, $sent.Error) 'Run all again in a few minutes.')

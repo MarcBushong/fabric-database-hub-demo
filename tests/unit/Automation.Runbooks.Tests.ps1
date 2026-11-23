@@ -98,6 +98,7 @@ BeforeAll {
         $script:replicaRefuse = @()
         $script:replicaNotReady = 0
         $script:replicaForbidden = $false
+        $script:replicaJoinRefused = $false
         $script:replicaCreateMinutes = 9
         $script:replicaSku = ''
         $script:replicaRole = 'AsyncReplica'
@@ -502,6 +503,8 @@ BeforeAll {
                     # The session's creation (createMode Replica): refused sizes, a T4 that isn't ready yet, or no grant.
                     $sku = [string]$Body.sku.name
                     if ($script:replicaForbidden) { return (New-Response 403 '{"error":{"code":"AuthorizationFailed","message":"The client does not have authorization to perform action Microsoft.DBforPostgreSQL/flexibleServers/write."}}') }
+                    # A role without the join of T4's subnet, where Azure checks it (live, 2026-11-23, West Central US).
+                    if ($script:replicaJoinRefused) { return (New-Response 500 '{"error":{"code":"LinkedResourceAccessDenied","message":"The caller does not have permission to perform action ''Microsoft.Network/virtualNetworks/subnets/join/action'' on the linked resource ''/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-dbhub-demo/providers/Microsoft.Network/virtualNetworks/vnet-dbhub-demo/subnets/snet-pg'' or the linked resource is invalid."}}') }
                     if ($script:replicaNotReady -gt 0) {
                         $script:replicaNotReady--
                         return (New-Response 409 '{"error":{"code":"ReadReplicaServerInUnexpectedState","message":"Cannot perform operation on read replica because it''s in ''Restarting'' state."}}')
@@ -1569,6 +1572,20 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status.replica.fix | Should -Match $Match
         $status.replicaLag.planned | Should -BeFalse
         $status.replicaLag.note | Should -Match 'doesn''t run this session'
+        $script:replica | Should -BeNullOrEmpty
+    }
+
+    It 'names the action Azure refused when the role lacks the join of T4''s subnet, which Azure checks for the create (live, 2026-11-23, West Central US)' {
+        # Azure answered LinkedResourceAccessDenied as a server error, so it's not a 403: before, the replica was Failed, with
+        # a fix about policies.
+        $script:replicaJoinRefused = $true
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Partial'
+        $status = Get-SessionStatus
+        $status.replica.state | Should -Be 'NotGranted'
+        $status.replica.note | Should -Be 'The control identity can''t create T4''s read replica yet: its role doesn''t allow Microsoft.Network/virtualNetworks/subnets/join/action, which Azure checks for the create, so this session has none, and Database Hub''s Read replica lag stays empty.'
+        $status.replica.fix | Should -Be 'An Owner runs ./scripts/grant-safety-stop.ps1 once, which gives the role its approved actions; the next Run all creates the replica.'
+        @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('NotGranted') -Because 'no other size is asked for: the size isn''t what Azure refused'
         $script:replica | Should -BeNullOrEmpty
     }
 
