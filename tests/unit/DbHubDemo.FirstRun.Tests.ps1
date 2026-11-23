@@ -1735,6 +1735,10 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
     Context 'in Stop-DemoEnvironment' {
         BeforeEach {
             $script:order = [System.Collections.Generic.List[string]]::new()
+            # The RCA sidecars (2026-11-23): none, unless a test says otherwise.
+            $script:sidecarState = $null
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $script:sidecarState }
+            Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarSave -MockWith { $null }
             $script:still = $false
             $script:stopConfig = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
             $script:stopConfig['subscriptionId'] = $script:subA
@@ -1809,6 +1813,25 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
                 $script:order.Clear()
                 Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false @case | Out-Null
                 @($script:order | Where-Object { $_ -like 'RcaExport:*' -or $_ -like 'Pending:*' }) | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'fetches the RCA sidecars right after the evidence''s export, before the VMs stop, sends them with the history run, and defers their acknowledgements (2026-11-23)' {
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaScriptExport -MockWith { $script:order.Add('RcaExport'); [pscustomobject]@{ Evidence = ''; Documents = @(); Pending = @(); PendingFound = $false; Results = @() } }
+            $script:sidecarState = [pscustomobject]@{ Fetched = [ordered]@{}; Batches = @() }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $script:order.Add(('SidecarFetch:{0}:{1}' -f [bool]$PesterBoundParameters['Final'], $CheckPrefix)); $script:sidecarState }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -MockWith { $script:order.Add(('SaveHistory:{0}' -f [object]::ReferenceEquals($PesterBoundParameters['RcaSidecar'], $script:sidecarState))); [pscustomobject]@{ Result = (New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'saved'); StillRunning = $false; RcaSaved = $true; RcaNote = '' } }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -MockWith { $script:order.Add('Pending') }
+            Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarSave -MockWith { $script:order.Add(('SidecarComplete:{0}' -f [bool]$PesterBoundParameters['Now'])); New-DemoResult -CheckId 'STOP.RCA.SIDECAR' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'deferred' }
+            $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
+            $script:order | Should -Be @('RcaExport', 'SidecarFetch:True:STOP', 'Deallocate:archost01', 'Deallocate:sqlvm01', 'SaveHistory:True', 'Pending', 'SidecarComplete:False', 'Pause') -Because 'the stop runs the notebook after the VMs deallocate, so the acknowledgements wait for the next export'
+            ($results | Where-Object { $_.checkId -eq 'STOP.RCA.SIDECAR' }).status | Should -Be 'Pass'
+
+            # Without a history save, or with -ParkT2 or -SkipFabric, nothing is fetched: it stays on the VMs.
+            foreach ($case in @(@{}, @{ SaveHistory = $true; ParkT2 = $true }, @{ SaveHistory = $true; SkipFabric = $true })) {
+                $script:order.Clear()
+                Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false @case | Out-Null
+                @($script:order | Where-Object { $_ -like 'Sidecar*' }) | Should -BeNullOrEmpty
             }
         }
 

@@ -207,6 +207,25 @@ Describe 'New-DemoT2GoldenSnapshot' {
         # unless a test sets another.
         $script:notebookState = [pscustomobject]@{ Known = $true; Current = $true; Error = '' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenRcaNotebookState -MockWith { $script:notebookState }
+        # The Incident RCA's sidecars (2026-11-23): this PC's lists hold no deferred acknowledgement, and T2's guest holds no
+        # sidecar that isn't in the history, unless a test sets some.
+        $script:sidecarAcks = [ordered]@{}
+        $script:guestSidecars = [ordered]@{ spans = 0; sealed = 0; unsealed = 0; ledger = 'none'; sidecars = @() }
+        $script:ackOutcome = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Read-DemoRcaSidecarList -MockWith { [pscustomobject]@{ Paths = [pscustomobject]@{ Pending = (Join-Path -Path $repoRoot -ChildPath 'out/history-pending/rca-sidecar-pending-rg-dbhub-demo.json'); Acks = (Join-Path -Path $repoRoot -ChildPath 'out/history-pending/rca-sidecar-acks-rg-dbhub-demo.json') }; Pending = [ordered]@{}; Acks = $script:sidecarAcks; Writable = @{ Pending = $true; Acks = $true }; Problems = [System.Collections.Generic.List[string]]::new() } }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaSidecarList -MockWith { $script:calls.Add(('save acks {0}' -f @($List.Acks.Keys).Count)); @() }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarRunCommand -MockWith {
+            $script:calls.Add(('rca ack {0}' -f (@($Plan[0].Steps | ForEach-Object { @($_.Request['documentIds']) }) -join ',')))
+            $results = [ordered]@{}
+            foreach ($step in @($Plan[0].Steps)) {
+                $results[$step.Key] = [pscustomobject]@{ State = 'Read'; Out = [pscustomobject]@{ Status = $script:ackOutcome; Message = 'runner rca ack: exit code 3.'; OldRunner = $false; OldBundle = $false; Line = '' }; Error = '' }
+                if ($script:ackOutcome -eq 'Pass') {
+                    # The runner took them: the guest's ledger marks them acknowledged.
+                    $script:guestSidecars['sealed'] = 0
+                }
+            }
+            [pscustomobject]@{ Vm = 'archost01'; Outcome = ''; Message = ''; Results = $results; Leftover = @() }
+        }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' }
@@ -238,6 +257,7 @@ Describe 'New-DemoT2GoldenSnapshot' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
             $script:calls.Add('guest ' + $Action)
             switch ($Action) {
+                'RcaSidecars' { [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 30; Data = [pscustomobject]@{ succeeded = $true; rca = [pscustomobject]$script:guestSidecars } } }
                 'Release' { [pscustomobject]@{ Succeeded = $true; Data = [pscustomobject]@{ succeeded = $true; captured = $false }; Error = ''; Seconds = 5 } }
                 'Inspect' {
                     [pscustomobject]@{
@@ -385,6 +405,62 @@ Describe 'New-DemoT2GoldenSnapshot' {
         ($results | Where-Object checkId -EQ 'GOLDEN.CAPTURE').status | Should -Be 'Pass'
         $script:calls | Should -Contain 'guest Prepare'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoGoldenRcaNotebookState -Times 0 -Exactly -Because 'the notebook is read only when T2''s documents are listed'
+    }
+
+    It 'captures nothing while T2''s guest holds a sidecar that isn''t in the history, its only pending evidence, and deletes nothing (2026-11-23)' {
+        $script:hostPower = 'PowerState/running'
+        $script:guestSidecars['sealed'] = 1
+        $script:guestSidecars['sidecars'] = @('20261123T100000Z-arcsql01-0001-sidecar')
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be 'T2''s guest holds Incident RCA sidecars that aren''t in the history yet (1 sealed sidecar(s) its runner hasn''t been told are in the history), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+        $rca.remediation | Should -Be 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches them from T2 and has its runner acknowledge them, again while its RCA.SIDECAR line says sidecars wait. Run all sessions leave their sidecars in T2''s guest until Run all takes them itself (a later release), so a scripts'' save brings them in. Then run ./scripts/capture-t2-golden.ps1 again.'
+        @($rca.evidence.sidecars) | Should -Be @('20261123T100000Z-arcsql01-0001-sidecar')
+        @($script:calls | Where-Object { $_ -in 'power Start', 'profile off', 'guest RcaSidecars' }) | Should -Be @('power Start', 'profile off', 'guest RcaSidecars') -Because 'the guest is asked with its activity off'
+        foreach ($step in 'password', 'guest Prepare', 'power Deallocate') {
+            $script:calls | Should -Not -Contain $step
+        }
+        $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.SNAPSHOT' | Should -BeNullOrEmpty
+
+        # Rows not sealed yet count the same, and so does a ledger that can't be read; with the host deallocated, the save is
+        # a session's stop.
+        $script:calls.Clear()
+        $script:hostPower = 'PowerState/deallocated'
+        $script:guestSidecars['sealed'] = 0
+        $script:guestSidecars['unsealed'] = 1
+        $script:guestSidecars['ledger'] = 'unreadable'
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Match '\(1 observation span\(s\) with rows not sealed into a sidecar yet; a ledger of acknowledged sidecars that can''t be read, so it counts as holding some\)'
+        $rca.remediation | Should -Match '^Save the history first: \./scripts/start-demo\.ps1, then \./scripts/stop-demo\.ps1 -SaveHistory, which fetches them'
+        $script:calls | Should -Not -Contain 'guest Prepare'
+    }
+
+    It 'sends the acknowledgements a stop deferred to archost01 first, then captures once nothing waits in its guest (2026-11-23)' {
+        $script:sidecarAcks['20261123T100000Z-arcsql01-0001-sidecar'] = [ordered]@{ documentId = '20261123T100000Z-arcsql01-0001-sidecar'; vm = 'archost01'; status = 'written'; recordedUtc = '2026-11-23T12:00:00Z' }
+        $script:sidecarAcks['20261123T100000Z-sqlvm01-0001-sidecar'] = [ordered]@{ documentId = '20261123T100000Z-sqlvm01-0001-sidecar'; vm = 'sqlvm01'; status = 'written'; recordedUtc = '2026-11-23T12:00:00Z' }
+        # Until its acknowledgement arrives, the guest's ledger doesn't mark it.
+        $script:guestSidecars['sealed'] = 1
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        ($results | Where-Object checkId -EQ 'GOLDEN.CAPTURE').status | Should -Be 'Pass'
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Pass'
+        $rca.message | Should -Be '1 acknowledgement(s) that a stop deferred went to T2''s guest first, and no Incident RCA sidecar waits there for the history.'
+        @($script:calls | Where-Object { $_ -like 'rca ack *' -or $_ -in 'guest RcaSidecars', 'guest Prepare' }) | Should -Be @('rca ack 20261123T100000Z-arcsql01-0001-sidecar', 'guest RcaSidecars', 'guest Prepare')
+        $script:calls | Should -Contain 'save acks 1' -Because 'sqlvm01''s acknowledgement stays for its next export'
+
+        # One that doesn't reach the guest: the capture says so, and captures nothing.
+        $script:calls.Clear()
+        $script:ackOutcome = 'Fail'
+        $script:guestSidecars['sealed'] = 1
+        $script:sidecarAcks['20261123T100000Z-arcsql01-0001-sidecar'] = [ordered]@{ documentId = '20261123T100000Z-arcsql01-0001-sidecar'; vm = 'archost01'; status = 'written'; recordedUtc = '2026-11-23T12:00:00Z' }
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Match 'didn''t all reach it: runner rca ack: exit code 3\.$'
+        $script:calls | Should -Not -Contain 'guest Prepare'
     }
 
     It 'captures nothing while the session control''s status lists T2''s documents its runbooks couldn''t fetch, and says to run a session (the review of 3f6cd14)' {

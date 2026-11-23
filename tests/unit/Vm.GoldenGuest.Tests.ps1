@@ -428,3 +428,108 @@ Describe 'The Incident RCA''s capture in the guest, deleted before a golden snap
         Should -Invoke -CommandName Stop-Process -Times 0 -Exactly
     }
 }
+
+Describe 'The Incident RCA''s sidecars in the guest: the store isn''t deleted before the history has them (2026-11-23)' {
+    BeforeAll {
+        $stubs = @{
+            'Get-ScheduledTask'   = 'param([string] $TaskName)'
+            'Stop-ScheduledTask'  = 'param([string] $TaskName)'
+            'Start-ScheduledTask' = 'param([string] $TaskName)'
+            'Get-CimInstance'     = 'param([string] $ClassName, [string] $Filter)'
+        }
+        foreach ($name in $stubs.Keys) {
+            Set-Item -Path ('function:local:' + $name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stubs[$name]))
+        }
+        $script:sidecarId = '20261123T100000Z-arcsql01-0001-sidecar'
+        # A store as the runner keeps it with the sidecar (T1a's hand-off): a span an export took all of, its evidence in
+        # T2.jsonl, a sealed sidecar in sidecars\<documentId>.json.gz, and the ledger, in T1a's format, beside its lock.
+        function New-SidecarStore([string] $AcknowledgedUtc = '', [switch] $Unsealed, [string] $Ledger = '') {
+            $store = Join-Path -Path $TestDrive -ChildPath ('rca-' + [guid]::NewGuid().ToString('N'))
+            $span = Join-Path -Path $store -ChildPath '20261123T100000Z'
+            $null = New-Item -ItemType Directory -Path $span -Force
+            Set-Content -LiteralPath (Join-Path -Path $span -ChildPath 'span.json') -Value '{"version":1,"spanId":"x","processId":4242}'
+            Set-Content -LiteralPath (Join-Path -Path $span -ChildPath 'export.json') -Value '{"version":1,"complete":true}'
+            Set-Content -LiteralPath (Join-Path -Path $span -ChildPath 'T2.jsonl') -Value '{"kind":"sample"}'
+            if ($Unsealed) {
+                Set-Content -LiteralPath (Join-Path -Path $span -ChildPath 'sidecar-T2.rows') -Value '{"table":"rca_query_stats"}'
+            }
+            $sealed = Join-Path -Path $store -ChildPath 'sidecars'
+            $null = New-Item -ItemType Directory -Path $sealed -Force
+            Set-Content -LiteralPath (Join-Path -Path $sealed -ChildPath ('{0}.json.gz' -f $script:sidecarId)) -Value 'gzip'
+            Set-Content -LiteralPath (Join-Path -Path $sealed -ChildPath 'ledger.lock') -Value ''
+            if (-not $Ledger) {
+                $when = if ($AcknowledgedUtc) { '"{0}"' -f $AcknowledgedUtc } else { 'null' }
+                $Ledger = '{{"version":1,"nextSequence":2,"expiredUnread":0,"sidecars":[{{"documentId":"{0}","sessionId":null,"bound":false,"sealedUtc":"2026-11-23T10:20:00+00:00","parts":1,"offered":0,"lastOfferedUtc":null,"acknowledgedUtc":{1}}}],"budgets":{{}},"spans":{{}},"sealed":[]}}' -f $script:sidecarId, $when
+            }
+            Set-Content -LiteralPath (Join-Path -Path $sealed -ChildPath 'ledger.json') -Value $Ledger
+            $store
+        }
+    }
+
+    BeforeEach {
+        Mock -CommandName Get-ScheduledTask -MockWith { [pscustomobject]@{ TaskName = $TaskName; State = 'Running' } }
+        Mock -CommandName Stop-ScheduledTask -MockWith { }
+        Mock -CommandName Start-ScheduledTask -MockWith { }
+        Mock -CommandName Get-CimInstance -MockWith { [pscustomobject]@{ ProcessId = 4242; ExecutablePath = 'C:\ProgramData\DbHubDemo\dotnet\dotnet.exe' } }
+        Mock -CommandName Stop-Process -MockWith { }
+        Mock -CommandName Get-Process -MockWith { }
+        Mock -CommandName Start-Sleep -MockWith { }
+    }
+
+    It 'refuses to delete a store whose sealed sidecar the ledger doesn''t mark acknowledged, and starts the runner again' {
+        $store = New-SidecarStore
+        $result = & $script:GuestRcaClearBlock $store 'C:\ProgramData\DbHubDemo\dotnet' 60
+        Test-Path -LiteralPath (Join-Path -Path $store -ChildPath ('sidecars\{0}.json.gz' -f $script:sidecarId)) | Should -BeTrue -Because 'nothing is deleted'
+        $result.left | Should -BeTrue
+        $result.sealed | Should -Be 1
+        @($result.sidecars) | Should -Be @($script:sidecarId)
+        $result.ledger | Should -Be 'read'
+        $result.error | Should -Be 'it holds Incident RCA sidecars that aren''t in the history yet (1 sidecar(s) the runner''s ledger doesn''t mark acknowledged)'
+        $result.taskStopped | Should -BeFalse -Because 'the runner runs again'
+        Should -Invoke -CommandName Stop-ScheduledTask -Times 1 -Exactly -Because 'it counts with the runner stopped, so nothing is sealed between the count and the delete'
+        Should -Invoke -CommandName Start-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'DbHubDemo-Workload' }
+    }
+
+    It 'refuses while a span holds rows not sealed yet (its sidecar-T2.rows); a span''s .jsonl is evidence, never a sidecar' {
+        $store = New-SidecarStore -AcknowledgedUtc '2026-11-23T11:00:00+00:00' -Unsealed
+        $result = & $script:GuestRcaClearBlock $store 'C:\ProgramData\DbHubDemo\dotnet' 60
+        $result.left | Should -BeTrue
+        $result.sealed | Should -Be 0
+        $result.unsealed | Should -Be 1
+        $result.error | Should -Match '1 span\(s\) with rows not sealed yet'
+        Test-Path -LiteralPath $store | Should -BeTrue
+    }
+
+    It 'counts a ledger it can''t read as holding unacknowledged sidecars, and keeps it (<Case>)' -ForEach @(
+        @{ Case = 'not JSON'; Ledger = '{ "version": 1, "sidecars": [' }
+        @{ Case = 'a newer version'; Ledger = '{"version":2,"sidecars":[]}' }
+        @{ Case = 'an ID that isn''t a sidecar''s'; Ledger = '{"version":1,"sidecars":[{"documentId":"20261123T100000Z-arcsql01-0001","acknowledgedUtc":"2026-11-23T11:00:00+00:00"}]}' }
+    ) {
+        $store = New-SidecarStore -Ledger $Ledger
+        $result = & $script:GuestRcaClearBlock $store 'C:\ProgramData\DbHubDemo\dotnet' 60
+        $result.left | Should -BeTrue
+        $result.ledger | Should -Be 'unreadable'
+        $result.error | Should -Match 'a ledger that can''t be read'
+        (Get-Content -LiteralPath (Join-Path -Path $store -ChildPath 'sidecars\ledger.json') -Raw).Trim() | Should -Be $Ledger -Because 'an unreadable ledger is kept, never deleted'
+    }
+
+    It 'deletes the store, its evidence spans included, once the ledger marks every sidecar acknowledged' {
+        $store = New-SidecarStore -AcknowledgedUtc '2026-11-23T11:00:00+00:00'
+        $result = & $script:GuestRcaClearBlock $store 'C:\ProgramData\DbHubDemo\dotnet' 60
+        $result.left | Should -BeFalse
+        $result.sealed | Should -Be 0
+        $result.unsealed | Should -Be 0 -Because 'T2.jsonl is the span''s evidence'
+        Test-Path -LiteralPath $store | Should -BeFalse
+    }
+
+    It 'with CheckOnly, only counts them: nothing is stopped or deleted' {
+        $store = New-SidecarStore -Unsealed
+        $result = & $script:GuestRcaClearBlock $store 'C:\ProgramData\DbHubDemo\dotnet' 0 $true
+        $result.sealed | Should -Be 1
+        $result.unsealed | Should -Be 1
+        $result.left | Should -BeFalse
+        Test-Path -LiteralPath $store | Should -BeTrue
+        Should -Invoke -CommandName Stop-ScheduledTask -Times 0 -Exactly
+        Should -Invoke -CommandName Stop-Process -Times 0 -Exactly
+    }
+}

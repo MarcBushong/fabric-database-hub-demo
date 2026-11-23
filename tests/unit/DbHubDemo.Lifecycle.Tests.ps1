@@ -2184,6 +2184,9 @@ Describe 'Stop-DemoEnvironment' {
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -MockWith { $script:order.Add('Release'); [pscustomobject]@{ Ran = $true; Released = $true; RestoredState = 'DEFAULT'; Error = '' } }
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -MockWith { $script:order.Add('AutoTuning'); New-TestResult 'STOP.T3.AUTOTUNING' 'Pass' 'infra' 'T3' }
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaScriptExport -MockWith { $script:order.Add('ScriptsExport'); [pscustomobject]@{ Results = @(); Evidence = '' } }
+            # The RCA sidecars (2026-11-23): fetched only beside the scripts' own export.
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $script:order.Add('SidecarFetch'); $null }
+            Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarSave -MockWith { $null }
             # The T2 host's Run Commands, which the handoff reads for the host password's (review of f5972d2d): none by default.
             $script:hostCommands = @()
             Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRunCommandLeftover -MockWith { $script:order.Add('HostList'); [pscustomobject]@{ Ok = $true; Error = ''; Items = @($script:hostCommands) } }
@@ -2252,6 +2255,7 @@ Describe 'Stop-DemoEnvironment' {
             Mock -ModuleName DbHubDemo -CommandName Suspend-DemoFabricCapacity -MockWith { New-TestResult 'STOP.FABRIC.CAPACITY' 'Not selected' 'fabric' 'fabric' }
             $results = @(Stop-DemoEnvironment -Config $config -SaveHistory -Confirm:$false)
             $script:order | Should -Not -Contain 'ScriptsExport'
+            $script:order | Should -Not -Contain 'SidecarFetch' -Because 'the sidecars stay on the VMs for the next save, as the evidence goes to the control''s stop'
             Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -Times 1 -Exactly -ParameterFilter { $RcaEvidence -eq '' }
             # It says so (review of f5972d2d): the session's evidence is the control vault's, for the session's own save.
             (@($results | Where-Object { $_.checkId -eq 'STOP.FABRIC.SAVEHISTORY' })[0]).message | Should -Match ' It''s without the Run all session''s Incident RCA evidence, which the session control''s stop kept in the control vault: the next Run all that starts a session within 7 days saves it, or Run all''s own save at the session''s planned end does, if the capacity stays on; after 7 days, nothing saves it\. To save it at once, stop a session with Stop now in NB_DatabaseHub_Control instead\.$'
@@ -2260,6 +2264,7 @@ Describe 'Stop-DemoEnvironment' {
             $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
             $results = @(Stop-DemoEnvironment -Config $config -SaveHistory -Confirm:$false)
             $script:order | Should -Contain 'ScriptsExport'
+            $script:order | Should -Contain 'SidecarFetch'
             $script:order | Should -Not -Contain 'Handoff'
             (@($results | Where-Object { $_.checkId -eq 'STOP.FABRIC.SAVEHISTORY' })[0]).message | Should -Not -Match 'Incident RCA evidence'
         }
