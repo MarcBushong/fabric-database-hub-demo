@@ -1,5 +1,6 @@
 using System.Data;
 using System.Globalization;
+using System.Text;
 using System.Text.RegularExpressions;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Rca.Observer;
@@ -13,19 +14,17 @@ namespace ContosoCare.Workload.Tests;
 
 /// <summary>
 /// The runner's own statements outside any module (rca/README.md, What the capture leaves out, 3): the forms in which the
-/// runner sends them and Query Store keeps them match, a workload statement of the same shape elsewhere doesn't, and every
-/// statement the runner's harness code sends is listed. Against a real engine, opt-in, every statement Query Store
-/// recorded outside a module while only the runner's own ran is matched.
+/// runner sends them and Query Store keeps them match, and a workload statement of the same shape elsewhere doesn't. Every
+/// command the runner sends to SQL Server is listed, carries the observer's marker (the capture's own, and the answer
+/// key's read), or calls a module. Against a real engine, opt-in, every statement Query Store recorded outside a module
+/// while only the runner's own ran is matched.
 /// </summary>
 public sealed partial class RcaHarnessStatementsTests
 {
-    /// <summary>The runner's harness code: its SQL Server statements outside any module are in these files.</summary>
-    private static readonly string[] Sources =
-    [
-        "workload-generator/src/ContosoCare.Workload/Sql/DemoDatabase.cs",
-        "workload-generator/src/ContosoCare.Workload/Sql/SqlScripts.cs",
-        "workload-generator/src/ContosoCare.Workload/Cli/CommandLine.cs",
-    ];
+    private const string Marker = "/* dbhubdemo:rca-observer */";
+
+    /// <summary>The runner's source: the scan reads every file of it that uses SQL Server's client.</summary>
+    private static readonly string SourceRoot = RepositoryPaths.Combine("workload-generator", "src", "ContosoCare.Workload");
 
     [Theory]
     [InlineData("(@run_id varchar(64))SELECT demo.fn_x(@run_id);", "selectdemo.fn_x(?)")]
@@ -85,28 +84,81 @@ public sealed partial class RcaHarnessStatementsTests
     }
 
     [Fact]
-    public void EveryStatementTheRunnersHarnessCodeSendsOutsideAModuleIsListed()
+    public void EveryCommandTheRunnerSendsToSqlServerIsListedMarkedOrAModuleCall()
     {
-        // Every Text(...) and CommandText = ... literal, parsed as T-SQL: each query statement in it, those within IF and
-        // BEGIN included, must be listed. A statement added without its entry fails here.
-        var found = new List<string>();
-        foreach (var source in Sources)
+        // Every CommandText the runner's source sets for SQL Server, read where it's set, or where an indirection says.
+        var sites = CommandSites();
+
+        // PostgreSQL's (T4) have their own rules: in the files that use both clients, only the answer key's T4 read.
+        Assert.Equal(["Rca/AnswerKey/AnswerKeyRecorder.cs"], sites.Where(s => s.Postgres).Select(s => s.File));
+
+        var unread = new List<string>();
+        var unlisted = new List<string>();
+        var listed = new List<string>();
+        var marked = new List<string>();
+        foreach (var site in sites.Where(s => !s.Postgres))
         {
-            var code = File.ReadAllText(RepositoryPaths.Combine(source.Split('/')));
-            foreach (var literal in Literal().Matches(code).Cast<Match>())
+            var texts = site.Literal is { } literal ? [($"{site.File}:{site.Line}", literal)] : Indirect(site).ToList();
+            foreach (var (where, text) in texts)
             {
-                var sql = literal.Groups["raw"].Success ? literal.Groups["raw"].Value : literal.Groups["text"].Value.Replace("\\\"", "\"", StringComparison.Ordinal);
-                foreach (var statement in QueryStatements(sql))
+                if (text is null)
                 {
-                    found.Add(statement);
-                    Assert.True(HarnessStatements.IsRunners(statement), $"{source} sends a statement outside any module that Rca/QueryStore/HarnessStatements.cs doesn't list: {statement}");
+                    unread.Add(where);
+                    continue;
+                }
+
+                // A module's name (CommandType.StoredProcedure): a module call, which Query Store records as the module's.
+                if (ModuleName().IsMatch(text.Trim()))
+                {
+                    continue;
+                }
+
+                // Each query statement, those within IF and BEGIN included; a batch with none (EXEC, SET, DDL) is a module call or nothing Query Store records.
+                foreach (var statement in QueryStatements(text))
+                {
+                    if (HarnessStatements.IsRunners(statement))
+                    {
+                        listed.Add(statement);
+                    }
+                    else if (statement.Contains(Marker, StringComparison.Ordinal))
+                    {
+                        marked.Add(where);
+                    }
+                    else
+                    {
+                        unlisted.Add($"{where}: {statement}");
+                    }
                 }
             }
         }
 
-        // The stop check every run polls is among them, and at least the ten statements the list has had since edd01c86.
-        Assert.Contains(found, s => s.Contains("fn_run_stop_requested", StringComparison.Ordinal));
-        Assert.True(found.Select(HarnessText.Normalize).Distinct(StringComparer.Ordinal).Count() >= 10, string.Join('\n', found));
+        Assert.True(unread.Count == 0, $"The scan can't read these command texts as literals; read them, or say where the test reads them instead (Indirect):\n{string.Join('\n', unread)}");
+        Assert.True(unlisted.Count == 0, $"These statements the runner sends to SQL Server aren't on Rca/QueryStore/HarnessStatements.cs's list, don't carry the observer's marker after their first keyword, and don't call a module:\n{string.Join('\n', unlisted)}");
+
+        // Today's: the stop check every run polls and the ten statements the list has had since edd01c86; the answer key's
+        // read and the capture catalog's blocks carry the marker.
+        Assert.Contains(listed, s => s.Contains("fn_run_stop_requested", StringComparison.Ordinal));
+        Assert.True(listed.Select(HarnessText.Normalize).Distinct(StringComparer.Ordinal).Count() >= 10, string.Join('\n', listed));
+        Assert.Contains(marked, m => m.StartsWith("Rca/AnswerKey/AnswerKeyRecorder.cs:", StringComparison.Ordinal));
+        Assert.Contains("RCA-SQL-10", marked);
+    }
+
+    [Fact]
+    public void TheAnswerKeysReadCarriesTheObserversMarkerSoQueryStoresReadsLeaveItOut()
+    {
+        // The answer key's read of a run's events on T1 to T3, after every run: the marker is inside its statement, after
+        // its first keyword, so Query Store keeps it with the text.
+        var site = Assert.Single(CommandSites(), s => s.File == "Rca/AnswerKey/AnswerKeyRecorder.cs" && !s.Postgres);
+        var statement = Assert.Single(QueryStatements(Assert.IsType<string>(site.Literal)));
+        Assert.Contains(Marker, statement, StringComparison.Ordinal);
+
+        // As Query Store keeps it from sp_executesql, its parameter's declaration first: RCA-SQL-10, 14, and 16 each leave
+        // out a text their rule on the observer's marker matches.
+        var kept = "(@run_id varchar(64))" + statement;
+        foreach (var id in new[] { "RCA-SQL-10", "RCA-SQL-14", "RCA-SQL-16" })
+        {
+            Assert.Matches(Like(MarkerRule(id)), kept);
+        }
     }
 
     /// <summary>
@@ -213,8 +265,176 @@ public sealed partial class RcaHarnessStatementsTests
         return command;
     }
 
-    [GeneratedRegex("""(?s)(?:\bText\(\s*|\bCommandText\s*=\s*)(?:"{3}(?<raw>.*?)"{3}|"(?<text>(?:[^"\\]|\\.)*)")""")]
-    private static partial Regex Literal();
+    /// <summary>
+    /// Every CommandText set, and every SqlCommand or SqlBatchCommand made, in the runner's source files that use SQL
+    /// Server's client. A site is PostgreSQL's when the client named nearest before it is Npgsql's: a file can use both.
+    /// </summary>
+    private static List<CommandSite> CommandSites()
+    {
+        var sites = new List<CommandSite>();
+        foreach (var path in Directory.GetFiles(SourceRoot, "*.cs", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
+        {
+            var file = Path.GetRelativePath(SourceRoot, path).Replace('\\', '/');
+            var code = File.ReadAllText(path);
+            if (file.StartsWith("bin/", StringComparison.Ordinal) || file.StartsWith("obj/", StringComparison.Ordinal) || !SqlServerClient().IsMatch(code))
+            {
+                continue;
+            }
+
+            foreach (var site in CommandTextSite().Matches(code).Cast<Match>())
+            {
+                var before = code[..site.Index];
+                var sqlServer = SqlServerClient().Matches(before).LastOrDefault()?.Index ?? -1;
+                var postgres = PostgresClient().Matches(before).LastOrDefault()?.Index ?? -1;
+                var made = before.LastIndexOf("CreateCommand()", StringComparison.Ordinal);
+                var (literal, expression) = Assigned(code, site.Index + site.Length);
+                sites.Add(new CommandSite(file, Line(code, site.Index), literal, expression, made < 0 ? string.Empty : before[made..], postgres > sqlServer));
+            }
+        }
+
+        return sites;
+    }
+
+    /// <summary>
+    /// Where the scan reads a command text that isn't a literal where it's set, and what it is; null for one it can't
+    /// read. Any other expression fails the scan.
+    /// </summary>
+    private static IEnumerable<(string Where, string? Text)> Indirect(CommandSite site) => (site.File, site.Expression) switch
+    {
+        // DemoDatabase's helpers: Text("...") sends a statement and Procedure("...") calls a module, each with its literal.
+        ("Sql/DemoDatabase.cs", "sql") => HelperCalls(site.File, "Text"),
+        ("Sql/DemoDatabase.cs", "name") => HelperCalls(site.File, "Procedure"),
+
+        // The embedded scripts' batches: setup's, at a deploy or a start (rca/README.md, What the capture leaves out, 3:
+        // not on the list).
+        ("Sql/SqlScripts.cs", "batch") => [],
+
+        // The capture catalog's blocks, the observer's own: its event session's drop among them.
+        ("Rca/Observer/SqlCapture.cs", "text") => CatalogBlocks(),
+        ("Cli/CommandLine.Rca.cs", "target == DemoTarget.T3 ? CaptureCatalog.DatabaseScopedDrop() : CaptureCatalog.Get(\"RCA-XE-05\")") => CatalogBlocks(),
+
+        // A scenario's module, named by the scenario catalog, called as a stored procedure.
+        ("Runs/ScenarioRunner.cs", "plan.Scenario.Procedure" or "procedure") when site.Made.Contains("CommandType.StoredProcedure", StringComparison.Ordinal) => [],
+
+        // The idle holders' batches, each a literal where its holder is made.
+        ("Runs/ScenarioRunner.cs", "holder.AcquireSql") => HolderBatches(site.File),
+
+        _ => [($"{site.File}:{site.Line}: CommandText = {site.Expression}", null)],
+    };
+
+    /// <summary>The text set at <paramref name="at"/>: a string literal's value when it's one alone (regular, verbatim, or raw), and the expression otherwise.</summary>
+    private static (string? Literal, string Expression) Assigned(string code, int at)
+    {
+        var literal = StringLiteral().Match(code, at);
+        if (literal.Success && code[(literal.Index + literal.Length)..].TrimStart() is [';' or ',' or ')', ..])
+        {
+            var value = literal.Groups["raw"].Success ? literal.Groups["raw"].Value
+                : literal.Groups["verbatim"].Success ? literal.Groups["verbatim"].Value.Replace("\"\"", "\"", StringComparison.Ordinal)
+                : literal.Groups["text"].Value.Replace("\\\"", "\"", StringComparison.Ordinal).Replace("\\\\", "\\", StringComparison.Ordinal);
+            return (value, literal.Value);
+        }
+
+        var end = code.IndexOf(';', at);
+        return (null, Whitespace().Replace(code[at..(end < 0 ? code.Length : end)], " ").Trim());
+    }
+
+    /// <summary>Each call of DemoDatabase's own helper, Text or Procedure, with its literal; null for one the scan can't read.</summary>
+    private static IEnumerable<(string Where, string? Text)> HelperCalls(string file, string helper)
+    {
+        var code = File.ReadAllText(Path.Combine(SourceRoot, file));
+        var calls = HelperCall().Matches(code).Where(m => m.Groups["helper"].Value == helper).ToList();
+        if (calls.Count == 0)
+        {
+            return [($"{file}: no call of {helper}", null)];
+        }
+
+        return calls.Select(m => ($"{file}:{Line(code, m.Index)}", Assigned(code, m.Index + m.Length).Literal));
+    }
+
+    /// <summary>The batch each idle holder runs, the first argument where it's made; null for one the scan can't read.</summary>
+    private static IEnumerable<(string Where, string? Text)> HolderBatches(string file)
+    {
+        var code = File.ReadAllText(Path.Combine(SourceRoot, file));
+        var made = IdleHolderMade().Matches(code).ToList();
+        if (made.Count == 0)
+        {
+            return [($"{file}: no idle holder made", null)];
+        }
+
+        return made.Select(m => ($"{file}:{Line(code, m.Index)}", Assigned(code, m.Index + m.Length).Literal));
+    }
+
+    /// <summary>The capture catalog's T-SQL blocks, RCA-XE-05's database-scoped form among them.</summary>
+    private static IEnumerable<(string Where, string? Text)> CatalogBlocks() =>
+        CaptureCatalog.All.Where(b => !b.Key.StartsWith("RCA-PG-", StringComparison.Ordinal))
+            .Select(b => (b.Key, (string?)b.Value))
+            .Append(("RCA-XE-05 (T3, database-scoped)", CaptureCatalog.DatabaseScopedDrop()));
+
+    private static int Line(string code, int index) => code.AsSpan(0, index).Count('\n') + 1;
+
+    /// <summary>A block's rule on the observer's marker: the pattern of its qt.query_sql_text NOT LIKE.</summary>
+    private static string MarkerRule(string id)
+    {
+        var text = CaptureCatalog.Get(id);
+        var script = new TSql160Parser(initialQuotedIdentifiers: true).Parse(new StringReader(text), out var errors);
+        Assert.Empty(errors);
+        var likes = new LikeVisitor();
+        script.Accept(likes);
+        var rule = Assert.Single(likes.Found, l => l.NotDefined && text.Substring(l.FirstExpression.StartOffset, l.FirstExpression.FragmentLength) == "qt.query_sql_text");
+        return Assert.IsType<StringLiteral>(rule.SecondExpression).Value;
+    }
+
+    /// <summary>A T-SQL LIKE pattern as a regular expression: % any text, _ one character, [...] a set; case ignored, as ContosoCare's collation does.</summary>
+    private static Regex Like(string pattern)
+    {
+        var regex = new StringBuilder("^");
+        for (var i = 0; i < pattern.Length; i++)
+        {
+            switch (pattern[i])
+            {
+                case '%':
+                    regex.Append(".*");
+                    break;
+                case '_':
+                    regex.Append('.');
+                    break;
+                case '[':
+                    {
+                        var end = pattern.IndexOf(']', i + 1);
+                        regex.Append(pattern, i, end - i + 1);
+                        i = end;
+                        break;
+                    }
+
+                default:
+                    regex.Append(Regex.Escape(pattern[i..(i + 1)]));
+                    break;
+            }
+        }
+
+        return new Regex(regex.Append('$').ToString(), RegexOptions.Singleline | RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+    }
+
+    [GeneratedRegex(@"\b(?:Microsoft\.Data\.SqlClient|SqlConnectionOpener|SqlConnection|SqlCommand|SqlCaptureConnector)\b")]
+    private static partial Regex SqlServerClient();
+
+    [GeneratedRegex(@"\b(?:Npgsql\w*|PgConnectionOpener|PgConnection)\b")]
+    private static partial Regex PostgresClient();
+
+    [GeneratedRegex(@"\bCommandText\s*=(?!=)\s*|\bnew\s+Sql(?:Batch)?Command\s*\(\s*")]
+    private static partial Regex CommandTextSite();
+
+    [GeneratedRegex("""\G(?:"{3}(?<raw>[\s\S]*?)"{3}|@"(?<verbatim>(?:[^"]|"")*)"|"(?<text>(?:[^"\\\r\n]|\\.)*)")""")]
+    private static partial Regex StringLiteral();
+
+    [GeneratedRegex(@"(?<![\w.]|SqlCommand\s)(?<helper>Text|Procedure)\(\s*")]
+    private static partial Regex HelperCall();
+
+    [GeneratedRegex(@"\bnew\s+IdleHolder\(\s*")]
+    private static partial Regex IdleHolderMade();
+
+    [GeneratedRegex(@"^\[?\w+\]?\.\[?\w+\]?$")]
+    private static partial Regex ModuleName();
 
     [GeneratedRegex(@"@\w+")]
     private static partial Regex Parameter();
@@ -236,4 +456,18 @@ public sealed partial class RcaHarnessStatementsTests
 
         public override void Visit(MergeStatement node) => Found.Add(node);
     }
+
+    private sealed class LikeVisitor : TSqlFragmentVisitor
+    {
+        public List<LikePredicate> Found { get; } = [];
+
+        public override void Visit(LikePredicate node) => Found.Add(node);
+    }
+
+    /// <summary>
+    /// A place the runner's source sets a SQL Server command's text: its file and line, the literal when it's one alone and
+    /// the expression otherwise, what's done to the command since it was made (its CommandType), and whether it's
+    /// PostgreSQL's.
+    /// </summary>
+    private sealed record CommandSite(string File, int Line, string? Literal, string Expression, string Made, bool Postgres);
 }
