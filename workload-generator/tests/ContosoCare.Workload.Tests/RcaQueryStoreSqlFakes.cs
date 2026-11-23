@@ -382,11 +382,11 @@ internal sealed class SteppedClock(ManualTime time) : TimeProvider
 }
 
 /// <summary>
-/// A target whose evidence blocks answer as <c>evidence</c>'s connection does (RcaSimulation's T1) and take no time, and
-/// whose Query Store blocks can cost time (the clock moves by it; past its timeout, by the timeout, and the block fails
-/// as SqlClient's command timeout does), fail, or throw. The connection can break at a moment: a Query Store block at it,
-/// or any block after it, fails on the connection that was open then, as does every later block on it; a connection
-/// opened after the break works.
+/// A target whose evidence blocks answer as <c>evidence</c>'s connection does (RcaSimulation's T1) and cost what
+/// <see cref="EvidenceCost"/> says, by default nothing, and whose Query Store blocks can cost time (the clock moves by it;
+/// past its timeout, by the timeout, and the block fails as SqlClient's command timeout does), fail, or throw. The
+/// connection can break at a moment: a Query Store block at it, or any block after it, fails on the connection that was
+/// open then, as does every later block on it; a connection opened after the break works.
 /// </summary>
 internal sealed class TimedConnector(ManualTime clock, ICaptureConnector evidence) : ICaptureConnector
 {
@@ -401,6 +401,9 @@ internal sealed class TimedConnector(ManualTime clock, ICaptureConnector evidenc
     public int Opens { get; private set; }
 
     public Func<string, TimeSpan> Cost { get; set; } = _ => TimeSpan.Zero;
+
+    /// <summary>What an evidence block costs, by its ID and when it ran: the clock moves by it once the block has answered.</summary>
+    public Func<string, DateTimeOffset, TimeSpan> EvidenceCost { get; set; } = (_, _) => TimeSpan.Zero;
 
     public Func<string, Exception?> Failure { get; set; } = _ => null;
 
@@ -449,9 +452,11 @@ internal sealed class TimedConnector(ManualTime clock, ICaptureConnector evidenc
 
             if (!sidecar)
             {
-                return parameters is null
+                var rows = parameters is null
                     ? await inner.QueryAsync(blockId, text, parameter, timeout, cancellationToken)
                     : await inner.QueryAsync(blockId, text, parameters, timeout, cancellationToken);
+                owner.Time.Advance(owner.EvidenceCost(blockId, at));
+                return rows;
             }
 
             var cost = owner.Cost(blockId);
@@ -484,12 +489,21 @@ internal sealed class ThrowingSidecarSink : ISidecarSink
     }
 }
 
-/// <summary>A span that keeps what a <see cref="MemorySink"/> keeps, and every watermark in order.</summary>
+/// <summary>
+/// A span that keeps what a <see cref="MemorySink"/> keeps, every watermark in order, and every attempt to write one. From
+/// <see cref="FailsAt"/>, a watermark's write fails, as SpanWriter's does when span.json can't be written after its retries.
+/// </summary>
 internal sealed class WatermarkLog(MemorySink inner) : ICaptureSpan
 {
+    public const string Failure = "span.json couldn't be written (a test's failure).";
+
     public MemorySink Inner => inner;
 
     public List<DateTimeOffset> Marks { get; } = [];
+
+    public List<DateTimeOffset> Attempts { get; } = [];
+
+    public DateTimeOffset? FailsAt { get; init; }
 
     public void Write(CaptureRow row) => inner.Write(row);
 
@@ -497,6 +511,12 @@ internal sealed class WatermarkLog(MemorySink inner) : ICaptureSpan
 
     public void Watermark(string target, DateTimeOffset complete)
     {
+        Attempts.Add(complete);
+        if (complete >= FailsAt)
+        {
+            throw new IOException(Failure);
+        }
+
         Marks.Add(complete);
         inner.Watermark(target, complete);
     }
@@ -513,11 +533,12 @@ internal static class LaneDriver
 {
     /// <summary>
     /// Begins the observer at <paramref name="from"/>; ticks it when it says, 50 ms to 1 s after the last tick ended, as
-    /// ObserverLane does; ends it at <paramref name="to"/>; and releases it, as the lane does with the end hook wired: at
-    /// the clock's time when the evidence's own end is done (EndAsync's hook), or the clock's time once EndAsync returns.
-    /// The target is the span's only member, so its release closes the span.
+    /// ObserverLane does; ends it at <paramref name="to"/> with the end hook and the clock; and releases it, as the lane
+    /// does with the hook wired, even when the end fails: at the evidence's end time the hook gets, or the clock's time once
+    /// EndAsync returns. <paramref name="evidenceEnded"/>, the test's, runs in the hook after the lane has the time. The
+    /// target is the span's only member, so its release closes the span.
     /// </summary>
-    public static async Task RunAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
+    public static async Task RunAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken, Action<DateTimeOffset>? evidenceEnded = null)
     {
         clock.Set(from);
         span.Began(observer.Target, from);
@@ -536,10 +557,24 @@ internal static class LaneDriver
             clock.Set(to);
         }
 
-        DateTimeOffset? evidenceEnded = null;
-        await observer.EndAsync(to, cancellationToken, () => evidenceEnded = clock.Now);
-        var released = evidenceEnded ?? clock.Now;
-        span.Ended(observer.Target, released);
-        span.Close(released);
+        DateTimeOffset? ended = null;
+        try
+        {
+            await observer.EndAsync(
+                to,
+                cancellationToken,
+                at =>
+                {
+                    ended = at;
+                    evidenceEnded?.Invoke(at);
+                },
+                clock);
+        }
+        finally
+        {
+            var released = ended ?? clock.Now;
+            span.Ended(observer.Target, released);
+            span.Close(released);
+        }
     }
 }
