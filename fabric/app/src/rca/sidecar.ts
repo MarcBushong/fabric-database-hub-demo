@@ -157,9 +157,18 @@ export interface SidecarEvidence {
     connections: ConnectionGroup[];
     /** The sidecar tables the history's model doesn't have (a model from before them): their rows aren't known, which is never none. */
     missing: string[];
-    /** The reads that returned as many rows as they may, by table: what they hold from `until` on wasn't read. */
-    cut?: Array<{ table: string; until: Date }>;
+    /**
+     * The reads that returned as many rows as they may, by table: what they hold from `until` on wasn't read; for a read
+     * newest first (RCA Query Plans), what they hold before `until`.
+     */
+    cut?: Array<{ table: string; until: Date; newestFirst?: boolean }>;
 }
+
+/**
+ * How long after a window its plans are read: RCA-SQL-14 reads the plans of the queries each read of RCA-SQL-10 returned,
+ * at that read's time, which is up to an interval and 2 minutes after the interval it read (rca/README.md, Query Store).
+ */
+export const PLAN_LAG_MINUTES = 30;
 
 export const emptySidecar = (): SidecarEvidence => ({ stats: [], waits: [], plans: [], events: [], coverage: [], connections: [], missing: [] });
 

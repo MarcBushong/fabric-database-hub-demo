@@ -19,8 +19,9 @@
 // https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits
 
 import { recommend } from "./catalog";
+import { notInHistoryYet } from "./queries";
 import type { ConnectionGroup } from "./sidecar";
-import { asWholeReadings, hhmmss, iso, metricIn, plural, type Confidence, type EvidenceRef, type Finding, type MetricPoint, type RcaTarget, type Recommendation, type ResourcePoint, type SessionSample } from "./types";
+import { asWholeReadings, fromTo, hhmmss, iso, metricIn, plural, type Confidence, type EvidenceRef, type Finding, type MetricPoint, type RcaTarget, type Recommendation, type ResourcePoint, type SessionSample } from "./types";
 
 /** The share of the limit at which the capture watches every 10 s, and the detector opens an episode. */
 export const CONNECTION_LEVEL = 0.8;
@@ -159,13 +160,13 @@ export function holdersOf(groups: readonly ConnectionGroup[], target: RcaTarget,
     const most = (s: readonly ConnectionGroup[]) => Math.max(...s.map((g) => g.connections));
     const ordered = [...series.values()].sort((a, b) => most(b) - most(a));
     const at = (t: number) => hhmmss(new Date(t));
-    const fromTo = (a: number, b: number) => (a === b ? `at ${at(a)}` : `from ${at(a)} to ${at(b)}`);
+    const between = (a: number, b: number) => (a === b ? `at ${at(a)}` : `from ${at(a)} to ${at(b)}`);
     const parts = ordered.map((s) => {
         const first = s[0];
         const end = s[s.length - 1];
         const top = most(s);
         const atTop = s.filter((g) => g.connections === top).map((g) => g.capturedAt.getTime());
-        const counts = s.every((g) => g.connections === top) ? `${top} ${first.state}` : `${first.connections} ${first.state} at ${at(first.capturedAt.getTime())} UTC and ${top} ${fromTo(atTop[0], atTop[atTop.length - 1])} UTC`;
+        const counts = s.every((g) => g.connections === top) ? `${top} ${first.state}` : `${first.connections} ${first.state} at ${at(first.capturedAt.getTime())} UTC and ${top} ${between(atTop[0], atTop[atTop.length - 1])} UTC`;
         const oldest =
             first.state.startsWith("idle") && first.oldestStateS !== undefined && end.oldestStateS !== undefined
                 ? s.length > 1
@@ -181,8 +182,8 @@ export function holdersOf(groups: readonly ConnectionGroup[], target: RcaTarget,
     const gone = ordered.filter((s) => s[s.length - 1].capturedAt.getTime() < last).map((s) => `the ${s[s.length - 1].state} connections of ${nameOf(s[0])}`);
     const groupList = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join("; ")}; and ${parts[parts.length - 1]}`;
     const text =
-        `Who held them, as the capture counted them by program, login, and state in ${plural(times.length, "sample")} ${fromTo(times[0], last)} UTC (RCA Connections): ${groupList}. ` +
-        `Together they held ${peak} at most, ${fromTo(atPeak[0], atPeak[atPeak.length - 1])} UTC.${gone.length ? ` At ${at(last)} UTC, the capture counted none of ${sayList(gone)}.` : ""}`;
+        `Who held them, as the capture counted them by program, login, and state in ${plural(times.length, "sample")} ${between(times[0], last)} UTC (RCA Connections): ${groupList}. ` +
+        `Together they held ${peak} at most, ${between(atPeak[0], atPeak[atPeak.length - 1])} UTC.${gone.length ? ` At ${at(last)} UTC, the capture counted none of ${sayList(gone)}.` : ""}`;
     const peakRows = rows.filter((g) => g.capturedAt.getTime() === atPeak[0]);
     return {
         text,
@@ -217,8 +218,12 @@ export function analyzeConnections(input: {
     readStopped?: boolean;
     /** Who held the connections, as the capture counted them in a connection episode (the sidecar's RCA Connections). */
     holders?: readonly ConnectionGroup[];
-    /** Its caller couldn't read them (a failed read, or a model without the table) and says so itself: never "not captured". */
-    holdersUnread?: boolean;
+    /**
+     * What's known of who held them when its caller read the history for them and found none: why (a model without the
+     * table, a read that failed, or Query Store's evidence that holds no count of them). Without it, decision C: they aren't
+     * in this history yet, or a part of the demo older than Query Store's evidence saved these minutes (notInHistoryYet).
+     */
+    holdersNote?: string;
 }): ConnectionAnalysis {
     const { target, from, to } = input;
     const notCaptured: string[] = [];
@@ -383,9 +388,11 @@ export function analyzeConnections(input: {
 
     // Who held them: the capture's counts by program, login, and state in a connection episode (RCA Connections), idle
     // ones included; else only the sessions the capture sampled, which are the ones not idle, and only while a client
-    // waited on a lock.
+    // waited on a lock. Without the counts, never "not captured": the capture counts them in every connection episode, and
+    // after a Run all session they wait on the VMs with Query Store's evidence (the review of d441fe13, decision C).
     const holders = holdersOf(input.holders ?? [], target, from, to);
     const seen = input.sessions.filter((s) => s.target === target && s.capturedAt >= from && s.capturedAt <= to && (s.backendType === undefined || s.backendType === "client backend"));
+    const holdersNote = input.holdersNote ?? `${target}: ${notInHistoryYet(target, `who held the connections ${fromTo(from, to)} UTC`)}`;
     let who = "";
     if (holders) {
         who = ` ${holders.text}`;
@@ -400,9 +407,9 @@ export function analyzeConnections(input: {
             groups.set(key, g);
         }
         who = ` Of the sessions the capture sampled (only those not idle), ${[...groups.entries()].map(([k, g]) => `${plural(g.sessions.size, "session")} came from ${k}${g.idleMs ? `, idle in a transaction for up to ${span(g.idleMs)}` : ""}`).join("; ")}.`;
-        if (!input.holdersUnread) notCaptured.push(`${target}: who held the idle connections isn't captured: the capture samples sessions (RCA-PG-01) that aren't idle, and only while a client waits on a lock; RCA-PG-10 counts the rest by state.`);
-    } else if (!input.holdersUnread) {
-        notCaptured.push(`${target}: who held the connections (their application, user, and client address) and how long each sat idle aren't captured for these minutes: RCA-PG-10 counts connections by state, and the capture samples sessions (RCA-PG-01) only while a client waits on a lock, which none did here.`);
+        notCaptured.push(holdersNote);
+    } else {
+        notCaptured.push(holdersNote);
     }
 
     const statement = `${reached}${held}.${cutOff} ${cause}${who}${fullText}${monitorText}`;

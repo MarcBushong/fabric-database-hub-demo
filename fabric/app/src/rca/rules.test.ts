@@ -631,11 +631,12 @@ describe("T4's connections against the limit, by what held them", () => {
         expect(a.rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %): 0 active, 34 idle, 0 idle in a transaction, and the capture's own");
     });
 
-    it("says exactly what isn't captured: who held the connections, how many were refused, and the states when only the total was counted", () => {
+    it("says exactly what isn't captured, how many were refused and the states when only the total was counted, and that who held the connections isn't in this history yet", () => {
         const a = ask(surge(2, 32, 0, 0));
         expect(a.notCaptured).toEqual([
             "T4: how many clients were refused at the connection limit isn't captured: PostgreSQL refuses them before they reach a session, and in this demo's live check Azure Monitor's failed connections counted none of them.",
-            "T4: who held the connections (their application, user, and client address) and how long each sat idle aren't captured for these minutes: RCA-PG-10 counts connections by state, and the capture samples sessions (RCA-PG-01) only while a client waits on a lock, which none did here.",
+            // Decision C (unit 2's review of d441fe13): the capture counts who held them in every connection episode.
+            expect.stringMatching(/^T4: who held the connections from 15:30:00 to 15:31:00 UTC isn't in this history yet, or those minutes were saved by a part of the demo older than Query Store's evidence\. .* That says nothing about Query Store on T4\.$/),
         ]);
         const totals = surge(2, 32, 0, 0).filter((r) => ["connections_total", "max_connections", "reserved_connections"].includes(r.metric));
         const b = ask(totals, []);

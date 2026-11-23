@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import { QueryFailure } from "@/data/query-client";
-import { loadSidecar, PLAN_LAG_MINUTES, rcaDax, RcaReadError, sidecarDax, tableDax, type DaxLog } from "./loader";
-import { decodeSidecar, latestReads, parseExact, SidecarFormatError, toId, type QueryStat, type QueryWait, type SidecarEvidence } from "./sidecar";
+import { loadSidecar, PLAN_LAG_MINUTES, planDax, rcaDax, RcaReadError, sidecarDax, tableDax, type DaxLog } from "./loader";
+import { decodeSidecar, emptySidecar, latestReads, parseExact, SidecarFormatError, toId, type QueryStat, type QueryWait, type SidecarEvidence } from "./sidecar";
 import { RCA_SPEC, SIDECAR_SPEC, SIDECAR_TABLES, type SidecarTableKey } from "./spec";
 import { fixtureSidecar, namesAScenario, readContract, readContractExact, SIDECAR_FIXTURES } from "./testdata/contract";
 
@@ -22,17 +22,26 @@ describe("the sidecar documents (the contract's fixtures)", () => {
             ["Parallelism", 11_620],
             ["Buffer IO", 920],
         ]);
-        const plans = s.plans.filter((p) => p.queryId === "412" && p.capturedAt.getTime() === at("20T17:20:10.050").getTime());
-        expect(plans.map((p) => [p.planId, p.isForced, p.forcingType, p.isParallel, p.estimatedCost])).toEqual([
-            ["31", true, "AUTO", false, 0.0331],
-            ["58", false, "NONE", true, 38.6],
+        // A plan's row is written when a read first returns it, and again when it changes (rca/fixtures/README.md, Plans): plan
+        // 31 at 16:50 and, forced, at 17:17; plans 58 and 40 once each, at 17:17; and the final read writes none.
+        const rowsOf = (planId: string) => s.plans.filter((p) => p.planId === planId).map((p) => [p.capturedAt.toISOString().slice(11, 16), p.isForced, p.forcingType]);
+        expect(rowsOf("31")).toEqual([
+            ["16:50", false, "NONE"],
+            ["17:17", true, "AUTO"],
         ]);
-        expect(plans.find((p) => p.planId === "58")?.compiled).toEqual(at("20T17:03:11.870"));
-        expect(plans.find((p) => p.planId === "31")?.summary).toMatch(/^Index Seek on \[care\]\.\[appointments\]\.\[ix_appointments_patient\]/);
-        expect(s.events.map((e) => [e.kind, e.at.toISOString().slice(11, 19), e.from?.toISOString().slice(11, 19), e.queryId, e.planId, e.forcingType ?? null, e.state])).toEqual([
-            ["tuning", "17:09:30", "17:09:00", "412", "31", null, "Executing"],
-            ["forced", "17:10:00", "17:09:00", "412", "31", "AUTO", "forced"],
-            ["tuning", "17:10:30", "17:10:00", "412", "31", null, "Verifying"],
+        expect([rowsOf("58"), rowsOf("40")]).toEqual([[["17:17", false, "NONE"]], [["17:17", false, "NONE"]]]);
+        expect(s.plans.filter((p) => p.capturedAt.getTime() === at("20T17:20:10.050").getTime())).toEqual([]);
+        const plan = (planId: string) => s.plans.filter((p) => p.queryId === "412" && p.planId === planId).at(-1)!;
+        expect([plan("31").isParallel, plan("31").estimatedCost, plan("31").lastCompiled]).toEqual([false, 0.0331, at("20T17:09:41.120")]);
+        expect([plan("58").isParallel, plan("58").estimatedCost, plan("58").compiled]).toEqual([true, 38.6, at("20T17:03:11.870")]);
+        expect(plan("31").summary).toContain("[care].[appointments].[ix_appointments_patient]");
+        expect(plan("58").summary).toContain("[care].[appointments].[pk_appointments]");
+        // Automatic tuning's recommendation from its first appearance, with no state before it.
+        expect(s.events.map((e) => [e.kind, e.at.toISOString().slice(11, 19), e.from?.toISOString().slice(11, 19), e.queryId, e.planId, e.forcingType ?? null, e.state, e.previousState ?? null])).toEqual([
+            ["tuning", "17:06:00", "17:05:30", "412", "31", null, "Active", null],
+            ["tuning", "17:09:30", "17:09:00", "412", "31", null, "Executing", "Active"],
+            ["forced", "17:10:00", "17:09:00", "412", "31", "AUTO", "forced", "not forced"],
+            ["tuning", "17:10:30", "17:10:00", "412", "31", null, "Verifying", "Executing"],
         ]);
         expect(s.coverage).toEqual([expect.objectContaining({ target: "T3", state: "READ_WRITE", captureMode: "AUTO", intervalMinutes: 15, readFrom: at("20T16:15:00"), readTo: at("20T17:30:00"), backfill: false, gaps: [] })]);
         expect(s.coverage[0].sources).toEqual(["RCA-SQL-10", "RCA-SQL-11", "RCA-SQL-14", "RCA-SQL-15", "RCA-AZ-03", "RCA-AZ-04"]);
@@ -208,9 +217,41 @@ describe("the sidecar's DAX loader", () => {
         for (const member of ["stats", "waits", "plans", "events", "coverage", "connections"] as const) expect(got[member], member).toEqual(expected[member]);
         expect(got.stats.map((s) => s.queryId)).toContain("-6412873301142229951");
         expect(got.missing).toEqual([]);
-        // The plans as the window's reads saw them, up to PLAN_LAG_MINUTES past its end.
+        // The plans of the queries the statistics and events name, up to PLAN_LAG_MINUTES past the window, with no lower bound.
         const plans = runDax.mock.calls.map(([q]) => q).find((q) => q.includes("'RCA Query Plans',"))!;
         expect(plans).toContain(`'RCA Query Plans'[Captured At UTC] <= DATE ( 2026, 11, 21 ) + TIME ( 11, ${PLAN_LAG_MINUTES}, 0 ),`);
+        expect(runDax.mock.calls.at(-1)![0]).toBe(plans);
+    });
+
+    // The review of d441fe13: plans were read from the window's start, so a plan that never changed, whose only row is its
+    // first read's, dropped out of later windows.
+    it("reads the plans of the window's queries newest first, with no lower bound, so a plan first read long before is there", async () => {
+        const dax = planDax(at("20T17:45:00"), at("20T19:45:00"), ["T3"], ["412", "377", "412", "-6412873301142229951", "1e5"]);
+        expect(dax).toContain(`'RCA Query Plans'[Captured At UTC] <= DATE ( 2026, 11, 20 ) + TIME ( 19, 45, 0 ),`);
+        expect(dax).not.toMatch(/\[Captured At UTC\] >=/);
+        expect(dax).toContain("'RCA Query Plans'[Query ID] IN { 412, 377, -6412873301142229951 },");
+        expect(dax).toMatch(/\nORDER BY \[Captured At UTC\] DESC$/);
+        expect(planDax(at("20T17:45:00"), at("20T19:45:00"), ["T3"])).not.toContain(" IN {");
+        // The engine, as the DAX bounds it: a window from 19:00 whose query 412 last changed plan at 17:17.
+        const fixture = fixtureSidecar("t3");
+        const later = fixture.stats.filter((r) => r.queryId === "412" && r.planId === "31" && r.intervalStart.getTime() === at("20T17:15:00").getTime()).map((r) => ({ ...r, capturedAt: at("20T19:17:05"), intervalStart: at("20T19:00:00"), intervalEnd: at("20T19:15:00") }));
+        const sidecar = { ...emptySidecar(), stats: later, plans: fixture.plans };
+        const engine = async (query: string) => {
+            const key = SIDECAR_TABLES.find((k) => query.includes(`'${SIDECAR_SPEC[k].model}',`))!;
+            const bound = (op: ">=" | "<=") => {
+                const m = new RegExp(`\\[(?:Captured At UTC|Interval (?:Start|End) UTC|Event Time UTC|Window (?:Start|End) UTC)\\] ${op} DATE \\( (\\d+), (\\d+), (\\d+) \\) \\+ TIME \\( (\\d+), (\\d+), (\\d+) \\)`).exec(query);
+                return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]) : null;
+            };
+            const [low, high] = [bound(">="), bound("<=")];
+            const time = (row: Record<string, unknown>) => Date.parse(`${String(row[(SIDECAR_SPEC[key].fields as Record<string, { model: string }>)[SIDECAR_SPEC[key].time].model])}Z`);
+            return key === "queryPlans" ? asModelRows(sidecar, key).filter((row) => (low === null || time(row) >= low) && (high === null || time(row) <= high)) : asModelRows(sidecar, key);
+        };
+        const got = await loadSidecar(engine, at("20T17:45:00"), at("20T19:15:00"), ["T3"]);
+        expect(got.plans.filter((p) => p.queryId === "412").map((p) => [p.planId, p.capturedAt.toISOString().slice(11, 16)])).toEqual([
+            ["31", "16:50"],
+            ["31", "17:17"],
+            ["58", "17:17"],
+        ]);
     });
 
     it("names the tables a model from before the sidecar doesn't have, and reads the others", async () => {

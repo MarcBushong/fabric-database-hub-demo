@@ -3,6 +3,8 @@ import type { PostgresCapture } from "@/data/model";
 import { analyzeConnections } from "./connections";
 import { LOCK_WAIT_TABLES, QUERY_STORE_TABLES } from "./explain-queries";
 import { RcaReadError } from "./loader";
+import { INVESTIGATION_PLAYBOOK } from "./playbook";
+import { QS_EVIDENCE_FIX, type QueryStoreDetails } from "./queries";
 import { emptySidecar, type SidecarEvidence } from "./sidecar";
 import type { SidecarTableKey } from "./spec";
 import { fixtureSidecar, namesAScenario } from "./testdata/contract";
@@ -76,22 +78,26 @@ describe("explain_incident's CPU and wait classes, from Query Store's evidence",
         // From 17:03, the sample before the incident's first busy minute, with the hour before and an interval after.
         expect(reads).toEqual([{ from: "2026-11-20T15:48:00.000Z", to: "2026-11-20T17:25:00.000Z", targets: ["T3"], tables: QUERY_STORE_TABLES }]);
         expect(r.rootCause).toMatchObject({ ruleIds: ["QS-PLAN-REGRESSION", "QS-PLAN-FORCED"], confidence: "high" });
+        // The facts through details, and the statement only for its numbers (the review of d441fe13).
         const s = r.rootCause!.statement;
-        expect(s).toMatch(/^T3: CPU .*UTC.* Query 412 \(\[demo\]\.\[usp_visit_summary_lookup\]\) changed to a new plan: plan 58, compiled at 17:03:11 UTC,/);
-        expect(s).toContain("The CPU rose at 17:04:00 UTC, as the new plan first ran, and automatic tuning recommended forcing the earlier plan for the same query.");
-        expect(s).toContain("The response, as measured: Plan 31 of query 412 was forced by automatic plan correction between 17:09:00 and 17:10:00 UTC");
+        expect(s).toMatch(/^T3: CPU .*UTC/);
+        for (const figure of ["Query 412", "plan 58", "17:03:11 UTC", "176 ms", "2.1 ms for plan 31", "83 times", "17:04:00 UTC", "17:09:00 and 17:10:00 UTC"]) expect(s, figure).toContain(figure);
         expect(r.rootCause!.evidence.map((e) => e.table)).toEqual(["Telemetry Snapshots", "RCA Query Stats", "RCA Query Stats", "RCA Query Plans"]);
         expect(r.findings.map((f) => f.ruleId)).toEqual(expect.arrayContaining(["QS-PLAN-REGRESSION", "QS-PLAN-FORCED", "QS-TOP-CPU"]));
-        expect(r.recommendations.map((x) => x.id)).toEqual(["CPU-FORCE-PLAN", "CPU-MISSING-INDEX"]);
+        expect(r.recommendations.map((x) => x.id)).toContain("CPU-FORCE-PLAN");
+        expect(r.recommendations.map((x) => x.id)).not.toContain("CPU-AUTO-CORRECT");
         expect(r.nextSteps).toContain("Compare plan 58 with plan 31 of query 412: explain_queries with queryId 412 gives both plans' shapes and figures.");
         expect(r.nextSteps.join(" ")).toMatch(/^Read the queries and plans in Query Store on T3 for from 17:03:00 to 17:10:00 UTC while it keeps them \(14 days\)/);
         // What this history holds replaces what the capture didn't collect, and the ready-to-run query for minutes without it.
         expect(r.notCaptured.join(" ")).not.toMatch(/doesn't collect|isn't in this history/);
         expect(r.details).not.toHaveProperty("queryStoreQueries");
-        const qs = r.details!.queryStore as Array<{ target: string; recorded: string; top: Array<{ queryId: string }> }>;
+        const qs = r.details!.queryStore as QueryStoreDetails[];
         expect(qs).toHaveLength(1);
         expect(qs[0]).toMatchObject({ target: "T3", recorded: "yes" });
         expect(qs[0].top[0].queryId).toBe("412");
+        expect(qs[0].planChanges[0]).toMatchObject({ queryId: "412", newPlan: { planId: "58" }, before: [expect.objectContaining({ planId: "31" })], mixed: { otherExecutions: 668 } });
+        expect(qs[0].planChanges[0].times).toBeCloseTo(83.4, 1);
+        expect(qs[0].forcings[0]).toMatchObject({ kind: "forced", planId: "31", forcingType: "AUTO" });
         expect(namesAScenario(JSON.stringify(r))).toEqual([]);
     });
 
@@ -103,10 +109,17 @@ describe("explain_incident's CPU and wait classes, from Query Store's evidence",
         expect(older.nextSteps[0]).toMatch(/^Read Query Store on T3 for the queries and plans that used the CPU from 17:04:00 to 17:10:00 UTC: its Top Resource Consuming Queries/);
         expect(older.details!.queryStoreQueries).toEqual([expect.objectContaining({ target: "T3", language: "tsql", database: "ContosoCare", fromUtc: "2026-11-20T17:04:00Z", toUtc: "2026-11-20T17:10:00Z" })]);
 
+        // No coverage row for those minutes: decision C, in the cause and in what this history doesn't hold (the review of d441fe13).
         const none = await cpuIncident(toolsWith(emptySidecar()).tools);
-        expect(none.rootCause?.statement).toMatch(/Which queries drove it isn't in this history: the capture holds no Query Store statistics for those minutes\.$/);
-        expect(none.notCaptured).toContain("T3: the capture holds no Query Store statistics from 17:03:00 to 17:10:00 UTC: it didn't read Query Store then (a history saved before it did, or the capture wasn't running), which says nothing about Query Store on T3.");
-        for (const r of [older, none]) expect(r.notCaptured.join(" ")).not.toMatch(/doesn't collect Query Store's per-query statistics yet/);
+        expect(none.rootCause?.statement).toMatch(/UTC\b.* Which queries drove it isn't in this history yet, or those minutes were saved by a part of the demo older than Query Store's evidence\. /);
+        expect(none.rootCause?.statement).toContain(QS_EVIDENCE_FIX);
+        expect(none.rootCause?.statement).toMatch(/ That says nothing about Query Store on T3\.$/);
+        expect(none.notCaptured).toContainEqual(expect.stringMatching(/^T3: Query Store's evidence from 17:03:00 to 17:10:00 UTC isn't in this history yet, /));
+        expect(none.details!.queryStoreQueries).toHaveLength(1);
+        // A coverage row, and no query in what it read: said as such.
+        const read = { ...emptySidecar(), coverage: fixtureSidecar("t3").coverage };
+        expect((await cpuIncident(toolsWith(read).tools)).rootCause?.statement).toMatch(/ Which queries drove it isn't in this history: Query Store's evidence of those minutes holds no query\.$/);
+        for (const r of [older, none]) expect(r.notCaptured.join(" ")).not.toMatch(/doesn't collect Query Store's per-query statistics yet|not captured|didn't read/);
     });
 
     it("says a read that failed couldn't be read, never that nothing was recorded, and still answers with the telemetry", async () => {
@@ -154,6 +167,13 @@ describe("explain_locking's statements, from Query Store's lock waits", () => {
     });
 });
 
+// Decision C (the review of d441fe13): the chat relays a tool's "isn't in this history yet" with its fix, never "not captured".
+describe("the playbook, for Query Store's evidence that isn't in this history yet", () => {
+    it("tells the chat to say so, with the tool's fix, and never not captured for those minutes", () => {
+        expect(INVESTIGATION_PLAYBOOK).toContain('say what they say there: "not captured" and what would capture it, or that Query Store\'s evidence isn\'t in this history yet, with its fix.');
+        expect(INVESTIGATION_PLAYBOOK).toContain("say exactly that, with the fix it gives, and that it says nothing about Query Store on the target: for those minutes, never \"not captured\", and never that the capture didn't read Query Store.");
+    });
+});
 describe("explain_queries, the chat's tool", () => {
     const minutes = { target: "T3", from: "2026-11-20T17:03:00Z", to: "2026-11-20T17:10:00Z" };
 
@@ -215,14 +235,20 @@ describe("T4's connections, by who held them (RCA Connections)", () => {
         expect(namesAScenario(JSON.stringify(a))).toEqual([]);
     });
 
-    it("says who held them isn't captured only when nothing counted them, and leaves it to a caller that couldn't read them", () => {
-        expect(analyzeConnections({ ...minutes, holders: [] }).notCaptured).toContain(
-            "T4: who held the connections (their application, user, and client address) and how long each sat idle aren't captured for these minutes: RCA-PG-10 counts connections by state, and the capture samples sessions (RCA-PG-01) only while a client waits on a lock, which none did here.",
-        );
-        expect(analyzeConnections({ ...minutes, holdersUnread: true }).notCaptured.join(" ")).not.toMatch(WHO_NOT);
+    // Decision C (the review of d441fe13): the capture counts them in every connection episode, and after a Run all session
+    // they wait on the VMs with Query Store's evidence; "aren't captured" was a false cause.
+    it("says, without the counts, that who held them isn't in this history yet, or a caller's note of why", () => {
+        const none = analyzeConnections({ ...minutes, holders: [] }).notCaptured;
+        const line = none.find((l) => l.startsWith("T4: who held the connections from 10:06:00 to 10:12:00 UTC isn't in this history yet, or those minutes were saved by a part of the demo older than Query Store's evidence. "));
+        expect(line).toContain(QS_EVIDENCE_FIX);
+        expect(line).toMatch(/ That says nothing about Query Store on T4\.$/);
+        expect(none.join(" ")).not.toMatch(/who held [^.]*(isn't|aren't) captured/);
+        const noted = analyzeConnections({ ...minutes, holdersNote: "T4: why." }).notCaptured;
+        expect(noted).toContain("T4: why.");
+        expect(noted.join(" ")).not.toMatch(/who held the connections [^.]* isn't in this history yet/);
     });
 
-    it("explain_incident reads them for the connections episode, and says when the model lacks them or the read failed", async () => {
+    it("explain_incident reads them for the connections episode, and says when the model lacks them, the read failed, or what it read holds none", async () => {
         // The capture's connection episode, as it records one: escalated at the first sample at the level, relaxed when they fell.
         const code = "T4-20261121T100600Z";
         const evidence: Evidence = {
@@ -240,16 +266,26 @@ describe("T4's connections, by who held them (RCA Connections)", () => {
             return { r: await ask(tools, "explain_incident", { episodeKey: episode.key }), reads };
         };
         const { r, reads } = await explain(surge);
-        expect(reads).toEqual([{ from: "2026-11-21T10:06:00.000Z", to: "2026-11-21T10:13:00.000Z", targets: ["T4"], tables: ["connections"] }]);
+        expect(reads).toEqual([{ from: "2026-11-21T10:06:00.000Z", to: "2026-11-21T10:13:00.000Z", targets: ["T4"], tables: ["connections", "queryCoverage"] }]);
         expect(r.rootCause?.statement).toContain(WHO);
         expect(r.notCaptured.join(" ")).not.toMatch(WHO_NOT);
 
         const older = (await explain({ ...emptySidecar(), missing: ["RCA Connections"] })).r;
         expect(older.notCaptured).toContain("T4: who held the connections isn't in this history: its model doesn't have RCA Connections yet; ./scripts/deploy.ps1 updates the model.");
-        expect(older.notCaptured.join(" ")).not.toMatch(/aren't captured for these minutes/);
+        expect(older.notCaptured.join(" ")).not.toMatch(/aren't captured|isn't in this history yet/);
 
         const failed = (await explain(failure())).r;
         expect(failed.notCaptured).toContain(`T4: who held the connections from 10:06:00 to 10:13:00 UTC couldn't be read, so they aren't named: ${failure().message}`);
         expect(failed.rootCause?.statement).not.toContain("Who held them");
+
+        // Query Store's evidence of those minutes is in the history, with no count of who held them: its gaps say why.
+        const refused = "RCA-PG-17 was refused: it needs pg_read_all_stats.";
+        const read = (await explain({ ...emptySidecar(), coverage: surge.coverage.map((c) => ({ ...c, gaps: [...c.gaps, refused] })) })).r;
+        expect(read.notCaptured).toEqual(expect.arrayContaining(["T4: Query Store's evidence in this history holds no count of who held the connections from 10:06:00 to 10:13:00 UTC.", `T4: ${refused}`]));
+        expect(read.notCaptured.join(" ")).not.toMatch(/isn't in this history yet|Pending publication:/);
+
+        // Neither the counts nor the coverage: decision C.
+        const none = (await explain(emptySidecar())).r;
+        expect(none.notCaptured).toContainEqual(expect.stringMatching(/^T4: who held the connections from 10:06:00 to 10:13:00 UTC isn't in this history yet, /));
     });
 });

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { analyzeQueries, QS_RETENTION_DAYS, type QueryIncident } from "./queries";
-import { emptySidecar, type SidecarEvidence } from "./sidecar";
+import { analyzeQueries, QS_EVIDENCE_FIX, QS_RETENTION_DAYS, type QueryIncident } from "./queries";
+import { emptySidecar, type QueryCoverage, type SidecarEvidence } from "./sidecar";
 import { fixtureSidecar, namesAScenario } from "./testdata/contract";
 
 const at = (text: string) => new Date(`2026-11-${text}Z`);
@@ -12,17 +12,12 @@ const t3 = (sidecar: SidecarEvidence = fixtureSidecar("t3"), incident: QueryInci
     analyzeQueries({ target: "T3", from: at("20T17:03:00"), to: at("20T17:10:00"), sidecar, now: NOW, incident });
 
 describe("Query Store's rules: T3's plan regression (t3-plan-regression)", () => {
+    // The review of d441fe13: the facts through details, and the text only for its numbers, so the reader's own words (the
+    // plan summaries, A1's) can change without changing what the rules found.
     it("finds the regression from the sidecar alone: both plans, the baseline, the mixed interval, and the response as measured", () => {
         const a = t3();
         expect(a.rootCause?.ruleIds).toEqual(["QS-PLAN-REGRESSION", "QS-PLAN-FORCED"]);
         expect(a.rootCause?.confidence).toBe("high");
-        const s = a.rootCause!.statement;
-        expect(s).toContain("Query 412 ([demo].[usp_visit_summary_lookup]) changed to a new plan: plan 58, compiled at 17:03:11 UTC, which took 176 ms of CPU an execution over its 524 executions from 17:03:12 to 17:09:40 UTC, against 2.1 ms for plan 31 in Query Store's 15-minute intervals from 16:15 to 17:00 UTC: 83 times as much.");
-        expect(s).toContain("Query Store's 15-minute interval from 17:00 to 17:15 UTC is mixed: plan 31 also ran 668 times in it, and plan 58 used 96 % of the captured top queries' CPU in it (92,224 of 95,644 ms).");
-        expect(s).toContain("Plan 58's shape, from its showplan: Clustered Index Scan on [care].[appointments].[pk_appointments], every row");
-        expect(s).toContain(
-            "The response, as measured: Plan 31 of query 412 was forced by automatic plan correction between 17:09:00 and 17:10:00 UTC (automatic tuning's recommendation: Executing at 17:09:30 UTC, Verifying at 17:10:30 UTC). It was compiled again at 17:09:41 UTC. Plan 58 last ran at 17:09:40 UTC. From Query Store's 15-minute interval from 17:15 to 17:30 UTC, plan 31 ran alone, 371 times at 2.1 ms of CPU each; the last interval was still open when the capture last read it, at 17:20:10 UTC.",
-        );
         const change = a.details.planChanges[0];
         expect(change).toMatchObject({ queryId: "412", measure: "cpu", regression: true, mixed: { start: "2026-11-20T17:00:00Z", end: "2026-11-20T17:15:00Z", otherExecutions: 668 } });
         expect(change.newPlan).toMatchObject({ planId: "58", compiledInWindow: true, isParallel: true, maxDop: 4, estimatedCost: 38.6, executions: 524, firstExecutionUtc: "2026-11-20T17:03:12Z" });
@@ -34,11 +29,22 @@ describe("Query Store's rules: T3's plan regression (t3-plan-regression)", () =>
             { category: "CPU", waitMs: 18_900 },
             { category: "Parallelism", waitMs: 11_620 },
         ]);
-        // Automatic plan correction already forced it: no advice to turn it on.
-        expect(a.recommendations.map((r) => r.id)).toEqual(["CPU-FORCE-PLAN", "CPU-MISSING-INDEX"]);
         expect(a.details.forcings).toEqual([expect.objectContaining({ kind: "forced", queryId: "412", planId: "31", forcingType: "AUTO", from: "2026-11-20T17:09:00Z", at: "2026-11-20T17:10:00Z" })]);
-        expect(a.details.tuning.map((t) => t.state)).toEqual(["Executing", "Verifying"]);
+        expect(a.details.forcings[0].after).toMatchObject({ executions: 371, from: "2026-11-20T17:15:00Z", openWhenRead: true });
+        expect(a.details.forcings[0].after?.cpuMs).toBeCloseTo(2.1, 1);
+        // Automatic tuning's recommendation, from its first appearance (Active, with no state before it).
+        expect(a.details.tuning.map((t) => [t.state, t.previousState ?? null, t.at])).toEqual([
+            ["Active", null, "2026-11-20T17:06:00Z"],
+            ["Executing", "Active", "2026-11-20T17:09:30Z"],
+            ["Verifying", "Executing", "2026-11-20T17:10:30Z"],
+        ]);
         expect(a.details).toMatchObject({ recorded: "yes", intervalMinutes: 15, intervals: { from: "2026-11-20T17:00:00Z", to: "2026-11-20T17:15:00Z" }, state: { state: "READ_WRITE", captureMode: "AUTO", intervalMinutes: 15 } });
+        // The statement says the same numbers.
+        const s = a.rootCause!.statement;
+        for (const figure of ["plan 58", "17:03:11 UTC", "176 ms", "524 executions", "2.1 ms for plan 31", "83 times", "668 times", "96 %", "92,224 of 95,644 ms", "17:09:00 and 17:10:00 UTC", "371 times", "17:20:10 UTC"]) expect(s, figure).toContain(figure);
+        // Automatic plan correction already forced it: no advice to turn it on.
+        expect(a.recommendations.map((r) => r.id)).toContain("CPU-FORCE-PLAN");
+        expect(a.recommendations.map((r) => r.id)).not.toContain("CPU-AUTO-CORRECT");
     });
 
     it("says why it's sure: the CPU's rise at the new plan's first run, or a tuning recommendation naming the same plans; medium with neither", () => {
@@ -143,16 +149,78 @@ describe("Query Store's rules: what this history doesn't hold", () => {
         expect(a.notCaptured).toEqual(["T3: this history's model doesn't have Query Store's tables yet (RCA Query Coverage, RCA Query Stats), so it holds no per-query statistics; ./scripts/deploy.ps1 updates the model."]);
     });
 
-    it("says why there are no rows: what the capture read of Query Store, or that it didn't read it then", () => {
-        expect(analyzeQueries({ ...window, sidecar: emptySidecar() }).notCaptured).toEqual([
-            "T3: the capture holds no Query Store statistics from 17:03:00 to 17:10:00 UTC: it didn't read Query Store then (a history saved before it did, or the capture wasn't running), which says nothing about Query Store on T3.",
-        ]);
+    // Decision C (unit 2's plan, revision 2; the review of d441fe13): after a Run all session the capture did read Query
+    // Store, and its evidence waits on the VMs, so "it didn't read Query Store then" was a false cause.
+    it("says minutes with no coverage row aren't in this history yet, or were saved by an older part, with the fix, never that they weren't captured", () => {
+        const a = analyzeQueries({ ...window, sidecar: emptySidecar() });
+        expect(a.details).toMatchObject({ recorded: "no-rows", state: null });
+        expect(a.notCaptured).toHaveLength(1);
+        const [line] = a.notCaptured;
+        expect(line).toMatch(/^T3: Query Store's evidence from 17:03:00 to 17:10:00 UTC isn't in this history yet, or those minutes were saved by a part of the demo older than Query Store's evidence\. /);
+        expect(line).toContain(`waits on the VMs until a save from the scripts takes it: ${QS_EVIDENCE_FIX}.`);
+        expect(QS_EVIDENCE_FIX).toMatch(/^\.\/scripts\/deploy\.ps1, then \.\/scripts\/stop-demo\.ps1 -SaveHistory with the VMs running \(\.\/scripts\/start-demo\.ps1 first/);
+        expect(line).toMatch(/ That says nothing about Query Store on T3\.$/);
+        expect(line).not.toMatch(/not captured|no Query Store\b|didn't read|wasn't running/i);
+    });
+
+    it("says what the capture read held no query, with Query Store's state when it's worth saying, and each gap as its own line", () => {
         const readOnly = emptySidecar();
         readOnly.coverage.push({ target: "T3", from: at("20T16:50:00"), to: at("20T17:20:00"), state: "READ_ONLY", backfill: false, sources: ["RCA-SQL-15"], gaps: ["Query Store was READ_ONLY from 16:58: it reached its size limit (readonly_reason 65536)."] });
-        expect(analyzeQueries({ ...window, sidecar: readOnly }).notCaptured).toEqual([
-            "T3: the capture holds no Query Store statistics from 17:03:00 to 17:10:00 UTC: Query Store was READ_ONLY when it read it (Query Store was READ_ONLY from 16:58: it reached its size limit (readonly_reason 65536).).",
+        const a = analyzeQueries({ ...window, sidecar: readOnly });
+        expect(a.details).toMatchObject({ recorded: "no-rows", state: { state: "READ_ONLY" } });
+        expect(a.notCaptured).toEqual([
+            "T3: Query Store's evidence in this history holds no query from 17:03:00 to 17:10:00 UTC: Query Store was READ_ONLY when the capture read it.",
+            "T3: Query Store was READ_ONLY from 16:58: it reached its size limit (readonly_reason 65536).",
         ]);
-        for (const line of analyzeQueries({ ...window, sidecar: emptySidecar() }).notCaptured) expect(line).not.toMatch(/T3 (has|doesn't have) (no )?Query Store/);
+        for (const line of a.notCaptured) expect(line).not.toMatch(/T3 (has|doesn't have) (no )?Query Store/);
+    });
+
+    // The review of d441fe13: on PostgreSQL the state is the capture mode, and "all" read as an abnormal state.
+    it("says T4's capture mode only when it's none, and only the gaps of rows whose own window holds the minutes", () => {
+        const minutes = { target: "T4" as const, from: at("20T18:00:00"), to: at("20T18:10:00"), now: NOW };
+        const row = (state: string, gaps: string[]): QueryCoverage => ({ target: "T4", from: at("20T17:55:00"), to: at("20T18:20:00"), state, readFrom: at("20T17:45:00"), readTo: at("20T18:15:00"), backfill: false, sources: ["RCA-PG-13"], gaps });
+        const holding = "T4: Query Store's evidence in this history holds no query from 18:00:00 to 18:10:00 UTC";
+        const all = { ...emptySidecar(), coverage: [row("all", ["Pending publication: Query Store shows an interval only once it ends, so 18:15 to 18:20 is read at the next start while T4 runs."])] };
+        expect(analyzeQueries({ ...minutes, sidecar: all }).notCaptured).toEqual([`${holding}.`]);
+        expect(analyzeQueries({ ...minutes, sidecar: { ...emptySidecar(), coverage: [row("none", [])] } }).notCaptured).toEqual([`${holding}: its capture mode was none.`]);
+        // A row whose read reached the minutes, but whose own window doesn't hold them, says nothing of them.
+        const earlier = { ...emptySidecar(), coverage: [{ ...row("all", ["The sidecar's budget cut each plan's waits past its three largest."]), from: at("20T17:30:00"), to: at("20T17:55:00") }] };
+        expect(analyzeQueries({ ...minutes, sidecar: earlier }).notCaptured).toEqual([`${holding}.`]);
+    });
+
+    // The review of d441fe13: with Query Store's rows there, a cut of the sidecar's budget or a refused read vanished.
+    it("says each overlapping row's gaps beside Query Store's rows too, as lines with their target", () => {
+        const s = fixtureSidecar("t3");
+        const gaps = ["The sidecar's budget cut the plan summaries of query 377's plans.", "RCA-AZ-04 was refused: it needs VIEW SERVER PERFORMANCE STATE, through ##MS_ServerStateReader##."];
+        s.coverage = s.coverage.map((c) => ({ ...c, gaps }));
+        const a = t3(s);
+        expect(a.details.recorded).toBe("yes");
+        expect(a.notCaptured).toEqual(gaps.map((g) => `T3: ${g}`));
+        expect(t3().notCaptured).toEqual([]);
+    });
+
+    // Contract b1c12d23: a backfill that finds T4 started again during a pending range calls what Query Store doesn't show of
+    // it "Lost when T4 stopped", never pending (A2's gap, as the runner writes it).
+    it("takes a range a backfill finished out of what's pending, and says what it lost in its gap's words", () => {
+        const lost = "Lost when T4 stopped: Query Store shows nothing of 2026-11-20 17:15 to 2026-11-20 17:20 UTC, which it still held in memory when T4 stopped, and T4 has started again since, so none of it will show.";
+        const backfill = (extra: Partial<QueryCoverage>): QueryCoverage => ({ target: "T4", from: at("20T17:15:00"), to: at("20T17:20:00"), state: "all", backfill: true, sources: ["RCA-PG-13"], gaps: [], ...extra });
+        const minutes = { target: "T4" as const, from: at("20T17:15:00"), to: at("20T17:20:00"), now: NOW };
+        const s = fixtureSidecar("t4");
+        s.coverage.push(backfill({ gaps: [lost] }));
+        const a = analyzeQueries({ ...minutes, sidecar: s });
+        expect(a.details).toMatchObject({ recorded: "no-rows", pending: [] });
+        expect(a.notCaptured).toEqual(["T4: Query Store's evidence in this history holds no query from 17:15:00 to 17:20:00 UTC.", `T4: ${lost}`]);
+        expect(a.notCaptured.join(" ")).not.toMatch(/pending publication|next start/i);
+        // A backfill that still waits takes the range's place with what's left of it.
+        const waits = fixtureSidecar("t4");
+        waits.coverage.push(backfill({ readFrom: at("20T17:15:00"), readTo: at("20T17:15:00"), pendingFrom: at("20T17:15:00"), pendingTo: at("20T17:20:00") }));
+        expect(analyzeQueries({ ...minutes, sidecar: waits }).details.pending).toEqual([{ from: "2026-11-20T17:15:00Z", to: "2026-11-20T17:20:00Z", expired: false }]);
+        // One that waited, then one that finished: neither range is pending any more.
+        const twice = fixtureSidecar("t4");
+        twice.coverage.push(backfill({ readFrom: at("20T17:15:00"), readTo: at("20T17:15:00"), pendingFrom: at("20T17:15:00"), pendingTo: at("20T17:20:00") }), backfill({ gaps: [lost] }));
+        const after = analyzeQueries({ ...minutes, sidecar: twice });
+        expect(after.details.pending).toEqual([]);
+        expect(after.notCaptured).toContain(`T4: ${lost}`);
     });
 
     it("sends a DBA to the target's own Query Store while it keeps the minutes, and says when it no longer does", () => {

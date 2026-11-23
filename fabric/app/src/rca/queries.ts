@@ -17,7 +17,7 @@
 //   QS-LOCK-WAITS           the queries that waited on locks, for a blocking chain
 
 import { recommend } from "./catalog";
-import { latestReads, type QueryCoverage, type QueryEvent, type QueryPlan, type QueryStat, type QueryWait, type SidecarEvidence } from "./sidecar";
+import { latestReads, PLAN_LAG_MINUTES, type QueryCoverage, type QueryEvent, type QueryPlan, type QueryStat, type QueryWait, type SidecarEvidence } from "./sidecar";
 import { fromTo, hhmmss, iso, plural, spanEnds, type Confidence, type EvidenceRef, type Finding, type RcaTarget, type Recommendation, type ResourcePoint } from "./types";
 
 /** Query Store's interval, in minutes, when the rows don't say: the demo's on every target (each database's 030-configure.sql; T4's default). */
@@ -571,21 +571,86 @@ function tuningOf(w: Windowed, events: readonly QueryEvent[], from: Date, to: Da
         .map((e) => clean<TuningView>({ at: iso(e.at), from: e.from ? iso(e.from) : undefined, queryId: e.queryId, planId: e.planId, state: e.state, previousState: e.previousState, detail: e.detail }));
 }
 
-/** PostgreSQL's minutes its Query Store hadn't published when read, less what a later read took; expired past its retention. */
+/**
+ * PostgreSQL's minutes its Query Store hadn't published when read, less what a later read took; expired past its retention.
+ * A backfill (rca_query_coverage.backfill) reads a pending range again once Query Store has published it. One with no
+ * pending range of its own finished the range: what it read is in the statistics, and what it couldn't, its gaps say
+ * (gapLines: "Lost when T4 stopped", or the range expired; rca/README.md, Pending publication). One that still waits
+ * takes the earlier range's place with its own, what's left of it.
+ */
 function pendingOf(target: RcaTarget, coverage: readonly QueryCoverage[], stats: readonly QueryStat[], from: Date, to: Date, now: Date): PendingView[] {
     if (queryStoreOf(target) !== "postgresql") return [];
     const read = (a: Date, b: Date) =>
         coverage.some((c) => c.target === target && c.readFrom && c.readTo && c.readFrom.getTime() <= a.getTime() && c.readTo.getTime() >= b.getTime()) ||
         stats.some((s) => s.target === target && s.intervalStart.getTime() <= a.getTime() && s.intervalEnd.getTime() >= b.getTime());
+    const pendingIn = (c: QueryCoverage, a: Date, b: Date) => !!c.pendingFrom && !!c.pendingTo && c.pendingTo.getTime() > a.getTime() && c.pendingFrom.getTime() < b.getTime();
     const keeps = (QS_RETENTION_DAYS[target] ?? 7) * DAY;
     const out: PendingView[] = [];
     for (const c of coverage) {
         if (c.target !== target || !c.pendingFrom || !c.pendingTo) continue;
         if (c.pendingTo.getTime() <= from.getTime() || c.pendingFrom.getTime() >= to.getTime() || read(c.pendingFrom, c.pendingTo)) continue;
-        if (out.some((p) => p.from === iso(c.pendingFrom!) && p.to === iso(c.pendingTo!))) continue;
-        out.push({ from: iso(c.pendingFrom), to: iso(c.pendingTo), expired: now.getTime() - c.pendingTo.getTime() > keeps });
+        const [a, b] = [c.pendingFrom, c.pendingTo];
+        const backfills = coverage.filter((x) => x !== c && x.target === target && x.backfill && x.from.getTime() <= a.getTime() && x.to.getTime() >= b.getTime());
+        if (backfills.some((x) => !pendingIn(x, a, b))) continue;
+        if (!c.backfill && backfills.length) continue;
+        if (out.some((p) => p.from === iso(a) && p.to === iso(b))) continue;
+        out.push({ from: iso(a), to: iso(b), expired: now.getTime() - b.getTime() > keeps });
     }
     return out;
+}
+
+/** Whether a coverage row's own window overlaps the minutes asked about (an instant: holds it). */
+const overlapsWindow = (c: QueryCoverage, from: Date, to: Date) =>
+    from.getTime() === to.getTime() ? c.from.getTime() <= from.getTime() && c.to.getTime() >= to.getTime() : c.from.getTime() < to.getTime() && c.to.getTime() > from.getTime();
+
+/**
+ * The coverage rows' gaps for the minutes, each a line with its target: of every row whose own window overlaps them, also
+ * when Query Store's rows are there (a cut of the sidecar's budget, a refused read, a timeout, T4's lost window), but for
+ * the lines of publication still pending, which pendingOf words (the review of d441fe13). A line that starts with a target
+ * already names it.
+ */
+export function coverageGapLines(target: RcaTarget, coverage: readonly QueryCoverage[], from: Date, to: Date): string[] {
+    const lines: string[] = [];
+    for (const c of coverage) {
+        if (c.target !== target || !overlapsWindow(c, from, to)) continue;
+        for (const gap of c.gaps) {
+            if (/^Pending publication:/.test(gap)) continue;
+            const line = /^(T[1-5])\b/.test(gap) ? gap : `${target}: ${gap}`;
+            if (!lines.includes(line)) lines.push(line);
+        }
+    }
+    return lines;
+}
+
+/**
+ * Query Store's state as the rows of the minutes read it, when it's worth saying: on SQL Server, anything but READ_WRITE;
+ * on PostgreSQL, whose state is its capture mode (top, all, or none), only none (the review of d441fe13: "all" read as
+ * an abnormal state).
+ */
+function unusualState(target: RcaTarget, rows: readonly QueryCoverage[]): string | null {
+    if (queryStoreOf(target) === "postgresql") return rows.some((c) => c.state === "none") ? "its capture mode was none" : null;
+    const states = [...new Set(rows.map((c) => c.state).filter((s): s is string => !!s && s !== "READ_WRITE"))];
+    return states.length ? `Query Store was ${states.join(", then ")} when the capture read it` : null;
+}
+
+/**
+ * How Query Store's evidence comes into the history, as T2a's troubleshooting rows say it (eea61a49, 8e2ada18): a Run all
+ * session leaves its sidecars on the VMs until a save from the scripts takes them, and a save exports only from running VMs
+ * (Invoke-DemoRcaScriptExport); the update comes first, as decision C has it. Run all's own path, a later release, changes it.
+ */
+export const QS_EVIDENCE_FIX = "./scripts/deploy.ps1, then ./scripts/stop-demo.ps1 -SaveHistory with the VMs running (./scripts/start-demo.ps1 first when they're stopped)";
+
+/**
+ * Decision C (unit 2's integration plan, revision 2, section 0), the one place its words live: what the RCA says of minutes
+ * for which this history holds no Query Store coverage row. After a Run all session the capture did read Query Store, and
+ * its sidecars wait on the VMs until a save from the scripts takes them; or a part of the demo older than the sidecar saved
+ * those minutes. So: not in this history yet, or saved by an older part, with the fix, and nothing about the target; never
+ * that it has no Query Store, or that its evidence wasn't captured (the review of d441fe13: "it didn't read Query Store
+ * then" was false after a Run all session). `subject` names what isn't there: "Query Store's evidence from ... UTC", "Which
+ * queries drove it", "who held the connections ...".
+ */
+export function notInHistoryYet(target: RcaTarget, subject: string): string {
+    return `${subject} isn't in this history yet, or those minutes were saved by a part of the demo older than Query Store's evidence. After a Run all session, that evidence waits on the VMs until a save from the scripts takes it: ${QS_EVIDENCE_FIX}. That says nothing about Query Store on ${target}.`;
 }
 
 /** The target's measured CPU in the minutes (RCA Resource: T3's resource governance, avg_cpu_percent of its cap). */
@@ -608,11 +673,10 @@ function notRecordedWords(target: RcaTarget, recorded: QueryStoreRecorded, sidec
         case "pending":
             return [];
         default: {
-            const gaps = [...new Set(coverage.flatMap((c) => c.gaps))];
-            const states = [...new Set(coverage.map((c) => c.state).filter((s): s is string => !!s && s !== "READ_WRITE"))];
-            if (gaps.length || states.length) return [`${target}: the capture holds no Query Store statistics ${minutes}${states.length ? `: Query Store was ${states.join(", then ")} when it read it` : ""}${gaps.length ? ` (${gaps.join("; ")})` : ""}.`];
-            if (coverage.length) return [`${target}: Query Store's top lists hold no query ${minutes}.`];
-            return [`${target}: the capture holds no Query Store statistics ${minutes}: it didn't read Query Store then (a history saved before it did, or the capture wasn't running), which says nothing about Query Store on ${target}.`];
+            // No coverage row for these minutes: decision C, never "no Query Store" or "not captured".
+            if (coverage.length === 0) return [`${target}: ${notInHistoryYet(target, `Query Store's evidence ${minutes}`)}`];
+            const state = unusualState(target, coverage.filter((c) => overlapsWindow(c, from, to)));
+            return [`${target}: Query Store's evidence in this history holds no query ${minutes}${state ? `: ${state}` : ""}.`];
         }
     }
 }
@@ -671,7 +735,7 @@ export function analyzeQueries(input: QueryStoreInput): QueryStoreAnalysis {
     const rankBy = input.rankBy ?? "cpu";
     const coverage = input.sidecar.coverage.filter((c) => c.target === target && ((c.to.getTime() >= from.getTime() && c.from.getTime() <= to.getTime()) || (!!c.readFrom && !!c.readTo && c.readTo.getTime() >= from.getTime() && c.readFrom.getTime() <= to.getTime())));
     const w = windowed(input);
-    const plans = latestPlans(input.sidecar.plans, target, new Date(to.getTime() + 30 * MIN));
+    const plans = latestPlans(input.sidecar.plans, target, new Date(to.getTime() + PLAN_LAG_MINUTES * MIN));
     const intervalsFrom = w.inWindow.length ? new Date(Math.min(...w.inWindow.map((s) => s.intervalStart.getTime()))) : null;
     const intervalsTo = w.inWindow.length ? new Date(Math.max(...w.inWindow.map((s) => s.intervalEnd.getTime()))) : null;
     const pending = pendingOf(target, input.sidecar.coverage, w.stats, from, to, input.now);
@@ -700,7 +764,11 @@ export function analyzeQueries(input: QueryStoreInput): QueryStoreAnalysis {
         retention: retention ? { days: retention.days, past: retention.past } : null,
         measuredCpu: measuredCpuOf(input.resource, target, from, to),
     });
-    const notCaptured = recorded === "yes" ? [] : notRecordedWords(target, recorded, input.sidecar, coverage, from, to);
+    const notCaptured = [
+        ...(recorded === "yes" ? [] : notRecordedWords(target, recorded, input.sidecar, coverage, from, to)),
+        // The rows' gaps, also beside Query Store's rows; a read replica's and T5's say only what the line above says.
+        ...(kind === "sql" || kind === "postgresql" ? coverageGapLines(target, input.sidecar.coverage, from, to) : []),
+    ];
     for (const p of pending) {
         notCaptured.push(
             p.expired

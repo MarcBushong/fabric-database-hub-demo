@@ -3,11 +3,11 @@
 // investigations and gives it their window, episodes, and envelope; this file holds what's its own: its parameters, its
 // arguments' checks, the minutes it reads (the hour before, for a baseline), and its answer.
 
-import { BASELINE_MINUTES, QS_INTERVAL_MINUTES, QUERY_RANKS, analyzeQueries, queryStoreOf, type QueryIncident, type QueryRank, type QueryStoreAnalysis, type QueryStoreDetails } from "./queries";
+import { BASELINE_MINUTES, QS_INTERVAL_MINUTES, QUERY_RANKS, analyzeQueries, notInHistoryYet, queryStoreOf, type QueryIncident, type QueryRank, type QueryStoreAnalysis, type QueryStoreDetails } from "./queries";
 import { unexplainedByQuery } from "./query-store";
 import { emptySidecar, type SidecarEvidence } from "./sidecar";
 import type { SidecarTableKey } from "./spec";
-import { fromTo, hhmmss, isRcaTarget, RCA_TARGETS, type Episode, type InvestigationResult, type RcaTarget, type ResourcePoint } from "./types";
+import { dateTime, fromTo, hhmmss, isRcaTarget, RCA_TARGETS, type Episode, type InvestigationResult, type RcaTarget, type ResourcePoint } from "./types";
 
 export const EXPLAIN_QUERIES = "explain_queries";
 
@@ -104,7 +104,8 @@ export function unexplainedWords(e: Pick<Episode, "target">, a: QueryStoreAnalys
         case "pending":
             return "Which queries drove it isn't in this history yet: Query Store's minutes were pending publication when the capture read them.";
         case "no-rows":
-            return "Which queries drove it isn't in this history: the capture holds no Query Store statistics for those minutes.";
+            // No coverage row for those minutes: decision C (queries.ts's notInHistoryYet); with one, what it read held none.
+            return a.details.state === null ? notInHistoryYet(e.target, "Which queries drove it") : "Which queries drove it isn't in this history: Query Store's evidence of those minutes holds no query.";
         case "model-missing":
             return "Which queries drove it isn't in this history: its model doesn't have Query Store's tables yet.";
         default:
@@ -132,8 +133,12 @@ export async function explainQueries(input: ExplainQueriesInput): Promise<Invest
     const read = queryReadWindow(from, to);
     const sidecar = await input.sidecar(read.from, read.to, [args.target], QUERY_STORE_TABLES);
     const a = analyzeQueries({ target: args.target, from, to, sidecar, resource: input.resource, incident: cpuIncidentIn(input.episodes, args.target, from, to), rankBy: args.rankBy, queryId: args.queryId, now: input.now });
-    // A read at its limit holds only up to there, as the RCA tables' (tools.ts's envelope).
-    const cut = (sidecar.cut ?? []).map((c) => `${c.table}: the window holds more rows than one query returns, so what it holds from ${hhmmss(c.until)} UTC on wasn't read; ask about a narrower window`);
+    // A read at its limit holds only up to there, as the RCA tables' (tools.ts's envelope); the plans, read newest first, back to there.
+    const cut = (sidecar.cut ?? []).map((c) =>
+        c.newestFirst
+            ? `${c.table}: these minutes' queries have more plan rows than one query returns, so the rows read before ${dateTime(c.until)} UTC weren't read; ask about a narrower window`
+            : `${c.table}: the window holds more rows than one query returns, so what it holds from ${hhmmss(c.until)} UTC on wasn't read; ask about a narrower window`,
+    );
     const missingQuery = args.queryId && a.details.recorded === "yes" && a.details.top.length === 0 ? [`${args.target}: query ${args.queryId} isn't in Query Store's top lists in these minutes, as the capture read them.`] : [];
     return {
         ...base,

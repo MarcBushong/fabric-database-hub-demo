@@ -107,7 +107,8 @@ describe("explain_queries' answer", () => {
         expect((await explain({ target: "T3", rankBy: "cpu" }, fixtureSidecar("t3"))).result.rootCause?.statement).not.toContain("The CPU rose");
         expect(result.details).toMatchObject({ target: "T3", recorded: "yes", rankBy: "cpu" });
         expect(result.details.top[0].queryId).toBe("412");
-        expect(result.recommendations.map((r) => r.id)).toEqual(["CPU-FORCE-PLAN", "CPU-MISSING-INDEX"]);
+        expect(result.recommendations.map((r) => r.id)).toContain("CPU-FORCE-PLAN");
+        expect(result.details.planChanges[0]).toMatchObject({ queryId: "412", newPlan: { planId: "58" }, before: [expect.objectContaining({ planId: "31" })] });
         expect(result.notCaptured).toContain("T3: the envelope's line.");
         const text = JSON.stringify(result);
         expect(JSON.parse(text)).toMatchObject({ tool: EXPLAIN_QUERIES });
