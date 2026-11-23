@@ -13,6 +13,11 @@ export function readContract<T = unknown>(relative: string): T {
     return JSON.parse(readFileSync(resolve(CONTRACT_DIR, relative), "utf8")) as T;
 }
 
+/** A contract file's text: its README's rules, which a test can hold the app's words to. */
+export function readContractText(relative: string): string {
+    return readFileSync(resolve(CONTRACT_DIR, relative), "utf8");
+}
+
 /** A contract file read with its 64-bit integers' exact digits (sidecar.ts's parseExact). */
 export function readContractExact<T = unknown>(relative: string): T {
     return parseExact(readFileSync(resolve(CONTRACT_DIR, relative), "utf8")) as T;

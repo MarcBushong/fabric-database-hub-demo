@@ -634,23 +634,26 @@ function unusualState(target: RcaTarget, rows: readonly QueryCoverage[]): string
 }
 
 /**
- * How Query Store's evidence comes into the history, as T2a's troubleshooting rows say it (eea61a49, 8e2ada18): a Run all
- * session leaves its sidecars on the VMs until a save from the scripts takes them, and a save exports only from running VMs
- * (Invoke-DemoRcaScriptExport); the update comes first, as decision C has it. Run all's own path, a later release, changes it.
+ * Where a Run all session's Query Store evidence waits, for how long, and what brings it into the history: the one sentence
+ * of it, which every "isn't in this history yet" holds (notInHistoryYet), as T2a's troubleshooting rows and fix say it
+ * (eea61a49, 8e2ada18). A Run all session leaves its sidecars on the VMs, whose runner keeps one until it's acknowledged,
+ * or for 30 days after it sealed it (rca/README.md, The sidecar); a save from the scripts takes them, and exports only from
+ * running VMs (Invoke-DemoRcaScriptExport); the update comes first, as decision C has it. T2c, Run all's own path, changes
+ * this sentence, and only it, when it merges (the re-check of fc430a78).
  */
-export const QS_EVIDENCE_FIX = "./scripts/deploy.ps1, then ./scripts/stop-demo.ps1 -SaveHistory with the VMs running (./scripts/start-demo.ps1 first when they're stopped)";
+export const QS_EVIDENCE_FIX = "After a Run all session, that evidence waits on the VMs for 30 days for a save from the scripts to take it: ./scripts/deploy.ps1, then ./scripts/stop-demo.ps1 -SaveHistory with the VMs running (./scripts/start-demo.ps1 first when they're stopped).";
 
 /**
  * Decision C (unit 2's integration plan, revision 2, section 0), the one place its words live: what the RCA says of minutes
  * for which this history holds no Query Store coverage row. After a Run all session the capture did read Query Store, and
- * its sidecars wait on the VMs until a save from the scripts takes them; or a part of the demo older than the sidecar saved
- * those minutes. So: not in this history yet, or saved by an older part, with the fix, and nothing about the target; never
- * that it has no Query Store, or that its evidence wasn't captured (the review of d441fe13: "it didn't read Query Store
- * then" was false after a Run all session). `subject` names what isn't there: "Query Store's evidence from ... UTC", "Which
- * queries drove it", "who held the connections ...".
+ * its sidecars wait on the VMs for a save from the scripts (QS_EVIDENCE_FIX); or a part of the demo older than the sidecar
+ * saved those minutes. So: not in this history yet, or saved by an older part, with where it waits and the fix, and nothing
+ * about the target; never that it has no Query Store, or that its evidence wasn't captured (the review of d441fe13: "it
+ * didn't read Query Store then" was false after a Run all session). `subject` names what isn't there: "Query Store's
+ * evidence from ... UTC", "Which queries drove it", "who held the connections ...".
  */
 export function notInHistoryYet(target: RcaTarget, subject: string): string {
-    return `${subject} isn't in this history yet, or those minutes were saved by a part of the demo older than Query Store's evidence. After a Run all session, that evidence waits on the VMs until a save from the scripts takes it: ${QS_EVIDENCE_FIX}. That says nothing about Query Store on ${target}.`;
+    return `${subject} isn't in this history yet, or those minutes were saved by a part of the demo older than Query Store's evidence. ${QS_EVIDENCE_FIX} That says nothing about Query Store on ${target}.`;
 }
 
 /** The target's measured CPU in the minutes (RCA Resource: T3's resource governance, avg_cpu_percent of its cap). */

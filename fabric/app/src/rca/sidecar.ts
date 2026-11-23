@@ -158,8 +158,8 @@ export interface SidecarEvidence {
     /** The sidecar tables the history's model doesn't have (a model from before them): their rows aren't known, which is never none. */
     missing: string[];
     /**
-     * The reads that returned as many rows as they may, by table: what they hold from `until` on wasn't read; for a read
-     * newest first (RCA Query Plans), what they hold before `until`.
+     * The reads that returned as many rows as they may, one for each, by table: what they hold from `until` on wasn't read;
+     * for a read newest first (RCA Query Plans, a read per PLAN_QUERY_IDS of the window's queries), what they hold before it.
      */
     cut?: Array<{ table: string; until: Date; newestFirst?: boolean }>;
 }

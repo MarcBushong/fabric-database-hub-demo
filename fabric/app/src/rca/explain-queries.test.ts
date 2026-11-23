@@ -139,6 +139,13 @@ describe("explain_queries' answer", () => {
         expect((await explain({ target: "T3", rankBy: "cpu" }, cut)).result.notCaptured).toContain(
             "RCA Query Stats: the window holds more rows than one query returns, so what it holds from 17:05:00 UTC on wasn't read; ask about a narrower window",
         );
+        // The plans, read newest first in reads of PLAN_QUERY_IDS queries (the re-check of fc430a78): one line, from the latest stop.
+        const plansCut = (...untils: string[]): SidecarEvidence => ({ ...fixtureSidecar("t3"), cut: untils.map((u) => ({ table: "RCA Query Plans", until: at(u), newestFirst: true })) });
+        const plansLines = async (s: SidecarEvidence) => (await explain({ target: "T3", rankBy: "cpu" }, s)).result.notCaptured.filter((l) => l.startsWith("RCA Query Plans:"));
+        expect(await plansLines(plansCut("20T09:00:00"))).toEqual(["RCA Query Plans: these minutes' queries have more plan rows than one query returns, so the rows read before 2026-11-20 09:00:00 UTC weren't read; ask about a narrower window"]);
+        expect(await plansLines(plansCut("20T09:00:00", "20T11:30:00"))).toEqual([
+            "RCA Query Plans: these minutes' queries have more plan rows than one query returns, so some of the rows read before 2026-11-20 11:30:00 UTC weren't read; ask about a narrower window",
+        ]);
         const older: SidecarEvidence = { ...emptySidecar(), missing: ["RCA Query Coverage", "RCA Query Stats"] };
         const { result } = await explain({ target: "T3", queryId: "412", rankBy: "cpu" }, older);
         expect(result.details.recorded).toBe("model-missing");

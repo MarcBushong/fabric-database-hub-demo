@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { analyzeQueries, QS_EVIDENCE_FIX, QS_RETENTION_DAYS, type QueryIncident } from "./queries";
+import { analyzeQueries, notInHistoryYet, QS_EVIDENCE_FIX, QS_RETENTION_DAYS, type QueryIncident } from "./queries";
 import { emptySidecar, type QueryCoverage, type SidecarEvidence } from "./sidecar";
-import { fixtureSidecar, namesAScenario } from "./testdata/contract";
+import { fixtureSidecar, namesAScenario, readContractText } from "./testdata/contract";
 
 const at = (text: string) => new Date(`2026-11-${text}Z`);
 const NOW = at("21T12:00:00");
@@ -154,13 +154,25 @@ describe("Query Store's rules: what this history doesn't hold", () => {
     it("says minutes with no coverage row aren't in this history yet, or were saved by an older part, with the fix, never that they weren't captured", () => {
         const a = analyzeQueries({ ...window, sidecar: emptySidecar() });
         expect(a.details).toMatchObject({ recorded: "no-rows", state: null });
-        expect(a.notCaptured).toHaveLength(1);
-        const [line] = a.notCaptured;
-        expect(line).toMatch(/^T3: Query Store's evidence from 17:03:00 to 17:10:00 UTC isn't in this history yet, or those minutes were saved by a part of the demo older than Query Store's evidence\. /);
-        expect(line).toContain(`waits on the VMs until a save from the scripts takes it: ${QS_EVIDENCE_FIX}.`);
-        expect(QS_EVIDENCE_FIX).toMatch(/^\.\/scripts\/deploy\.ps1, then \.\/scripts\/stop-demo\.ps1 -SaveHistory with the VMs running \(\.\/scripts\/start-demo\.ps1 first/);
-        expect(line).toMatch(/ That says nothing about Query Store on T3\.$/);
-        expect(line).not.toMatch(/not captured|no Query Store\b|didn't read|wasn't running/i);
+        expect(a.notCaptured).toEqual([
+            `T3: Query Store's evidence from 17:03:00 to 17:10:00 UTC isn't in this history yet, or those minutes were saved by a part of the demo older than Query Store's evidence. ${QS_EVIDENCE_FIX} That says nothing about Query Store on T3.`,
+        ]);
+        expect(a.notCaptured[0]).not.toMatch(/not captured|no Query Store\b|didn't read|wasn't running/i);
+    });
+
+    // The re-check of fc430a78: where the evidence waits, for how long, and the fix are one sentence, QS_EVIDENCE_FIX, so T2c
+    // (Run all's own path) changes them in one place; and the runner deletes a sidecar no save took 30 days after sealing it.
+    it("says where a Run all session's evidence waits, for as long as the runner keeps it, and the fix, in the one sentence", () => {
+        const days = /A sealed sidecar stays until it's acknowledged, or for (\d+) days after its sealing\./.exec(readContractText("README.md"))?.[1];
+        expect(days, "rca/README.md, The sidecar: how long the runner keeps a sealed sidecar").toBeDefined();
+        expect(QS_EVIDENCE_FIX).toMatch(
+            new RegExp(`^After a Run all session, that evidence waits on the VMs for ${days} days for a save from the scripts to take it: \\./scripts/deploy\\.ps1, then \\./scripts/stop-demo\\.ps1 -SaveHistory with the VMs running \\(\\./scripts/start-demo\\.ps1 first when they're stopped\\)\\.$`),
+        );
+        // The words around it name none of the path: no Run all, VMs, script, or time the runner keeps it.
+        for (const line of [notInHistoryYet("T3", "Which queries drove it"), notInHistoryYet("T4", "who held the connections from 10:06:00 to 10:12:00 UTC")]) {
+            expect(line.split(QS_EVIDENCE_FIX)).toHaveLength(2);
+            expect(line.replace(QS_EVIDENCE_FIX, "")).not.toMatch(/Run all|\bVMs?\b|\bscripts?\b|\.ps1|\bdays?\b|\bwaits?\b/i);
+        }
     });
 
     it("says what the capture read held no query, with Query Store's state when it's worth saying, and each gap as its own line", () => {

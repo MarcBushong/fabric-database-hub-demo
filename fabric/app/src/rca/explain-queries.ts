@@ -133,12 +133,15 @@ export async function explainQueries(input: ExplainQueriesInput): Promise<Invest
     const read = queryReadWindow(from, to);
     const sidecar = await input.sidecar(read.from, read.to, [args.target], QUERY_STORE_TABLES);
     const a = analyzeQueries({ target: args.target, from, to, sidecar, resource: input.resource, incident: cpuIncidentIn(input.episodes, args.target, from, to), rankBy: args.rankBy, queryId: args.queryId, now: input.now });
-    // A read at its limit holds only up to there, as the RCA tables' (tools.ts's envelope); the plans, read newest first, back to there.
-    const cut = (sidecar.cut ?? []).map((c) =>
-        c.newestFirst
-            ? `${c.table}: these minutes' queries have more plan rows than one query returns, so the rows read before ${dateTime(c.until)} UTC weren't read; ask about a narrower window`
-            : `${c.table}: the window holds more rows than one query returns, so what it holds from ${hhmmss(c.until)} UTC on wasn't read; ask about a narrower window`,
-    );
+    // A read at its limit holds only up to there, as the RCA tables' (tools.ts's envelope). The plans, read newest first in
+    // reads of PLAN_QUERY_IDS queries, back to there: one line for them, from the latest such read's stop.
+    const plansCut = (sidecar.cut ?? []).filter((c) => c.newestFirst);
+    const cut = [
+        ...(sidecar.cut ?? []).filter((c) => !c.newestFirst).map((c) => `${c.table}: the window holds more rows than one query returns, so what it holds from ${hhmmss(c.until)} UTC on wasn't read; ask about a narrower window`),
+        ...(plansCut.length
+            ? [`${plansCut[0].table}: these minutes' queries have more plan rows than one query returns, so ${plansCut.length > 1 ? "some of " : ""}the rows read before ${dateTime(new Date(Math.max(...plansCut.map((c) => c.until.getTime()))))} UTC weren't read; ask about a narrower window`]
+            : []),
+    ];
     const missingQuery = args.queryId && a.details.recorded === "yes" && a.details.top.length === 0 ? [`${args.target}: query ${args.queryId} isn't in Query Store's top lists in these minutes, as the capture read them.`] : [];
     return {
         ...base,

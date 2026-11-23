@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
 import { QueryFailure } from "@/data/query-client";
-import { loadSidecar, PLAN_LAG_MINUTES, planDax, rcaDax, RcaReadError, sidecarDax, tableDax, type DaxLog } from "./loader";
+import { loadSidecar, PLAN_LAG_MINUTES, PLAN_QUERY_IDS, planDaxQueries, rcaDax, RcaReadError, sidecarDax, tableDax, type DaxLog } from "./loader";
 import { decodeSidecar, emptySidecar, latestReads, parseExact, SidecarFormatError, toId, type QueryStat, type QueryWait, type SidecarEvidence } from "./sidecar";
 import { RCA_SPEC, SIDECAR_SPEC, SIDECAR_TABLES, type SidecarTableKey } from "./spec";
 import { fixtureSidecar, namesAScenario, readContract, readContractExact, SIDECAR_FIXTURES } from "./testdata/contract";
@@ -226,12 +226,12 @@ describe("the sidecar's DAX loader", () => {
     // The review of d441fe13: plans were read from the window's start, so a plan that never changed, whose only row is its
     // first read's, dropped out of later windows.
     it("reads the plans of the window's queries newest first, with no lower bound, so a plan first read long before is there", async () => {
-        const dax = planDax(at("20T17:45:00"), at("20T19:45:00"), ["T3"], ["412", "377", "412", "-6412873301142229951", "1e5"]);
+        const [dax, ...more] = planDaxQueries(at("20T17:45:00"), at("20T19:45:00"), ["T3"], ["412", "377", "412", "-6412873301142229951", "1e5"]);
+        expect(more).toEqual([]);
         expect(dax).toContain(`'RCA Query Plans'[Captured At UTC] <= DATE ( 2026, 11, 20 ) + TIME ( 19, 45, 0 ),`);
         expect(dax).not.toMatch(/\[Captured At UTC\] >=/);
         expect(dax).toContain("'RCA Query Plans'[Query ID] IN { 412, 377, -6412873301142229951 },");
         expect(dax).toMatch(/\nORDER BY \[Captured At UTC\] DESC$/);
-        expect(planDax(at("20T17:45:00"), at("20T19:45:00"), ["T3"])).not.toContain(" IN {");
         // The engine, as the DAX bounds it: a window from 19:00 whose query 412 last changed plan at 17:17.
         const fixture = fixtureSidecar("t3");
         const later = fixture.stats.filter((r) => r.queryId === "412" && r.planId === "31" && r.intervalStart.getTime() === at("20T17:15:00").getTime()).map((r) => ({ ...r, capturedAt: at("20T19:17:05"), intervalStart: at("20T19:00:00"), intervalEnd: at("20T19:15:00") }));
@@ -254,6 +254,38 @@ describe("the sidecar's DAX loader", () => {
         ]);
     });
 
+    // The re-check of fc430a78: by no query ID, the plans read had no filter and took the targets' whole plan history, up to
+    // RCA_MAX_ROWS rows, none of them used; past PLAN_QUERY_IDS of them, it did too.
+    it("reads no plan when the statistics and events name no query, and a window's many queries' plans in reads of PLAN_QUERY_IDS, each by its IDs", async () => {
+        expect(planDaxQueries(at("20T17:45:00"), at("20T19:45:00"), ["T3"], [])).toEqual([]);
+        expect(planDaxQueries(at("20T17:45:00"), at("20T19:45:00"), ["T3"], ["1e5", "412 } ) EVALUATE"])).toEqual([]);
+        const quiet: string[] = [];
+        expect((await loadSidecar(async (q) => (quiet.push(q), []), at("20T17:00:00"), at("20T17:20:00"), ["T3"])).plans).toEqual([]);
+        expect(quiet.filter((q) => q.includes("'RCA Query Plans',"))).toEqual([]);
+        expect(quiet).toHaveLength(SIDECAR_TABLES.length - 1);
+
+        // Twice PLAN_QUERY_IDS queries and one more: three reads, each naming at most PLAN_QUERY_IDS of them, every one once.
+        const fixture = fixtureSidecar("t3");
+        const ids = Array.from({ length: 2 * PLAN_QUERY_IDS + 1 }, (_, i) => String(1000 + i));
+        const many = { ...emptySidecar(), stats: ids.map((queryId) => ({ ...fixture.stats[0], queryId })), plans: ids.map((queryId) => ({ ...fixture.plans[0], queryId })) };
+        const named: string[][] = [];
+        const got = await loadSidecar(
+            async (q) => {
+                if (!q.includes("'RCA Query Plans',")) return q.includes("'RCA Query Stats',") ? asModelRows(many, "queryStats") : [];
+                const these = /'RCA Query Plans'\[Query ID\] IN \{ ([^}]*) \},/.exec(q)?.[1].split(", ") ?? [];
+                named.push(these);
+                return asModelRows(many, "queryPlans").filter((row) => these.includes(String(row["Query ID"])));
+            },
+            at("20T17:00:00"),
+            at("20T17:20:00"),
+            ["T3"],
+        );
+        expect(named.map((n) => n.length)).toEqual([PLAN_QUERY_IDS, PLAN_QUERY_IDS, 1]);
+        expect(named.flat().sort()).toEqual([...ids].sort());
+        expect(got.plans.map((p) => p.queryId).sort()).toEqual([...ids].sort());
+        expect(got.cut).toBeUndefined();
+    });
+
     it("names the tables a model from before the sidecar doesn't have, and reads the others", async () => {
         const logs: DaxLog[] = [];
         const runDax = async (query: string) => {
@@ -262,7 +294,9 @@ describe("the sidecar's DAX loader", () => {
             return [];
         };
         const got = await loadSidecar(runDax, at("20T17:00:00"), at("20T17:20:00"), ["T4"], { onDax: (l) => logs.push(l) });
-        expect(got.missing).toEqual(["RCA Query Coverage", "RCA Query Events", "RCA Query Plans", "RCA Query Stats", "RCA Query Waits"]);
+        // No plan is read: the statistics and events it doesn't have name no query.
+        expect(got.missing).toEqual(["RCA Query Coverage", "RCA Query Events", "RCA Query Stats", "RCA Query Waits"]);
+        expect(logs.map((l) => l.table)).not.toContain("RCA Query Plans");
         expect(logs.filter((l) => !l.error).map((l) => l.table)).toEqual(["RCA Connections"]);
     });
 
@@ -288,7 +322,9 @@ describe("the sidecar's DAX loader", () => {
     it("never queries the answer key (rca/blind-detection.json)", async () => {
         const blind = readContract<{ answerKey: { modelTables: string[] } }>("blind-detection.json");
         const queries: string[] = [];
-        await loadSidecar(async (q) => (queries.push(q), []), at("20T16:00:00"), at("20T17:00:00"), ["T1", "T2", "T3", "T4", "T4-replica", "T5"]);
+        // Statistics that name queries, so the plans are read too: every table's read.
+        const stats = asModelRows(fixtureSidecar("t3"), "queryStats");
+        await loadSidecar(async (q) => (queries.push(q), q.includes("'RCA Query Stats',") ? stats : []), at("20T16:00:00"), at("20T17:00:00"), ["T1", "T2", "T3", "T4", "T4-replica", "T5"]);
         expect(queries).toHaveLength(SIDECAR_TABLES.length);
         for (const q of queries) for (const table of blind.answerKey.modelTables) expect(q).not.toContain(table);
     });

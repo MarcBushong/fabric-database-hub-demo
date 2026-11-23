@@ -10,6 +10,11 @@
 // it; they record no answer key, so their cases check the facts rca/fixtures/README.md lists (What a blind RCA finds in
 // the sidecars).
 
+import { QS_EVIDENCE_FIX } from "../queries";
+
+/** A text as a regular expression that matches it exactly. */
+const literally = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
 /** Which data a case reads: a contract fixture, or an environment's live rows. */
 export type EvalData = "t1" | "t3" | "t4" | "rb" | "ra";
 
@@ -285,8 +290,9 @@ export const EVAL_SET: EvalCase[] = [
         question: "Which queries used T3's CPU from 14:00 to 14:10 UTC on 20 November?",
         data: "t3",
         steps: [{ tool: "explain_queries", args: { target: "T3", from: "2026-11-20T14:00:00Z", to: "2026-11-20T14:10:00Z" } }],
-        // Decision C: minutes with no coverage row, as a Run all session's are until a save from the scripts takes them.
-        mustContain: ['"recorded":"no-rows"', '"state":null', "isn't in this history yet", "\\./scripts/deploy\\.ps1, then \\./scripts/stop-demo\\.ps1 -SaveHistory", "says nothing about Query Store on T3"],
+        // Decision C: minutes with no coverage row, as a Run all session's are until a save from the scripts takes them; where
+        // their evidence waits and the fix, in the one sentence of it (queries.ts's QS_EVIDENCE_FIX; the re-check of fc430a78).
+        mustContain: ['"recorded":"no-rows"', '"state":null', "isn't in this history yet", literally(QS_EVIDENCE_FIX), "says nothing about Query Store on T3"],
         mustNotContain: ["not captured", "didn't read", "no Query Store\\b", "QS-TOP-CPU"],
         key: null,
         note: "The T3 sidecar's coverage starts at 16:50: the question is what this history says of minutes it holds no coverage for.",
