@@ -530,10 +530,12 @@ function Get-DemoCostEstimate {
     # start, 2 to 20 minutes, plus up to 51 while it follows T2's Run Command after a cold start (2026-11-20, ADR 0026), its
     # stop or DbHub-Stop, up to 3, and DbHub-Monitor's re-checks, a few: 80 minutes. The Incident RCA's export (ADR 0031)
     # adds its limits to them: 6 at the stop, 8 at each of the session's about three 30-minute re-checks, and 6 at a start
-    # that fetches an earlier session's evidence, 36 more, so a ceiling of 116 minutes a session. The light-use month's
-    # sessions are Run all sessions, the owner's main path, at about 2 billed hours each (a 90-minute showcase touches 2
-    # clock hours): 5 in 10 running hours (the coordinator's decision, 2026-11-21). What the nightly stop's 120 leave of the
-    # 500 is priced at the included tier, and the rest at the next one.
+    # that fetches an earlier session's evidence, 36 more, so a ceiling of 116 minutes a session. Query Store's sidecars
+    # (2026-11-23) come within those same limits, after the evidence, and so do the start's acknowledgements of them
+    # (rca/README.md, Run all's path for the sidecars), so the ceiling holds; they use what the evidence leaves of it.
+    # The light-use month's sessions are Run all sessions, the owner's main path, at about 2 billed hours each (a 90-minute
+    # showcase touches 2 clock hours): 5 in 10 running hours (the coordinator's decision, 2026-11-21). What the nightly
+    # stop's 120 leave of the 500 is priced at the included tier, and the rest at the next one.
     if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
         $vaultItems = Get-CachedPrice "serviceName eq 'Key Vault' and armRegionName eq '$location' and skuName eq 'Standard' and priceType eq 'Consumption'"
         Add-Component 'Activity control vault operations' 'idle' ($vaultItems | Where-Object { $_.meterName -eq 'Operations' } | Select-Object -First 1) 1 '10K operations'
