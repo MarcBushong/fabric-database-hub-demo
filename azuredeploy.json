@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "9827529834521370362"
+      "templateHash": "15031617546459689715"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -443,7 +443,7 @@
       "type": "bool",
       "defaultValue": false,
       "metadata": {
-        "description": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): Query Store capturing the top queries and index tuning in REPORT mode every 60 minutes, set only on a size that runs it (General Purpose or Memory Optimized with at least 4 vCores). deploy.ps1 decides from t4AutonomousTuning and the size (Get-DemoT4Tuning). When false, those parameters are left as they are, except that Query Store is turned off on a Burstable size."
+        "description": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): index tuning in REPORT mode every 60 minutes, with the first sample of each query's parameters, set only on a size that runs it (General Purpose or Memory Optimized with at least 4 vCores). deploy.ps1 decides from t4AutonomousTuning and the size (Get-DemoT4Tuning). When false, those parameters are left as they are. Query Store and its wait sampling are on at every size but Burstable, whatever this says (2026-11-23)."
       }
     },
     "t4AvailabilityZone": {
@@ -670,7 +670,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "16425786594711647420"
+              "templateHash": "9797866607865993448"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -969,7 +969,7 @@
               "type": "bool",
               "defaultValue": false,
               "metadata": {
-                "description": "T4's autonomous tuning (Query Store and index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019)."
+                "description": "T4's autonomous tuning (index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019). Query Store and its wait sampling are on at every size but Burstable either way (2026-11-23)."
               }
             },
             "t4AvailabilityZone": {
@@ -1184,9 +1184,8 @@
               "autoStartAfterStoppedDays": 7,
               "capabilitiesApiVersion": "2025-08-01",
               "autonomousTuning": {
-                "note": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): set by the template only when Get-DemoT4Tuning allows it, on a General Purpose or Memory Optimized size with at least minVCores vCores ('supported on any currently supported compute SKU with at least 4 vCores'; Query Store, which it needs, shouldn't run on Burstable). Query Store captures the top queries, with the first sample of each parameterized query's parameters (the runner's queries are parameterized), and index tuning runs in report mode every 60 minutes, its minimum, because T4 runs only during demos; the interval is set before the mode, because the first session is scheduled from the interval in effect when tuning is turned on. All four parameters are dynamic (no restart; checked 2026-11-04). The recommendations show in the Azure portal (the server's Intelligent Performance > Autonomous tuning) and through az postgres flexible-server autonomous-tuning, not in Database Hub.",
+                "note": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): set by the template only when Get-DemoT4Tuning allows it, on a General Purpose or Memory Optimized size with at least minVCores vCores ('supported on any currently supported compute SKU with at least 4 vCores'; Query Store, which it needs, shouldn't run on Burstable). Query Store, which it needs, is queryStore's below, on at every size but Burstable whatever this says (2026-11-23); with tuning, Query Store also keeps the first sample of each parameterized query's parameters (the runner's queries are parameterized), and index tuning runs in report mode every 60 minutes, its minimum, because T4 runs only during demos; the interval is set before the mode, because the first session is scheduled from the interval in effect when tuning is turned on. All four parameters are dynamic (no restart; checked 2026-11-04). The recommendations show in the Azure portal (the server's Intelligent Performance > Autonomous tuning) and through az postgres flexible-server autonomous-tuning, not in Database Hub.",
                 "minVCores": 4,
-                "queryCaptureMode": "top",
                 "parametersCaptureMode": "capture_first_sample",
                 "analysisIntervalMinutes": 60,
                 "mode": "report",
@@ -1197,6 +1196,15 @@
                   "tuningParameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-autonomous-tuning",
                   "cli": "https://learn.microsoft.com/cli/azure/postgres/flexible-server/autonomous-tuning",
                   "scaling": "https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources"
+                }
+              },
+              "queryStore": {
+                "note": "T4's Query Store and its wait sampling (2026-11-23, user-directed: 'We would want query store enabled wherever possible'; ADR 0019): the template sets pg_qs.query_capture_mode to queryCaptureMode and pgms_wait_sampling.query_capture_mode to waitSamplingCaptureMode on every size but Burstable, whatever t4AutonomousTuning says, and both to none on Burstable, because Learn says 'Don't enable query store on the Burstable pricing tier as it causes performance problems'. all, not top: top tracks only top-level statements, and the workload's statements run inside its functions, which all also tracks ('nested queries (the ones that execute inside a function or procedure)'); autonomous tuning takes either ('Requires query store to be enabled by setting pg_qs.query_capture_mode to TOP or ALL'). pg_qs.query_capture_mode supersedes the wait sampling setting. Query Store doesn't record the queries run on a read replica, so the replica gets neither. Both parameters are dynamic, so setting them restarts nothing, and deploy.ps1 sets them on an existing server. Query Store is available at no extra charge; its data lives in the server's azure_sys database (query_store.qs_view and query_store.pgms_wait_sampling_view), kept pg_qs.retention_period_in_days (7 by default). Plan storage (pg_qs.store_query_plans) stays off, its default. Checked 2026-11-23.",
+                "queryCaptureMode": "all",
+                "waitSamplingCaptureMode": "all",
+                "docUrls": {
+                  "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
+                  "parameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-query-store"
                 }
               },
               "metrics": {
@@ -9880,6 +9888,9 @@
                   },
                   "tuning": {
                     "value": "[variables('postgres').autonomousTuning]"
+                  },
+                  "queryStore": {
+                    "value": "[variables('postgres').queryStore]"
                   }
                 },
                 "template": {
@@ -9889,9 +9900,9 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "17417311977485402231"
+                      "templateHash": "9129435408711150959"
                     },
-                    "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, the free enhanced metrics turned on, and max_connections at 50 on every size."
+                    "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, the free enhanced metrics turned on, max_connections at 50 on every size, and Query Store with its wait sampling on at every size but Burstable."
                   },
                   "parameters": {
                     "location": {
@@ -10004,19 +10015,28 @@
                       "type": "bool",
                       "defaultValue": false,
                       "metadata": {
-                        "description": "Autonomous tuning (2026-11-04, ADR 0019): Query Store and index tuning in REPORT mode, only on a size that runs them (4 vCores or more, not Burstable); deploy.ps1 decides (Get-DemoT4Tuning). When false, these parameters are left as they are, except that Query Store is turned off on a Burstable size."
+                        "description": "Autonomous tuning (2026-11-04, ADR 0019): index tuning in REPORT mode, only on a size that runs it (4 vCores or more, not Burstable); deploy.ps1 decides (Get-DemoT4Tuning). When false, its parameters are left as they are. Query Store and its wait sampling don't depend on it (queryStore)."
                       }
                     },
                     "tuning": {
                       "type": "object",
                       "defaultValue": {
-                        "queryCaptureMode": "top",
                         "parametersCaptureMode": "capture_first_sample",
                         "analysisIntervalMinutes": 60,
                         "mode": "report"
                       },
                       "metadata": {
-                        "description": "The autonomous tuning values from config/versions.json (postgresql.autonomousTuning): queryCaptureMode, parametersCaptureMode, analysisIntervalMinutes, and mode."
+                        "description": "The autonomous tuning values from config/versions.json (postgresql.autonomousTuning): parametersCaptureMode, analysisIntervalMinutes, and mode. Query Store's capture mode is queryStore's."
+                      }
+                    },
+                    "queryStore": {
+                      "type": "object",
+                      "defaultValue": {
+                        "queryCaptureMode": "all",
+                        "waitSamplingCaptureMode": "all"
+                      },
+                      "metadata": {
+                        "description": "Query Store and its wait sampling (2026-11-23, user-directed; ADR 0019), from config/versions.json (postgresql.queryStore): queryCaptureMode and waitSamplingCaptureMode, set on every size but Burstable whatever autonomousTuning says, and none on Burstable."
                       }
                     }
                   },
@@ -10126,16 +10146,28 @@
                       ]
                     },
                     {
-                      "condition": "[or(parameters('autonomousTuning'), equals(parameters('sizing').tier, 'Burstable'))]",
                       "type": "Microsoft.DBforPostgreSQL/flexibleServers/configurations",
                       "apiVersion": "2025-08-01",
                       "name": "[format('{0}/{1}', parameters('serverName'), 'pg_qs.query_capture_mode')]",
                       "properties": {
-                        "value": "[if(parameters('autonomousTuning'), string(parameters('tuning').queryCaptureMode), 'none')]",
+                        "value": "[if(equals(parameters('sizing').tier, 'Burstable'), 'none', string(parameters('queryStore').queryCaptureMode))]",
                         "source": "user-override"
                       },
                       "dependsOn": [
                         "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'max_connections')]",
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.DBforPostgreSQL/flexibleServers/configurations",
+                      "apiVersion": "2025-08-01",
+                      "name": "[format('{0}/{1}', parameters('serverName'), 'pgms_wait_sampling.query_capture_mode')]",
+                      "properties": {
+                        "value": "[if(equals(parameters('sizing').tier, 'Burstable'), 'none', string(parameters('queryStore').waitSamplingCaptureMode))]",
+                        "source": "user-override"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'pg_qs.query_capture_mode')]",
                         "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
                       ]
                     },
@@ -10149,8 +10181,8 @@
                         "source": "user-override"
                       },
                       "dependsOn": [
-                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'pg_qs.query_capture_mode')]",
-                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]",
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'pgms_wait_sampling.query_capture_mode')]"
                       ]
                     },
                     {

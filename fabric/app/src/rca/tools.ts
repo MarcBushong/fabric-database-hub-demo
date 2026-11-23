@@ -12,6 +12,7 @@ import { RCA_CATEGORY_IDS, RCA_SEVERITY_IDS, type RcaCategory, type RcaSeverity 
 import { categoryOf, facetArgs, FAR_PERCENT, FAR_TIMES, LONG_MINUTES, matches, severityOf } from "./facets";
 import { isPagedTable, MONITOR_PAGES, MONITOR_ROW_LIMIT, RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
+import { queryStoreNextStep, queryStoreNote, unexplainedByQuery } from "./query-store";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
@@ -650,12 +651,14 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         }
         const stopped = readStoppedAt(g.evidence);
         const parts = (await Promise.all(chosen.map((e) => explainEpisode(e, stopped)))).filter((p): p is InvestigationResult => !!p && typeof p !== "string");
-        // A signal Phase 1 doesn't investigate yet (CPU, the wait classes): the episode is the fact, and its cause isn't captured.
+        // A signal Phase 1 doesn't investigate yet (CPU, the wait classes): the episode is the fact, and which queries drove
+        // it isn't in this history, which is the capture's limit, never the target's (query-store.ts): live, the chat read
+        // "isn't captured yet" as "T1 doesn't have Query Store" (the owner, 2026-11-23).
         const telemetryOnly = chosen.filter((e) => !EXPLAINED_FAMILIES.includes(e.family));
         const causes = [
             ...parts.filter((p) => p.rootCause).map((p) => p.rootCause!),
             ...telemetryOnly.map((e) => ({
-                statement: `${describeEpisode(e)} What drove it (the plans and waits per query) isn't captured yet.`,
+                statement: `${describeEpisode(e)} ${unexplainedByQuery(e)}`,
                 confidence: "low" as Confidence,
                 ruleIds: ["TELEMETRY-ONLY"],
                 evidence: [{ table: e.source === "the RCA capture" ? "RCA Resource" : "Telemetry Snapshots", at: iso(e.peakAt), target: e.target, text: `${e.signal} ${Math.round(e.peak * 10) / 10} ${e.unit} (peak)` }],
@@ -666,7 +669,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         // capture" note again with other times: two such lines for one T5 storm (the coordinator's note on 803f2b1a). The
         // incident's own note says it once.
         const partNotes = parts.flatMap((p) => p.notCaptured).filter((line) => !RCA_TARGETS.some((t) => isNoCaptureNote(t, line) && base.notCaptured.some((b) => isNoCaptureNote(t, b))));
-        const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => `${e.target}: the ${e.signal}'s cause (Query Store's plans, waits per query) isn't captured yet.`)])];
+        const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map(queryStoreNote)])];
         // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
         if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded ${fromTo(e.start, e.end ?? e.last)} UTC explains the ${e.signal}.`));
         return {
@@ -674,7 +677,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             findings: parts.flatMap((p) => p.findings),
             rootCause: rootCause ?? null,
             recommendations: [...new Map(parts.flatMap((p) => p.recommendations).map((r) => [r.id, r])).values()],
-            nextSteps: [...new Set(parts.flatMap((p) => p.nextSteps))],
+            nextSteps: [...new Set([...parts.flatMap((p) => p.nextSteps), ...telemetryOnly.map(queryStoreNextStep).filter((s): s is string => s !== null)])],
             notCaptured,
             details: {
                 episodes: chosen.map((e) => ({ ...episodeView(e), text: describeEpisode(e) })),

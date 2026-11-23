@@ -239,7 +239,7 @@ param t4Enabled bool = true
 ])
 param t4SkuName string = 'Standard_D4ds_v5'
 
-@description('T4\'s autonomous tuning (2026-11-04, user-directed; ADR 0019): Query Store capturing the top queries and index tuning in REPORT mode every 60 minutes, set only on a size that runs it (General Purpose or Memory Optimized with at least 4 vCores). deploy.ps1 decides from t4AutonomousTuning and the size (Get-DemoT4Tuning). When false, those parameters are left as they are, except that Query Store is turned off on a Burstable size.')
+@description('T4\'s autonomous tuning (2026-11-04, user-directed; ADR 0019): index tuning in REPORT mode every 60 minutes, with the first sample of each query\'s parameters, set only on a size that runs it (General Purpose or Memory Optimized with at least 4 vCores). deploy.ps1 decides from t4AutonomousTuning and the size (Get-DemoT4Tuning). When false, those parameters are left as they are. Query Store and its wait sampling are on at every size but Burstable, whatever this says (2026-11-23).')
 param t4AutonomousTuning bool = false
 
 @description('T4\'s availability zone when it is created: empty for no preference, or 1, 2, or 3. A server keeps its zone, so deploy.ps1 passes it only while T4 doesn\'t exist (Phase 24, ADR 0019).')
