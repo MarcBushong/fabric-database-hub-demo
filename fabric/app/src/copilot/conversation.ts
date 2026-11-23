@@ -175,7 +175,7 @@ export function contextPrompt(ctx: AskContext): string {
         if (anomaly) {
             const unit = anomaly.unit ? ` ${anomaly.unit}` : "";
             lines.push(
-                `Anomaly: ${anomaly.metric}${anomaly.target ? ` on ${anomaly.target}` : ""}${anomaly.at ? ` at ${anomaly.at}` : ""}${anomaly.value !== undefined ? `, value ${anomaly.value}${unit}` : ""}${anomaly.baseline !== undefined ? ` against a baseline of ${anomaly.baseline}${unit}` : ""}${anomaly.incidentKey ? ` (incident ${anomaly.incidentKey})` : ""}.`,
+                `Anomaly: ${anomaly.metric}${anomaly.target ? ` on ${anomaly.target}` : ""}${anomaly.at ? ` at ${anomaly.at}` : ""}${anomaly.value !== undefined ? `, value ${anomaly.value}${unit}` : ""}${anomaly.baseline !== undefined ? ` against a baseline of ${anomaly.baseline}${unit}` : ""}.`,
             );
         }
         if (ctx.dax) lines.push("The visual's DAX:", "```dax", ctx.dax.slice(0, 2500), "```");

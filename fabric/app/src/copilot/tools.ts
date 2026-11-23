@@ -3,9 +3,14 @@
 //   show_chart        draws a native app chart (ChartSpec) from a run_dax result
 //   suggest_followups shows the next questions as one-click chips
 //   estate_overview   the live estate, through the app's estate function (only when it's deployed)
+//   find_incidents, triage_window, explain_*   the Incident RCA's investigations (src/rca/tools.ts), when the model has its tables
+// Blind (ADR 0031): run_dax refuses a query that names the demo's answer key (./answer-key.ts).
 // Copilot gets each tool's answer as text; the dock keeps the full results for charts, tables, and "Show the DAX".
 
+import { INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS } from "@/rca/tools";
+import { answerKeyIn, answerKeyRefusal, foldNames, wholeModelRefusal } from "./answer-key";
 import { CHART_KINDS, MAX_CHART_ROWS, validateChartSpec, type ChartSpec, type ContextRow } from "./contract";
+import { ANSWER_KEY_MEASURES } from "./model-guide.generated";
 import type { ToolSpec } from "./relay";
 
 export const DAX_ROW_LIMIT = 2000;
@@ -62,6 +67,8 @@ export interface AskToolDeps {
     onChart?: (chart: ChartSpec, run: DaxRun) => void;
     onFollowups?: (questions: string[]) => void;
     onEstate?: (call: EstateCall) => void;
+    /** The Incident RCA's investigation tools, when the model has the RCA tables (src/rca/tools.ts). */
+    investigations?: { run: (name: string, args: unknown) => Promise<ToolOutcome> };
     now?: () => number;
 }
 
@@ -101,7 +108,7 @@ const missingParts = (errors: string[]) => [...new Set(errors.map((e) => LIVE_PA
 const UNITS: Record<string, string> = { percent: "%", seconds: "s", milliseconds: "ms", minutes: "min", mb: "MB", gb: "GB", count: "count", number: "" };
 export const ESTATE_VIEWS = ["inventory", "health", "security"] as const;
 
-export function toolSpecs(options: { estate: boolean }): ToolSpec[] {
+export function toolSpecs(options: { estate: boolean; rca?: boolean }): ToolSpec[] {
     const specs: ToolSpec[] = [
         {
             name: "run_dax",
@@ -169,26 +176,122 @@ export function toolSpecs(options: { estate: boolean }): ToolSpec[] {
             },
         });
     }
+    if (options.rca) specs.push(...INVESTIGATION_TOOL_SPECS);
     return specs;
 }
 
-/** Removes DAX comments, so the statement check sees the first real keyword. */
+/**
+ * Removes DAX comments (`//` and `--` to the line's end, and `/* … *\/`), so the statement check sees the first real keyword.
+ * A comment marker inside a string ("…"), a quoted name ('…'), or a bracketed name ([…]) is text, not a comment: each is
+ * read whole, with its doubled closing character as an escape, so no string can hide the rest of a query (the review of 34a9732).
+ */
 export function stripDaxComments(query: string): string {
-    return query
-        .replace(/\/\*[\s\S]*?\*\//g, " ")
-        .replace(/(^|[^:])\/\/.*$/gm, "$1")
-        .replace(/--.*$/gm, "")
-        .trim();
+    return scanDax(query, "nothing").trim();
 }
 
-/** Plain-language reason a query isn't accepted, or null when it is. */
+/** The query's code alone: comments removed, and every string, quoted name, and bracketed name emptied, so a check for a function never matches text. */
+export function daxCode(query: string): string {
+    return scanDax(query, "strings and names");
+}
+
+/**
+ * The text run_dax checks and sends: each CRLF, lone CR, and form feed as a line feed (the review of bfbbe2a). Where the
+ * engine ends a `//` or `--` comment isn't documented, and both guesses about a lone CR let a query hide code from the
+ * check: ending the comment there before fb964e7, and not ending it there after. With neither character in the text, the
+ * check and the engine read every comment's end alike, whatever the engine does. A CR or form feed inside a string becomes
+ * a line feed too, which a query never needs.
+ */
+export function normalizeDax(query: string): string {
+    return query.replace(/\r\n?|\f/g, "\n");
+}
+
+/**
+ * Where a line comment ends: at a line feed, where the engine ends it too, and at a vertical tab, U+0085, U+2028, or
+ * U+2029, which Unicode also makes mandatory line breaks. Whether the engine ends a comment at one of those isn't
+ * documented, so the comment ends there here, and the plain-ASCII rule then refuses that character as code: a query in
+ * which one could end a comment is refused, whatever the engine does (the reviews of fb964e7 and bfbbe2a). No CR or form
+ * feed gets here (normalizeDax).
+ */
+const LINE_BREAK = /[\n\v\u0085\u2028\u2029]/g;
+
+/** Reads a query, normalized as run_dax sends it, without its comments, as stripDaxComments says, and empties its strings, or its names too, for checks that read code only. */
+function scanDax(text: string, empty: "nothing" | "strings" | "strings and names"): string {
+    const query = normalizeDax(text);
+    let out = "";
+    let i = 0;
+    while (i < query.length) {
+        const c = query[i];
+        const next = query[i + 1];
+        if (c === '"' || c === "'" || c === "[") {
+            const close = c === "[" ? "]" : c;
+            let j = i + 1;
+            for (; j < query.length; j++) {
+                if (query[j] !== close) continue;
+                if (query[j + 1] === close) j++;
+                else break;
+            }
+            const emptied = empty === "strings and names" || (empty === "strings" && c === '"');
+            out += emptied ? c + close : query.slice(i, j + 1);
+            i = j + 1;
+        } else if (c === "/" && next === "*") {
+            const end = query.indexOf("*/", i + 2);
+            out += " ";
+            i = end < 0 ? query.length : end + 2;
+        } else if ((c === "/" && next === "/") || (c === "-" && next === "-")) {
+            LINE_BREAK.lastIndex = i;
+            i = LINE_BREAK.exec(query)?.index ?? query.length;
+        } else {
+            out += c;
+            i++;
+        }
+    }
+    return out;
+}
+
+/** What a query's code may hold outside its strings and comments: printable ASCII, spaces, tabs, and line feeds (no CR is left, normalizeDax). */
+const NOT_PLAIN = /[^\t\n\x20-\x7E]/u;
+
+/**
+ * What run_dax says about a character outside plain ASCII in a query's code, outside its strings and comments, or null.
+ * Every name in the model is plain ASCII (guide.test.ts pins it), so a name the chat may query never needs one. Any other
+ * character, such as a compatibility form, an invisible character, a control, or one an older collation gives no weight,
+ * could spell a name the engine resolves and the name check can't see (the coordinator's hardening of 9f3d35f).
+ */
+export function plainCodeRefusal(query: string): string | null {
+    const char = NOT_PLAIN.exec(scanDax(query, "strings"))?.[0];
+    if (!char) return null;
+    const code = `U+${char.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`;
+    const shown = /^[\p{L}\p{N}\p{P}\p{S}]$/u.test(char) ? ` (${char})` : "";
+    return (
+        `The query has the character ${code}${shown} outside a string. Every table, column, and measure in the model guide is named in plain ASCII: ` +
+        "write names, keywords, and operators with plain letters, digits, spaces, and straight quotes, and give a column your query names itself a plain name. " +
+        "Any other text can go in a string, in double quotes, or in a comment."
+    );
+}
+
+/** Plain-language reason a query isn't accepted, or null when it is. It judges the query as run_dax sends it (normalizeDax). */
 export function checkDax(query: unknown): string | null {
     if (typeof query !== "string" || !query.trim()) return "The query is empty.";
-    if (query.length > DAX_MAX) return `The query is longer than ${DAX_MAX} characters.`;
-    const body = stripDaxComments(query);
+    const text = normalizeDax(query);
+    if (text.length > DAX_MAX) return `The query is longer than ${DAX_MAX} characters.`;
+    const body = stripDaxComments(text);
     if (!/^(DEFINE|EVALUATE)\b/i.test(body)) return "The query must start with EVALUATE (or DEFINE ... EVALUATE).";
     if (!/\bEVALUATE\b/i.test(body)) return "The query has no EVALUATE statement.";
-    return null;
+    // A function that reads the whole model reaches the answer key without naming it (the re-review of 817b81c), however
+    // its name is written: in the code, where a comment can split its name, and, like a key table's name, in the text as
+    // written, strings and comments included, so no misreading of where a comment or a string ends can hide a call (the
+    // review of bfbbe2a).
+    const wholeModel = wholeModelRefusal(foldNames(daxCode(text)));
+    if (wholeModel) return wholeModel;
+    const named = wholeModelRefusal(foldNames(text));
+    if (named) return `${named} Leave its name out of the query's strings, comments, and names too.`;
+    // The text that runs is the query as written, so the answer key is looked for there too, comments and strings included,
+    // with names folded as leniently as the engine's collation might compare them (foldNames): naming a table in a comment
+    // or a string is refused with it, which never hides a real reference.
+    const key = answerKeyIn(text, ANSWER_KEY_MEASURES) ?? answerKeyIn(body, ANSWER_KEY_MEASURES);
+    if (key) return answerKeyRefusal(key);
+    // Then plain ASCII outside strings and comments, so no character the fold doesn't know can spell a name.
+    return plainCodeRefusal(text);
 }
 
 function compactValue(value: unknown): unknown {
@@ -217,7 +320,9 @@ export function createToolRunner(deps: AskToolDeps) {
     let n = 0;
 
     async function runDax(args: Record<string, unknown>): Promise<ToolOutcome> {
-        const query = typeof args.query === "string" ? args.query.trim() : "";
+        // What's checked, sent to the history connector, and shown under "Show the sources" is one text: the query with a
+        // line feed for each CR and form feed (normalizeDax), so the engine never reads one (the review of bfbbe2a).
+        const query = typeof args.query === "string" ? normalizeDax(args.query).trim() : "";
         const purpose = str(args.purpose, 300) || "A query Copilot ran.";
         const id = `r${++n}`;
         const started = now();
@@ -324,6 +429,10 @@ export function createToolRunner(deps: AskToolDeps) {
 
     return {
         results,
+        /** Whether a tool reads data: text Copilot wrote before it is what it will check, not the answer (R925). */
+        isQuery(name: string): boolean {
+            return name === "run_dax" || name === "estate_overview" || INVESTIGATION_TOOL_NAMES.includes(name);
+        },
         async run(name: string, args: unknown): Promise<ToolOutcome> {
             const input = typeof args === "object" && args !== null && !Array.isArray(args) ? (args as Record<string, unknown>) : {};
             switch (name) {
@@ -336,6 +445,7 @@ export function createToolRunner(deps: AskToolDeps) {
                 case "estate_overview":
                     return estateOverview(input);
                 default:
+                    if (deps.investigations && INVESTIGATION_TOOL_NAMES.includes(name)) return deps.investigations.run(name, input);
                     return { ok: false, text: `There's no tool named ${name}.` };
             }
         },

@@ -890,6 +890,229 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         Invoke-DemoWorkloadControl -ActionName 'Format' -Request '' -StateRoot $root
         (Get-ControlResult).status | Should -Be 'Fail'
     }
+
+    Context 'Rca: the Incident RCA''s evidence export (ADR 0031)' {
+        BeforeAll {
+            $rcaFixtures = Join-Path -Path $repoRoot -ChildPath 'rca/fixtures'
+            $script:rcaIndexLine = 'DBHUBDEMO-RCA-INDEX ' + (Get-Content -LiteralPath (Join-Path -Path $rcaFixtures -ChildPath 'export-index.json') -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 5 -Compress)
+            $script:rcaParts = @(Get-Content -LiteralPath (Join-Path -Path $rcaFixtures -ChildPath 't1-blocking-chain.parts.txt') | Where-Object { $_ })
+            $script:rcaSession = '5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21'
+            function Get-RcaResult {
+                $script:lines[0] | Should -Match '^DBHUBDEMO-WORKLOAD \{'
+                $script:lines[0].Substring('DBHUBDEMO-WORKLOAD '.Length) | ConvertFrom-Json
+            }
+        }
+
+        It 'checks its part line against rca/transport.schema.json''s' {
+            $schema = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json') -Raw | ConvertFrom-Json -AsHashtable
+            $script:ControlRcaPartPattern | Should -BeExactly $schema['$defs']['partLine']['pattern']
+            $script:ControlRcaDocumentPattern | Should -BeExactly $schema['$defs']['documentRef']['properties']['documentId']['pattern']
+        }
+
+        It 'exports on T1 with the session''s ID, and prints the runner''s index line last, whole' {
+            $root = New-ControlRoot
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = ("observer: 2 documents`r`n" + $script:rcaIndexLine + "`r`n"); StdErr = '' } }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession; final = $true }) -StateRoot $root
+            $script:lines.Count | Should -Be 2
+            $result = Get-RcaResult
+            $result.action | Should -Be 'Rca'
+            $result.status | Should -Be 'Pass'
+            $script:lines[1] | Should -BeExactly $script:rcaIndexLine
+            ($script:lines -join "`n").Length | Should -BeLessThan 4096 -Because 'the instance view keeps the last 4 KB'
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq ('rca export --session {0} --final' -f $script:rcaSession) -and $TimeoutSeconds -eq 600 }
+            # Outside a control session, and without --final.
+            $script:lines.Clear()
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export' }) -StateRoot $root
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq 'rca export --session none' }
+        }
+
+        It 'prints the part asked for, and refuses another part or a line outside the contract' {
+            $root = New-ControlRoot
+            $script:rcaOut = $script:rcaParts[1]
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:rcaOut; StdErr = '' } }
+            $request = @{ command = 'part'; documentId = '20261120T165000Z-sqlvm01-0001'; part = 2 }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request $request) -StateRoot $root
+            (Get-RcaResult).status | Should -Be 'Pass'
+            $script:lines[1] | Should -BeExactly $script:rcaParts[1]
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 1 -Exactly -ParameterFilter { ($ArgumentList -join ' ') -eq 'rca part --document 20261120T165000Z-sqlvm01-0001 --part 2' -and $TimeoutSeconds -eq 120 }
+            # The VM side knows the document and the part asked for; the runbook checks the count and the SHA-256 against the
+            # export's index (Test-DbHubRcaPartLine).
+            foreach ($other in @($script:rcaParts[0], ($script:rcaParts[1] + '!'), ($script:rcaParts[1] -replace '-0001 ', '-0002 '))) {
+                $script:lines.Clear()
+                $script:rcaOut = $other
+                Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request $request) -StateRoot $root
+                $script:lines.Count | Should -Be 1
+                (Get-RcaResult).status | Should -Be 'Fail'
+            }
+        }
+
+        It 'says Not selected when nothing was captured since the last export, and Not supported for a runner older than the export' {
+            $root = New-ControlRoot
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 2; StdOut = ''; StdErr = '' } }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession }) -StateRoot $root
+            (Get-RcaResult).status | Should -Be 'Not selected'
+            $script:lines.Clear()
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "Unrecognized command or argument 'rca'." } }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession }) -StateRoot $root
+            $result = Get-RcaResult
+            $result.status | Should -Be 'Not supported'
+            $result.evidence.oldRunner | Should -BeTrue
+            $result.message | Should -Match 'predates the RCA export .* \./scripts/deploy\.ps1 updates it'
+        }
+
+        It 'refuses a request outside the contract without running the runner' {
+            $root = New-ControlRoot
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { throw 'must not run' }
+            foreach ($request in @(
+                    @{ command = 'export'; sessionId = '5F1C0E7A9B2D4C6E8F0A1B3C5D7E9F21' }
+                    @{ command = 'export'; sessionId = 'none; whoami' }
+                    @{ command = 'part'; documentId = '20261120T165000Z-sqlvm01-0001'; part = 0 }
+                    @{ command = 'part'; documentId = '../20261120T165000Z-sqlvm01-0001'; part = 1 }
+                    @{ command = 'part'; documentId = '20261120T165000Z-sqlvm01-0001'; part = '1 --session x' }
+                    @{ command = 'run'; documentId = '20261120T165000Z-sqlvm01-0001'; part = 1 }
+                )) {
+                $script:lines.Clear()
+                Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request $request) -StateRoot $root
+                $script:lines.Count | Should -Be 1
+                (Get-RcaResult).status | Should -Be 'Fail' -Because ($request | ConvertTo-Json -Compress)
+            }
+            Should -Invoke -CommandName Invoke-DemoVmRunnerProcess -Times 0
+        }
+
+        It 'runs in T2''s guest on archost01, without making the guest ready or restarting it' {
+            $root = New-ControlRoot -Role 'ArcHost' -NoInstall
+            Mock -CommandName Invoke-DemoControlT2Attempt -MockWith { [pscustomobject]@{ Run = [pscustomobject]@{ ExitCode = 0; StdOut = $script:rcaIndexLine; StdErr = '' }; ReadyNote = [ordered]@{}; Failure = $null } }
+            Mock -CommandName Invoke-DemoControlT2Recovery -MockWith { throw 'must not restart the guest' }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession; final = $true }) -StateRoot $root
+            (Get-RcaResult).status | Should -Be 'Pass'
+            (Get-RcaResult).evidence.guest | Should -Be 'arcsql01'
+            $script:lines[1] | Should -BeExactly $script:rcaIndexLine
+            Should -Invoke -CommandName Invoke-DemoControlT2Attempt -Times 1 -Exactly -ParameterFilter { -not $Activity -and ($Arguments -join ' ') -eq ('rca export --session {0} --final' -f $script:rcaSession) -and $GuestName -eq 'arcsql01' -and $LockSeconds -eq 30 }
+            # A guest without the runner yet has captured nothing: Not selected.
+            $script:lines.Clear()
+            Mock -CommandName Invoke-DemoControlT2Attempt -MockWith { throw 'T2 isn''t set up yet: the guest gets its demo module after SQL Server setup, so the workload runner is not installed in the guest yet.' }
+            Invoke-DemoWorkloadControl -ActionName 'Rca' -Request (ConvertTo-Request @{ command = 'export'; sessionId = $script:rcaSession }) -StateRoot $root
+            (Get-RcaResult).status | Should -Be 'Not selected'
+        }
+    }
+}
+
+Describe 'Invoke-DemoWorkloadControl.ps1: the files its actions dot-source (live, 2026-11-21)' {
+    BeforeAll {
+        # The control script alone, as a managed Run Command runs it: no stand-in or mock for what GuestVm.ps1 defines, so an
+        # action that doesn't load that file fails here as T2's export did on archost01 ("The term 'Get-DemoGuestCredential'
+        # is not recognized").
+        . (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoWorkloadControl.ps1')
+        $script:indexLine = 'DBHUBDEMO-RCA-INDEX ' + (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/fixtures/export-index.json') -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 5 -Compress)
+    }
+
+    BeforeEach {
+        $script:lines = [System.Collections.Generic.List[string]]::new()
+        Mock -CommandName Write-DemoControlLine -MockWith { $script:lines.Add($Line) }
+    }
+
+    # DPAPI (ProtectedData) exists only on Windows, so the static checks' ubuntu-latest leg skips this test; the path check
+    # below runs everywhere.
+    It 'exports T2''s evidence on archost01 with the credential GuestVm.ps1 reads, mocking only PowerShell Direct' -Skip:($IsWindows -eq $false) {
+        Test-Path -LiteralPath 'function:\Get-DemoGuestCredential' | Should -BeFalse -Because 'the action must load GuestVm.ps1 itself, the way the bundle does'
+        $root = Join-Path -Path $TestDrive -ChildPath ('archost-' + [guid]::NewGuid().ToString('N'))
+        New-Item -ItemType Directory -Path (Join-Path -Path $root -ChildPath 'protected') -Force | Out-Null
+        $settings = [ordered]@{ role = 'ArcHost'; workload = [ordered]@{ runnerSha256 = $script:sha; runnerChunkCount = 7; activityProfile = 'baseline'; autoShutdownTime = '1900'; autoShutdownTimeZone = 'UTC' } }
+        Set-Content -LiteralPath (Join-Path -Path $root -ChildPath 'settings.json') -Value ($settings | ConvertTo-Json -Depth 5)
+        # The guest administrator's password as the host keeps it (DPAPI, LocalMachine, as Protect-DemoVmSecret writes it),
+        # made up here.
+        $script:password = 'pw-' + [guid]::NewGuid().ToString('N')
+        Add-Type -AssemblyName 'System.Security'
+        $protected = [System.Security.Cryptography.ProtectedData]::Protect([System.Text.Encoding]::UTF8.GetBytes($script:password), $null, [System.Security.Cryptography.DataProtectionScope]::LocalMachine)
+        [System.IO.File]::WriteAllBytes((Join-Path -Path $root -ChildPath 'protected/guest-administrator.bin'), $protected)
+        # PowerShell Direct into the guest, where the runner prints its index line.
+        $script:signedIn = $null
+        Mock -CommandName Invoke-Command -MockWith {
+            $script:signedIn = $Credential
+            [pscustomobject]@{ ExitCode = 0; StdOut = $script:indexLine; StdErr = '' }
+        }
+        $request = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes((@{ command = 'export'; sessionId = ('5f1c0e7a' * 4); final = $true } | ConvertTo-Json -Compress)))
+        Invoke-DemoWorkloadControl -ActionName 'Rca' -Request $request -StateRoot $root
+        $result = $script:lines[0].Substring('DBHUBDEMO-WORKLOAD '.Length) | ConvertFrom-Json
+        $result.status | Should -Be 'Pass' -Because $result.message
+        $script:lines[1] | Should -BeExactly $script:indexLine
+        Should -Invoke -CommandName Invoke-Command -Times 1 -Exactly -ParameterFilter { $VMName -eq 'arcsql01' }
+        $script:signedIn.UserName | Should -Be 'Administrator'
+        $script:signedIn.GetNetworkCredential().Password | Should -BeExactly $script:password
+    }
+
+    It 'loads each file before a function that needs it runs, on every path from an action' {
+        $parse = { param([string] $Path) [System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$null, [ref]$null) }
+        $isFunction = { param($Node) $Node -is [System.Management.Automation.Language.FunctionDefinitionAst] }
+        $functions = @{}
+        foreach ($function in (& $parse (Join-Path -Path $repoRoot -ChildPath 'vm/bootstrap/Invoke-DemoWorkloadControl.ps1')).FindAll($isFunction, $true)) {
+            $functions[$function.Name] = $function
+        }
+        # The files the control's functions dot-source, by a name each load names, and the functions each file defines.
+        $sources = [ordered]@{ 'GuestVm' = 'vm/hyperv-guest/GuestVm.ps1'; 'Invoke-DemoGoldenGuest' = 'vm/bootstrap/Invoke-DemoGoldenGuest.ps1'; 'Invoke-DemoSignInResidue' = 'vm/bootstrap/Invoke-DemoSignInResidue.ps1' }
+        $definedIn = @{}
+        foreach ($key in $sources.Keys) {
+            foreach ($function in (& $parse (Join-Path -Path $repoRoot -ChildPath $sources[$key])).FindAll($isFunction, $true)) {
+                if (-not $functions.ContainsKey($function.Name)) {
+                    $definedIn[$function.Name] = $key
+                }
+            }
+        }
+        $callsOf = @{}
+        foreach ($name in $functions.Keys) {
+            $callsOf[$name] = @($functions[$name].Body.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.GetCommandName() }, $true))
+        }
+        # Where a function loads a file: a dot-source that names it, itself or in the value of the variable it dot-sources.
+        $loadedAt = {
+            param([string] $Name, [string] $Key)
+            $body = $functions[$Name].Body
+            $offsets = foreach ($dot in $body.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.CommandAst] -and $Node.InvocationOperator -eq [System.Management.Automation.Language.TokenKind]::Dot }, $true)) {
+                $first = $dot.CommandElements[0]
+                $text = $first.Extent.Text
+                if ($first -is [System.Management.Automation.Language.VariableExpressionAst]) {
+                    $variable = '$' + $first.VariablePath.UserPath
+                    $text += ' ' + (@($body.FindAll({ param($Node) $Node -is [System.Management.Automation.Language.AssignmentStatementAst] -and $Node.Left.Extent.Text -eq $variable }, $true) | ForEach-Object { $_.Right.Extent.Text }) -join ' ')
+                }
+                if ($text -match [regex]::Escape($Key)) {
+                    $dot.Extent.StartOffset
+                }
+            }
+            @($offsets) | Sort-Object | Select-Object -First 1
+        }
+        # A call is covered when its function loaded the file before it, or when every call to that function is covered in
+        # turn. The dispatcher has no caller here, so only its own loads cover it; a call back into a function already on
+        # the path adds nothing.
+        $covered = {
+            param([string] $Name, [string] $Key, [int] $Offset, [string[]] $Seen)
+            $loaded = & $loadedAt $Name $Key
+            if ($null -ne $loaded -and $loaded -lt $Offset) {
+                return $true
+            }
+            if ($Seen -contains $Name) {
+                return $true
+            }
+            $sites = @(foreach ($caller in $functions.Keys) { foreach ($call in $callsOf[$caller]) { if ($call.GetCommandName() -eq $Name) { [pscustomobject]@{ Caller = $caller; Offset = $call.Extent.StartOffset } } } })
+            if ($sites.Count -eq 0) {
+                return $false
+            }
+            foreach ($site in $sites) {
+                if (-not (& $covered $site.Caller $Key $site.Offset @(@($Seen) + $Name))) {
+                    return $false
+                }
+            }
+            return $true
+        }
+        $needs = @(foreach ($name in $functions.Keys) { foreach ($call in $callsOf[$name]) { if ($definedIn[$call.GetCommandName()]) { [pscustomobject]@{ Name = $name; Call = $call } } } })
+        $needs.Count | Should -BeGreaterThan 10 -Because 'the check must see the calls it guards'
+        @($needs | Where-Object { $_.Name -eq 'Invoke-DemoControlT2Attempt' -and $_.Call.GetCommandName() -eq 'Get-DemoGuestCredential' }).Count | Should -Be 1
+        $uncovered = foreach ($need in $needs) {
+            $key = $definedIn[$need.Call.GetCommandName()]
+            if (-not (& $covered $need.Name $key $need.Call.Extent.StartOffset @())) {
+                '{0} calls {1} (line {2}) on a path that doesn''t load {3} first' -f $need.Name, $need.Call.GetCommandName(), $need.Call.Extent.StartLineNumber, $sources[$key]
+            }
+        }
+        @($uncovered) | Should -BeNullOrEmpty
+    }
 }
 
 Describe 'Invoke-DemoWorkloadControl.ps1: a cold start never fails an activity (control start reliability)' {

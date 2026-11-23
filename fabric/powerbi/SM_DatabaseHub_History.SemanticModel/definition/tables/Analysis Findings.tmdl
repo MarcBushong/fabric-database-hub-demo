@@ -87,7 +87,7 @@ table 'Analysis Findings'
         formatString: #,0
         displayFolder: Findings
 
-    /// T5's throttling episodes that the notebook detected: runs of intervals with throttled requests (429s), an ru-storm's waves in one slot joined (the cosmosdb.T5.throttle.<start> findings).
+    /// T5's throttling episodes that the notebook detected: runs of intervals with throttled requests (429s), with runs less than 3 minutes apart joined into one (the cosmosdb.T5.throttle.<start> findings).
     measure 'Throttling Episodes' =
             CALCULATE (
                 DISTINCTCOUNT ( 'Analysis Findings'[Finding ID] ),

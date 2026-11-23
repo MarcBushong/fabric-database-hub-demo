@@ -97,7 +97,7 @@ table 'Telemetry Snapshots'
         formatString: #,0
         displayFolder: Locks and blocking
 
-    /// Seconds of Buffer IO page-latch waits (PAGEIOLATCH): data pages read from storage. The IO-pressure and missing-index signal.
+    /// Seconds of Buffer IO page-latch waits (PAGEIOLATCH): tasks waiting for data pages to be read from storage.
     measure 'Buffer IO Wait (s)' =
             DIVIDE (
                 CALCULATE (
@@ -110,7 +110,7 @@ table 'Telemetry Snapshots'
         formatString: #,0.0
         displayFolder: Waits and IO
 
-    /// Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance, the T3 log-rate scenario's signature.
+    /// Seconds of Log Rate Governor waits: Azure SQL Database's log-rate governance, which limits how fast a database writes its transaction log.
     measure 'Log Rate Governor Wait (s)' =
             DIVIDE (
                 CALCULATE (
@@ -455,7 +455,7 @@ table 'Telemetry Snapshots'
         formatString: #,0
         displayFolder: Cosmos DB
 
-    /// T5's availability in the selection (ServiceAvailability, the average of its hourly values), as Database Hub's Performance shows it. A throttled request isn't a failure, so an ru-storm leaves it at 100 %.
+    /// T5's availability in the selection (ServiceAvailability, the average of its hourly values), as Database Hub's Performance shows it. A throttled request (429) isn't a failure, so throttling alone leaves it at 100 %.
     measure 'Cosmos DB Availability (%)' =
             CALCULATE (
                 AVERAGEX ( SUMMARIZE ( 'Telemetry Snapshots', 'Telemetry Snapshots'[Target Key], 'Telemetry Snapshots'[Bucket UTC] ), [Snapshot Value] ),

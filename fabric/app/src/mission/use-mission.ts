@@ -102,6 +102,11 @@ export function useQueryList(specs: readonly QuerySpec[]): ListState {
 export interface MissionData {
     /** The sessions and lone incident requests in the period, newest first. */
     plans: Plan[];
+    /**
+     * The same on every target, before the page's filter: the postmortem's answer key reads them, as its blind investigation
+     * reads every target (the review of b4370565).
+     */
+    allPlans: Plan[];
     /** The session in focus: the view's, or the newest. */
     plan: Plan | null;
     /** Its faults, scored. */
@@ -120,6 +125,11 @@ export interface MissionData {
     postgres: PostgresCapture | null;
     /** The queries behind it, for the DAX, Ask Copilot, and the postmortem. */
     specs: QuerySpec[];
+    /**
+     * Its measured queries only, with no answer-key table or measure, and waits for the session in focus only, never a lone
+     * incident request's minutes: what Ask Copilot hands the chat (ADR 0031).
+     */
+    askSpecs: QuerySpec[];
     loading: boolean;
     /** The sessions query's failure, with no sessions loaded before: without it there's no plan. */
     error: Error | null;
@@ -152,6 +162,18 @@ function waitSpecsFor(plans: readonly Plan[], selected: readonly FilterTarget[])
         }
     }
     return out;
+}
+
+/**
+ * The waits Ask Copilot hands the chat (ADR 0031, decision 7): the session in focus, over its own minutes, on every SQL
+ * target in the filter, whatever it injected where. Never a lone incident request's minutes, which are its fault's own, nor
+ * the other plans the scoreboard shows for its aggregates.
+ */
+function askWaitSpecsFor(plan: Plan | null, selected: readonly FilterTarget[]): QuerySpec[] {
+    if (plan?.kind !== "session") return [];
+    const start = new Date(plan.start.getTime() - 30 * MIN);
+    const end = new Date(plan.end.getTime() + 45 * MIN);
+    return (["T1", "T2", "T3"] as const).filter((target) => selected.includes(target)).map((target) => incidentWaitsQuery({ target, start, end }));
 }
 
 /** Everything the Wave 1 pages show, for the plan in focus and, for the scoreboard's aggregates, the newest `others` plans. */
@@ -193,6 +215,7 @@ export function useMission(others = 0): MissionData {
 
     const runs = useMemo(() => toSessions(sessionRows).filter((r) => !r.profile.startsWith("incident:") || keepTarget(r.target, view.targets)), [sessionRows, view.targets]);
     const plans = useMemo(() => toPlans(runs), [runs]);
+    const allPlans = useMemo(() => toPlans(toSessions(sessionRows)), [sessionRows]);
     const sessionsLoaded = Boolean(sessions.data ?? sessions.stale);
     const requested = view.session ? (plans.find((p) => p.key === view.session) ?? null) : null;
     // A session the address asks for that isn't in this period (or doesn't exist) shows as missing, never as another one.
@@ -265,6 +288,13 @@ export function useMission(others = 0): MissionData {
         () => [sessionsSpec, seriesSpec, incidentsSpec, beatsSpec, ...waitSpecs, cosmosSeriesSpec, cosmosFindingsSpec, pgSeriesSpec].filter((s): s is QuerySpec => s !== null),
         [sessionsSpec, seriesSpec, incidentsSpec, beatsSpec, waitSpecs, cosmosSeriesSpec, cosmosFindingsSpec, pgSeriesSpec],
     );
+    const pgSeriesAskSpec = useMemo(() => (view.targets.includes("T4") ? postgresSeriesQuery({ measured: true }) : null), [view.targets]);
+    const cosmosSeriesAskSpec = useMemo(() => (view.targets.includes("T5") ? cosmosSeriesQuery({ measured: true }) : null), [view.targets]);
+    const askWaitSpecs = useMemo(() => askWaitSpecsFor(plan, filters.targets), [plan, filters.targets]);
+    const askSpecs = useMemo(
+        () => [seriesSpec, ...askWaitSpecs, pgSeriesAskSpec, cosmosSeriesAskSpec].filter((s): s is QuerySpec => s !== null),
+        [seriesSpec, askWaitSpecs, pgSeriesAskSpec, cosmosSeriesAskSpec],
+    );
 
     // The sessions query's failure with nothing loaded before leaves no plan (the page's empty state says it); every other
     // failure is named in loadError, beside what the page still shows, and refetch runs those queries again.
@@ -333,6 +363,7 @@ export function useMission(others = 0): MissionData {
 
     return {
         plans,
+        allPlans,
         plan,
         scores: plan ? (scored.get(plan.key) ?? []) : [],
         scored,
@@ -344,6 +375,7 @@ export function useMission(others = 0): MissionData {
         cosmos,
         postgres,
         specs,
+        askSpecs,
         loading: sessions.loading || series.loading || beatsState.loading || waits.loading || pgPending,
         error,
         loadError,

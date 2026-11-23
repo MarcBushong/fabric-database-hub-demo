@@ -1,0 +1,155 @@
+/// One Query Store plan over one phase of a capture episode. The Incident RCA's evidence (ADR 0031): what the observer beside the workload captured, which NB_DatabaseHub_LiveActivity writes from its evidence documents (rca/history-tables.json).
+table 'RCA Queries'
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The evidence document the row came from (documentId).
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// T1, T2, or T3.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// The observer's capture episode.
+    column 'Episode ID'
+        dataType: string
+        isHidden
+        sourceColumn: episode_id
+
+    /// baseline or episode.
+    column Phase
+        dataType: string
+        sourceColumn: phase
+
+    /// Start of the Query Store intervals summed.
+    column 'Interval Start UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: interval_start_utc
+
+    /// End of the Query Store intervals summed.
+    column 'Interval End UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: interval_end_utc
+
+    /// Query Store query_id.
+    column 'Query ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: query_id
+
+    /// Query Store plan_id.
+    column 'Plan ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: plan_id
+
+    /// The query hash, as hex.
+    column 'Query Hash'
+        dataType: string
+        sourceColumn: query_hash
+
+    /// The module the query belongs to.
+    column Module
+        dataType: string
+        sourceColumn: module_name
+
+    /// The query text, normalized.
+    column Statement
+        dataType: string
+        sourceColumn: statement_text
+
+    /// Executions in the phase.
+    column Executions
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: executions
+
+    /// Total CPU time.
+    column 'CPU (ms)'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: cpu_ms
+
+    /// Total duration.
+    column 'Duration (ms)'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: duration_ms
+
+    /// Total logical reads.
+    column 'Logical Reads'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: logical_reads
+
+    /// Total physical reads.
+    column 'Physical Reads'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: physical_reads
+
+    /// Total log bytes used.
+    column 'Log Bytes'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: log_bytes
+
+    /// The largest memory grant used.
+    column 'Max Used Memory (KB)'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: max_used_memory_kb
+
+    /// The highest degree of parallelism.
+    column 'Max DOP'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: max_dop
+
+    /// How many plans the query had in Query Store.
+    column 'Plans For Query'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: plans_for_query
+
+    /// True when the plan is forced.
+    column 'Is Forced Plan'
+        dataType: boolean
+        sourceColumn: is_forced_plan
+
+    /// MANUAL or AUTO when forced.
+    column 'Plan Forcing Type'
+        dataType: string
+        sourceColumn: plan_forcing_type
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Queries' = entity
+        mode: directLake
+        source
+            entityName: rca_queries
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

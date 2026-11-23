@@ -24,6 +24,12 @@ Stops the demo's compute after a session (plan section 9.4, ADR 0016).
 - A rotation needs the host running: on a deallocated host it reports Manual action required with the steps.
 - -RemoveT3: also deletes T3 and its private endpoint, which stops its fixed monthly costs; the next
   start-demo.ps1 recreates it under the same names (about 10 more minutes).
+- During a Run all session (2026-11-22): after Bastion and the host password, the session's stop goes to the session
+  control, as Stop now's does (STOP.CONTROL.SESSION), so a re-check's export of its evidence is kept apart from the
+  stop's once ./scripts/deploy.ps1 has republished the runbooks; the profiles and T2's guest end with the VMs'
+  deallocation, and the rest goes on after it. -SaveHistory then saves the history without that session's Incident RCA
+  evidence, which the control keeps for the next Run all that starts a session within 7 days (STOP.FABRIC.SAVEHISTORY
+  says so). When the control can't take it, the stop goes on as before, with a Warning.
 - -SaveHistory (or fabric.saveHistoryOnStop): after the VMs stop, runs NB_DatabaseHub_LiveActivity on demand to save
   the session's history to the lakehouse, at most 15 minutes (STOP.FABRIC.SAVEHISTORY). Then, only with
   fabric.manageCapacity true, the Fabric capacity that start-demo.ps1 resumed is paused, never while that run is

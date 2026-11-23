@@ -124,6 +124,7 @@ export default function PerformancePage() {
                 fetchedAt={series.data?.fetchedAt}
                 onRefresh={series.refetch}
                 askPrompt={`Compare ${info.label.toLowerCase()} across the targets in this period: which one stands out, when, and why?`}
+                ask={{ specs: [seriesSpec] }}
             >
                 <ChartView hideHeader height={280} spec={{ kind: "line", title: `${info.label} per target`, rows: lineRows, x: "at", y: "value", series: "target", unit: info.unit }} annotations={{ bands }} />
             </VisualCard>

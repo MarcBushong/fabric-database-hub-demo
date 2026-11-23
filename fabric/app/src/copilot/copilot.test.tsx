@@ -2,11 +2,15 @@ import { act, configure, fireEvent, render, screen, waitFor, within } from "@tes
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { QueryClientContext } from "@/data/use-query";
-import type { QueryClient } from "@/data/query-client";
+import { createQueryClient, describeFailure, QueryFailure, type ConnectorResult, type Execute, type QueryClient } from "@/data/query-client";
 import { setLiveEstateReader, useLiveEstate, type EstateAnswer, type EstateReader, type EstateView } from "@/data/live-estate";
+import { retryClock } from "@/data/retry";
+import { RCA_PRESENCE_DAX } from "@/rca/loader";
+import { INVESTIGATION_TOOL_NAMES } from "@/rca/tools";
 import { AccountChips } from "@/shell/AccountChips";
 import { CopilotDock } from "./CopilotDock";
 import { CopilotProvider } from "./CopilotProvider";
+import { NEWEST_BIN_DAX } from "./investigations";
 import { COSMOS_PROBE_DAX } from "./starters";
 import { useCopilot, useCopilotAccount, useCopilotDock } from "./use-copilot";
 
@@ -145,8 +149,30 @@ const signedInNineHoursAgo = () => ({ accessToken: fakeToken(), expiresAt: Date.
 
 /** What the history model's T5 probe answers: 1 once the lakehouse holds T5's (Azure Cosmos DB) metrics. */
 let hasCosmos = 0;
+/** Whether the history model has the Incident RCA's tables: without them, the presence check fails, as on a model from before the feature. */
+let hasRca = false;
+/** How many more presence checks Power BI throttles, as it answers past 120 queries a minute (live, 2026-11-21). */
+let rcaThrottled = 0;
 const queryClient: QueryClient = {
-    run: vi.fn(async (spec) => ({ spec, columns: [], rows: spec.dax === COSMOS_PROBE_DAX ? [{ HasCosmos: hasCosmos }] : [{ CpuPct: 88.2 }], requestId: "q", fetchedAt: new Date(0), provenance: "history" as const })),
+    run: vi.fn(async (spec) => {
+        if (spec.dax === RCA_PRESENCE_DAX && rcaThrottled > 0) {
+            rcaThrottled -= 1;
+            throw new QueryFailure(describeFailure("api", "You have exceeded the amount of requests allowed in the current time frame and further requests will fail. Retry in 60 seconds."), "api", "429");
+        }
+        // Execute Queries' answer on a model from before the Incident RCA (live, 2026-11-21), as the history source reports it.
+        if (spec.dax === RCA_PRESENCE_DAX && !hasRca) throw new QueryFailure(describeFailure("api", "Query (1, 32) Cannot find table '<oii>RCA Coverage</oii>'."), "api", "400");
+        const rows =
+            spec.dax === COSMOS_PROBE_DAX
+                ? [{ HasCosmos: hasCosmos }]
+                : spec.dax === RCA_PRESENCE_DAX
+                  ? [{ Rows: 0 }]
+                  : spec.dax === NEWEST_BIN_DAX
+                    ? [{ Newest: "2026-11-20T17:20:00" }]
+                    : spec.dax.includes("'RCA ")
+                      ? []
+                      : [{ CpuPct: 88.2 }];
+        return { spec, columns: [], rows, requestId: "q", fetchedAt: new Date(0), provenance: "history" as const };
+    }),
     peek: () => undefined,
     clear: () => undefined,
 };
@@ -163,6 +189,8 @@ function renderDock(initialOpen = true, estate = false) {
 
 beforeEach(() => {
     hasCosmos = 0;
+    hasRca = false;
+    rcaThrottled = 0;
     FakeSocket.startError = null;
     FakeSocket.script = null;
     FakeSocket.startGate = null;
@@ -259,6 +287,84 @@ describe("the Copilot dock", () => {
         renderDock();
         expect(await screen.findByRole("button", { name: "Was Cosmos DB throttled?" })).toBeInTheDocument();
         expect(run.mock.calls.filter(([spec]) => spec.dax === COSMOS_PROBE_DAX)).toHaveLength(1);
+    });
+
+    // ADR 0031: with the RCA tables, the dock offers the investigations, blind; without them (above), it offers none.
+    it("offers the investigation starters and tools once the history model has the RCA tables, with the playbook and without the answer key", async () => {
+        hasRca = true;
+        window.localStorage.setItem("dbhub-insights.github.v1", JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+        vi.stubGlobal(
+            "fetch",
+            fetchStub({
+                "/healthz": { ok: true, version: "t", signIn: "device" },
+                "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+            }),
+        );
+        FakeSocket.script = (socket, message) => {
+            if (message.type === "user") socket.emit({ type: "tool_call", callId: "c1", name: "find_incidents", arguments: {} });
+            if (message.type === "tool_result") {
+                socket.emit({ type: "message", messageId: "m1", text: "Nothing abnormal was captured in the newest 90 minutes." });
+                socket.emit({ type: "idle" });
+            }
+        };
+        renderDock();
+        const latest = await screen.findByRole("button", { name: "What caused the latest incident?" });
+        expect(screen.getByRole("button", { name: "Who blocked whom?" })).toBeInTheDocument();
+        expect(screen.queryByRole("button", { name: "What happened in the latest incident?" })).not.toBeInTheDocument();
+        fireEvent.click(latest);
+        expect(await screen.findByText(/Nothing abnormal was captured/)).toBeInTheDocument();
+        const start = FakeSocket.last!.sent[0];
+        expect((start.tools as Array<{ name: string }>).map((t) => t.name)).toEqual(["run_dax", "show_chart", "suggest_followups", ...INVESTIGATION_TOOL_NAMES]);
+        const system = String(start.systemMessage);
+        expect(system).toContain("# Investigating incidents");
+        for (const key of ["Incident Windows", "Scenario Runs", "Analysis Findings", "[In Incident Window]", "fixed minutes"]) expect(system).not.toContain(key);
+        const result = FakeSocket.last!.sent.find((m) => m.type === "tool_result");
+        expect(result).toMatchObject({ callId: "c1", ok: true });
+        const answer = JSON.parse(String(result?.result)) as { tool: string; window: { fromUtc: string; toUtc: string } };
+        expect(answer).toMatchObject({ tool: "find_incidents", window: { fromUtc: "2026-11-20T15:50:00Z", toUtc: "2026-11-20T17:20:00Z" } });
+        expect(vi.mocked(queryClient.run).mock.calls.filter(([spec]) => spec.dax === RCA_PRESENCE_DAX)).toHaveLength(1);
+    });
+
+    // Live, 2026-11-21: a check that Power BI throttled said nothing about the model, but the dock kept "no RCA tables" for
+    // the rest of the session.
+    it("asks again for the next conversation when its check stayed throttled, and gives that conversation the investigations", async () => {
+        hasRca = true;
+        rcaThrottled = 2;
+        const sleep = vi.spyOn(retryClock, "sleep").mockResolvedValue(undefined);
+        try {
+            window.localStorage.setItem(SESSION, JSON.stringify({ accessToken: fakeToken(), expiresAt: null, refreshToken: null, refreshExpiresAt: null, login: "octo" }));
+            vi.stubGlobal(
+                "fetch",
+                fetchStub({
+                    "/healthz": { ok: true, version: "t", signIn: "device" },
+                    "/auth/user": { login: "octo", name: null, avatarUrl: null },
+                    "/auth/copilot": { ok: true, login: "octo", plan: "enterprise" },
+                }),
+            );
+            FakeSocket.script = (socket, message) => {
+                if (message.type === "user") {
+                    socket.emit({ type: "message", messageId: "m1", text: "T1 worked hardest." });
+                    socket.emit({ type: "idle" });
+                }
+            };
+            const asked = () => vi.mocked(queryClient.run).mock.calls.filter(([spec]) => spec.dax === RCA_PRESENCE_DAX).length;
+            renderDock();
+            // The dock's own check: throttled, then throttled again with its next wait past the budget.
+            await waitFor(() => expect(asked()).toBe(2));
+            await act(async () => {
+                await new Promise((resolve) => setTimeout(resolve, 0));
+            });
+            expect(screen.queryByRole("button", { name: "What caused the latest incident?" })).not.toBeInTheDocument();
+            fireEvent.click(await screen.findByRole("button", { name: "Which target worked hardest this week?" }));
+            expect(await screen.findByText("T1 worked hardest.")).toBeInTheDocument();
+            expect(asked()).toBe(3);
+            const start = FakeSocket.last!.sent[0];
+            expect((start.tools as Array<{ name: string }>).map((t) => t.name)).toEqual(["run_dax", "show_chart", "suggest_followups", ...INVESTIGATION_TOOL_NAMES]);
+            expect(String(start.systemMessage)).toContain("# Investigating incidents");
+        } finally {
+            sleep.mockRestore();
+        }
     });
 
     it("keeps the viewer signed in 9 hours after sign-in: it renews before asking GitHub who the token is (security review, 2026-11-19)", async () => {
@@ -712,6 +818,37 @@ describe("the end of a turn (R925)", () => {
         expect(second.sent.filter((m) => m.type === "user").map((m) => m.text)).toEqual([QUESTION]);
         expect(screen.queryByText(/New chat started another conversation/)).not.toBeInTheDocument();
         expect(document.querySelectorAll(".copilot-answer")).toHaveLength(1);
+    });
+
+    // The review of bfbbe2a: what run_dax checked is what reaches the history connector's executeQuery, through the provider
+    // and the app's own query client, with no CR or form feed in it.
+    it("hands the history connector the query as run_dax checked it, with a line feed for each CR and form feed", async () => {
+        const execute = vi.fn(
+            async ({ query }: Parameters<Execute>[0]): Promise<ConnectorResult> =>
+                query.includes("'RCA ")
+                    ? { status: "error", error: { category: "query", message: "The model has no table named 'RCA Coverage'." }, requestId: "q" }
+                    : { status: "success", table: { columns: [{ name: "[CpuPct]", dataType: "Double" }], rows: [[88.2]] }, requestId: "q" },
+        );
+        FakeSocket.script = (s, m) => {
+            if (m.type === "user") s.emit({ type: "tool_call", callId: "c1", name: "run_dax", arguments: { query: '// Peak CPU\r\nEVALUATE\fROW("CpuPct", 88.2)\r', purpose: "Peak CPU" } });
+            else {
+                s.emit({ type: "message", messageId: "m2", text: ANSWER });
+                s.emit({ type: "idle" });
+            }
+        };
+        signedIn();
+        render(
+            <QueryClientContext.Provider value={createQueryClient(execute)}>
+                <CopilotProvider initialOpen settings={{ relayUrl: RELAY, estate: false }}>
+                    <Harness />
+                </CopilotProvider>
+            </QueryClientContext.Provider>,
+        );
+        await ask();
+        await screen.findByText(ANSWER);
+        const queries = execute.mock.calls.map(([input]) => input.query);
+        expect(queries.filter((query) => query.includes("CpuPct"))).toEqual(['// Peak CPU\nEVALUATE\nROW("CpuPct", 88.2)']);
+        for (const query of queries) expect(query).not.toMatch(/[\r\f]/);
     });
 });
 

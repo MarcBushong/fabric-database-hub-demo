@@ -1858,8 +1858,12 @@ function Invoke-DemoDeploymentTrack {
                     # once it completes, before the Insights app, whose checks read the model.
                     $refreshWaiting = Set-DemoHistoryRefreshWaiting -Result $powerBI -FirstRun $firstRun -WaitMinutes $historyWait -FollowMinutes $historyFollow
                     & $addAll $powerBI
-                    if ($null -ne $refreshWaiting -and $firstRun.Pending) {
-                        Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message $refreshWaiting.message
+                    # Or the model left the Incident RCA's tables out while the run that creates them (an update's first run of
+                    # this release's notebook; ADR 0031) was still queued or running: the model's step runs again once it completes.
+                    $rcaWaiting = @($powerBI | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'FABRIC.SEMANTICMODEL.RCA' -and [string]$_.status -eq 'Warning' }).Count -gt 0
+                    if (($null -ne $refreshWaiting -or $rcaWaiting) -and $null -ne $firstRun -and $firstRun.Pending) {
+                        $waitingNote = if ($null -ne $refreshWaiting) { [string]$refreshWaiting.message } else { 'The history model reads the Incident RCA''s tables once NB_DatabaseHub_LiveActivity, still queued or running, creates them.' }
+                        Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message $waitingNote
                         $again = @(Invoke-DemoHistoryFirstRunFollowUp -Config $Config -ConfigPath $fabricConfigPath -FirstRun $firstRun -RefreshWarning $refreshWaiting -FollowMinutes $historyFollow -ProgressPath $progress)
                         # The follow-up's model step checked the model's data again, so the first step's "Not selected" data
                         # check, from before the model had tables, goes (the review of #68).

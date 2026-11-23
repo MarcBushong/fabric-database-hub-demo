@@ -27,7 +27,7 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | [0007](0007-networking-modes-and-egress.md) | Networking modes and egress strictness | User-directed (Q4b, Q5) | Accepted |
 | [0008](0008-identity-rbac-abac.md) | Identity and permissions: the Contributor-only model | User-directed (§9.1, Q4d; the nightly safety stop's exception, 2026-11-05) | Accepted; amended 2026-11-05 ([ADR 0024](0024-nightly-safety-stop.md)) |
 | [0009](0009-secrets-handling.md) | Secrets handling | Engineering (§9.1); the guest's one automatic sign-in, owner-approved 2026-10-29 | Accepted; Phase 28 amendment not yet run live |
-| [0010](0010-workload-generator-technology.md) | Workload generator technology and delivery | Engineering | Accepted |
+| [0010](0010-workload-generator-technology.md) | Workload generator technology and delivery | Engineering | Accepted; amended 2026-11-20 (the Incident RCA observer's event session, [ADR 0031](0031-incident-rca.md)) |
 | [0011](0011-control-surface-priority.md) | One orchestrator and the demo control surface | Engineering (§9.2) | Accepted |
 | [0012](0012-validation-model.md) | Validation model and status taxonomy | Engineering | Accepted |
 | [0013](0013-agent-experience.md) | Agent experience: in-Hub Database Agent first, skills as fallback | User-directed (Q3) | Accepted, validation pending (the owner's rehearsal) |
@@ -48,6 +48,7 @@ The ADRs follow the approved implementation plan, including **Revision 2** (plan
 | [0028](0028-ask-copilot-in-the-insights-app.md) | Ask: GitHub Copilot chat in the Insights app, on each viewer's own Copilot | User-directed (2026-11-17 and 18: the in-app chat "is a must and a gamechanger", one click and repeatable), with the coordinator's decisions on sign-in, the image, the live estate, and user steps | Accepted; Phase 0 live evidence in the ADR; the in-browser check waits for the owner's rehearsal |
 | [0029](0029-insights-app-dba-console.md) | The Insights app as a DBA console: Fluent 2, the DBA's information architecture, history and live, and bounded Manage actions | User-directed (2026-11-18: "a DBA's dream app", the in-app Copilot, demo it yourself); Manage's write path decided for the user by the coordinator (A, with C as the fallback) | Proposed; Manage's sending mode is built, and confirmed live after the identity proof |
 | [0030](0030-insights-app-mission-control.md) | The Insights app's own look, and what only it can show: Mission Control, the "Did we catch it?" scoreboard, the business lens, the postmortem, the replay, and the kiosk | User-directed (2026-11-19: "things the Database Hub standalone can't and visually different", Wave 1 now); the palette and the dark default are the coordinator's calls, for the owner to confirm | Proposed; built and tested in the preview, seen deployed in the release's final tests |
+| [0031](0031-incident-rca.md) | Incident RCA from saved history, blind, with the chat as the first-line investigator | User-directed (2026-11-20: the blocking chain "and what was the first one", the chat as "the first base investigation and extended DBA assistant", and a real DBA's view: blind detection), with the coordinator's recorded decisions | Proposed; Phase 1 building against the evidence contract in `rca/` |
 
 ## Template
 

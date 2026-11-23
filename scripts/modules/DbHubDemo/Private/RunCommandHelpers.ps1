@@ -1304,13 +1304,14 @@ function Get-DemoVmRunCommandLeftover {
     Running (a deployment, a check, or an on-demand run in progress). Nothing runs on a VM that isn't running, so there
     every one of them counts. Names of anything else aren't the demo's and are left out. Azure allows 25 managed Run
     Commands per VM (https://learn.microsoft.com/azure/virtual-machines/run-command-overview). Returns Ok, Error, Items
-    (VmName, Name, Kind Control or Demo, ExecutionState, ProvisioningState, Finished, by Test-DemoRunCommandFinished, and
-    Deleting), and RecentDeletes. With -IncludeDeleting (the T2 host, 2026-11-17), the demo's ones that Azure is deleting
-    are items too, the bootstrap loader and the profile included, with Deleting set: on that host, they go with a VM agent
-    that isn't working (R871). Except a delete in flight (the review of F31): one whose name ends in a time
-    (-yyyyMMddHHmmss: a fresh-named read, whose delete nobody waits for, or the control's) less than -RecentDeleteMinutes
-    old is a name in RecentDeletes instead, as status.ps1's own health read is seconds after it. Older ones are items, and
-    so is every chunk (DbHubDemo-Chunk-*), whatever its name (the review of 8ff25e95).
+    (VmName, Name, Kind Control or Demo, ExecutionState, ProvisioningState, Finished, by Test-DemoRunCommandFinished,
+    Deleting, and StartUtc, its instance view's startTime, $null when it has none), and RecentDeletes. With
+    -IncludeDeleting (the T2 host, 2026-11-17), the demo's ones that Azure is deleting are items too, the bootstrap loader
+    and the profile included, with Deleting set: on that host, they go with a VM agent that isn't working (R871). Except a
+    delete in flight (the review of F31): one whose name ends in a time (-yyyyMMddHHmmss: a fresh-named read, whose delete
+    nobody waits for, the control's, or the RCA export's DbHubDemo-Rca-*) less than -RecentDeleteMinutes old is a name in
+    RecentDeletes instead, as status.ps1's own health read is seconds after it. Older ones are items, and so is every chunk
+    (DbHubDemo-Chunk-*), whatever its name (the review of 8ff25e95).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1352,7 +1353,8 @@ function Get-DemoVmRunCommandLeftover {
         }
         $properties = Get-DemoMemberValue -InputObject $item -Name 'properties'
         $provisioning = [string](Get-DemoMemberValue -InputObject $properties -Name 'provisioningState')
-        $execution = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $properties -Name 'instanceView') -Name 'executionState')
+        $view = Get-DemoMemberValue -InputObject $properties -Name 'instanceView'
+        $execution = [string](Get-DemoMemberValue -InputObject $view -Name 'executionState')
         $deleting = $provisioning -eq 'Deleting'
         if ($deleting) {
             if (-not $IncludeDeleting) {
@@ -1371,7 +1373,7 @@ function Get-DemoVmRunCommandLeftover {
         elseif ($name -in 'DbHubDemo-Bootstrap', 'DbHubDemo-Profile' -or ($Running -and $execution -in 'Pending', 'Running')) {
             continue
         }
-        $items.Add([pscustomobject]@{ VmName = $VmName; Name = $name; Kind = $kind; ExecutionState = $execution; ProvisioningState = $provisioning; Finished = (Test-DemoRunCommandFinished -Name $name -ExecutionState $execution -NowUtc $NowUtc); Deleting = $deleting })
+        $items.Add([pscustomobject]@{ VmName = $VmName; Name = $name; Kind = $kind; ExecutionState = $execution; ProvisioningState = $provisioning; Finished = (Test-DemoRunCommandFinished -Name $name -ExecutionState $execution -NowUtc $NowUtc); Deleting = $deleting; StartUtc = (ConvertTo-DemoRunCommandUtc -Value (Get-DemoMemberValue -InputObject $view -Name 'startTime')) })
     }
     return [pscustomobject]@{ Ok = $true; Error = ''; Items = $items.ToArray(); RecentDeletes = $recent.ToArray() }
 }

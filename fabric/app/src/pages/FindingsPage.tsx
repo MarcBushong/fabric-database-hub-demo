@@ -12,10 +12,11 @@ import { StatusBadge } from "@/components/StatusBadge";
 import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import { FINDING_CATEGORIES, findingCategory, toFindings, toPostgresFindings, toTargetNames, type FindingCategory, type TargetName } from "@/data/model";
-import { findingsQuery, postgresFindingsQuery, targetNamesQuery } from "@/data/queries";
+import { findingsQuery, postgresFindingsQuery, targetNamesQuery, type ColumnSpec } from "@/data/queries";
 import { liveDataOf, liveOffOf, liveRoutes, useLiveEstate, type EstateAnswer, type EstateView, type MissedAnswer } from "@/data/live-estate";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf } from "@/lib/agent-prompts";
+import { measuredFindings } from "@/lib/ask";
 import { liveOptimizationRows, liveSecurityRows, type LiveCheckRow } from "@/lib/live-findings";
 import { formatDateTimeUtc, sentence } from "@/lib/format";
 import { worstStatus } from "@/lib/status";
@@ -27,10 +28,21 @@ interface FindingRow extends Record<string, unknown> {
     statusSort: number;
     target: string;
     category: FindingCategory;
+    /** The analysis's key: the grading analyses' rows never go to the chat (ADR 0031). */
+    analysisKey: string;
     analysis: string;
     finding: string;
     capturedAt: Date | null;
 }
+
+const TABLE_COLUMNS: ColumnSpec[] = [
+    { key: "status", label: "Status", kind: "status" },
+    { key: "target", label: "Target", kind: "text" },
+    { key: "category", label: "Category", kind: "text" },
+    { key: "analysis", label: "Analysis", kind: "text" },
+    { key: "finding", label: "Finding", kind: "text" },
+    { key: "capturedAt", label: "Captured (UTC)", kind: "datetime" },
+];
 
 const CATEGORY_LABEL = Object.fromEntries(FINDING_CATEGORIES.map((c) => [c.id, c.label])) as Record<FindingCategory, string>;
 
@@ -177,8 +189,8 @@ export default function FindingsPage() {
         const ids = new Set(sql.map((f) => f.id));
         const pg = toPostgresFindings(pgState.data?.rows ?? []).filter((f) => !ids.has(f.id));
         return [
-            ...sql.map((f) => ({ id: f.id, status: f.status, statusSort: f.statusSort, target: f.target, category: findingCategory(f), analysis: f.analysis, finding: f.text, capturedAt: f.capturedAt })),
-            ...pg.map((f) => ({ id: f.id, status: f.status, statusSort: f.statusSort, target: f.target, category: findingCategory({ analysisKey: "postgresql", group: "PostgreSQL", id: f.id }), analysis: "PostgreSQL", finding: f.text, capturedAt: f.capturedAt })),
+            ...sql.map((f) => ({ id: f.id, status: f.status, statusSort: f.statusSort, target: f.target, category: findingCategory(f), analysisKey: f.analysisKey, analysis: f.analysis, finding: f.text, capturedAt: f.capturedAt })),
+            ...pg.map((f) => ({ id: f.id, status: f.status, statusSort: f.statusSort, target: f.target, category: findingCategory({ analysisKey: "postgresql", group: "PostgreSQL", id: f.id }), analysisKey: "postgresql", analysis: "PostgreSQL", finding: f.text, capturedAt: f.capturedAt })),
         ].sort((a, b) => a.statusSort - b.statusSort || (b.capturedAt?.getTime() ?? 0) - (a.capturedAt?.getTime() ?? 0));
     }, [findingsState.data, pgState.data, view.targets]);
 
@@ -227,16 +239,11 @@ export default function FindingsPage() {
                 error={findingsState.error}
                 empty={!findingsState.loading && shown.length === 0}
                 emptyText={<EmptyState compact title={tab === "all" ? "No findings in this period" : `No ${CATEGORY_LABEL[tab].toLowerCase()} findings in the history`}>{tab === "all" ? "Run all in NB_DatabaseHub_Control: the session's history brings the findings." : null}</EmptyState>}
-                table={{ columns: [
-                    { key: "status", label: "Status", kind: "status" },
-                    { key: "target", label: "Target", kind: "text" },
-                    { key: "category", label: "Category", kind: "text" },
-                    { key: "analysis", label: "Analysis", kind: "text" },
-                    { key: "finding", label: "Finding", kind: "text" },
-                    { key: "capturedAt", label: "Captured (UTC)", kind: "datetime" },
-                ], rows: shown, caption: "Findings" }}
+                table={{ columns: TABLE_COLUMNS, rows: shown, caption: "Findings" }}
                 summary={`${shown.length} findings shown.`}
                 askPrompt="Which of these findings should I address first, and how?"
+                // The measured analyses' rows only, with no DAX: Analysis Findings also holds the grading analyses' (ADR 0031).
+                ask={{ specs: [], table: { columns: TABLE_COLUMNS, rows: measuredFindings(shown, (r) => r.analysisKey), caption: "Findings" } }}
                 quiet
             >
                 <DataGrid columns={COLUMNS} rows={shown} caption="Findings" exportName={`findings-${tab}`} />

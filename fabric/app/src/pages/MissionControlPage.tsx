@@ -5,7 +5,7 @@
 
 import { useMemo, useState } from "react";
 import { Button, Link, MessageBar, MessageBarBody } from "@fluentui/react-components";
-import { Replay20Regular, Open16Regular, Trophy20Regular, Tv20Regular } from "@fluentui/react-icons";
+import { Replay20Regular, Open16Regular, TextBulletListTree20Regular, Trophy20Regular, Tv20Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { EmptyState } from "@/components/EmptyState";
@@ -14,9 +14,10 @@ import { TargetChip } from "@/components/TargetChip";
 import { VisualCard } from "@/components/VisualCard";
 import type { ColumnSpec } from "@/data/queries";
 import { hubUrlOf } from "@/lib/agent-prompts";
+import { withoutColumns } from "@/lib/ask";
 import { serviceOf } from "@/lib/business";
 import { formatDateTimeUtc, formatDayUtc, formatNumber, formatTimeUtc, percent } from "@/lib/format";
-import type { PostmortemInput } from "@/lib/postmortem";
+import { nextSessionStart, type PostmortemInput } from "@/lib/postmortem";
 import { minutesText, summarize } from "@/lib/scoreboard";
 import { statusMeta } from "@/lib/status";
 import type { EstateTarget } from "@/lib/view-state";
@@ -43,7 +44,7 @@ const SERVICE_COLUMNS: ColumnSpec[] = [
 ];
 
 export default function MissionControlPage() {
-    const { view, setView, navigate, runtime, meta, provenance, reducedMotion, manage } = useApp();
+    const { view, setView, navigate, runtime, meta, provenance, reducedMotion, manage, rca } = useApp();
     const data = useMission();
     const [lens, setLens] = useState<Lens>("technical");
     const [postmortem, setPostmortem] = useState<PostmortemInput | null>(null);
@@ -67,7 +68,7 @@ export default function MissionControlPage() {
     }));
     const openPostmortem = () => {
         if (!plan) return;
-        setPostmortem({ plan, scores, episodes, beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, generatedAt: new Date() });
+        setPostmortem({ plan, scores, episodes, beat, asOf: meta?.latestCapture ?? null, provenance, specs: data.specs, askSpecs: data.askSpecs, nextSessionStart: nextSessionStart(data.plans, plan), plans: data.allPlans, generatedAt: new Date() });
     };
     const running = manage.mode === "run" ? manage.running : null;
     const windowText = plan ? `${formatDayUtc(plan.start)} ${formatTimeUtc(plan.start)}–${formatTimeUtc(plan.end)} UTC` : "";
@@ -95,6 +96,12 @@ export default function MissionControlPage() {
                         <Button size="small" icon={<Trophy20Regular />} disabled={!plan} onClick={() => navigate("scoreboard", { session: view.session })}>
                             Scoreboard
                         </Button>
+                        {rca === true ? (
+                            // The blind investigation of the history's newest minutes (ADR 0031): one way, it never links back.
+                            <Button size="small" icon={<TextBulletListTree20Regular />} onClick={() => navigate("rca")}>
+                                Root cause
+                            </Button>
+                        ) : null}
                         <PostmortemButton ready={Boolean(plan) && !data.loading} scoreError={data.scoreError} onClick={openPostmortem} />
                         <Button
                             size="small"
@@ -186,6 +193,12 @@ export default function MissionControlPage() {
                 table={{ columns: SERVICE_COLUMNS, rows, caption: "ContosoCare's services" }}
                 summary={rows.map((r) => `${r.service} (${r.target}): ${r.status || "no data"}; ${lens === "business" ? r.impact : r.metric}`).join(". ")}
                 askPrompt="What did ContosoCare's services go through in this session, in business terms, and which needs attention first?"
+                ask={{
+                    // Each service's key number and the telemetry behind it. Its health, impact, and fault counts come from the plan and the findings, the answer key (ADR 0031).
+                    specs: data.askSpecs,
+                    table: withoutColumns({ columns: SERVICE_COLUMNS, rows, caption: "ContosoCare's services" }, ["status", "impact", "evidence", "events"]),
+                    prompt: "What did ContosoCare's services go through in this period, from their measurements, and which needs attention first?",
+                }}
             >
                 <ul className="mc-services">
                     {nodes.map((n) => (

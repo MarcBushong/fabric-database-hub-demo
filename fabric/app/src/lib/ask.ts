@@ -2,6 +2,7 @@
 // them, where the data comes from, and the filter in force.
 
 import { MAX_CONTEXT_ROWS, type AnomalyContext, type AskContext, type ContextColumn, type ContextRow, type DataProvenance } from "@/copilot/contract";
+import { ANSWER_KEY_ANALYSES } from "@/copilot/answer-key";
 import type { Meta } from "@/data/model";
 import type { ColumnSpec, Filters, QuerySpec } from "@/data/queries";
 import { formatIsoDay } from "./format";
@@ -32,6 +33,18 @@ export function contextColumns(columns: readonly ColumnSpec[]): ContextColumn[] 
 export function joinDax(specs: ReadonlyArray<QuerySpec | null | undefined>): string | undefined {
     const shown = specs.filter((s): s is QuerySpec => Boolean(s));
     return shown.length > 0 ? shown.map((s) => `// ${s.title}\n${s.dax}`).join("\n\n") : undefined;
+}
+
+/** A visual's table without some columns: what Ask Copilot hands the chat when those columns are the answer key (ADR 0031). */
+export function withoutColumns<T extends { columns: readonly ColumnSpec[]; rows: ReadonlyArray<Record<string, unknown>> }>(table: T | null, keys: readonly string[]): T | null {
+    if (!table) return null;
+    const drop = new Set(keys);
+    return { ...table, columns: table.columns.filter((c) => !drop.has(c.key)), rows: table.rows.map((r) => Object.fromEntries(Object.entries(r).filter(([k]) => !drop.has(k)))) };
+}
+
+/** Findings without the grading analyses' rows (correlation, the Database Agent loop, blocking): the measured ones Ask Copilot may pass (ADR 0031). */
+export function measuredFindings<R extends Record<string, unknown>>(rows: readonly R[], analysisOf: (r: R) => unknown = (r) => r.AnalysisKey): R[] {
+    return rows.filter((r) => !(ANSWER_KEY_ANALYSES as readonly string[]).includes(String(analysisOf(r) ?? "")));
 }
 
 export interface AskInput {

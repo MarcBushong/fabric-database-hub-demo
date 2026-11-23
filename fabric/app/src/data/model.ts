@@ -200,6 +200,22 @@ export function toSessions(rows: readonly Row[]): SessionRun[] {
         .sort((a, b) => (b.requestedAt?.getTime() ?? 0) - (a.requestedAt?.getTime() ?? 0));
 }
 
+/** The profiles of a whole session (Run all), not a lone incident request. */
+export const SESSION_PROFILES: ReadonlySet<string> = new Set(["session", "showcase"]);
+
+/**
+ * The newest whole session's minutes, or null: what the chat's blind triage of "the session" covers (ADR 0031). Never a
+ * lone incident request's, whose window is its fault's.
+ */
+export function newestSessionWindow(runs: readonly SessionRun[]): { from: Date; to: Date } | null {
+    let newest: { from: Date; to: Date } | null = null;
+    for (const r of runs) {
+        if (!SESSION_PROFILES.has(r.profile.trim()) || !r.windowStart || !r.windowEnd || r.windowEnd <= r.windowStart) continue;
+        if (!newest || r.windowStart > newest.from) newest = { from: r.windowStart, to: r.windowEnd };
+    }
+    return newest;
+}
+
 /** T3's Database Agent beat: the regression, the documented response the run applied, and whether CPU recovered. */
 export interface AgentBeat {
     id: string;

@@ -95,6 +95,13 @@ $script:ActivityControlActiveJobStatuses = @('New', 'Activating', 'Running', 'Re
 # with this marker, so the control's runbook lets a later Run all, the Insights app's Start, or a run replace it with its own
 # plan ($script:DbHubStartDemoMarker in DbHubControl.Common.ps1, which must match), and status.ps1 says whose it is.
 $script:ActivityControlStartDemoMarker = '[start-demo.ps1]'
+# What STOP.CONTROL.AUTOSTOP says stops the demo once stop-demo.ps1 removed a pending auto-stop: stop-demo.ps1 itself, or,
+# once a Run all session's stop went to the session control and its job stopped the session, that job
+# (Invoke-DemoStopHandoff; Final tests' live round at d7df4f9f, O3).
+$script:ActivityControlAutoStopRemovedBy = @{
+    Script  = '; stop-demo.ps1 stops the demo itself.'
+    Control = ' right before the session''s stop went to the session control, so it can''t start a second stop: the control''s DbHub-Stop job stops the demo, as Stop now''s does.'
+}
 # How start-demo.ps1 tells that the published DbHub-Control knows that marker (Test-DemoActivityControlStartDemoRunbook):
 # the variable that holds it in DbHubControl.Common.ps1.
 $script:ActivityControlStartDemoRunbookToken = '$script:DbHubStartDemoMarker'
@@ -602,6 +609,12 @@ function Get-DemoActivityControlRunbookSetting {
         monitoring             = [ordered]@{ extensionInstanceName = [string]$sqlVm['extensionInstanceName']; statusPlugin = [string]$sqlVm['statusPlugin']; featureFlag = [string]$sqlVm['featureFlag']; serviceName = 'SQLIaaSExtension'; settleMinutes = 8; verifyMinutes = 5 }
         apiVersions            = $apiVersions
         controlScriptTemplate  = (Get-DemoWorkloadControlTemplate).Replace('__ACTION__', 'Runner')
+        # The Incident RCA's export (ADR 0031): the VM-side control's Rca action, and its bounds. A stop exports for at most
+        # stopMinutes before the VMs deallocate, a monitoring re-check for at most recheckMinutes; up to maxParallel part
+        # Run Commands per VM at a time, and never more than a VM's 25 managed Run Commands
+        # (https://learn.microsoft.com/azure/virtual-machines/run-command-overview).
+        rcaScriptTemplate      = (Get-DemoWorkloadControlTemplate).Replace('__ACTION__', 'Rca')
+        rca                    = [ordered]@{ stopMinutes = 6; recheckMinutes = 8; startMinutes = 6; maxParallel = 10; exportSeconds = 600; partSeconds = 120 }
     }
 }
 
@@ -2843,7 +2856,8 @@ function Clear-DemoActivityControlAutoStop {
 
     .DESCRIPTION
     - Stop (STOP.CONTROL.AUTOSTOP): stop-demo.ps1 stops the demo itself, so the auto-stop goes, and it can't
-      deallocate the VMs of a later session. Removed is a Pass.
+      deallocate the VMs of a later session. Removed is a Pass. When a Run all session's stop then goes to the session
+      control and its job stops the session, Invoke-DemoStopHandoff words the line for that job instead.
     - Start (START.CONTROL.AUTOSTOP): a local session takes over from an on-demand run, so its pending auto-stop is
       cancelled. That's a Warning, because the VMs now run until stop-demo.ps1 or the nightly auto-shutdown, and
       the message says when that is. When it can't be removed, the Warning gives the pending stop's time and how to
@@ -2956,7 +2970,7 @@ function Clear-DemoActivityControlAutoStop {
         $whose = if (([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $schedule.Value -Name 'properties') -Name 'description')).StartsWith($script:ActivityControlStartDemoMarker, [System.StringComparison]::Ordinal)) { 'start-demo.ps1 session''s' } else { 'on-demand' }
         if ($Purpose -eq 'Stop') {
             if ($removed) {
-                return (& $withBackup (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The pending {0} auto-stop was removed; stop-demo.ps1 stops the demo itself.' -f $whose) -Evidence $evidence -DocUrl $doc))
+                return (& $withBackup (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Pass' -Message ('The pending {0} auto-stop was removed{1}' -f $whose, $script:ActivityControlAutoStopRemovedBy.Script) -Evidence $evidence -DocUrl $doc))
             }
             return (& $withBackup (New-DemoResult -CheckId $checkId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message ('The pending {0} auto-stop couldn''t be removed: {1}. It deallocates the VMs at its time; start-demo.ps1 replaces it when the next session starts.' -f $whose, $deleted.Error) -Evidence $evidence -Remediation $cancel -DocUrl $doc))
         }

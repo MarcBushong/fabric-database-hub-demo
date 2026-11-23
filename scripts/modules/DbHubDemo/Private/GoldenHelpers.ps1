@@ -992,3 +992,151 @@ function Get-DemoGoldenCaptureControlResult {
     }
     return (& $new 'Pass' ('No on-demand run is active: no {0} or {1} job is queued or running, and no auto-stop is pending.' -f $name.ControlRunbook, $name.StopRunbook) $evidence)
 }
+
+function Get-DemoGoldenControlRcaPending {
+    <#
+    .SYNOPSIS
+    The Incident RCA's documents that the session control's runbooks exported on a VM but couldn't fetch, as the session's
+    status lists them, for capture-t2-golden.ps1 (ADR 0031; the review of 3f6cd14): the status's own (rca.pending, and
+    rcaHandoff, what a re-check found while a stop ran) and earlier sessions' (rcaEarlierPending), each with its VM and its
+    session's ID: the status's for its own and the handoff, the carry's for an earlier session's. Only the control's next
+    start fetches them, from the IDs the status keeps, and each start fetches one session's (Get-DbHubRcaEarlier; the review
+    of 0a9fb8d). Read from the control account's variable
+    DbHubSessionStatus, the runbooks' copy of the status, which infra/control/control.bicep creates unencrypted, through Azure
+    Resource Manager with the read access the scripts already use on the control's account: no new grant, and the vault's
+    copy isn't read. Documents past the 7 days the runner keeps them are left out, since no start fetches them any more.
+    An encrypted variable is unreadable here (2026-11-23): a tenant's policy can re-create Automation variables encrypted,
+    and then only a runbook's Get-AutomationVariable reads the value, while Resource Manager returns the variable with no
+    value, which would otherwise read as a status that lists nothing. So isEncrypted, or a variable with no value, is an
+    Error, and Encrypted says why.
+    Returns Read (a status was read), Documents, Error (a read that failed), Encrypted (Resource Manager returned no value:
+    the variable is encrypted, or came with none), Variable, and Notebook. Never throws. Internal.
+    https://learn.microsoft.com/rest/api/automation/variable/get,
+    https://learn.microsoft.com/azure/automation/shared-resources/variables
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [datetime] $NowUtc = [DateTime]::UtcNow
+    )
+
+    $name = Get-DemoActivityControlName -Config $Config
+    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
+    if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
+        return $answer
+    }
+    $read = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/variables/DbHubSessionStatus' -f $name.AutomationAccountId) -ApiVersion '2024-10-23')
+    if (-not $read.Ok) {
+        # A control from before 2026-11-16 has no such variable, and so no session that listed any.
+        if (-not $read.Missing) {
+            $answer.Error = [string]$read.Error
+        }
+        return $answer
+    }
+    # An encrypted variable's value only a runbook reads: Resource Manager leaves it out, and an empty value would read as
+    # a status that lists nothing, so the capture would delete what it lists (2026-11-23).
+    $properties = Get-DemoMemberValue -InputObject $read.Value -Name 'properties'
+    $hasValue = $false
+    if ($properties -is [System.Collections.IDictionary]) {
+        $hasValue = @($properties.Keys | Where-Object { [string]$_ -eq 'value' }).Count -gt 0
+    }
+    elseif ($null -ne $properties) {
+        $hasValue = $null -ne $properties.PSObject.Properties['value']
+    }
+    if ((Get-DemoMemberValue -InputObject $properties -Name 'isEncrypted') -eq $true) {
+        $answer.Encrypted = $true
+        $answer.Error = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
+        return $answer
+    }
+    if (-not $hasValue) {
+        $answer.Encrypted = $true
+        $answer.Error = 'Azure Resource Manager returned it with no value, as it does for an encrypted variable'
+        return $answer
+    }
+    # A variable's value is its JSON, so the status's JSON comes as a JSON string ('""' until the runbooks write one).
+    $text = [string](Get-DemoMemberValue -InputObject $properties -Name 'value')
+    $status = $null
+    try {
+        if (-not [string]::IsNullOrWhiteSpace($text)) {
+            $status = $text | ConvertFrom-Json -AsHashtable -Depth 64
+            if ($status -is [string]) {
+                $status = if ($status.TrimStart().StartsWith('{')) { $status | ConvertFrom-Json -AsHashtable -Depth 64 } else { $null }
+            }
+        }
+    }
+    catch {
+        $answer.Error = 'its value isn''t the JSON of a status'
+        return $answer
+    }
+    $answer.Read = $true
+    if ($status -isnot [System.Collections.IDictionary]) {
+        return $answer
+    }
+    $documents = [System.Collections.Generic.List[object]]::new()
+    $add = {
+        param([object] $Items, [string] $Session)
+        foreach ($item in @($Items)) {
+            $id = [string](Get-DemoMemberValue -InputObject $item -Name 'documentId')
+            $vm = [string](Get-DemoMemberValue -InputObject $item -Name 'vm')
+            if ($id -and $vm) {
+                $documents.Add([ordered]@{ documentId = $id; vm = $vm; sessionId = $Session })
+            }
+        }
+    }
+    # The status's own: kept from its last write, as the next start reads them (Get-DbHubRcaBacklog), with its session's ID.
+    $updated = ConvertTo-DemoUtcDateTime -Value $status['updatedUtc']
+    if ($null -eq $updated -or $updated.AddDays(7) -gt $NowUtc) {
+        & $add (Get-DemoMemberValue -InputObject $status['rca'] -Name 'pending') ([string]$status['sessionId'])
+        & $add $status['rcaHandoff'] ([string]$status['sessionId'])
+    }
+    foreach ($carry in @($status['rcaEarlierPending'])) {
+        $expires = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $carry -Name 'expiresUtc')
+        if ($null -eq $expires -or $expires -gt $NowUtc) {
+            & $add (Get-DemoMemberValue -InputObject $carry -Name 'pending') ([string](Get-DemoMemberValue -InputObject $carry -Name 'sessionId'))
+        }
+    }
+    $answer.Documents = $documents.ToArray()
+    return $answer
+}
+
+function Get-DemoGoldenRcaNotebookState {
+    <#
+    .SYNOPSIS
+    Whether the demo workspace's NB_DatabaseHub_LiveActivity saves the Incident RCA's evidence, for capture-t2-golden.ps1's
+    GOLDEN.CAPTURE.RCA (ADR 0031; the review of c059878). The scripts' history saves and Run all both save it with that
+    notebook, and a copy from before the Incident RCA doesn't know RCA_EVIDENCE_FILE, so it saves none: with
+    fabric.importNotebooks false, deploy.ps1 keeps the workspace's copy, and the scripts' save would fetch T2's documents
+    again and again. Read as FABRIC.RCA.EVIDENCE reads it (Invoke-DemoRcaNotebookRun): a Fabric token for the configured
+    subscription (Get-DemoFabricToken), the workspace by name, read-only (Resolve-DemoFabricConfig -SkipLakehouse, no
+    -Create), and the notebook's definition (Test-DemoFabricNotebookParameter). Returns Known (the definition was read),
+    Current (it knows RCA_EVIDENCE_FILE), and Error (why it isn't known). Never throws. Internal.
+    https://learn.microsoft.com/rest/api/fabric/core/items/get-item-definition
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config
+    )
+
+    $answer = [pscustomobject]@{ Known = $false; Current = $false; Error = '' }
+    try {
+        $token = Get-DemoFabricToken -SubscriptionId ([string]$Config['subscriptionId'])
+        $resolution = Resolve-DemoFabricConfig -Config $Config -Token $token -SkipLakehouse
+        if (-not $resolution.Resolved) {
+            $answer.Error = 'the demo''s Fabric workspace isn''t resolved'
+            return $answer
+        }
+        $knows = Test-DemoFabricNotebookParameter -WorkspaceId ([string]$resolution.WorkspaceId) -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'RCA_EVIDENCE_FILE' -Token $token
+        $answer.Known = [bool]$knows.Known
+        $answer.Current = [bool]$knows.Known -and [bool]$knows.Has
+        $answer.Error = [string]$knows.Error
+    }
+    catch {
+        $answer.Error = Protect-DemoText -Text $_.Exception.Message
+    }
+    return $answer
+}

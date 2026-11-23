@@ -163,8 +163,54 @@ def iso(value):
 SENT, JOBS, REFS, VALIDATORS, ORDER, REFUSED, JOBREADS, STOPS, STATUSREADS, SECRET_URL = [], [], [], [], [], [0], [0], [0], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
 VAULT = {"dbhub-session-status": "{}", "dbhub-session-metrics": "{}", "dbhub-activity-webhook": SECRET_URL}
 RUNBOOK = {"session": None, "accepted": None, "minutes": 0}
-# The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound", "full", and "leftoverjob".
-LAKEHOUSE = "" if scenario in ("unbound", "full", "leftoverjob") else "cccccccc-0000-0000-0000-000000000003"
+# The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound", "full", "leftoverjob", and
+# "rcaleftoverjob".
+LAKEHOUSE = "" if scenario in ("unbound", "full", "leftoverjob", "rcaleftoverjob") else "cccccccc-0000-0000-0000-000000000003"
+# The Incident RCA (ADR 0031): the metrics secret's earlier versions, which hold the bundles the runbook wrote; the demo
+# lakehouse's files (notebookutils.fs); what the activity notebook found staged; and the versions read.
+VERSIONS, FILES, FOLDERS, STAGED, VAULTREADS = {}, {}, set(), [], []
+# A session's history that runs as a job, with its evidence staged (re-check of d2067d69): the reference run fails, and the
+# job's state at Run all's look is queued, Completed after its notebook deleted the file, Completed with the file left (a
+# copy from before the Incident RCA), or Failed; or Completed with the staged file's check raising (review of 37a546bc).
+RCA_JOB_SCENARIOS = ("rcajobqueued", "rcajobdone", "rcajobold", "rcajobfailed", "rcajobunchecked")
+RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail") + RCA_JOB_SCENARIOS
+FIXTURE = json.load(open(sys.argv[4] + "/rca/fixtures/rca-evidence.parameter.json", encoding="utf-8")) if len(sys.argv) > 4 else {"parts": []}
+BUNDLE_PARTS = {"1" * 32: FIXTURE["parts"][:2], "2" * 32: FIXTURE["parts"][2:], "3" * 32: FIXTURE["parts"][:2]}
+DOCUMENT_REFS = [{"documentId": part.split()[2], "parts": int(part.split()[3].split("/")[1]), "sha256": part.split()[4]} for part in FIXTURE["parts"][::2]]
+
+
+def rca_bundle_index(session, bundles):
+    """The rca member the runbook writes (rca/transport.schema.json, bundleIndex), for the bundles given."""
+    for version in bundles:
+        VERSIONS[version] = json.dumps({"kind": "ContosoCare.RcaBundle", "version": 1, "sessionId": session, "parts": BUNDLE_PARTS[version]})
+    return {"kind": "ContosoCare.RcaBundleIndex", "version": 1, "sessionId": session, "bundles": bundles,
+            "documents": [ref for ref in DOCUMENT_REFS if any(ref["documentId"] in part for version in bundles for part in BUNDLE_PARTS[version])],
+            "status": "Pass", "message": "%d evidence document(s) from sqlvm01." % len(bundles)}
+
+
+class FileSystem:
+    """notebookutils.fs over the demo lakehouse, in memory."""
+    def mkdirs(self, path):
+        FOLDERS.add(path)
+        return True
+
+    def put(self, path, content, overwrite=False):
+        FILES[path] = content
+        return True
+
+    def exists(self, path):
+        if scenario == "rcajobunchecked" and path.endswith(".json"):
+            # OneLake didn't answer the staged file's check (review of 37a546bc).
+            raise OSError("OneLake didn't answer")
+        return path in FILES or path in FOLDERS
+
+    def ls(self, path):
+        prefix = path.rstrip("/") + "/"
+        return [types.SimpleNamespace(name=name[len(prefix):]) for name in sorted(FILES) if name.startswith(prefix) and "/" not in name[len(prefix):]]
+
+    def rm(self, path, recurse=False):
+        FILES.pop(path, None)
+        return True
 
 
 def running_status(session_id, accepted, minutes):
@@ -282,6 +328,12 @@ if scenario == "leftovercosmos":
     VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "e" * 32, "capturedBy": "control", "capturedUtc": iso(earlier), "startUtc": iso(earlier - real_dt.timedelta(minutes=100)),
                                                  "endUtc": iso(earlier), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [],
                                                  "cosmos": cosmos_document("e" * 32, earlier - real_dt.timedelta(minutes=100), earlier)}, separators=(",", ":"))
+if scenario in ("leftoverrca", "rcaleftoverjob"):
+    # The Incident RCA's evidence alone (ADR 0031): an empty T4 document carries the bundle index as its rca member.
+    earlier = Clock.now - real_dt.timedelta(days=1)
+    VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": "e" * 32, "capturedBy": "control", "capturedUtc": iso(earlier), "startUtc": iso(earlier - real_dt.timedelta(minutes=100)),
+                                                 "endUtc": iso(earlier), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [],
+                                                 "rca": rca_bundle_index("e" * 32, ["1" * 32, "2" * 32])}, separators=(",", ":"))
 
 
 def runbook(body):
@@ -309,13 +361,59 @@ def runbook(body):
                                                                  "the history's metrics saved to the control vault", "busy marker cleared"],
                                                         "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."},
                                                         "takenOver": {"by": "start-demo", "autoStopUtc": until}})
+        if session and scenario in RCA_SCENARIOS:
+            # A runbook with the Incident RCA (ADR 0031): the stop's export, and each target's capture line, for the notebook.
+            stopped = json.loads(VAULT["dbhub-session-status"])
+            stopped.update(rca={"sessionId": session, "bundles": ["1" * 32, "2" * 32], "final": True, "status": "Pass"},
+                           rcaLines=[{"step": "RCA.EXPORT", "status": "Pass", "message": "2 evidence documents in 4 parts from sqlvm01.", "fix": ""},
+                                     {"step": "RCA.CAPTURE.T1", "status": "Pass", "message": "T1: captured from 16:50 to 17:05 UTC.", "fix": ""}])
+            if scenario == "earlierrca":
+                stopped["rcaEarlier"] = json.loads(VAULT["dbhub-session-status"]).get("rcaEarlier") or RUNNING_EARLIER[0]
+            VAULT["dbhub-session-status"] = json.dumps(stopped)
         if session:
             accepted = RUNBOOK["accepted"] or Clock.now
             document = {"version": 1, "sessionId": session, "capturedUtc": iso(Clock.now), "startUtc": iso(accepted), "endUtc": iso(Clock.now),
                         "windowMinutes": 90, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}
             if scenario == "sessioncosmos":
                 document["cosmos"] = cosmos_document(session, accepted, Clock.now)
+            if scenario in RCA_SCENARIOS and scenario != "leftoverrca":
+                document["rca"] = rca_bundle_index(session, ["1" * 32, "2" * 32])
             VAULT["dbhub-session-metrics"] = json.dumps(document, separators=(",", ":"))
+            if scenario in ("sessionrcalate", "sessionrcapinfail"):
+                # A runbook from 2026-11-20 on names the metrics' final version in the stop's status (review of 15ad76d) ...
+                pin_metrics("4" * 32)
+                if scenario == "sessionrcalate":
+                    # ... because a re-check's bundle, written right after it, can be the secret's latest version.
+                    late_bundle(session)
+
+
+def pin_metrics(version):
+    """The stop's status names the metrics' version that the stop wrote (metrics.version), which Get Secret reads by its ID."""
+    VERSIONS[version] = VAULT["dbhub-session-metrics"]
+    stopped = json.loads(VAULT["dbhub-session-status"])
+    stopped["metrics"]["version"] = version
+    VAULT["dbhub-session-status"] = json.dumps(stopped)
+
+
+def late_bundle(session):
+    """A re-check's evidence bundle written after the stop's version of the metrics: the secret's latest."""
+    VAULT["dbhub-session-metrics"] = json.dumps({"kind": "ContosoCare.RcaBundle", "version": 1, "sessionId": session, "parts": FIXTURE["parts"][:2]}, separators=(",", ":"))
+
+
+if scenario in ("stoppedlate", "leftoverlate"):
+    # A stopped session whose status names its metrics' version, and a re-check's bundle after it as the latest: Stop now
+    # when no session runs ("stoppedlate"), and the next Run all's pre-check ("leftoverlate").
+    session = ("b" if scenario == "stoppedlate" else "e") * 32
+    ended = Clock.now - (real_dt.timedelta(minutes=5) if scenario == "stoppedlate" else real_dt.timedelta(days=1))
+    VAULT["dbhub-session-status"] = json.dumps(stopped_status(session, ended, running_status(session, ended - real_dt.timedelta(minutes=90), 90)))
+    VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": session, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=100)),
+                                                 "endUtc": iso(ended), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+    pin_metrics("5" * 32)
+    late_bundle(session)
+
+
+# The status a session's start writes when it exported an earlier session's evidence (its rcaEarlier; ADR 0031).
+RUNNING_EARLIER = [None]
 
 
 HOST_WARNING = {"step": "Host", "state": "Warning", "message": "T2: archost01 is deallocated, so T2 has no activity now.",
@@ -336,6 +434,9 @@ def vault_read(name):
                 status["dispatchPending"] = ["T2"]
                 status["steps"].append({"step": "Times", "state": "Info", "atUtc": iso(Clock.now), "fix": "",
                                         "message": "T2: its activity isn't set on archost01 yet (a VM or guest that has just started can take minutes), so T2's times count from when it is; the live view says when."})
+            if scenario == "earlierrca":
+                # The start exported session dddd...'s evidence, which its own stop didn't (ADR 0031).
+                RUNNING_EARLIER[0] = status["rcaEarlier"] = rca_bundle_index("d" * 32, ["3" * 32])
             VAULT[name] = json.dumps(status)
         elif scenario == "t2late" and current.get("phase") == "running" and current.get("dispatchPending") \
                 and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=22):
@@ -387,12 +488,22 @@ class Notebook:
             return ""
         REFS.append({"path": path, "timeout": timeout_seconds, "workspace": workspace, "args": arguments})
         ORDER.append("history:" + str(arguments.get("SESSION_ID", ""))[:8])
-        if scenario == "refail":
+        if scenario == "refail" or scenario in RCA_JOB_SCENARIOS:
             raise RuntimeError("The referenced notebook's default lakehouse differs from the caller's.")
         if scenario in ("queued", "queuedjob"):
             # Live, 2026-11-16: Fabric's reference run failed on a cell's result, and the job then queued behind this session.
             raise RuntimeError("Unrecognized token 'REDACTED': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')")
         _sleep(240)
+        staged = [name for name in FILES if arguments.get("RCA_EVIDENCE_FILE") and name.endswith("/" + arguments["RCA_EVIDENCE_FILE"])]
+        if staged:
+            # The activity notebook reads the staged evidence; since the Incident RCA it deletes the file and answers with
+            # RCA.EVIDENCE, and a copy from before it does neither ("sessionrcaold").
+            document = json.loads(FILES[staged[0]])
+            STAGED.append({"name": arguments["RCA_EVIDENCE_FILE"], "document": document})
+            if scenario != "sessionrcaold":
+                del FILES[staged[0]]
+                documents = sorted({part.split()[2] for part in document["parts"]})
+                return "RCA.EVIDENCE Pass: Wrote %d evidence document(s) from sqlvm01." % len(documents)
         return ""
 
 
@@ -431,6 +542,16 @@ def post(url, data=None, headers=None, timeout=None, json=None):
 
 
 def request(method, url, json=None, headers=None, timeout=None):
+    if method == "GET" and ".vault.azure.net/secrets/" in url:
+        # Key Vault's Get Secret for one of the metrics secret's earlier versions (ADR 0031), with the keyvault token.
+        assert (headers or {}).get("Authorization") == "Bearer simulated-keyvault", headers
+        name, version = __import__("re").search(r"/secrets/([^/?]+)/([0-9a-f]{32})\?api-version=2025-07-01$", url).groups()
+        VAULTREADS.append("%s/%s" % (name, version[:8]))
+        if scenario == "bundlefail" and version == "2" * 32:
+            return Response(403, {"error": {"code": "Forbidden", "message": "The user doesn't have secrets get permission."}})
+        if scenario == "sessionrcapinfail" and version == "4" * 32:
+            return Response(403, {"error": {"code": "Forbidden", "message": "The user doesn't have secrets get permission."}})
+        return Response(200, {"value": VERSIONS[version], "id": url.split("?")[0]})
     # No capacity call: the control never checks, starts, or pauses the capacity (the user, 2026-11-14).
     assert url.startswith(FABRIC + "/"), url
     if method == "GET" and "/items?type=" in url:
@@ -445,7 +566,16 @@ def request(method, url, json=None, headers=None, timeout=None):
         return Response(202, None, FABRIC + "/workspaces/x/items/nb-1/jobs/instances/run-%d" % len(JOBS))
     if method == "GET" and "/jobs/instances/run-" in url:
         JOBREADS[0] += 1
-        return Response(200, {"status": "NotStarted" if scenario in ("queued", "queuedjob") else "Completed"})
+        if scenario in ("queued", "queuedjob", "rcajobqueued"):
+            return Response(200, {"status": "NotStarted"})
+        if scenario == "rcajobfailed":
+            return Response(200, {"status": "Failed", "failureReason": {"message": "Notebook execution failed in cell 4."}})
+        if scenario == "rcajobdone":
+            # The job ran, and its notebook deleted the staged evidence once it had written it.
+            staged = JOBS[int(url.rsplit("-", 1)[1]) - 1].get("RCA_EVIDENCE_FILE") or ""
+            for name in [name for name in FILES if staged and name.endswith("/" + staged)]:
+                del FILES[name]
+        return Response(200, {"status": "Completed"})
     raise AssertionError("unexpected %s %s" % (method, url))
 
 
@@ -460,7 +590,7 @@ def stop_session():
 sys.modules["requests"] = fake_requests
 sys.modules["pandas"] = types.ModuleType("pandas")
 # Run all in the notebook editor is an interactive session; "queuedjob" is a scheduled or pipeline run.
-namespace = {"notebookutils": types.SimpleNamespace(credentials=Credentials(), notebook=Notebook(), session=types.SimpleNamespace(stop=stop_session),
+namespace = {"notebookutils": types.SimpleNamespace(credentials=Credentials(), notebook=Notebook(), session=types.SimpleNamespace(stop=stop_session), fs=FileSystem(),
                                                    runtime=types.SimpleNamespace(context={"currentWorkspaceId": "dddddddd-0000-0000-0000-000000000004", "defaultLakehouseId": LAKEHOUSE,
                                                                                           "isForInteractive": scenario != "queuedjob"}))}
 buffer = io.StringIO()
@@ -471,6 +601,7 @@ with contextlib.redirect_stdout(buffer):
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
                           "takenoverstop": {"STOP_NOW": True}, "takenoveragain": {"STOP_NOW": True}, "nocontrolstop": {"STOP_NOW": True},
+                          "stoppedlate": {"STOP_NOW": True},
                           "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False},
                           "askedshort": {"DURATION_MINUTES": 20}, "askedlong": {"DURATION_MINUTES": 150},
                           "askedfraction": {"DURATION_MINUTES": 45.5}, "askednone": {"DURATION_MINUTES": None}, "askedtext": {"DURATION_MINUTES": "abc"},
@@ -482,12 +613,13 @@ with contextlib.redirect_stdout(buffer):
     except Exception as failure:
         error = "%s: %s" % (type(failure).__name__, failure)
 printed = buffer.getvalue()
-print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "validators": VALIDATORS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "statusReads": STATUSREADS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed}))
+print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "validators": VALIDATORS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "statusReads": STATUSREADS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed,
+                  "staged": STAGED, "files": sorted(FILES), "vaultReads": VAULTREADS}))
 '@
 
     function Invoke-Simulation([string] $Path, [string] $Scenario, [string] $Start) {
         $PSNativeCommandUseErrorActionPreference = $false
-        $output = & $script:python $script:simulator $Path $Scenario $Start 2>&1
+        $output = & $script:python $script:simulator $Path $Scenario $Start $repoRoot 2>&1
         if ($LASTEXITCODE -ne 0) {
             throw ($output -join "`n")
         }
@@ -575,11 +707,20 @@ Describe 'NB_DatabaseHub_Control' {
         }
     }
 
-    It 'asks only for the pbi and kusto tokens, and sends requests only to documented hosts' {
+    It 'asks only for the pbi, kusto, and keyvault tokens, and sends requests only to documented hosts' {
         foreach ($use in [regex]::Matches($script:allCode, '(?<!def )\bget_token\(([^)]*)\)')) {
-            $use.Groups[1].Value | Should -BeIn @('"pbi"', '"kusto"', 'audience')
+            $use.Groups[1].Value | Should -BeIn @('"pbi"', '"kusto"', '"keyvault"', 'audience')
         }
-        $script:allCode | Should -Match 'if audience not in \("pbi", "kusto"\):'
+        $script:allCode | Should -Match 'if audience not in \("pbi", "kusto", "keyvault"\):'
+        # The keyvault token reads only the metrics secret's earlier versions, which hold the Incident RCA's evidence
+        # (ADR 0031): Key Vault's Get Secret, by version, in one function.
+        @([regex]::Matches($script:allCode, 'get_token\("keyvault"\)')).Count | Should -Be 1
+        [regex]::Match($script:allCode, '(?ms)^def read_secret_version\(.*?(?=^def )').Value | Should -Match 'get_token\("keyvault"\)'
+        $script:allCode | Should -Match 'address = "%s/secrets/%s/%s\?api-version=%s" % \(KEY_VAULT_URL\.rstrip\("/"\), name, version, KEY_VAULT_API_VERSION\)'
+        $script:allCode | Should -Match '(?m)^KEY_VAULT_API_VERSION = "2025-07-01"$'
+        foreach ($use in [regex]::Matches($script:allCode, '(?<!def )\bread_secret_version\(([^,)]*)')) {
+            $use.Groups[1].Value | Should -BeIn @('METRICS_SECRET_NAME', 'name')
+        }
         $script:allCode | Should -Match 'if not url\.startswith\(FABRIC_API \+ "/"\):'
         $script:allCode | Should -Not -Match 'mssparkutils|management\.azure\.com|api\.github\.com|workflow_dispatch'
         $allowed = '^(adx\.centralus\.arcdataservices\.com|dataexplorer\.azure\.com|powerbi\.com|learn\.microsoft\.com|api\.fabric\.microsoft\.com|app\.fabric\.microsoft\.com)$'
@@ -1585,6 +1726,164 @@ print(json.dumps(out))
         if ($Scenario -eq 'stoppedold') {
             $report.printed | Should -Not -Match 'already stopped'
         }
+    }
+
+    It 'passes the Incident RCA''s evidence to the history in <Case> (ADR 0031)' -ForEach @(
+        @{ Case = 'a session''s end: the bundles read from the metrics secret''s earlier versions, staged, and the file gone after the run'; Scenario = 'sessionrca'; Refs = 1 }
+        @{ Case = 'a session whose activity notebook is from before the Incident RCA: a Warning with the fix, and the file deleted'; Scenario = 'sessionrcaold'; Refs = 1 }
+        @{ Case = 'a session whose start exported an earlier session''s evidence: that evidence saved alone under its ID'; Scenario = 'earlierrca'; Refs = 2 }
+        @{ Case = 'an earlier session whose metrics hold only its evidence: saved right after the start, as a leftover'; Scenario = 'leftoverrca'; Refs = 2 }
+        @{ Case = 'a bundle the vault refuses: the whole documents it could read, and which it couldn''t'; Scenario = 'bundlefail'; Refs = 1 }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.leaked | Should -BeFalse
+        @($report.refs).Count | Should -Be $Refs
+        $session = $report.sent[0].sessionId
+        $fixture = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/fixtures/rca-evidence.parameter.json') -Raw | ConvertFrom-Json
+        # The staged file: one RCA_EVIDENCE document (rca/transport.schema.json, parameter) per history, named in the inbox.
+        foreach ($staged in @($report.staged)) {
+            $staged.name | Should -Match '^Files/rca/inbox/\d{8}T\d{6}Z-[0-9a-f]{8}-[0-9a-f]{8}\.json$'
+            $staged.document.kind | Should -Be 'ContosoCare.RcaEvidenceParts'
+            $staged.document.version | Should -Be 1
+            @($staged.document.parts).Count | Should -BeLessOrEqual 64
+        }
+        # Nothing is left in the inbox: the activity notebook deletes what it reads, and the control what it doesn't.
+        @($report.files) | Should -BeNullOrEmpty
+        $report.printed | Should -Not -Match 'Bearer|simulated-keyvault'
+        switch ($Scenario) {
+            'sessionrca' {
+                $report.refs[0].args.SESSION_ID | Should -Be $session
+                $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
+                @($report.staged[0].document.parts) | Should -Be @($fixture.parts)
+                $report.staged[0].document.sessionId | Should -Be $session
+                @($report.vaultReads) | Should -Be @('dbhub-session-metrics/11111111', 'dbhub-session-metrics/22222222')
+                $report.printed | Should -Match 'RCA\.EXPORT Pass: 2 evidence documents in 4 parts from sqlvm01\.'
+                $report.printed | Should -Match 'RCA\.CAPTURE\.T1 Pass: T1: captured from 16:50 to 17:05 UTC\.'
+                $report.printed | Should -Match ('Session {0}''s RCA evidence: 2 document\(s\) in 4 part\(s\), passed to its history\.' -f $session.Substring(0, 8))
+                $report.printed | Should -Match 'Pass: the history is saved; the report and the Insights app show it after their next refresh\.\s+RCA\.EVIDENCE Pass: Wrote 2 evidence document\(s\) from sqlvm01\.'
+            }
+            'sessionrcaold' {
+                $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
+                $report.printed | Should -Match 'RCA\.EVIDENCE Warning: NB_DatabaseHub_LiveActivity in the demo workspace didn''t read the session''s RCA evidence: its copy is from before the Incident RCA \(ADR 0031\)\. Fix: \./scripts/deploy\.ps1 updates it when fabric\.importNotebooks is true, or \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates it alone; then Run all again saves the evidence' -Because 'Run all''s line for an older notebook is labeled RCA.EVIDENCE, as its other evidence lines are'
+            }
+            'earlierrca' {
+                # The session's own evidence first, then the earlier session's alone: RCA_ONLY, with SAVE_RESULTS False, so a
+                # copy of the activity notebook from before the Incident RCA saves nothing.
+                $report.refs[0].args.SESSION_ID | Should -Be $session
+                $report.refs[1].args.SESSION_ID | Should -Be ('d' * 32)
+                $report.refs[1].args.RCA_ONLY | Should -BeTrue
+                $report.refs[1].args.SAVE_RESULTS | Should -BeFalse
+                $report.refs[1].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[1].name
+                @($report.staged[1].document.parts) | Should -Be @($fixture.parts[0..1])
+                $report.staged[1].document.sessionId | Should -Be ('d' * 32)
+                $report.refs[1].args.PSObject.Properties.Name | Should -Not -Contain 'SESSION_PLAN'
+                $report.printed | Should -Match 'Session dddddddd''s RCA evidence, which a later session''s start exported from the VMs, is saved under that session''s ID\.'
+            }
+            'leftoverrca' {
+                @($report.order) | Should -Be @('sent:session', 'history:eeeeeeee', 'validator', 'sent:stop', ('history:{0}' -f $session.Substring(0, 8)))
+                $report.refs[0].args.SESSION_ID | Should -Be ('e' * 32)
+                $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
+                $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'POSTGRES_METRICS'
+                $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'COSMOS_METRICS'
+                $report.printed | Should -Match 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault'
+            }
+            'bundlefail' {
+                @($report.staged[0].document.parts) | Should -Be @($fixture.parts[0..1])
+                $report.staged[0].document.status | Should -Be 'Warning'
+                $report.printed | Should -Match ('Session {0}''s RCA evidence: 1 document\(s\) in 2 part\(s\), passed to its history \(bundle 22222222: the control vault answered HTTP 403; 20261120T170000Z-sqlvm01-0002: its bundles don''t hold all its parts\)\.' -f $session.Substring(0, 8))
+            }
+        }
+    }
+
+    It 'reads the metrics'' version that the stop wrote, by its ID, when a re-check''s bundle is the latest, in <Case> (review of 15ad76d)' -ForEach @(
+        @{ Case = 'a session''s end'; Scenario = 'sessionrcalate'; Refs = 1; Session = '' }
+        @{ Case = 'a session''s end whose version the vault refuses: the latest, with a Warning'; Scenario = 'sessionrcapinfail'; Refs = 1; Session = '' }
+        @{ Case = 'Stop now after a session that already stopped'; Scenario = 'stoppedlate'; Refs = 1; Session = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' }
+        @{ Case = 'the next Run all''s pre-check of an earlier session'; Scenario = 'leftoverlate'; Refs = 2; Session = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.leaked | Should -BeFalse
+        @($report.refs).Count | Should -Be $Refs
+        $expected = $(if ($Session) { $Session } else { $report.sent[0].sessionId })
+        $report.refs[0].args.SESSION_ID | Should -Be $expected
+        # T4's metrics, from the version the stop wrote, not the re-check's bundle after it.
+        $report.refs[0].args.PSObject.Properties.Name | Should -Contain 'POSTGRES_METRICS'
+        ($report.refs[0].args.POSTGRES_METRICS | ConvertFrom-Json).sessionId | Should -Be $expected
+        $report.printed | Should -Not -Match 'Bearer|simulated-keyvault'
+        switch ($Scenario) {
+            'sessionrcalate' {
+                @($report.vaultReads) | Should -Be @('dbhub-session-metrics/44444444', 'dbhub-session-metrics/11111111', 'dbhub-session-metrics/22222222')
+                $fixture = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/fixtures/rca-evidence.parameter.json') -Raw | ConvertFrom-Json
+                $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
+                @($report.staged[0].document.parts) | Should -Be @($fixture.parts)
+                $report.printed | Should -Not -Match 'Warning: the history''s metrics version'
+            }
+            'sessionrcapinfail' {
+                $report.printed | Should -Match 'Warning: the history''s metrics version 44444444, which the stop wrote, couldn''t be read \(the control vault answered HTTP 403\), so the vault''s latest is used\.'
+                $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
+            }
+            'stoppedlate' {
+                @($report.vaultReads) | Should -Be @('dbhub-session-metrics/55555555')
+                @($report.order) | Should -Be @('sent:stop', 'history:bbbbbbbb')
+            }
+            'leftoverlate' {
+                @($report.vaultReads) | Should -Be @('dbhub-session-metrics/55555555')
+                $report.printed | Should -Match 'An earlier session \(eeeeeeee, .*\) left its metrics in the vault: its history is saved right after this session''s start is sent'
+            }
+        }
+    }
+
+    It 'says what became of the Incident RCA''s evidence that a history job got, as far as Run all can tell: <Case> (ADR 0031, re-check of d2067d69)' -ForEach @(
+        @{ Case = 'a job queued until Run all''s Spark session ends'; Scenario = 'rcajobqueued'; Files = 1; Says = 'RCA\.EVIDENCE Warning: Run all can''t tell whether session {0}''s RCA evidence is saved: the history job is queued until this notebook''s Spark session ends\. Fix: once the job has run, the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line; when it isn''t Pass, or the job failed, Run all again saves the evidence while its index is in the control vault \(until the next session ends\)\.' }
+        @{ Case = 'a job that ended and deleted the file'; Scenario = 'rcajobdone'; Files = 0; Says = 'Pass: the history is saved; the report and the Insights app show it after their next refresh\.\s+RCA\.EVIDENCE Pass: the history job read session {0}''s RCA evidence and deleted its file, as it does once it has written it; the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line, with any document it skipped\.' }
+        @{ Case = 'a job that ended and left the file'; Scenario = 'rcajobold'; Files = 0; Says = 'RCA\.EVIDENCE Warning: the history job ended without writing session {0}''s RCA evidence: NB_DatabaseHub_LiveActivity in the demo workspace is from before the Incident RCA, or it wrote none of it \(the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line\)\. Fix: when its copy is from before the Incident RCA, \./scripts/deploy\.ps1 updates it when fabric\.importNotebooks is true, or \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates it alone; then Run all again saves the evidence' }
+        @{ Case = 'a job that ended, whose staged file couldn''t be checked (review of 37a546bc)'; Scenario = 'rcajobunchecked'; Files = 1; Says = 'RCA\.EVIDENCE Warning: Run all can''t tell whether session {0}''s RCA evidence is saved: the history job is Completed, but whether it deleted its staged file couldn''t be checked\. Fix: the job''s run in the demo workspace''s Monitor hub has its RCA\.EVIDENCE line; when it isn''t Pass, Run all again saves the evidence while its index is in the control vault \(until the next session ends\)\.' }
+        @{ Case = 'a job that failed'; Scenario = 'rcajobfailed'; Files = 0; Says = 'Warning: the history job is Failed: Notebook execution failed in cell 4\.[^\n]*\s+RCA\.EVIDENCE Warning: session {0}''s RCA evidence wasn''t saved: the history job is Failed, so nothing read it\. Fix: Run all again saves the evidence while its index is in the control vault \(until the next session ends\)\.' }
+        @{ Case = 'an earlier session''s history saved as a job that Run all doesn''t look at'; Scenario = 'rcaleftoverjob'; Files = 1; Says = 'RCA\.EVIDENCE Warning: Run all can''t tell whether session eeeeeeee''s RCA evidence is saved: Run all doesn''t wait for the history job\. Fix: once the job has run' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # At d2067d69, Run all printed nothing about the evidence on the job path, and the inbox's day-old sweep later deleted a
+        # file the job left.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.leaked | Should -BeFalse
+        $job = @($report.jobs | Where-Object { $_.PSObject.Properties.Name -contains 'RCA_EVIDENCE_FILE' })
+        $job.Count | Should -Be 1
+        $job[0].RCA_EVIDENCE_FILE | Should -Match '^Files/rca/inbox/\d{8}T\d{6}Z-[0-9a-f]{8}-[0-9a-f]{8}\.json$'
+        $report.printed | Should -Match ($Says -f $report.sent[0].sessionId.Substring(0, 8))
+        @([regex]::Matches($report.printed, '(?m)^RCA\.EVIDENCE (Pass|Warning):')).Count | Should -Be 1
+        # A job that will still run keeps its file; one that ended, or won't run, leaves nothing in the inbox.
+        @($report.files).Count | Should -Be $Files
+        if ($Files -gt 0) {
+            $report.files[0] | Should -BeLike ('*/' + $job[0].RCA_EVIDENCE_FILE)
+        }
+    }
+
+    It 'says when the control''s runbook is from before the Incident RCA, and passes no evidence (ADR 0031)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # The simulator's runbook writes a stop status without rca or rcaLines, as a runbook from before ADR 0031 does.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'capped' -Start '2026-11-14T17:45:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.printed | Should -Match 'RCA\.EXPORT Warning: the Incident RCA''s evidence wasn''t exported: the control''s runbook is from before it \(ADR 0031\)\. Fix: \./scripts/deploy\.ps1 republishes the runbooks; the evidence stays on the VMs, and the next session''s start exports it\.'
+        $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'RCA_EVIDENCE_FILE'
+        @($report.staged) | Should -BeNullOrEmpty
+        @($report.vaultReads) | Should -BeNullOrEmpty
     }
 
     It 'completes a session''s history that a cancel cut off before scenario_runs, with its plan, and the next Run all doesn''t analyze it again (2026-11-19, needs pandas)' {

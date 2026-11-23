@@ -9,6 +9,7 @@ import { liveOffText, useLiveOff } from "@/data/live-estate";
 import { probeQuery } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf } from "@/lib/agent-prompts";
+import { withoutColumns } from "@/lib/ask";
 import { copyText } from "@/lib/clipboard";
 import { formatDateTimeUtc, formatNumber } from "@/lib/format";
 import { appItemUrl } from "@/lib/runtime-config";
@@ -144,6 +145,8 @@ export default function LinksPage() {
                 summary={row ? `Connector check passed: ${String(row.ValidationRows)} validation checks, ${String(row.SnapshotRows)} telemetry rows, ${String(row.Incidents)} incident windows.` : "Connector check."}
                 fetchedAt={probe.data?.fetchedAt}
                 onRefresh={probe.refetch}
+                // The count of incident windows is the answer key's, so the chat gets the other two, without the DAX that counts it (ADR 0031).
+                ask={{ specs: [], table: probe.data ? withoutColumns({ columns: probeSpec.columns, rows: probe.data.rows, caption: "Connector check" }, ["Incidents"]) : null }}
                 quiet
             >
                 {row ? (

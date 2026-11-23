@@ -314,7 +314,7 @@ describe("the glob and minimatch overrides with the pinned Rayfin CLI and ESLint
         expect(test.rules["react-refresh/only-export-components"]?.[0]).toBe(0);
         expect(app.rules["react-hooks/rules-of-hooks"]?.[0]).toBe(2);
         const results = await eslint.lintFiles(["src/test/*.ts"]);
-        expect(results.map((result) => result.filePath.replace(/\\/g, "/").replace(/^.*\/src\/test\//, "")).sort()).toEqual(["overrides.test.ts", "setup.ts"]);
-        expect(results.map((result) => result.errorCount + result.warningCount)).toEqual([0, 0]);
+        expect(results.map((result) => result.filePath.replace(/\\/g, "/").replace(/^.*\/src\/test\//, "")).sort()).toEqual(["blind.ts", "overrides.test.ts", "setup.ts"]);
+        expect(results.map((result) => result.errorCount + result.warningCount)).toEqual([0, 0, 0]);
     }, 120_000);
 });

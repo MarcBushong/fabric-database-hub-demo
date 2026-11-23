@@ -175,7 +175,9 @@ current. It runs analyze-only, scoped to the demo's resource group
 (RESOURCE_GROUP, rg-<prefix>-<environment>). It waits up to -TimeoutSeconds (at least 5 minutes) for the job. Step 5
 also runs once by itself when step 2 created the notebook, or bound it to a lakehouse that step 0 created, so a new
 lakehouse gets the tables; that first run waits up to -HistoryRunWaitMinutes, since a busy capacity can keep it queued
-for longer than 10 minutes (#68).
+for longer than 10 minutes (#68). With -RunLiveActivity and the Azure CLI's sign-in (not -FabricToken), the run also
+takes the Incident RCA's evidence (2026-11-20, ADR 0031): the runners' export on the VMs that run, with what an earlier
+save didn't take, staged as RCA_EVIDENCE_FILE (FABRIC.RCA.EXPORT, FABRIC.RCA.CAPTURE.<target>, FABRIC.RCA.PENDING).
 
 .PARAMETER HistoryRunWaitMinutes
 How long the first history run (step 5 by itself, above) is waited for while it's queued on the capacity or runs
@@ -615,6 +617,18 @@ if ($null -ne $liveImport) {
 }
 $liveReady = $null -ne $liveImport -and $liveImport.status -eq 'Pass'
 $firstRun = $liveReady -and ($liveOperation -eq 'created' -or $newLakehouse)
+# An update whose history model reads tables the lakehouse doesn't have yet (2026-11-20: the Incident RCA's eight, ADR
+# 0031): this release's notebook, just updated, creates them on its next run, so it runs once now, as for a first
+# deployment, and the history model's step that follows reads them. Read-only check (OneLake's Path - List), only after
+# the subscription guard; one that can't list the tables runs nothing, and the model's step leaves the tables out.
+if ($liveReady -and -not $firstRun -and -not $RunLiveActivity -and $liveOperation -eq 'updated' -and $config -and -not $WhatIfPreference -and -not $guardFailed) {
+    $tablePlan = Get-DemoRcaModelTablePlan -Config $config -WorkspaceId ([string]$fabric['workspaceId']) -LakehouseId ([string]$fabric['lakehouseId'])
+    $tableEvidence = $tablePlan.Result.evidence
+    if (@($tablePlan.Excluded).Count -gt 0 -and [bool]$tableEvidence['listed']) {
+        Write-DemoLog -Message ('NB_DatabaseHub_LiveActivity was updated, and the lakehouse doesn''t have {0} yet: the notebook runs once now and creates them, so the history model reads them.' -f (@($tableEvidence['excluded']) -join ', '))
+        $firstRun = $true
+    }
+}
 if ($newLakehouse -and $liveOperation -eq 'unchanged') {
     $results.Add((New-DemoResult -CheckId 'FABRIC.NOTEBOOKS.IMPORT' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' `
                 -Message ('The lakehouse "{0}" was just created, but NB_DatabaseHub_LiveActivity was already in the workspace and was left as it is, so it may still be bound to another lakehouse, and the history tables weren''t created.' -f [string]$fabric['lakehouseName']) `
@@ -721,8 +735,44 @@ if ($RunLiveActivity -or $firstRun) {
                 $runProgress = @{ ProgressPath = $ProgressPath; ProgressId = 'Fabric.Items'; ProgressNote = 'It''s the first history run: the history model refreshes once it has run.' }
             }
         }
-        $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes $runTimeout @runProgress
+        # The Incident RCA's evidence (2026-11-20, ADR 0031), with -RunLiveActivity after the subscription guard: the runners'
+        # export, not a session's last, with what an earlier save didn't take, staged for the run as RCA_EVIDENCE_FILE, as
+        # deploy.ps1's snapshot does it (FABRIC.RCA.EXPORT, FABRIC.RCA.CAPTURE.<target>); what the run doesn't take stays
+        # listed in out/history-pending for the next save (FABRIC.RCA.PENDING).
+        $rcaExport = $null
+        if ($RunLiveActivity -and $azGuarded) {
+            $rcaExport = & $module { param($Configuration) Invoke-DemoRcaScriptExport -Config $Configuration -CheckPrefix FABRIC } $config
+            foreach ($item in @($rcaExport.Results)) {
+                $results.Add($item)
+            }
+        }
+        $rcaRun = $null
+        $rcaPending = $null
+        try {
+            if ($null -ne $rcaExport -and [string]$rcaExport.Evidence) {
+                $rcaRun = & $module { param($Configuration, $Parameters, $Token, $Evidence, $Minutes, $Options) Invoke-DemoRcaNotebookRun -Config $Configuration -Parameter $Parameters -Token $Token -Evidence $Evidence -TimeoutMinutes $Minutes -RunOption $Options } $config $notebookParameters $runToken ([string]$rcaExport.Evidence) $runTimeout $runProgress
+                $run = $rcaRun.Run
+                if (-not [bool]$rcaRun.RcaSent) {
+                    $results.Add((New-DemoResult -CheckId 'FABRIC.RCA.EVIDENCE' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The RCA evidence wasn''t sent with the run: {0}.' -f [string]$rcaRun.RcaNote) -Remediation $(if ([string]$rcaRun.RcaNote -notmatch 'from before the Incident RCA') { 'Run this command again: it stages the evidence again.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook; then this command again sends the evidence.' } else { 'Run this script with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook alone (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copies); then this command again sends the evidence.' }) -DocUrl 'https://learn.microsoft.com/fabric/onelake/onelake-access-api'))
+                }
+            }
+            else {
+                $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes $runTimeout @runProgress
+            }
+        }
+        finally {
+            # The pending list whatever the run did (review of 3b1348a), as stop-demo.ps1 and deploy.ps1's snapshot keep it:
+            # the runner lists an exported document once, so what the run didn't take stays listed for the next save.
+            if ($null -ne $rcaExport) {
+                $rcaSaved = $null -ne $rcaRun -and [bool]$rcaRun.RcaSaved
+                $rcaWhy = if ($null -ne $rcaRun -and [string]$rcaRun.RcaNote) { [string]$rcaRun.RcaNote } else { 'the run didn''t complete' }
+                $rcaPending = & $module { param($Configuration, $Export, $Saved, $Why) Save-DemoRcaPending -Config $Configuration -CheckPrefix FABRIC -Export $Export -Saved:$Saved -Why $Why -Confirm:$false } $config $rcaExport $rcaSaved $rcaWhy
+            }
+        }
         $results.Add($run)
+        if ($null -ne $rcaPending) {
+            $results.Add($rcaPending)
+        }
         if ($PostgresMetricsPath -and [string]$run.status -eq 'Pass' -and -not $postgresWithheld) {
             # Added to the history: the file moves aside, so it isn't sent again by mistake.
             $savedFolder = Join-Path -Path (Split-Path -Path $PostgresMetricsPath -Parent) -ChildPath 'saved'

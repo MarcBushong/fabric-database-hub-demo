@@ -1,0 +1,755 @@
+import { describe, expect, it } from "vitest";
+import { COSMOS_METRICS } from "@/data/model";
+import { analyzeConnections } from "./connections";
+import { analyzeErrorsResult } from "./errors";
+import { analyzeLocking, blockingEpisodes, chainsOf } from "./locking";
+import { analyzeReplicaLag, LAG_METRIC } from "./replica";
+import { fixtureEvidence, namesAScenario } from "./testdata/contract";
+import { analyzeThroughput } from "./throughput";
+import { pointKey, type EventRow, type MetricPoint, type RcaTarget, type ReplicaSample, type ResourcePoint, type SessionSample, type WholeReading } from "./types";
+
+const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
+
+/** The owner's measured Read Replica Lag of 2026-11-20 (Azure Monitor, a point a minute), around the 12:14 EST spike. */
+export const LIVE_LAG: MetricPoint[] = [
+    ["17:09:00", 0.5],
+    ["17:10:00", 0.6],
+    ["17:11:00", 0.7],
+    ["17:12:00", 45],
+    ["17:13:00", 106],
+    ["17:14:00", 166],
+    ["17:15:00", 1],
+    ["17:16:00", 0.8],
+].map(([time, value]) => ({ target: "T4-replica", at: at(time as string), metric: LAG_METRIC, value: value as number }));
+
+describe("blocking (INV-01) on T1's chain", () => {
+    const e = fixtureEvidence("t1");
+    const a = analyzeLocking(e.sessions, e.events);
+
+    it("puts the head blocker first: the idle transaction, its procedure, who ran it, and its lock", () => {
+        const chain = a.episodes.find((x) => x.headSession === 63)!;
+        expect(chain).toMatchObject({ target: "T1", headSession: 63, headKind: "idle-open-transaction", cycles: 5 });
+        expect(chain.peak).toMatchObject({ blocked: 6, depth: 4, width: 2 });
+        expect(a.rootCause?.ruleIds).toEqual(["BLK-IDLE-HEAD"]);
+        expect(a.rootCause?.confidence).toBe("high");
+        const s = a.rootCause!.statement;
+        for (const fact of ["[demo].[usp_scenario_chain_acquire]", "session 63", "NT AUTHORITY\\SYSTEM", "SQLVM01", "ContosoCare.Demo", "79 s", "[care].[work_queues]", "pk_work_queues", "6 sessions", "2 branches", "4 levels", "58 s", "5 times"]) expect(s).toContain(fact);
+        expect(a.chainLines[0]).toMatch(/^HEAD session 63/);
+    });
+
+    it("names each lock escalation to a table lock", () => {
+        const escalations = a.findings.filter((f) => f.ruleId === "BLK-ESCALATION");
+        expect(escalations).toHaveLength(4);
+        expect(escalations[0].detail).toMatch(/6,248 locks escalated to an X lock/);
+        expect(a.recommendations.map((r) => r.id)).toEqual(expect.arrayContaining(["BLK-COMMIT", "ESC-BATCH"]));
+    });
+
+    it("says nothing the workload planned", () => {
+        expect(namesAScenario(JSON.stringify(a))).toEqual([]);
+    });
+});
+
+/** A session in one blocking sample: what the chain needs, nothing else. */
+const sample = (target: RcaTarget, capturedAt: Date, session: number, blockedBy: number[]): SessionSample => ({ target, capturedAt, session, blockedBy, status: blockedBy.length ? "suspended" : "sleeping", openTransactions: 1, isDemo: true });
+
+describe("blocking chains, the review of 34a9732", () => {
+    it("counts one formation per target when two targets block at once, with interleaved samples", () => {
+        // T1 sampled every 10 s at :00, T4 every 10 s at :05: together, one sample every 5 s.
+        const rows: SessionSample[] = [];
+        for (let s = 0; s < 60; s += 10) {
+            const t1 = new Date(Date.UTC(2026, 10, 20, 17, 0, s));
+            const t4 = new Date(Date.UTC(2026, 10, 20, 17, 0, s + 5));
+            rows.push(sample("T1", t1, 51, []), sample("T1", t1, 52, [51]), sample("T4", t4, 61, []), sample("T4", t4, 62, [61]));
+        }
+        const episodes = blockingEpisodes(rows);
+        expect(episodes.map((e) => [e.target, e.cycles, e.samples])).toEqual(expect.arrayContaining([["T1", 1, 6], ["T4", 1, 6]]));
+    });
+
+    it("puts a session that waits on a special owner under it, never as a head of its own", () => {
+        // Session 10 waits on -2 (an orphaned distributed transaction), and session 11 waits on 10.
+        const t = at("17:00:00");
+        const chains = chainsOf([sample("T1", t, 10, [-2]), sample("T1", t, 11, [10])]);
+        expect(chains).toHaveLength(1);
+        expect(chains[0]).toMatchObject({ headKind: "special", blocked: 2, depth: 3 });
+        expect(chains[0].head.session).toBe(-2);
+    });
+});
+
+describe("blocking (INV-01) on T4's chain, PostgreSQL", () => {
+    const e = fixtureEvidence("t4");
+    const a = analyzeLocking(e.sessions.filter((s) => s.target === "T4"), e.events, at("17:05:00"));
+
+    it("finds the session idle in transaction at the head, and its three waiters", () => {
+        expect(a.rootCause?.ruleIds).toEqual(["BLK-PG-IDLE-IN-TRANSACTION"]);
+        const s = a.rootCause!.statement;
+        for (const fact of ["demo.usp_scenario_locking_acquire", "session 20432", "care.work_queues", "3 sessions", "4 times"]) expect(s).toContain(fact);
+        expect(a.chainLines.join("\n")).toMatch(/HEAD session 20432[\s\S]*9772[\s\S]*20584[\s\S]*35660/);
+        expect(a.recommendations.map((r) => r.id)).toEqual(expect.arrayContaining(["PG-IDLE-TIMEOUT", "PG-LOCK-TIMEOUT"]));
+    });
+});
+
+describe("errors by class (INV-12) on T1", () => {
+    it("counts the 30 lock timeouts, who hit them, and that their own TRY...CATCH caught every one", () => {
+        const r = analyzeErrorsResult(fixtureEvidence("t1").events);
+        expect(r.details).toMatchObject({ classes: [{ class: "lock-timeout", count: 30, intercepted: 30, top: "[demo].[usp_scenario_chain_link]", targets: ["T1"] }] });
+        expect(r.rootCause?.statement).toMatch(/^Most errors were lock timeouts \(30, 16:53:00 to 17:00:00 UTC, mostly \[demo\]\.\[usp_scenario_chain_link\]\)/);
+        expect(r.nextSteps[0]).toMatch(/^explain_locking for T1/);
+    });
+});
+
+describe("read replica lag (INV-15) on T4's replica", () => {
+    const e = fixtureEvidence("t4");
+
+    it("explains the stall from the replica's own samples: a replay conflict, and not the network or the write volume", () => {
+        const a = analyzeReplicaLag({ at: at("17:14:00"), metrics: [], samples: e.replica, events: e.events });
+        expect(a.rise?.source).toBe("RCA Replica");
+        expect(a.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-REPLAY-CONFLICT"] });
+        const s = a.rootCause!.statement;
+        for (const fact of ["175.4 s at 17:14:10 UTC", "demo.replica_lag_marks", "AccessExclusiveLock", "AccessShareLock", "session 41872", "from 17:11:15 UTC", "178500 bytes received but not replayed", "at most 0.002 s", "1020 bytes/s", "max_standby_streaming_delay (600 s)", "nothing was cancelled"]) expect(s).toContain(fact);
+        expect(a.recommendations.map((r) => r.id)).toEqual(["RPL-SHORT-REPORTS", "RPL-STANDBY-DELAY", "RPL-NO-EXCLUSIVE"]);
+    });
+
+    // Live, 2026-11-21: Azure Monitor's 5-minute intervals stood for a stall the capture had sampled every 5 s, so its cause
+    // was looked for before it began. The capture's own samples tell the rise now, and Azure Monitor's are cited beside them.
+    it("reads the rise from the replica's own samples where the capture took them, and cites Azure Monitor's lag beside them", () => {
+        const a = analyzeReplicaLag({ at: at("17:14:00"), metrics: LIVE_LAG, samples: e.replica, events: e.events });
+        expect(a.rise?.source).toBe("RCA Replica");
+        expect(a.rootCause?.statement).toMatch(
+            /^The replica's time since its last replay rose from 17:11:30 to 175\.4 s at 17:14:10 UTC \(15\.4 s, 100\.4 s, 160\.4 s, 175\.4 s\), counting from its last replay at 17:11:14 UTC, and was back to 0\.9 s at 17:14:15 UTC; it grew 1 s per second: replay stood still\./,
+        );
+        expect(a.rootCause?.ruleIds).toEqual(["REPL-REPLAY-CONFLICT"]);
+        expect(a.rootCause?.evidence.filter((x) => x.table === "Telemetry Snapshots").map((x) => x.text)).toEqual(["Read Replica Lag 45 s", "Read Replica Lag 106 s", "Read Replica Lag 166 s"]);
+        expect(a.reads).toEqual({ from: new Date("2026-11-20T17:10:14.600Z"), to: at("17:15:15") });
+    });
+
+    it("reads Azure Monitor's 5-minute intervals as intervals where the capture didn't sample: each the highest in its minutes, never an instant", () => {
+        const five: MetricPoint[] = ([["16:10:00", 1], ["16:15:00", 178], ["16:20:00", 178], ["16:25:00", 2]] as const).map(([t, v]) => ({ target: "T4-replica", at: at(t), metric: LAG_METRIC, value: v, intervalMs: 300_000 }));
+        const a = analyzeReplicaLag({ at: at("16:17:12"), metrics: five, samples: [], events: [] });
+        expect(a.rootCause?.statement).toBe(
+            "Read Replica Lag (its highest value in each 5-minute interval) reached 178 s in the 5 minutes from 16:15:00 UTC (1 s, 178 s, 178 s, 2 s) and was back to 2 s in the 5 minutes from 16:25:00 UTC. Azure Monitor's 5-minute highest values can't say whether replay stood still or slowed, and nothing captured says why.",
+        );
+        expect(a.rise?.slope).toBeNull();
+        // The stall began no earlier than the interval's start less its lag: the cause is looked for from then.
+        expect(a.reads).toEqual({ from: at("16:11:02"), to: at("16:26:00") });
+        expect(a.notCaptured.join(" ")).toMatch(/5-minute intervals here, the highest value in each, so when the lag rose and peaked is known to the interval only/);
+    });
+
+    it("lets an Azure Monitor interval stand for its minutes when its rise fell between the capture's samples, and says so", () => {
+        const sentinel: ReplicaSample[] = Array.from({ length: 41 }, (_, i) => ({ target: "T4-replica", at: new Date(at("20:20:12").getTime() + i * 30_000), side: "replica", sinceLastReplayS: 0.4, receivedNotReplayedBytes: 0 }));
+        const metrics: MetricPoint[] = ([["20:20:00", 1], ["20:25:00", 1], ["20:30:00", 31], ["20:35:00", 1]] as const).map(([t, v]) => ({ target: "T4-replica", at: at(t), metric: LAG_METRIC, value: v, intervalMs: 300_000 }));
+        const a = analyzeReplicaLag({ at: at("20:30:00"), metrics, samples: sentinel, events: [] });
+        expect(a.rise).toMatchObject({ source: "Telemetry Snapshots", peak: { value: 31 } });
+        expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-UNEXPLAINED"] });
+        expect(a.rootCause?.statement).toMatch(/^Read Replica Lag \(its highest value in each 5-minute interval\) reached 31 s in the 5 minutes from 20:30:00 UTC \(0\.4 s, 31 s, 0\.4 s\) and was back to 0\.4 s at 20:35:12 UTC\. The capture's own samples on the replica in that interval stayed under 5 s, so the stall fell between them/);
+        // An interval the capture's samples explain gives way to them: 20:25's 1 s isn't in the series.
+        expect(a.rise?.points.map((p) => p.source)).toEqual(["RCA Replica", "Telemetry Snapshots", "RCA Replica"]);
+    });
+
+    // The review of 4e2c65ed: a stall that began after an interval's last sentinel sample, or ended before the next
+    // interval's first, made that interval stand for its minutes, so the rise read "from 16:15:00", counting from a last
+    // replay at 16:14:51, and the recovery's own samples were dropped.
+    it("keeps the capture's samples where the one beside an interval saw the stall: begun after its last sample, or over before its first", () => {
+        const samples: ReplicaSample[] = [];
+        const add = (t: number, s: number) => samples.push({ target: "T4-replica", at: new Date(t), side: "replica", sinceLastReplayS: Math.round(s * 10) / 10, receivedNotReplayedBytes: 0 });
+        const since = at("16:19:50").getTime();
+        for (let t = at("16:10:12").getTime(); t <= at("16:19:42").getTime(); t += 30_000) add(t, 0.4);
+        add(at("16:20:12").getTime(), 22);
+        for (let t = at("16:20:40").getTime(); t <= at("16:25:00").getTime(); t += 5_000) add(t, (t - since) / 1000);
+        add(at("16:25:05").getTime(), 0.9);
+        for (let t = at("16:25:10").getTime(); t <= at("16:25:15").getTime(); t += 5_000) add(t, 0.4);
+        for (let t = at("16:25:42").getTime(); t <= at("16:34:42").getTime(); t += 30_000) add(t, 0.4);
+        // Azure Monitor's highest in each 5 minutes: 10 s as 16:20 began, 310 s as 16:25 began, 312 s at the recovery.
+        const metrics: MetricPoint[] = ([["16:10:00", 1], ["16:15:00", 10], ["16:20:00", 310], ["16:25:00", 312], ["16:30:00", 1]] as const).map(([t, v]) => ({ target: "T4-replica", at: at(t), metric: LAG_METRIC, value: v, intervalMs: 300_000 }));
+        const a = analyzeReplicaLag({ at: at("16:22:00"), metrics, samples, events: [] });
+        expect(a.rise?.source).toBe("RCA Replica");
+        expect(a.rise?.points.every((p) => p.source === "RCA Replica")).toBe(true);
+        expect(a.rise?.lastReplay).toEqual(at("16:19:50"));
+        expect(a.rootCause?.statement).toMatch(/^The replica's time since its last replay rose from 16:20:12 to 310 s at 16:25:00 UTC \(.*\), counting from its last replay at 16:19:50 UTC, and was back to 0\.9 s at 16:25:05 UTC; it grew 1 s per second/);
+        expect(a.reads).toEqual({ from: at("16:18:50"), to: at("16:26:05") });
+    });
+
+    // The review of ebd1c6c3: a rise's minutes start a minute before its last replay, so they held the stall before it,
+    // and the first conflict in them, that stall's lock, was named as this one's cause.
+    it("names a rise's conflict only from when its own replay stood still, never the stall a minute before it", () => {
+        const samples: ReplicaSample[] = [];
+        const add = (t: string, since: string | null, holder?: number) =>
+            samples.push({
+                target: "T4-replica",
+                at: at(t),
+                side: "replica",
+                sinceLastReplayS: since === null ? 0.3 : (at(t).getTime() - at(since).getTime()) / 1000,
+                receivedNotReplayedBytes: since === null ? 0 : 4096,
+                ...(holder ? { conflictRelation: "demo.replica_lag_marks", conflictWantedMode: "AccessExclusiveLock", conflictWaitStart: at(holder === 111 ? "16:00:01" : "16:01:21"), conflictHolder: holder, conflictHolderMode: "AccessShareLock" } : {}),
+            });
+        const every5 = (from: string, to: string, f: (t: string) => void) => {
+            for (let t = at(from).getTime(); t <= at(to).getTime(); t += 5_000) f(new Date(t).toISOString().slice(11, 19));
+        };
+        // The first stall, held by session 111, and its recovery; the second, from a last replay at 16:01:20, held by 222.
+        every5("16:00:10", "16:01:00", (t) => add(t, "16:00:00", 111));
+        every5("16:01:05", "16:01:15", (t) => add(t, null));
+        every5("16:01:25", "16:01:40", (t) => add(t, "16:01:20"));
+        every5("16:01:45", "16:03:00", (t) => add(t, "16:01:20", 222));
+        every5("16:03:05", "16:04:00", (t) => add(t, null));
+        const a = analyzeReplicaLag({ at: at("16:02:30"), metrics: [], samples, events: [] });
+        expect(a.rise?.lastReplay).toEqual(at("16:01:20"));
+        expect(a.rootCause?.ruleIds).toEqual(["REPL-REPLAY-CONFLICT"]);
+        expect(a.rootCause?.statement).toContain("from 16:01:21 UTC, which a query on the replica held (AccessShareLock; session 222)");
+        expect(a.rootCause?.statement).not.toContain("session 111");
+        // The review of 921d3097: the primary's side has no sample here, so how it shipped isn't said ("at most 0 s").
+        expect(a.rootCause?.statement).toContain(". The primary's side wasn't sampled during the stall, so whether it shipped normally isn't known. Replay may wait");
+        expect(a.rootCause?.statement).not.toMatch(/shipped normally \(/);
+    });
+
+    // The review of fb144473: a conflict's lock was read with no upper bound and its cancels with no bound at all, so a later
+    // stall's lock, or an earlier stall's cancel, read as this one's, beside its own figures.
+    describe("reads a conflict's lock and the queries recovery cancelled from its own stall", () => {
+        /** Every 5 s from `from` to `to`, as the capture reads the replica while replay stands still. */
+        const every5 = (from: string, to: string) => {
+            const out: string[] = [];
+            for (let t = at(from).getTime(); t <= at(to).getTime(); t += 5_000) out.push(new Date(t).toISOString().slice(11, 23));
+            return out;
+        };
+        /** The replica's reading at `t`: since its last replay at `since` (null: replay current, 0.3 s), and what was read with it. */
+        const reading = (t: string, since: string | null, o: { behind?: number; holder?: number; waitStart?: string; cancelled?: number } = {}): ReplicaSample => ({
+            target: "T4-replica",
+            at: at(t),
+            side: "replica",
+            sinceLastReplayS: since === null ? 0.3 : (at(t).getTime() - at(since).getTime()) / 1000,
+            receivedNotReplayedBytes: o.behind ?? 0,
+            conflictsCancelled: o.cancelled ?? 0,
+            ...(o.holder ? { conflictRelation: "demo.replica_lag_marks", conflictWantedMode: "AccessExclusiveLock", conflictWaitStart: at(o.waitStart ?? since ?? t), conflictHolder: o.holder, conflictHolderMode: "AccessShareLock" } : {}),
+        });
+        const primary = (t: string, walBytesPerS: number): ReplicaSample => ({ target: "T4", at: at(t), side: "primary", walBytesPerS, writeLagS: 0.002, flushLagS: 0.002, sendGapBytes: 0 });
+        const statementAt = (samples: ReplicaSample[], t: string, metrics: MetricPoint[] = []) => analyzeReplicaLag({ at: at(t), metrics, samples, events: [] }).rootCause?.statement ?? "";
+
+        it("names no lock the replica took after the stall ended: the review's P2", () => {
+            const samples = [
+                // Replay stood still from 16:00:00 with nothing behind, the primary idle, and was back at 16:01:35.
+                ...every5("16:00:05", "16:01:30").flatMap((t) => [reading(t, "16:00:00"), primary(t, 0)]),
+                reading("16:01:35", null),
+                primary("16:01:35", 0),
+                reading("16:01:40", null),
+                reading("16:01:45", null),
+                // The next stall: its startup process waits for a lock from 16:01:51, sampled from 16:01:55, back at 16:02:45.
+                ...every5("16:01:55", "16:02:40").flatMap((t) => [reading(t, "16:01:50", { behind: 40_960, holder: 333, waitStart: "16:01:51" }), primary(t, 2797)]),
+                reading("16:02:45", null),
+            ];
+            const first = analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+            expect(first.rise?.recovered?.at).toEqual(at("16:01:35"));
+            expect(first.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-IDLE-PRIMARY"] });
+            expect(JSON.stringify(first)).not.toMatch(/session 333|16:01:51|40960/);
+            // The next stall's lock is its own, with its own figures.
+            const second = analyzeReplicaLag({ at: at("16:02:20"), metrics: [], samples, events: [] });
+            expect(second.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-REPLAY-CONFLICT"] });
+            expect(second.rootCause?.statement).toContain("(40960 bytes received but not replayed) while its startup process waited for AccessExclusiveLock on demo.replica_lag_marks from 16:01:51 UTC, which a query on the replica held (AccessShareLock; session 333). The primary shipped normally (write and flush lag at most 0.002 s, WAL about 2797 bytes/s)");
+        });
+
+        it("counts no earlier stall's cancel, and a stall's own, recorded at its recovery: the review's P5", () => {
+            const samples = [
+                // Replay stood still from 15:58:00 behind session 111, which recovery cancelled: recorded at 16:00:30.
+                ...every5("15:58:05", "16:00:25").map((t) => reading(t, "15:58:00", { behind: 4096, holder: 111 })),
+                reading("16:00:30", null, { cancelled: 1 }),
+                ...every5("16:00:35", "16:00:50").map((t) => reading(t, null)),
+                // From a last replay at 16:00:50, behind session 222, whose query ended on its own.
+                ...every5("16:00:55", "16:02:00").map((t) => reading(t, "16:00:50", { behind: 4096, holder: 222 })),
+                reading("16:02:05", null),
+            ];
+            expect(statementAt(samples, "16:01:30")).toMatch(/\(AccessShareLock; session 222\)\. .*; the query ended before that, so nothing was cancelled, and replay caught up\.$/);
+            expect(statementAt(samples, "15:59:30")).toMatch(/\(AccessShareLock; session 111\)\. .*; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+        });
+
+        // After the recovery the count goes on, since a cancel is recorded at or after it, up to the next rise's first point at
+        // its level: the next stall's cancel ends that one, so the capture records it only after reading it there.
+        it("counts no cancel of the next stall, though the capture recorded it in the minute after this one's recovery", () => {
+            const samples = [
+                ...every5("16:00:05", "16:00:40").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                reading("16:00:45", null),
+                reading("16:00:50", null),
+                // From 16:00:55, behind session 222, which recovery cancelled: recorded at its recovery, 16:01:35.
+                ...every5("16:01:00", "16:01:30").map((t) => reading(t, "16:00:55", { behind: 4096, holder: 222 })),
+                reading("16:01:35", null, { cancelled: 1 }),
+            ];
+            expect(statementAt(samples, "16:00:20")).toMatch(/\(AccessShareLock; session 111\)\. .*; the query ended before that, so nothing was cancelled, and replay caught up\.$/);
+            expect(statementAt(samples, "16:01:15")).toMatch(/\(AccessShareLock; session 222\)\. .*; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+        });
+
+        // As in B's data: its first stall recovered at 16:19:27.763, and the blip after it stood still from 16:19:32.69, 0.13 s
+        // before the first stall's next reading. Counted from each one's last replay, that reading would be both stalls'.
+        it("counts a reading after a recovery once, for the stall it follows, though the next one's last replay came just before it", () => {
+            const samples = [
+                ...every5("16:00:05", "16:00:25").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                reading("16:00:30", null),
+                // The first stall's cancel, recorded a reading after its recovery, 0.13 s after the next one's last replay.
+                reading("16:00:35", "16:00:34.870", { cancelled: 1 }),
+                ...every5("16:00:40", "16:01:00").map((t) => reading(t, "16:00:34.870", { behind: 4096, holder: 222 })),
+                reading("16:01:05", null),
+            ];
+            expect(statementAt(samples, "16:00:15")).toMatch(/session 111\)\. .*; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+            expect(statementAt(samples, "16:00:50")).toMatch(/session 222\)\. .*; the query ended before that, so nothing was cancelled, and replay caught up\.$/);
+            // Recorded at the next stall's first reading at its level, it's still the first one's: the next was standing still.
+            const atNext = samples.map((s) => (s.at.getTime() === at("16:00:35").getTime() ? { ...s, conflictsCancelled: 0 } : s.at.getTime() === at("16:00:40").getTime() ? { ...s, conflictsCancelled: 1 } : s));
+            expect(statementAt(atNext, "16:00:15")).toMatch(/; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+            expect(statementAt(atNext, "16:00:50")).toMatch(/; the query ended before that, so nothing was cancelled, and replay caught up\.$/);
+        });
+
+        it("says whether the query was cancelled isn't known when the stall hadn't recovered by the end of the minutes read", () => {
+            const open = every5("16:00:05", "16:01:30").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 }));
+            expect(analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples: open, events: [] }).rise?.recovered).toBeUndefined();
+            const statement = statementAt(open, "16:01:00");
+            expect(statement).toMatch(/; replay hadn't caught up by the end of the minutes read, so whether the query ended or recovery cancelled it isn't known\.$/);
+            expect(statement).not.toMatch(/nothing was cancelled|, and replay caught up/);
+            // A cancel the capture recorded during it is said as one.
+            const cancelled = open.map((s) => (s.at.getTime() === at("16:00:45").getTime() ? { ...s, conflictsCancelled: 1 } : s));
+            expect(statementAt(cancelled, "16:01:00")).toMatch(/; recovery cancelled 1 replica query \(SQLSTATE 40001\) during it, and replay hadn't caught up by the end of the minutes read\.$/);
+        });
+
+        it("says whether the query was cancelled isn't known when the capture didn't read the replica from the stall's recovery on", () => {
+            // The capture's readings end in the stall, and Azure Monitor's lag is back under 5 s from 16:05.
+            const samples = every5("16:00:05", "16:01:30").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 }));
+            const metrics: MetricPoint[] = [{ target: "T4-replica", at: at("16:05:00"), metric: LAG_METRIC, value: 0.5, intervalMs: 60_000, grainMs: 60_000 }];
+            expect(analyzeReplicaLag({ at: at("16:01:00"), metrics, samples, events: [] }).rise?.recovered).toMatchObject({ source: "Telemetry Snapshots", value: 0.5 });
+            expect(statementAt(samples, "16:01:00", metrics)).toMatch(/; the capture has no reading of the replica's cancels from its recovery on, so whether recovery cancelled the query isn't known, and replay caught up\.$/);
+        });
+
+        // The review of 6eaed9aa: a cancel ends a stall's wait, and replay can take more than a reading to catch up after it, as
+        // B's first stall did, so the capture can record the cancel before the recovery. With no reading after the recovery,
+        // it read as not known; fb144473 said it.
+        it("states a cancel recorded during the stall's catch-up, though the capture didn't read the replica from its recovery on: the review's probe", () => {
+            const samples = [
+                ...every5("16:00:05", "16:01:30").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                // Recovery cancelled session 111's query: replay resumed, still 60 s and 2048 bytes behind, and the capture ends.
+                reading("16:01:35", "16:00:35", { behind: 2048, cancelled: 1 }),
+            ];
+            const metrics: MetricPoint[] = [{ target: "T4-replica", at: at("16:05:00"), metric: LAG_METRIC, value: 0.5, intervalMs: 60_000, grainMs: 60_000 }];
+            const a = analyzeReplicaLag({ at: at("16:01:00"), metrics, samples, events: [] });
+            expect(a.rise?.recovered).toMatchObject({ source: "Telemetry Snapshots", value: 0.5 });
+            expect(a.rootCause?.statement).toMatch(/\(AccessShareLock; session 111\)\. .*; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+            expect(a.rootCause?.statement).not.toMatch(/whether recovery cancelled the query isn't known/);
+        });
+
+        // Each reading's count is the cancels since the reading before (pg_stat_database_conflicts' deltas), so they add up.
+        it("adds the cancels each reading recorded since the one before", () => {
+            const samples = [
+                ...every5("16:00:05", "16:00:40").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                reading("16:00:45", null, { cancelled: 1 }),
+                reading("16:00:50", null, { cancelled: 1 }),
+            ];
+            expect(statementAt(samples, "16:00:20")).toMatch(/; recovery cancelled 2 replica queries \(SQLSTATE 40001\), and replay caught up\.$/);
+        });
+
+        // The capture's episode events cited beside a conflict are the stall's own: from its first reading at its level to the
+        // episode's relax after its recovery. A stall that began while the episode for the one before it still ran (B's blip
+        // at 16:19:37) has no escalation of its own, and a later episode's escalation isn't its.
+        it("cites the capture's episode events in the stall's own minutes, up to the relax after its recovery", () => {
+            const samples = [
+                ...every5("16:00:05", "16:00:40").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                reading("16:00:45", null),
+                reading("16:00:50", null),
+                // The next stall, in the episode the first one began, which relaxes after it.
+                ...every5("16:00:56", "16:01:10").map((t) => reading(t, "16:00:51", { behind: 4096, holder: 222 })),
+                ...every5("16:01:15", "16:01:25").map((t) => reading(t, null)),
+            ];
+            const event = (t: string, name: string): EventRow => ({ target: "T4-replica", at: at(t), kind: "capture", name, code: "T4-replica-episode", count: 1, detail: `${name} at ${t}` });
+            const events = [event("16:00:30", "escalated"), event("16:01:25", "relaxed"), event("16:02:30", "escalated"), event("16:03:00", "relaxed")];
+            const cited = (t: string) => (analyzeReplicaLag({ at: at(t), metrics: [], samples, events }).rootCause?.evidence ?? []).filter((e) => e.table === "RCA Events").map((e) => e.text);
+            expect(cited("16:00:20")).toEqual(["capture escalated: escalated at 16:00:30", "capture relaxed: relaxed at 16:01:25"]);
+            expect(cited("16:01:05")).toEqual(["capture relaxed: relaxed at 16:01:25"]);
+        });
+    });
+
+    // The review of ebd1c6c3: the rise was read from the first point at or after the asked time less a minute, so a time in
+    // one rise read as the one a minute before it.
+    it("reads the rise at the asked time from the last point at or before it, never the one a minute before", () => {
+        const samples: ReplicaSample[] = [];
+        const add = (t: string, since: string | null) => samples.push({ target: "T4-replica", at: at(t), side: "replica", sinceLastReplayS: since === null ? 0.3 : (at(t).getTime() - at(since).getTime()) / 1000, receivedNotReplayedBytes: 0 });
+        for (let s = 5; s <= 40; s += 5) add(`16:00:${String(s).padStart(2, "0")}`, "16:00:00");
+        add("16:00:45", null);
+        add("16:00:50", null);
+        for (let s = 0; s <= 55; s += 5) add(`16:01:${String(s).padStart(2, "0")}`, "16:00:55");
+        add("16:02:00", null);
+        const a = analyzeReplicaLag({ at: at("16:01:30"), metrics: [], samples, events: [] });
+        expect(a.rise?.lastReplay).toEqual(at("16:00:55"));
+        expect(a.rise?.peak.at).toEqual(at("16:01:55"));
+    });
+
+    // The re-review of bb70161f: with the capture from 16:16:12, partway through a stall from 16:13:00, the rise "rose
+    // from 16:10:00", the start of Azure Monitor's interval before it, counting from a last replay at 16:13:00.
+    it("starts a rise whose first point is one of Azure Monitor's intervals at the capture's first sample, or says that interval", () => {
+        const since = at("16:13:00").getTime();
+        const samples: ReplicaSample[] = [];
+        for (let t = at("16:16:12").getTime(); t <= at("16:18:00").getTime(); t += 5_000) samples.push({ target: "T4-replica", at: new Date(t), side: "replica", sinceLastReplayS: (t - since) / 1000, receivedNotReplayedBytes: 0 });
+        for (let t = at("16:18:05").getTime(); t <= at("16:24:35").getTime(); t += 30_000) samples.push({ target: "T4-replica", at: new Date(t), side: "replica", sinceLastReplayS: 0.4, receivedNotReplayedBytes: 0 });
+        const fiveMinutes: MetricPoint[] = ([["16:10:00", 120], ["16:15:00", 300], ["16:20:00", 1]] as const).map(([t, v]) => ({ target: "T4-replica", at: at(t), metric: LAG_METRIC, value: v, intervalMs: 300_000 }));
+        const a = analyzeReplicaLag({ at: at("16:17:00"), metrics: fiveMinutes, samples, events: [] });
+        expect(a.rootCause?.statement).toMatch(/^The replica's time since its last replay rose from 16:16:12 to 297 s at 16:17:57 UTC \(.*\), counting from its last replay at 16:13:00 UTC/);
+        // Azure Monitor alone, with a 5-minute interval before 1-minute ones: the interval, as an interval.
+        const mixed: MetricPoint[] = [
+            { target: "T4-replica", at: at("16:10:00"), metric: LAG_METRIC, value: 120, intervalMs: 300_000 },
+            ...([["16:15:00", 180], ["16:16:00", 240], ["16:17:00", 0.5]] as const).map(([t, v]): MetricPoint => ({ target: "T4-replica", at: at(t), metric: LAG_METRIC, value: v, intervalMs: 60_000 })),
+        ];
+        const b = analyzeReplicaLag({ at: at("16:16:00"), metrics: mixed, samples: [], events: [] });
+        expect(b.rootCause?.statement).toMatch(/^Read Replica Lag rose in the 5 minutes from 16:10:00 UTC to 240 s at 16:16:00 UTC/);
+    });
+
+    it("says 'nothing captured says why' when only the metric is left, at low confidence, and never guesses", () => {
+        const a = analyzeReplicaLag({ at: at("17:14:00"), metrics: LIVE_LAG, samples: [], events: [] });
+        expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-REPLAY-STALLED"] });
+        expect(a.notCaptured.join(" ")).toMatch(/RCA Replica/);
+    });
+
+    it("reads a rise right after a gap as the replica's catch-up after a restart, not lag", () => {
+        const restart: MetricPoint[] = [
+            { target: "T4-replica", at: at("16:00:00"), metric: LAG_METRIC, value: 0.5 },
+            { target: "T4-replica", at: at("16:30:00"), metric: LAG_METRIC, value: 1400 },
+            { target: "T4-replica", at: at("16:31:00"), metric: LAG_METRIC, value: 2 },
+        ];
+        const a = analyzeReplicaLag({ at: at("16:30:00"), metrics: restart, samples: [], events: [] });
+        expect(a.rootCause?.ruleIds).toEqual(["REPL-CATCHUP"]);
+    });
+
+    // The review of 34a9732: asked about 12:20 with the 166 s spike at 12:14, it answered that the lag "rose … to 0.6 s"
+    // and "grew 1 s per second", a rise that never happened.
+    it("explains the window's rise before the asked minute, never a sub-floor point after it", () => {
+        const a = analyzeReplicaLag({ at: at("17:20:00"), metrics: LIVE_LAG, samples: [], events: [] });
+        expect(a.rootCause?.statement).toMatch(/^Read Replica Lag rose from 17:12:00 to 166 s at 17:14:00 UTC .* and was back to 1 s at 17:15:00 UTC; it grew 1\.0\d s per second\./);
+        expect(a.rise?.peak.value).toBe(166);
+    });
+
+    it("says there's no lag when nothing in the window reached the floor", () => {
+        const calm = LIVE_LAG.filter((p) => (p.value ?? 0) < 5);
+        const a = analyzeReplicaLag({ at: at("17:16:00"), metrics: calm, samples: [], events: [] });
+        expect(a.rise).toBeNull();
+        expect(a.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-NO-LAG"] });
+        expect(a.rootCause?.statement).toMatch(/^Read Replica Lag stayed under 5 s in these minutes, at most 1 s at 17:15:00 UTC/);
+        expect(a.rootCause?.statement).not.toMatch(/rose|grew/);
+    });
+
+    it("gives a rate only from two rising points", () => {
+        const one: MetricPoint[] = [
+            { target: "T4-replica", at: at("16:59:00"), metric: LAG_METRIC, value: 0.5 },
+            { target: "T4-replica", at: at("17:00:00"), metric: LAG_METRIC, value: 30 },
+            { target: "T4-replica", at: at("17:01:00"), metric: LAG_METRIC, value: 0.7 },
+        ];
+        const a = analyzeReplicaLag({ at: at("17:00:00"), metrics: one, samples: [], events: [] });
+        expect(a.rise?.slope).toBeNull();
+        expect(a.rootCause?.statement).not.toMatch(/per second/);
+        expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-UNEXPLAINED"] });
+    });
+
+    // Final tests' check of ddebd4c3 (F4): B's 68 s from 18:54, the rest of a 15-minute interval after the capture's last
+    // sample at 18:53:23 (0.1 s since a replay, 0 bytes behind, the primary's WAL about 2797 bytes/s before Stop now), read as
+    // REPL-REPLAY-SLOW: "replay advanced slower than WAL arrived (0 bytes behind …)", from samples before the stall began.
+    describe("names a replay-state cause only from the capture's own samples of the stall, and slow replay only with WAL not replayed", () => {
+        const replica = (t: number, since: number, behind: number): ReplicaSample => ({ target: "T4-replica", at: new Date(t), side: "replica", sinceLastReplayS: since, receivedNotReplayedBytes: behind });
+        const primary = (t: number): ReplicaSample => ({ target: "T4", at: new Date(t), side: "primary", walBytesPerS: 2797, writeLagS: 0.002, flushLagS: 0.002, sendGapBytes: 0 });
+
+        it("reads a rise the samples are only beside from its shape, and says where they are", () => {
+            const samples: ReplicaSample[] = [];
+            for (let t = at("18:45:23").getTime(); t <= at("18:53:23").getTime(); t += 30_000) samples.push(replica(t, 0.1, 0), primary(t));
+            const metrics: MetricPoint[] = [
+                ...Array.from({ length: 9 }, (_, i): MetricPoint => ({ target: "T4-replica", at: new Date(at("18:45:00").getTime() + i * 60_000), metric: LAG_METRIC, value: 0.4, intervalMs: 60_000, grainMs: 60_000 })),
+                { target: "T4-replica", at: at("18:54:00"), metric: LAG_METRIC, value: 68, intervalMs: 6 * 60_000, grainMs: 15 * 60_000 },
+            ];
+            const a = analyzeReplicaLag({ at: at("18:54:00"), metrics, samples, events: [] });
+            expect(a.rise).toMatchObject({ source: "Telemetry Snapshots", peak: { value: 68 } });
+            expect(a.rise?.lastReplay).toBeUndefined();
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-UNEXPLAINED"] });
+            expect(a.rootCause?.statement).toBe(
+                "Read Replica Lag (its highest value in each interval) reached 68 s in the 6 minutes from 18:54:00 UTC (0.1 s, 68 s). Azure Monitor's highest value in those 6 minutes can't say whether replay stood still or slowed, and nothing captured says why.",
+            );
+            // Its words give the 6 minutes, never its save's 15 (F4, the grain).
+            expect(a.notCaptured).toContain("Azure Monitor's Read Replica Lag here is its highest value in the 6 minutes from 18:54:00 UTC, so when the lag rose and peaked is known to those 6 minutes only.");
+            expect([a.rootCause?.statement, ...a.notCaptured].join(" ")).not.toMatch(/15-minute/);
+            expect(a.notCaptured).toContain("The capture's own samples on the replica (RCA Replica) end at 18:53:23 UTC, before this rise, so its replay state during the rise wasn't captured: the explanation rests on the metric's shape alone.");
+            expect(a.recommendations).toEqual([]);
+        });
+
+        // Samples beside the rise that once named a cause (an idle primary, or WAL that didn't reach the replica) name none
+        // either, and the note says where they are: before the rise, after it, or both.
+        it.each([
+            ["an idle primary's, before the rise", { walBytesPerS: 10 }, ["18:51:30", "18:53:30"], "end at 18:53:30 UTC, before this rise"],
+            ["a late primary's, before the rise", { writeLagS: 7.1 }, ["18:51:30", "18:53:30"], "end at 18:53:30 UTC, before this rise"],
+            ["the capture's, after the rise", {}, ["19:00:00", "19:00:45"], "start at 19:00:00 UTC, after this rise"],
+            ["the capture's, before and after the rise", {}, ["18:51:00", "18:52:00", "19:00:15"], "stop at 18:52:00 UTC, before this rise, and start again at 19:00:15 UTC, after it"],
+        ] as const)("names no cause from %s", (_, side, times, where) => {
+            const samples = times.flatMap((t) => [replica(at(t).getTime(), 0.2, 0), { ...primary(at(t).getTime()), ...side }]);
+            const metrics: MetricPoint[] = [{ target: "T4-replica", at: at("18:54:00"), metric: LAG_METRIC, value: 68, intervalMs: 6 * 60_000, grainMs: 15 * 60_000 }];
+            const a = analyzeReplicaLag({ at: at("18:54:00"), metrics, samples, events: [] });
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-UNEXPLAINED"] });
+            expect(a.notCaptured).toContain(`The capture's own samples on the replica (RCA Replica) ${where}, so its replay state during the rise wasn't captured: the explanation rests on the metric's shape alone.`);
+        });
+
+        /** A stall the capture sampled every 5 s from a last replay at 16:00:00, with `behind` bytes received but not replayed. */
+        const stall = (behind: number) => {
+            const samples: ReplicaSample[] = [];
+            for (let t = at("15:59:00").getTime(); t < at("16:00:00").getTime(); t += 30_000) samples.push(replica(t, 0.3, 0), primary(t));
+            for (let t = at("16:00:05").getTime(); t <= at("16:01:30").getTime(); t += 5_000) samples.push(replica(t, (t - at("16:00:00").getTime()) / 1000, behind), primary(t));
+            samples.push(replica(at("16:01:35").getTime(), 0.2, 0), primary(at("16:01:35").getTime()));
+            return analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+        };
+
+        it("reads a stall the capture sampled with nothing behind as replay that stood still, not slow replay", () => {
+            const a = stall(0);
+            expect(a.rise?.lastReplay).toEqual(at("16:00:00"));
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-REPLAY-STALLED"] });
+            expect(a.rootCause?.statement).toMatch(/; it grew 1 s per second\. Replay stood still, and nothing captured says why\.$/);
+            expect(a.notCaptured.join(" ")).not.toMatch(/RCA Replica/);
+        });
+
+        it("reads replay as slower than WAL when the stall's samples hold WAL received but not replayed", () => {
+            const a = stall(65_536);
+            expect(a.rootCause).toMatchObject({ confidence: "medium", ruleIds: ["REPL-REPLAY-SLOW"] });
+            expect(a.rootCause?.statement).toMatch(/: replay advanced slower than WAL arrived \(65536 bytes behind, WAL about 2797 bytes\/s\)\.$/);
+            expect(a.recommendations.map((r) => r.id)).toEqual(["RPL-SHORT-REPORTS"]);
+        });
+
+        // The review of 921d3097: the stall was sampled, but the figures each rule read still came from the minute either side
+        // of it, so one sample there decided the cause.
+        it("reads the figures from the stall's own samples, not one a minute before it: the review's Stop now, sampled", () => {
+            const samples: ReplicaSample[] = [];
+            // The primary is busy until 16:00, with 512 bytes in flight on the replica at 15:59:30.
+            for (let t = at("15:59:00").getTime(); t < at("16:00:00").getTime(); t += 30_000) samples.push(replica(t, 0.3, t === at("15:59:30").getTime() ? 512 : 0), primary(t));
+            // Then it commits nothing: replay stands still with nothing behind, sampled every 5 s, and is back at 16:01:35.
+            for (let t = at("16:00:05").getTime(); t <= at("16:01:35").getTime(); t += 5_000) {
+                samples.push(t < at("16:01:35").getTime() ? replica(t, (t - at("16:00:00").getTime()) / 1000, 0) : replica(t, 0.2, 0), { ...primary(t), walBytesPerS: 0 });
+            }
+            const a = analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+            expect(a.rise?.lastReplay).toEqual(at("16:00:00"));
+            expect(a.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-IDLE-PRIMARY"] });
+            expect(a.rootCause?.statement).toMatch(/, but the replica had nothing to replay: the primary committed nothing, and the metric counts the time since the last replayed transaction\.$/);
+            expect(JSON.stringify(a)).not.toMatch(/512 bytes|slower than WAL/);
+            expect(a.recommendations).toEqual([]);
+        });
+
+        // Its recovery's sample is replay resumed, not the stall: WAL in flight there, as a busy primary's always is, isn't WAL
+        // the stall left behind.
+        it("reads the stall's samples up to its recovery, not the recovery's own", () => {
+            const samples: ReplicaSample[] = [];
+            for (let t = at("16:00:05").getTime(); t <= at("16:01:30").getTime(); t += 5_000) samples.push(replica(t, (t - at("16:00:00").getTime()) / 1000, 0), primary(t));
+            samples.push(replica(at("16:01:35").getTime(), 0.2, 4096), primary(at("16:01:35").getTime()));
+            const a = analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+            expect(a.rise?.recovered?.at).toEqual(at("16:01:35"));
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-REPLAY-STALLED"] });
+            expect(JSON.stringify(a)).not.toMatch(/4096 bytes|slower than WAL/);
+        });
+
+        it("says the primary committed nothing only from its own samples in the stall", () => {
+            // Replay stood still with nothing behind, and the primary was sampled idle only before it.
+            const samples: ReplicaSample[] = [primary(at("15:59:00").getTime()), primary(at("15:59:30").getTime())].map((s) => ({ ...s, walBytesPerS: 0 }));
+            for (let t = at("16:00:05").getTime(); t <= at("16:01:30").getTime(); t += 5_000) samples.push(replica(t, (t - at("16:00:00").getTime()) / 1000, 0));
+            samples.push(replica(at("16:01:35").getTime(), 0.2, 0));
+            const a = analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-REPLAY-STALLED"] });
+            expect(a.rootCause?.statement).toMatch(/Replay stood still, and nothing captured says why\.$/);
+        });
+    });
+});
+
+// Live, 2026-11-21: a surge to T4's limit had no explanation at all, since only the errors were read for it, and none was
+// refused. Each state that can hold the slots has its rule; RCA-PG-10 counts a client waiting on a lock as active too.
+describe("T4's connections against the limit, by what held them", () => {
+    // As RCA-PG-10 counts them since 3732317d: the total has the capture's own connection, which no state has.
+    const counts = (when: Date, active: number, idle: number, idleInTransaction: number, waitingLock: number): ResourcePoint[] =>
+        Object.entries({ connections_total: active + idle + idleInTransaction + 1, connections_active: active, connections_idle: idle, connections_idle_in_transaction: idleInTransaction, connections_waiting_lock: waitingLock, max_connections: 50, reserved_connections: 15 }).map(([metric, value]) => ({ target: "T4", at: when, source: "RCA-PG-10", metric, value }));
+    const surge = (active: number, idle: number, idleInTransaction: number, waitingLock: number) => [0, 10, 20].flatMap((s) => counts(new Date(at("15:30:00").getTime() + s * 1000), active, idle, idleInTransaction, waitingLock));
+    const failed = (value: number): MetricPoint[] => [{ target: "T4", at: at("15:30:00"), metric: "connections_failed", value, intervalMs: 300_000 }];
+    const ask = (resource: ResourcePoint[], metrics: MetricPoint[] = failed(0)) => analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:00"), resource, sessions: [], metrics });
+
+    it.each([
+        ["CONN-LOCK-WAIT", surge(29, 2, 3, 20), ["PG-LOCK-TIMEOUT", "PG-IDLE-TIMEOUT", "PG-POOL"], "20 of the 35 at the peak waited on a lock (9 ran a query, 2 sat idle, 3 sat idle in a transaction)"],
+        ["CONN-IDLE-IN-TX", surge(4, 10, 20, 0), ["PG-IDLE-TIMEOUT", "PG-POOL"], "20 of the 35 at the peak sat idle in a transaction, and at least 20 in every sample (4 ran a query, 10 sat idle, none waited on a lock)"],
+        ["CONN-IDLE", surge(2, 32, 0, 0), ["PG-POOL", "PG-IDLE-SESSION-TIMEOUT"], "Most of them sat idle: 32 of the 35 at the peak, and at least 32 in every sample (2 ran a query, none sat idle in a transaction, none waited on a lock)"],
+        // Queries filled every slot: only then more slots (the live check of 4e2c65ed: failed connections, its old trigger, counted none of the refusals).
+        ["CONN-ACTIVE", surge(29, 5, 0, 1), ["PG-POOL", "PG-CPU", "PG-MAXCONN"], "Most of them ran a query: 29 of the 35 at the peak, 1 of them waiting on a lock (5 sat idle, none sat idle in a transaction)"],
+    ])("%s: says what held the slots, with its recommendations", (ruleId, resource, ids, held) => {
+        const a = ask(resource);
+        expect(a.rootCause).toMatchObject({ ruleIds: [ruleId], confidence: "high" });
+        expect(a.rootCause?.statement).toContain("T4's client connections reached 35 of the 35 slots clients can use (max_connections 50 less 15 reserved; the capture's own connection among them) at 15:30:00 UTC");
+        expect(a.rootCause?.statement).toContain(held);
+        // Final tests' live check of 4e2c65ed: Azure Monitor's failed connections stayed at 0 through the workload's refused
+        // attempts, so no refusal is inferred from them; every slot in use says a client connecting then was refused.
+        expect(a.rootCause?.statement).toContain("Every usable slot was in use in 3 samples between 15:30:00 and 15:30:20 UTC (35 of 35), so a client connecting then would have been refused (SQLSTATE 53300, too many clients).");
+        expect(a.rootCause?.statement).toContain("Azure Monitor's failed-connection count stayed at 0 in its interval from 15:30 to 15:35 UTC; in this demo's live check it counted none of the refusals at the connection limit, so the capture can't say how many there were.");
+        expect(a.rootCause?.statement).not.toMatch(/No client was refused|no client asked/);
+        expect(a.recommendations.map((r) => r.id)).toEqual(ids);
+    });
+
+    it("says what Azure Monitor's failed connections count, never the refusals at the limit, and whether one is known below it", () => {
+        const a = ask(surge(2, 32, 0, 0), failed(6));
+        expect(a.rootCause?.statement).toContain("Azure Monitor counted 6 failed connections in its interval from 15:30 to 15:35 UTC; in this demo's live check it counted none of the refusals at the connection limit, so these may have failed for another reason, and how many clients were refused isn't known.");
+        expect(a.recommendations.map((r) => r.id)).toEqual(["PG-POOL", "PG-IDLE-SESSION-TIMEOUT"]);
+        // Every sample under the limit: the slots may have filled between them (live: for 0.1 s, between two of 34 of 35).
+        const below = ask(surge(2, 30, 0, 0));
+        expect(below.rootCause?.statement).toContain("The capture's samples saw at most 33 of the 35 usable slots in use; between them the slots may have filled, so whether a client was refused isn't known.");
+        expect(below.rootCause?.statement).toContain("Azure Monitor's failed-connection count stayed at 0 in its interval from 15:30 to 15:35 UTC; in this demo's live check it counted none of the refusals at the connection limit.");
+    });
+
+    // The review of c4c63abe: a coarser point's count, split by length around a finer save, read its share as Azure
+    // Monitor's count for the share's own minutes, "2 failed connections in its interval from 15:30 to 15:33 UTC".
+    it("says a count split around a finer save as Azure Monitor counted it, over its whole interval", () => {
+        const whole: WholeReading = { key: pointKey("T4", "connections_failed", at("15:30:00")), at: at("15:30:00"), intervalMs: 900_000, grainMs: 900_000, value: 6, finer: 0, covered: [{ from: at("15:33:00"), to: at("15:38:00") }] };
+        const split: MetricPoint[] = [
+            { target: "T4", at: at("15:30:00"), metric: "connections_failed", value: 2, intervalMs: 180_000, grainMs: 900_000, whole },
+            { target: "T4", at: at("15:33:00"), metric: "connections_failed", value: 0, intervalMs: 300_000, grainMs: 300_000 },
+            { target: "T4", at: at("15:38:00"), metric: "connections_failed", value: 4, intervalMs: 420_000, grainMs: 900_000, whole },
+        ];
+        const a = ask(surge(2, 32, 0, 0), split);
+        expect(a.rootCause?.statement).toContain("Azure Monitor counted 6 failed connections in its interval from 15:30 to 15:45 UTC;");
+        expect(a.rootCause?.evidence.map((e) => e.text)).toContain("6 failed connections from 15:30 to 15:45 UTC (Azure Monitor)");
+        expect(JSON.stringify(a)).not.toMatch(/\b2 failed connections|15:30 to 15:33/);
+    });
+
+    // 3732317d's review: the states leave out the capture's own connection, and the total doesn't, so they add up to one
+    // less; and "36 of the 35 slots" read as nonsense where connections that may use the reserved slots took one.
+    it("says the total has the capture's own connection, and a total past the limit as such", () => {
+        const a = ask(surge(1, 34, 0, 0));
+        expect(a.rootCause?.statement).toMatch(
+            /^T4's client connections reached 36, over the 35 slots clients can use \(max_connections 50 less 15 reserved, which only privileged roles can take; the capture's own connection among them\) at 15:30:00 UTC/,
+        );
+        expect(a.rootCause?.statement).toContain("Most of them sat idle: 34 of the 36 at the peak, and at least 34 in every sample (1 ran a query, none sat idle in a transaction, none waited on a lock).");
+        expect(a.rootCause?.statement).toContain("(up to 36 connections, over the 35), so a client connecting then would have been refused");
+        // The review of ebd1c6c3: its evidence read "36 client connections of 35 (103 %)".
+        expect(a.rootCause?.evidence[0].text).toBe("36 client connections, over the 35 usable: 1 active, 34 idle, 0 idle in a transaction, and the capture's own");
+    });
+
+    // Final tests' live round at d7df4f9f (O2): the evidence listed "20 waiting on a lock" beside the states, though RCA-PG-10
+    // counts a client waiting on a lock as active too, so the line read as if they added up.
+    it("gives the clients waiting on a lock as some of the active, never beside them", () => {
+        expect(ask(surge(29, 2, 3, 20)).rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %): 29 active (20 of them waiting on a lock), 2 idle, 3 idle in a transaction, and the capture's own");
+        expect(ask(surge(2, 32, 0, 0)).rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %): 2 active, 32 idle, 0 idle in a transaction, and the capture's own");
+    });
+
+    // Before 3732317d, the capture's own query was one of the active in every sample: a row whose states add up to its total.
+    it("reads a row from before 3732317d with the capture's own query left out of the active", () => {
+        const old = [0, 10, 20].flatMap((s) =>
+            Object.entries({ connections_total: 35, connections_active: 1, connections_idle: 34, connections_idle_in_transaction: 0, connections_waiting_lock: 0, max_connections: 50, reserved_connections: 15 }).map(
+                ([metric, value]): ResourcePoint => ({ target: "T4", at: new Date(at("15:30:00").getTime() + s * 1000), source: "RCA-PG-10", metric, value }),
+            ),
+        );
+        const a = ask(old);
+        expect(a.rootCause?.statement).toContain("Most of them sat idle: 34 of the 35 at the peak, and at least 34 in every sample (none ran a query, none sat idle in a transaction, none waited on a lock).");
+        expect(a.rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %): 0 active, 34 idle, 0 idle in a transaction, and the capture's own");
+    });
+
+    it("says exactly what isn't captured: who held the connections, how many were refused, and the states when only the total was counted", () => {
+        const a = ask(surge(2, 32, 0, 0));
+        expect(a.notCaptured).toEqual([
+            "T4: how many clients were refused at the connection limit isn't captured: PostgreSQL refuses them before they reach a session, and in this demo's live check Azure Monitor's failed connections counted none of them.",
+            "T4: who held the connections (their application, user, and client address) and how long each sat idle aren't captured for these minutes: RCA-PG-10 counts connections by state, and the capture samples sessions (RCA-PG-01) only while a client waits on a lock, which none did here.",
+        ]);
+        const totals = surge(2, 32, 0, 0).filter((r) => ["connections_total", "max_connections", "reserved_connections"].includes(r.metric));
+        const b = ask(totals, []);
+        expect(b.rootCause).toMatchObject({ ruleIds: ["CONN-STATES-UNKNOWN"], confidence: "low" });
+        expect(b.notCaptured).toEqual(expect.arrayContaining([expect.stringMatching(/^T4: the connections' states .* weren't captured, only their total\.$/), "T4: Azure Monitor's failed connections aren't in the history for 15:30:00-15:31:00 UTC."]));
+        // The review of ebd1c6c3: its evidence gave "0 active, 0 idle, …" for the states it says weren't captured.
+        expect(b.rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %), the capture's own among them; their states weren't captured, only the total");
+    });
+
+    it("describes a surge in waves by their peaks and the troughs between them, and one the capture never ended by where it ended", () => {
+        const sample = (s: number, total: number) => counts(new Date(at("15:30:00").getTime() + s * 1000), 0, total - 1, 0, 0);
+        const waves = [35, 33, 9, 8, 34, 33, 8, 33, 14].flatMap((total, i) => sample(i * 10, total));
+        const a = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: waves, sessions: [], metrics: failed(0), openEnded: true });
+        expect(a.rootCause?.statement).toContain(
+            "in 3 waves at 80 % of the limit or more between 15:30:00 and 15:31:10 UTC, with peaks of 35, 34, and 33 and the connections falling to 8 and 8 between them; 5 of the 9 samples from 15:30:00 to 15:31:20 UTC were at that level.",
+        );
+        // The review of 803f2b1a: its last sample, 14, was under the level, so it fell, and wasn't "still on".
+        expect(a.rootCause?.statement).toContain("The connections fell under 80 % of the limit by 15:31:20 UTC; the capture ended at 15:31:20 UTC, before it could confirm the end.");
+        expect(a.rootCause?.statement).not.toMatch(/still on/);
+        expect(a.details).toMatchObject({ captureEnded: "2026-11-20T15:31:20Z", fellUnder: "2026-11-20T15:31:20Z", waves: [{ peak: 35, lowBefore: null }, { peak: 34, lowBefore: 8 }, { peak: 33, lowBefore: 8 }] });
+        // Its last sample at the level: still on.
+        const on = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: [35, 33, 9, 8, 34, 33, 8, 33].flatMap((total, i) => sample(i * 10, total)), sessions: [], metrics: failed(0), openEnded: true });
+        expect(on.rootCause?.statement).toContain("The capture ended at 15:31:10 UTC while it was still on (it recorded no end), so what came after isn't known.");
+        expect(on.details).toMatchObject({ fellUnder: null });
+        // The review of 858c50c2: where the minutes read end first, the same fall, and the same "still on" only at the level.
+        const read = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: waves, sessions: [], metrics: failed(0), readEnd: at("15:31:30") });
+        expect(read.rootCause?.statement).toContain("The connections fell under 80 % of the limit by 15:31:20 UTC; the minutes read end at 15:31:30 UTC, before the capture confirmed the end.");
+        expect(read.details).toMatchObject({ captureEnded: null, fellUnder: "2026-11-20T15:31:20Z", readEnd: "2026-11-20T15:31:30Z" });
+        const still = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: [35, 33, 9, 8, 34, 33, 8, 33].flatMap((total, i) => sample(i * 10, total)), sessions: [], metrics: failed(0), readEnd: at("15:31:30") });
+        expect(still.rootCause?.statement).toContain("It was still on at 15:31:30 UTC, where the minutes read end.");
+        // The review of eb89acbb: where a read of the capture's tables stopped short, that's where it says the read ended.
+        const stopped = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: [35, 33, 9, 8, 34, 33, 8, 33].flatMap((total, i) => sample(i * 10, total)), sessions: [], metrics: failed(0), readEnd: at("15:31:30"), readStopped: true });
+        expect(stopped.rootCause?.statement).toContain("It was still on at 15:31:30 UTC, where the read stopped.");
+        const fellStopped = analyzeConnections({ target: "T4", from: at("15:30:00"), to: at("15:31:30"), resource: waves, sessions: [], metrics: failed(0), readEnd: at("15:31:30"), readStopped: true });
+        expect(fellStopped.rootCause?.statement).toContain("The connections fell under 80 % of the limit by 15:31:20 UTC; the read stopped at 15:31:30 UTC, before the capture confirmed the end.");
+    });
+});
+
+// Found with the live findings (2026-11-21): an RU episode was explained only through its 429s, so one without any had no cause.
+describe("T5's normalized RU consumption at 100 %", () => {
+    const point = (metric: string, time: string, value: number, intervalMs = 60_000): MetricPoint => ({ target: "T5", at: at(time), metric, value, intervalMs });
+    const minutes = (throttled: number[]) => [
+        ...[100, 100, 60].map((v, i) => point(COSMOS_METRICS.normalizedRu, `17:0${i}:00`, v)),
+        ...[1200, 1300, 900].map((v, i) => point(COSMOS_METRICS.requests, `17:0${i}:00`, v)),
+        ...throttled.map((v, i) => point(COSMOS_METRICS.throttled, `17:0${i}:00`, v)),
+    ];
+    const provisioned = (ru: number) => point(COSMOS_METRICS.provisioned, "17:00:00", ru, 3_600_000);
+
+    // The review of 4e2c65ed: the counts took in 17:02's interval, which the sentence doesn't name; 100 % read as the
+    // container's whole throughput; and a new partition key and autoscale were recommended with nothing throttled.
+    it("says what 100 % means, counts only the intervals it names, and recommends no change when none was throttled", () => {
+        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: minutes([0, 0, 0]) });
+        expect(a.rootCause).toMatchObject({ ruleIds: ["RU-AT-LIMIT"], confidence: "medium" });
+        expect(a.rootCause?.statement).toBe(
+            "T5's normalized RU consumption (the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in each 1-minute interval) reached 100 % in at least one second of each of the 2 intervals from 17:00 to 17:02 UTC: in such a second, at least one partition key range used all of its share of the RU/s. Azure Monitor counted 2500 requests in those intervals, none of them throttled.",
+        );
+        expect(a.recommendations).toEqual([]);
+        expect(a.notCaptured[0]).toMatch(/^T5: which partition key range was busiest.* Nor is its provisioned throughput for these minutes, so whether a new partition key could help isn't known/);
+    });
+
+    // The shared finestPerInterval (a390db00): a remainder of a coarser save spans only part of its interval, and its value
+    // is the highest in its own minutes. The review of 96abcf65, after F4's grain: they're what the words give, never the
+    // save's interval beside them ("keeps the highest in each 15-minute interval … the interval from 17:00 to 17:03").
+    it("gives a remainder its own minutes, never the interval of the save it comes from", () => {
+        const piece = { ...point(COSMOS_METRICS.normalizedRu, "17:00:00", 100, 3 * 60_000), grainMs: 15 * 60_000 };
+        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: [piece] });
+        expect(a.rootCause?.statement).toContain("(the busiest partition key range's share of its RU/s; Azure Monitor keeps the highest in each interval) reached 100 % in at least one second of the interval from 17:00 to 17:03 UTC");
+        expect(a.rootCause?.statement).not.toMatch(/15-minute|3-minute/);
+        // A whole interval keeps its save's words.
+        const whole = analyzeThroughput({ from: at("17:00:00"), to: at("17:15:00"), metrics: [{ ...piece, intervalMs: 15 * 60_000 }] });
+        expect(whole.rootCause?.statement).toContain("Azure Monitor keeps the highest in each 15-minute interval) reached 100 % in at least one second of the interval from 17:00 to 17:15 UTC");
+    });
+
+    // Final tests' check of ddebd4c3 (F6): "each of the 9 intervals from 15:31 to 15:42" read as all 11 at 100 %, and the 429s
+    // of the 2 under it were only in the page's errors table, so it said 14,593 where the statement said 13,222.
+    it("says how many of the intervals from its first at 100 % to its last were, and counts the 429s of the others", () => {
+        const series = (ru: number[], throttled: number[]) => [
+            ...ru.map((v, i) => point(COSMOS_METRICS.normalizedRu, `17:0${i}:00`, v)),
+            ...ru.map((_, i) => point(COSMOS_METRICS.requests, `17:0${i}:00`, 1000)),
+            ...throttled.map((v, i) => point(COSMOS_METRICS.throttled, `17:0${i}:00`, v)),
+        ];
+        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:05:00"), metrics: series([100, 4, 100, 100, 3], [300, 200, 400, 100, 50]) });
+        expect(a.rootCause?.statement).toContain("reached 100 % in at least one second of 3 of the 4 intervals from 17:00 to 17:04 UTC:");
+        expect(a.rootCause?.statement).toContain("Azure Monitor counted 3000 requests in those 3 intervals, 800 of them throttled (429, 26.7 %)");
+        // 17:01's, not 17:04's, which comes after the last interval at 100 %.
+        expect(a.rootCause?.statement).toContain(" In the other interval, where normalized RU consumption stayed under 100 %, Azure Monitor counted 200 more throttled requests.");
+        expect(analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: series([100, 4, 100], [300, 0, 400]) }).rootCause?.statement).not.toContain("In the other");
+        // None throttled at 100 %: the others' are counted, with no "more".
+        const quiet = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: series([100, 4, 100], [0, 70, 0]) });
+        expect(quiet.rootCause?.statement).toContain("Azure Monitor counted 2000 requests in those 2 intervals, none of them throttled. In the other interval, where normalized RU consumption stayed under 100 %, Azure Monitor counted 70 throttled requests.");
+        // Every interval at 100 %: "each of", as before.
+        expect(analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: series([100, 100, 60], [1, 1, 1]) }).rootCause?.statement).toContain("each of the 2 intervals from 17:00 to 17:02 UTC: ");
+    });
+
+    it.each([
+        ["above 5 %: more throughput", [150, 50, 0], "200 of them throttled (429, 8 %)", "That's more than the 5 % of requests at which Learn recommends more throughput.", ["RU-RETRY", "RU-AUTOSCALE"]],
+        ["up to 5 %: the clients' retries only", [60, 40, 0], "100 of them throttled (429, 4 %)", "Learn counts up to 5 % of requests throttled, with acceptable latency, as RU/s fully used, with no action needed.", ["RU-RETRY"]],
+    ])("counts the throttled requests in the intervals it names, with their share, and recommends by Learn's 5 %, %s", (_, throttled, counted, guide, ids) => {
+        const a = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: minutes(throttled as number[]) });
+        expect(a.rootCause?.ruleIds).toEqual(["RU-THROTTLED"]);
+        expect(a.rootCause?.statement).toContain(`Azure Monitor counted 2500 requests in those intervals, ${counted}`);
+        expect(a.rootCause?.statement).toContain(guide as string);
+        expect(a.recommendations.map((r) => r.id)).toEqual(ids);
+    });
+
+    it("says why a new partition key wouldn't help a container of one physical partition, and recommends one only with several", () => {
+        const one = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: [...minutes([150, 50, 0]), provisioned(400)] });
+        expect(one.rootCause?.statement).toContain(
+            "At 400 RU/s, under the 10,000 RU/s one physical partition serves, the container needs only one physical partition unless it holds more than 50 GB, so all its requests share those 400 RU/s whatever their partition key: a new key wouldn't raise the limit.",
+        );
+        expect(one.recommendations.map((r) => r.id)).toEqual(["RU-RETRY", "RU-AUTOSCALE"]);
+        expect(one.notCaptured[0]).not.toMatch(/Nor is its provisioned throughput/);
+        const several = analyzeThroughput({ from: at("17:00:00"), to: at("17:03:00"), metrics: [...minutes([150, 50, 0]), provisioned(20_000)] });
+        expect(several.rootCause?.statement).toContain("At 20000 RU/s, over the 10,000 RU/s one physical partition serves, the container has several physical partitions");
+        expect(several.recommendations.map((r) => r.id)).toEqual(["RU-RETRY", "RU-AUTOSCALE", "RU-PARTITION"]);
+    });
+});

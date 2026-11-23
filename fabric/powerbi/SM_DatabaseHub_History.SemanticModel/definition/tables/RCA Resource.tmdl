@@ -1,0 +1,62 @@
+/// One counter or resource sample, in long format: the sentinel's counters, and the resource samples of capture episodes. The Incident RCA's evidence (ADR 0031): what the observer beside the workload captured, which NB_DatabaseHub_LiveActivity writes from its evidence documents (rca/history-tables.json).
+table 'RCA Resource'
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The evidence document the row came from (documentId).
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// When the sample was taken; for a delta, the end of its interval.
+    column 'At UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: at_utc
+
+    /// T1 to T5, or T4-replica.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// The capture ID that read it (rca/capture/README.md).
+    column Source
+        dataType: string
+        sourceColumn: source
+
+    /// The metric's name (rca/README.md, Resource metrics).
+    column Metric
+        dataType: string
+        sourceColumn: metric
+
+    /// The value: a gauge's reading, or a counter's delta over the interval.
+    column Value
+        dataType: double
+        formatString: #,0.##
+        summarizeBy: none
+        sourceColumn: value
+
+    /// count, percent, ms, bytes, or per second.
+    column Unit
+        dataType: string
+        sourceColumn: unit
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Resource' = entity
+        mode: directLake
+        source
+            entityName: rca_resource
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

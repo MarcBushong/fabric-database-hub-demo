@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState } from "react";
 import { Button, Link } from "@fluentui/react-components";
-import { Bot16Regular, CheckmarkCircle16Regular, DataBarVertical16Regular, Flash16Regular, Wrench16Regular } from "@fluentui/react-icons";
+import { Bot16Regular, CheckmarkCircle16Regular, DataBarVertical16Regular, Flash16Regular, TextBulletListTree16Regular, Wrench16Regular } from "@fluentui/react-icons";
 
 import { useApp } from "@/app-context";
 import { AgentCard, AgentDialog } from "@/components/AgentPrompts";
@@ -19,6 +19,9 @@ import { binMinutes, hubUrlOf, incidentPrompts, olderThanRetention, TELEMETRY_RE
 import { TARGETS } from "@/lib/estate";
 import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc } from "@/lib/format";
 import { baselineText, compareIncident, familySignal, incidentInsight, incidentPadMinutes, incidentsOverview, signalValue, timesShort, timesText, waitFamilyInsight, type IncidentComparison } from "@/lib/insights";
+import { findIncidentsAsk } from "@/rca/entry";
+import { isRcaTarget } from "@/rca/types";
+import { windowKey } from "@/rca/view/selection";
 import { PageHeader } from "@/shell/PageHeader";
 import { ChartView } from "@/visuals/ChartView";
 import { IncidentReplay } from "@/visuals/IncidentReplay";
@@ -168,7 +171,7 @@ function AgentLoop(props: { incident: Incident; comparison: IncidentComparison |
     );
 }
 export default function IncidentsPage() {
-    const { filters, view, setView, runtime } = useApp();
+    const { filters, view, setView, runtime, navigate, rca } = useApp();
     const [agentOpen, setAgentOpen] = useState(false);
     const listSpec = useMemo(() => (filters.targets.length ? incidentsQuery(filters) : null), [filters]);
     const flowSpec = useMemo(() => (filters.targets.length ? waitsQuery(filters) : null), [filters]);
@@ -186,6 +189,7 @@ export default function IncidentsPage() {
     const sessions = useMemo(() => toSessions(sessionsState.data?.rows ?? []), [sessionsState.data]);
     const beats = useMemo(() => toAgentBeats(beatsState.data?.rows ?? []), [beatsState.data]);
     const selected = incidents.find((i) => i.key === view.incident) ?? incidents[0] ?? null;
+    const rcaTarget = selected && isRcaTarget(selected.target) ? selected.target : null;
 
     const range = useMemo(() => {
         if (!selected) return null;
@@ -259,7 +263,8 @@ export default function IncidentsPage() {
                         empty={!list.loading && incidents.length === 0}
                         table={list.data && listSpec ? { columns: listSpec.columns, rows: list.data.rows, caption: "Incident windows" } : null}
                         summary={`${incidents.length} incident windows.`}
-                        askPrompt="Walk me through these incidents: which are related, and which matters most?"
+                        // The windows are the answer key, so the chat finds the incidents itself, from the signals (ADR 0031).
+                        ask={rca === true ? findIncidentsAsk() : false}
                     >
                         {incidents.length > 0 ? <Timeline incidents={incidents} selected={selected} onSelect={select} /> : null}
                     </VisualCard>
@@ -273,12 +278,13 @@ export default function IncidentsPage() {
                                 sub={comparison?.peakAt ? `at ${formatTimeUtc(comparison.peakAt)} UTC` : selected.peakUnit}
                                 status="Warning"
                                 actions={
-                                    signal ? (
+                                    // Only the measured part (ADR 0031): the signal's own bins, peak, and baseline, with no window key, label, or source.
+                                    signal && comparison && comparison.peak !== null ? (
                                         <AskWhy
-                                            title={`${selected.label} incident`}
+                                            title={`${selected.target} ${signal.label}`}
                                             visualId="incidents.selected"
-                                            prompt={`Why did ${selected.target}'s ${signal.label} reach ${formatNumber(comparison?.peak ?? selected.peakValue, signal.kind)} ${windowPhrase(selected.start, selected.end)}${comparison?.baseline ? `, against a baseline of ${formatNumber(comparison.baseline, signal.kind)}` : ""}? What caused it, which sessions and queries were involved, and what should I change?`}
-                                            anomaly={{ metric: signal.label, target: selected.target, at: (comparison?.peakAt ?? selected.start).toISOString(), value: comparison?.peak ?? selected.peakValue ?? undefined, baseline: comparison?.baseline ?? undefined, incidentKey: selected.key }}
+                                            prompt={`Why did ${selected.target}'s ${signal.label} reach ${formatNumber(comparison.peak, signal.kind)}${comparison.peakAt ? ` at ${formatTimeUtc(comparison.peakAt)} UTC on ${formatDayUtc(comparison.peakAt)}` : ` ${windowPhrase(selected.start, selected.end)}`}${comparison.baseline ? `, against a baseline of ${formatNumber(comparison.baseline, signal.kind)}` : ""}? What caused it, which sessions and queries were involved, and what should I change?`}
+                                            anomaly={{ metric: signal.label, target: selected.target, at: (comparison.peakAt ?? selected.start).toISOString(), value: comparison.peak, baseline: comparison.baseline ?? undefined }}
                                             specs={[seriesSpec, spotSpec]}
                                             rows={series.data?.rows}
                                             columns={seriesSpec?.columns}
@@ -307,10 +313,23 @@ export default function IncidentsPage() {
                             fetchedAt={series.data?.fetchedAt}
                             onRefresh={series.refetch}
                             askPrompt={`Replay this ${selected.target} incident for me: what happened first, what followed, and what caused it?`}
+                            ask={{
+                                // The bins as measured, under a neutral title: the window's label is the answer key (ADR 0031).
+                                title: `${selected.target}, bin by bin`,
+                                prompt: `Walk me through these minutes on ${selected.target}, bin by bin: what happened first, what followed, and what caused it?`,
+                            }}
                             toolbar={
-                                <Button size="small" appearance="subtle" icon={<Bot16Regular />} onClick={() => setAgentOpen(true)}>
-                                    Ask the agent
-                                </Button>
+                                <>
+                                    {rca === true && rcaTarget && range ? (
+                                        // One way only: the Root cause view gets the target and the minutes, never the window's name (ADR 0031).
+                                        <Button size="small" appearance="subtle" icon={<TextBulletListTree16Regular />} onClick={() => navigate("rca", { incident: windowKey(rcaTarget, range.start, range.end) })}>
+                                            Root cause
+                                        </Button>
+                                    ) : null}
+                                    <Button size="small" appearance="subtle" icon={<Bot16Regular />} onClick={() => setAgentOpen(true)}>
+                                        Ask the agent
+                                    </Button>
+                                </>
                             }
                         >
                             <IncidentReplay incident={selected} bins={bins} index={view.incident === selected.key ? view.replay : null} onIndex={onIndex} />
@@ -339,6 +358,11 @@ export default function IncidentsPage() {
                             table={{ columns: SPOTLIGHT_COLUMNS, rows: spotChartRows, caption: "Wait seconds per bin, before and during the incident window" }}
                             summary={spotRows.map((r) => `${r.category}: ${r.before.toFixed(2)} s before, ${r.during.toFixed(2)} s during`).join("; ")}
                             askPrompt="Which wait category explains this incident, and what does it point to?"
+                            ask={{
+                                // The waits per bin as measured; "before" and "during" would hand the chat the window, which is the answer key (ADR 0031).
+                                table: spotSpec && spot.data ? { columns: spotSpec.columns, rows: spot.data.rows, caption: "Wait seconds per bin and category" } : null,
+                                prompt: "Which wait category stands out in these minutes, when, and what does it point to?",
+                            }}
                         >
                             <ChartView hideHeader height={240} spec={{ kind: "bar", title: "Waits before and during", rows: spotChartRows, x: "category", y: ["Before", "During"], unit: "s" }} colors={{ Before: "var(--colorNeutralStroke1)", During: TARGETS[selected.target].color }} />
                         </VisualCard>
@@ -356,6 +380,7 @@ export default function IncidentsPage() {
                         table={list.data && listSpec ? { columns: listSpec.columns, rows: list.data.rows, caption: "Incident windows" } : null}
                         summary={`${rows.length} incident windows.`}
                         quiet
+                        ask={rca === true ? findIncidentsAsk() : false}
                     >
                         <DataGrid columns={LIST_COLUMNS} rows={rows} caption="Incident windows" exportName="incident-windows" onRowClick={(r) => select(r.key)} rowLabel={(r) => `Replay ${r.target} ${r.signal}, ${formatDateTimeUtc(r.start)}`} />
                     </VisualCard>

@@ -195,6 +195,29 @@ public sealed class ProfileHostTests
         Assert.Contains("profile.not-after", host.Log, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task TheRcaObserversGateFollowsTheSessionAndTheAnswerKeyGetsOnlyFaults()
+    {
+        // ADR 0031: the observer captures a target while its profile is active and its runs are ending, and learns only
+        // that; the answer key gets the fault runs the host ran, never the baseline.
+        var at = DateTimeOffset.UtcNow - TimeSpan.FromSeconds(1);
+        var store = new FakeStore(new ProfileState("incident:locking-blocking", at, "test", at + TimeSpan.FromMinutes(30), null));
+        var work = new FakeWork { Behavior = FakeWork.UntilCancelled(TimeSpan.FromMilliseconds(400)) };
+        var sink = new RecordingAnswerKey();
+        await using var host = HostHarness.Start(store, work, Options(), answerKey: sink);
+        Assert.False(host.Host.IsActive(DemoTarget.T3));
+
+        await Until(() => work.Starts.Count >= 2);
+        Assert.True(host.Host.IsActive(DemoTarget.T1));
+
+        store.Set(ProfileState.Off(DateTimeOffset.UtcNow));
+        await Until(() => work.Ended >= 2 && !host.Host.IsActive(DemoTarget.T1));
+
+        var recorded = Assert.Single(sink.Runs);
+        Assert.Equal(DemoTarget.T1, recorded.Target);
+        Assert.Equal("locking-blocking", recorded.Result.ScenarioId);
+    }
+
     private static ProfileHostOptions Options() => new()
     {
         Poll = TimeSpan.FromMilliseconds(50),
@@ -234,14 +257,16 @@ public sealed class ProfileHostTests
         private readonly string folder = Path.Combine(AppContext.BaseDirectory, "profile-host-" + Guid.NewGuid().ToString("N"));
         private bool stopped;
 
-        private HostHarness(FakeStore store, FakeWork work, ProfileHostOptions options, DateTimeOffset? notAfter)
+        private HostHarness(FakeStore store, FakeWork work, ProfileHostOptions options, DateTimeOffset? notAfter, Rca.AnswerKey.IAnswerKeySink? answerKey)
         {
             StatePath = Path.Combine(folder, HostLanesFile.FileName);
             log = new RunnerLog(writer);
             var target = new ProfileTarget(DemoTarget.T1, new ScenarioRunner(new SqlConnectionOpener(TargetEndpoint.Create(DemoTarget.T1, null, false, null), log), log, TimeProvider.System), store);
-            var host = new ProfileHost(ActivityProfilesDefinition.Default, ScenarioCatalog.Default, log, TimeProvider.System, options with { StateFilePath = StatePath }, _ => work);
-            Task = Task.Run(() => host.RunAsync([target], notAfter, stop.Token), TestContext.Current.CancellationToken);
+            Host = new ProfileHost(ActivityProfilesDefinition.Default, ScenarioCatalog.Default, log, TimeProvider.System, options with { StateFilePath = StatePath }, _ => work, answerKey);
+            Task = Task.Run(() => Host.RunAsync([target], notAfter, stop.Token), TestContext.Current.CancellationToken);
         }
+
+        public ProfileHost Host { get; }
 
         public Task Task { get; }
 
@@ -249,7 +274,7 @@ public sealed class ProfileHostTests
 
         public string Log => writer.Text;
 
-        public static HostHarness Start(FakeStore store, FakeWork work, ProfileHostOptions options, DateTimeOffset? notAfter = null) => new(store, work, options, notAfter);
+        public static HostHarness Start(FakeStore store, FakeWork work, ProfileHostOptions options, DateTimeOffset? notAfter = null, Rca.AnswerKey.IAnswerKeySink? answerKey = null) => new(store, work, options, notAfter, answerKey);
 
         public async Task StopAsync()
         {
@@ -272,6 +297,33 @@ public sealed class ProfileHostTests
                 Directory.Delete(folder, recursive: true);
             }
         }
+    }
+
+    private sealed class RecordingAnswerKey : Rca.AnswerKey.IAnswerKeySink
+    {
+        private readonly Lock gate = new();
+        private readonly List<(DemoTarget Target, RunResult Result)> runs = [];
+
+        public IReadOnlyList<(DemoTarget Target, RunResult Result)> Runs
+        {
+            get
+            {
+                lock (gate)
+                {
+                    return [.. runs];
+                }
+            }
+        }
+
+        public void RunEnded(DemoTarget target, RunResult result)
+        {
+            lock (gate)
+            {
+                runs.Add((target, result));
+            }
+        }
+
+        public bool IsPending(DemoTarget target) => false;
     }
 
     private sealed class LockedWriter : StringWriter

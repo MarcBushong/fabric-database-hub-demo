@@ -2079,6 +2079,9 @@ Describe 'stop-demo.ps1, start-demo.ps1, and a pending auto-stop (Clear-DemoActi
         $result = Invoke-Clear -Purpose Stop
         $result.checkId | Should -Be 'STOP.CONTROL.AUTOSTOP'
         $result.status | Should -Be 'Pass'
+        # The handoff of a Run all session's stop words it for the control's job once that job stopped the session
+        # (Invoke-DemoStopHandoff, DbHubDemo.Lifecycle.Tests.ps1); here, and on every other path, stop-demo.ps1 stops it.
+        $result.message | Should -Be 'The pending on-demand auto-stop was removed; stop-demo.ps1 stops the demo itself.'
         Get-Deleted | Should -Be @('ffffffff-0000-0000-0000-000000000007', 'dbhub-autostop')
     }
 
@@ -2257,9 +2260,11 @@ Describe 'stop-demo.ps1, start-demo.ps1, and a pending auto-stop (Clear-DemoActi
         Get-Deleted | Should -Contain 'dbhub-autostop-backup'
     }
 
-    It 'is called by Stop-DemoEnvironment for a full stop with the control on, and not for -ParkT2' {
+    It 'is called by Stop-DemoEnvironment for a full stop with the control on, unless the handoff removed it already, and not for -ParkT2' {
         $text = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'scripts/modules/DbHubDemo/Public/Stop-DemoEnvironment.ps1') -Raw
-        $text | Should -Match 'if \(-not \$ParkT2 -and \(Get-DemoActivityControlSetting -Config \$Config\)\.Enabled\) \{\s+#[^\n]*\n\s+\$results\.Add\(\(Clear-DemoActivityControlAutoStop -Config \$Config -Confirm:\$false\)\)'
+        # The handoff of a Run all session's stop removes it right before the control's job (review of f5972d2d), and its
+        # result is reported instead.
+        $text | Should -Match 'if \(-not \$ParkT2 -and \(Get-DemoActivityControlSetting -Config \$Config\)\.Enabled\) \{(\s+#[^\n]*\n)+\s+if \(\$null -ne \$handoff -and \$null -ne \(Get-DemoMemberValue -InputObject \$handoff -Name ''AutoStop''\)\) \{\s+\$results\.Add\(\$handoff\.AutoStop\)\s+\}\s+else \{\s+\$results\.Add\(\(Clear-DemoActivityControlAutoStop -Config \$Config -Confirm:\$false\)\)'
     }
 }
 

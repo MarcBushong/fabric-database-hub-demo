@@ -9,6 +9,7 @@ import { VisualCard } from "@/components/VisualCard";
 import { toDays } from "@/data/model";
 import { dailyTrendQuery } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
+import { withoutColumns } from "@/lib/ask";
 import { formatNumber } from "@/lib/format";
 import { change, pct, weekOverWeek, type ChangeRow } from "@/lib/trends";
 import { PageHeader } from "@/shell/PageHeader";
@@ -27,6 +28,8 @@ const CHANGE_COLUMNS: GridColumn<ChangeRow>[] = [
 export default function TrendsPage() {
     const { filters, view, setView } = useApp();
     const spec = useMemo(() => (filters.targets.length ? dailyTrendQuery(filters) : null), [filters]);
+    // Ask Copilot hands the chat the measured columns only: the incident windows per day are the demo's answer key (ADR 0031).
+    const measuredSpec = useMemo(() => (filters.targets.length ? dailyTrendQuery(filters, { incidents: false }) : null), [filters]);
     const state = useQuery(spec);
     const days = useMemo(() => toDays(state.data?.rows ?? []), [state.data]);
     const changes = useMemo(() => weekOverWeek(days), [days]);
@@ -45,6 +48,7 @@ export default function TrendsPage() {
         table: spec && state.data ? { columns: spec.columns, rows: state.data.rows, caption: "Daily history per target" } : null,
         fetchedAt: state.data?.fetchedAt,
     };
+    const askMeasured = { specs: [measuredSpec], table: withoutColumns(common.table, ["Incidents"]) };
 
     return (
         <div className="page">
@@ -70,16 +74,16 @@ export default function TrendsPage() {
                 </EmptyState>
             ) : (
                 <>
-                    <VisualCard id="trends.cpu" className="span-6" title="CPU, daily average" subtitle="Each target's average CPU per UTC day." summary="Daily average CPU per target." askPrompt="How has CPU trended across the targets, and is anything drifting?" {...common}>
+                    <VisualCard id="trends.cpu" className="span-6" title="CPU, daily average" subtitle="Each target's average CPU per UTC day." summary="Daily average CPU per target." askPrompt="How has CPU trended across the targets, and is anything drifting?" {...common} ask={askMeasured}>
                         <ChartView hideHeader height={220} spec={{ kind: "line", title: "CPU, daily average", rows: cpuRows, x: "day", y: "value", series: "target", unit: "%" }} />
                     </VisualCard>
-                    <VisualCard id="trends.cpupeak" className="span-6" title="CPU, daily peak" subtitle="Each target's highest CPU bin per UTC day." summary="Daily peak CPU per target." askPrompt="Which days had CPU peaks, and do they match the sessions?" quiet {...common}>
+                    <VisualCard id="trends.cpupeak" className="span-6" title="CPU, daily peak" subtitle="Each target's highest CPU bin per UTC day." summary="Daily peak CPU per target." askPrompt="Which days had CPU peaks, and what was running then?" quiet {...common} ask={askMeasured}>
                         <ChartView hideHeader height={220} spec={{ kind: "line", title: "CPU, daily peak", rows: peakRows, x: "day", y: "value", series: "target", unit: "%" }} annotations={{ thresholds: [{ value: 80, label: "80 %", tone: "warning" }] }} />
                     </VisualCard>
-                    <VisualCard id="trends.waits" className="span-6" title="Wait time per day" subtitle="Total wait seconds per target and UTC day." summary="Daily wait time per target." askPrompt="Is wait time growing anywhere? What's behind it?" quiet {...common}>
+                    <VisualCard id="trends.waits" className="span-6" title="Wait time per day" subtitle="Total wait seconds per target and UTC day." summary="Daily wait time per target." askPrompt="Is wait time growing anywhere? What's behind it?" quiet {...common} ask={askMeasured}>
                         <ChartView hideHeader height={220} spec={{ kind: "stackedBar", title: "Wait time per day", rows: waitRows, x: "day", y: "value", series: "target", unit: "s" }} />
                     </VisualCard>
-                    <VisualCard id="trends.incidents" className="span-6" title="Incidents per day" subtitle="Incident windows per target and UTC day." summary="Daily incidents per target." askPrompt="How often do incidents happen, and on which targets?" quiet {...common}>
+                    <VisualCard id="trends.incidents" className="span-6" title="Incidents per day" subtitle="Incident windows per target and UTC day." summary="Daily incidents per target." quiet {...common} ask={false}>
                         <ChartView hideHeader height={220} spec={{ kind: "stackedBar", title: "Incidents per day", rows: incidentRows, x: "day", y: "value", series: "target", unit: "count" }} />
                     </VisualCard>
                     <VisualCard
@@ -89,6 +93,20 @@ export default function TrendsPage() {
                         summary={changes.map((c) => `${c.target}: CPU ${change(c.cpuNow, c.cpuBefore)}, waits ${change(c.waitNow, c.waitBefore)}`).join("; ")}
                         askPrompt="What changed in my databases this week compared with last week?"
                         {...common}
+                        ask={{
+                            specs: [measuredSpec],
+                            table: {
+                                columns: [
+                                    { key: "target", label: "Target", kind: "text" },
+                                    { key: "cpuNow", label: "CPU avg, this week (%)", kind: "percent" },
+                                    { key: "cpuBefore", label: "CPU avg, the week before (%)", kind: "percent" },
+                                    { key: "waitNow", label: "Wait time, this week (s)", kind: "seconds" },
+                                    { key: "waitBefore", label: "Wait time, the week before (s)", kind: "seconds" },
+                                ],
+                                rows: changes.map((c) => ({ target: c.target, cpuNow: c.cpuNow, cpuBefore: c.cpuBefore, waitNow: c.waitNow, waitBefore: c.waitBefore })),
+                                caption: "Week over week",
+                            },
+                        }}
                         table={{ columns: [
                             { key: "target", label: "Target", kind: "text" },
                             { key: "cpuNow", label: "CPU avg, this week (%)", kind: "percent" },

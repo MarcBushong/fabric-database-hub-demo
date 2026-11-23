@@ -22,7 +22,9 @@ Actions:
   C:\ProgramData\DbHubDemo\golden\capture-in-progress.json (the snapshot name, the time, and this host's Azure VM
   ID): while it's there and recent, T2's control relay leaves the guest alone (Get-GoldenCaptureProgress). Then
   removes the sign-in data that setup leaves on the VM again and
-  checks that none remains, turns IE ESC back on when it's off, writes the capture record
+  checks that none remains, turns IE ESC back on when it's off, deletes the Incident RCA's capture in the guest
+  (C:\ProgramData\DbHubDemo\rca, after stopping the workload runner, which the next boot starts again) so the
+  snapshot carries none, writes the capture record
   C:\ProgramData\DbHubDemo\golden\capture.json (the snapshot name, this host's Azure VM ID, and the guest's
   Arc identity), applies the air gap (the guest's automatic start action becomes Nothing, and its network
   adapter is disconnected), then shuts the guest down cleanly and confirms it's off.
@@ -108,6 +110,10 @@ $script:JwtPattern = 'eyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{
 $script:Notes = New-Object -TypeName 'System.Collections.Generic.List[string]'
 # The last PowerShell Direct failure Test-GoldenGuestSession saw (Wait-GoldenGuest -BrokenChannelSeconds; issue #65).
 $script:GoldenSessionError = ''
+# In the guest: the Incident RCA's local store (the runner's EvidenceStore.DefaultRoot) and the workload's .NET runtime
+# (the bundle's Get-DemoVmWorkloadPath under the guest's tools folder, C:\ProgramData\DbHubDemo).
+$script:GuestRcaStore = 'C:\ProgramData\DbHubDemo\rca'
+$script:GuestRuntime = 'C:\ProgramData\DbHubDemo\dotnet'
 
 function Add-GoldenNote {
     param([string] $Text)
@@ -616,6 +622,96 @@ $script:GuestCleanBlock = {
     [pscustomobject]@{ cachesRemoved = $removed; logFilesRedacted = $redacted }
 }
 
+$script:GuestRcaClearBlock = {
+    # The Incident RCA's local store in the guest (ADR 0031): what the runner's observer captured of T2, with the demo's
+    # own sessions' statements, logins, and hosts. A golden snapshot carries none of it: a T2 restored from the snapshot
+    # would keep this environment's capture, and the new environment's first export would give it to its own session
+    # (the docs review of 0189a4b). The runner may hold the store's files open, so it's stopped first, as the bundle's
+    # Stop-DemoVmWorkload does: the DbHubDemo-Workload task, then any runner process on the workload's .NET runtime. The
+    # guest shuts down next, and the task starts the runner again at its next boot. When the store can't be deleted, the
+    # task starts again at once, and the caller captures nothing.
+    param($StoreRoot, $RuntimeRoot, $WaitSeconds)
+    $ErrorActionPreference = 'Continue'
+    $result = [ordered]@{ spans = 0; notExported = 0; runnersStopped = 0; taskStopped = $false; left = $false; error = '' }
+    if (-not (Test-Path -LiteralPath $StoreRoot)) {
+        return [pscustomobject]$result
+    }
+    # Each observation span has a span.json; export.json says whether an export took all of it (complete).
+    foreach ($folder in @(Get-ChildItem -LiteralPath $StoreRoot -Directory -Force -ErrorAction SilentlyContinue)) {
+        if (-not (Test-Path -LiteralPath (Join-Path -Path $folder.FullName -ChildPath 'span.json'))) {
+            continue
+        }
+        $result['spans']++
+        $complete = $false
+        $exportPath = Join-Path -Path $folder.FullName -ChildPath 'export.json'
+        if (Test-Path -LiteralPath $exportPath) {
+            try {
+                $export = Get-Content -LiteralPath $exportPath -Raw | ConvertFrom-Json
+                $complete = $null -ne $export.PSObject.Properties['complete'] -and [bool]$export.complete
+            }
+            catch {
+                $complete = $false
+            }
+        }
+        if (-not $complete) {
+            $result['notExported']++
+        }
+    }
+    $taskName = 'DbHubDemo-Workload'
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($task) {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        $result['taskStopped'] = $true
+    }
+    $prefix = ([string]$RuntimeRoot).TrimEnd('\') + '\'
+    $runners = @(Get-CimInstance -ClassName 'Win32_Process' -Filter "Name = 'dotnet.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { ([string]$_.ExecutablePath).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) })
+    foreach ($runner in $runners) {
+        Stop-Process -Id ([int]$runner.ProcessId) -Force -ErrorAction SilentlyContinue
+        $result['runnersStopped']++
+    }
+    $clock = [System.Diagnostics.Stopwatch]::StartNew()
+    while ($runners.Count -gt 0 -and $clock.Elapsed.TotalSeconds -lt [int]$WaitSeconds -and @($runners | Where-Object { Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue }).Count -gt 0) {
+        Start-Sleep -Seconds 1
+    }
+    Remove-Item -LiteralPath $StoreRoot -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable removeErrors
+    if (Test-Path -LiteralPath $StoreRoot) {
+        $result['left'] = $true
+        $text = if (@($removeErrors).Count -gt 0) { [string]@($removeErrors)[0].Exception.Message } else { 'it was still there after the delete' }
+        $result['error'] = $text.Substring(0, [Math]::Min(200, $text.Length))
+        if ($task) {
+            Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            $result['taskStopped'] = $false
+        }
+    }
+    [pscustomobject]$result
+}
+
+$script:GuestRunnerStartBlock = {
+    # Starts the guest's workload runner again (the DbHubDemo-Workload task), after a Prepare that stopped it failed later.
+    $ErrorActionPreference = 'Continue'
+    Start-ScheduledTask -TaskName 'DbHubDemo-Workload' -ErrorAction SilentlyContinue
+    $task = Get-ScheduledTask -TaskName 'DbHubDemo-Workload' -ErrorAction SilentlyContinue
+    [pscustomobject]@{ state = $(if ($task) { [string]$task.State } else { 'Missing' }) }
+}
+
+function Restore-GoldenGuestRunner {
+    # After the Incident RCA step stopped the guest's workload runner, a later Prepare step failed: a guest that still runs
+    # gets its runner back, since the source's Release starts a guest only when it isn't running (the review of 3f6cd14).
+    # Best effort, and a note either way; a guest that's off starts the runner at its next start.
+    param([System.Management.Automation.PSCredential] $Credential)
+    try {
+        if ([string](Get-VM -Name $GuestName).State -ne 'Running') {
+            return
+        }
+        $started = Invoke-Command -VMName $GuestName -Credential $Credential -ScriptBlock $script:GuestRunnerStartBlock -ErrorAction Stop
+        Add-GoldenNote -Text ('The guest''s workload runner, stopped for the Incident RCA step, was started again (DbHubDemo-Workload: {0}).' -f [string]$started.state)
+    }
+    catch {
+        Add-GoldenNote -Text ('The guest''s workload runner, stopped for the Incident RCA step, couldn''t be started again ({0}); the guest''s next start starts it.' -f $_.Exception.Message)
+    }
+}
+
 $script:GuestAgentBlock = {
     # Only the Arc agent's state, for the wait until 'azcmagent show -j' can be read.
     $ErrorActionPreference = 'Continue'
@@ -913,36 +1009,58 @@ function Invoke-GoldenPrepare {
     if ([string]$after.sqlEdition -notmatch 'Standard') {
         throw ('SQL Server in the guest reports edition ''{0}'', not Standard; nothing was captured.' -f [string]$after.sqlEdition)
     }
-    $agent = ConvertFrom-GoldenAgentJson -Text ([string]$after.agentJson)
-    $record = [ordered]@{
-        schemaVersion        = 1
-        snapshotName         = $script:Options.SnapshotName
-        capturedUtc          = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
-        sourceAzureVmId      = $hostFacts['azureVmId']
-        guestHyperVId        = $hostFacts['guestHyperVId']
-        arcResourceName      = $agent.resourceName
-        arcResourceGroup     = $agent.resourceGroup
-        arcSubscriptionId    = $agent.subscriptionId
-        arcVmId              = $agent.vmId
-        evaluationExpiresUtc = [string]$after.evaluationExpiresUtc
-        released             = $false
+    # The Incident RCA's capture in the guest (ADR 0031), deleted so the snapshot carries none, after the checks above so
+    # that none of them leaves the runner stopped (the docs review of 0189a4b).
+    $rca = Invoke-Command -VMName $GuestName -Credential $credential -ScriptBlock $script:GuestRcaClearBlock -ArgumentList $script:GuestRcaStore, $script:GuestRuntime, 60 -ErrorAction Stop
+    if ($null -eq $rca -or $null -eq $rca.PSObject.Properties['left'] -or [bool]$rca.left) {
+        $why = if ($null -ne $rca -and $null -ne $rca.PSObject.Properties['error'] -and [string]$rca.error) { [string]$rca.error } else { 'the guest didn''t say whether it was deleted' }
+        throw ('The Incident RCA''s capture is left in the guest ({0}): {1}; nothing was captured.' -f $script:GuestRcaStore, $why)
     }
-    Write-GoldenJson -Path ([System.IO.Path]::Combine($script:Options.Root, 'golden', 'capture.json')) -Value $record
-    Set-VM -Name $GuestName -AutomaticStartAction Nothing
-    Disconnect-GoldenAdapter
-    $result['airGap'] = [ordered]@{ startAction = [string](Get-VM -Name $GuestName).AutomaticStartAction; adapter = Get-GoldenAdapterState }
-    # A guest operating system shutdown through the Hyper-V shutdown integration service; -Force only skips
-    # the prompt a signed-in session would raise (the same call as Invoke-DemoWorkloadControl.ps1 StopGuest).
-    $clock = [System.Diagnostics.Stopwatch]::StartNew()
-    Stop-VM -Name $GuestName -Force -AsJob | Out-Null
-    while ($clock.Elapsed.TotalMinutes -lt 15 -and [string](Get-VM -Name $GuestName).State -ne 'Off') {
-        Start-Sleep -Seconds 5
+    $result['rcaSpansRemoved'] = [int]$rca.spans
+    $result['rcaSpansNotExported'] = [int]$rca.notExported
+    $result['runnersStopped'] = [int]$rca.runnersStopped
+    # From here on, a failure would leave a guest that still runs without its workload runner, which the step above
+    # stopped, until its next start: the source's Release starts a guest only when it isn't running. So the runner is
+    # started again before the failure goes on (the review of 3f6cd14).
+    $runnerStopped = $null -ne $rca.PSObject.Properties['taskStopped'] -and [bool]$rca.taskStopped
+    try {
+        $agent = ConvertFrom-GoldenAgentJson -Text ([string]$after.agentJson)
+        $record = [ordered]@{
+            schemaVersion        = 1
+            snapshotName         = $script:Options.SnapshotName
+            capturedUtc          = [DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ')
+            sourceAzureVmId      = $hostFacts['azureVmId']
+            guestHyperVId        = $hostFacts['guestHyperVId']
+            arcResourceName      = $agent.resourceName
+            arcResourceGroup     = $agent.resourceGroup
+            arcSubscriptionId    = $agent.subscriptionId
+            arcVmId              = $agent.vmId
+            evaluationExpiresUtc = [string]$after.evaluationExpiresUtc
+            released             = $false
+        }
+        Write-GoldenJson -Path ([System.IO.Path]::Combine($script:Options.Root, 'golden', 'capture.json')) -Value $record
+        Set-VM -Name $GuestName -AutomaticStartAction Nothing
+        Disconnect-GoldenAdapter
+        $result['airGap'] = [ordered]@{ startAction = [string](Get-VM -Name $GuestName).AutomaticStartAction; adapter = Get-GoldenAdapterState }
+        # A guest operating system shutdown through the Hyper-V shutdown integration service; -Force only skips
+        # the prompt a signed-in session would raise (the same call as Invoke-DemoWorkloadControl.ps1 StopGuest).
+        $clock = [System.Diagnostics.Stopwatch]::StartNew()
+        Stop-VM -Name $GuestName -Force -AsJob | Out-Null
+        while ($clock.Elapsed.TotalMinutes -lt 15 -and [string](Get-VM -Name $GuestName).State -ne 'Off') {
+            Start-Sleep -Seconds 5
+        }
+        $state = [string](Get-VM -Name $GuestName).State
+        $result['guestState'] = $state
+        $result['guestShutdownSeconds'] = [int]$clock.Elapsed.TotalSeconds
+        if ($state -ne 'Off') {
+            throw ('The guest did not shut down cleanly within 15 minutes (state {0}); it was not turned off by force.' -f $state)
+        }
     }
-    $state = [string](Get-VM -Name $GuestName).State
-    $result['guestState'] = $state
-    $result['guestShutdownSeconds'] = [int]$clock.Elapsed.TotalSeconds
-    if ($state -ne 'Off') {
-        throw ('The guest did not shut down cleanly within 15 minutes (state {0}); it was not turned off by force.' -f $state)
+    catch {
+        if ($runnerStopped) {
+            Restore-GoldenGuestRunner -Credential $credential
+        }
+        throw
     }
     $result['record'] = $record
     $result['succeeded'] = $true
