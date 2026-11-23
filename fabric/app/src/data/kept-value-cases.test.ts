@@ -178,6 +178,31 @@ const NAMED: Case[] = [
             ...series({ captured: s("15:33", 1), start: s("15:22"), end: s("15:22", 1) }, "T1", "counter_deltas", "Batch Requests/sec", "15:15", 15, [32, 60]),
         ],
     },
+    {
+        // The review of 67f08e7d: a known difference from finestPerInterval, which design (i)'s build aligns. A finer row
+        // straddles a coarser save's window cut, and part of what's left of it is in the part cut off: finestPerInterval
+        // splits that across the row's uncovered stretches by length, and the rule counts all of it against the part the
+        // window keeps. As the case above, but the session's Lock waits are quiet at 15:20, a bin WAITS_KQL leaves out
+        // (WaitMs > 0): the stop save's 15:20 holds 18, 10 at 15:21 and 8 from 15:22 to 15:24. The data hold 86 from 15:15
+        // to 15:30, the rule's answer; finestPerInterval gives the quiet 15:20 3 of the 8, and 89.
+        name: "a known difference: a quiet minute in a finer row that a coarser save's window cuts through",
+        rows: [
+            ...series(save("15:23", "15:16", "15:22"), "T1", "wait_deltas", "Lock", "15:16", 1, [10, 10, 10, 10, null, 10]),
+            ...series(save("15:24:30", "03:24", "15:24"), "T1", "wait_deltas", "Lock", "15:15", 5, [44, 18]),
+            ...series({ captured: s("15:33", 1), start: s("15:22"), end: s("15:22", 1) }, "T1", "wait_deltas", "Lock", "15:15", 15, [32, 60]),
+        ],
+    },
+    {
+        // The same difference the other way: a session from 15:21 to 15:23 at 10 a minute. The stop save's 15:20 holds 28,
+        // 8 of it beside the session's minutes: 4 at 15:20, which the day's window cuts off, and 4 at 15:23. The data hold
+        // 72 from 15:15 to 15:30, finestPerInterval's answer; the rule counts all 8 against the day's part: 68.
+        name: "a known difference: what's left of a finer row on both sides of a coarser save's window cut",
+        rows: [
+            ...series(save("15:23:30", "15:21", "15:23"), "T1", "counter_deltas", "Batch Requests/sec", "15:21", 1, [10, 10]),
+            ...series(save("15:24:30", "03:24", "15:24"), "T1", "counter_deltas", "Batch Requests/sec", "15:15", 5, [20, 28]),
+            ...series({ captured: s("15:33", 1), start: s("15:22"), end: s("15:22", 1) }, "T1", "counter_deltas", "Batch Requests/sec", "15:15", 15, [38, 60]),
+        ],
+    },
 ];
 
 /** A seeded generator (mulberry32), so the random cases are the same on every run. */
@@ -395,7 +420,23 @@ describe("F35 design (i)'s shared cases", () => {
         expect(totalOf("a finer save only where", "15:15", "15:30")).toBe(96);
     });
 
-    it("gives every series the same totals and peaks, hour by hour, as finestPerInterval, on every case", () => {
+    it("pins a known difference, a quiet minute in a finer row that a window cuts through: 86, the data's, from 15:15 to 15:30", () => {
+        // The stop save's 15:20 keeps 8, all of it from 15:22 to 15:24, so the day's 15:15 keeps 24 for 15:24 to 15:30:
+        // with the stop save's 15:15, 4, its bin is 28. finestPerInterval gives the quiet 15:20 3 of the 8, by length, so
+        // the day keeps 27 where 24 is right, and it gives 89: the parity test pins that hour.
+        expect(valueAt("a known difference: a quiet minute", "15:15")).toBe(28);
+        expect(totalOf("a known difference: a quiet minute", "15:15", "15:30")).toBe(86);
+    });
+
+    it("pins a known difference, what's left of a finer row on both sides of a window's cut: 68, where the data hold 72", () => {
+        // The stop save's 15:20 keeps 8, 4 of it at 15:20, which the day's window cuts off; the rule counts all 8 against
+        // the day's part, which keeps 20 of its 38, beside the stop save's 15:15, 20: 40. finestPerInterval gives the day
+        // 24, and 72, the data's answer: the parity test pins that hour.
+        expect(valueAt("a known difference: what's left", "15:15")).toBe(40);
+        expect(totalOf("a known difference: what's left", "15:15", "15:30")).toBe(68);
+    });
+
+    it("gives every series the same totals and peaks, hour by hour, as finestPerInterval, but for three known differences", () => {
         const differ: string[] = [];
         let compared = 0;
         for (const c of CASES) {
@@ -407,16 +448,23 @@ describe("F35 design (i)'s shared cases", () => {
                 if (a === undefined || b === undefined || Math.abs(a - b) > 1e-9 * Math.max(1, Math.abs(a), Math.abs(b))) differ.push(`${c.name}, ${key}: ${a} and ${b}`);
             }
         }
-        // One difference, which isn't about ranks: random 11's newer 900-minute save holds 3 rows of T2's sessions, 30 minutes
-        // apart at their closest, and no other series. finestPerInterval reads a capture's step from its bins, 30 minutes here,
-        // so the save is coarser than the older one and left out at 15:30, where the older save's 7 is kept; snapshotValues
-        // reads the notebook's 15 from its window, so the newer save is the finer and its 43 is kept. Each of the notebook's
-        // analyses is its own capture and shows its step through its own series, and sessions and wait_deltas hold only bins
-        // with activity, so a save with scattered activity can read coarser, as this one does. Until the save's declared
-        // grain lands, this affects f35Check, not the app's views. With the fourth and later saves against the first three,
-        // the five saves' case differed too: 3,548 and 3,600 from 15:00 to 16:00; with finer saves chosen by the part of an
-        // interval that a window keeps, the window-cut case did: 136 and 156.
-        expect(differ).toEqual(["random 11, T2|sessions|MaxSessions|2026-11-21T15:00:00.000Z: 43 and 29"]);
+        // Three known differences, none about ranks, which design (i)'s build aligns. First, random 11's newer 900-minute
+        // save holds 3 rows of T2's sessions, 30 minutes apart at their closest, and no other series. finestPerInterval reads
+        // a capture's step from its bins, 30 minutes here, so the save is coarser than the older one and left out at 15:30,
+        // where the older save's 7 is kept; snapshotValues reads the notebook's 15 from its window, so the newer save is the
+        // finer and its 43 is kept. Each of the notebook's analyses is its own capture and shows its step through its own
+        // series, and sessions and wait_deltas hold only bins with activity, so a save with scattered activity can read
+        // coarser, as this one does. Until the save's declared grain lands, this affects f35Check, not the app's views.
+        // Then the review of 67f08e7d's two cases: a finer row that a coarser save's window cuts through, with part of
+        // what's left of it in the part cut off: finestPerInterval splits that by length, and the rule counts all of it
+        // against the window's part. Their pins give the data's answers, one each way. With the fourth and later saves
+        // against the first three, the five saves' case differed too: 3,548 and 3,600 from 15:00 to 16:00; with finer saves
+        // chosen by the part of an interval that a window keeps, the window-cut case did: 136 and 156.
+        expect(differ).toEqual([
+            "a known difference: a quiet minute in a finer row that a coarser save's window cuts through, T1|wait_deltas|Lock|2026-11-21T15:00:00.000Z: 146 and 149",
+            "a known difference: what's left of a finer row on both sides of a coarser save's window cut, T1|counter_deltas|Batch Requests/sec|2026-11-21T15:00:00.000Z: 128 and 132",
+            "random 11, T2|sessions|MaxSessions|2026-11-21T15:00:00.000Z: 43 and 29",
+        ]);
         expect(compared).toBeGreaterThan(CASES.length);
     });
 });

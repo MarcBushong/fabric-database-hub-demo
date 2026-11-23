@@ -5929,7 +5929,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 
 ### F35 design (i) groundwork: every finer save against every earlier one (2026-11-22)
 
-**Why.** A fresh reviewer of 79a35e57 found the index and `to_ms` clean, with one Low: the section above said the fourth-and-later limit was part 1's too, but `finestPerInterval` takes each point against every one it kept before. Only `snapshotValues` and this rule took the fourth and later finer saves against the first three. The coordinator's decision: remove the divergence, in `snapshotValues` (4944e22d, on the follow-ups branch) and here, so design (i) matches the app's views exactly.
+**Why.** A fresh reviewer of 79a35e57 found the index and `to_ms` clean, with one Low: the section above said the fourth-and-later limit was part 1's too, but `finestPerInterval` takes each point against every one it kept before. Only `snapshotValues` and this rule took the fourth and later finer saves against the first three. The coordinator's decision: remove the divergence, in `snapshotValues` (4944e22d, on the follow-ups branch) and here, so design (i) matches the app's views exactly. (i)'s build still has to make that true: the rules still differ in [the known differences](#f35-design-i-groundwork-two-known-differences-pinned-2026-11-22) that the shared cases pin, which it aligns.
 
 **Work summary.**
 
@@ -6009,3 +6009,26 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 **Validation.** vitest: the cases file's 9 tests pass; typecheck and eslint clean; markdownlint clean; the test file is ASCII, with LF line endings.
 
 **Risks.** None: a comment and this report.
+
+### F35 design (i) groundwork: two known differences, pinned (2026-11-22)
+
+**Why.** The review of 67f08e7d, and of this branch's same change, found the fix correct in both rules, with one Low older than both. A finer row straddles a coarser point's window cut, and part of what's left of it is in the part cut off: `finestPerInterval` splits that across the row's uncovered stretches by length, and both rules here count all of it against the part the window keeps. [The follow-ups' section](#the-review-of-67f08e7d-two-known-differences-pinned-2026-11-22) has the reviewer's two cases, D and A, and how often they happen. The coordinator's decision: no rule change now; pin both beside `random 11`, and align the rules when (i) is built.
+
+**Work summary.**
+
+- **The shared cases:** D and A, each named "a known difference: ...", with a pin of its 15:15 bin and its total from 15:15 to 15:30. For D, 28 and 86, the data's answer; for A, 40 and 68, where the data hold 72. The file's diff inserts their 58 lines and changes nothing else: 48 cases, 1,733 bins.
+- **Parity with `finestPerInterval`** pins three known differences, each in its hour from 15:00 to 16:00: D's 146 and 149, A's 128 and 132, and `random 11`'s 43 and 29. Any other difference fails it; its name and comment say so.
+- **`kept_value.py`'s docstring** says that `snapshotValues` follows `finestPerInterval` but for the two known differences its notes name, which the build aligns. No code changes.
+- **This report:** the every-rank section's "Why", which quotes the coordinator's decision, gets a note that (i)'s build still has to make it true. The design note's build-time item, both rules splitting a straddling row the same way, is in the coordinator's material for decision 3.
+
+**Changed files.** `fabric/app/src/data/kept-value-cases.test.ts`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/history/kept_value.py` (its docstring), and this report.
+
+**Validation.**
+
+- **The pins catch a change in either rule,** each made in a copy:
+  - with 67f08e7d's choice of finer saves reverted in `snapshotValues`, the file, the window-cut case's pin, D's pin, and parity fail (D's hour, 136 and 149);
+  - with `finestPerInterval` splitting a remainder evenly, parity fails (146 and 150).
+- **Python:** `Fabric.History` passes on Python 3.11.9 and 3.10.11, so `kept_value.py` gives D's and A's bins as `snapshotValues` does. The mutations' counts are as before but for the new cases' bins: the coarser save winning, 693; and finer saves chosen by the part a window keeps, 2, the window-cut case's 15:15 and D's.
+- **And:** vitest, the cases file's 11 tests and the app's whole suite, 401 of 401 in 22 files; typecheck and eslint clean; markdownlint clean; the changed files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames, with the follow-ups' two commits under it: 135 passed, 3 skipped.
+
+**Risks.** None: nothing runs this code yet, and no rule changes.

@@ -3,8 +3,8 @@
 The history keeps every save, each at its own interval (1 to 1,440 minutes), so one minute can be in several saves. Each
 interval is taken from its finest save, by the rows each save holds: a coarser save's point keeps only what the finer
 saves' rows in its interval don't hold, so nothing counts twice and nothing is lost. This is the rule of the app's
-snapshotValues (fabric/app/src/data/snapshot-value.ts, which follows finestPerInterval in finest-per-interval.ts),
-reduced to one kept value per raw row:
+snapshotValues (fabric/app/src/data/snapshot-value.ts, which follows finestPerInterval in finest-per-interval.ts but for
+the two known differences its notes name, which the build aligns), reduced to one kept value per raw row:
 
 - A point (a save's rows of a series at one bin) that no finer save's rows reach keeps each row's value.
 - A point that finer saves' rows cover keeps None in each row.
