@@ -9,7 +9,7 @@ import { LAG_METRIC } from "./replica";
 import { monitorTelemetry } from "./sources";
 import { emptyListNote } from "./view/facts";
 import { INVESTIGATION_PLAYBOOK } from "./playbook";
-import { QUERY_STORE_RETENTION_DAYS } from "./query-store";
+import { QUERY_STORE_RETENTION_DAYS, queryStoreQuery, type QueryStoreQuery } from "./query-store";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { live, liveSources } from "./testdata/live-rb-2233e0ae";
 import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
@@ -801,6 +801,50 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         expect(QUERY_STORE_RETENTION_DAYS.postgresql).toBe(7);
         expect(readFileSync(resolve(import.meta.dirname, "../../../../infra/modules/pgflex01.bicep"), "utf8")).not.toMatch(/retention_period_in_days/);
     });
+
+    // Wednesday's release: the next step's ready-to-run, read-only query, built from the incident's measured target, family,
+    // and times only, which the view copies and the chat gives as is.
+    it("gives each next step a read-only query of the target's own Query Store for the incident's exact minutes", async () => {
+        const queries = async (target: RcaTarget, family: string, tools = deps) => ((await incidentOn(target, family, tools)).details?.queryStoreQueries ?? []) as QueryStoreQuery[];
+        const [t1] = await queries("T1", "cpu");
+        expect(t1).toMatchObject({ target: "T1", language: "tsql", database: "ContosoCare", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" });
+        expect(t1.text).toContain("-- Read-only: Query Store's top plans on T1 from 15:40:00 to 15:50:00 UTC, by CPU, then duration, with their plan IDs.");
+        expect(t1.text).toContain("DECLARE @from datetimeoffset = '2026-11-20T15:40:00+00:00', @to datetimeoffset = '2026-11-20T15:50:00+00:00';");
+        expect(t1.text).toContain("ORDER BY cpu_ms DESC, duration_ms DESC;");
+        expect(t1.text).toMatch(/\bp\.plan_id\b/);
+        expect(t1.text).not.toMatch(/wait_category_desc/);
+        const [t2] = await queries("T2", "latch");
+        expect(t2).toMatchObject({ target: "T2", database: "ContosoCare" });
+        expect(t2.text).toContain("AND ws.wait_category_desc = N'Buffer Latch'");
+        const [t4] = await queries("T4", "cpu");
+        expect(t4).toMatchObject({ target: "T4", language: "postgresql", database: "azure_sys", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" });
+        expect(t4.text).toContain("WHERE q.end_time > '2026-11-20 15:40:00' AND q.start_time <= '2026-11-20 15:50:00'");
+        expect(t4.text).toContain("WHERE w.end_time > '2026-11-20 15:40:00' AND w.start_time <= '2026-11-20 15:50:00'");
+        expect(t4.text).toContain("FROM query_store.qs_view AS q");
+        expect(t4.text).toContain("FROM query_store.pgms_wait_sampling_view AS w");
+        expect(t4.text).not.toMatch(/query_parameters/);
+        // None where Query Store doesn't record the queries, and none past its retention, as for the next step.
+        expect(await queries("T4-replica", "cpu")).toEqual([]);
+        expect(await queries("T4", "cpu", toolsAt(new Date("2026-11-28T16:00:00Z")))).toEqual([]);
+        for (const q of [t1, t2, t4]) {
+            // Read-only, and blind: it names no scenario and nothing the demo planned.
+            expect(q.text).not.toMatch(/\b(INSERT|UPDATE|DELETE|MERGE|ALTER|CREATE|DROP|EXEC|EXECUTE|TRUNCATE|GRANT|SET\s+QUERY_STORE)\b/i);
+            expect(namesAScenario(q.text)).toEqual([]);
+            expect(namesAScenario(q.text.toLowerCase())).toEqual([]);
+            expect(q.text).not.toMatch(/scenario|inject|demo\./i);
+        }
+    });
+
+    it("reads an incident across UTC midnight with both dates, and one instant from its interval", () => {
+        const across = queryStoreQuery({ target: "T3", family: "cpu", start: new Date("2026-11-19T23:52:00Z"), end: new Date("2026-11-20T00:07:30Z"), last: new Date("2026-11-20T00:07:00Z") }, new Date("2026-11-20T01:00:00Z"));
+        expect(across?.text).toContain("DECLARE @from datetimeoffset = '2026-11-19T23:52:00+00:00', @to datetimeoffset = '2026-11-20T00:07:30+00:00';");
+        expect(across?.text).toContain("on T3 from 2026-11-19 23:52:00 to 2026-11-20 00:07:30 UTC");
+        const instant = queryStoreQuery({ target: "T4", family: "cpu", start: new Date("2026-11-20T15:45:00Z"), end: null, last: new Date("2026-11-20T15:45:00Z") }, new Date("2026-11-20T16:00:00Z"));
+        // An interval that starts at the instant holds it: start_time <= the instant.
+        expect(instant?.text).toContain("WHERE q.end_time > '2026-11-20 15:45:00' AND q.start_time <= '2026-11-20 15:45:00'");
+        expect(instant?.text).toContain("on T4 at 15:45:00 UTC");
+    });
+
     it("never says that a target has no Query Store, in any tool's result or in the playbook, and drops the old words", async () => {
         const results = [
             ...(await Promise.all([incidentOn("T1", "cpu"), incidentOn("T2", "latch"), incidentOn("T3", "cpu"), incidentOn("T4", "cpu"), incidentOn("T4-replica", "cpu")])),

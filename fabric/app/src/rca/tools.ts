@@ -10,7 +10,7 @@ import { describeEpisode, findEpisodes, SOURCES } from "./detector";
 import { analyzeErrorsResult, AZURE_MONITOR } from "./errors";
 import { isPagedTable, MONITOR_PAGES, MONITOR_ROW_LIMIT, RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
-import { queryStoreNextStep, queryStoreNote, unexplainedByQuery } from "./query-store";
+import { queryStoreNextStep, queryStoreNote, queryStoreQuery, unexplainedByQuery, type QueryStoreQuery } from "./query-store";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
@@ -628,6 +628,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const partNotes = parts.flatMap((p) => p.notCaptured).filter((line) => !RCA_TARGETS.some((t) => isNoCaptureNote(t, line) && base.notCaptured.some((b) => isNoCaptureNote(t, b))));
         // Whether the target's Query Store still keeps those minutes is judged now, by the viewer's clock (the review of 319b3ae1).
         const now = (deps.now ?? (() => new Date()))();
+        const queryStoreQueries = telemetryOnly.map((e) => queryStoreQuery(e, now)).filter((q): q is QueryStoreQuery => q !== null);
         const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => queryStoreNote(e, now))])];
         // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
         if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded ${fromTo(e.start, e.end ?? e.last)} UTC explains the ${e.signal}.`));
@@ -641,6 +642,9 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             details: {
                 episodes: chosen.map((e) => ({ ...episodeView(e), text: describeEpisode(e) })),
                 ...(readAs.length ? { readAs: { key, as: readAs.map((e) => e.key) } } : {}),
+                // Each next step's ready-to-run, read-only query of the target's own Query Store for those minutes, while it keeps
+                // them (query-store.ts): built from the episode's target, family, and times only.
+                ...(queryStoreQueries.length ? { queryStoreQueries } : {}),
                 alsoInTheseMinutes: others.map((c) => c.statement),
                 parts: parts.map((p) => ({ tool: p.tool, details: p.details })),
             },
