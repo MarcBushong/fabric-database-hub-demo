@@ -211,6 +211,12 @@ describe("the organized Root cause list", () => {
             expect(within(bar).getByRole("button", { name: /^T1 · .*incidents?$/ })).toHaveAttribute("aria-pressed", "true");
             expect((within(bar).getByRole("combobox", { name: "Minutes" }) as HTMLSelectElement).value).toBe("custom");
             cleanup();
+            // A window longer than the page reads, an older link's too, is the newest minutes' (the review of 90e9d914).
+            renderWithApp(<RcaPage />, { rca: true, client: sampleClient(), view: { page: "rca", incident: "T1.20261101T000000Z.20261123T000000Z" } });
+            const long = await facets();
+            expect((within(long).getByRole("combobox", { name: "Minutes" }) as HTMLSelectElement).value).toBe("90");
+            expect(within(long).getByRole("button", { name: /^T1 · .*incidents?$/ })).toHaveAttribute("aria-pressed", "true");
+            cleanup();
             const cleared = renderWithApp(<RcaPage />, { rca: true, client: sampleClient(), view: { page: "rca", rcaFilters: { ...DEFAULTS, categories: ["connections"] } } });
             expect(await screen.findByText(/^No incident in these minutes matches the filters\./, {}, { timeout: 10000 })).toBeInTheDocument();
             fireEvent.click(screen.getAllByRole("button", { name: "Clear the filters" })[0]);

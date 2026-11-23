@@ -20,7 +20,7 @@ import { buildAskContext } from "@/lib/ask";
 import { SQL_TARGETS } from "@/lib/dax";
 import { Stage } from "@/mission/Stage";
 import { createRcaClient } from "@/rca/client";
-import { DEFAULT_RCA_FILTERS, type RcaFilters } from "@/rca/facet-ids";
+import { DEFAULT_RCA_FILTERS, isReadableWindow, type RcaFilters } from "@/rca/facet-ids";
 import { groupIncidents, matches } from "@/rca/facets";
 import type { DaxLog } from "@/rca/loader";
 import { bothTimes } from "@/rca/time";
@@ -50,12 +50,14 @@ export default function RcaPage() {
     const client = useMemo(() => (queryClient ? createRcaClient(queryClient) : null), [queryClient]);
     const selection = useMemo(() => parseSelection(view.incident), [view.incident]);
     // The page's filters, from the address (lib/view-state.ts). An older link's window key ("T1.from.to") is its target and
-    // minutes: filters too, which the page writes out at the first change.
+    // minutes: filters too, which the page writes out at the first change. A window longer than the page reads, from any
+    // of them (an older link's, the Incidents page's, the scoreboard's), is the newest minutes' instead (the review of
+    // 90e9d914: an address's 528 hours were read on all six targets at once).
     const legacyWindow = !view.rcaFilters && selection?.kind === "window" ? selection : null;
-    const filters: RcaFilters = useMemo(
-        () => view.rcaFilters ?? (legacyWindow ? { ...DEFAULT_RCA_FILTERS, targets: [legacyWindow.target], window: { from: legacyWindow.from, to: legacyWindow.to } } : DEFAULT_RCA_FILTERS),
-        [view.rcaFilters, legacyWindow],
-    );
+    const filters: RcaFilters = useMemo(() => {
+        const f = view.rcaFilters ?? (legacyWindow ? { ...DEFAULT_RCA_FILTERS, targets: [legacyWindow.target], window: { from: legacyWindow.from, to: legacyWindow.to } } : DEFAULT_RCA_FILTERS);
+        return "from" in f.window && !isReadableWindow(f.window.from, f.window.to) ? { ...f, window: DEFAULT_RCA_FILTERS.window } : f;
+    }, [view.rcaFilters, legacyWindow]);
     const [list, setList] = useState<Keyed<InvestigationResult> | null>(null);
     const [report, setReport] = useState<Keyed<{ incident: InvestigationResult; errors: InvestigationResult | null; logs: DaxLog[] }> | null>(null);
     // Try again after a read that failed, also once its retries ran out (src/data/retry.ts): each try is a new key.

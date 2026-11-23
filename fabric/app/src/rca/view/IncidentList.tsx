@@ -5,10 +5,10 @@
 import { memo, useId, useState, type ReactNode } from "react";
 import { Button, Input, Select, ToggleButton } from "@fluentui/react-components";
 
-import { RCA_CATEGORIES, RCA_FACET_TARGETS, RCA_NEWEST_MINUTES, RCA_SEVERITIES, type RcaFilters, type RcaGroup, type RcaNewest, type RcaSeverity, type RcaSort } from "../facet-ids";
+import { isReadableWindow, MAX_WINDOW_HOURS, RCA_CATEGORIES, RCA_FACET_TARGETS, RCA_NEWEST_MINUTES, RCA_SEVERITIES, type RcaFilters, type RcaGroup, type RcaNewest, type RcaSeverity, type RcaSort } from "../facet-ids";
 import { categoryLabel, facetCounts, type IncidentGroup } from "../facets";
 import { bothTimes, offsetMs, resolveTime } from "../time";
-import { MAX_WINDOW_HOURS, targetLabel, type ListedIncident, type ServerNames } from "./facts";
+import { targetLabel, type ListedIncident, type ServerNames } from "./facts";
 
 const NEWEST_LABEL: Record<RcaNewest, string> = { 90: "The newest 90 minutes", 360: "The newest 6 hours", 1440: "The newest 24 hours" };
 
@@ -76,7 +76,7 @@ export const FacetBar = memo(function FacetBar({ incidents, filters, onFilters, 
         const a = resolveTime(from, new Date(), timeZone);
         const b = resolveTime(to, new Date(), timeZone);
         if (!a || !b || b <= a) return setWhy("Give both times, the end after the start.");
-        if (b.getTime() - a.getTime() > MAX_WINDOW_HOURS * 3_600_000) return setWhy(`At most ${MAX_WINDOW_HOURS} hours: ask the chat about a longer one.`);
+        if (!isReadableWindow(a, b)) return setWhy(`At most ${MAX_WINDOW_HOURS} hours: ask the chat about a longer one.`);
         setWhy("");
         setChoosing(false);
         onFilters({ window: { from: a, to: b } });
