@@ -1795,6 +1795,10 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         # The session's own part is a stop's (the RCA release's merge): its evidence's final export first, through Run Commands
         # that only read, then the metrics' version that lists its bundles, which the notebook reads, and its lines.
         @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { '{0}:{1}' -f $_.Request.sessionId, $_.Request.final } | Select-Object -Unique) | Should -Be @(('{0}:True' -f $script:sessionId))
+        # It doesn't end the capture: the start-demo.ps1 session that took over keeps the VMs and its capture, which an end
+        # would stop for the rest of it, since a target captures after an end only when its profile was set after it (the
+        # review of the next release's integration). Only Stop-DbHubDemo's export ends it (O1).
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' -and $null -ne $_.Request.PSObject.Properties['endCapture'] }) | Should -BeNullOrEmpty
         @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
         $stopped.PSObject.Properties.Name | Should -Contain 'rca'
         $stopped.PSObject.Properties.Name | Should -Contain 'rcaLines'

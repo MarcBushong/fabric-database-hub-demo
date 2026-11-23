@@ -8541,3 +8541,18 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 
 - **Two changes still to come,** each merged when it's reviewed: the Livy steps' first deployment, whose end step deploys the kept form itself instead of warning, and the notebook session's report-only commit with its validation.
 - **Not proven live,** as ADR 0014's amendment lists: a net-new deployment and an update at the release's final SHA, and the deployed model's kept form against its reference, in Tuesday's timing run.
+
+### The next release's integration: the review of its merges (2026-11-23)
+
+**Why.** An independent review of the next release's integration merges (66cc5326..07dc860c) said **SHIP WITH FIXES**: a High that comes from the integration itself, a Low, and an optional fix for a test that fails under load. The coordinator asked for each as a fix-up commit on the release branch, with a test that fails without it.
+
+- **High: a taken-over session's end stopped the newer session's Incident RCA capture.**
+  - **The cause:** stop-tail's O1 (d06899f6) made `Invoke-DbHubRcaStop` always pass `-EndCapture`, and the RCA release's takeover (adc2ca16) calls it at a taken-over session's end (`Complete-DbHubTakenOverSession`). Neither side's review could see it, since stop-tail's base has no takeover.
+  - **What happened:** that end stops nothing and leaves the VMs to the `start-demo.ps1` session, but its export made each runner record the capture's end (`capture-end.json`). The observer then captures a target only when its profile was set after the end (`ProfileHost.IsActiveAfter`), and the `start-demo.ps1` session set its profiles before it, so its capture stopped there, silently, for the rest of the session.
+  - **The fix:** `-EndCapture` is a switch on `Invoke-DbHubRcaStop` that only `Stop-DbHubDemo` passes, so the takeover's end exports as it did at 66cc5326.
+  - **The test:** the takeover flow's test asserts that none of its exports carries `endCapture`. The stop's own test still asserts that each of its exports does.
+  - **Docs:** O1's CHANGELOG entry, `rca/README.md`'s runbook, ADR 0031's capture's end, and ADR 0026's takeover.
+
+**Changed files (High).** `automation/runbooks/DbHubControl.Common.ps1`, `tests/unit/Automation.Runbooks.Tests.ps1`, the CHANGELOG, `rca/README.md`, ADR 0026, ADR 0031, and this report.
+
+**Validation (High).** Pester with StrictMode and the Azure CLI guard, on `Automation.Runbooks.Tests.ps1`: the takeover flow's test passed, and all 29 of the capture's tests (`*capture*`), the stop's own `endCapture` among them; 0 az calls. With only the runbook's change stashed, the takeover flow's test fails: both of its exports carry `endCapture`.
