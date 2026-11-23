@@ -106,14 +106,21 @@ function Get-DemoCostEstimate {
     PREFLIGHT.COST.MONTHLY says which. -T5ContainerLifecycle says whether they bill all month or only while the demo
     runs.
 
+    .PARAMETER T5PrivateEndpoint
+    Whether T5 has, or gets, a private endpoint and its private DNS zone, which bill all month (Get-DemoT5PrivateEndpointStatus;
+    2026-11-21, ADR 0027): true prices them; false leaves them out (public mode with no policy that needs them, where T1's
+    subnet reaches T5 through its service endpoint, as T3); $null, when it wasn't told, prices them, an upper bound, since a
+    new account gets them unless preflight finds no policy that needs them. In private mode they're always priced.
+
     .PARAMETER T5ContainerLifecycle
     When T5's container, the only part of the account with provisioned throughput, exists (2026-11-19, ADR 0027): Session,
     the default, once the session control's role can create it (the resource group's DbHubT5Container tag), so it exists
     only during a session, and its throughput, its storage (prorated by the hour), and Defender for Azure Cosmos DB, when
     its plan (CosmosDbs) is on Standard, are running costs; AlwaysOn while that role can't create it, or in an environment
     deployed before then (until ./scripts/deploy.ps1 runs as an Owner, or an Owner runs ./scripts/grant-safety-stop.ps1), so
-    the container stays between sessions and they bill all month, as before. T5's private endpoint and private DNS zone bill
-    all month either way. PREFLIGHT.COST.MONTHLY gives the difference between the two (T5AlwaysOnExtraMonthly).
+    the container stays between sessions and they bill all month, as before. T5's private endpoint and private DNS zone, when
+    it has them (-T5PrivateEndpoint), bill all month either way. PREFLIGHT.COST.MONTHLY gives the difference between the two
+    (T5AlwaysOnExtraMonthly).
 
     .PARAMETER T5ManualDeleteOnly
     With -T5ContainerLifecycle AlwaysOn (2026-11-19, the re-review of 0590bbe; the coordinator's decision, which the owner
@@ -180,6 +187,9 @@ function Get-DemoCostEstimate {
 
         [AllowNull()]
         [object] $T5FreeTier = $null,
+
+        [AllowNull()]
+        [object] $T5PrivateEndpoint = $null,
 
         [ValidateSet('Session', 'AlwaysOn')]
         [string] $T5ContainerLifecycle = 'Session',
@@ -442,7 +452,8 @@ function Get-DemoCostEstimate {
     # T2 golden snapshots (ADR 0018): incremental snapshots are stored as Standard HDD, LRS or ZRS
     # (https://learn.microsoft.com/azure/virtual-machines/disks-incremental-snapshots).
     # T5, the Azure Cosmos DB account (2026-11-18, ADR 0027): an account has no stop, so its private endpoint and its private
-    # DNS zone bill all month, in both network modes. Its container, the only part with provisioned throughput (the database
+    # DNS zone, when it has them (in private mode, under a policy that needs them, or an account that already has them;
+    # 2026-11-21, -T5PrivateEndpoint), bill all month. Its container, the only part with provisioned throughput (the database
     # has none of its own), exists only during a session since 2026-11-19 (Session): start-demo.ps1 and Run all create it,
     # and stop-demo.ps1, the session's end, and the nightly safety stop delete it. So its throughput and its storage
     # (prorated by the hour, as T4's read replica's) bill for the running hours only. Cosmos DB bills provisioned throughput
@@ -453,6 +464,8 @@ function Get-DemoCostEstimate {
     # meters, which cost nothing. Its periodic backup's two copies are free.
     $t5On = Test-DemoT5Enabled -Config $Config
     $t5Free = if ($null -eq $T5FreeTier) { $null } else { [bool]$T5FreeTier }
+    $t5EndpointKnown = $effectiveNetworkMode -eq 'private' -or $null -ne $T5PrivateEndpoint
+    $t5Endpoint = $effectiveNetworkMode -eq 'private' -or $null -eq $T5PrivateEndpoint -or [bool]$T5PrivateEndpoint
     $t5Session = $T5ContainerLifecycle -ceq 'Session'
     $t5Units = 0.0
     if ($t5On) {
@@ -471,9 +484,11 @@ function Get-DemoCostEstimate {
             Add-Component ('T5 throughput ({0} RU/s manual, {1})' -f $cosmos['throughputRUs'], $t5Label) 'idle' $t5Throughput ($t5Units * $hoursPerMonth) '100 RU/s-hour'
             Add-Component ('T5 storage (about {0} GB, {1})' -f $cosmos['estimatedStorageGB'], $t5Label) 'idle' $t5Storage ([double]$cosmos['estimatedStorageGB']) 'GB-month'
         }
-        Add-Component 'T5 private endpoint' 'idle' (Select-HourlyPrice "serviceName eq 'Virtual Network' and productName eq 'Virtual Network Private Link' and skuName eq 'Standard'" 'Standard Private Endpoint') $hoursPerMonth 'hour'
-        $t5DnsItems = Get-CachedPrice "serviceName eq 'Azure DNS' and skuName eq 'Private' and meterName eq 'Private Zone' and priceType eq 'Consumption'"
-        Add-Component 'T5 private DNS zone' 'idle' ($t5DnsItems | Where-Object { $_.armRegionName -notmatch 'Gov' } | Sort-Object -Property tierMinimumUnits, armRegionName | Select-Object -First 1) 1 'zone-month'
+        if ($t5Endpoint) {
+            Add-Component 'T5 private endpoint' 'idle' (Select-HourlyPrice "serviceName eq 'Virtual Network' and productName eq 'Virtual Network Private Link' and skuName eq 'Standard'" 'Standard Private Endpoint') $hoursPerMonth 'hour'
+            $t5DnsItems = Get-CachedPrice "serviceName eq 'Azure DNS' and skuName eq 'Private' and meterName eq 'Private Zone' and priceType eq 'Consumption'"
+            Add-Component 'T5 private DNS zone' 'idle' ($t5DnsItems | Where-Object { $_.armRegionName -notmatch 'Gov' } | Sort-Object -Property tierMinimumUnits, armRegionName | Select-Object -First 1) 1 'zone-month'
+        }
     }
     foreach ($snapshot in @($GoldenSnapshots | Where-Object { $null -ne $_ })) {
         $snapshotSku = [string](Get-DemoMemberValue -InputObject $snapshot -Name 'Sku')
@@ -509,17 +524,28 @@ function Get-DemoCostEstimate {
     # 2 to 4 minutes, more on a night it waits up to 10 minutes for a T4 that's starting. A ceiling: 120 job minutes a month.
     Add-Component 'Nightly safety stop job minutes (the first 500 a month are included)' 'idle' $automationItem 120 'minute'
 
-    # The session control (ADR 0026), in rg-<prefix>-control: the vault bills per 10,000 operations, and Automation includes
-    # the first 500 job minutes a month. A light-use month's 10 hours are about 5 Run all sessions of about 2 billed hours,
-    # and a session's jobs take at most about 60 minutes with the Incident RCA's export (ADR 0031): its own job's 2 to 20,
-    # the stop's 1 to 3, and the export's limits, 6 at the stop and 8 at each of its about three 30-minute re-checks. So
-    # these are ceilings: one block of operations, a session's few dozen RCA bundles included, and 300 job minutes, which
-    # with the nightly safety stop's 120 stay within the 500 included, so the tier that starts at 0 is the right one
-    # (DbHubDemo.Cost.Tests.ps1 checks it).
+    # The session control (ADR 0020, ADR 0026), in rg-<prefix>-control: the vault bills per 10,000 operations and a session
+    # reads its few secrets a few times and writes its few dozen Incident RCA bundles (ADR 0031), so one block of
+    # operations is a ceiling. Automation includes the first 500 job minutes a month. A session's jobs: DbHub-Control's
+    # start, 2 to 20 minutes, plus up to 51 while it follows T2's Run Command after a cold start (2026-11-20, ADR 0026), its
+    # stop or DbHub-Stop, up to 3, and DbHub-Monitor's re-checks, a few: 80 minutes. The Incident RCA's export (ADR 0031)
+    # adds its limits to them: 6 at the stop, 8 at each of the session's about three 30-minute re-checks, and 6 at a start
+    # that fetches an earlier session's evidence, 36 more, so a ceiling of 116 minutes a session. The light-use month's
+    # sessions are Run all sessions, the owner's main path, at about 2 billed hours each (a 90-minute showcase touches 2
+    # clock hours): 5 in 10 running hours (the coordinator's decision, 2026-11-21). What the nightly stop's 120 leave of the
+    # 500 is priced at the included tier, and the rest at the next one.
     if ((Get-DemoActivityControlSetting -Config $Config).Enabled) {
         $vaultItems = Get-CachedPrice "serviceName eq 'Key Vault' and armRegionName eq '$location' and skuName eq 'Standard' and priceType eq 'Consumption'"
         Add-Component 'Activity control vault operations' 'idle' ($vaultItems | Where-Object { $_.meterName -eq 'Operations' } | Select-Object -First 1) 1 '10K operations'
-        Add-Component 'Activity control job minutes (the first 500 a month are included)' 'idle' $automationItem 300 'minute'
+        $runAllSessionHours = 2.0
+        $sessionsPerMonth = [System.Math]::Ceiling($LightUseHoursPerMonth / $runAllSessionHours)
+        $controlMinutes = $sessionsPerMonth * (80 + 36)
+        $includedMinutes = [System.Math]::Min($controlMinutes, [System.Math]::Max(0, 500 - 120))
+        Add-Component 'Activity control job minutes (the first 500 a month are included)' 'idle' $automationItem $includedMinutes 'minute'
+        if ($controlMinutes -gt $includedMinutes) {
+            $paidItem = $automationItems | Where-Object { [double]$_.tierMinimumUnits -gt 0 } | Sort-Object -Property { [double]$_.tierMinimumUnits } | Select-Object -First 1
+            Add-Component 'Activity control job minutes past the 500 included' 'idle' $paidItem ($controlMinutes - $includedMinutes) 'minute'
+        }
     }
 
     # Microsoft Defender for Cloud, from the subscription's plans.
@@ -718,6 +744,9 @@ function Get-DemoCostEstimate {
     if ($t5On) {
         $evidence['t5FixedMonthly'] = $t5FixedMonthly
         $evidence['t5FreeTier'] = $t5Free
+        # T5's private endpoint and DNS zone (2026-11-21): priced or not, and whether that was told or assumed.
+        $evidence['t5PrivateEndpoint'] = [bool]$t5Endpoint
+        $evidence['t5PrivateEndpointChecked'] = [bool]$t5EndpointKnown
         # T5's container (2026-11-19, ADR 0027): Session or AlwaysOn, its running hour, and the difference between the two.
         $evidence['t5ContainerLifecycle'] = $T5ContainerLifecycle
         $evidence['t5RunningHourly'] = $t5RunningHourly
@@ -864,25 +893,38 @@ function Get-DemoCostEstimate {
                 ' Whether it can have the subscription''s free tier wasn''t checked, so its throughput is at list price, an upper bound; preflight checks it, and on the free tier it costs nothing.'
             }
             $t5Rus = (Get-DemoCosmosSetting)['throughputRUs']
+            # Its private endpoint and DNS zone (2026-11-21): in the list when priced; a note when that's only because
+            # whether a policy needs them wasn't told (an upper bound).
+            $t5Kept = if ($t5Endpoint) { ', storage, private endpoint, and private DNS zone' } else { ' and storage' }
+            $t5EndpointNote = if ($t5Endpoint -and -not $t5EndpointKnown) {
+                ' Whether a policy needs its private endpoint wasn''t checked, so the endpoint and its private DNS zone are counted, an upper bound; preflight checks it, and in public mode with no such policy a new T5 has none.'
+            }
+            else { '' }
             if ($t5Session) {
                 $t5Other = if ($t5AlwaysOnExtra -gt 0) {
                     [string]::Format($t5Culture, ' If the session control holds a role without the container''s actions (an update by someone who isn''t an Owner, until an Owner runs ./scripts/grant-safety-stop.ps1 once), the container stays between sessions and adds about {0:N2} USD a month.', [double]$t5AlwaysOnExtra)
                 }
                 else { '' }
                 $t5Parts = if ($billedPlans -contains 'CosmosDbs') { ', its storage, and Defender for Azure Cosmos DB' } else { ' and its storage' }
-                $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) costs {0:N2} USD a month whether the demo runs or not (its private endpoint and private DNS zone). Its container exists only during a session (start-demo.ps1 and Run all create it; stop-demo.ps1, the session''s end, and the nightly safety stop delete it), so its {1} RU/s of throughput{2} add {3:N3} USD a running hour.{4}{5}', [double]$t5FixedMonthly, $t5Rus, $t5Parts, [double]$t5RunningHourly, $t5FreeText, $t5Other)
+                $t5Idle = if ($t5Endpoint) {
+                    [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) costs {0:N2} USD a month whether the demo runs or not (its private endpoint and private DNS zone).', [double]$t5FixedMonthly)
+                }
+                else {
+                    ' T5 (Azure Cosmos DB) has no private endpoint (in public mode, T1''s subnet reaches it through its service endpoint, as T3), so it costs nothing while the demo is stopped.'
+                }
+                $monthlyMessage += $t5Idle + [string]::Format($t5Culture, ' Its container exists only during a session (start-demo.ps1 and Run all create it; stop-demo.ps1, the session''s end, and the nightly safety stop delete it), so its {0} RU/s of throughput{1} add {2:N3} USD a running hour.{3}{4}{5}', $t5Rus, $t5Parts, [double]$t5RunningHourly, $t5FreeText, $t5Other, $t5EndpointNote)
             }
             elseif ($T5ManualDeleteOnly) {
                 # Only ./scripts/stop-demo.ps1 deletes the container (2026-11-19, the re-review): it's priced all month because
                 # nothing automatic does, not because it stays.
-                $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) is priced at {0:N2} USD a month (its {1} RU/s of throughput, storage, private endpoint, and private DNS zone{2}): its container exists only during a session, but only ./scripts/stop-demo.ps1 deletes it after one, since the session control has no role and the nightly safety stop''s role can''t, so the estimate counts it all month, about {3:N2} USD more than for the running hours only.{4}', [double]$t5FixedMonthly, $t5Rus, $t5Defender, [double]$t5AlwaysOnExtra, $t5FreeText)
+                $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) is priced at {0:N2} USD a month (its {1} RU/s of throughput{2}{3}): its container exists only during a session, but only ./scripts/stop-demo.ps1 deletes it after one, since the session control has no role and the nightly safety stop''s role can''t, so the estimate counts it all month, about {4:N2} USD more than for the running hours only.{5}{6}', [double]$t5FixedMonthly, $t5Rus, $t5Kept, $t5Defender, [double]$t5AlwaysOnExtra, $t5FreeText, $t5EndpointNote)
             }
             else {
                 $t5Other = if ($t5AlwaysOnExtra -gt 0) {
                     [string]::Format($t5Culture, ' Once ./scripts/deploy.ps1 runs as an Owner of the subscription, or an Owner runs ./scripts/grant-safety-stop.ps1 once, the container exists only during a session, which saves about {0:N2} USD a month.', [double]$t5AlwaysOnExtra)
                 }
                 else { '' }
-                $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) costs {0:N2} USD a month whether the demo runs or not (its {1} RU/s of throughput, storage, private endpoint, and private DNS zone{2}): its container stays between sessions until the session control''s role can create it.{3}{4}', [double]$t5FixedMonthly, $t5Rus, $t5Defender, $t5FreeText, $t5Other)
+                $monthlyMessage += [string]::Format($t5Culture, ' T5 (Azure Cosmos DB) costs {0:N2} USD a month whether the demo runs or not (its {1} RU/s of throughput{2}{3}): its container stays between sessions until the session control''s role can create it.{4}{5}{6}', [double]$t5FixedMonthly, $t5Rus, $t5Kept, $t5Defender, $t5FreeText, $t5Other, $t5EndpointNote)
             }
         }
         if ($t3UsesFreeOffer) {

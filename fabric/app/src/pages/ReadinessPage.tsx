@@ -14,7 +14,7 @@ import { toChecks, toCoverage, toReadinessSummary, toTargetNames, toTargets, typ
 import { coverageQuery, estateQuery, readinessChecksQuery, readinessSummaryQuery, targetNamesQuery } from "@/data/queries";
 import { useQuery } from "@/data/use-query";
 import { coveragePrompt, libraryPrompts, type AgentSurface, type LibraryContext } from "@/lib/agent-prompts";
-import { formatDateTimeUtc, formatNumber } from "@/lib/format";
+import { formatDateTimeUtc, formatNumber, percent } from "@/lib/format";
 import { lagInsight, readinessInsight } from "@/lib/insights";
 import { statusMeta, STATUSES } from "@/lib/status";
 import { PageHeader } from "@/shell/PageHeader";
@@ -95,7 +95,7 @@ export default function ReadinessPage() {
             ) : (
                 <>
                     <section className="kpis" aria-label="Readiness at a glance">
-                        <KpiTile label="Ready" value={summary?.readiness !== null && summary?.readiness !== undefined ? `${Math.round(summary.readiness * 100)} %` : "–"} sub={summary ? `${summary.passed} of ${applicable} applicable pass` : ""} status={summary ? (summary.failed > 0 ? "Fail" : summary.manual > 0 ? "Manual action required" : summary.warnings > 0 ? "Warning" : "Pass") : null} />
+                        <KpiTile label="Ready" value={summary?.readiness !== null && summary?.readiness !== undefined ? percent(summary.readiness) : "–"} sub={summary ? `${summary.passed} of ${applicable} applicable pass` : ""} status={summary ? (summary.failed > 0 ? "Fail" : summary.manual > 0 ? "Manual action required" : summary.warnings > 0 ? "Warning" : "Pass") : null} />
                         <KpiTile label="Failed" value={String(summary?.failed ?? 0)} status={summary?.failed ? "Fail" : null} onOpen={() => setStatus("Fail")} openLabel="Show the failed checks" />
                         <KpiTile label="Manual steps" value={String(summary?.manual ?? 0)} status={summary?.manual ? "Manual action required" : null} onOpen={() => setStatus("Manual action required")} openLabel="Show the manual steps" />
                         <KpiTile label="Warnings" value={String(summary?.warnings ?? 0)} status={summary?.warnings ? "Warning" : null} onOpen={() => setStatus("Warning")} openLabel="Show the warnings" />

@@ -205,7 +205,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R343 | `t2Source` `auto` builds T2 when no usable snapshot exists | **Accepted:** `PREFLIGHT.T2.SOURCE` says which source and why |
 | R344 | A reused policy inventory can miss a changed definition behind an unchanged assignment | **Accepted:** the what-if still runs, and the cache lasts 168 hours at most |
 | R345 | The parallel deploy differs from the sequential one in side effects | **Mitigated:** the two found live are fixed, and `-Sequential` stays |
-| R346 | The runner's status can exceed Run Command's 4,096 bytes of output, so the bounds check can't read it | **Open:** with Phase 25b's longer outcomes, `WORKLOAD.<target>.BOUNDS` was a **Warning** on every target in Phase 25d's live run; the runner still clamps every scenario to its limits, and a compact status for the check is a follow-up |
+| R346 | The runner's status can exceed Run Command's 4,096 bytes of output, so the bounds check can't read it | **Mitigated** (2026-11-20, F20): the VM's relay reads the running runs' bounds from the runner's whole status and returns them compactly, while its line fits, as it does the profile; a VM gets that relay with its next `deploy.ps1`, and until then the check is the **Warning** it was. Before, with Phase 25b's longer outcomes, `WORKLOAD.<target>.BOUNDS` was a **Warning** on every target in Phase 25d's live run and during every session; the runner still clamps every scenario to its limits. **Not proven live** |
 | R347 | The golden snapshot's quarantine test needs quota for one more host and takes over an hour | **Accepted:** it checks the quota first |
 | R348 | `configure-fabric-app.ps1` might take parameters the Fabric track doesn't pass | **Accepted:** the track passes only the parameters the script declares |
 | R349 | The notebooks carried real Fabric workspace and lakehouse IDs | **Closed:** the notebooks carry no Fabric IDs, and the import injects the resolved ones (Phase 26a) |
@@ -307,7 +307,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R642 | The showcase is unit-tested only: its slots, anchors, cycles, and tiers, the request stamps, and which visual each slot fills and how soon | **Open:** the owner's live check, with the README's table as the expectation; until then, limitations lists it as not proven live (the showcase) |
 | R643 | Whether automatic tuning forces `plan-regression`'s plan within its 10-minute slot isn't documented: Learn gives the 10-second CPU gain and the 30-minute to 72-hour verification, not the detection time | **Open:** the README says "likely, not proven live"; the DMV shows the regression whether or not the plan is forced, and the forced plan stays after the run for the presenter. The owner's live check times it (the showcase) |
 | R644 | T4's new `max_connections` takes effect only after a restart: an environment deployed before it keeps its old limit until a run that deploys the template and passes T1's T4 step (`deploy.ps1 -FromStage Infrastructure`), and the restart ends T4's open sessions | **Mitigated:** `T4.MAXCONNECTIONS` is a **Warning** while the value waits, deployment's "Update an existing environment" gives the command, the restart runs before T1 sets T4 up and the runner's connections retry, a T4 that isn't Ready isn't restarted (a **Warning**), and a deployment that changes nothing never restarts T4. Not proven live (the showcase) |
-| R645 | `connection-surge`'s refused attempts, and **Failed connections** filling on every T4 size, are unit-tested only | **Open:** at most 5 refused attempts in any minute and 30 a run, the free slots held 5 seconds at most, only "too many connections" (53300) counted, and a sign-in failure stops the surge. The owner's live check on the next deploy closes it; limitations says so (the showcase) |
+| R645 | `connection-surge`'s refused attempts, and **Failed connections** filling on every T4 size, are unit-tested only | **Closed** (live 2026-11-21, F34 on 2026-11-22): on the default `Standard_D4ds_v5`, in two new environments, `DEPLOY.T4.RESTART` put `max_connections` 50 in effect, every wave reached the limit, and its 2 attempts past it were refused (48 in 24 waves), within the bounds. **Failed connections** didn't fill: Azure Monitor's `connections_failed` stayed 0 in every interval, while **Connections** peaked at 36 to 39 in each surge. So the scenario, the notebook, the app, and the docs now grade and describe it by Connections at 35 or more, and never claim a refusal from failed connections ([F34](#f34-connection-surges-signal-is-connections-at-the-limit-2026-11-22)). The other sizes stay unproven ([limitations](limitations.md)) |
 | R646 | An environment whose runner predates the showcase refuses `showcase` ("Unknown activity profile"), and the control notebook can't see a refusal | **Open:** deployment's "Update an existing environment" delivers the runner (`-FromStage Infrastructure`, or `-FromStage Artifacts` for the runner alone); the same holds for `--vcores` (2026-11-04). The job's output in the Automation account shows the Run Command's refusal (the showcase) |
 | R647 | T1's CPU slot shares `sqlvm01` with the runner that drives T3 and T4, and Phase 25d saw a saturated `sqlvm01` starve a lane | **Mitigated:** T1's CPU slot is 7 minutes late in the cycle with 2 sessions, `capacity-max` isn't in the showcase, and the profile host runs at above-normal priority; its lanes keep their bounded reads and retries. Not proven live (the showcase) |
 | R648 | A Burstable T4 can run out of CPU credits: "When credits are exhausted, the VM is restricted to baseline CPU" | **Mitigated:** on Burstable, the showcase's T4 CPU slot is 6 minutes in odd cycles only; a T4 without a recorded tier runs the Burstable slots. Not proven live: West US 3 refused the Burstable sizes for the test subscription (the showcase) |
@@ -458,7 +458,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R850 | Every `deploy.ps1` run creates T4's read replica again for **DONE**'s checks, since the last run deleted it: in the T4 track on a full run, in parallel, but in **DONE**'s gate on `-Resume` after **DONE**, which then waits about 9 minutes for it and up to 15 more for its metrics | **Accepted** (the coordinator's decision, 2026-11-16): **DONE** checks the replica's Estate row and metrics, and nothing bills for it between runs; under $0.50 a run at the 2026-11-13 list prices |
 | R851 | A workspace's `NB_DatabaseHub_LiveActivity` from before 2026-11-13 ignores `POSTGRES_METRICS`, so newer scripts that send T4's metrics to it lose them while the run passes (after an upgrade whose Fabric step a paused capacity kept from finishing) | **Fixed** (2026-11-16): `stop-demo.ps1 -SaveHistory` and `configure-fabric.ps1 -RunLiveActivity` read the notebook's definition first; an older copy isn't sent them, a **Warning** says so with `./scripts/deploy.ps1`, and the metrics stay in `out/history-pending`. A definition that can't be read gets them, as before |
 | R852 | T1's Bootstraps step merged the monitoring flag while the bootstrap could be in its lockout recovery, which has SQL Server in single-user mode, so the SQL IaaS Agent extension's update could fail and stay Failed (live, 2026-11-16: one of the two first deployments that day; `main` has it too) | **Fixed:** the step merges the flag before the loader, once `sqlvm01`'s extensions have settled, so the update ends before the bootstrap starts. For an extension that's already Failed, the Monitoring step repairs it with the documented Redeploy, once per run, only when `sqlvm01` runs and SQL Server is in multi-user mode after a Ready bootstrap, re-applies and verifies what a repair drops, and says so as a **Warning**; a repair that can't run or fails is a **Fail** with the portal's Repair |
-| R853 | A resumed `deploy.ps1` skipped a Fabric step that an earlier run had finished, so an upgraded environment kept the older notebooks, history model, and Insights app, and a session's history lost T4's metrics with no word from Run all (found 2026-11-16 in the upgrade test; `main` has it too) | **Fixed** (2026-11-16): the Fabric step records what it published in full (`DbHubFabricSha256`, the Insights app included), and a resume, on either path, publishes it all again when this copy's content differs or nothing is recorded, with no Fabric call. Residual: with `"importNotebooks": false`, `deploy.ps1` keeps the workspace's notebooks by design, and the history's fix text then names `./scripts/configure-fabric.ps1` |
+| R853 | A resumed `deploy.ps1` skipped a Fabric step that an earlier run had finished, so an upgraded environment kept the older notebooks, history model, and Insights app, and a session's history lost T4's metrics with no word from Run all (found 2026-11-16 in the upgrade test; `main` has it too) | **Fixed** (2026-11-16): the Fabric step records what it published in full (`DbHubFabricSha256`, the Insights app included), and a resume, on either path, publishes it all again when this copy's content differs or nothing is recorded, with no Fabric call. Residual: with `"importNotebooks": false`, `deploy.ps1` keeps the workspace's notebooks by design, and the history's fix text then names `./scripts/configure-fabric.ps1`. Since 2026-11-23 (follow-ups decision 2a), it keeps only a notebook someone edited, and the fix names `-Notebook NB_DatabaseHub_LiveActivity` ([the section](#decision-2a-deployps1-updates-the-notebooks-that-nobody-edited-2026-11-23)) |
 | R854 | After a stopped replica restarts, Azure Monitor's Read replica lag reads the time since its last replay until T4 writes again (1,380 s on 2026-11-13), and the history's lag finding and the app named that as the session's peak | **Fixed** (2026-11-16): the notebook and the app leave the catch-up out of the peak with one rule (a gap of 10 minutes or more, then the leading points that reach half the time since), and say so; the rows keep every point |
 | R855 | A stopped replica's start-first record lived only in T4's start evidence, so a start-first **Warning** could go unseen | **Fixed** (2026-11-16): T4's start record carries its message, and its status and fix when worse |
 | R856 | An empty list of a VM's chunk Run Commands reached the callers as `$null`, so "The Run Commands on the VM could not be listed" was a **Warning** in nearly every deploy (`main` too), and `DEPLOY.ARTIFACTS.CLEANUP_<VM>` named chunks that Azure had already deleted | **Fixed** (2026-11-16): the list stays a list; a failed list is tried 3 times, and its **Warning** keeps az's redacted error |
@@ -523,7 +523,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R915 | The Owner's `grant-safety-stop.ps1` gives the control vault's three secrets, which hold the webhook URL, a bearer secret, to the environment's deployer, read from what Azure records as the vault's last change (`systemData.lastModifiedBy`; 2026-11-19), so someone who changed the vault outside `deploy.ps1` before the grant would be taken for the deployer | **Accepted:** changing the vault needs write rights on it in the control's resource group, which only the demo's deployers and the subscription's administrators hold, and every `deploy.ps1` run writes it again; only a user counts (an application or managed identity names no person), the name must resolve to exactly one user through Microsoft Graph, and `CONTROL.ROLE.DEPLOYER` names whom it chose, so an Owner sees it. Before this, a Contributor who deployed couldn't Run all at all without editing the configuration |
 | R918 | Stop now's and the pre-check's saves of a session again passed no plan, because a session's stop replaced its status with one that kept none: a save that a cancel cut off before its `scenario_runs` rows never got the session's row or its beats' rows (nor, cut off before its findings, their correlation and its `database_agent` finding), and every later Run all and Stop now analyzed the session again, for 7 days (2026-11-19, found in R907's work) | **Fixed** (2026-11-19, the coordinator's request; [below](#a-sessions-history-saved-again-with-its-plan-r918-2026-11-19)): the runbooks' stop keeps the session's plan in its status, and both saves rebuild its beats from it, so the save is completed and the session recorded as saved. **Accepted:** when the status doesn't have the plan (a stop by runbooks that `deploy.ps1` hasn't republished yet, or a later session's status that replaced it before the save), the history is saved without its beats, once, with a **Warning** that says so; those beats can't be saved later, because only the status had them |
 | R919 | A `start-demo.ps1` session stops by itself 4 hours after its start (2026-11-19, `START.CONTROL.AUTOSTOP`), which can end a long demo someone forgot to extend; and a Run all whose notebook still follows its session stops the demo at its end even when a later `start-demo.ps1` took over | **Provisional:** the coordinator's decision for the owner, who can reverse it. **Mitigated:** the console and the status page say when, with the nightly stop when it comes first; `-Hours` up to 24, and running `start-demo.ps1` again starts the hours over; a later Run all or the app's **Start** replaces it; it moves past a `deploy.ps1` that's still running; without the control's role, or with runbooks from before 2026-11-19 (an update of the scripts before `deploy.ps1`), none is scheduled, a pending one or its backup is removed, and a **Warning** says why, so a Run all is never refused for it. **Accepted:** the notebook's end and its Stop now send the runbook the same request, so the second case, as before 2026-11-19, needs a notebook change ([limitations](limitations.md)). **Open:** live proof |
-| R924 | The Insights app's live estate read nothing in a real deployment: Database Hub answers every route HTTP 401 "Authentication failed for all authenticators" to the token Fabric gives the app's functions (`ctx.Tokens.Fabric`, the app identity's), while the same routes accept a person's own Azure CLI sign-in (live on `dbhubfn`, 2026-11-19). So the pages showed an empty "live" estate, the migration card said T2 had no assessment, and Ask's live tool reported 401s | **Mitigated** (2026-11-19, the coordinator's decision, which the owner can reverse; [below](#the-insights-apps-live-estate-and-database-hubs-sign-in-r924-2026-11-19)): when no route answers, the function's answer carries no data, and, when Database Hub refused the app's sign-in, one plain sentence (`unavailable`), never the routes' errors (those stay in the function's log); while every view is refused, the pages hide their live parts and **Live views** says why in one line ([the follow-up](#the-live-parts-hidden-while-database-hub-refuses-the-app-and-a-view-without-data-r924-follow-up-2026-11-19)), and a single view without data shows as partial, never as zero; T2's migration readiness comes from its SQL Server instance's documented `properties.migration.assessment`, read at each deploy into `dbhub-app.json` and shown with its time; `FABRIC.APP.ESTATE` is **Not supported** and names what works. **Open:** the product issue the owner files (accept Fabric apps' platform token, or a public Database Hub API); no token a function can get works, and a script can't call the function to see when that changes. **Accepted:** T2's readiness is as of the last deploy; when no assessment has uploaded by then (sometimes on a new environment's first run), the card links the Azure portal until the next `deploy.ps1` |
+| R924 | The Insights app's live estate read nothing in a real deployment: Database Hub answers every route HTTP 401 "Authentication failed for all authenticators" to the token Fabric gives the app's functions (`ctx.Tokens.Fabric`, the app identity's), while the same routes accept a person's own Azure CLI sign-in (live on `dbhubfn`, 2026-11-19). So the pages showed an empty "live" estate, the migration card said T2 had no assessment, and Ask's live tool reported 401s | **Mitigated** (2026-11-19, the coordinator's decision, which the owner can reverse; [below](#the-insights-apps-live-estate-and-database-hubs-sign-in-r924-2026-11-19)): when no route answers, the function's answer carries no data, and, when Database Hub refused the app's sign-in, one plain sentence (`unavailable`), never the routes' errors (those stay in the function's log); while every view is refused, the pages hide their live parts and **Live views** says why in one line ([the follow-up](#the-live-parts-hidden-while-database-hub-refuses-the-app-and-a-view-without-data-r924-follow-up-2026-11-19)), and a single view without data shows as partial, never as zero; T2's migration readiness comes from its SQL Server instance's documented `properties.migration.assessment`, read at each deploy into `dbhub-app.json` and shown with its time; `FABRIC.APP.ESTATE` is **Not supported** and names what works. **Open:** the product issue the owner files (accept Fabric apps' platform token, or a public Database Hub API); no token a function can get works, and a script can't call the function to see when that changes. **Accepted:** T2's readiness is as of the last deploy; when no assessment has uploaded by then (sometimes on a new environment's first run), the card links the Azure portal until the next `deploy.ps1`. Since 2026-11-20 (F18), an update whose stop at its end waits for that first upload deploys the app once more after it ([below](#t2s-readiness-on-the-first-update-that-turns-on-its-assessment-f18-2026-11-20)) |
 | R926 | A new environment's first `deploy.ps1` left the Insights app's Manage copying each request for Run all ("Manage's function is missing NB_DatabaseHub_Control", `FABRIC.APP.ACTIONS`): the app's step reads the control notebook's IDs before its first `rayfin up`, both paths put the notebook in Fabric only after the app's step, and a resume skipped the finished Fabric step, so nothing deployed the app with them (the final tests' net-new run, `dbhubfn` at 33a1bb6, 2026-11-19) | **Fixed** (2026-11-19, the coordinator's request; [below](#a-new-environments-manage-and-the-control-notebook-r926-2026-11-19)): after the control's Fabric part, the parallel path runs the app's step once more when this run's app, or on a resume the state's record (`DbHubAppControlNotebook`, new), has no notebook for Manage; `-Sequential` puts the notebook in Fabric before the app; the app's own second deploy runs only when it completes Manage's settings, so a first deployment still runs `rayfin up` twice. **Accepted:** a new environment's run takes a few minutes more, once, after DONE's checks (the app's step again, its relay and query checks included); a resume of an environment deployed before then, whose Fabric step it skips, runs the app's step once more, once, since nothing recorded what its Manage has; `-Sequential` has no such step, so an environment it deployed before then keeps copy mode until a run that runs its Fabric stage again; while the notebook isn't in Fabric, Manage copies requests, as `DEPLOY.CONTROL` says, until the next `deploy.ps1`; a failure of that last app step is the app's, which never blocks **DONE** |
 | R890 | A first run without a configuration file (a fresh clone, another PC, a lost file) wrote the defaults for the prefix `dbhub` without checking whether that environment existed, so the next `deploy.ps1` applied them to it: a new administrators' group for T3 and T4, the default network mode, schedule, ceilings, sizes, and Fabric workspaces; in someone else's environment, your settings and your group ([#60](https://github.com/MarcBushong/fabric-database-hub-demo/issues/60), found 2026-11-18 in the pull-safety check of `main`; `main` too) | **Fixed** (2026-11-18, the coordinator's decisions: one click, nothing silently changed): the first run reads the subscription first, read-only (`INIT.EXISTING`); an environment that's yours (its owner tag or budget address is your sign-in, or you own its administrators' group) gets its configuration from its deployment record and its tags, with its group, workspaces, and capacity kept; one that isn't, or can't be told apart, is never updated by a first run, which deploys a new environment with a free prefix (`init.ps1 -Prefix` stops instead); a failed read writes nothing. After #62's live checks (the coordinator's decision): the notebooks of a recovered environment's own workspace are republished, as an update does (`fabric.importNotebooks` true for the workspace it records, one that holds only what the demo creates, or one the demo's notebooks are already in; otherwise a first run's rule, with the reason in the message), and its session control keeps its own custom roles (`control.roleNameSuffix`, from the role its identity holds; a read that fails writes nothing), so a test environment's update never touches the owner's shared roles. A read-only `Initialize-DemoConfig -WhatIf` on the owner's subscription recovered `rg-dbhub-demo`'s group, private network, ceiling, schedule, and Fabric workspaces, and wrote and created nothing. **Accepted:** settings Azure doesn't record (`sessionCeilingUsd`, `activityProfile`, `t3FreeOffer`, `keyVault`, and a few more) keep their defaults, listed in the message; an opt-in `keyVault` (none on the owner's subscription) is then left as it is by the update; another prefix's environment that records no Fabric workspace gets the name a first run gives that prefix, or, with `init.ps1 -Prefix`, **Manual action required** for its workspace's name; a recorded `Standard_B1ms` is left to the move to today's T4 default, and the message says so; `deploy.ps1` has no `-Prefix`, so another prefix's environment is recovered through `init.ps1 -Prefix` |
 | R897 | Ask's live estate reads the 8 Database Hub routes the GA `databasehub-cli` skill uses, which aren't a documented API, so they can change or go away without notice (2026-11-18) | **Mitigated:** an exact allowlist of read-only routes, from the app's function only, as the app's owner, filtered to the demo's subscription and resource group, with a 90-second budget and 60-second caching; a route that fails is named in the answer, the dock and the pages say the live estate is unavailable, and the history keeps working ([ADR 0013's amendment](adr/0013-agent-experience.md#amendment-2026-11-18-the-ga-skill-and-one-narrow-exception)) |
@@ -532,7 +532,7 @@ Every risk number that the docs, scripts, and tests cite, with its status: **Clo
 | R900 | The relay is a public endpoint: a client that forges the `Origin` header can reach its routes and use the demo's compute with its own GitHub token | **Mitigated:** the relay holds no credential and runs no tool, so it can reach nothing the caller can't; per-client rate limits, size limits, at most 20 conversations and 1 replica, and a 60-minute cap per conversation bound the cost, and it scales to zero |
 | R901 | Ask needs the relay's image published and pinned: until the repository's workflow builds it, the package is public, and `config/versions.json` pins its digest, `deploy.ps1` doesn't deploy the relay | **Closed** (2026-11-19): the workflow's run on dc2642d, with the security review's fixes, published `ask-relay@sha256:8825035c813a`, and its run on 87af20c, with R925's fixes and their review's, published `ask-relay@sha256:85fdef25f31d`, which `config/versions.json` pins now (`askRelay.image`), so `deploy.ps1` deploys the relay from exactly that digest, without credentials. The first publish from this public repository made the package public, which the owner keeps: a public package can't be made private again, only deleted. `ask.image` can name another image; a fork's or a private copy's package can start private, GitHub's default for a new package, so an image that can't be pulled stays a **Warning** that says so, and **DONE** is unaffected |
 | R925 | A Copilot turn in the Insights app's dock can end with its query rows and no answer: live on 2026-11-19 (`dbhubfn`, the owner's question while the live estate failed), the dock showed three live-estate rows, "The live view returned 401 on every call, so I'll check the history model instead.", three history rows, and four follow-ups, with no answer and no message, and the relay logged nothing about the turn's end | **Mitigated** (2026-11-19, from the code and scripted event streams; not reproduced live: the owner was away for a test sign-in; [below](#ask-a-turn-that-ended-with-no-answer-r925-2026-11-19)): the relay sends all of a turn's assistant text before `idle`, from the session's history when the live events didn't deliver it, and logs `chat.turn.end` (counts and lengths only); the dock says "Copilot didn't write an answer" with **Retry**, which asks the same conversation to write it in the same turn, never a silent finish; the guidance and `suggest_followups` have Copilot write the answer before the follow-ups, and remind it when it hasn't; Copilot never gets HTTP codes or routes, and once the live view isn't available, the rest of the conversation answers from the history. An independent review's three bugs are fixed too: a read where every route failed counted as an answer, a late live call from the last conversation turned the live view off after **New chat**, and `finalTextChars` counted differently from the dock; and its re-review's two: **New chat** while a session started lost the new conversation's rows, and the dock didn't follow later live reads while it stayed open. **Open:** the live check, the owner's question again in the deployed app after the final tests redeploy the app and the relay |
-| R927 | The Insights app's scoreboard measures "signal visible in telemetry" itself, from the history's bins with a copy of the analysis notebook's rules (`SCENARIO_SIGNALS`, `EPISODE_RULES`), so a presenter could read its times as Database Hub's detection, and a later change to the notebook's rules would leave the app's behind; Mission Control shows a session's plan only once it ends (2026-11-19, Wave 1) | **Mitigated** (2026-11-19; [below](#insights-app-wave-1-what-only-the-app-shows-r927-2026-11-19)): every label says "signal visible in telemetry", and since 2026-11-20 "Signal seen" and "time to signal" under the subtitle "Verified against the injected faults", each row says how it was measured, and ADR 0030, the app's README, and the walkthrough's script say it isn't what Database Hub detected; the tests pin the rules' numbers; the plan says "as of" and **Database Hub, live** opens the live view. An independent review's 10 findings are fixed (2026-11-19), among them each fault read in its own bins' step and replay playback that wrote the address at every step, and so are the 3 gaps its re-review found: a query the kiosk's retry ran never refreshed again, a postmortem that said nothing was injected when the telemetry failed, and buttons that took the latest session along as if picked. **Accepted:** T4's and T5's beats aren't in `Scenario Runs`, so they show as measured episodes without a time to signal; the palette changes app-wide (`APP_BRAND` swaps it back in one line). **Open:** the deployed app on a real session's history (the final tests), and the owner's calls on the dark default and the service names (the palette: Microsoft's colors, the owner's choice on 2026-11-20) |
+| R927 | The Insights app's scoreboard measures "signal visible in telemetry" itself, from the history's bins with a copy of the analysis notebook's rules (`SCENARIO_SIGNALS`, `EPISODE_RULES`), so a presenter could read its times as Database Hub's detection, and a later change to the notebook's rules would leave the app's behind; Mission Control shows a session's plan only once it ends (2026-11-19, Wave 1) | **Mitigated** (2026-11-19; [below](#insights-app-wave-1-what-only-the-app-shows-r927-2026-11-19)): every label says "signal visible in telemetry", and since 2026-11-20 "Signal seen" and "time to signal" under the subtitle "Verified against the injected faults", each row says how it was measured, and ADR 0030, the app's README, and the walkthrough's script say it isn't what Database Hub detected; the tests pin the rules' numbers; the plan says "as of" and **Database Hub, live** opens the live view. An independent review's 10 findings are fixed (2026-11-19), among them each fault read in its own bins' step and replay playback that wrote the address at every step, and so are the 3 gaps its re-review found: a query the kiosk's retry ran never refreshed again, a postmortem that said nothing was injected when the telemetry failed, and buttons that took the latest session along as if picked. **Accepted:** T4's and T5's beats aren't in `Scenario Runs`, so they show as measured episodes without a time to signal; the palette changes app-wide (`APP_BRAND` swaps it back in one line). **Open:** the deployed app on a real session's history (the final tests), and the owner's calls on the dark default and the service names (the palette: Microsoft's colors, the owner's choice on 2026-11-20, then earth tones on cream on 2026-11-23, [its entry](#the-insights-app-in-earth-tones-2026-11-23)) |
 
 ## Phase log
 
@@ -4319,6 +4319,1546 @@ With them, at the coordinator's request: high contrast's selected and hovered na
 - **Why deleted databases stay listed** is inferred, not documented: the list matched the telemetry endpoint's Azure SQL databases in count and dates, and Learn doesn't say how the list is built. If that changes, the page's "Why deleted databases stay in the list" and troubleshooting's two rows are the places to update; `DESTROY.HUB.AGENT.T3`, the README, cleanup, and limitations say only that deleted databases can stay for a while.
 - **Telling the ContosoCare rows apart** is still the fallback until the owner says whether hovering or a row's gear shows the server.
 
+### T2's readiness on the first update that turns on its assessment (F18, 2026-11-20)
+
+**Why.** The final tests (dbhubfu's update rehearsal, 2026-11-20): on the first update that turns on T2's migration assessment, the Insights app deployed a few minutes before the assessment's first upload, so its **Ready to migrate** card linked the Azure portal until the next `deploy.ps1`, and `FABRIC.APP.ESTATE` had no `t2MigrationReadAt`. The stop at the end of an update (`Invoke-DemoUpdateEndStop`) already waits for that upload before it deallocates `archost01` (`Wait-DemoUpdateStopWork`), but nothing used it for the app.
+
+**Work summary.**
+
+1. **The end stop says when the upload came:** `Wait-DemoUpdateStopWork` returns `T2UploadedAt`, and `DEPLOY.ENDSTOP`'s evidence has `t2AssessmentUploadedAt` (empty when it didn't wait for it or didn't see it).
+2. **The app once more** (`Complete-DemoInsightsAppMigration`, after `Complete-DemoInsightsAppManage`'s pattern): `Complete-DemoDeploymentRun` runs it after the stop, so the VMs are deallocated first; the app needs only Fabric, and the readiness is read from T2's SQL Server instance resource in Azure, which keeps it. `Get-DemoInsightsAppMigrationGap` decides: the end stop saw the upload, this run deployed the app (`FABRIC.APP.DEPLOY` **Pass**), and its `FABRIC.APP.ESTATE` has no `t2MigrationReadAt`. A new deployment, a demo that was running, and `-KeepRunning` don't wait for the upload, so nothing changes for them.
+3. **One set of app records:** the step's records go into the ending's `Added`, and `deploy.ps1` merges them with `Merge-DemoRunResult`, where they replace the app's earlier records with the same check IDs, as `Complete-DemoInsightsAppManage`'s do during the run. So out/deploy.jsonl has `FABRIC.APP.ESTATE` once, with `t2MigrationReadAt`, and `FABRIC.APP.DEPLOY`'s evidence says why it ran again (`redeployedFor` `t2Migration`). `Start-DemoDeploymentRun` keeps the configuration's path for it.
+4. **When that deploy doesn't pass:** the earlier records stay (the app deployed earlier in the run works), `FABRIC.APP.MIGRATION` (a **Warning**, non-blocking) says the card shows the portal path until the next deploy, with `./scripts/configure-fabric-app.ps1` as the fix, and the status page's Insights app and Ask rows show the earlier records again, with it.
+
+**Changed files.** `scripts/deploy.ps1`; `scripts/modules/DbHubDemo/DbHubDemo.psd1`, `Public/Merge-DemoRunResult.ps1` (new), `Public/Complete-DemoDeploymentRun.ps1`, `Public/Start-DemoDeploymentRun.ps1`, `Private/DeployHelpers.ps1`, and `Private/UpdateEndStopHelpers.ps1`; `tests/unit/DbHubDemo.OneCommand.Tests.ps1` and `Repo.LifecycleScripts.Tests.ps1`; `fabric/app/README.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report (R924's row).
+
+**Validation.** On `ignite-updates` at 2056a53 with this change, with Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: the end stop's suites in `DbHubDemo.OneCommand` (55 passed) and `Repo.LifecycleScripts` (69 passed); no unit test reached the Azure CLI. The new cases fail without the change (5 of them: the end stop's evidence twice, the app once more, the Warning when it doesn't pass, and deploy.ps1's results file); the three cases where it mustn't run pass either way. No live run: next week's update of a stopped demo that turns on T2's assessment shows it.
+
+**Risks.** The ending takes about 3 to 4 more minutes on that one update (one `rayfin up` and the app's checks), after the VMs are stopped, so it bills nothing more. A Ctrl+C during it keeps the earlier records; the next deploy reads the readiness again.
+
+**After the review (2026-11-20).** A Ctrl+C during that deploy left the status page's Insights app and Ask rows **Running** on a DONE page: `Invoke-DemoInsightsAppStep` sets both to Running first and lets a stop of the run through. `Complete-DemoInsightsAppMigration` now calls it in `try`/`finally`, and when it didn't return, the rows show the app as this run deployed it earlier (`Restore-DemoInsightsAppRow`, which the failure branch uses too), whose records the results keep. A test in `DbHubDemo.OneCommand.Tests.ps1` (the stop simulated in a pipeline of the same runspace) fails without the change.
+
+### The scenario bounds during a session (F20, 2026-11-20)
+
+**Why.** The final tests (dbhubfu, 2026-11-20): on a running demo, `validate.ps1`'s `WORKLOAD.T1.BOUNDS` to `WORKLOAD.T5.BOUNDS` were each a **Warning**, "The runner's status ... couldn't be parsed (a Run Command keeps only the last 4,096 bytes of output)" (R346). The VM's relay keeps the last 1,800 characters of the runner's output, and `status --json --runs 5` writes its runs near its top: a status with two runs is about 2,100 characters, five about 3,600, so after any session the runs were cut off, and the bounds were never checked during one.
+
+**Work summary.**
+
+1. **The relay reads the bounds from the whole output** (`vm/bootstrap/Invoke-DemoWorkloadControl.ps1`, `Get-DemoControlRunnerBound`), as it has read the profile since the re-review of PR 16: each Running run's ID, scenario, start, deadline, and maximum duration, how many runs the status listed, and how many live demo sessions it saw. Only when the request asks for them (`bounds`), so every other caller's line is as before.
+2. **The line still fits:** the relay measures its result line (`Get-DemoControlResultLine`, split out of `Write-DemoControlResult`) and leaves the bounds out when the line would pass 3,900 characters (`boundsCut`). Measured with the tests' status: 2,353 characters without them and 2,583 to 3,277 with one to five running runs; with five running runs and a 500-character error output, 3,780 on PowerShell 7 and 3,831 on Windows PowerShell 5.1. Only the longest messages (a guest recovery's) with many running runs reach the guard.
+3. **The check reads them:** `Invoke-DemoWorkloadCommand -Bounds` asks for them, the Workload area passes them with the relay's profile to `Test-DemoValidationWorkloadBound`, and its evidence says where the runs came from (`source`: `relay`, or `status` for a VM whose bundle predates it, which parses the kept output as before). The Warning for a status it still can't read now says why (an older bundle, or `boundsCut`) and names `./scripts/deploy.ps1`, which sends the current bundle. A run's deadline in the evidence is ISO 8601 again, not the culture's format of the DateTime that JSON made of it.
+
+**Changed files.** `vm/bootstrap/Invoke-DemoWorkloadControl.ps1`; `scripts/modules/DbHubDemo/Public/Invoke-DemoWorkloadCommand.ps1`, `Private/ValidationAreas.ps1`, and `Private/ValidationHelpers.ps1`; `tests/unit/Vm.WorkloadSteps.Tests.ps1`, `DbHubDemo.Validation.Tests.ps1`, and `DbHubDemo.Workload.Tests.ps1`; ADR 0012, `docs/troubleshooting.md`, `docs/limitations.md`, the CHANGELOG, and this report (R346).
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `DbHubDemo.Validation`, `Vm.WorkloadSteps`, and `DbHubDemo.Workload` (216), with the suites that load the relay, the bundle, or the control (`Vm.Loader`, `Vm.Compatibility`, `Vm.Workload`, `Automation.Runbooks`, `DbHubDemo.ActivityControl`, `ActivityProfile`, `Lifecycle`, and `Golden`) and the `Repo` and `Docs` conventions: 1,330 passed, none failed; no unit test reached the Azure CLI. PSScriptAnalyzer (the VM settings for the relay) found nothing in the changed files, and markdownlint no issue. The relay's bounds checked under Windows PowerShell 5.1 too (a single running run stays an array, and an empty list is `[]`). The new cases fail without the change. No live run: next week's `validate.ps1` during a session shows it.
+
+**Live evidence, on code without this fix (2026-11-22).** The final tests found the same **Warnings** again, and the coordinator asked for the cause and when the release shows them:
+
+- **When:** every `validate.ps1` of a running demo in the final tests, four from 2026-11-20 to 22 on code without this fix (two of the release's own commits and two of the RCA branch's), had all five `WORKLOAD.<target>.BOUNDS` as this **Warning**, and none had a **Pass**. The seven of a stopped demo had none: with its VMs stopped, the check doesn't run. `deploy.ps1` doesn't run it either (22 runs' results). So on the release, every `validate.ps1` of a running demo shows the five **Warnings** once a target's status lists two or more runs, which a deploy's interim baseline and its switch to business-day already make.
+- **The cause is this section's:** the relay's tail of 1,800 characters, under the Run Command's 4,096 bytes that the message names.
+- **It fits with this fix:** each target's kept tail and profile from the last of those runs, with its one or two running runs, make this relay's line 2,539 to 2,746 characters with the bounds, measured with `Get-DemoControlResultLine` on Windows PowerShell 5.1, as on the VMs; the budget is 3,900, so none would be cut. The whole-output parse the bounds share with the profile read the profile live from all five statuses.
+- **Still the live proof:** `validate.ps1` during a session, once the update's `deploy.ps1` has sent the VMs this relay.
+
+**Risks.** A VM keeps its older relay until its next `deploy.ps1`; until then, the check is the **Warning** it was. Five running runs with the longest messages leave the bounds out (`boundsCut`), also a **Warning**.
+
+### A Ready VM's Warning names its step (F24, 2026-11-20)
+
+**Why.** The final tests (dbhubfn and dbhubfu, 2026-11-20): `validate.ps1`'s `INFRA.HEALTH.SQLVM01` was a **Warning**, "sqlvm01 reports Ready: Every step is in the desired state.", with "The bootstrap is still working or waiting; run validate.ps1 again later" as the fix. health.json's status is a **Warning** when the state is Ready and it has warnings, but the summary the validator reads (`Get-DemoHealth.ps1 -View Summary`) didn't print them, and a warning never named its step. The list also never emptied: a note such as "SQL Server setup asked for a restart ...; the nightly shutdown or the next start completes it" stayed after the restart, so the **Warning** stayed for good.
+
+**Work summary.**
+
+1. **Each warning names its step** (`vm/bootstrap/lib`): the step runner adds a step's warnings as `<Step>: ...` (`Add-DemoVmWarning -Step`).
+2. **A one-off note goes with a new generation** (`Invoke-DemoVmStateMachine`; changed after the review, below): a step marks its one-off notes (`New-DemoVmStepResult -TransientWarningMessage`: a restart that's pending, media trusted on first use, T1's sysadmin recovery, and the sign-in cleanups), which the next generation clears, with the same notes from older bundles. Any other warning stays until its step's Set runs again, which drops the step's own warnings first and says again what still holds. Within a generation, nothing changes. health.json's schema and its status rule are as before.
+3. **The summary prints them** (`vm/health/Get-DemoHealth.ps1`): the first two, each cut to 240 characters, and `warningCount`, so it still fits a Run Command's 4 KB.
+4. **The checks say them** (`Get-DemoHealthWarningNote`): `INFRA.HEALTH.<vm>` and `status.ps1`'s `STATUS.VM_<vm>` add "Its bootstrap has a warning: `<Step>: ...`" (or how many, with the first two), and the validator's fix says that nothing blocks the demo, that each warning says what happens next, when it goes away, and that `Get-DemoVmHealth -View Full` lists them all. A VM whose bundle predates this says so, with the same command. A bootstrap that's still working keeps its own fix.
+
+**Changed files.** `vm/bootstrap/lib/State.ps1` and `Runner.ps1`, `vm/health/Get-DemoHealth.ps1` and its README; `scripts/modules/DbHubDemo/Private/ValidationHelpers.ps1`, `Private/ValidationAreas.ps1`, and `Public/Get-DemoEnvironmentStatus.ps1`; `tests/unit/Vm.StateMachine.Tests.ps1`, `Vm.WorkloadSteps.Tests.ps1`, `DbHubDemo.Validation.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`; `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: every `Vm.*` suite (the step runner is every bootstrap's), `DbHubDemo.Validation`, `Lifecycle`, `Arc`, and `Tracks`, and the `Repo` and `Docs` conventions, 1,416 passed, none failed; no unit test reached the Azure CLI. PSScriptAnalyzer (the VM settings for the bootstrap files) found nothing in the changed files, and markdownlint no issue. The new cases fail without the change (the state machine's new generation, the summary's warnings, the validator's message and fix, and status.ps1's message), and the state machine's existing warning test now expects the step's name. No live run: next week's `validate.ps1` on an updated environment shows it.
+
+**Risks.** A lasting warning from a bundle before this names no step, so it stays until the VM is rebuilt, as all warnings did before. Until a VM gets the new bundle, its summary doesn't name its warnings, which the message says.
+
+**After the review (2026-11-20).** The first version started the list again at each generation, so a warning whose cause lasts, but whose step passes its Test from then on, went away while the cause stayed: on a `JumpstartImage` T2 host, `GuestFirstBoot`'s "Uninstalling AS,IS ... didn't pass" after the next `deploy.ps1`, with SSAS and SSIS still installed, turned `INFRA.HEALTH.ARCHOST01` and `STATUS.VM_ARCHOST01` Pass. Now only one-off notes go with a generation (`Clear-DemoVmTransientWarning`), and a step's own warnings go just before its Set runs again (`Remove-DemoVmStepWarning`). The producers mark their one-off notes: `Invoke-SqlVmBootstrap.ps1` (the restart setup asked for, the sysadmin recovery, and automatic sign-in that was armed), `GuestSql.ps1` (the sign-in cleanup's cleared logs), `HostSteps.ps1` and `Invoke-EvalArcVmBootstrap.ps1` (media trusted on first use), and `GuestJumpstart.ps1` (how the image download was checked, apart from a newer image than the tested one, which lasts). Tests in `Vm.StateMachine.Tests.ps1` (a lasting cause with a passing Test keeps its warning across two generations; a one-off note and a cause its Set fixed go; an older bundle's one-off notes go and its other warnings stay) fail without the change. After the re-review: a step's own warnings go only once its Set returns Done or NotSelected, so a Set that throws (PowerShell Direct, #65) or stops early (InProgress, Waiting) while the guest doesn't answer keeps them; and an older bundle's lasting warning, which names no step, gets its step's name at the next generation (`$script:DemoVmLegacyWarningStep`, beside the one-off texts), so it goes, or shows once, as a current one does. Two more cases in `Vm.StateMachine.Tests.ps1` (the throw and InProgress paths; the older bundle's lasting text, gone and holding) fail without it, and the same paths were run under Windows PowerShell 5.1.
+
+### A Run all session that start-demo.ps1 took over ends without stopping the demo (2026-11-20)
+
+**Why.** The owner's follow-up after the release: `start-demo.ps1` replaces a running session's auto-stop with its own (2026-11-19), but a Run all that still followed its session sent its stop at the session's planned end, and the runbook's `Stop-DbHubDemo` stopped everything under the local session, hours before that session's auto-stop. ADR 0020 had left it as "not changed", because the notebook's end and its Stop now send the same request.
+
+**Work summary.**
+
+1. **The runbook tells the end by its time** (`automation/runbooks/DbHubControl.Common.ps1`, `Get-DbHubSessionTakeover`): a stop with the session's ID, from 2 minutes before the status copy's `runEndUtc` to 30 minutes after it, while the pending `dbhub-autostop` is a `[start-demo.ps1]` one later than now, is the session's end after a takeover. No new request field: the runbook refuses unknown fields, so a newer notebook would fail on runbooks not yet republished.
+2. **That end stops nothing** (`Complete-DbHubTakenOverSession`): it saves T4's and T5's metrics for the history, clears the session's busy marker when it's still this session's, and writes the stopped status with `takenOver` and the session's plan (`Write-DbHubStopStatus -TakenOver`), with status `TakenOver`. The VMs, T4, its replica, T5's container, and the auto-stop stay.
+3. **The notebook says so** (`finish_session`): "Taken over: a start-demo.ps1 session runs the demo now, so nothing was stopped; its auto-stop stops it at ..., and Stop now again, or ./scripts/stop-demo.ps1, stops it sooner", then what was done, and its telemetry wait no longer says the VMs and T4 are stopped. It saves the history as at any end.
+4. **An explicit Stop now still stops everything** before the window and after it; after a taken-over end, the status says stopped, so Stop now again sends no session ID and stops everything.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`; `fabric/control/NB_DatabaseHub_Control.ipynb`; `tests/unit/Automation.Runbooks.Tests.ps1` and `Fabric.ControlNotebook.Tests.ps1`; ADR 0020 and ADR 0026, `docs/limitations.md`, `docs/deployment.md`, `docs/troubleshooting.md`, `fabric/control/README.md`, `automation/README.md`, the CHANGELOG, and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `Automation.Runbooks`, `Fabric.ControlNotebook` (with Python 3.11), `DbHubDemo.ActivityControl`, `DbHubDemo.SafetyStop`, and the `Repo` and `Docs` conventions (739), and the other suites that read the notebook or the runbooks (`Destroy`, `FabricApp`, `FabricTrack`, `FabricItem`, `FirstRun`, `Golden`, `Lifecycle`, `OneCommand`, `Tracks`, and `Fabric.Notebooks`; 1,162): 1,901 passed, none failed; no unit test reached the Azure CLI. PSScriptAnalyzer (the VM settings for the runbooks) found nothing in the changed files, and markdownlint no issue. The new cases fail without the change, and the late Stop now's case fails without the 30-minute bound. No live run: next week's session, with `start-demo.ps1` during a Run all, shows it.
+
+**Risks.** A session-end job that starts more than 30 minutes late stops everything, as before.
+
+**After the re-review (2026-11-20).** An explicit Stop now inside the window, while the status still said the session ran, sent the session's ID, so the runbook took it for that end and stopped nothing, and the Insights app showed "Stop now: ... completed" while the demo billed until start-demo's auto-stop (nothing in `fabric/app` reads `takenOver`). The owner's intent: an explicit Stop now always stops. The notebook's Stop now (`finish_session` with "Stop now"), which the app runs too, now sends a stop with no session ID when the status comes back with `takenOver`, and waits for the new stopped status (`follow_status`'s `until`); the runbook never takes such a stop for a session's end, and nothing else changed. Tests: `Fabric.ControlNotebook.Tests.ps1` (Stop now inside the window, which fails without the change, and Stop now again after a taken-over end) and `Automation.Runbooks.Tests.ps1` (a stop with no session ID inside the window stops everything).
+
+### T2's times after a cold start count from when its activity was set (2026-11-20)
+
+**Why.** The owner's follow-up after the release: T2's session times after a cold start ran a few minutes early. ADR 0026's 2026-11-19 amendment anchors each target's showcase on when its runner set it (`DBHUB-SET`), but only for a dispatch Run Command that had ended by the start's check. T2's waits for its guest, up to 12 minutes for its heartbeat and then for its SQL Server, so after a cold start it often hadn't. `DbHub-Monitor` moved the time later, but wrote it only with a new `Host` step, and the notebook never recomputed its beats after the guide.
+
+**Work summary.**
+
+1. **The start marks pending targets** (`automation/runbooks/DbHubControl.Common.ps1`): `Get-DbHubSessionHealth -Unfinished` lists the dispatch Run Commands that are Pending, Running, or Unknown; `Set-DbHubDispatchPending` puts their targets in the status's `dispatchPending`, with a `Times` step (Info) each.
+2. **The start follows them** (`Wait-DbHubSessionDispatch`), after it writes `running`: one instance view per Run Command every 20 seconds, for at most 51 minutes, never past the session's end, and while the session goes on. When one ends, `Update-DbHubSessionHealth -SessionId` moves its targets' `dispatchUtc` (`Get-DbHubSessionHealth -Moved`), clears them from `dispatchPending`, adds a `Times` step (`Add-DbHubDispatchSetStep`), or a `Host` **Warning** when it failed, and writes the status with the existing guard, up to 3 tries.
+3. **DbHub-Monitor writes a move** with no new `Host` step (outcome `Moved`).
+4. **The notebook** (`NB_DatabaseHub_Control`): the guide marks pending targets; the live view holds their beats (and the Database Agent view while T3 is pending), reads the status at every refresh while one is pending, recomputes the beats when an anchor moves (`moved_targets`), prints the moved target's beats to come, and the session's end saves the history with them.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`; `fabric/control/NB_DatabaseHub_Control.ipynb`; `tests/unit/Automation.Runbooks.Tests.ps1` and `Fabric.ControlNotebook.Tests.ps1`; ADR 0026, `docs/troubleshooting.md`, `docs/limitations.md`, `fabric/control/README.md`, `automation/README.md`, the CHANGELOG, and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `Automation.Runbooks`, `Fabric.ControlNotebook` (with Python 3.11), `DbHubDemo.ActivityControl`, `DbHubDemo.SafetyStop`, and `DbHubDemo.Lifecycle`, and the `Repo` and `Docs` conventions: 1,091 passed, none failed, 3 skipped by their own conditions; no unit test reached the Azure CLI. PSScriptAnalyzer found nothing in the changed files, and markdownlint no issue. The three new cases fail without the change: the start's pending T2 and its move, DbHub-Monitor's `Moved` after the start stopped following, and the notebook's held and moved T2 beats with the history's. No live run: next week's Run all after a cold start shows it.
+
+**Risks.** The start's job runs up to 51 minutes longer after a cold start, while T2's Run Command waits for its guest, reading one instance view every 20 seconds; a warm start's job is unchanged. After the re-review: those minutes are counted. The cost guide says so (about 5 such sessions a month fit in Azure Automation's 500 included minutes beside the nightly stop's, and past them up to about $0.15 a session at 2026-11-03's $0.002 a minute), and `Get-DemoCostEstimate` prices 80 job minutes a session for the light-use month's sessions instead of 60 minutes in all, with the minutes past the included 500, less the nightly stop's 120, at the next tier (`DbHubDemo.Cost.Tests.ps1`: 160 minutes at the defaults, $0; 2,500 paid minutes for 36 business-hours sessions, $5; both fail without it). A Run Command that can't be read at the start's check isn't marked pending, and its target's beats are announced from the accepted time, as before.
+
+### DEPLOY.NIGHTLYSTOP after the update's own stop (item 11, 2026-11-20)
+
+**Why.** The final tests (dbhubfu's update at bf010ed): the nightly stop's 19:30 T3 check found `deploy.ps1` still running, so `DEPLOY.NIGHTLYSTOP` was a **Warning** that the demo stops at 21:25, with `./scripts/stop-demo.ps1` "to stop the demo now". But the same run's stop at its end had stopped everything (`DEPLOY.ENDSTOP` **Pass**), and DONE said "Stopped at the end". The ending already dropped DONE's nightly line and set the status page's **Nightly stop** row to **Pass** then; the record itself, which the report and `out/deploy.jsonl` show, kept the Warning.
+
+**Work summary.** When the stop at the end stopped the demo, `Complete-DemoDeploymentRun` replaces the `DEPLOY.NIGHTLYSTOP` Warning in its `Added` with a **Pass** (`ConvertTo-DemoBusyMarkerStoppedResult`): its first sentence, kept in the evidence as `waited` (`Get-DemoBusyMarkerWaitText`, which `Get-DemoBusyMarkerEndText` now uses too), then "This run stopped the demo itself at its end (DEPLOY.ENDSTOP), so the nightly stop's later pass finds nothing running.", with `stoppedByRun` and no remediation. `-KeepRunning`, and a stop at the end that left something running, keep the Warning.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/BusyMarkerHelpers.ps1` and `Public/Complete-DemoDeploymentRun.ps1`; `tests/unit/DbHubDemo.OneCommand.Tests.ps1`; ADR 0024, `docs/deployment.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `DbHubDemo.OneCommand`, `SafetyStop`, `ActivityProfile`, `T4Fallback`, and `Repo.LifecycleScripts`, 597 passed, none failed; no unit test reached the Azure CLI. PSScriptAnalyzer found nothing in the changed files. The Pass case fails without the change; the two Warning cases (`-KeepRunning`, and a stop at the end that left archost01 running) pass either way, as they should. No live run: next week's update across the nightly stop's time shows it.
+
+**Risks.** None beyond the wording: the deferred pass, when the stop at the end didn't remove it, still runs and finds nothing running.
+
+### A quieter host log on a new T2 (item 6, 2026-11-20)
+
+**Why.** The owner's follow-up after the release: on a new T2, the host's log had "Database check in the guest: The specified module 'C:\ProgramData\DbHubDemo\module\DbHubDemo.Vm.psd1' was not loaded" (live 2026-11-20, 19:47:55). `ConfigureSql`'s first check (`Test-DemoHostDatabase`) queries the guest through the demo's module, which only its own Set copies in (`Copy-DemoGuestTool`), so the check failed, logged a **Warning**, and the step ran, as it should. Harmless, but a warning in the log.
+
+**Work summary.** The guest's side of `Invoke-DemoGuestSqlQuery` now checks for the module first and, when it isn't there, says so plainly: "The guest has no demo tools at ... yet; the database step copies them in." `Test-DemoHostDatabase` logs that as an ordinary line ("The guest has no database tools yet; this step copies them in, then sets up ContosoCare.") and returns false, so the step's Set runs as before. Any other failure of the check is still a **Warning**. No extra PowerShell Direct call: the check is in the same one.
+
+**Changed files.** `vm/hyperv-guest/GuestSql.ps1` and `vm/bootstrap/HostSteps.ps1`; `tests/unit/Vm.HostPlan.Tests.ps1`; the CHANGELOG and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode: `Vm.HostPlan` (the guest's side run locally, with a tools folder that isn't there; and another failure still a Warning), with every `Vm.*` suite: 568 passed, none failed. PSScriptAnalyzer (the VM settings) found nothing in the changed files. The first case fails without the change; the second passes either way, as it should. No live run: the host's log on next week's new deployment shows it.
+
+**Risks.** None: the check returns false in both cases, as before, so the step's Set runs the same way; a host gets it with its next bundle.
+
+### A new configuration's ceiling from its region's worst case (item 7, decision 8b, 2026-11-20)
+
+**Why.** The owner's decision 8b: with 415 for every new configuration, a Contributor's first deployment fit only in West US 3 and East US 2; Central US and North Europe got a **Warning**, and UK South, West Europe, Japan East, and Australia East failed at preflight.
+
+**Work summary.** `Get-DemoInitialMonthlyCeiling` (`Private/FirstRunHelpers.ps1`) prices the new configuration's region as preflight prices a Contributor's first deployment (`Get-DemoCostEstimate` with the subscription's Defender plans, `T5ContainerLifecycle` AlwaysOn with `T5ManualDeleteOnly`, no `T4RestartCoverage`, and no free offer), and returns the worst case with 4% headroom, rounded up to 5 USD, never below the example's 415, with the sentence `INIT.CONFIG` adds. `Initialize-DemoConfig` writes it for a new configuration, adds `monthlyCeilingUsd` to the keys it wrote, and leaves a recovered environment's recorded value alone (no pricing then). It never throws: prices that can't be read keep 415, said in the note; Defender plans that can't be read are left out, said too.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/FirstRunHelpers.ps1` and `Public/Initialize-DemoConfig.ps1`; `tests/unit/DbHubDemo.FirstRun.Tests.ps1`; `config/environment.schema.json`'s description and `scripts/estimate-cost.ps1`'s help; ADR 0016, `docs/cost-management.md`, `docs/configuration.md`, the README, `docs/architecture.md`, `docs/database-hub-visuals.md`, `docs/demo-walkthrough.md`, `docs/deployment.md`, `docs/faq.md`, `docs/prerequisites.md`, `docs/presentation.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `DbHubDemo.FirstRun`, `Config`, `Cost`, `EstimateCost`, and `Preflight`, with the `Repo` and `Docs` conventions: 577 passed, none failed, 3 skipped by their own conditions; no unit test reached the Azure CLI or the Retail Prices API (the init tests mock the helper). The new West Europe case fails without the change (415, not 470). Run once against the public price list, with no subscription and so no Defender plan: West Europe's worst case was $407.02, so 425. No live run through `init.ps1`.
+
+**Risks.** `init.ps1` reads the price list once more, about as long as `estimate-cost.ps1` takes. A higher ceiling also raises the budget's alert thresholds for that environment, by design: the ceiling is meant to hold the region's worst case. The 4% headroom is a choice, matching 415 over West US 3's figure; a later price rise past it gives preflight's **Warning** or **Fail** with the figure, as before.
+
+### A Run all after a deferred nightly stop ends before the moved auto-shutdown (item 12, F25, 2026-11-21)
+
+**Why.** Found live on `dbhubfr`'s net-new deployment at bf010ed. The nightly stop's 19:30 check found `deploy.ps1` still running, so the run's end left the demo up until 22:15: the deferred pass `dbhub-safety-deferred` and the VMs' auto-shutdown were both set to that time. A Run all started then planned its session from the configured 19:00 alone. So a session that spanned 22:15 would lose its VMs there, mid-session. The cause is the VMs' DevTest Labs auto-shutdown, which no busy marker holds back; the deferred pass already waits for a session's marker. The control's role has no DevTest Labs action (the coordinator's decision of 2026-11-14), so the session can't move it back. And the session overwrote the busy marker and cleared it at its end. After that, `start-demo.ps1`, `stop-demo.ps1`, and `status.ps1` no longer saw the moved time, and it stayed moved every evening until the next `deploy.ps1`.
+
+**Work summary.**
+
+- **Module:** `Sync-DemoAutoShutdownForBusy` records where the VMs' auto-shutdown is in the demo resource group's new `DbHubAutoShutdownMoved` tag (`Save-DemoAutoShutdownMoved`): the times of the enabled schedules that aren't `autoShutdownTime`, or nothing. It writes the tag only when every VM's schedule was read, and only when the tag changes; a busy run's check writes it only when it moved one. `Resolve-DemoBusyNightlyStop` and `Get-DemoBusyMarkerStatus` act on the tag when the marker is empty. `start-demo.ps1`, taking over from a Run all session that's still going on, now removes the deferred pass and puts the auto-shutdown back too, and keeps the session's marker. `DEPLOY.NIGHTLYSTOP`'s remediation adds what Run all does tonight, only when this run's `CONTROL.RUNBOOKS` is a **Pass**.
+- **Runbook:** `Get-DbHubRunPlan -Tags` ends a run or session before the earliest moved time that comes before `autoShutdownTime`'s next (`Get-DbHubMovedShutdownUtc`), and says which (`ShutdownMoved`, `NightlyUtc`). The session's **Plan** step and its refusal say it's the moved time, that a session can't move it, and the fix. The busy step names the nightly stop at `autoShutdownTime`, not the moved time. The deferred pass is left as it is: `Scope Nightly` already honors the session's busy marker, which ends at most 145 minutes ahead, and its first run comes at the moved time, after the session's planned end. Kept, it's the net behind the session's two auto-stops.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`; `scripts/modules/DbHubDemo/Private/BusyMarkerHelpers.ps1` and `DeployHelpers.ps1`, and `Public/Get-DemoDeploymentState.ps1`, `Set-DemoDeploymentState.ps1`, and `Get-DemoEnvironmentStatus.ps1`; `tests/unit/Automation.Runbooks.Tests.ps1` and `DbHubDemo.SafetyStop.Tests.ps1`; ADR 0024 and 0026, `docs/deployment.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `Automation.Runbooks`, `DbHubDemo.SafetyStop`, `OneCommand`, `Lifecycle`, and `T2HostRebuild`, 857 passed, 0 failed; `Fabric.ControlNotebook`, 60 passed. PSScriptAnalyzer: 0 findings. The new tests fail on the code before this change. In `Automation.Runbooks`: the plan around a moved time, a session at 20:20 that runs 30 minutes, and one at 21:20 that runs 90, with the deferred pass `Deferred` and the auto-stop deallocating both VMs. In `SafetyStop`: the tag after a move and at the end of a deferral, `stop-demo.ps1` and `status.ps1` after a Run all session, `start-demo.ps1`'s takeover, and DONE's sentence with the runbooks published. The cases with no moved time (unchanged) and an older `DbHub-Control` (no sentence) pass both before and after. Not run live.
+
+**Risks.**
+
+- A Run all during that hour is shorter than asked, and says so, until the moved time has passed or `./scripts/stop-demo.ps1` has put it back. A full session would need `Microsoft.DevTestLab/schedules/read` and `/write` in the control's role, which is the owner's call.
+- The control notebook's estimate before it sends can't know the moved time, since it reads no Azure; the runbook's **Plan** step corrects it.
+- A moved time from code before this change has no tag, so Run all doesn't see it until the next `deploy.ps1`, whose template puts the auto-shutdown back anyway.
+
+### The Database Agent beat's switch is checked (item 13, F26, 2026-11-21)
+
+**Why.** Found live on `dbhubfn` at bf010ed, by the final tests. At the switch of the 30-minute `incident:plan-regression` beat (`holdAutoCorrection`, with `FORCE_LAST_GOOD_PLAN` held off and confirmed), worker 1 compiled the scanning plan B, which Query Store shows ran 10 times. In the same second, the lookup's cached plan was the seek plan A again, compiled then, with 251,539 executions at about 100 µs. T3's CPU stayed at 6%, so there was no regression and no agent issue. Statistics hadn't changed, and nothing in the repository clears plans; the 15:09 beat's switch had held.
+
+**Cause.** `sp_recompile` only drops the cached plan, and the procedure's next run compiles it with that run's own parameter values ([sp_recompile](https://learn.microsoft.com/sql/relational-databases/system-stored-procedures/sp-recompile-transact-sql)). The other workers stayed out of the lookup only once they saw the switch's time. One of the six, already past that check and calling the lookup with a few patients, could compile around worker 1's switch and leave plan A in the cache. With 6 sessions at a 5 ms pause, one is almost always in flight, which makes it intermittent.
+
+**Work summary.**
+
+- **The procedure** (`demo.usp_scenario_plan_regression`):
+  - The other workers stay out from 2 seconds before the switch until 5 seconds after it.
+  - 7 seconds after the switch, worker 1 reads the lookup's cached plan (`sys.dm_exec_procedure_stats`, `sys.dm_exec_text_query_plan`), inside a TRY block. Plan A names `ix_appointments_patient`, and plan B scans and names no other index.
+  - A seek plan is switched again 20 and then 40 seconds after the first, in the other workers' fixed quiet windows then; at most 3 switches, never after the response. A plan that automatic tuning forced back already counts as the regression having run.
+  - Events `plan-switch`, `plan-switch-retry`, or `plan-switch-unverified`, and results `switch_attempts` and `switch_verified`.
+- **The control notebook:** `agent_regression` reads T3's CPU over the 5 minutes from a minute after the beat's switch, once that telemetry can be in and before the response, once. Below 30%, it prints a **Warning** that the regression didn't start; otherwise a **Pass**. `agent_summary` repeats the Warning at the session's end. Without telemetry it says nothing, since the response's check says so.
+- **Unchanged:** every way back for `FORCE_LAST_GOOD_PLAN` (the plan read can't end the run before its release), and the runner itself.
+
+**Changed files.** `database/common/120-scenario-procedures.sql`; `fabric/control/NB_DatabaseHub_Control.ipynb`; `scenarios/plan-regression/scenario.json` and `README.md`; `workload-generator/tests/ContosoCare.Workload.Tests/SqlScriptTests.cs` and `tests/unit/Fabric.ControlNotebook.Tests.ps1`; ADR 0013, `fabric/control/README.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.**
+
+- The workload generator's tests, with the .NET SDK 10.0.403: 714 total, 695 passed, 19 skipped (they need a SQL Server), 0 failed. Among them, the new `SqlScriptTests` case and the ScriptDom parse of every demo script.
+- Pester under StrictMode: `Fabric.ControlNotebook`, 61 passed. `Automation.Runbooks`, `DbHubDemo.ActivityControl`, `Fabric.Notebooks`, and `Repo.Conventions`, 636 passed.
+- The new C# and notebook tests fail on the code before this change.
+- Not run live: whether the race is gone, and the plan read's permissions on T3, are next week's live checks.
+
+**Risks.**
+
+- The other workers also pause for 7 seconds 20 and 40 seconds after the switch, whether or not a second switch comes, since the workers don't talk to each other. The dip is too short to see on 1-minute charts.
+- The live view's 30% floor fits T3's 2 vCores under the beat's six sessions: 99% with the regression in the session of 2026-11-19, and 6% without it in F26.
+- A plan that can't be read (no permission, or none cached) is `plan-switch-unverified` with the reason, and the live view's CPU check still tells the presenter.
+
+### stop-demo.ps1 settles a deferred night after a Run all session (F27, 2026-11-21)
+
+**Why.** Found live on `dbhubfr`'s net-new deployment at bf010ed:
+
+- DONE at 21:08 had deferred the nightly stop and moved the VMs' auto-shutdown to 22:15.
+- A Run all session from 21:13 to 21:48, in the grace, replaced the `deploy-grace` busy marker with its own and cleared it at its end.
+- `stop-demo.ps1 -SaveHistory` at 22:03 settles the nightly stop only when the marker holds something, so it printed no `STOP.NIGHTLYSTOP`.
+- At 22:25, both VMs' auto-shutdown was still 22:15, and `dbhub-safety-deferred` ran hourly until 07:30.
+- `validate.ps1`'s `COST.AUTOSHUTDOWN` warned that the time differs, with only "deploy again" as the fix.
+
+**Work summary.** Item 12 (f9d1597) already keeps the moved time in the demo resource group's `DbHubAutoShutdownMoved` tag. `Resolve-DemoBusyNightlyStop` acts on that tag when the marker is empty, so `stop-demo.ps1` and `start-demo.ps1` now settle this case. This change adds the live repro as a test, with the deferred pass still there: `STOP.NIGHTLYSTOP` is a **Pass** that removes the pass and puts both auto-shutdowns back. It also makes `COST.AUTOSHUTDOWN` name a time the tag recorded ("where deploy.ps1 moved it for a run the nightly stop waited for"). Its fix then names `./scripts/stop-demo.ps1` or `./scripts/start-demo.ps1` and the next `./scripts/deploy.ps1`, and says that a Run all session ends before it until then. Any other difference keeps "deploy again". The session itself still can't put the auto-shutdown back, since the control's role has no DevTest Labs action.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/ValidationAreas.ps1`; `tests/unit/DbHubDemo.SafetyStop.Tests.ps1` and `DbHubDemo.Validation.Tests.ps1`; ADR 0024, `docs/deployment.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** With Program Files' Pester 5.9.1 under StrictMode and the Azure CLI guard: `DbHubDemo.SafetyStop` and `DbHubDemo.Validation`. The repro test fails on the code before item 12 (no `STOP.NIGHTLYSTOP`), and the `COST.AUTOSHUTDOWN` test fails without this change. Not run live.
+
+**Risks.** An environment that bf010ed's code left in this state has no tag, so `stop-demo.ps1` can't see the move there; the update's `./scripts/deploy.ps1` puts it back (its template, then its end). The deferred pass, while it's there, finds nothing running once the session has stopped everything.
+
+### The relay checks GitHub's sign-in page (item 8, 2026-11-21)
+
+**Why.** The owner's follow-up after the release, as defense in depth: the Insights app already links only `https://github.com/login/device`, but the relay passed on GitHub's `verification_uri` as it came.
+
+**Work summary.** `ask-relay/src/github.ts`: `startDeviceFlow` passes on `verification_uri` only when it's exactly GitHub's device page (`safeVerificationUri`): https, origin exactly `https://github.com`, no user name or password, path `/login/device`, and no query or fragment. Otherwise it answers that page itself (`VERIFICATION_URI`). An answer without a verification page is still refused, as before.
+
+**Changed files.** `ask-relay/src/github.ts`, `ask-relay/test/github.test.ts` (new), `ask-relay/README.md`, the CHANGELOG, and this report.
+
+**Validation.** `npm ci` and `npm test` in `ask-relay` with Node.js 24.22.2: 4 files, 52 tests passed. `npm run typecheck`: no errors. Without the change, 15 of the 16 new tests fail; the 16th, an answer without a page, passes before too.
+
+**To release it (not done here: nothing is pushed).**
+
+1. Once this branch reaches `ignite-updates` or `main`, `.github/workflows/ask-relay-image.yml` builds, tests, and publishes the relay's image to GitHub Container Registry. Its run summary prints the digest to pin.
+2. Pin that digest in `config/versions.json` (`askRelay.image`), commit, and push.
+3. Check that an anonymous pull of the pinned digest works, as on 2026-11-19.
+4. Then `./scripts/deploy.ps1` runs the new image.
+
+Until then, deployments keep the pinned image, which works as before.
+
+**Risks.** None for viewers: the page they're sent to is the same.
+
+### Arc data records that outlive their resource group (item 9, F21, 2026-11-21, read-only)
+
+**Why.** The owner's follow-up after the release: Resource Graph still listed `microsoft.azurearcdata/sqlserverinstances/databases` records in four resource groups that no longer exist (rg-dbhubal-demo 10, rg-dbhubask-demo 10, rg-dbhubvn-demo 10, rg-dbhubvu-demo 5).
+
+**Findings (read-only; nothing changed in Azure).**
+
+- On 2026-11-21 at about 00:37 UTC, Resource Graph (through `az rest`) listed 10 such rows each in rg-dbhubal-demo and rg-dbhubask-demo: five databases under `arcsql01`, and five under `sqlvm01`'s instance. Those in rg-dbhubvn-demo and rg-dbhubvu-demo had aged out.
+- A GET of a listed row's ID answers `ResourceGroupNotFound`.
+- The activity log shows the two groups deleted on 2026-11-19, at about 21:28 and 04:05 UTC, so the rows outlived their groups by about 27 and 20 hours.
+- `destroy.ps1` already deletes the Arc SQL Server instances, T1's included, and the Arc machines before the group, in the order Learn gives. `TEARDOWN.RESIDUAL.RECORDS` already confirms such rows with Azure Resource Manager and passes them.
+- **The documented cause:** Learn's [Disconnect SQL Server instances from Azure Arc](https://learn.microsoft.com/sql/sql-server/azure-arc/delete-from-azure-arc) says a deleted Arc-enabled SQL Server resource can still show for a while because of caching, needs no action, and isn't billed.
+
+**Proposal and change.** No change to `destroy.ps1`: it already removes the instances and machines first, and nothing it could do (nothing documented) clears another service's cached index. The docs said "more than 30 minutes"; `docs/cleanup.md` (Resource Graph lags behind deletes) and `docs/troubleshooting.md` now say a day or more, with the Learn page.
+
+**Changed files.** `docs/cleanup.md`, `docs/troubleshooting.md`, and this report.
+
+**Validation.** markdownlint. Docs only.
+
+**Risks.** None.
+
+### The app's remaining roundings (item 10, 2026-11-21)
+
+**Why.** The coordinator's addition after the release froze its app text: numbers that read 100 % when they aren't. None shows a wrong number with the release tests' data, but each can.
+
+**Work summary.** Each now uses the release's helpers in `fabric/app/src/lib/format.ts`: `percent(share)` for a share, which never rounds some to none or nearly all to all, and `formatLevel(value, "percent")` for a level, which never writes a percentage under 100 as 100.
+
+- **Readiness:** the Readiness page's **Ready** tile and the Overview's **Demo readiness** tile used `Math.round`, so 249 of 250 checks read "100 %". They read "more than 99 %".
+- **The Performance page's insights:** the largest wait family's share (its number and its title) and the busiest hour's share of the total, the same way: "100 % of all wait time" when one family held 99.5 % or more.
+- **T5's normalized RU peak:** `formatNumber(..., "percent")` writes 99.95 to 99.99 % as "100.0 %", the throttling line, beside a **Pass**. The Estate page's tile, the chart's summary, and its peak marker; the service map's T5 key number (`cosmosHealth`'s first metric); and Live now's Cosmos DB tile now write it with `formatLevel`: "99.96 %", or "just under 100 %".
+- **Beyond the list, the same defect:** T5's lowest availability (the Estate tile, whose **Warning** starts below 99.99 %, `cosmosHealth`, and Live now's line), which read "100.0 %" beside a **Warning**.
+- **Left as they are:** the SQL targets' and T4's CPU peaks (`health.ts`), where 100 % isn't a status line, and the kiosk's progress bar, which is a width.
+
+**Changed files.** `fabric/app/src/pages/ReadinessPage.tsx`, `OverviewPage.tsx`, `EstatePage.tsx`, `fabric/app/src/lib/insights.ts`, `health.ts`, `fabric/app/src/components/LiveNow.tsx`; tests in `fabric/app/src/lib/insights.test.ts`, `mission.test.ts`, and `fabric/app/src/pages/pages.test.tsx`; the CHANGELOG, and this report.
+
+**Validation.** Five new tests, one per place: the wait family and busiest hour, the service map's T5 node and `cosmosHealth`, Estate's T5 tile, summary, and marker, the Ready and Demo readiness tiles, and Live now's Cosmos DB tile. All five fail with the source changes stashed and pass with them; the three test files pass (102 tests). `./tests/Invoke-StaticValidation.ps1 -Check FabricApp, Markdown` with Node.js 24.22.2: both **Pass** (typecheck, lint, 19 test files with 339 tests, license check, and build; markdownlint).
+
+**Risks.** None found: a value that is exactly 100, or whole, reads as before, and the Overview's live test with the sample's 100 still passes.
+
+**Review follow-up (2026-11-21).** The review of 6c70917 found the same defect one step lower, at the status lines themselves: `formatLevel` guards only 100 %, so T5's lowest availability from about 99.985 up to just under 99.99 read "99.99 %" beside a **Warning**, and a CPU peak just under 80 % read "80.0 %" beside a **Pass** (T1 to T3's and T4's CPU tiles, T4's CPU insight, which said both "peaked at 80.0 %" and "80 % or more is a warning"). `formatBeside(value, kind, line)` in `format.ts` writes what `formatNumber` writes, and adds decimals, 4 at most, only while that text would put the value on the line's other side, under 100 % included for percentages; past 4, "just under 80 %". Every value beside a status line uses it: CPU at 80 % (the Estate tiles, T4's insight, the service map's metrics), T4's read replica lag at 60 s (its tile, summary, insight, and the map), T5's normalized RU at 100 % (the tile, summary, marker, the map, and Live now), and T5's lowest availability at 99.99 % (the tile, the map, and Live now). Three tests, each failing without the change: `formatBeside` at 79.95, 79.996, 80.0, 80.04, 99.989, 99.99, 99.996, 59.96 s, and 241.4 s; T4's CPU and lag insights at 79.996 % and 59.96 s; and T5's availability tile at 99.989 %, beside its **Warning**. Ordinary values read as before: 241.4 s is still "241 s", and 45.12 % "45.1 %".
+
+**Second review follow-up (2026-11-21).** The re-check of 77f3480 confirmed `formatBeside` and found four chart texts on the Estate page still at one decimal beside the same lines: the SQL target's CPU chart summary and peak marker (beside its 80 % line), the read replica lag chart's peak marker (beside "60 s: warning"), and T4's CPU chart summary. They use `formatBeside` too. One test, failing without the change: T3's CPU summary and marker at 79.996 %, the lag marker at 59.96 s, and T4's CPU summary at 79.996 %.
+
+**Third review follow-up (2026-11-21).** The re-check of 29a7cb4 found one more: an incident insight is a **Warning** at twice its baseline or more, on the raw ratio, but `timesShort` and `timesText` wrote one decimal, so a ratio from 1.95 to just under 2 read "2.0×" and "2.0 times" without the **Warning**, while exactly 2 read the same with it. A ratio under 10 is now written by `formatBeside(ratio, "decimal", 2)`, so 1.96 reads "1.96×" and 1.999 "1.999×"; 2 still reads "2.0×", and 10 or more stays whole. The two helpers serve the insight, the Incidents page's **Against its baseline** tile, the replay, and the business impact lens's evidence (`business.ts`) alike. One test, failing without the change ("2.0×" for 1.96): the insight at 1.96 and at 2.0, and the helpers at 1.999, 3.42, 9.96, and 35.3. The freshness insight's "24 h" stays as it is: its rule is "more than", and the mismatch lasts 30 seconds. `./tests/Invoke-StaticValidation.ps1 -Check FabricApp, Markdown` with Node.js 24.22.2: both **Pass** (typecheck, lint, 19 test files with 344 tests, license check, and build; markdownlint).
+
+### T5's private endpoint only when something needs it (2026-11-21)
+
+**Why.** The owner's follow-up list ("T5's private endpoint only when a policy needs it", about $7.80 a month; ADR 0027), which the coordinator approved on 2026-11-21 with four conditions: every T5 data-plane caller works in public mode, using T1's subnet or Azure Resource Manager alone, with no IP rule; a policy read that fails or is incomplete keeps the endpoint, as do Deny and Modify policies, including a Modify that may turn public access off later; the cost guide and estimate count the endpoint and its zone only when they're kept, and the docs say which mode a deployment gets, why, how to tell, and that Database Hub's Security page then lists T5's public access, as T3's; and an update of an existing deployment changes nothing in T5's network. Existing endpoints are never deleted: the owner's call.
+
+**Work summary.**
+
+- **The template:** `t5PrivateAccess` (`infra/main.bicep`, default true) reaches `infra/modules/demo.bicep`, which keeps the endpoint in private mode whatever it says. `cosmos01.bicep`'s `privateAccess` makes the endpoint, its DNS zone, the zone's link, and the zone group conditional; without them, the account has public network access on, the virtual network filter on, one rule for `snet-sqlvm` (`ignoreMissingVNetServiceEndpoint` false), and no IP rule. `network.bicep`'s `cosmosServiceEndpoint` adds `Microsoft.AzureCosmosDB` to `snet-sqlvm`'s service endpoints, beside `Microsoft.Sql`, only then. `azuredeploy.json` rebuilt with Bicep 0.47.16.
+- **The decision,** before the template (`Resolve-DemoT5NetworkAccess`, `DEPLOY.T5.NETWORK`, `Invoke-DemoTemplateDeployment`): private mode; an existing account with public access off (every T5 before today) keeps its endpoint, zone, and `snet-sqlvm`'s service endpoints; an existing public one keeps its rule unless a policy now needs the endpoint; an account that couldn't be read keeps or gets the endpoint (a **Warning**); a new one gets it under a policy that needs it, or when the policies weren't all read, and none otherwise.
+- **The policies** (`Get-DemoPolicyRuleCategory`'s COSMOSPUBLIC, `PREFLIGHT.POLICY.COSMOSPUBLIC`, `Get-DemoT5PolicyAccess`): a Modify of Azure Cosmos DB's `publicNetworkAccess` to Disabled, or to a value its assignment sets; a Deny on public access, the virtual network filter, its rules, IP rules, or network bypass, unless its condition is provably false for T5's public settings (the evaluator's three-valued logic; a count is unknown, so it counts). Preflight adds COSMOSPUBLIC as **Not selected**, endpoint required, when its inventory is skipped, deferred, or fails, and the parallel and sequential runs pass its evidence to the template step (`T5Policy`), the deferred inventory's replacing preflight's.
+- **The callers (condition 1):** only T1's runner calls T5's data plane, from `sqlvm01` in `snet-sqlvm`, whoever starts it (through Run Command). The scripts, the runbooks, `validate.ps1`, `status.ps1`, and Database Hub use Azure Resource Manager or Azure Monitor alone; the notebooks and the Insights app don't call Azure Cosmos DB. With the endpoint, `Allow-Cosmos-From-T1` let in the same subnet alone.
+- **The warm-up** waits at least 20 minutes on the service endpoint's path, which Learn says can take up to 15 minutes to propagate (`Invoke-DemoT5WarmUp -ServiceEndpoint`, from `T5.NETWORK`'s evidence, in both the parallel and the sequential runs), with its own texts and fix.
+- **`T5.NETWORK`** passes the subnet rule's path (public access on, the filter on, no IP rule, and rules only for `snet-sqlvm` in the demo resource group's network; evidence `path`), and fails anything wider with `./scripts/deploy.ps1`.
+- **Cost (condition 3):** `Get-DemoCostEstimate -T5PrivateEndpoint` counts the endpoint and zone only when T5 has or gets them, and as an upper bound, with a note, when that isn't told; `Get-DemoT5PrivateEndpointStatus` tells it for preflight, T4's General Purpose fallback, the Cost area, `start-demo.ps1`'s guardrail, and `estimate-cost.ps1` (signed in). `init.ps1`'s ceiling still counts them. `STOP.T5` says nothing of T5 bills between sessions when it has no endpoint.
+- **Docs:** ADR 0027's amendment, the cost guide, troubleshooting, architecture, deployment, configuration, security model, permissions, limitations, prerequisites, the walkthrough, the visuals map, cleanup, references, `database/cosmosdb`, the README, AGENTS.md, and the CHANGELOG.
+
+**Changed files.** `infra/main.bicep`, `infra/modules/demo.bicep`, `cosmos01.bicep`, `network.bicep`, `azuredeploy.json`, `config/versions.json`, `ps-rule.yaml`; `scripts/estimate-cost.ps1`, `stop-demo.ps1`; in `scripts/modules/DbHubDemo`: `Private/T5Helpers.ps1`, `PolicyHelpers.ps1`, `T4Helpers.ps1`, `ParallelDeployment.ps1`, `TrackHelpers.ps1`, `LifecycleHelpers.ps1`, `ValidationAreas.ps1`, `Public/Get-DemoCostEstimate.ps1`, `Get-DemoDeploymentParameter.ps1`, `Get-DemoPolicyConstraint.ps1`, `Invoke-DemoDeployment.ps1`, `Invoke-DemoPreflight.ps1`, `Invoke-DemoTemplateDeployment.ps1`, `Invoke-DemoValidation.ps1`, `Stop-DemoEnvironment.ps1`, `Test-DemoT5.ps1`; tests in `tests/unit/Infra.T5.Tests.ps1` and `Infra.Helpers.ps1` (new; the template evaluator moved out of `Infra.T3.Tests.ps1`), `DbHubDemo.T5.Tests.ps1`, `DbHubDemo.Policy.Tests.ps1`, `DbHubDemo.Preflight.Tests.ps1`, `DbHubDemo.Cost.Tests.ps1`, `DbHubDemo.EstimateCost.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`; the docs above, and this report.
+
+**Validation.** Pester with StrictMode, the affected suites (24 files, among them Infra.T3, Infra.T5, Policy, Preflight, T3, T4, T4Fallback, T5, EstimateCost, Validation, Workload, FirstRun, ActivityControl, TransientRetry, Tracks, and Repo.Conventions): 1,763 passed, 0 failed, 0 az calls; after the last text edits, T5, Policy, CosmosHistory, FirstRun, OneCommand, Tracks, and Cost again: 722 passed; Lifecycle 271, Preflight 88, and Cost 73 passed. With the source stashed and the tests kept, every new test fails (42 failures, the EstimateCost suite's whole because its mock names the new function), and Infra.T3 still passes with its evaluator moved. PSScriptAnalyzer on the 27 changed PowerShell files: 0 findings. `./tests/Invoke-StaticValidation.ps1 -Check Bicep, PSRule, Markdown`: all **Pass** (Bicep 0.47.16, `azuredeploy.json` in sync; PSRule for Azure 1.47.0; markdownlint). PSRule on the public path too, from a temporary parameter file with `t5PrivateAccess = false`: its one finding, `Azure.Cosmos.PublicAccess`, is now suppressed in `ps-rule.yaml` with the reason. The real built-in "Azure Cosmos DB accounts should have firewall rules" (version 2.1.0) is in the Policy tests: T5's public settings meet it.
+
+**Risks.**
+
+- **Not run live.** The live tests next week cover a new deployment (public mode where no policy needs the endpoint) and an update (an existing T5 keeps its endpoint).
+- **A public T5 that later needs the endpoint** (a policy assigned after it was created): the same deployment removes `snet-sqlvm`'s Azure Cosmos DB service endpoint and turns the account's public access off. The virtual network updates first; untested live. (Since the review of 31ccf40, 2026-11-22, that deployment keeps the service endpoint, and the next one drops it: [below](#the-review-of-31ccf40-a-move-to-t5s-endpoint-keeps-t1s-path-2026-11-22).)
+- **A Deny the evaluator can't read** (a count, for one) keeps the endpoint, which costs $7.80 a month but always deploys.
+- **The service endpoint changes `snet-sqlvm`'s traffic to every Azure Cosmos DB account** to the subnet's identity; T1 reaches no other account, and the demo sets no IP rule.
+
+### The session control's job minutes from 5 Run all sessions (2026-11-21)
+
+**Why.** The coordinator's decision, from a cross-branch review: d644cdd counted ceil(10 ÷ the estimate's 5-hour session) = 2 sessions in the light-use month, while the RCA branch counts 5 Run all sessions of about 2 billed hours each, the owner's main path. Use 5: 5 × 80 = 400 job minutes, with the nightly stop's 120, 520, of which 20 are priced at $0.002, about $0.04 a month. Keep the included-plus-overflow code, and add the two caveats of the [pricing page](https://azure.microsoft.com/pricing/details/automation/) to what the estimate leaves out. The RCA branch carries its own merge note (its export's 36 minutes a session); none of its numbers are here.
+
+**Work summary.** `Get-DemoCostEstimate` counts the light-use month's sessions as Run all sessions of about 2 billed hours each (`ceil(LightUseHoursPerMonth / 2)`), not as sessions of `-DemoHours`, at 80 job minutes each, and prices what passes the 500 included, less the nightly stop's 120, at the next tier, as before. The cost guide's session control section and At a glance row say so, and that the 2026-11-19 month figures there don't include the $0.04; its "Not included" adds that Azure Automation's 500 included minutes are aggregated across the subscription's Automation accounts, so a second environment shares them, and that flat-discount and fixed-monthly-credit rate plans don't include them. The README's and the deployment guide's words follow.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Get-DemoCostEstimate.ps1`; `tests/unit/DbHubDemo.Cost.Tests.ps1`; `docs/cost-management.md`, `docs/deployment.md`, `README.md`, the CHANGELOG, and this report.
+
+**Validation.** `DbHubDemo.Cost.Tests.ps1`: the default light-use month has 380 included and 20 paid minutes at $0.002, $0.04, and so does a 10-hour `-DemoHours` (1 session before); 176 business hours are 88 sessions, 6,660 paid minutes, $13.32; the month totals the other tests pin are $0.04 higher. These fail without the change (8 failures: 160 minutes, 1 component, 2,500 paid minutes, and the totals). Cost and EstimateCost: 88 passed; T4, T4Fallback, FirstRun, T5, and Preflight: 518 passed; Lifecycle: 271 passed; 0 az calls. PSScriptAnalyzer: 0 findings. markdownlint: **Pass**.
+
+**Risks.** None found: every month figure grows by $0.04, under every ceiling's margin. `init.ps1`'s ceiling, rounded up to 5 USD with 4% headroom, moves only for a worst case within 4 cents of a step: none of the eight regions' 2026-11-19 figures is (West Europe's comes closest, 451.92 × 1.04 = 469.997, still 470).
+
+### The review of fae05b4: T5 under a policy at the resource group (2026-11-22)
+
+**Why.** The review of fae05b4 found one Medium and one Low in 3d2eaabd (T5's private endpoint only when something needs it), the rest confirmed: existing T5s updated from bf010ed show no what-if change and no new **Warning** or **Fail**, and the policy logic, the callers, `T5.NETWORK`, and the cost are right.
+
+- **Medium:** the policy inventory doesn't read assignments at the demo resource group (`Get-DemoPolicyConstraint`'s docstring leaves them to the what-if), and preflight's what-if never passed `T5PrivateAccess`, so it checked T5 behind its endpoint, not the public T5 the template step deploys. In a group that exists already (created by hand, an older deployment that adds T5, or `t5Enabled` turned on), a Deny on Azure Cosmos DB's public network access passed preflight; Azure then refused the account, and T5 was left out, with a **Warning**, on every run (at bf010ed it deployed behind its endpoint). A Modify instead created it with public network access off and no endpoint, so `T5.NETWORK` failed and the run ended **NOT DONE**.
+- **Low:** `ps-rule.yaml`'s suppression of `Azure.Cosmos.PublicAccess` did nothing (CI's `main.bicepparam` keeps `t5PrivateAccess` true), and, keyed by name, it would hide a regression on the default path.
+
+**Work summary.**
+
+- **Preflight** (`Invoke-DemoPreflight`): `Get-DemoT5PrivateEndpointStatus` runs before the what-if, which gets `T5PrivateAccess` from it (`$null`, T5 off or not known, is the endpoint, the template's default), and the estimate uses the same answer. When the what-if of a public T5 fails with a policy denial of T5's resources alone (`Get-DemoT5OnlyFailure`), it runs again with the endpoint, `PREFLIGHT.POLICY.COSMOSPUBLIC` is replaced by one that says so (reason Policy, evidence `whatIfDenied`, from `Get-DemoT5PolicyAccess -Denied`), so the template step deploys the endpoint and the estimate prices it, and `PREFLIGHT.POLICY.WHATIF`'s **Pass** says T5 was checked behind it. A denial that names any other resource fails as before, with one what-if.
+- **The template step** (`Invoke-DemoTemplateDeployment`): a public T5 whose attempt failed in T5's resources alone with `RequestDisallowedByPolicy` is deployed again once with `t5PrivateAccess` true before the existing branch leaves T5 out, an existing public account too. After a successful attempt with a public T5, the account is read once, and when its public network access isn't Enabled (a Modify), the template is deployed again with the endpoint. Both replace `DEPLOY.T5.NETWORK` with `Resolve-DemoT5NetworkAccess -PolicyFound Denied|Modified` (reason Policy, evidence `policyFound`, `existed` as before the run, and the endpoint's monthly cost in its message), and set the T4 cost checks' `T5PrivateEndpoint`. One attempt more in the limit (9 without `t4SkuName`, up to 11). When T5 is left out, its `DEPLOY.T5.NETWORK` goes with it, as its `DEPLOY.T5.FREETIER` already did.
+- **`ps-rule.yaml`:** the suppression is gone; PSRule passes on CI's parameters.
+- **Docs:** ADR 0027's 2026-11-21 amendment (and its sources: the deny and modify effects, and the RequestDisallowedByPolicy error), the cost guide, troubleshooting (a row for the new texts), prerequisites, deployment, the CHANGELOG's T5 entry, and `Get-DemoPolicyConstraint`'s docstring.
+
+**Changed files.** `ps-rule.yaml`; `scripts/modules/DbHubDemo/Private/T5Helpers.ps1`, `Public/Invoke-DemoPreflight.ps1`, `Invoke-DemoTemplateDeployment.ps1`, `Get-DemoPolicyConstraint.ps1`; `tests/unit/DbHubDemo.Preflight.Tests.ps1`, `DbHubDemo.T4Fallback.Tests.ps1`; `docs/adr/0027-t5-cosmos-db.md`, `docs/cost-management.md`, `docs/troubleshooting.md`, `docs/prerequisites.md`, `docs/deployment.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: T4Fallback, Preflight, and T5: 325 passed; with Golden, EstimateCost, Policy, ActivityControl, Cost, TransientRetry, Tracks, Infra.T5, Repo.Conventions, and Repo.FunctionNames: 1,025 passed; Lifecycle: passed; 0 az calls. With the three source files at HEAD and the tests kept, 7 of the 8 new tests fail: the what-if's parameters and its second run, the denial's retry for a new and an existing T5, a T5 left out after both, and the Modify for a new and an existing T5; the eighth checks that a T5 behind its endpoint from the start isn't read again. PSScriptAnalyzer on the changed PowerShell files: 0 findings. `./tests/Invoke-StaticValidation.ps1 -Check Bicep, PSRule, Markdown`: all **Pass**, PSRule's 302 rules without the suppression.
+
+**Risks.**
+
+- **Not run live:** Azure Policy at a resource group isn't part of next week's live tests. The template step's paths follow Azure's documented answers (403 RequestDisallowedByPolicy for a Deny; the request changed for a Modify) and were tested with them offline.
+- **A Deny of every Azure Cosmos DB account** at the resource group now takes one attempt more before T5 is left out, as before.
+- **A Modify found by the template step:** preflight's estimate didn't count the endpoint and zone; `DEPLOY.T5.NETWORK` says they bill all month, and the next run's estimate counts them.
+
+### T2's guest network repaired by deploy.ps1, and reset-demo.ps1 -RebuildGuest (2026-11-22)
+
+**Why.** The owner's lower-priority follow-ups: a scripted repair for T2's disconnected guest network adapter, and `reset-demo.ps1 -RebuildGuest`, which was **Not supported**. `T2.GUEST.STATE`'s fix for a disconnected guest was `./scripts/deploy.ps1`, then `destroy.ps1 -KeepFabric` and `deploy.ps1`, with a by-hand `Connect-VMNetworkAdapter` last; but only JumpstartImage's `GuestFirstBoot` connected the adapter (and re-ran the whole first boot to do it), and a build-mode guest had no step that reconnects it.
+
+**Work summary.**
+
+- **`GuestNetwork`, a new host step** after `GuestFirstBoot`, in every mode (`vm/bootstrap/HostSteps.ps1`, `Invoke-HostBootstrap.ps1`): its Test passes when every adapter of the guest is on the NAT switch; its Set connects the ones off it ([Connect-VMNetworkAdapter](https://learn.microsoft.com/powershell/module/hyper-v/connect-vmnetworkadapter)) and logs a **Warning** that says how many. A guest without an adapter fails the step with `-RebuildGuest` as the fix, which `INFRA.HEALTH.ARCHOST01` names (F24). It changes nothing while a golden capture holds the guest (`Test-DemoGuestHeldOff`), nor for a copy whose record says released without a reset while this host isn't known to be the capture's source (`Test-DemoGuestCopyUnsettled`, new in `vm/hyperv-guest/GuestVm.ps1`): such a copy may hold the captured Arc identity, so T2's relay refuses it too (`Get-DemoControlGoldenDecision`), and `deploy.ps1`'s T2 track resets it first. Every plain `deploy.ps1` starts a new bootstrap generation, which runs the step's Test again, so `deploy.ps1` is the repair.
+- **`reset-demo.ps1 -RebuildGuest`** (`Reset-DemoWorkload`, `Request-DemoT2GuestRebuild`): `RESET.GUEST` asks `archost01` through the managed Run Command `DbHubDemo-GuestRebuild` (`vm/bootstrap/Set-DemoGuestRebuildRequest.ps1`, Windows PowerShell 5.1), which writes `guest-rebuild-request.json` (an ID, when, and by whom; nothing secret). **Not supported** in `ProductKey` and `Developer` mode and the evaluation-only mode, with the fix; **Not selected** while `archost01` isn't running and with `-WhatIf`; a **Fail**, with nothing asked, while the host's health says a golden capture holds the guest (`Get-DemoT2GuestGoldenHold`). On a **Pass**, `reset-demo.ps1` runs `./scripts/deploy.ps1 -FromStage Artifacts` (`Invoke-DemoDeployScript`, new and exported) and exits with its code; no target is reset then, since that run sets the activity up.
+- **On the host,** the `GuestSource` step's Test fails while a request is to do (no outcome, and no rebuild record with its ID), so its Set acts on it: refused, with the request's outcome and why, and nothing deleted, when a golden capture holds the guest, a released copy was never reset, or the configured mode isn't JumpstartImage (each checked again on the host, fail closed); otherwise `Remove-DemoHostGuest -RequestId` deletes the guest as an unfinished one (its disk and records; the space check first) and records the request's ID, and the pass runs the configured JumpstartImage mode (`Use-DemoHostConfiguredMode`), so the image's steps make the new guest in the same pass, a kept `PaygWizard` guest's included. A refused request is a one-off note on `GuestSource` (`TransientWarningMessage`, F24's lifecycle).
+- **The deploy side:** the host's health summary has `rebuildRequested`; `DEPLOY.T2.REBUILD` says that `reset-demo.ps1 -RebuildGuest` asked (`Get-DemoT2RebuildText -Requested`), and deletes the old guest's Arc resources in this environment's resource group only, as for an unfinished guest.
+- **`T2.GUEST.STATE`:** its fix for a disconnected guest is `./scripts/deploy.ps1` (the `GuestNetwork` step), then `-RebuildGuest` where Arc Jumpstart's image makes T2, then `destroy.ps1 -KeepFabric` and `deploy.ps1`, with the by-hand command last.
+- **Docs:** the CHANGELOG (Added), deployment (the `reset-demo.ps1` paragraph), troubleshooting (`T2.GUEST.STATE`, and a `RESET.GUEST` row), limitations (a kept `PaygWizard` guest's evaluation expiry), the automation support matrix, ADR 0006's note, and `vm/bootstrap/README.md`.
+
+**Changed files.** `vm/bootstrap/HostSteps.ps1`, `Invoke-HostBootstrap.ps1`, `Set-DemoGuestRebuildRequest.ps1` (new), `README.md`; `vm/hyperv-guest/GuestVm.ps1`; `vm/health/Get-DemoHealth.ps1`; `scripts/reset-demo.ps1`; in `scripts/modules/DbHubDemo`: `DbHubDemo.psd1`, `Private/T2GuestHelpers.ps1`, `GoldenHelpers.ps1`, `GuidedStopHelpers.ps1`, `Public/Reset-DemoWorkload.ps1`, `Invoke-DemoDeployScript.ps1` (new); tests in `tests/unit/Vm.GuestRebuild.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, `Vm.JumpstartImage.Tests.ps1`, `DbHubDemo.Lifecycle.Tests.ps1`, `DbHubDemo.Golden.Tests.ps1`, and `Repo.LifecycleScripts.Tests.ps1`; the docs above, and this report.
+
+**Validation.** Pester with StrictMode: the 18 `Vm.*` suites: 581 passed; Lifecycle, Golden, Repo.LifecycleScripts, Repo.FunctionNames, and Repo.Conventions: 569 passed; 0 az calls. With the source at HEAD and the tests kept, 34 tests fail: every new test of the request, its refusals (a golden capture, a build mode, an unreset copy), the space check, `GuestNetwork` (including the golden guards), the host's step plans with the new step, the health summary, `RESET.GUEST`'s paths, `reset-demo.ps1`'s chaining to `deploy.ps1`, and `T2.GUEST.STATE`'s fix; the one that passes pins what HEAD already did (the build modes stay **Not supported**). Windows PowerShell 5.1 parses the five VM-side files. PSScriptAnalyzer on the 18 changed PowerShell files: 0 findings (`Use-DemoHostConfiguredMode` changes only the pass's context, so it isn't a `Set-` verb). markdownlint: **Pass**.
+
+**Risks.**
+
+- **Not run live:** neither a disconnected guest nor a requested rebuild is part of next week's live tests. The rebuild reuses the deletion of an unfinished guest (2026-11-09, unit-tested), the image's steps that make every new T2 (live with each new deployment), and the Arc cleanup that follows a rebuild.
+- **A rebuild deletes the guest's database,** as `destroy.ps1` would: ContosoCare is seeded again, and T2's history in Fabric stays. The request is explicit, and its result says so before `deploy.ps1` runs.
+- **A host's own golden source** whose record says released without a reset is left alone when IMDS can't be read, as T2's relay does: the repair then waits for the next pass.
+
+### The review of 31ccf40: a move to T5's endpoint keeps T1's path (2026-11-22)
+
+**Why.** The review of 99ecca6 confirmed the T2 work and the rest of 31ccf40, and found one Medium there: the template step's policy retry (`Invoke-DemoTemplateDeployment`) follows any policy denial of T5's resources alone, including one the private endpoint doesn't satisfy (Cosmos DB allowed locations, customer-managed keys, a tag rule). On an existing public T5, the retry's attempt sent `t5PrivateAccess` true, so the network module removed `Microsoft.AzureCosmosDB` from `snet-sqlvm` (`cosmosServiceEndpoint: t5Enabled && !t5Private`) before Azure denied the account again. The account stayed public with its rule for `snet-sqlvm`, which admits the subnet only through that service endpoint, so T1 got 403 and T5 was offline; every later run added the endpoint back and removed it again. Before 31ccf40 the run ended **NOT DONE** with T5 working, and `T5.NETWORK` still passed, because it didn't read the subnet. The coordinator's choice: make the transition safe rather than only restricting the retry.
+
+**Work summary.**
+
+- **The template** (`infra/main.bicep`, `infra/modules/demo.bicep`, `network.bicep`, `azuredeploy.json` rebuilt with Bicep 0.47.16): a new `t5WasPublic` (default false), and `cosmosServiceEndpoint: t5Enabled && (!t5Private || t5WasPublic)`. The network module now honors it in private mode too (`Microsoft.AzureCosmosDB` alone), because networkMode `auto` resolves to private once a policy turns SQL public access off, which moves a public T5 as well. With the default, every existing case compiles to the same service endpoints as before.
+- **`Test-DemoT5WasPublic`** (`T5Helpers.ps1`): the account's `publicNetworkAccess` is Enabled before the deployment; for an account that couldn't be read, whether `snet-sqlvm` has the Azure Cosmos DB service endpoint now (`Get-DemoT5SubnetServiceEndpoint`, `az network vnet subnet show`), which the demo adds only for a public T5, so a T5 with its endpoint never gets one. The template step sends it in every attempt (`Get-DemoDeploymentParameter -T5WasPublic`, false with T5 off), and preflight's what-if sends the same, from one read of the account that `Get-DemoT5PrivateEndpointStatus` now shares. The next run drops the service endpoint once the account reads public network access off. When a run moves such an account, `DEPLOY.T5.NETWORK` says that `snet-sqlvm` keeps the service endpoint until then, and why (evidence `subnetServiceEndpointKept`); its **Warning** for a network that couldn't be decided now goes, as its other results do, when T5 is left out.
+- **`T5.NETWORK`** (`Test-DemoT5`): for a T5 limited to `snet-sqlvm`, it reads the subnet its rule names: **Pass** with the service endpoint; **Fail** without it, "so T1 can't reach T5: Azure Cosmos DB answers its requests with 403 (Forbidden)", with `./scripts/deploy.ps1`; a **Warning** when the subnet can't be read or the endpoint isn't provisioned (evidence `subnetServiceEndpoint`, `subnetServiceEndpointState`). A T5 behind its private endpoint isn't read for it.
+- **Docs:** ADR 0027 (the 2026-11-22 bullets, its "Not run live" note, and the sources: service endpoints, the Private Link FAQ, and `az network vnet subnet show`), troubleshooting (a `T5.NETWORK` row), the CHANGELOG's T5 entry, and this report.
+
+**Changed files.** `infra/main.bicep`, `infra/modules/demo.bicep`, `infra/modules/network.bicep`, `azuredeploy.json`; `scripts/modules/DbHubDemo/Private/T5Helpers.ps1`, `Public/Get-DemoDeploymentParameter.ps1`, `Invoke-DemoTemplateDeployment.ps1`, `Invoke-DemoPreflight.ps1`, `Test-DemoT5.ps1`; tests in `tests/unit/Infra.T5.Tests.ps1`, `DbHubDemo.T4Fallback.Tests.ps1`, `DbHubDemo.T5.Tests.ps1`, and `DbHubDemo.Preflight.Tests.ps1`; `docs/adr/0027-t5-cosmos-db.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: T4Fallback, Preflight, T5, Infra.T5, Infra.T3, Lifecycle, Policy, Cost, EstimateCost, Tracks, T3, Arc, Workload, Validation, Repo.Conventions, and Repo.FunctionNames: 1,400 passed; after the status note, T4Fallback, Lifecycle, Tracks, T5, Infra.T5, and Preflight again: 790 passed; 0 failed, 0 az calls. With the source at HEAD (the Bicep, `azuredeploy.json`, and the five module files) and the tests kept, 9 tests fail: the compiled template's move in both modes; `T5.NETWORK`'s subnet read, its **Fail**, and its **Warning**; the parameter builder; `Test-DemoT5WasPublic`'s reads; the reviewer's case (a denial the endpoint doesn't cure, on an existing public T5: both attempts send `t5WasPublic`, the compiled template keeps `Microsoft.Sql,Microsoft.AzureCosmosDB` on `snet-sqlvm` for the refused attempt, the run ends **NOT DONE** with T5 kept); the existing public T5's denial and Modify moves; and preflight's what-if. PSScriptAnalyzer on the changed PowerShell files: 0 findings. `./tests/Invoke-StaticValidation.ps1 -Check Bicep, PSRule, Markdown`: all **Pass** (Bicep 0.47.16, `azuredeploy.json` in sync; PSRule's 302 rules).
+
+**Risks.**
+
+- **Not run live:** a move of a public T5 to its endpoint, refused or not. The template's paths are evaluated offline from `azuredeploy.json`.
+- **A move adds the service endpoint** only where the account is public and `snet-sqlvm` lacks it, the state 31ccf40's retry could leave (no environment has run it: the branch isn't deployed). That's the repair, and like any new service endpoint it can take up to 15 minutes to apply; `T5.NETWORK` fails until it's there.
+- **The retry still follows any T5-only policy denial:** it now costs one more attempt and changes nothing that T1 needs; the run ends **NOT DONE** with Azure's reason, as before 31ccf40.
+
+### "Run all is ready" only when Run all can start a session (F28, 2026-11-22)
+
+**Why.** The RCA live test's net-new deployment (`dbhubra`, at b059c91 too) ran in a subscription that already had 10 Azure Automation accounts in westus3: the owner's demo and four test environments, two each. Azure refused both of its accounts ("Conflict: ... exceeded your quota for Automation accounts in your subscription in the region"), so `CONTROL.RESOURCES` and `SAFETYSTOP.RESOURCES` were **Warnings**. But the control's template had created its identity and vault, so the Fabric part put the notebook in Fabric and `DEPLOY.CONTROL` was **Pass**, "Run all is ready", on the console, the status page, and in **DONE**. The coordinator's choice of **Warning** or **NOT DONE** was left to this change.
+
+**Work summary.**
+
+- **What Run all needs, read after the setup** (`Get-DemoControlGap`, `ControlDeployHelpers.ps1`): the control's Automation account, its vault, an enabled, unexpired webhook for `DbHub-Control` with its URL's secret (`Get-DemoActivityControlWebhook` now returns `SecretMissing`, an HTTP 404, apart from a read that failed), and the session's status secret, through Azure Resource Manager, metadata only. Only an HTTP 404 counts as missing; any other failed read claims nothing. The Fabric part takes this run's results (`-PriorResult`, from both deploy paths) to name why: the step where the Azure part's setup stopped (`Get-DemoControlSetupStop`: `CONTROL.SETUP`, `PROVIDER`, `GROUP`, `RESOURCES`, or `MODE` when nothing after it ran), or else the later step that didn't finish (`RUNBOOKS`, `WEBHOOK`, `SECRETS`).
+- **`DEPLOY.CONTROL`:**
+  - Something missing: a **Warning**, "... is in ..., but Run all can't start a session yet: &lt;what&gt;: &lt;why&gt;", with the step's fix and `./scripts/start-demo.ps1` meanwhile. Evidence `ready` false (so **DONE** names only the scripts for each session), `missing`, `cause`.
+  - Nothing missing, but this run's setup stopped before the runbooks: a **Warning** that Run all starts a session with what an earlier `deploy.ps1` set up, naming the step and its fix (`ready` true). Before, it was **Pass**. An account that couldn't be read there makes it "may not start a session" (`ready` false).
+  - Otherwise, as before: **Pass** "Run all is ready", or the Fabric part's **Warnings**.
+  - **DONE**'s line (`Get-DemoControlDeployNote`) doesn't repeat the cause under "In Azure".
+- **The quota in plain words** (`Get-DemoAutomationQuotaText`, a new `AutomationQuotaHelpers.ps1`): `CONTROL.RESOURCES` and `SAFETYSTOP.RESOURCES` say "Azure refused &lt;account&gt; because the subscription's quota for Azure Automation accounts in &lt;region&gt; is used up (Conflict)", with how to free one (`./scripts/destroy.ps1` on an environment you no longer use deletes its two) or raise the quota (the portal's **Quotas** page or a support request; not on Free Trial or Azure for Students), Azure's full answer in the evidence, and Learn's limits page. Any other refusal keeps its words and fix.
+- **Warning, not NOT DONE,** for the reasons in [ADR 0026's amendment](adr/0026-one-run-all-session.md#2026-11-21-amendment-run-all-is-ready-only-when-run-all-can-start-a-session-f28): the session control never keeps a run from **DONE**; the demo itself works; **NOT DONE** sends a person or an agent to run `deploy.ps1` again, which can't help until an account is freed, and would make every update of such an environment **NOT DONE**; and preflight is where a new deployment should stop (F30).
+- **Docs:** ADR 0026 (the amendment and Learn's Automation limits in its sources), troubleshooting (three `DEPLOY.CONTROL` rows), the CHANGELOG, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/AutomationQuotaHelpers.ps1` (new), `ControlDeployHelpers.ps1`, `ActivityControlHelpers.ps1`, `SafetyStopHelpers.ps1`, `ParallelDeployment.ps1`, `Public/Invoke-DemoDeployment.ps1`; tests in `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` and `DbHubDemo.SafetyStop.Tests.ps1`; `docs/adr/0026-one-run-all-session.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: ActivityControl and SafetyStop, 238 passed; Tracks, Lifecycle, OneCommand, OneClick, Progress, Redaction, Results, Repo.Conventions, Repo.FunctionNames, Repo.NeutralWording, and Repo.LifecycleScripts, 959 passed; 0 failed, 0 az calls. With the source at HEAD (the five module files, and without `AutomationQuotaHelpers.ps1`) and the tests kept, 11 tests fail: the quota's words in `CONTROL.RESOURCES` and `SAFETYSTOP.RESOURCES`; `DEPLOY.CONTROL` for the refused account (the live case: its **Warning**, evidence, the status page's row, and **DONE**'s line), for a missing webhook, an expired one, its URL's secret, and the session status; for a setup that stopped with Run all still working, and with the account unreadable; the unchanged **Pass**; where the setup stopped; and both deploy paths passing `-PriorResult`. PSScriptAnalyzer on the changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live.** The reads are the ones `validate.ps1`'s `Test-DemoActivityControl` already makes (the account, the webhooks, the secrets' metadata), four or five more `az rest` GETs per run.
+- **A webhook that expires within 14 days** still counts as there; the setup replaces it on the same run.
+
+### Run all names a session control that isn't set up (F29, 2026-11-22)
+
+**Why.** On `dbhubra` (F28), Run all ended in 76 seconds with "Manual action required: the control vault didn't answer: the secret dbhub-session-status couldn't be read (Py4JJavaError): you need Key Vault Secrets User on it ...". The vault existed, but the setup had stopped at its template, before the roles, so nobody could read it; and the real cause, the missing Automation account, can't be fixed with a role.
+
+**Work summary.**
+
+- **What the notebook can know:** a Fabric notebook gets no Azure Resource Manager token through a documented `notebookutils` audience key, so it can't read the Automation account itself. `deploy.ps1` already knows (F28's `Get-DemoControlGap`), so it says so at import: the notebook's parameters cell has a new `CONTROL_PROBLEM` (`Get-DemoActivityControlNotebook -ControlProblem`, through `Set-DemoActivityControlFabric`), filled with the gap's `Problem` ("./scripts/deploy.ps1 found on &lt;time&gt; UTC that Run all can't start a session: &lt;what&gt;&lt;why&gt;. Fix: &lt;fix&gt; Meanwhile ./scripts/start-demo.ps1 runs a session from a PC, and ./scripts/stop-demo.ps1 stops the demo."), and emptied on every run that finds nothing missing.
+- **The notebook** (`fabric/control/NB_DatabaseHub_Control.ipynb`): with `CONTROL_PROBLEM` set, a secret it can't read is "couldn't be read (&lt;type&gt;): the session control isn't set up. &lt;problem&gt;" (`read_secret_json`); the pre-check prints "Manual action required: Run all starts nothing: ..."; the webhook's URL it can't read is "Manual action required: the webhook URL couldn't be read from Key Vault (&lt;type&gt;): the session control isn't set up. ..."; an HTTP 400 or 404 from the webhook adds the problem; and **Stop now** without the session's status says it asks the control to stop whatever runs, then the webhook's read says why, once. None of these ask for Key Vault Secrets User. It only explains a read that fails, so a stale value blocks nothing. Without it, every message is as before. The notebook stays nbformat 4.5 with no outputs.
+- **Docs:** the control's README, troubleshooting (Run all's and Stop now's messages), ADR 0026's amendment, the CHANGELOG, and this report.
+
+**Changed files.** `fabric/control/NB_DatabaseHub_Control.ipynb`; `scripts/modules/DbHubDemo/Private/ActivityControlHelpers.ps1`, `ControlDeployHelpers.ps1`; tests in `tests/unit/Fabric.ControlNotebook.Tests.ps1` (the simulator's vault refuses every read in `nocontrol`, `nocontrolstop`, and `novault`, as `notebookutils` raises `Py4JJavaError`; the helpers' own harness gets the new parameter) and `DbHubDemo.ActivityControl.Tests.ps1`; `fabric/control/README.md`, `docs/troubleshooting.md`, `docs/adr/0026-one-run-all-session.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: Fabric.ControlNotebook (Python 3.11 with pandas, none skipped) and ActivityControl, 205 passed; 0 failed, 0 az calls. With HEAD's behavior cells and only the new parameter line, the Run all test fails on its message: the notebook printed "the control vault didn't answer: ... you need Key Vault Secrets User on it", the live finding. With HEAD's `ControlDeployHelpers.ps1`, the two deploy-step assertions fail (the problem passed for a missing account, and cleared when nothing is missing). The import test (the problem as a Python string literal, quotes included) fails without `-ControlProblem`. PSScriptAnalyzer: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live.** The notebook runs offline against stand-ins for `notebookutils` and the webhook.
+- **The Insights app's Manage still shows "completed"** for a notebook run that started nothing, here as for any other "Manual action required" in the notebook: the app reads the Fabric job's status, and the notebook ends normally. Pre-existing; not changed here.
+
+### Preflight checks the Azure Automation accounts a deployment adds (F30, 2026-11-22)
+
+**Why.** Preflight checked the vCPU quota, but not the subscription's quota of Azure Automation accounts per region. On `dbhubra` (F28), a new deployment in a subscription with 10 accounts in westus3 learned only at the end, from two Warnings, that neither of its accounts was created.
+
+**Learn** ([Azure subscription and service limits, Automation limits](https://learn.microsoft.com/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits); [Azure Automation subscription limits and quotas](https://learn.microsoft.com/azure/automation/automation-subscription-limits-faq); [Manage Azure Automation subscription limits and quotas](https://learn.microsoft.com/azure/automation/automation-limits-quotas); checked 2026-11-22):
+
+- At most 10 active Automation accounts in a subscription in a region for Enterprise and CSP subscriptions, 2 for pay-as-you-go, Sponsored, MSDN, MPN, and Azure Pass ones, both raisable by a support request or on the portal's **My quotas** page (provider **Automation accounts**).
+- 1 for Free Trial, Azure for Students, and Azure in Open ones, in six regions only, which can't be raised.
+- The offers' `quotaId`s are from [Understand Cost Management data](https://learn.microsoft.com/azure/cost-management-billing/costs/understand-cost-mgt-data). `MSDNDevTest_2014-09-01` covers Enterprise and pay-as-you-go Dev/Test alike, so its default is unknown. `Internal_2014-09-01` isn't on Learn: 10, as observed live, where the 11th account was refused.
+- No documented API returns the quota itself: the [Quota REST API](https://learn.microsoft.com/rest/api/quota/) covers virtual machines, Machine Learning, networking, HPC Cache, storage, and Purview, not Automation accounts, so a raised quota is a setting.
+
+**Work summary.**
+
+- **`PREFLIGHT.P3.AUTOMATION`** (`Get-DemoAutomationAccountQuotaResult`, after `PREFLIGHT.P3.PUBLICIP`):
+  - What this deployment adds: each of its two accounts (`aa-<prefix>-control`, which environments with one prefix share, and `aa-<prefix>-<environment>-safetystop`) that Azure Resource Manager answers isn't there (HTTP 404). An update whose accounts are there is a **Pass**, with nothing more read.
+  - What the subscription has in the region: one Azure Resource Graph count, through the verified-token path (`Invoke-DemoHubResourceGraph`).
+  - The quota: `automationAccountQuota` when set, else the offer's default (`Get-DemoAutomationAccountLimit`, from `Get-DemoSubscriptionQuotaId`).
+- **Its statuses:**
+  - **Pass** when they fit.
+  - **Fail** only for a new deployment whose accounts don't fit, before anything is created, with how to free an account or raise the quota. New means no demo resource group, or one with tags but no recorded stage (`Test-DemoAutomationQuotaNewDeployment`); a Free Trial gets its own fix.
+  - **Warning** for an environment that has deployed before (its update goes on), when it can't tell, when the count or an account can't be read, when the region has more accounts than the offer's default (a raised quota it can't read), and for an offer with no documented default above 2 accounts.
+- **`automationAccountQuota`:** an optional integer from 1 to 1,000 in `config/environment.schema.json`, with no default.
+- **Docs:** prerequisites (a P3 row), limitations, configuration, the cost guide (the account counts against a quota, not a price), troubleshooting (three `PREFLIGHT.P3.AUTOMATION` rows), ADR 0026's amendment, the CHANGELOG, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/AutomationQuotaHelpers.ps1`, `Public/Invoke-DemoPreflight.ps1`, `config/environment.schema.json`; tests in `tests/unit/DbHubDemo.Preflight.Tests.ps1`; `docs/prerequisites.md`, `docs/limitations.md`, `docs/configuration.md`, `docs/cost-management.md`, `docs/troubleshooting.md`, `docs/adr/0026-one-run-all-session.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: Preflight and Config, 133 passed; 0 failed, 0 az calls. With HEAD's `AutomationQuotaHelpers.ps1` and `Invoke-DemoPreflight.ps1` and the tests kept, all 14 new tests fail: the live case (10 of 10, a new deployment, a **Fail** with nothing created, and a group created ahead); an update whose accounts are there (a **Pass**, nothing more read); an environment that has deployed before, and one it can't tell (**Warnings**); four cases that fit; a pay-as-you-go region with one account; `automationAccountQuota`; a raised quota it can't read; an offer with no documented default; Free Trial; a count or an account it can't read; and the check's place in preflight, whose **Fail** fails it. PSScriptAnalyzer on the changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live.** The Resource Graph count can lag a create or a delete by a few minutes, so an account deleted just before can still count; the fix says so.
+- **A raised quota with fewer accounts than the offer's default** (say a pay-as-you-go subscription raised to 5, with 1 account) reads as the default, 2, so a new deployment there fails until `automationAccountQuota` says 5; the fix names it.
+- **An offer that isn't in the table**, or one that couldn't be read, passes only when two accounts fit in an empty region; otherwise a **Warning**, never a **Fail**.
+
+### A health read under a fresh name, and a loader check that knows when it didn't answer (F31, 2026-11-22)
+
+**Why.** Seen on `dbhubfn` at a8d51ac, before the RCA, then on `dbhubrb` and `dbhubra`: `archost01`'s `DbHubDemo-HealthRead` stayed Pending for 444 to 623 seconds. On a running demo, `validate.ps1` then gave `INFRA.BOOTSTRAP.LOADER_ARCHOST01` a **Fail** ("archost01 has no bootstrap loader Run Command"), because the loader check's fallback reads `health.json`; and the stop at the end of an update waited the whole time. The final tests read the host's own logs:
+
+- The Run Command handler (`RunCommandHandler.log`) keeps each name's last sequence number in the registry until a `disable` removes it, and exits without running a Run Command of that name that comes back with sequence number 0: "Current sequence number, 0, is not greater than ... MostRecentSequenceNumberFinished 0. Exit".
+- A delete reached the agent ("cannot be found in the latest goal state ... NotEnabled", `WaAppAgent.log`) without a `disable`, and a create 10 seconds after a delete was skipped the same way. The instance view then had no execution at all, so the caller waited its whole timeout; only the next delete's `disable` cleared the name.
+
+**Work summary.**
+
+- **`Invoke-DemoVmRunCommand -FreshName`** (`Get-DemoRunCommandReadName`):
+  - The script runs as `<name>-yyyyMMddHHmmss`, a name the handler has never seen, with no leftover wait first (up to 300 seconds before) and no wait for its own delete (up to 180 seconds before).
+  - One list of the VM's Run Commands comes first. Copies of the name whose owner has stopped waiting for them (by the time in their name, at least an hour, longer than any read waits) are deleted without waiting, so the ones whose delete Azure didn't finish never pile up; a younger copy is another read in progress, and stays.
+  - The fixed name an earlier version used is deleted too, as that version's own next read did.
+  - At 24 Run Commands on the VM (Azure allows 25), the read runs under its fixed name, as before, with a log line; when the list can't be read, the fresh name is used.
+- **`-PendingRetrySeconds`:** a read that hasn't started that long after Azure accepted it is deleted and runs once more under a fresh name, never the one just deleted, with the whole wait; only once, and the caller's own `-StartTimeoutSeconds` governs when it comes first. A stale result's retry gets a fresh name too, when the first was fresh.
+- **Callers:** `Get-DemoVmHealth` (every health read: `deploy.ps1`'s tracks and its end stop, `validate.ps1`, `status.ps1`, Arc onboarding, the guided stop, and T2's guest) uses both, with 90 seconds; T1's SQL mode read (`DbHubDemo-SqlModeRead`) and `validate.ps1`'s T2 probe (`DbHubDemo-ValidateProbe`) use fresh names. The other Run Commands, which change something, keep their names.
+- **`INFRA.BOOTSTRAP.LOADER_<vm>`:** with no `DbHubDemo-Bootstrap` Run Command and a health read that didn't answer, a **Warning** that says whether the loader ran couldn't be checked, points at `INFRA.HEALTH.<vm>`, and keeps the read's error in its evidence. A read that answers keeps the old outcomes: the recorded bundle passes, and anything else, including a host with no `health.json`, is still a **Fail**.
+- **Nothing reads the fixed name:** `status.ps1`, `deploy.ps1`, and `validate.ps1` read health only through `Get-DemoVmHealth`. `STATUS.RUNCOMMANDS` lists `DbHubDemo-` Run Commands by prefix and leaves out ones being deleted, and the session control's runbooks clean only their own `DbHubControl-` ones. The guided stop's note about stuck names keys on `DEPLOY.RUNCOMMAND.STUCK_*`, which other names still raise.
+- **Docs:** ADR 0012's amendment, troubleshooting (the loader's **Warning**, and the retry's log line), the CHANGELOG, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Invoke-DemoVmRunCommand.ps1`, `Public/Get-DemoVmHealth.ps1`, `Private/RunCommandHelpers.ps1`, `Private/SqlVmMonitoringHelpers.ps1`, `Private/ValidationAreas.ps1`; tests in `tests/unit/DbHubDemo.Arc.Tests.ps1` (the invoker's fake ARM gets names the handler skips, which stay Pending) and `DbHubDemo.Validation.Tests.ps1`; `docs/adr/0012-validation-model.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: Arc and Validation, 218 passed; then Arc, Validation, Lifecycle, Tracks, OneCommand, GuestRestart, T2HostRebuild, Golden, SignInData, Workload, SqlVmInventory, JumpstartStatus, Destroy, Teardown, and Repo.*, 1,393 passed, 0 az calls, and 1 failed that fails the same way with the source at HEAD: Teardown's "stay out of the static run" starts a child `pwsh` that imports Pester 5.9.1 by version, which on this PC resolves to a copy without `Pester.ps1`. With HEAD's five source files and the tests kept, all 6 new tests fail: the fresh name (no PUT to the skipped name, no leftover or delete wait, nothing reported as stuck); the cleanup (an abandoned copy and the old fixed name go, a read in progress stays); the fallback at 24; the backstop (90 then the whole wait, a different name, only once, and the caller's own watchdog first); the callers' switches; and the loader's **Warning**. PSScriptAnalyzer on the changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live.** The handler's behavior is from its own logs on `archost01`; a fresh name avoiding it is how the RCA export's unique names behaved there.
+- **More Run Command names on a VM for a moment:** each read's copy goes when its delete finishes. Where Azure's deletes stall (2026-11-13), copies stay until they're an hour old, and at 24 a read falls back to its fixed name, as before.
+- **A read that waits behind the VM's extension work** (a policy's `MDE.Windows` update) is deleted after 90 seconds and created again, which waits as long as before plus one delete.
+
+### The review of F30: a deployment's own accounts count once, and an offer's default is called that (2026-11-22)
+
+**Why.** The review of F30 (a6b8c2bc) found two Low false-**Fail** paths in `PREFLIGHT.P3.AUTOMATION`:
+
+- **A rebuild right after `./scripts/destroy.ps1` counted its own deleted accounts twice.** The check added the accounts Resource Manager answered 404 for to a Resource Graph count of the region with no name filter, and Resource Graph can list a deleted account for a few minutes. In a subscription with 2 per region, `destroy.ps1 -KeepFabric` then `deploy.ps1` read 2 + 2 > 2, a **Fail** for a deployment that fits.
+- **A quota above the offer's default was missed unless the count already showed it.** An Enterprise or internal subscription can have more than 10, raised on request or kept from before Learn's limits ("would be honored and then considered as your new limit", [Learn's FAQ](https://learn.microsoft.com/azure/automation/automation-subscription-limits-faq)). With 9 or 10 accounts, 9 + 2 > 10 was a **Fail** that called 10 "its quota", though Azure would take them.
+
+**Work summary.**
+
+- **The count:** Resource Graph's query leaves out this deployment's account names (`name !in~ (...)`, [Kusto](https://learn.microsoft.com/kusto/query/not-in-operator)), and each of them counts once: the ones Resource Manager answered 404 for, which it's authoritative on, and the ones it couldn't read, which count the same whether they're there or not. So the sum is the region's count after the deployment, and the evidence adds `needed`. Before, an account it couldn't read made a best and worst case; now a new deployment that doesn't fit either way is a **Fail**, and when only such an account would be over, a **Warning** that says nothing is added if it's there.
+- **The wording:** the offer's number is "Learn's default quota of &lt;n&gt; for &lt;offer&gt;", never "its quota", and a **Fail** for an offer whose default can be raised adds "unless the subscription's quota there is higher". Its fix starts with "Learn's default quota for &lt;offer&gt; is &lt;n&gt; per region. If the subscription's quota for Automation accounts in &lt;region&gt; is higher (the Azure portal's Quotas page, provider Automation accounts, shows it), set automationAccountQuota ...", then frees an account, raises the quota, or moves the region, as before. [Manage Azure Automation subscription limits and quotas](https://learn.microsoft.com/azure/automation/automation-limits-quotas) documents the Quotas page's current usage and limit. A quota from `automationAccountQuota` is the quota, and Free Trial's 1 can't be raised, so those keep their fixes.
+- **Microsoft's internal offer** (`Internal_2014-09-01`) isn't on Learn: its 10 was observed live, and its messages say "as observed (Learn doesn't list this offer)". The offer table records whether Learn documents each offer, and `Get-DemoAutomationAccountLimit` returns it (`Documented`).
+- **Docs:** troubleshooting's three `PREFLIGHT.P3.AUTOMATION` rows, the CHANGELOG's F30 entry, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/AutomationQuotaHelpers.ps1`; tests in `tests/unit/DbHubDemo.Preflight.Tests.ps1` (Resource Graph's fake lists accounts by name and leaves out the names a query excludes); `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: the F30 tests, 17 passed, 0 failed, 0 az calls. With HEAD's `AutomationQuotaHelpers.ps1` and the tests kept, 14 fail, among them both review cases: the rebuild after `destroy.ps1` (a **Pass**, `existing` 0), and an Enterprise subscription with 9 (a **Fail** whose fix starts with `automationAccountQuota`); the 3 that pass at HEAD are an update whose accounts are there, an offer with no documented default, and the check's place in preflight.
+
+**Risks.**
+
+- **Not run live.**
+- **Another environment's account deleted minutes ago still counts,** because Resource Graph can still list it; the fix says so, as before.
+
+### The review of F31: status.ps1's own health read isn't a stuck Run Command (2026-11-22)
+
+**Why.** The review of F31 (c603bb03) found a Medium regression. `Invoke-DemoVmRunCommand -FreshName` doesn't wait for a fresh name's delete, and `status.ps1` reads each running VM's health before `STATUS.RUNCOMMANDS` lists the VMs' Run Commands. On the T2 host, where that list includes the ones Azure is deleting (R871), its own health read was still in Deleting seconds later. So `status.ps1` warned that the host's Run Commands "go with a VM agent that isn't working", with a host rebuild as the fix. The reviewer reproduced it with a fake `Invoke-DemoAz`.
+
+**Work summary.**
+
+- **`Get-DemoVmRunCommandLeftover -IncludeDeleting`:** a Run Command in Deleting whose name ends in a time (`-yyyyMMddHHmmss`: F31's fresh reads, `Get-DemoRunCommandFreshName`'s names, and the session control's `DbHubControl-*`) less than 15 minutes old (`-RecentDeleteMinutes`) is a delete in flight. It's returned in `RecentDeletes`, not as an item. Older ones, and names with no time such as the chunks', are items as before (R871). `Get-DemoRunCommandNameTime` reads the time, a pure helper.
+- **`STATUS.RUNCOMMANDS`** names those deletes in flight only in its evidence (`deletingRecently`).
+- **Docs:** ADR 0012's F31 amendment, troubleshooting (a row for the host's Deleting **Warning**), the CHANGELOG's F31 entry, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/RunCommandHelpers.ps1`; tests in `tests/unit/DbHubDemo.Lifecycle.Tests.ps1`; `docs/adr/0012-validation-model.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode: the leftover Run Command tests, 20 passed, 0 failed, 0 az calls. With HEAD's `RunCommandHelpers.ps1` and the tests kept, the new test fails. It covers a health read 30 seconds into its delete and a control Run Command 14 minutes old, both left out with a **Pass**; then a read 20 minutes old and a chunk, both in the host's **Warning**.
+
+**Risks.**
+
+- **Not run live.**
+- **A delete that's really stuck** shows 15 minutes after its Run Command's time, not at once. `deploy.ps1`'s own watchdog doesn't use this list.
+
+### The review of F31: fresh names for actions too (2026-11-22)
+
+**Why.** The review of F31 (c603bb03) approved fresh names for every `Invoke-DemoVmRunCommand` call that deletes its Run Command, actions included. The handler's skip comes from reusing a name whose last delete never reached it as a disable, whatever the script does, and an action created again right after its delete is the live pattern:
+
+- **`DbHubDemo-HostPassword`,** at least twice a session: a skipped set waited 600 seconds, then failed. At a stop, `STOP.HOSTPASSWORD` reported that the last session's password was still valid, so the guardrail missed; at a start, the presenter got no working password.
+- **The parallel tracks' loader, `DbHubDemo-Bootstrap`:** its retry created the name again seconds after deleting the skipped one, which ended in a stuck **Fail** and **NOT DONE**.
+- `DbHubDemo-ArcProbe`, `DbHubDemo-ArcOnboard`, and the occasional ones: `MonitoringRestart`, `DiskWipe`, `SignInData`, `Golden`, `GuidedSetup`, `SqlProductKey`, and `GuestRebuild`.
+
+**Work summary.**
+
+- **`Invoke-DemoVmRunCommand -FreshAction`:** the script runs under `<name>-yyyyMMddHHmmss` (`Get-DemoRunCommandRunName`, F31's `Get-DemoRunCommandReadName` renamed, with `-LeaveFixedName`). Otherwise as before:
+  - The fixed name's leftover, an earlier version's or the template's loader, is deleted first, and that delete waited for, at most `-LeftoverWaitSeconds`. A delete Azure doesn't finish gets a log line, since the fresh name doesn't need it.
+  - Its own delete is waited for, and copies whose run stopped waiting for them (an hour or more after their time) go with the next run of the same action.
+  - It's never sent twice: `-PendingRetrySeconds` is refused without `-FreshName`, and `-FreshName` with `-FreshAction`.
+  - At 24 Run Commands on the VM, it runs under its fixed name, as before.
+- **The callers:** the twelve actions pass `-FreshAction`, two through their splats, and the three reads keep `-FreshName`. A test parses the module and pins each call's kind, so a new caller has to choose.
+- **Kept:** `DbHubDemo-Profile` and the template's `DbHubDemo-Bootstrap`, which keep their names: each profile change updates `DbHubDemo-Profile` in place, and the template updates `DbHubDemo-Bootstrap` in place, which the parallel tracks' loader deletes first (corrected by the review of 8ff25e95; this said "never deleted").
+- **By prefix:** `Wait-DemoBootstrapLoader` reads the newest `DbHubDemo-Bootstrap-<time>` when `DbHubDemo-Bootstrap` isn't there (`Get-DemoRunCommandCopyName`). That covers `INFRA.BOOTSTRAP.LOADER_<vm>`, validation's loader read, and the `-Sequential` Bootstraps stage. `STATUS.RUNCOMMANDS` already listed every `DbHubDemo-` copy by its prefix, and its fix now says when a fresh copy goes. Nothing else reads an action by its name: `destroy.ps1` deletes the resource group, `stop-demo.ps1` and `deploy.ps1` clean only the chunks, by their prefix, and `start-demo.ps1` and the session control's runbooks only the `DbHubControl-` ones.
+- **Existing deployments:** an update from bf010ed changes nothing on the VMs until an action runs. Its first run deletes the fixed-name leftover, waited for, then runs under its fresh name; a leftover of an action that doesn't run stays in `STATUS.RUNCOMMANDS`, as before.
+- **`DEPLOY.ARTIFACTS.STALL_SQLVM01`, checked: not this.** In fz, fn, fu, rb (twice), and ra, it came on a new `sqlvm01`, or, in rb's update, with a new bundle and runner. Either way the VM had never run those chunk names, and Azure was installing or finishing its SQL IaaS Agent and Defender for SQL extensions. A chunk set never deletes and creates a name again; chunk names repeat only when the same content goes to the same VM again, which this leaves as it is.
+- **Docs:** ADR 0012's second amendment, troubleshooting (the F31 log row, a row for the new log line, and the leftover row), the CHANGELOG's F31 entry, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Invoke-DemoVmRunCommand.ps1`, `Public/Wait-DemoBootstrapLoader.ps1`, `Public/Set-DemoVmLocalPassword.ps1`, `Public/Invoke-DemoArcOnboarding.ps1`, `Public/Set-DemoArcSqlProductKey.ps1`, `Private/RunCommandHelpers.ps1`, `Private/TrackHelpers.ps1`, `Private/SqlVmMonitoringHelpers.ps1`, `Private/SignInDataHelpers.ps1`, `Private/GoldenHelpers.ps1`, `Private/GuidedStopHelpers.ps1`, `Private/T2GuestHelpers.ps1`; tests in `tests/unit/DbHubDemo.Arc.Tests.ps1`, `DbHubDemo.Bundle.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`; `docs/adr/0012-validation-model.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode:
+
+- Arc, Bundle, Validation, Lifecycle, Tracks, OneCommand, OneClick, GuestRestart, T2HostRebuild, Golden, SignInData, Workload, SqlVmInventory, JumpstartStatus, Destroy, KeyVault, Progress, and FirstRun: 1,354 passed, 0 failed, 0 az calls. Repo.*: 207 passed, 0 failed, 3 skipped.
+- With HEAD's 12 source files and the tests kept, all 8 new tests fail:
+  - the action's fresh name, with the fixed leftover's delete and its own delete waited for;
+  - the copies' cleanup;
+  - the refused retry and the two switches;
+  - the test that pins each call's kind;
+  - the host's password at a stop, and the parallel tracks' loader, each while the handler skips its fixed name (a **Fail** at HEAD, a **Pass** now);
+  - the loader check reading the newest fresh copy;
+  - `STATUS.RUNCOMMANDS`'s fix.
+- PSScriptAnalyzer on the 15 changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live: this needs a live proof before it ships.** A proof, on a net-new deployment and on an update from bf010ed:
+  - `./scripts/start-demo.ps1` and `./scripts/stop-demo.ps1`, twice in a row: `START.HOSTPASSWORD` and `STOP.HOSTPASSWORD` pass, with no 600-second wait;
+  - `./scripts/deploy.ps1`: `INFRA.BOOTSTRAP.LOADER_*` pass, with `DbHubDemo-Bootstrap-<time>` in the log;
+  - then `./scripts/validate.ps1` and `./scripts/status.ps1`: the loader checks pass, and no copy is left once its delete finishes.
+- **Live evidence of the cause, on the release's code (2026-11-22):** two updates of the final tests' environment, on the RCA branch, started `sqlvm01` from deallocated, and the loader's first run under `DbHubDemo-Bootstrap` stayed Pending for 923 and 928 seconds. After the watchdog's restart, the same name ran in 63 seconds in the first update, and stayed Pending another 929 seconds in the second, which ended **NOT DONE** (`DEPLOY.EXTENSIONS_SQLVM01`, `INFRA.BOOTSTRAP.LOADER_SQLVM01`, and `DEPLOY.TRACK.T1` **Fail**). This fix runs both under names the handler has never seen ([the check](#a-loader-not-done-on-the-release-code-checked-against-the-fresh-names-2026-11-22)). It's evidence of the cause, not the proof above, which still has to run.
+- **An action at 24 Run Commands on its VM** runs under its fixed name, as before, and can still meet the skip.
+- **Chunk names** repeat when the same content goes to the same VM again; unchanged here.
+
+### A health Warning that's expected says so (F32, 2026-11-22)
+
+**Why.** Live on `dbhubra`, `validate.ps1`'s `INFRA.HEALTH.ARCHOST01` was a **Warning** that read "Every step is in the desired state", without the reason. The reason was health.json's own Warning from the new host's sign-in cleanup, which is by design. That release had no F24, which since names each warning's step; it still didn't say when a warning is expected.
+
+**Work summary.**
+
+- **`Get-DemoHealthWarningNote`** (`INFRA.HEALTH.<vm>` and `STATUS.VM_<vm>`) recognizes the one-off notes that a new VM's bootstrap gives by design (`$script:DemoHealthExpectedNote`), with or without their step's name:
+  - a sign-in cleanup that cleared an event log, after T2's Arc onboarding on a new host or a rebuilt guest;
+  - the restart SQL Server setup asks for when it removes Analysis Services and Integration Services from a new T1;
+  - T1's sysadmin recovery, which its image's SQL IaaS Agent least-privilege mode needs;
+  - Jumpstart's image checked by its length and pinned SHA-256 without Content-MD5.
+- **Left out:** a download without a pinned SHA-256, which is the repository's to fix, and automatic sign-in left armed, which nothing in the demo does. These are `vm/bootstrap/lib/State.ps1`'s legacy one-off notes, less those two.
+- **The message** adds "That's expected: ..." (or "Those are"), or "`<n>` of them are expected: ..." beside other warnings. When every warning is one, the fix is "Nothing to do: it's expected, and the next bootstrap generation clears it ...". The status stays health.json's own **Warning**, and the evidence adds `warningsExpected`.
+- **Docs:** a troubleshooting row, the CHANGELOG's F24 entry, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/ValidationHelpers.ps1`, `Private/ValidationAreas.ps1`; tests in `tests/unit/DbHubDemo.Validation.Tests.ps1` and `DbHubDemo.Lifecycle.Tests.ps1`; `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode:
+
+- Validation, Lifecycle, Tracks, Progress, and Repo.NeutralWording: 576 passed, 0 failed, 0 az calls.
+- With HEAD's two source files and the tests kept, the new test fails, and so do F24's two exact messages, which now name what's expected.
+- The new test covers a host whose only warning is the sign-in cleanup (expected, nothing to do), an older bundle's note without its step, the cleanup beside a lasting warning (one expected, the general fix), and automatic sign-in left armed (not expected).
+- PSScriptAnalyzer on the changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live.** The notes are matched by their text; a note reworded on the VM side reads as unexpected, as before F32.
+- **The Warning stays,** so a new deployment still ends with these Warnings. Calling them a **Pass** would differ from health.json's own status; that's the owner's call.
+
+### The review of 8ff25e95: a stuck action name is reported, and each chunk send has names of its own (2026-11-22)
+
+**Why.** The review of 8ff25e95 found one Low and a doc nit, asked for one log line, and approved a per-send suffix for chunk Run Commands:
+
+- **An action's stuck fixed-name leftover wasn't recorded as stuck.** With `-FreshAction`, a fixed-name leftover whose delete Azure didn't finish got only a log line, never `$script:DemoRunCommandStuckName` or `$script:DemoRunCommandStuck`, which `Resolve-DemoRunCommandFreshName` fills. So each later call of that action in the run waited the whole 300 seconds again (before, 30 at most), and `DEPLOY.RUNCOMMAND.STUCK_<VM>` was never reported. The log's "STATUS.RUNCOMMANDS lists it until then" was false on `sqlvm01`, where `status.ps1` leaves out what Azure is deleting. For example, a `DbHubDemo-Golden` from bf010ed that Azure keeps in Deleting for hours (2026-11-13) would cost each golden action 300 seconds, with nothing on the status page.
+- **ADR 0012 said the template's `DbHubDemo-Bootstrap` is never deleted;** every parallel-track loader deletes it first.
+- **The 24-of-25 fallback's log** named the count and the fixed name, but not that the handler can skip that name, so a later "didn't start" read as extension work.
+- **Chunks were the only Run Commands still read without `-NotBeforeUtc`,** and the same content sent to the same VM again reused each chunk's name: after a stalled or interrupted transfer, or the loader's missing-chunk recovery. A reused name could be skipped (a wait of 600 + 300 seconds, then a failure), or report an earlier run's **Succeeded** (the 2026-10-21 case), after which the loader finds the chunk missing. A rebuilt host isn't exposed: its rebuild deletes the VM and its disks.
+
+**Work summary.**
+
+- **The stuck name:** when an action's fixed-name delete doesn't finish, `Invoke-DemoVmRunCommand -FreshAction` records it as `Resolve-DemoRunCommandFreshName` does: the VM and name in `$script:DemoRunCommandStuckName`, and an entry in `$script:DemoRunCommandStuck` with the fresh name the step used. `DEPLOY.RUNCOMMAND.STUCK_<VM>` reports it, and the same action later in the process waits 30 seconds at most. The log says so, as the stuck path's does, without the claim about `STATUS.RUNCOMMANDS`. The guided stop's progress note, which said a stuck name on `archost01` meant its health reads ran under a fresh name, now says the step that uses it did.
+- **The fallback's log** adds that the VM's Run Command handler can skip a name it ran before until that name's delete reaches it, so a step that then doesn't start has that cause, not extension work. Its last sentence now says what `status.ps1` lists: those not being deleted.
+- **Chunk names:** `Send-DemoChunkSet` gives every chunk of a call one suffix (`Get-DemoChunkSendSuffix`), on a copy of the caller's chunk: `DbHubDemo-Chunk-<sha12>-<nnn>-s<6 hex digits>`, which is no 14-digit time.
+  - The VM writes `downloads\<sha12>\chunk-<nnn>` whatever the name and skips a chunk already there, and the loader verifies the bundle.
+  - Resuming goes by `BundleSentTo` and `RunnerSentTo`, and every cleanup matches `DbHubDemo-Chunk-*`.
+  - A name Azure keeps marked for deletion still runs as `<name>-yyyyMMddHHmmss`.
+- **c191a4c0's 15-minute rule leaves chunks out:** `STATUS.RUNCOMMANDS` counts every chunk Azure is deleting on the T2 host, whatever its name, since that's R871's sign, and a held chunk's fresh name ends in a time.
+- **Docs:** ADR 0012 (the "never deleted" correction, the stuck record, the fallback's log, and chunks in the 15-minute rule), a new ADR 0003 amendment, `vm/bootstrap/README.md`, troubleshooting (the action's log row, a row for the 24-of-25 log, and the host's Deleting row), the CHANGELOG's F31 entry, and this report, whose 8ff25e95 section said "never deleted" too.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Invoke-DemoVmRunCommand.ps1`, `Public/New-DemoBootstrapChunk.ps1`, `Private/RunCommandHelpers.ps1`, `Private/GuidedStopHelpers.ps1`; tests in `tests/unit/DbHubDemo.Arc.Tests.ps1`, `DbHubDemo.Bundle.Tests.ps1` (a fixed suffix, so the fake can name a chunk before it's sent; one test uses the real one), and `DbHubDemo.Lifecycle.Tests.ps1`; `docs/adr/0003-t2-host-size-security-type-bootstrap.md`, `docs/adr/0012-validation-model.md`, `docs/troubleshooting.md`, `vm/bootstrap/README.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode:
+
+- Arc, Bundle, Validation, Lifecycle, Tracks, OneCommand, OneClick, GuestRestart, T2HostRebuild, Golden, SignInData, Workload, SqlVmInventory, JumpstartStatus, Destroy, KeyVault, Progress, and FirstRun: 1,358 passed, 0 failed, 0 az calls.
+- With HEAD's four source files and the tests kept, the 4 new or extended tests fail:
+  - the stuck fixed name: waits of 300, then 30 seconds, `DEPLOY.RUNCOMMAND.STUCK_ARCHOST01`, and the log;
+  - the fallback's log;
+  - one suffix for every chunk of a send, both files', another for a resend, the same scripts, and the caller's chunks unchanged;
+  - a chunk Azure is deleting on the host, with a recent time in its name, still counted.
+- PSScriptAnalyzer on the changed PowerShell files: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live: the chunk names need a live proof before they ship,** with 8ff25e95's. On a net-new deployment and an update from bf010ed, `./scripts/deploy.ps1` delivers each VM's chunks as `DbHubDemo-Chunk-<sha12>-<nnn>-s<6 hex digits>`, `INFRA.BOOTSTRAP.LOADER_*` pass, and `./scripts/status.ps1` shows no chunk left once its deletes finish.
+- **Longer chunk names:** 40 characters, and 55 for a held chunk's fresh name, the fallback. Learn names no length rule for a Run Command's name; the longest chunk name that ran live had 47 (2026-11-16).
+
+### Run all names a duration outside a session's bounds as the cause (F33, 2026-11-22)
+
+**Why.** Live at 14:20, with `DURATION_MINUTES = 20`, Run all said: "Nothing is started: the VMs' nightly auto-shutdown is at 19:00 (Eastern Standard Time), too soon for a session of at least 30 minutes." The cause was the duration asked. The control notebook's `session_plan` set `ok` to `planned >= minMinutes`, and `plan_lines` named the auto-shutdown whenever `ok` was false. The same code is at bf010ed.
+
+- **Over the showcase's 120 minutes:** the plan capped 150 at 120 and said "This session runs 120 of the 150 minutes asked: it ends at ..., before the VMs' nightly auto-shutdown", which named the wrong cause too. Then the session's request failed at `build_request` ("DURATION_MINUTES must be a whole number from 30 to 120"), as the runbook would have refused it.
+- **Without an auto-shutdown,** a duration under 30 read "This session runs 20 minutes" while nothing started.
+- **The runbook isn't affected:** its request check refuses a session's `durationMinutes` outside `minSessionMinutes` to the showcase's maximum, so its "too soon" refusal only ever means the auto-shutdown.
+
+**Work summary.**
+
+- **`session_plan`** refuses a duration outside `minMinutes` to the showcase's `maxMinutes`, as the runbook does, and says which bound (`durationOut`: `short` or `long`). It also says whether the auto-shutdown alone leaves less than `minMinutes` (`shutdownShort`). Within the bounds, the plan is the same as before.
+- **`plan_lines`** names the duration first:
+  - "Nothing is started: a session runs at least 30 minutes, and you asked for 20." with "Fix: set DURATION_MINUTES to 30 or more, then Run all again.";
+  - "at most 120 minutes ... 150" with "120 or less";
+  - when the auto-shutdown is too soon as well, "The VMs' nightly auto-shutdown at 19:00 (...) is too soon for one now, too.", and the fix adds "Run all again earlier in the day, or set autoShutdownTime ...".
+  - Within the bounds, the auto-shutdown's lines are as before.
+- **Docs:** troubleshooting (a row for the duration, and one for the auto-shutdown's own refusal, which had none), the control notebook's guide (`fabric/control/README.md`), the CHANGELOG, and this report.
+
+**Changed files.** `fabric/control/NB_DatabaseHub_Control.ipynb` (cell 4: `session_plan` and `plan_lines`); tests in `tests/unit/Fabric.ControlNotebook.Tests.ps1`; `docs/troubleshooting.md`, `fabric/control/README.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode and the bundled Python:
+
+- Fabric.ControlNotebook, ActivityControl, Fabric.Notebooks, and Docs.Walkthrough: 389 passed, 0 failed, 0 az calls. Repo.*: 207 passed, 0 failed, 3 skipped.
+- With HEAD's notebook and the tests kept, 3 tests fail:
+  - the plan test: 20 minutes at 14:20 and at 18:40, 150 minutes, and 20 minutes with no auto-shutdown;
+  - Run all with `DURATION_MINUTES = 20` at 14:20, which now sends nothing, names the duration, and doesn't say "too soon";
+  - Run all with 150, which at HEAD ended with `build_request`'s ValueError and now sends nothing and names the bound.
+- The other 20 Run all cases pass, the shutdown's refusal among them, unchanged. PSScriptAnalyzer on the test file: 0 findings. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live;** the notebook reaches a Fabric workspace with the next `./scripts/deploy.ps1`.
+- **A duration that isn't a whole number** (45.5, say) still plans its whole part and fails at the request, with `build_request`'s message, as before. The Insights app sends whole numbers from 30 to 120. (Fixed by its review, below.)
+
+### The review of F33: one rule for `DURATION_MINUTES`, a whole number however it arrives (2026-11-22)
+
+**Why.** The review found one Low finding. `session_plan` truncated `DURATION_MINUTES` with `int()` before it checked the bounds, so values that `build_request` refuses passed the plan:
+
+- **45.5** printed "This session runs 45 minutes, until ...", and cell 8 then raised "ValueError: DURATION_MINUTES must be a whole number from 30 to 120."
+- **90.0 and "90"** did the same, although the parameters cell says a parameter may arrive "as a string, a number, or a bool".
+- **20.5** read "you asked for 20", and **True** read "you asked for 1".
+- **None and "abc"** raised a raw TypeError or ValueError in cell 7.
+
+The coordinator's decision: one shared rule, which accepts a whole number however it arrives (an int, a whole float, or text such as "90" or " 90 ") and refuses a bool, None, a fraction, and anything that isn't a number, with the refusal up front and the input quoted as it was given.
+
+**Work summary.**
+
+- **`_whole_number`** (cell 4) returns the int for an int, a whole float, or text of a whole number (optional sign, ASCII digits, an optional `.0`, surrounding spaces). It returns None for a bool (True is an int in Python), None, a fraction, NaN or infinity, and anything else: "abc", "1e2", and "9_0" or non-ASCII digits too, which `int()` alone would read as 90.
+- **`session_minutes`** is the one reading of a session's duration, for both `session_plan` and `build_request`: the minutes, the runbook's bounds (`minMinutes` and the showcase's `maxMinutes`), and `out`: "", "notWhole", "short", or "long". So the plan and the request can't disagree.
+- **`_whole`** coerces with `_whole_number` and returns the int, so the request carries 90 for "90" or 90.0. It also reads an `"activities"` run's `DURATION_MINUTES`, `intensity`, and `concurrency`, each still checked against its own bounds, so "8" goes as 8 and 8.5 or True is refused as before.
+- **`session_plan`** adds `given`, the input as it was given (`_as_given`: text in double quotes, anything else as Python writes it, redacted and capped at 40 characters). **`plan_lines`** has a third `durationOut`: "Nothing is started: a session runs a whole number of minutes, from 30 to 120, and you asked for 45.5." with "Fix: set DURATION_MINUTES to a whole number from 30 to 120, then Run all again." A coerced value outside the bounds keeps the short or long line and quotes the input as given ("you asked for "20"", "150.0"). The auto-shutdown's tail and fix are as in F33.
+- **Callers checked:** the Insights app sends `DURATION_MINUTES` as a whole number from 30 to 120, typed `int` (`fabric/app/src/lib/control.ts` checks it with `Number.isInteger` against `SESSION_MINUTES` in `src/lib/scenarios.ts`), and its copied notebook parameters are an int literal (`DURATION_MINUTES = 90`). No script passes it, and the runbook checks the int it's sent (`Test-DbHubControlRequest`). No caller relies on text being refused: only more inputs are accepted. `REFRESH_SECONDS`, `WATCH_MINUTES`, and `LOOKBACK_MINUTES` don't use `_whole`, and are unchanged.
+- **Docs:** the troubleshooting row (the third line, the accepted forms, and what "None" means), the control notebook's guide, the CHANGELOG's F33 entry, and this report.
+
+**Changed files.** `fabric/control/NB_DatabaseHub_Control.ipynb` (cell 4: `_WHOLE_TEXT`, `_whole_number`, `_as_given`, `_whole`, `session_minutes`, `build_request`'s session branch, `session_plan`, and `plan_lines`); tests in `tests/unit/Fabric.ControlNotebook.Tests.ps1`; `docs/troubleshooting.md`, `fabric/control/README.md`, the CHANGELOG, and this report.
+
+**Validation.** Pester with StrictMode and the bundled Python:
+
+- Fabric.ControlNotebook: 69 passed, 0 failed, 0 az calls.
+- With b481889b's notebook and the tests kept, 6 tests fail:
+  - the plan test (45.5, None, "abc", True, and 20.5 now refused as not whole; "20" and 150.0 quoted as given; 45.5 at 18:40 with the auto-shutdown's tail; "90", " 90 ", and 90.0 planned as 90);
+  - the `build_request` test (14 more requests, and the plan going ahead exactly when the request is built, for the same minutes, for 520 values at 09:00);
+  - Run all with 45.5, None, and "abc", which now send nothing and quote the value, and with "90", which now runs a 90-minute session and sends the int 90.
+- **The reviewer's check, repeated:** old and new `session_plan` and `plan_lines`, for whole numbers from 30 to 120 at every minute of 2026-11-14, with and without an auto-shutdown, in UTC and US Eastern: 524,160 comparisons against b481889b and 524,160 against 17be6286 (before F33), 0 differences. Every key of the old plan has the same value in the new one, and the lines are the same.
+- The 14 other suites that read the control notebook or its guide (ActivityControl, Destroy, FabricApp, FabricItem, FabricTrack, FirstRun, Golden, HistorySnapshot, Lifecycle, OneCommand, SafetyStop, Tracks, Fabric.Notebooks, and Docs.Walkthrough): 1,520 passed, 0 failed, 0 az calls. Repo.*: 207 passed, 0 failed, 3 skipped. PSScriptAnalyzer on the test file: 0 findings; it's ASCII-only. markdownlint: clean.
+
+**Risks.**
+
+- **Not run live;** the notebook reaches a Fabric workspace with the next `./scripts/deploy.ps1`.
+- **A showcase without `maxMinutes`** now has no upper bound for a session, where `build_request` raised a KeyError. The catalog always has it (setup bakes the showcase's 120 into it).
+
+### F34: connection-surge's signal is Connections at the limit (2026-11-22)
+
+**Why.** The Incident RCA's live test (2026-11-21, two new environments on the default `Standard_D4ds_v5`) found that the connection surge's promised signal never appears:
+
+- The scenario's own client recorded 48 attempts past the limit that the server refused with SQLSTATE 53300, "too many connections": 2 in each of 24 waves over 7 runs.
+- Azure Monitor's `connections_failed` stayed 0 in every interval, 31 samples over the first environment's 2 hours among them. Its `active_connections`, the highest value in each 5-minute interval, read 36 to 39 in every surge and 28 or less outside them; the RCA's own capture, every 5 seconds, saw all 35 slots clients can use taken at the peaks.
+- Learn defines Failed Connections only as "Number of failed connections" ([monitoring and metrics](https://learn.microsoft.com/azure/postgresql/monitor/concepts-monitoring)). Database Hub's PostgreSQL dashboard charts that same metric as **Failed connections** ([monitor PostgreSQL](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql), its signals table), so its tile reads what stayed 0. Whether the tile itself would show more can't be told without a live look; Azure Monitor's 0 is the evidence.
+- The release promised **Failed connections** above 0 (`scenarios/connection-surge/scenario.json`'s expected signals and `overshoot`, its README), and several places relied on it: the business lens ("connection attempts refused", evidence "failed connections"), the Estate page's **Failed connections** tile at **Pass** for 0, Mission Control's T4 card, `T4.MAXCONNECTIONS`'s messages, the template's and `config/versions.json`'s notes, the runner's comments, the notebook's failed-connections finding ("No failed connections on T4"), and the walkthrough, the visuals guide, deployment, and limitations. R645 waited for this live check.
+- Checking the scoreboard found more: a session's T4 beats aren't in `Scenario Runs` (ADR 0030), so its surges never reached the scoreboard, and T4's measured episodes were CPU and read replica lag only. A surge that a plan did record was **Not supported** under "Buffer IO (PAGEIOLATCH) waits", because the keyword "io" matched inside "connection", in the app's `expectedFamilies` and the notebook's `expected_signals`; `idle-in-transaction` read as IO pressure the same way.
+
+**The coordinator's decision.** The scenario's behavior stays as it is. Its measured signal is T4's **Connections** at the server's usable limit, 35 or more (`max_connections` 50, less the 15 that Azure reserves for physical replication and monitoring, [limits](https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits)), with **Sessions By State**'s idle count beside it. Nothing claims refusals from failed connections: where refusals matter, the demo says that at the limit a new client is refused, and that Azure Monitor's failed-connection count doesn't show it. R645 is closed with the live result.
+
+**Work summary.**
+
+- **The scenario:** its expected signals name Connections at 35 or more, the slots clients can use, with a note that a client refused at the limit isn't in Failed connections, and Sessions By State; Failed connections is no longer one. `overshoot` says the run's events record the refusals and Azure Monitor didn't count them. The README states the live result.
+- **The live-activity notebook:** `SCENARIO_SIGNALS` maps `connection-surge` to `connections` (labeled "Connections at the limit"), and a keyword matches only at a word's start. A new `postgresql.T4.connections` finding gives T4's peak active connections against the slots clients can use, a **Warning** at 35 or more with "At the limit, PostgreSQL refuses a new client (too many connections), and Azure Monitor's failed connections don't count that refusal." `postgresql.T4.connections_failed` keeps its statuses and adds "They leave out a client refused at the connection limit (too many connections), so T4's active connections show a connection surge."; at 0 it reads "Azure Monitor counted no failed connections on T4 ...". `POSTGRES_MAX_CONNECTIONS` (50) and `POSTGRES_RESERVED_CONNECTIONS` (15) are pinned to `config/versions.json` by a test, in the notebook and the app.
+- **The Insights app:**
+  - A session's surges are T4's measured episodes (`postgresEpisodes`, connections at 35 or more), in the scoreboard's "T4 and T5: what their metrics show", the ribbon, the replay's bands, the map, and the postmortem.
+  - A recorded surge's **Signal seen?** is graded by the latest capture's connections in its window (`scoreConnectionSurge`): **Pass** at 35 or more, with when, its peak, its recovery, and its impact; **Warning** when they stayed under, with their peak; **Not supported** when no capture in view covers it. `episodesIn` doesn't list its episode again. The scoreboard waits for T4's capture to load, as it waits for the bins.
+  - The business lens reads "Reporting: connections at the server's limit for 10 min (active connections peak 39, at or above the 35 slots clients can use)".
+  - The Estate page's **Connections, peak** tile (a **Warning** at 35 or more) replaces the **Failed connections** tile. Its chart draws the line at 35, keeps failed connections dashed, and its subtitle and summary say what they leave out. Mission Control's T4 card shows "Conn. peak 39 / 35" instead of "Failed conn.".
+  - `failedConnectionsInsight` says what failed connections leave out. The preview's samples show the surge as measured live: connections at 37 or 38, failed connections at 0, and the notebook's new findings.
+- **Scripts and template:** `T4.MAXCONNECTIONS` says the surge reaches the limit, which Database Hub's Connections chart shows; the template's description of `maxConnections` and `config/versions.json`'s note say the same (`azuredeploy.json` rebuilt with Bicep 0.47.16; only the two texts and their template hashes changed); and the runner's two comments say the run's events record the refusals.
+- **Docs:** ADR 0019 (status, the 2026-11-03 section's validation, and an amendment), ADR 0030 (its T4 episodes, and an amendment), the walkthrough's scenario row, the visuals guide's Connections and Failed connections rows and its threshold list, limitations (the scenario's line, and Not proven live: the other sizes only), deployment, `fabric/README.md`'s findings, the app's guide, troubleshooting (a T4 row for Failed connections at 0, and a scoreboard row), the CHANGELOG, R645, and this report.
+
+**Changed files.** `scenarios/connection-surge/scenario.json` and `README.md`; `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb` (cells 4 and 5, and section 7's T4 guide); `fabric/app/src/lib/business.ts`, `health.ts`, `insights.ts`, and `scoreboard.ts`, `src/mission/use-mission.ts`, `src/pages/EstatePage.tsx`, `src/preview/sample-data.ts` and `sample-session.ts`, and the tests `src/lib/mission.test.ts`, `insights.test.ts`, `src/pages/pages.test.tsx`, and `src/test/render.tsx`; `scripts/modules/DbHubDemo/Public/Test-DemoT4.ps1`; `infra/modules/pgflex01.bicep`, `azuredeploy.json`, and `config/versions.json`; the runner's `Postgres/ConnectionSurge.cs` and `PgScenarioRunner.cs` (comments only); `tests/unit/Fabric.Notebooks.Tests.ps1` and `DbHubDemo.T4.Tests.ps1`; and the docs above.
+
+**Validation.**
+
+- **The app** (`npm run typecheck`, `npm run lint`, `vitest run`): 351 passed, 0 failed. With 6d597572's sources and these tests, 8 fail: the business lens, the scoreboard's grade (Pass, Warning, and Not supported), the keyword rule, the T4 card, the session's episodes and the recorded surge listed once, the failed-connections insight, and the Estate page's tile, chart, and words.
+- **Pester** with StrictMode and the bundled Python, every unit suite but Repo.*: 5,119 passed, 1 failed, 1 skipped, 0 az calls. The failure is this PC's alone: Teardown's child `pwsh` loads the OneDrive copy of Pester 5.9.1, which lacks `Pester.ps1`. Repo.*: 207 passed, 0 failed, 3 skipped. With 6d597572's notebook, `Test-DemoT4.ps1`, and the app's two files, 4 fail: the notebook's T4 capture test (the new finding, the failed-connections words, the live and under cases), its new expected-signals test, and `T4.MAXCONNECTIONS` in effect and at a size's default.
+- **The runner** (`dotnet test`, the ConnectionSurge, Catalog, and Postgres tests): 207 passed, 1 skipped; the scenario's texts keep the bounds its test pins.
+- **STATIC.BICEP:** builds and lints, and `azuredeploy.json` is in sync. PSScriptAnalyzer on the changed PowerShell: 0 findings; ASCII-only. markdownlint: clean. No live resource name is in the tree.
+
+**Risks.**
+
+- **Not run live:** the app's grades and the texts reach a deployment with the next `./scripts/deploy.ps1`; the measurements behind them are the live run's. The notebook's changes reach a new workspace then, but an existing one only with `fabric.importNotebooks` true, `./scripts/deploy.ps1 -ImportNotebooks`, or `./scripts/configure-fabric.ps1`: otherwise `deploy.ps1` passes `-NewNotebooksOnly`, so its `configure-fabric.ps1` step imports only the notebooks a workspace lacks. Until then its notebook has no `postgresql.T4.connections` finding and no caveat on failed connections, and labels a surge's window "IO pressure"; the app's grades don't depend on it (F34's review). Every scenario's file is in the runner's source hash, so an update rebuilds and resends the runner, as this branch's earlier changes to `plan-regression` and the SQL procedures already do.
+- **35 is the default's usable slots:** Learn says the 15 reserved slots "can change". The notebook and the app count them as constants, pinned to `config/versions.json`'s 50 by a test, and a change on Azure's side would move the line.
+- **Azure Monitor counts the reserved slots' sessions too,** so a reading of 35 could leave a client slot or two free; the surges read 36 to 39 live, and everything else 28 or less.
+- **A capture every 5 minutes** sets a surge's grade by its interval: a 4-minute beat shows in one or two intervals, and its time to signal is 0 when an interval starts before it.
+- **Sessions By State's idle count isn't in the history:** `POSTGRES_METRICS` doesn't capture it, so the app and the notebook grade by Connections alone; the docs point to the Azure portal's Metrics for it.
+
+### F35: overlapping history saves, each interval from its finest save (2026-11-22)
+
+**Why.** The Incident RCA's integrator found two saves that overlap at different grains in a live test's history (2026-11-21): the session's own at its end (T5 every minute, T4 every 5 minutes) and the day-long one `./scripts/deploy.ps1` saved four hours later (both every 15 minutes). The model's measures keep the newest capture of each bin (`Snapshot Value`), and so did the RCA's first query, so T5's first storm counted 52,450 requests and 27,815 429s, where the 1-minute rows give 24,820 and 13,222; a replica-lag peak came from the 15-minute point (178 s, against the 5-minute 148 s); and one storm read as two incidents.
+
+The read-only answer, first:
+
+- **What reads the newest capture per bin:** the model's base measure `Snapshot Value`, under every T1 to T3 telemetry measure (Estate, Replay, the scoreboard's bins, Trends, the history report) and T5's model measures (Ask). The app's T4 and T5 reads (`postgres-series`, `cosmos-series`) read the latest save alone: they don't double, but they lose a session's own points once a coarser save is newer.
+- **The flows that overlap:** Run all's session save (its window, so 1 minute for SQL), `./scripts/stop-demo.ps1 -SaveHistory` (12 hours, 5 minutes), and `./scripts/deploy.ps1`'s snapshot at every run that reaches validation (a day, 15 minutes). A Run all session, then an update within a day, doubles T1 to T3's sums over the overlap, and shows a spike at each coarse bin.
+
+**The coordinator's decision.** Two commits, so the second can be held back: part 1 for the app's T4 and T5 reads, and part 2 for the model's `Snapshot Value`, proven live on that history's model with no redeploy. One shared rule, written here and copied verbatim to the RCA branch: the finest grain first, then the newest save. A coarser point is left out only where the kept points, cut to their own windows, cover all of it; otherwise it stays for the minutes they don't cover, a total as its total less theirs, and a maximum or an average only when it's higher (the app reviewer's verdict on the live rows, after the RCA's first copy dropped the replica's 34 s for 16:57 to 17:00). No schema change.
+
+**Work summary.**
+
+- **The shared function** (576c356e, b36f6357, 2e1a6d0b, and a390db00 after three reviews), `fabric/app/src/data/finest-per-interval.ts`, with the RCA's interface at ebd1c6c3 (kept rows, and each point's interval by `pointKey`), plus each point's grain and marks:
+  - A point's grain is its save's step, the smallest gap in any of its series, and T5's hourly metrics get at least an hour. Its data is its interval's inside its save's window, so a window that starts or ends inside an interval cuts it. By `pointKey`, `intervals` holds each kept point's span, for coverage and sums; `grains` its save's step, to step runs by and name; `sources` the point each piece of a coarser point came from; and `upperBounds` the split peaks. Marks sit beside the rows, not in them, so a consumer that decodes the rows still finds them.
+  - Each uncovered stretch of a coarser point is a point of its own, at its start, with its own span; a total is split across stretches by length, in whole numbers. A peak over two or more stretches is given to each, as upper bounds of one reading. A lower peak keeps no point but still covers its stretches, so a yet coarser peak can't land where a finer save says the value was lower.
+  - It's called once, on the history's rows as read: a second pass would infer a save's step from its remainders' starts (a 4-minute stretch from 15:41 makes a 15-minute save's step 4) and lose 468 requests on the 15:31 to 15:40 case. So it keeps the copies it makes in a `WeakSet` and throws when one comes back as input; the app's wrappers call it once, on the query's rows.
+  - Totals and peaks by the producers' own aggregations: `ADDITIVE_ANALYSES`, `ADDITIVE_METRICS`, `HOURLY_METRICS`, and `OFF_GRID_ANALYSES`, which a test ties to the notebooks' `add_snapshot` calls and to the Postgres and Cosmos helpers' tables.
+- **Part 1, the app's T4 and T5:**
+  - `postgres-series` and `cosmos-series` read the points of every save whose window overlaps the latest capture's, in that window and a day before it (for the steps of saves that only overlap its start), up to 20,000 rows, the app's bound for any query (`MONITOR_SERIES_ROW_LIMIT`). `cosmos-series` adds the target.
+  - `toPostgresCapture` and `toCosmosCapture` stay pure decoders: given rows alone, as the RCA calls them, they read as at the release, so a merge never runs twice (a second pass would infer a save's step from its remainders' irregular starts). The app's views call `latestPostgresCapture` and `latestCosmosCapture`, which merge every save in the latest capture's window (`latestWindowSaves`) and decode with the marks. They keep the latest capture's window, resources, and step, and leave out another resource's points (an environment deployed again since) and other saves' points outside the window. Each point carries its span (`minutes`), its save's grain (`grain`), and its `source` and `upperBound`; the capture, how many saves it holds (`saves`).
+  - Every consumer uses each point's own: its grain to step runs, judge a gap, and name an interval (the replica's catch-up, the episodes, the surge's bin, the failed-connections insight), and its span for ends, sums, and rates (the throttled runs, the episodes' ends, the surge's window). Runs and episodes count a split reading once (`oneReadingEach`); charts and totals keep every piece. A capture from one save reads as before, but at its window's edges: a point there starts or ends with the window (its chart point, a run, or a throttled interval), and T5's average latency weighs it by the minutes it covers.
+  - Estate's T4 and T5 pages say when the window holds saves at different intervals, then show totals per minute (`perMinute`) and name the interval range; T5's average latency is weighted by interval.
+- **Docs:** troubleshooting (a row, and F34's row's reach), the app's README, and the CHANGELOG.
+- **Part 1's review** (30c8f9b3 to 3fe52edb, 2 Low): connection-surge's note on a run that its metrics break off from names the run's last interval at the slots (`run.last`, as T4's episodes do). It took the newest save's interval from the run's end, so with a day-long save newer than the session's 5-minute one it said 16:42 for 16:55. The replay's 429s lane, on the Replay page and the kiosk, reads per minute where saves at different intervals meet, as Estate does (`cosmosLanePoints`, in `fabric/app/src/mission/timeline.ts`), and its readout then says "429s a minute" (the re-review of a8a12533). Before, it read 13,215 at 15:45 beside the session's 680 to 2,187 a minute.
+
+**Changed files.** `fabric/app/src/data/finest-per-interval.ts` and its test (576c356e, b36f6357, 2e1a6d0b, a390db00); `fabric/app/src/data/queries.ts`, `model.ts`, and `model.test.ts`; `fabric/app/src/lib/scoreboard.ts` and `insights.ts`; `fabric/app/src/pages/EstatePage.tsx`, `OverviewPage.tsx`, and `pages.test.tsx`; `fabric/app/src/mission/use-mission.ts`; `fabric/app/README.md`, `docs/troubleshooting.md`, `CHANGELOG.md`, and this report. Part 1's review: `fabric/app/src/lib/scoreboard.ts` and `mission.test.ts`, `fabric/app/src/mission/CinematicReplay.tsx` and `timeline.ts`, `fabric/app/src/pages/mission.test.tsx`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **The shared function** (576c356e, b36f6357, 2e1a6d0b, a390db00): 12 tests, from the live rows under placeholder names. With ebd1c6c3's rule, 5 of the first 9 fail: both of the verdict's cases, both window cuts, and the hourly grain. With 576c356e's, 4 of 11: the grains, the remainders' sources, a lower peak covering its minutes among three grains, and a split peak's upper bounds. With b36f6357's, 3: the marks read beside the rows, through a decoder. With 2e1a6d0b's, 1: its own output refused as input. With the release's decoders, as on the RCA branch, the tests pass.
+- **Part 1** (`npm run typecheck`, `npm run lint`, `vitest run`): 370 passed, 0 failed with a390db00. With 2e1a6d0b's app sources, 8 of part 1's fail: the queries' shape; the replica's lag beside a day-long save (its 34 s, its 178 s peak at 16:20, its grains, its episode back under at 16:25); another server's and an older save's points; a save's own 5 minutes when its window starts inside one; one CPU run across a cut point; T5's requests and throttled runs; a split peak read once; and Estate's T5 page.
+- **Part 1's review:** 2 tests, both failing at 3fe52edb. The reviewer's probe in `src/lib/mission.test.ts` reads "break off after 13:42" for 13:55, and the replay's T5 lane in `src/pages/mission.test.tsx` reads "429s 1,500" for 100 a minute; at a8a12533, "429s 100", without "a minute".
+- **Pester** Repo.* with StrictMode: 207 passed, 0 failed, 3 skipped. markdownlint: clean. No live resource name is in the tree.
+
+**Risks.**
+
+- **Not run live:** the two queries run first at the next `./scripts/deploy.ps1`'s app check (`FABRIC.APP.QUERIES`); their rules are tested against the live rows.
+- **A save with one point per series in what's read has no step,** as before: it's an instant, kept unless a kept point covers it. The day before the window makes that rare here; the RCA's narrower windows can hit it.
+- **The row limit:** 20,000 rows hold 20 to 30 saves whose windows overlap the latest one, each at most about 1,000 points (its document's 24 KB bound) and usually 200 to 900. Over it, the query fails as overflow rather than looking complete: T4's or T5's page says the query failed, and the deploy's app check names it (`FABRIC.APP.QUERIES`).
+- **Part 2,** the model's `Snapshot Value`, is its own commit, below.
+
+### F35 part 2: the history model's `Snapshot Value` (2026-11-22)
+
+**Why.** The read-only answer above: the model's `Snapshot Value` took each bin from its newest save, under every T1 to T3 telemetry measure (the history report, and the Insights app's Estate, Replay, scoreboard bins, and Trends) and T5's model measures (Ask). After a session and an update within a day, the day save's 15-minute totals counted beside the session's own minutes.
+
+**The coordinator's decision.** Part 2 is its own commit, held back until it's proven live on that history's model (dbhubrb) with no redeploy. The adds-versus-peaks list by analysis key and metric is approved, with unlisted metrics as peaks and off-grid analyses keeping the newest capture. The grain comes from the SQL save's window, and from the step for Azure Monitor. A partly covered coarse bin's remainder stays at that bin's start: counts add, and peaks take the higher where a finer point shares it. Window totals and peaks must match exactly. That placement, with the replica's 16:45 case as the example, goes in the ADR amendment and the limitations.
+
+**Work summary.**
+
+- **The measure** (`Telemetry Snapshots.tmdl`). Per target, analysis, metric, and bin, it takes each save's point there:
+  - Each save's interval. A SQL save's comes from its window's length, the notebook's own rule (1 minute up to 2 hours, 5 up to 12, else 15). An Azure Monitor save's is the coarsest of the history helpers' intervals that every bin starts on (from midnight UTC, as the helpers bucket them) and that its window can hold its bins in; T5's hourly metrics get at least 60. Their count alone would read a day-long save of a T4 that ran 2 of its hours (8 bins) as every 180 minutes.
+  - Each point covers its interval, cut to its save's window. With no finer save over it, the point stays. Where one finer save's window covers it, it's left out. Otherwise, from the finer rows in its interval (the finest and newest of each bin, and the outermost of nested ones), a total keeps what's left of it, never below 0, and a peak stays only when it's higher. Then totals add and peaks take the highest. Inside a save it sums across instances and files, and off the bin grid the newest capture stays, as before.
+  - **Each save is read whole, whatever the period:** `report_date_utc` is each row's bin date, so the Estate query's `DATESBETWEEN ( 'Date'[Date], ... )` would have cut a day-long save at midnight and changed the step its bins give. The saves, the step, and the partial reads remove the filters on `'Date'` and `Report Date UTC`.
+  - **A finer save's window stands for its rows,** which are read only in a partly covered interval: the model can't read every finer row in every visual's cell at a cost near today's. It agrees with `finestPerInterval` wherever a finer save's rows add up to the coarser totals, as on the live rows (T5's 1-minute rows from 15:30 to 15:44 sum to the day's 27,630 exactly).
+- **The TypeScript reference** (`fabric/app/src/data/snapshot-value.ts`): the same rule, for the tests and the live check. `f35Check` gives the rule's per-bin values and each target's window measures, by the rule and by `finestPerInterval`. `fabric/app/scripts/f35-reference.ts` runs it on `rows.dax`'s result, from objects or arrays beside their column names, as Execute Queries or a harness returns them.
+- **The live check** (`fabric/powerbi/checks/f35`, with a README):
+  - `rows.dax` exports every SQL row near the session, one row with no bin and no value for each SQL series and save whose window overlaps it (the measure sees every save of a series), and every row of the Azure Monitor saves whose window overlaps it.
+  - `snapshot-value-bins.dax` gives today's and the new value per series and bin, and `window-today.dax` and `window-f35.dax` give 13 window measures per target.
+  - `estate-today.dax` and `estate-f35.dax` are the Estate query, for timing.
+- **Ask's guide** (`fabric/app/src/copilot/guide.ts`): the measures count a time that two captures hold once, and T5's example filters the target and the period, where it filtered T5's latest run alone to avoid that double count.
+- **Docs:** ADR 0014's amendment, ADR 0028's note, the limitations (a section, and **Not proven live yet**), troubleshooting (a row), the report spec (the rule, its outline, the data caveat, and the DAX checks), the app's README, the model guide (regenerated), and the CHANGELOG.
+
+**Changed files.** `fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/tables/Telemetry Snapshots.tmdl`; `fabric/powerbi/checks/f35/` (seven files); `fabric/powerbi/_brief/report-spec.md`; `fabric/app/src/data/snapshot-value.ts` and its test; `fabric/app/scripts/f35-reference.ts`; `fabric/app/src/copilot/guide.ts`, `guide.test.ts`, and `model-guide.generated.ts`; `fabric/app/README.md`; `tests/unit/Fabric.PowerBI.Tests.ps1`; `docs/adr/0014-notebook-role-and-capacity.md`, `docs/adr/0028-ask-copilot-in-the-insights-app.md`, `docs/limitations.md`, `docs/troubleshooting.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **The app** (`npm run typecheck`, `npm run lint`, `vitest run`): 380 passed, 0 failed. The reference's 8 tests run on the live rows under placeholder names (T5's session and day-long saves, and the replica's lag at 16:45), plus SQL saves whose windows start and end inside a minute. They cover the steps (the 8-bin T4 day at 15), the window totals against `finestPerInterval` (T5's 51,591 requests and 27,808 429s), the partly covered bins, and a save read from a row with no bin. They're new with the module, so they fail at the parent. The guide's T5 test fails at f9b19f04, which still filters T5's latest run.
+- **Pester** (`Fabric.PowerBI`, `DbHubDemo.PowerBI`, StrictMode): 39 passed, 0 failed, 1 skipped (the report generator's npm packages aren't installed). The 3 new tests fail at the parent: the measure's lists, intervals, and bin rule against `finest-per-interval.ts`, the history helpers, and the notebook; each save read whole; and the check files' measure identical to the TMDL's.
+- **The reference's command** ran on the incident RCA's fixture of the live rows, in both input shapes, with the same result.
+- **Pester** Repo.* with StrictMode: 207 passed, 0 failed, 3 skipped. markdownlint: clean. No live resource name is in the tree.
+
+**Risks.**
+
+- **Not run live:** no local engine runs DAX. The check files on the live model are the first run of the measure's syntax and its time, then `FABRIC.SEMANTICMODEL.MEASURES` at the next `./scripts/deploy.ps1`, which evaluates every measure. Part 2 is held back until the check passes.
+- **Query time:** per visual cell, the measure reads the series' saves (and, for Azure Monitor, their bins), and the finer rows only in a partly covered interval. The check measures it against today's (at most about twice).
+- **Where it can differ from `finestPerInterval`** ([limitations](limitations.md#the-history-models-overlapping-saves-f35)): rows missing inside a finer save's window, three or more intervals at once, a save with a single bin, and a SQL save with a hand-set `BIN_MINUTES`. Live, the check compares both.
+- **Rounding:** a remainder of floating-point totals can be a tiny number rather than 0, in DAX and in TypeScript alike, so the check compares to within rounding.
+
+### F35 part 2's reviews: coverage by rows (2026-11-22)
+
+**Why.** Two reviews of 602e18a1.
+
+- **The static review** found 1 Medium and 1 Low:
+  - With three saves at 1, 5, and 15 minutes, totals counted twice even when every save agreed. A bin's finest row stood for its 5-minute row too, so the 15-minute remainder subtracted only the 1-minute rows, and the minutes only the 5-minute row held counted in both: 1,080 ms for 16:45 to 17:00, and 10,980 for 15:00 to 18:00, where 900 and 10,800 are.
+  - `./scripts/stop-demo.ps1 -SaveHistory` saved a window whose last minutes' SQL telemetry hadn't arrived, and the model took that window for its rows.
+- **Final tests ran it on the live test's model (dbhubrb).**
+  - The per-bin values matched the TypeScript reference in all 6,856 bins.
+  - 7 of 31 window measures fell short of `finestPerInterval`'s: a finer save's window stood for its rows. The session's SQL rows of T1 and T2 start at 15:31, a minute after its window holds 15:30, so the day's 15:30 point, with 1,204 s of T1's waits and 377 MB of its IO more than they, was left out. T2's sparse lock waits lost 0.1 s at 15:45 the same way.
+  - The window and Estate checks never reached the new measure: a model measure reads the deployed `Snapshot Value` whatever a query defines.
+  - `rows.dax` timed out (HTTP 500 after 242 s, twice).
+  - Final tests' own variant, with the dependent measures defined, ran the Estate query in 2,251 ms against 1,467 (1.53× end to end).
+
+**The coordinator's decisions.**
+
+- Coverage by rows, not windows, to match `finestPerInterval`, with the three-grain case handled by the shared function's finest-first order.
+- The check queries define every dependent measure they evaluate; `rows.dax` becomes three queries; a replica-lag measure joins the window check.
+- The Estate and T5 queries at most about 2× today's, end to end, measured again after the change.
+- The producer fix: `stop-demo.ps1 -SaveHistory` passes `WINDOW_END_UTC` as now less `TELEMETRY_LAG_MINUTES`.
+- Ask's guide says a per-bin T5 series can show bins of different lengths, and the latent filter on Captured At gets a note.
+
+**Work summary.**
+
+- **The measure** (`Telemetry Snapshots.tmdl`). Per save of a series, its rows' extent (first and last bin, cut to its window) and whether it has a row in every interval between them:
+  - No finer save's rows reach a point's interval: the point stays, with no read.
+  - One finer save has a row in every one of its intervals across it: the point is covered and left out, with no read.
+  - Otherwise the measure reads the finer saves' rows of the series whole, the same read for every bin of the series, and filters them to the interval in the formula engine. It ranks them by save, the finest first and then the newest, and each later save's rows keep what the shared function keeps of them against the earlier ones: all of a row with nothing earlier under it, nothing where earlier rows cover it, or else a total less theirs, never below 0. Four levels, the fourth holding the fourth and later saves.
+  - The point is left out where those rows cover it; otherwise a total keeps what's left after what they keep, and a peak stays only when it's higher than each of them not covered itself.
+  - The read takes its saves from `SeriesSaves`, so an outside filter on Captured At UTC hides a save there too: the latent case the static review asked a note for is gone, and the comment says why.
+- **The TypeScript reference** (`fabric/app/src/data/snapshot-value.ts`) in step, with the same levels, extents, and shortcuts, and a save's extent from `rows-saves.dax`'s markers (First, Last, Count). On the RCA fixture of the live rows, its T5 totals now equal `finestPerInterval`'s (51,591 requests and 27,808 429s; the window rule gave 51,382).
+- **The checks** (`fabric/powerbi/checks/f35`, written by a generator from the TMDL):
+  - Each `-f35` query defines the new `Snapshot Value` and every measure it evaluates or reads, with the TMDL's expressions.
+  - `rows-sql.dax`, `rows-saves.dax` (each SQL save's extent per series), and `rows-monitor.dax` replace `rows.dax`, and `scripts/f35-reference.ts` reads all three.
+  - The window checks add the read replica's lag peak, a measure both define in the query, since the model has none.
+  - `t5-today.dax` and `t5-f35.dax` time the Azure Monitor path.
+  - The README gives the session's SQL window as 15:19:04 to 16:59:04; its Azure Monitor captures' was 15:14 to 16:57.
+- **`stop-demo.ps1 -SaveHistory`** (`Save-DemoFabricHistory`) passes `WINDOW_END_UTC`, now less the notebook's `TELEMETRY_LAG_MINUTES` (15), with `WINDOW_MINUTES` 720 as before, so its window holds only minutes whose SQL telemetry has arrived, as Run all's save waits it out. T4's and T5's documents keep their own windows (the notebook's Azure Monitor parser doesn't read the SQL window). Its message says the window's end, and its evidence `windowEndUtc`.
+- **Ask's guide:** a per-bin T5 series can show bins of different lengths side by side, so compare totals over a period.
+- **Docs:** ADR 0014's amendment (coverage by rows, its cost, the producer fix, what still differs), the limitations (the list of differences cut to what's still true, and stop-demo's window), troubleshooting, the report spec, the measure's description and the model guide, `docs/deployment.md`, stop-demo's help, and the CHANGELOG.
+
+**Changed files.** `fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/tables/Telemetry Snapshots.tmdl`; `fabric/powerbi/checks/f35/` (`rows.dax` replaced by three; `t5-today.dax` and `t5-f35.dax` new; the README); `fabric/powerbi/_brief/report-spec.md`; `fabric/app/src/data/snapshot-value.ts` and its test; `fabric/app/scripts/f35-reference.ts`; `fabric/app/src/copilot/guide.ts`, `guide.test.ts`, and `model-guide.generated.ts`; `scripts/modules/DbHubDemo/Private/FabricCapacityHelpers.ps1`, `scripts/modules/DbHubDemo/Public/Stop-DemoEnvironment.ps1`, and `scripts/stop-demo.ps1`; `tests/unit/Fabric.PowerBI.Tests.ps1` and `DbHubDemo.FirstRun.Tests.ps1`; `docs/adr/0014-notebook-role-and-capacity.md`, `docs/limitations.md`, `docs/troubleshooting.md`, `docs/deployment.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **The app** (`npm run typecheck`, `npm run lint`, `vitest run`): 384 passed, 0 failed. The reference has 12 tests, 4 of them new. At 602e18a1, 5 fail:
+  - the two live cases: the session's rows starting after its window does (the day's 15:30 left out, 1,204 ms in the test), and a sparse finer series (100 ms left out);
+  - the two three-save cases: 16:45 reads 540 and 420, where 360 and 240 are;
+  - a save known from its marker alone.
+- **The reviewer's numbers,** by the old and the new rule on the same rows: 1,080 and 10,980 ms before, and 900 and 10,800 after, the shared function's.
+- **The guide's T5 test** pins the new sentence.
+- **Pester** with StrictMode:
+  - Fabric.PowerBI, DbHubDemo.PowerBI, and DbHubDemo.FirstRun: 140 passed, 0 failed, 1 skipped (the report generator's npm packages aren't installed).
+  - Repo.*: 207 passed, 0 failed, 3 skipped.
+  - At 602e18a1, the two changed Power BI checks fail (3 whole-save reads, not 6; check files without the dependent measures), and so does the new FirstRun test (no `WINDOW_END_UTC`).
+- **PSScriptAnalyzer:** no finding in the changed scripts; the test files' findings are the same as at HEAD. markdownlint: clean. The PowerShell is ASCII-only, and no live resource name is in the tree.
+
+**Risks.**
+
+- **Query time, not measured yet:** the row path now runs wherever a finer save's rows reach a coarse point and no single finer save is dense across it, so more points than before reach it (every coarse point a sparse finer series overlaps, not only those at a window's edge). Each such point reads the finer saves' rows of its series whole (one storage-engine query per series and set of finer saves, served from the cache after the first) and filters in the formula engine. Final tests measures the Estate and T5 queries against today's; over about 2×, the next step is to batch that read per visual cell.
+- **The DAX hasn't run on an engine in this form:** brackets and `VAR`/`RETURN` blocks are checked mechanically, and the check files are the first run, then `FABRIC.SEMANTICMODEL.MEASURES` at the next `./scripts/deploy.ps1`.
+- **B's history has two saves per period:** the three-save rule is proven by the TypeScript reference alone, until a history with a session, a stop-demo save, and an update is checked.
+
+### F35 part 2's second live check and second review: a refused name, the work per bin, and stop-demo's window (2026-11-22)
+
+**Why.**
+
+- **Final tests ran da68aed5's checks on the live test's model (dbhubrb).** Its four `-f35` queries didn't parse: "The syntax for 'Under' is incorrect." A probe, `EVALUATE ROW ( "x", VAR Under = 1 RETURN Under )`, fails the same way, and `VAR UnderRows = 1` works. The model's own measure declares `VAR Under` three times, so deploying it would most likely have left `Snapshot Value` in error, and every telemetry measure on it.
+- **With only that name changed** (Final tests' variant), everything passed: the bins (6,933 of 6,933), the window (32 of 32, with the model equal to `finestPerInterval`), the Estate series (769 rows), and T5's time (1.78×). The Estate query took 2.30 times today's, end to end: 3,072 against 1,335 ms, medians of 5 warm runs.
+- **The static review of da68aed5** found the rule clean, step for step with `snapshot-value.ts`, and one Medium: each evaluation listed every save in the series' whole history, with its interval and its rows' extent. So the work grew with the history: about bins times all saves, and after months, about 5 million save rows for the 7-day Performance query, against 50,000 today. With it, the coordinator undid its own earlier choice for `stop-demo.ps1 -SaveHistory`'s window.
+
+**The coordinator's decisions.** Rename the variable everywhere, with a test that fails on any DAX keyword or function name used as one; the planned optimization, aiming at 2× or less end to end, which Final tests times again; the prune to saves within a day of the bin; and `WINDOW_END_UTC` back to the moment the save runs, with a test that the measure keeps a later save's data for a save's last minutes without rows.
+
+**Work summary.**
+
+- **The rename:** `Under` is `UnderRows`, the name Final tests' variant proved, in the measure and in the four check queries generated from it.
+- **The work per bin and series,** with the same results:
+  - A series that one save holds takes its point, with no other work.
+  - Only the saves with a point at the bin, or whose window starts before a day after the bin and ends after it, are weighed. Results can't change. A point's interval starts at its bin, or at its own save's window start, and is at most a day long, the ladder's longest step. A save's rows lie inside its window. So every save that can be finer than a point and overlap it has a window that starts before the bin plus a day and ends after the bin. A save that ends by the bin can't overlap it, so the filter needn't reach a day back, as the review's example did; the saves with a point at the bin are added by name, so each point finds its own. `rows-saves.dax` already reads within a day of the session.
+  - A finer save's rows' extent is read only where that save's window reaches the point's interval, since no other save can have rows there; where none does, the point stays with no read. Before, every save's extent was read at every bin. Each extent's read takes the point's own save out of the filter, where the context transition put it, and filters to the finer save, as the rows' read already did.
+- **The names test** (`tests/unit/Fabric.PowerBI.Tests.ps1`, "DAX variable names"): every `VAR` in the model, in every `.dax` file in `fabric/powerbi`, and in the Insights app's queries (`fabric/app/src/data/queries.ts`) has a name that Learn's VAR page allows (letters and digits, never a digit first, `__` as a prefix), that isn't a table's, and that isn't in `tests/unit/data/dax-reserved-words.txt`. That list's 585 names are every DAX function without a dot in Learn's DAX reference, the visual calculations' functions and keywords, the query, window, and user-defined function keywords, Analysis Services' MDX reserved words, and `UNDER`, with each source in its header. Learn lists no reserved words for variables, and none lists `UNDER`, so the list is broader than the engine's: it refuses every function's name, which the engine doesn't.
+- **`stop-demo.ps1 -SaveHistory`** sends no `WINDOW_END_UTC` again, so its window ends when it runs: `FabricCapacityHelpers.ps1`, `Stop-DemoEnvironment.ps1`, and `scripts/stop-demo.ps1` are as at 602e18a1. Coverage by rows keeps a later save's data for the save's last minutes without rows, where the window that ended 15 minutes early left them unsaved when no day-long save followed. The FirstRun test now checks that it sends none. A new reference test, the review's probe, has a 5-minute save at 18:07 whose last 12 minutes have no rows, beside a later day-long save: 4,500 ms from 17:00 to 18:15, as `finestPerInterval` gives.
+- **Docs:** ADR 0014's amendment (its cost, a save's last minutes without rows, and the names test), the limitations (stop-demo's window), `docs/deployment.md` and the CHANGELOG as at 602e18a1 for that window, and the CHANGELOG's note on a long history.
+
+**Changed files.** `fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/tables/Telemetry Snapshots.tmdl`; `fabric/powerbi/checks/f35/estate-f35.dax`, `snapshot-value-bins.dax`, `t5-f35.dax`, and `window-f35.dax`; `fabric/app/src/data/snapshot-value.test.ts`; `scripts/modules/DbHubDemo/Private/FabricCapacityHelpers.ps1`, `scripts/modules/DbHubDemo/Public/Stop-DemoEnvironment.ps1`, and `scripts/stop-demo.ps1`; `tests/unit/Fabric.PowerBI.Tests.ps1`, `tests/unit/DbHubDemo.FirstRun.Tests.ps1`, and the new `tests/unit/data/dax-reserved-words.txt`; `docs/adr/0014-notebook-role-and-capacity.md`, `docs/limitations.md`, `docs/deployment.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **Pester** with StrictMode: Fabric.PowerBI, DbHubDemo.PowerBI, and DbHubDemo.FirstRun, 142 passed, 0 failed, 1 skipped (the report generator's npm packages aren't installed). At da68aed5, two fail, and only they: the names test (`VAR Under` in the model and the four check queries) and the window's end (`WINDOW_END_UTC` sent).
+- **vitest:** snapshot-value's 13 tests pass, the review's probe among them.
+- **The measure:** its brackets balance, and the names test reads its 505 variable declarations with the rest.
+
+**Risks.**
+
+- **Not run on an engine:** this structure's first run is Final tests' run on B (the bins, the window, the Estate series, and the times), then `FABRIC.SEMANTICMODEL.MEASURES` at the next `./scripts/deploy.ps1`.
+- **The time isn't measured here.** Counted, not timed: a bin and series of the Estate query now asks the storage engine for about 3 reads, against today's 2, where da68aed5 asked for about 3 for each save of the series' history. If it's still over about 2×, the next step is one read of the saves per visual cell.
+- **The list can't hold the engine's undocumented words:** no list has `UNDER`. This change's new names are compound (`SaveList`, `AtBinSaves`, `NearSaves`, `FinerWindows`), like the names the engine already took.
+
+### F36: T3's storage IO is its files' (2026-11-22)
+
+**Why.** Final tests found, beside F35's live check, that T3's `storage_io` rows in the live test's history (dbhubrb) hold nearly the same large figure in about every other minute: about 4,010 MB read and 5,973 MB written in the first session. So T3's IO read about 765 GB in 2 hours 15 minutes, under the release's measure and F35's alike.
+
+**The cause,** from read-only queries of the telemetry endpoint (2026-11-22) over that session of 2026-11-21:
+
+- Every sample of T3 in `SqlServerStorageIO` holds 7 data and log rows: two under each of FileID 1 and 2, with the same `ResourceID`, `SqlServerInstanceName`, `DatabaseID`, and `DatabaseName`, and FileIDs 3 to 5 once each. One file of each pair is the database's own (448 MB of data and a 2 GB log on disk); the other is 16 MB, like FileIDs 3 to 5, the shape of tempdb's files. No column tells the two apart, and `MachineName` is empty.
+- It's so in all 540 samples from 15:20 to 16:50, and only on T3: T1's and T2's storage IO, and every target's waits and the notebook's four rate counters, have one row per key and sample.
+- The query took each bin's first and last sample per file key with `arg_min` and `arg_max`, which pick either row of a pair at a tie. So a series stepped between the two files' counters. A step up counted the gap between their totals as IO, about 3,889 MB read and 3,800 MB written on the log and 120 MB and 2,174 MB on the data file. A step down was dropped as a reset, and that interval's real IO with it.
+- It has been so since the first release (470514a4), so b059c91 has it, and so does the Real-Time Dashboard, which is generated from the same KQL.
+
+**Work summary.**
+
+- **The query** (`Kql/Live.StorageIoDeltas.kql`, and its byte-for-byte copy, `STORAGE_IO_KQL` in `NB_DatabaseHub_LiveActivity`): a first `summarize` adds the files of each key within a sample (by the key and `SampleTimeUTC`, with `Files = count()`). Those sums are cumulative counters again, and the rest of the query reads them. The telemetry article's rule 2 forbids a sum across samples, which this isn't. A step whose number of files changed is skipped (`F == prev(F)` in `Keep`), as a reset is, so a file that appears or goes in a window never counts its whole counter. A key with one file, as every key on T1 and T2, gives what it gave.
+- **The Real-Time Dashboard** is regenerated (`Export-DemoRealTimeDashboard`): its two IO tiles carry the new query.
+- **The notebook's description** of the storage analysis says that it adds the files.
+- **Tests** (`Fabric.Dashboard.Tests.ps1`): a new test pins the per-sample sum, ahead of the first and last samples, which read only its sums, and the file-count step in `Keep`. The two rule-2 tests, here and in `Fabric.Notebooks.Tests.ps1`, now read each pipe statement: a raw counter may be summed only in a `summarize` by `SampleTimeUTC` itself, and never averaged, maxed, or summed in any other.
+- **Docs:** the limitations (T3's IO counts the second set), troubleshooting (a save from before, and how to replace it), the Real-Time Dashboard's README, and the CHANGELOG.
+
+**Live proof,** read-only: the old and the new query on the session's SQL window, 15:19:04 to 16:59:04 UTC, in 1-minute bins.
+
+| Target and files | Before: MB read, written | After |
+|---|---|---|
+| T1, data | 58.9, 812 | the same |
+| T1, log | 30.4, 3,533.2 | the same |
+| T2, data | 502.8, 15,905.1 | the same |
+| T2, log | 0, 18,820.3 | the same |
+| T3, data | 7,070.9, 167,223.6 | 63.2, 2,548.5 |
+| T3, log | 280,726.2, 280,021.8 | 3,858.6, 3,887.2 |
+
+- T1's and T2's bins, reads, writes, and stalls are the same in every column, and T3 goes from 735,042 MB to 10,358 MB.
+- The old query gives the saved rows (15:19: 3,888.25 MB read and 3,801.25 written). The new one reads at most 7.51 MB and writes at most 1.39 MB a minute from 15:19 to 15:42.
+- T3's log read 3.86 GB in the session, as far as its counter rose between the two sessions' pair gaps (3,889 MB at 15:30, about 7,750 MB at 17:15).
+- **Over the day-long save's window** (the 24 hours to 21:33 UTC, in 15-minute bins), T1's and T2's IO is the same too (10,717.6 and 69,034.6 MB, in as many bins), and T3's goes from 442,723.4 MB to 31,558.6 MB. The new query took 2.2 and 6.7 s end to end, the old one 3.0 and 5.4 s, each run twice through the Azure CLI.
+
+**Changed files.** `scripts/modules/DbHubDemo/Kql/Live.StorageIoDeltas.kql`; `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb`; `fabric/realtime/RealTimeDashboard.json` and `README.md`; `tests/unit/Fabric.Dashboard.Tests.ps1` and `Fabric.Notebooks.Tests.ps1`; `docs/limitations.md`, `docs/troubleshooting.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **Pester** with StrictMode, with Python: Fabric.Dashboard and Fabric.Notebooks, with the suites that read the dashboard or the notebook (DbHubDemo.DashboardData, HubKql, FabricItem, Fabric, and HistorySnapshot, and Fabric.ControlNotebook), 365 passed, 0 failed, 0 skipped. At the parent, the new test fails (no per-sample sum), and only it.
+- **PSScriptAnalyzer:** no finding in the changed test files that HEAD doesn't have. markdownlint: clean. Repo.*: 207 passed, 0 failed, 3 skipped. No live resource name is in the tree.
+
+**Risks.**
+
+- **A pair that doesn't share a sample time** would still alternate. Live, the pair shared it in 540 of 540 samples, as one collection pass gives it.
+- **T3's IO now includes the second set's,** whatever it is. If the endpoint drops it or tells it apart later, the sums follow with no change.
+- **Saves from before keep their values** ([troubleshooting](troubleshooting.md#database-hub-and-telemetry)). Under F35's finest-first rule, a later and coarser save doesn't replace a session's 1-minute rows; only a save of the same window does.
+- **The agent prompts,** for Copilot CLI and VS Code, ask the agent to write its own KQL on `SqlServerStorageIO` by the rule for cumulative counters. On T3, that KQL meets the same pair. This commit doesn't change them.
+
+### The reviews of 30392d79 and F36: a stop save's partial rows, the work's wording, the names test, and the agent prompts (2026-11-22)
+
+**Why.** Two reviews, with the coordinator's decisions.
+
+- **30392d79's re-review** found the prune exact, at the day's edges, for hourly Azure Monitor metrics, and for a point's own save; the late reads of the rows' extents give the same answers; the revert of `stop-demo.ps1 -SaveHistory` matches 602e18a1 byte for byte; and the names test is sound. It found one Low and two narrow gaps:
+  - **Partly arrived rows** (the Low, a trade-off): a stop save's last rows can hold only part of their telemetry, and where they fill every slot of a later day-long save's interval, they stand for it. The decision: keep the window ending when the save runs, and document the bound exactly.
+  - **The CHANGELOG's "a long history doesn't slow it"** held only for the costly part: the light pass over a series' list of saves still grows with the history.
+  - **The names test** matched `VAR` in `queries.ts` in upper case only, and cut a line at a `//` inside a DAX string.
+- **F36's review** (1546f89f) found it clean, apart from the agent prompts, which asked an agent to write its own KQL on `SqlServerStorageIO` without saying that a file key can hold two rows in a sample. The decision: add the rule to each of them, with a test.
+
+**Work summary.**
+
+- **The bound,** in the limitations and ADR 0014's amendment: a stop save's partly arrived rows stand for at most one 15-minute interval of a later day-long save, the last one its window holds whole, short by what hadn't arrived, and only where such a save holds it. A new reference test pins the review's probe: the stop save's 17:55 holds 120 of 300 ms and its 18:00 holds 60, so 17:00 to 18:15 reads 4.32 s, where the later save holds 4.5, in the model and in `finestPerInterval` alike. Ending the window 15 minutes early would avoid it, but would leave the stop's last 15 minutes out whenever no later save follows within a day.
+- **The wording:** the CHANGELOG, ADR 0014's cost bullet, and the measure's comment say that a bin works out each save's interval and rows for the saves near it alone, and that only the pass over the series' list of saves grows with the history. The measure changes in its comment only, and so do the four check queries generated from it.
+- **The names test:**
+  - It reads `var` in any case, in the app's TypeScript too, where the language's own `var` is a lint error (`no-var`, in typescript-eslint's recommended rules).
+  - One stripper, `$script:stripComments`, removes `//` comments without cutting a string: a DAX string (`"..."`, with `""` inside), or in TypeScript a `'...'`, `"..."`, or `` `...` `` string. A DAX name can't hold a slash. The F35 checks' test of dependent measures uses it too.
+  - A new test pins both on samples: a `VAR` after a string holding `https://`, and a lowercase `var` in a template string.
+- **The agent prompts:** the Insights app's new `STORAGE_IO_RULE` holds one sentence: "On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed: an Azure SQL database can report two files under one FileID." It follows the storage sentence in the app's IO prompt, and in the five skills prompts that ask for KQL on that table: `capacity-max`, `io-pressure`, `log-flush-waits`, `log-rate-pressure`, and `resource-governance`. T3 is the default target of `log-rate-pressure` and `resource-governance`, and one of `capacity-max`'s three. `Agent.PromptPack.Tests.ps1` reads the sentence from the app and checks that every prompt block naming `SqlServerStorageIO` holds it, five in all; the app's test checks where it sits.
+- **Docs:** the limitations (the bound, and F36's prompts), ADR 0014's amendment, and the CHANGELOG (the wording, and F36's prompts).
+
+**Changed files.** `fabric/app/src/data/snapshot-value.test.ts`; `fabric/app/src/lib/agent-prompts.ts` and its test; `fabric/agent/prompts/capacity-max.skills.md`, `io-pressure.skills.md`, `log-flush-waits.skills.md`, `log-rate-pressure.skills.md`, and `resource-governance.skills.md`; `fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/tables/Telemetry Snapshots.tmdl` (a comment) and the four `-f35` check queries; `tests/unit/Fabric.PowerBI.Tests.ps1` and `Agent.PromptPack.Tests.ps1`; `docs/adr/0014-notebook-role-and-capacity.md`, `docs/limitations.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **vitest:** snapshot-value 14 of 14, the probe among them; agent-prompts and the pages, 72 passed.
+- **Pester** with StrictMode: Fabric.PowerBI 21 passed, 1 skipped (the report generator's npm packages aren't installed); Agent.PromptPack 473 passed; Repo.* 207 passed, 0 failed, 3 skipped. At 1546f89f, the prompts' test fails: the app has no such sentence.
+- **The rest:** the app's typecheck and eslint, PSScriptAnalyzer (no finding that HEAD doesn't have), and markdownlint are clean, and the PowerShell is ASCII-only.
+
+**Risks.**
+
+- **The bound is a trade-off,** not a fix: a stop save whose last rows partly arrived reads short in one interval while a later day-long save holds that interval whole.
+- **The prompts' sentence is an observation,** from T3's telemetry on 2026-11-21, not a documented behavior: the telemetry page doesn't say that a file key can hold two rows in a sample.
+
+### F35 part 2's speed candidates for the live timing (2026-11-22)
+
+**Why.** Final tests ran 30392d79 on the live test's model: every answer was right, but the Estate query took 2.38 times today's time end to end, against a bar of about 2, and T5's 2.03. In the same lease, it was 1.20 times slower on Estate than da68aed5 with `Under` renamed, and 1.14 times on T5: on that short history, the prune cost more than it saved. The coordinator's decision: F35 isn't needed for Monday, so get the speed right, time-boxed to about 2 hours, with the prune's bound kept for long histories, and give Final tests a timing set. If 2 times isn't reachable, write up the producer-side alternative for the owner's decision.
+
+**Work summary.** Two candidates in `fabric/powerbi/checks/f35/candidates`, written from the TMDL by a generator, each with a values query, a window query, and the Estate and T5 timing queries, and a README with the order of the timing runs and the pass:
+
+- **C1:** a bin reads its points' own saves first, with their intervals. Another save can weigh on those points only if its window starts before the longest of those intervals ends, from the bin, and ends after the bin, so where only the points' own save does, the points are the value, with no other save's interval, rows, or table of points worked out. An Azure Monitor save's interval takes one pass over its bins: the ladder's steps divide each other in turn, so the steps that divide every bin's minute are those up to the smallest of each bin's coarsest step. Before, it took a pass for each of the 9 steps.
+- **C2:** C1, and where one save has points at a bin and no finer save's window reaches their interval, its point is the value, without the table of points per save.
+- Neither changes an answer. The README says why, and a test keeps every other measure the candidates define equal to the TMDL's. The TMDL's measure stays 30392d79's until the timing picks one.
+
+**Changed files.** `fabric/powerbi/checks/f35/candidates/` (8 queries and a README), `fabric/powerbi/checks/f35/README.md`, `tests/unit/Fabric.PowerBI.Tests.ps1`, and this report.
+
+**Validation.** Pester with StrictMode: Fabric.PowerBI 22 passed, 1 skipped. The names test reads the candidates' variables too. The generator checks that each candidate's brackets balance.
+
+**Risks.**
+
+- **Not run on an engine:** the timing run is also their first parse.
+- **Whether either meets the bar** is for the timing to say. C1 leaves most of a bin's work where another save's window reaches its interval, as a session's own minutes have the day-long save's window over them, and C2 takes those too. If neither does, the next step is the producer-side alternative.
+
+### F35 part 2's speed candidates withdrawn, and the names test reads comments in one pass (2026-11-22)
+
+**Why.**
+
+- **The candidates:** Final tests timed 4361ad4e's two candidates on B's model in one lease. Both gave 30392d79's answers: the bins 6,933 of 6,933, the window 32 of 32 (C2's within 8.2e-16), and the Estate and T5 answers byte-identical. Both were slower:
+
+  | Medians of 5 warm, interleaved runs, in one lease | Estate | Against today's | Net | T5 | Against today's | Net |
+  |---|---|---|---|---|---|---|
+  | Today's measure | 1,450 ms | 1.00× | 1.00× | 1,269 ms | 1.00× | 1.00× |
+  | da68aed5's measure, with `Under` renamed | 3,080 ms | 2.12× | 4.30× | 2,128 ms | 1.68× | 3.74× |
+  | 30392d79's measure | 3,640 ms | 2.51× | 5.43× | 2,376 ms | 1.87× | 4.54× |
+  | C1 | 3,988 ms | 2.75× | 6.14× | 4,190 ms | 3.30× | 10.33× |
+  | C2 | 4,051 ms | 2.79× | 6.27× | 4,346 ms | 3.42× | 10.83× |
+
+  "Against today's" is end to end. "Net" takes off the round trip first, a trivial `EVALUATE ROW ( "x", 1 )` that took 956 ms (the median of 5 runs at the lease's end), so it compares the queries' own time: today's took 494 ms on Estate and 313 on T5.
+
+  C1 lost most on T5. Final tests points at its Azure Monitor interval: a `MINX` with up to 8 `MOD`s over every bin of each save near a bin, at each bin, where the ladder's `ISEMPTY ( FILTER ( … ) )` tests can stop early. The coordinator's decision: the speed work stops, neither candidate is adopted, and the TMDL keeps 30392d79's measure. Final tests now times da68aed5's and 30392d79's forms on a synthetic month of history, which decides between them, and whether the write-time version is needed.
+- **The stripper:** the review of 5eac6f95 and 4361ad4e found that the names test could still miss a name. A `//` inside a `/* */` comment, or inside a DAX string across lines, cut the rest of its line, so `/* https://x */ VAR Under = 1` passed. No file had it.
+
+**Work summary.**
+
+- The candidates folder and its temporary test are gone, and the checks' README no longer points at them.
+- The names test's stripper reads each file once, from the start, so whatever a string, a name, or a comment holds is text there:
+  - **DAX:** strings, with `""` inside and across lines; `'table'` and `[column]` names, which can hold a double quote but not a newline ([DAX syntax](https://learn.microsoft.com/dax/dax-syntax-reference)); and `//` and `/* */` comments. A `--` line is kept whole, since the DAX query view's page lists only those two ([DAX query view](https://learn.microsoft.com/power-bi/transform-model/dax-query-view)): a name in it is still checked, and a double quote in it opens no string.
+  - **TypeScript:** strings, where a backslash escapes, a line's end included; and `//` and `/* */` comments.
+  - A `/* */` comment becomes a space, so the words on either side stay apart.
+
+**Changed files.** `fabric/powerbi/checks/f35/candidates/` (removed), `fabric/powerbi/checks/f35/README.md`, `tests/unit/Fabric.PowerBI.Tests.ps1`, and this report.
+
+**Validation.**
+
+- A new test reads 14 VAR names in DAX and 5 in TypeScript, each after one of those forms. With 4361ad4e's stripper, it misses 6 of the DAX names and reads one inside a comment. It also fails with any one of seven of the new stripper's parts taken out.
+- On the 21 files the names test reads (the model's tables, the DAX checks, and the app's `queries.ts`), the new stripper finds the same 505 VAR names and the same measure references as the old one. Its only change to their text is in `queries.ts`: it strips the 35 doc comments, whose 30 backticks the old one read as template literals. They happened to pair up.
+- Pester with StrictMode: Fabric.PowerBI 22 passed, 1 skipped, and with Repo.Conventions, Repo.NeutralWording, and Repo.Gitleaks, 155 passed, 4 skipped. PSScriptAnalyzer: no new findings. markdownlint: clean.
+
+**Risks.**
+
+- A VAR in a `--` comment is checked like code: at worst, a false alarm.
+- F35 part 2's speed is unchanged: 30392d79's measure, at 2.51 times today's Estate time and 1.87 times T5's in that lease, or 5.43 and 4.54 times net of the round trip, until the long-history timing decides.
+
+### F35 part 2's query-time version withdrawn, and 55de8cc3's review (2026-11-22)
+
+**Why.**
+
+- **The long-history timing:** Final tests timed both correct forms of part 2's measure, da68aed5's (with `Under` renamed) and 30392d79's, on the live test's model with a month and then two months more history: that day's rows, copied for each earlier day through Fabric's Livy API, and deleted afterward. Medians of 5 warm runs, end to end, against the release's measure in the same history:
+
+  | Query, history | The release's | da68aed5's | 30392d79's |
+  |---|---|---|---|
+  | The app's 7-day Performance query, + 1 month | 2,780 ms | 19,018 ms (6.84×) | fails, 2 of 2 |
+  | The same, + 2 months | 2,648 ms | 20,347 ms (7.68×) | fails, 1 of 1 |
+  | Estate: the live test's day only; + 1 month; + 2 months | 1,451; 1,611; 1,714 ms | 2.24×; 3.32×; 2.96× | 2.68×; 4.16×; 3.88× |
+  | T5: the same | 1,201; 1,380; 1,340 ms | 1.98×; 2.41×; 2.51× | 2.15×; 2.45×; 2.33× |
+
+  - 30392d79's form ran out of the F4 capacity's 1,024 MB of memory per query, after 27 to 30 s.
+  - The window drives the cost, not the history: the second month changed each form by −13 to +11 %, while each day of window added about 2 to 2.6 s with da68aed5's form and 5.7 s with 30392d79's. So 30392d79's prune didn't pay.
+  - A few 7-day runs within minutes put the F4 capacity into Fabric's 20-second interactive delay, twice.
+  - The answers didn't change at any history length, and the two forms agreed exactly on 1- and 3-day windows.
+- **The decision (the coordinator):** the query-time version is withdrawn, and this branch must not ship it. Part 1, the shared function, stays. The model goes back to the release's, the docs keep the release's double count as a known issue with its workaround, and a fix that resolves the overlaps when a save is written is the owner's decision 3.
+- **55de8cc3's review:** the scanner and the removal were clean, with two Lows: the timing section gave ratios only, and the sample test didn't pin the stripper's template part.
+
+**Work summary.**
+
+- **The model is the release's again:** `fabric/powerbi` equals b059c91's, the TMDL and the report spec included. So do the app's parts that taught part 2's measure: Ask's guide and its test (T5's measures from its latest capture again), the generated model guide, the app's README, and ADR 0028.
+- **Removed:** `fabric/powerbi/checks/f35`, the live checks, whose `-f35` queries defined part 2's measure, and `fabric/app/scripts/f35-reference.ts`, their driver. A later fix's live proof can take them from 55de8cc3.
+- **Kept, for a later fix:**
+  - the rule's TypeScript reference with its tests (`fabric/app/src/data/snapshot-value.ts`), whose comments now call it that;
+  - the DAX variable-name test, with its stripper and reserved words. It now reads the model's tables and the app's queries: 81 names, against a floor of 60;
+  - `./scripts/stop-demo.ps1 -SaveHistory`'s window, which still ends when it runs, and its test, whose comment no longer leans on part 2's measure.
+- **Tests:** the Power BI tests' F35 block, which pinned part 2's measure and its checks, is gone.
+- **Docs:**
+  - CHANGELOG: part 2's entry is gone, and part 1's says the model's fix is pending;
+  - limitations: the known issue, where it shows and where it doesn't, its workaround, and the pending fix;
+  - troubleshooting: the known issue's row, in place of part 2's;
+  - ADR 0014: an amendment that records the query-time version as rejected, with this evidence.
+- **55de8cc3's Lows:**
+  - The withdrawal's section above gives each median in milliseconds, end to end and net of the 956 ms round trip.
+  - The sample test has a template that holds a URL, with a name after it on the same line: without the template's part, the URL's `//` reads as a comment and hides the name.
+  - The stripper's comment says that a template's text is kept whole, a DAX comment in it included, so a name there is checked too: at worst, a false alarm. It also names its limits, which none of the files it reads has: a string or a `/*` that's never closed, or a template inside another's `${…}`, can shift what it reads as a string or a comment from there on.
+
+**Changed files.** `fabric/powerbi/SM_DatabaseHub_History.SemanticModel/definition/tables/Telemetry Snapshots.tmdl`, `fabric/powerbi/_brief/report-spec.md`, `fabric/powerbi/checks/f35/` (removed), `fabric/app/scripts/f35-reference.ts` (removed), `fabric/app/src/copilot/guide.ts`, `guide.test.ts`, and `model-guide.generated.ts`, `fabric/app/README.md`, `fabric/app/src/data/snapshot-value.ts` and its test (comments), `tests/unit/Fabric.PowerBI.Tests.ps1`, `tests/unit/DbHubDemo.FirstRun.Tests.ps1` (a comment), `CHANGELOG.md`, `docs/limitations.md`, `docs/troubleshooting.md`, `docs/adr/0014-notebook-role-and-capacity.md`, `docs/adr/0028-ask-copilot-in-the-insights-app.md`, and this report.
+
+**Validation.**
+
+- Each part of the stripper, taken out or narrowed in turn, fails the sample test: 12 mutants, each run through Pester. In DAX: strings, strings across lines, `'table'` names, `[column]` names, and `--` lines. In TypeScript: `'…'` and `"…"` strings, templates, and a backslash before a line's end. In both: `/* */` comments, a comment read as a space, and `//` comments. At 55de8cc3, the template's mutant passes.
+- Pester with StrictMode: 606 passed, 4 skipped, in Fabric.PowerBI, DbHubDemo.PowerBI, DbHubDemo.FabricItem, DbHubDemo.FirstRun, DbHubDemo.ActivityProfile, DbHubDemo.OneCommand, Repo.Conventions, Repo.NeutralWording, and Repo.Gitleaks. The report generator's check is skipped as before, because its npm dependencies aren't installed; `fabric/powerbi` equals b059c91's.
+- The Insights app: the generated model guide equals a fresh `npm run guide:build`, and typecheck, lint, and 386 tests in 21 files pass.
+- PSScriptAnalyzer: no new findings. markdownlint: clean.
+
+**Risks.**
+
+- Until a write-time fix, the history report's telemetry, the app's T1 to T3 charts, and Ask's T1 to T3 sums count overlapping saves twice, as in the release. Limitations says where, and the workaround.
+- A later fix's live proof needs checks again: 55de8cc3 has the queries and their driver.
+
+### 759e6360's review: where the known issue shows (2026-11-22)
+
+**Why.** The review of 759e6360 found one Low. Limitations' "Where it doesn't" listed Mission Control's cards and replay without limiting them to T4 and T5, while part 1 changed only those targets' cards, replay lanes, and episodes. Mission Control's T1 to T3 cards take their Waits from the Estate query (`sqlHealth`), and the replay's and kiosk's T1 to T3 lanes and the scoreboard's T1 to T3 scores take the series query's bins, all from the model. "Where it shows" left out the Performance page among others.
+
+**Work summary.**
+
+- **Where it shows:** the history report's telemetry; the app's T1 to T3 views, which read the model's totals through the Estate, series, waits, incident, and daily trend queries: the Overview, Estate, Performance, Incidents, and Trends pages, Mission Control's T1 to T3 cards (their Waits), the scoreboard's T1 to T3 bins and scores, and the replay's and kiosk's T1 to T3 lanes; and Ask's T1 to T3 sums. The Readiness page reads the Estate query only for the telemetry's lag, so it isn't listed.
+- **Where it doesn't:** the T4 and T5 pages, Mission Control's T4 and T5 cards, the replay's and kiosk's T4 and T5 lanes, and T4's and T5's measured episodes.
+- The CHANGELOG's part 1 entry said "Mission Control's cards and replay" too, and now says the same as limitations.
+
+**Changed files.** `docs/limitations.md`, `CHANGELOG.md`, and this report.
+
+**Validation.** Pester with StrictMode: Repo.Conventions, Repo.NeutralWording, and Repo.Gitleaks, 133 passed, 3 skipped. markdownlint: clean.
+
+**Risks.** None new.
+
+### F37: a refusal over the PostgreSQL vCore quota moves the size fallback on (2026-11-22)
+
+**Why.** Final tests found that preflight doesn't check the region's vCore quota for Azure Database for PostgreSQL flexible server: West US 3 read 24 of 24 `cores`, so a new deployment there would create T4, have its read replica refused, and end **NOT DONE**. Before any check stopped a deploy, the coordinator asked which reading Azure enforces. Final tests' Saturday logs answered (read-only; nothing with resource names copied here): on 2026-11-21 Azure created two environments' T4 servers and both their read replicas in West US 3, all `Standard_D4ds_v5`, the second replica while the first still existed, so the region's PostgreSQL vCores reached 32 at most, and refused none. Meanwhile `cores` read a limit of 24 (20 of 24 in use after a destroy) and `standardDDSv5Family` one of 4 (24, then 20, in use). Neither is enforced as reported, so a stop, or a **Warning**, on them would turn a deploy Azure accepts red or yellow. The coordinator's decision: (a) the readings are logged for diagnosis only, and (b) Azure's refusal at creation moves the size fallback on, with the usual notice, and the ways out when nothing fits. The switch to stop on a proven-binding reading was dropped: no reading is proven, and it would have cost a setting and its tests. Also, 44341bea's review found one Low: limitations' "Where it shows" left out the postmortem's T1 to T3 rows, which come from the scoreboard's fault scores.
+
+**Work summary.**
+
+- **The refusal:** `T4QuotaHelpers.ps1` (new) reads Learn's message, "exceeding approved {0} Cores quota" with its figures ([exceeded quota](https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors#exceeded-quota)), wherever Azure's error text carries it; ARM's generic quota errors don't match. `Get-DemoT4CreateFailure` and `Get-DemoT4ReplicaCreateFailure` return it as `QuotaExceeded`, with the figures, from the deployment's operations, where `SkuNotAvailable` is; `SkuNotAvailable` wins when both appear.
+- **T4's fallback** (`Invoke-DemoTemplateDeployment`) moves on from it as from `SkuNotAvailable`, without the retry in another zone, since a quota is the subscription's in the region. Its **Warning** gives Azure's reason and figures; `DbHubT4Refused` marks the size `quota` among its zones, which an older reader drops with the zones it doesn't know, and `DEPLOY.T4.FALLBACK`, `STATUS.T4.SIZE`, and DONE's note say each size's own reason. A refused move of an existing T4 keeps its size and says why. When every size is refused, `DEPLOY.T4.SKU` (**Fail**, evidence `overQuota`) and `DEPLOY.T4.OFF` name the ways out: free vCores in the region (`./scripts/destroy.ps1 -ConfigPath <its configuration>` on an environment you no longer use; a stopped server still counts), request more quota ([request a quota increase](https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-request-quota-increase)), or move the demo to another region; a run with both kinds of refusal names both fixes. The status page shows them through those results.
+- **The replica's fallback:** `Complete-DemoT4ReplicaCreate` (`deploy.ps1` and `start-demo.ps1`) and the control runbook's `Send-DbHubSessionReplicaAttempt` (Run all) move on from it too, the module's without the same size in another zone; the notice and Run all's replica note say the quota, and when every size is refused, the fix is the quota's.
+- **Preflight** reads Quota Usages - List ([REST](https://learn.microsoft.com/rest/api/postgresql/quota-usages/list), the flexible server provider's pinned API version, 2025-08-01) and logs `cores` and the size's series against T4's vCores and its replica's, "for diagnosis only", and keeps them in `PREFLIGHT.T4.REPLICA`'s `quotaUsage` evidence; no status changes, and a read that fails is a line too. A quota refusal on record counts like `SkuNotAvailable` (`PREFLIGHT.T4.SKU`), with no zone to try.
+- **Docs:** limitations (the postmortem's T1 to T3 rows, the Low), prerequisites (a P3 row), deployment, troubleshooting (four new rows, one row's example, and the fallbacks table), the cost guide (a stopped server still counts against the quota), ADR 0019's and ADR 0025's amendments, `AGENTS.md`, and the CHANGELOG.
+
+**Changed files.** New: `scripts/modules/DbHubDemo/Private/T4QuotaHelpers.ps1`. In the module: `Private/T4Helpers.ps1`, `Private/T4ReplicaHelpers.ps1`, `Private/DeployExperience.ps1`, `Public/Invoke-DemoPreflight.ps1`, and `Public/Invoke-DemoTemplateDeployment.ps1`. `automation/runbooks/DbHubControl.Common.ps1`. Tests: `tests/unit/DbHubDemo.T4Fallback.Tests.ps1`, `DbHubDemo.T4Replica.Tests.ps1`, `DbHubDemo.Preflight.Tests.ps1`, and `Automation.Runbooks.Tests.ps1`. Docs: `AGENTS.md`, `CHANGELOG.md`, `docs/limitations.md`, `docs/prerequisites.md`, `docs/deployment.md`, `docs/troubleshooting.md`, `docs/cost-management.md`, `docs/adr/0019-t4-postgresql-flexible-server.md`, `docs/adr/0025-t4-read-replica.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 1,518 passed, none failed, in DbHubDemo.T4Fallback, DbHubDemo.T4Replica, DbHubDemo.Preflight, DbHubDemo.T4, DbHubDemo.Tracks, DbHubDemo.Lifecycle, DbHubDemo.OneCommand, DbHubDemo.OneClick, DbHubDemo.FirstRun, DbHubDemo.DiskDrift, and Automation.Runbooks. Repo.Conventions, Repo.FunctionNames, Repo.Gitleaks, Repo.LifecycleScripts, Repo.NeutralWording, and Repo.TestAzGuard: 207 passed, 3 skipped.
+- Each new test fails on 44341bea's code (the four test files copied into a worktree of it): 21 failed; the 8 that passed there are existing tests whose names the filter matched, such as the rows for another quota's error, a policy denial, and a transient error, which behave as before.
+- PSScriptAnalyzer: no new findings (24 before and after, all in the test files' helpers). markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- Where Azure puts the refusal is documented only as a message: if it ever came at the template's validation instead of from the server's operation, the template would fail as before, with Azure's message, rather than move the fallback on.
+- The quota's name in Azure's message isn't documented (Learn's `{0}`); the reason quotes what Azure gives.
+- Not proven live: no quota refusal has occurred. The runbook change reaches an environment with its next `./scripts/deploy.ps1`, which republishes the runbooks.
+
+### `destroy.ps1 -WhatIf` in a non-interactive shell (2026-11-22)
+
+**Why.** Final tests, destroying an environment, couldn't preview it: `./scripts/destroy.ps1 -WhatIf` failed in a non-interactive shell with "PowerShell is in NonInteractive mode", so an assistant can't preview a destroy that way. Without `-Force`, `destroy.ps1` passes `-WhatIf` with `-Confirm` to `Remove-DemoEnvironment`. Before its one question, with the list of what it deletes and keeps, the subscription guard's `Set-DemoValidatedAzContext` honored `-WhatIf`, so the context wasn't recorded and the list's reads of Fabric and the security group couldn't get a token. Then the first Azure CLI read inherited `$ConfirmPreference` 'Low': the redirection of the CLI's errors to its temporary file, which writes through `Out-File`, asked first ("Output to File"), and the file's `Remove-Item` asked again, and its error, the last, was the one the run showed; a non-interactive shell refuses both. In a terminal, the same run asked before that question too, twice for each Azure CLI call's temporary file; without `-WhatIf`, the guard also asked to clear and record its context.
+
+**Work summary.**
+
+- **`Remove-DemoEnvironment`** follows the golden snapshot's pattern: everything before the one question only reads (the guard, the group's existence and tags, `Get-DemoDestroyExtraPlan`, whose parts only read, and the golden group's existence), so it runs with `$WhatIfPreference` off and `$ConfirmPreference` 'None'. The caller's values come back for the question, so `-WhatIf` still ends at it (**Not selected**) and `-Confirm` still asks it, whether they were passed or inherited; after a yes, nothing asks again.
+- **`Invoke-DemoAzCli`** deletes its own temporary file without asking (`-Confirm:$false`), as it already did under `-WhatIf`, for any caller with `-Confirm`. That was only half: the redirection before it still asked, which [a later section](#invoke-demoazcli-for-a-caller-with--confirm-2026-11-22) fixes.
+- **The test** (`DbHubDemo.Destroy.Tests.ps1`) runs `destroy.ps1` in a `pwsh -NonInteractive` child with this module and a stand-in Azure CLI first on PATH: it answers only the subscription guard, as a service principal (no Microsoft Graph read), with one token per audience, and fails every other call, as a read that can't be made; a proxy on a closed port stops any HTTP call. With `-WhatIf`, the run ends at **Not selected**, exit 0, with the plan's own token requests made and only reads sent. Without `-Force`, it stops at its one question, after the plan, and the prompt is `Remove-DemoEnvironment`'s, not an Azure CLI call's.
+- **Docs:** the cleanup guide's commands (one question, and `-WhatIf` asks nothing), the CHANGELOG, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Remove-DemoEnvironment.ps1`, `scripts/modules/DbHubDemo/Private/Invoke-DemoAzCli.ps1`, `tests/unit/DbHubDemo.Destroy.Tests.ps1`, `docs/cleanup.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 799 passed in DbHubDemo.Destroy, DbHubDemo.Teardown, DbHubDemo.Guard, DbHubDemo.Golden, DbHubDemo.Lifecycle, DbHubDemo.KeyVault, DbHubDemo.Validation, Repo.LifecycleScripts, and Repo.TestAzGuard. One failed, on this PC only: Teardown's "skips every live teardown test" check imports Pester by name in a child process, which here finds a broken OneDrive copy of Pester 5.9.1, so the live tests fail instead of skipping. It fails on b97bdcdb the same way, and with the machine-wide Pester 5.9.1 all 11 skip, as the check expects.
+- Both new tests fail on b97bdcdb's code (the test file copied into a worktree of it): the preview with "PowerShell is in NonInteractive mode" at `Invoke-DemoAzCli.ps1`'s `Remove-Item`, as live, where the redirection before it had asked first.
+- PSScriptAnalyzer: no new findings (9 before and after, all in the test file's helpers). markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- The reads before the question now run under `-WhatIf` too; they're the ones a confirmed run makes, and none writes (the writes are `Invoke-DemoDestroyExtra`'s and later, after the question).
+- Not run live: Final tests' next destroy can preview with `-WhatIf` first.
+
+### Run all's replica note: costs more only with more vCores (2026-11-22)
+
+**Why.** 201a6666's review of b97bdcdb (F37) found a Low that predates F37: when a session's read replica ran on another size than T4's, Run all's note said it "has more vCores and costs more" whenever the sizes differed. The next size tried has T4's vCores when the documented sizes have one (`Get-DbHubReplicaSizeOrder`): with T4 on `Standard_D4ds_v5`, the replica falls back to `Standard_D4ads_v5`, with the same 4 vCores, and F37 makes that the likely fallback for a quota refusal, since it's another size family. The note is the Replica step's message, which the notebook prints. F37's test matched only the sentence's start, so it passed.
+
+**Work summary.**
+
+- **`Get-DbHubReplicaSizeNote`** (new, pure, in the control runbook) writes the note from both sizes' vCores (`Get-DbHubT4VCore`): more vCores than T4's cost more, as before; T4's vCores were "at the same price per vCore", which [a later section](#t4s-sizes-with-the-same-vcores-no-price-claim-2026-11-22) drops; and a size whose name gives no vCores, or one with fewer (which the order never asks for), gets no claim on its cost, only `./scripts/estimate-cost.ps1`. `Complete-DbHubSessionReplica` uses it, with the quota's words from F37.
+- **The price claim:** the documented replica sizes are General Purpose `Standard_D2ds_v5`, `Standard_D4ds_v5`, and `Standard_D4ads_v5`, so the sizes with the same vCores are `Standard_D4ds_v5` and `Standard_D4ads_v5`. Their meters had the same per-vCore prices in each region checked (West US 3, East US 2, Central US, North Europe, UK South, West Europe, Japan East, and Australia East) in the Azure Retail Prices API on 2026-11-22, but not in every region: 201a6666's review found Norway West, so [a later section](#t4s-sizes-with-the-same-vcores-no-price-claim-2026-11-22) drops the claim. The note gives no price ([ADR 0016](adr/0016-cost-profiles.md)).
+- **Docs:** the CHANGELOG and this report.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`, `tests/unit/Automation.Runbooks.Tests.ps1`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 346 passed, none failed, in Automation.Runbooks and DbHubDemo.T4Replica.
+- 8 of the new and extended tests fail on 4a6a7b36's runbook: the helper's 6 cases, since it's missing, and both sessions' full sentences (the fallback for `SkuNotAvailable`, with the Replica step's message, and for the quota). The new session with more vCores (T4 on `Standard_D2ds_v5`, the replica on `Standard_D4ds_v5`) passes on both, since it pins the wording that stays.
+- PSScriptAnalyzer: none in the runbook; no new findings in the test file. markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- A documented size with T4's vCores at another price per vCore would need the middle case to compare prices; one region already has that, so [a later section](#t4s-sizes-with-the-same-vcores-no-price-claim-2026-11-22) makes no claim there instead.
+- The runbook change reaches an environment with its next `./scripts/deploy.ps1`, which republishes the runbooks.
+
+### `Invoke-DemoAzCli` for a caller with `-Confirm` (2026-11-22)
+
+**Why.** 1f7dca70's review of 4a6a7b36 found its `Invoke-DemoAzCli` part only half-worked: under a caller's `-Confirm`, the inherited `$ConfirmPreference` 'Low' made the redirection of the CLI's errors to its temporary file (`2> $errorFile`, which writes through `Out-File`) ask "Output to File" before the `finally` block's `-Confirm:$false` deletion was reached. At b97bdcdb that redirection was the first prompt in the live failure; the error pointed at the deletion because it asked too, and its error replaced the first. A path that still asked: in a terminal, `./scripts/check-sign-in-data.ps1 -Clean` without `-Force` hands `-Confirm` to `Find-DemoSignInData`, and after a Yes for a VM, `Get-DemoVmPowerState`'s `az vm get-instance-view` asked about its temporary file. The reviewer's probes in a `pwsh -NonInteractive` child reproduced both prompts, and so did this one's.
+
+**Work summary.**
+
+- **`Invoke-DemoAzCli`** pins `$ConfirmPreference` to 'None', next to `$WhatIfPreference` off, for both of its paths: callers decide with ShouldProcess whether a command runs, so neither the redirection nor the deletion asks. The deletion's `-Confirm:$false`, now redundant, is gone, and the comment gives the cause.
+- **The test** (`DbHubDemo.Guard.Tests.ps1`) runs an advanced caller with `-Confirm` in a `pwsh -NonInteractive` child, with a stand-in Azure CLI first on PATH that writes to both streams and a temporary folder of its own: the call asks nothing, returns both streams, and leaves no temporary file.
+- **Docs:** the destroy section above and its CHANGELOG entry give the cause (the redirection asked first, then the deletion), and the entry names the `check-sign-in-data.ps1` path; this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/Invoke-DemoAzCli.ps1`, `tests/unit/DbHubDemo.Guard.Tests.ps1`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 618 passed, none failed, in DbHubDemo.Guard, DbHubDemo.Destroy, DbHubDemo.SignInData, DbHubDemo.Validation, DbHubDemo.Lifecycle, Repo.TestAzGuard, and Repo.LifecycleScripts.
+- The new test fails on 885a8d52's `Invoke-DemoAzCli.ps1`, which is 4a6a7b36's: "PowerShell is in NonInteractive mode" at the redirection, and no result. It passes with the fix; its temporary folder check holds because the child's temporary file goes to that folder (checked).
+- PSScriptAnalyzer: no new findings (none in the wrapper, and 6 before and after in the test file, all its helpers). markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- The wrapper asks nothing itself, as under `-WhatIf` since Phase 14: each caller decides with ShouldProcess before a call that writes, and the temporary file is the wrapper's own plumbing.
+
+### T4's sizes with the same vCores: no price claim (2026-11-22)
+
+**Why.** 201a6666's review of 885a8d52 found the new note's middle case wrong in one region. The Azure Retail Prices API gives `Standard_D4ds_v5` and `Standard_D4ads_v5` the same hourly price in 57 of the 58 regions that sell both; in Norway West, `Standard_D4ds_v5`'s 4-vCore row lists at 1.3236 USD an hour and `Standard_D4ads_v5`'s at 0.6214 (list prices on 2026-11-22, dated examples; [ADR 0016](adr/0016-cost-profiles.md); [a later section](#moves-between-t4s-4-vcore-sizes-are-priced-2026-11-22) compares the per-vCore meters the estimates read). So a replica there that fell back from `Standard_D4ads_v5` to `Standard_D4ds_v5` would have been told it costs the same. The claim predates 885a8d52 in T4's own fallback Warning (`DEPLOY.T4.SKU`, when it tries `Standard_D4ads_v5`) and in `t4SkuName`'s description. A check of the same API here agreed: 58 regions sell both at 4 vCores, only Norway West differs, and it differs at 2 vCores too. With it, 1f7dca70's decision on afb30e0e: pin `Invoke-DemoDotNet` as `Invoke-DemoAzCli` is, since it redirects to a temporary file the same way, and its re-review's docs Low on the destroy section.
+
+**Work summary.**
+
+- **Run all's note** (`Get-DbHubReplicaSizeNote`): a size with T4's vCores gets "..., which has T4's vCores; ./scripts/estimate-cost.ps1 shows what it costs." A size with more vCores still costs more: each 4-vCore size lists above `Standard_D2ds_v5` in every region that sells both (116 pairs, the same API and day).
+- **T4's fallback Warning** (`T4Helpers.ps1`) and **`t4SkuName`'s description** (`config/environment.schema.json`) drop "at the same price per vCore": the Warning keeps estimate-cost.ps1's pointer, and the description now reads as the template's does.
+- **`Invoke-DemoDotNet`** pins `$WhatIfPreference` off and `$ConfirmPreference` to 'None', as `Invoke-DemoAzCli` does, so the module's `Publish-DemoWorkloadRunner -Confirm` no longer asks about the SDK call's temporary file. No script hands it `-Confirm`: each caller of `Publish-DemoWorkloadRunner` passes `-Confirm:$false`.
+- **Tests:** the runbook's pinned sentences (both sessions, and the helper's cases, with a new one the other way round, `Standard_D4ads_v5` to `Standard_D4ds_v5`); the fallback Warning's sentence (`DbHubDemo.T4Fallback`); and a `pwsh -NonInteractive` child in which an advanced caller with `-Confirm` runs `Invoke-DemoDotNet`, with this PowerShell as the stand-in dotnet writing to both streams, and a temporary folder of its own (`DbHubDemo.DotNetSdk`).
+- **Docs:** the CHANGELOG (the replica note's entry, and the .NET SDK's calls in the destroy entry), the 885a8d52 and afb30e0e sections above, the destroy section's sentence on what a terminal asked (the guard asked only without `-WhatIf`), and this report.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`, `scripts/modules/DbHubDemo/Private/T4Helpers.ps1`, `scripts/modules/DbHubDemo/Private/WorkloadHelpers.ps1`, `config/environment.schema.json`, `tests/unit/Automation.Runbooks.Tests.ps1`, `tests/unit/DbHubDemo.T4Fallback.Tests.ps1`, `tests/unit/DbHubDemo.DotNetSdk.Tests.ps1`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 1,233 passed, none failed, in Automation.Runbooks, DbHubDemo.T4Fallback, DbHubDemo.DotNetSdk, DbHubDemo.T4, DbHubDemo.T4Replica, DbHubDemo.Lifecycle, DbHubDemo.Preflight, DbHubDemo.Workload, DbHubDemo.Config, DbHubDemo.Cost, and DbHubDemo.OneClick. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+- 6 tests fail on afb30e0e's three source files (swapped in from a backup, then restored): both sessions' notes, the helper's two cases with the same vCores, the fallback Warning's sentence, and the new `Invoke-DemoDotNet` test.
+- PSScriptAnalyzer: no new findings (none in the three source files, and 6, 7, and 4 before and after in the test files, all their helpers). markdownlint: clean. The changed PowerShell files and the schema are ASCII, and the schema parses.
+
+**Risks.**
+
+- The note and the Warning say less and point to the estimate, which prices each size from the Retail Prices API at run time.
+- The runbook change reaches an environment with its next `./scripts/deploy.ps1`, which republishes the runbooks.
+
+### Moves between T4's 4-vCore sizes are priced (2026-11-22)
+
+**Why.** 201a6666's review of 4e0126d9 found the "same price" assumption outside the messages. ADR 0019 still said `Standard_D4ads_v5` has "the same vCore price", and three comments in `T4Helpers.ps1` said the two 4-vCore sizes "share the vCore price". The code acted on it: `Get-DemoT4SizeRank` gives both one rank, so `Test-DemoT4SizeIncrease` counted a move between them as no increase, and the template step's pricing of a move (`$priceMove` in `Invoke-DemoTemplateDeployment`) skipped it. With `./scripts/deploy.ps1 -FromStage Infrastructure`, which skips preflight's cost checks, such a move met neither ceiling. And `T4CostOrder` breaks their tie by the list's order, `Standard_D4ds_v5` first, which isn't cheapest first where `Standard_D4ds_v5` costs more. The reviewer also found that the `Invoke-DemoDotNet` test ran only with `-Confirm`, so it would still pass without the `$WhatIfPreference` pin.
+
+**Which prices.** The Azure Retail Prices API lists each General Purpose series two ways: a row for each size ("2 vCore", "4 vCore", each its own meter, since 2023), and per-vCore rows ("vCore" and "1 vCore", one meter in most regions, since 2024 or 2025). The demo's estimates read the cheapest per-vCore row, times the vCores (`Select-DemoT4ComputePrice`, until [a later section](#t4s-per-vcore-price-the-1-vcore-row-first-2026-11-22)). On 2026-11-22 (dated examples, [ADR 0016](adr/0016-cost-profiles.md)):
+
+- **The cheapest per-vCore row** of Ddsv5 and Dadsv5 is the same in 67 of the 68 regions that sell both, Norway West included (0.155 USD a vCore-hour). The exception is a row: in Indonesia Central, Dadsv5's "vCore" row lists 0.01 where its "1 vCore" row, the same meter, lists 0.1098, so the cheapest-row rule prices `Standard_D4ads_v5` there at about a tenth of its other rows. And UAE Central's Dadsv5 has two per-vCore meters: a "vCore" one at 0.141, as Ddsv5 lists on both its rows, and a newer "1 vCore" one, listed since 2026-10-01, at 0.1655; the cheapest row is the older.
+- **The rows for each size** differ from the per-vCore meter times the vCores in 15 regions, mostly by about 1 % and at most 17 % (Qatar Central, Saudi Arabia East), and the two series agree there. Norway West's Ddsv5 "4 vCore" row, 1.3236, is 2.1 times its meter's 0.62, and it's the only place where the two series' rows differ.
+- **Which one a bill uses** isn't on Learn's compute page; a Learn Q&A from May 2024 reports a flexible server's bill moving to a "1 vCore" meter.
+
+So with the demo's prices then, the two sizes cost the same everywhere but Indonesia Central, where that row made `Standard_D4ds_v5` look ten times dearer. Since [a later section](#t4s-per-vcore-price-the-1-vcore-row-first-2026-11-22), they cost the same everywhere but UAE Central, where `Standard_D4ads_v5` reads the newer meter, about 17 % dearer.
+
+**Work summary.**
+
+- **`Test-DemoT4SizeIncrease`** counts a move to another size of the same tier and vCores as one that can raise the price, so the template step prices it as it prices a move to a larger size: over either ceiling, or without a price, T4 keeps its size (`DEPLOY.T4.SIZE`, Ceiling), and within both it scales and says the check passed. The same size isn't a move. A move to a size `t4SkuName` sets now deletes a read replica first in this case too, as every priced move does, and the T4 track creates it again; the log says T4 "moves" rather than "grows".
+- **The tie stays, with a limitation.** The fallback's order is fixed before any size is priced: preflight picks where it starts, and each step's cost check runs right before its attempt. And by the demo's own prices, the two sizes are the same in every region but the row above, and since the later section, but UAE Central, where the order's first, `Standard_D4ds_v5`, is the cheaper. So a tie-break by price would change nothing where the size rows differ, and would have acted on that row. The limitations page says that the fallback can try the dearer size first.
+- **Docs:** ADR 0019 (the fallback's "(4 vCores)", the move's pricing, and the order's sentence), the three comments and the order's comment, a test's comment, the limitations page, the CHANGELOG (a new entry, and the replica entry's words on Norway West), and this report.
+- **Tests** (`DbHubDemo.T4Fallback`, `DbHubDemo.DotNetSdk`): the block that pinned "isn't priced" now prices the move to the default from `Standard_D4ads_v5`, which scales within the ceilings and keeps its size over one; a `t4SkuName` move from `Standard_D4ds_v5` to `Standard_D4ads_v5` is priced and scales; the size table has both directions and the same size; and the `Invoke-DemoDotNet` test runs with `-WhatIf` as well as `-Confirm`.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/T4Helpers.ps1`, `scripts/modules/DbHubDemo/Public/Invoke-DemoTemplateDeployment.ps1`, `tests/unit/DbHubDemo.T4Fallback.Tests.ps1`, `tests/unit/DbHubDemo.DotNetSdk.Tests.ps1`, `docs/adr/0019-t4-postgresql-flexible-server.md`, `docs/limitations.md`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- Pester with StrictMode: 1,315 passed, none failed, in DbHubDemo.T4Fallback, DbHubDemo.DotNetSdk, DbHubDemo.T4, DbHubDemo.T4Replica, DbHubDemo.Lifecycle, DbHubDemo.Tracks, DbHubDemo.Preflight, DbHubDemo.Cost, DbHubDemo.OneClick, DbHubDemo.OneCommand, and DbHubDemo.Workload. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped (run again after another session's cleanup of `%TEMP%\dbhub-*` interrupted the first run).
+- Without the fix: on 4e0126d9's `T4Helpers.ps1`, 4 tests fail (the default move's pricing, the `t4SkuName` move's, and the table's two directions); without `Invoke-DemoDotNet`'s `$WhatIfPreference` pin, its `-WhatIf` case fails ("What if: Performing the operation "Output to File"", no error text, and the temporary file left), and without its `$ConfirmPreference` pin, its `-Confirm` case does.
+- PSScriptAnalyzer: no new findings (none in the two source files, and 7 and 4 before and after in the test files, all their helpers). markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- A move between the two sizes now needs a price: when the Retail Prices API doesn't answer, T4 keeps its size that run, as for a larger size, and the next run moves it.
+- Not changed here: the cheapest-row rule, which priced `Standard_D4ads_v5` in Indonesia Central from its 0.01 row. [A later section](#t4s-per-vcore-price-the-1-vcore-row-first-2026-11-22) reads the "1 vCore" row first, which changes it there and in UAE Central.
+
+### T4's per-vCore price: the 1 vCore row first (2026-11-22)
+
+**Why.** 7b9b49ea's work found it, and the coordinator asked for the fix: `Select-DemoT4ComputePrice` read a General Purpose series' per-vCore price as the cheapest of its `vCore` meter's rows. In Indonesia Central, the Retail Prices API listed the Dadsv5 series' per-vCore meter twice (one `meterId`): a "vCore" row at 0.01 USD a vCore-hour and a "1 vCore" row at 0.1098, which the series' own size rows agree with (the "4 vCore" row, 0.4392). So the estimate priced `Standard_D4ads_v5` there at 0.04 USD an hour against 0.4392, in `./scripts/estimate-cost.ps1`, preflight's cost checks, and every T4 and read replica cost notice (dated examples, 2026-11-22; [ADR 0016](adr/0016-cost-profiles.md)).
+
+**Work summary.**
+
+- **`Select-DemoT4ComputePrice`** reads the "1 vCore" row first, then the "vCore" row, then, where neither is listed, the cheapest vCore row, as before. Burstable sizes are unchanged.
+- **UAE Central changes too, by the coordinator's decision.** Its Dadsv5 series has two per-vCore meters: a "vCore" one at 0.141, which its size rows agree with ("4 vCore" is 0.562), and a newer "1 vCore" one, listed since 2026-10-01, at 0.1655. So `Standard_D4ads_v5` there goes from 0.564 to 0.662 USD an hour. A first version read the "1 vCore" row only where the two rows were one meter, which left UAE Central as it was. The coordinator chose the newer meter instead: it's the likelier bill, and an estimate too low is the worse error, since it could let a move past the cost ceilings. T4's fallback still tries `Standard_D4ds_v5` first there, the cheaper of the two.
+- **Docs:** the CHANGELOG, and this report (its 7b9b49ea section's meters, with UAE Central's); no doc quotes a price that changed.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/T4Helpers.ps1`, `tests/unit/DbHubDemo.T4.Tests.ps1`, `CHANGELOG.md`, and this report.
+
+**Validation.**
+
+- **Every region, before and after:** the module's own pricing of the 5 documented T4 sizes in each of the 69 regions that list PostgreSQL flexible server compute (1,793 rows of the two General Purpose series and the Burstable one, read once, 2026-11-22), on 7b9b49ea's code and on this commit's. 336 of the 345 prices exist, and exactly the two expected changed: `Standard_D4ads_v5` in Indonesia Central, from 0.04 to 0.4392 USD an hour, and in UAE Central, from 0.564 to 0.662.
+- **The test** (`DbHubDemo.T4`), with obviously fake prices in both regions' shapes: one meter listed at two prices reads its "1 vCore" row, and so do two meters with a dearer "1 vCore" one; a "vCore" row alone, and neither row, read as before; and T4's hour at `Standard_D4ads_v5` follows. The two regions' cases fail on 7b9b49ea's code; the other two pin what doesn't change. A fifth, from a0e1fd6a's review, pins the middle step: a "vCore" row beside a cheaper size row reads the "vCore" row. It fails on 7b9b49ea's code, and with that step dropped ("1 vCore", then the cheapest), which the other four pass.
+- Pester with StrictMode: 1,013 passed, none failed, in DbHubDemo.T4, DbHubDemo.Cost, DbHubDemo.T4Fallback, DbHubDemo.T4Replica, DbHubDemo.Preflight, DbHubDemo.Lifecycle, DbHubDemo.OneClick, and DbHubDemo.Tracks. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+- PSScriptAnalyzer: no new findings (none in `T4Helpers.ps1`, and 7 before and after in the test file, all its helpers). markdownlint: clean. The changed PowerShell files are ASCII.
+
+**Risks.**
+
+- Which meter Azure bills isn't on Learn's compute page. Where a series' two per-vCore rows differ, the estimate reads the "1 vCore" row, which can be the dearer, as in UAE Central.
+
+### F35's per-bin reference takes every finer save against every earlier one (2026-11-22)
+
+**Why.** A fresh reviewer of 79a35e57, the groundwork's fixes, found that `snapshotValues` (`fabric/app/src/data/snapshot-value.ts`) differs from `finestPerInterval`, the shared function the app's T4 and T5 views read. `snapshotValues` is F35's per-bin reference, which this branch kept when the query-time version was withdrawn.
+
+- `snapshotValues` took the fourth and later finer saves in a coarser point's interval against the first three only, where `finestPerInterval` takes each point against every one it kept before. Where those later saves overlap each other, a coarser total lost their shared time twice.
+- In the groundwork's named case, four 1-minute saves and a 5-minute one in a day save's 15:15 bin, `snapshotValues` gave 848 ms from 15:15 to 15:30 and `finestPerInterval` 900. So `f35Check`, documented to agree with `finestPerInterval`, read LockWaitS as 0.848 s against 0.9.
+- The review found rank 4 and later routine with the real producers, about 1.6 % of points on a typical day and 12 % on a busy one, though the double loss itself appeared in none of 700 simulated two-day histories.
+- The coordinator's decision: remove the divergence, so design (i) matches the app's views exactly, with nothing in `limitations.md`. (i)'s build still has to make that true: two kinds of difference remain, which it aligns, a save whose bins don't show its step and what's left of a finer row where a window cuts through it ([the review of 67f08e7d](#the-review-of-67f08e7d-two-known-differences-pinned-2026-11-22)).
+
+**Work summary.**
+
+- **`snapshotValues`** takes each finer save's rows in a coarser point's interval against every earlier save's rows there, in the same order as before (the finest first, then the newest), as `finestPerInterval` does, for the finer saves whose rows reach the part of the interval that the coarser save's window keeps. [A later section](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) ranks those whose rows reach only the part it cuts off too. Its notes say so.
+- **A test:** the named case's saves, in the test file's own terms. The day's 15:15 bin is 780, its 900 less the minutes' 130 beside the newest save's minute, where it was 728; and `f35Check`'s model equals finest from 15:15 to 15:30, 0.9 s.
+- **What doesn't change:** the app's views, which don't call `snapshotValues` (only its tests do, and the shared cases' test on the groundwork branch); the model; and every doc a user reads. So there's no CHANGELOG entry.
+
+**Changed files.** `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, and this report.
+
+**Validation.**
+
+- vitest: the new test fails with the previous rule ("expected 728 to be 780"), where the file's other 14 pass, and passes with this one. The app's whole suite: 387 of 387, in 21 files. typecheck and eslint: clean. markdownlint: clean.
+
+**Risks.**
+
+- None for deployments: neither the app nor the model runs the reference.
+- A coarser point's later saves are each taken against more rows than before, at most every earlier save's rows in its interval, as `finestPerInterval` takes them already.
+
+### A loader NOT DONE on the release code, checked against the fresh names (2026-11-22)
+
+**Why.** The final tests found a **NOT DONE** on 2026-11-22, in an update of their environment on the RCA branch, whose bootstrap code is the release's. The coordinator asked whether [the review of F31's](#the-review-of-f31-fresh-names-for-actions-too-2026-11-22) fresh names would have prevented it, for the loader's first run and for its run again after the watchdog's restart, and to add the run to that section as live evidence.
+
+- **The run** (times UTC): it started `sqlvm01` and `archost01` from deallocated at 21:09. T1's loader, `DbHubDemo-Bootstrap`, started on `sqlvm01` at 21:26 and stayed Pending for 928 seconds. The watchdog restarted the VM, and the loader ran again under the same name at 21:42, Pending for 929 seconds. The run ended **NOT DONE** after 53.5 minutes, with `DEPLOY.EXTENSIONS_SQLVM01`, `INFRA.BOOTSTRAP.LOADER_SQLVM01`, and `DEPLOY.TRACK.T1` **Fail**. A plain rerun ran the loader in 57 seconds and ended **DONE**, with no **Fail**.
+- **The update before it, that day:** the same first run, Pending for 923 seconds; after the watchdog's restart, the same name ran in 63 seconds (`DEPLOY.WATCHDOG_SQLVM01`, a **Warning**).
+
+**What the check found: the fresh names cover both runs, so there's no code change.**
+
+- **The first run:** the T1 track's loader, `Invoke-DemoBootstrapLoaderRun`, runs `Invoke-DemoVmRunCommand -RunCommandName 'DbHubDemo-Bootstrap' -FreshAction` (`TrackHelpers.ps1:125`); the release's call has no `-FreshAction`.
+  - `Get-DemoRunCommandRunName` gives it `DbHubDemo-Bootstrap-yyyyMMddHHmmss` (`RunCommandHelpers.ps1:370`, `:408`).
+  - The fixed name is deleted first, and that delete waited for (`Invoke-DemoVmRunCommand.ps1:264` to `:277`).
+  - So the PUT (`:314`) goes only to a name the handler has never run, which its sequence-number check can't skip.
+- **The run again after the restart:** the track calls the same loader again (`TrackHelpers.ps1:1139`, `:1140`, `:1149`), and that call takes a name of its own, with its own time, after the restart. The first run's copy is deleted, and its delete waited for (`Invoke-DemoVmRunCommand.ps1:359`), before the call returns that it didn't start (`:412`).
+- **A test pins it:** `DbHubDemo.Arc.Tests.ps1` marks `DbHubDemo-Bootstrap` as a name the handler skips (`:465`) and expects the loader to pass under `DbHubDemo-Bootstrap-<time>` (`:567`, `:573`). It passes on this tree. With `-FreshAction` taken out of the loader's call, as the release has it, it fails: the fixed name stays Pending, and the loader's result is a **Fail**.
+
+**What the evidence says about the cause:** it fits the handler's skip of a name created again ([F31](#a-health-read-under-a-fresh-name-and-a-loader-check-that-knows-when-it-didnt-answer-f31-2026-11-22)), for both runs, but doesn't prove it.
+
+- **It fits:**
+  - The release creates `DbHubDemo-Bootstrap` again on every update, on a VM whose handler ran that name on each earlier update. With no bundle passed, the template doesn't touch it (`demo.bicep:350`).
+  - At both watchdog moments, the VM's saved instance view has the agent Ready and every extension handler and extension succeeded. So the stuck result named only "the VM agent's Run Command handling", which it says when nothing else is busy (`VmExtensionHelpers.ps1:768`).
+  - A skipped Run Command stays Pending for the whole start wait, as these did: 923 to 929 seconds, where this VM's loader otherwise ran in 38 to 78.
+  - A cold start alone doesn't do it: the three updates of 2026-11-21 also started `sqlvm01` from deallocated, and its loader ran in 38 to 51 seconds.
+  - The skip is per VM: in both updates, `archost01`'s loader ran under the same name, in 50 and 54 seconds.
+  - The rerun ran the same name in 57 seconds, after the stuck one's delete, as the next delete's `disable` cleared the name on `archost01`.
+- **Not proven:** the handler's own log on `sqlvm01` (`RunCommandHandler.log`, under `C:\WindowsAzure\Logs`) wasn't read, so its skip line isn't in the evidence, and the delete that missed its `disable` can't be named.
+  - After each loader, the release ran its health read at once, a managed Run Command, and the first action Run Command on `sqlvm01` 67 to 74 seconds later. On `archost01`, the trigger was an action Run Command within seconds of a delete.
+  - A read of that log would settle it.
+
+**Changed files.** This report: an evidence bullet in the review of F31's section, and this section.
+
+**Validation.**
+
+- `DbHubDemo.Arc.Tests.ps1`'s loader test, as above: it passes on this tree, and fails without `-FreshAction`.
+- markdownlint: clean. `Repo.NeutralWording`: 3 passed.
+
+**Risks.** None changes with this check:
+
+- **At 24 or more Run Commands on the VM,** the loader runs under its fixed name, as before, and can meet the skip; the log says why (`RunCommandHelpers.ps1:404` to `:406`). These runs had far fewer: the most the logs show is 8 chunk Run Commands Azure was still deleting.
+- **`deploy.ps1 -Sequential`** still runs the template's loader under its fixed name (`bootstrap.bicep:69`), as the review of F31 chose, so an update with it creates the name again. The default path doesn't use it.
+- **A loader held back by something else** still waits 15 minutes, gets the watchdog's restart, and runs once more, as here.
+- **The review of F31's live proof** still has to run: this is evidence of the cause, not of the fix.
+
+### The session control's removal says what was already gone (2026-11-22)
+
+**Why.** The final tests ran `./scripts/setup-activity-control.ps1 -Remove -Force -SkipFabric` after `./scripts/destroy.ps1` had deleted the session control (`DESTROY.CONTROL.RESOURCES` **Pass**, the group empty and being deleted). `CONTROL.REMOVE.RESOURCES` said "Deleted:" for the identity, the vault, and the Automation account, which were already gone.
+
+- **The cause:** `Remove-DemoActivityControlResource` listed a delete as done when it succeeded or when Azure answered that the resource wasn't there.
+- **And a success isn't proof either:** Resource Manager answers a delete of a resource that doesn't exist with 204 No Content while its group exists, which the Azure CLI reports as a success, so "Deleted" can't come from the delete's answer alone.
+- **`destroy.ps1` uses the same code** for `DESTROY.CONTROL.RESOURCES`, so a rerun after an interruption could say the same.
+
+**Work summary.**
+
+- **Each resource is read first:** the identity, the vault, and the Automation account, each with the API version its delete uses.
+  - One that's already gone gets no delete and is listed under "Already gone".
+  - One that's there is deleted as before. "Deleted" lists the deletes that succeeded, and one that Azure answers isn't there, deleted meanwhile, goes under "Already gone" too.
+  - A read that fails for another reason, access for example, leaves the delete to say what happened, as before.
+- **The message:** "Deleted: ..." and "Already gone: ...", each only when it has something, or "Nothing was deleted." when neither has; then "Failed: ...", and the group's note. When the group itself is gone, the note says it's already gone, where it said nothing.
+- **Unchanged:** the order (the Automation account last), the purge (still only "the vault purge" when one was done), the group's deletion when nothing else is in it, and the statuses, except that a resource that's already gone no longer fails on a refused delete. Resource Manager checks access before it looks for a resource, so a role without the delete permission got 403 for one that was gone: a **Fail**, with the Automation account kept. Now the read's 404 lists it as already gone, so it no longer fails the run or holds back the Automation account ([the review of 842a3e5c](#the-review-of-842a3e5c-the-statuses-and-three-cases-pinned-2026-11-22)).
+- **Docs:** the CHANGELOG, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/ActivityControlHelpers.ps1`; `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` (its fake answers a delete of what doesn't exist with 204, as Resource Manager does, and a group that's gone with 404 for everything in it); the CHANGELOG, and this report.
+
+**Validation.**
+
+- **The new test,** three cases through `Invoke-DemoActivityControlSetup -Remove -Force -SkipFabric`: everything gone with the group, as after `destroy.ps1`; everything gone with the group kept for what else it holds; and only the identity gone. Each checks the whole message and that nothing that's gone gets a delete. With the previous code all three fail: they say "Deleted:" for what was gone.
+- Pester with StrictMode: DbHubDemo.ActivityControl, DbHubDemo.Destroy, DbHubDemo.Teardown, and DbHubDemo.SafetyStop, 364 passed, and 1 failed that fails the same way with the previous code: Teardown's "stay out of the static run" starts a child `pwsh` that imports Pester 5.9.1 by version, which on this PC resolves to a copy without `Pester.ps1`. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+- PSScriptAnalyzer: no findings in the two changed PowerShell files, before or after. markdownlint: clean. The changed files are ASCII, with LF line endings.
+
+**Risks.**
+
+- **Three more reads per removal,** one per resource; each is one Resource Manager GET.
+- **A read Azure refuses** goes to the delete as before, so a resource that was gone then reads as deleted, as before the change.
+- **Not run live:** the next `-Remove` after a `destroy.ps1`, or on a control that's there, shows it.
+
+### The review of 4944e22d: a finer save where a window cuts the interval off (2026-11-22)
+
+**Why.** The review of 4944e22d, and of the groundwork's change of the same rule, found taking each rank against every earlier one correct, with two Lows. The first is in both rules, and older than that change; the second is the groundwork's, on its own branch.
+
+- **The problem:** `snapshotValues` ranked only the finer saves whose rows reach the part of a coarser point's interval that the coarser save's window keeps. A finer save whose rows fall only in the part the window cuts off wasn't ranked there. So a finer point that straddles the cut kept all it held, and the coarser remainder lost the minutes they share twice. `finestPerInterval` takes such a point against every point it kept before, so `f35Check` disagreed.
+- **The reviewer's case,** the three real producers, with values that agree across saves:
+  - background load of 4 a minute, and a session from 15:16 to 15:22 at 10 a minute, saved every minute;
+  - `stop-demo.ps1 -SaveHistory` at 15:24, whose 15:20 bin is cut to 15:20 to 15:24 and holds 28;
+  - the next day's update at 15:22, whose day save's 15:15 bin is cut to 15:22 to 15:30 and holds 32.
+
+  From 15:15 to 15:30, `snapshotValues` gave 76, and `finestPerInterval` 96, which the data hold. The session's rows end at 15:22, where the day save's window begins, so the day's point left the session's save out; the stop save's 15:20 then kept its 28 where 8 is its own, and the day's point kept 4 where 24 is.
+- **When:** an update that runs, a day later, at a time of day between a session's end and its stop save's. The review's simulation of the three producers found it in 32 of 9,390 hourly totals when forcing that timing after each session, and in none of 7,195 hours otherwise.
+- **The coordinator's decision:** fix it in both rules as the reviewer suggests, and correct the claims that the rules match `finestPerInterval` without that limit. (i)'s build still has to make them match: what's left of a finer row that straddles a window's cut is still counted differently where part of it is in the part cut off ([the review of 67f08e7d](#the-review-of-67f08e7d-two-known-differences-pinned-2026-11-22)).
+
+**Work summary.**
+
+- **`snapshotValues`** chooses a coarser point's finer saves by its whole interval, the part its window cuts off too. The check that one finer save covers it, and its own remainder, stay on the part its window keeps. Its notes say so. The groundwork branch makes the same change in `kept_value.py`.
+- **A test:** the reviewer's case. The day's 15:15 bin is 28, the stop save's 4 beside the day's 24, and `f35Check`'s model equals finest from 15:15 to 15:30: 96.
+- **What doesn't change:** the app's views, which don't call `snapshotValues`; the model; and every doc a user reads. So there's no CHANGELOG entry.
+- **This report:** 4944e22d's section no longer says the rule takes every finer save as `finestPerInterval` does without that limit.
+
+**Changed files.** `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, and this report.
+
+**Validation.**
+
+- **The test** fails with the previous rule ("expected 8 to be 28": the bin was the stop save's 4 and the day's 4), and passes with this one.
+- **The reviewer's checks, again, with generators of my own** in a scratch test, not committed:
+  - the case: 76 with the previous rule, 96 with this one and with `finestPerInterval`;
+  - 4,000 random histories in the shared cases' style, every kind of window cut among them (274,607 rows, 11,166 hours of totals and peaks): no hour changes. The 7 hours where both rules differ from `finestPerInterval` are saves whose bins don't show their step, the groundwork's pinned kind;
+  - the three producers over four days, 30 histories with the review's timing (97,438 rows, 6,552 hours): the previous rule differs from `finestPerInterval` in 36 hourly totals, in 22 histories, by up to 50. This one changes exactly those 36, each to `finestPerInterval`'s, and no hour moves further from it. Peaks agree in both. 30 histories without that timing differ in no hour, with either rule.
+- vitest: the app's whole suite, 388 of 388 in 21 files. typecheck and eslint: clean. markdownlint: clean.
+
+**Risks.**
+
+- None for deployments: neither the app nor the model runs the reference.
+- More finer saves are ranked in an interval that a window cuts: those whose rows reach its cut-off part. An answer changes only where one of their rows straddles the cut.
+
+### The review of 67f08e7d: two known differences, pinned (2026-11-22)
+
+**Why.** The review of 67f08e7d, and of the groundwork's same change, found the fix correct in both rules: it moves bins toward `finestPerInterval`, and never away. One Low remains, older than these commits: a finer row that straddles a coarser point's window cut, with an uncovered stretch entirely in the part cut off.
+
+- **The difference:** `finestPerInterval` splits what's left of such a row across its uncovered stretches by length, and a later point takes only the stretches that overlap it. `snapshotValues`, and the groundwork's `kept_value.py`, keep it as one piece over the row's span, and count all of it against the part of the coarser point's interval that its window keeps, for a total's remainder and a peak's comparison alike.
+- **Neither rule is always the data's answer.** The reviewer's two cases, with [the review of 4944e22d's](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) producers and timing:
+  - **D:** the session's Lock waits are quiet at 15:20, a bin `WAITS_KQL` leaves out (`WaitMs > 0`). The stop save's 15:20 holds 18: 10 at 15:21, and 8 from 15:22 to 15:24. The data hold 86 from 15:15 to 15:30, `snapshotValues`' answer. `finestPerInterval` gives the quiet minute 3 of the 8, by length, so the day keeps 27 where 24 is right, and it gives 89. Before 67f08e7d, `snapshotValues` gave 76.
+  - **A:** a session from 15:21 to 15:23, `stop-demo.ps1` at 15:24, and the next day's update at 15:22. The stop save's remainder of 8 is 4 at 15:20, which the day's window cuts off, and 4 at 15:23. The data hold 72, `finestPerInterval`'s answer; `snapshotValues` gives 68, before and after 67f08e7d.
+- **How often,** in the review's simulation of the three producers, with its timing forced after each session: 14 of 2,800 sparse 15-minute bins differ, where 60 did before 67f08e7d, and 1 of 2,800 dense ones; about half of those are closer to the data with `snapshotValues`. None differ without that timing. 67f08e7d's own checks, with my generators, met neither case. A live proof that compares against `finestPerInterval` could meet one, and so could (i)'s T4 and T5 against the app's views: T5's sparse `ThrottledRequests`, for example.
+- **The coordinator's decision:** as for the step rule, no rule change now. Pin D and A as known differences beside the shared cases' `random 11`, soften the claims that the rules agree, and add a build-time item to the design note: both rules split a straddling row the same way.
+
+**Work summary.**
+
+- **Two tests,** D and A, in a new group of known differences. Each pins both rules' answers from 15:15 to 15:30 through `f35Check`, and the day's 15:15 bin; its name gives the data's answer and the rule that gives it.
+- **`snapshot-value.ts`'s notes:** the header and `snapshotValues`' notes say the rule keeps each point as `finestPerInterval` does but for two known differences, which they name: a save whose bins don't show its step, and this one. Design (i)'s build aligns them. `f35Check`'s two "which must agree" now say they agree but for those. [A later section](#the-review-of-b5023826-fc7ffa8d-and-51bb1aa3-two-claims-narrowed-2026-11-23) adds their condition: a window whose edges fall on every save's bin grid.
+- **This report:** the two "Why" bullets that quote the coordinator's decisions, in [4944e22d's section](#f35s-per-bin-reference-takes-every-finer-save-against-every-earlier-one-2026-11-22) and [67f08e7d's](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22), keep their words, with a note that (i)'s build still has to make them true.
+- **The groundwork branch** pins D and A in the shared cases, beside `random 11`. The design note's build-time item is in the coordinator's material for decision 3.
+- **What doesn't change:** every rule, the app's views, the model, and every doc a user reads. So there's no CHANGELOG entry.
+
+**Changed files.** `fabric/app/src/data/snapshot-value.ts` (comments), `fabric/app/src/data/snapshot-value.test.ts`, and this report.
+
+**Validation.**
+
+- **The pins catch a change in either rule,** each made in a copy:
+  - with 67f08e7d's choice of finer saves reverted, D fails: its 15:15 bin is 18, where it's 28, and 76 in all;
+  - with `finestPerInterval` splitting a remainder evenly, not by length, D fails: 0.09 s for 0.089;
+  - with this rule counting a finer row's remainder only for its share of the window's part, A fails (its bin is 44 for 40), and so do D and 67f08e7d's case.
+- vitest: the file's 18 tests, and the app's whole suite, 390 of 390 in 21 files. typecheck and eslint: clean. markdownlint: clean.
+
+**Risks.** None: two tests, comments, and this report.
+
+### The review of 842a3e5c: the statuses, and three cases pinned (2026-11-22)
+
+**Why.** The review of 7b1110a6, 527c386c, and 842a3e5c found no bugs or regressions: ship it. Its one Low was in the docs: [842a3e5c's section](#the-session-controls-removal-says-what-was-already-gone-2026-11-22) said the statuses are unchanged, and one changed, for the better.
+
+- **Before,** a resource that was already gone still got a delete. Resource Manager checks access before it looks for the resource, so for a role without the delete permission that was a 403: `CONTROL.REMOVE.RESOURCES` was a **Fail**, the Automation account was kept, and in `destroy.ps1`, `DESTROY.CONTROL` was a **Warning**.
+- **Now,** the read's 404 lists it as already gone, so it no longer fails the run or holds back the Automation account. What else Azure refuses still fails it: the vault's purge, for example, which is still sent ([a later section](#the-review-of-b5023826-fc7ffa8d-and-51bb1aa3-two-claims-narrowed-2026-11-23)).
+- **The reviewer also checked three cases by probe only,** which no test covered. `destroy.ps1` runs this code, so the coordinator asked to pin them in `DbHubDemo.ActivityControl`.
+
+**Work summary.**
+
+- **The docs:** 842a3e5c's section, and the CHANGELOG's entry, say what changed in the statuses.
+- **Three tests,** through `Invoke-DemoActivityControlSetup -Remove -Force -SkipFabric`:
+  - **a refused read** (403) still sends the delete, and the message never calls the identity already gone. With the delete allowed, it's a **Pass** that lists the identity as deleted; with the delete refused too, a **Fail** that names it, with the Automation account kept;
+  - **a resource that goes between its read and its delete** is already gone: another run deletes the control's group after the identity's read, so the identity's delete gets 404, and so does every later read in the group;
+  - **a vault that's deleted but not purged yet** gets its purge, and no delete: with the rest still there, and with the rest gone with the group.
+- **The fake** can refuse an identity's read or delete with 403 before it looks for the identity, as Resource Manager does, and can delete the control's group at the identity's delete.
+
+**Changed files.** `tests/unit/DbHubDemo.ActivityControl.Tests.ps1`, the CHANGELOG, and this report.
+
+**Validation.**
+
+- **The new cases catch what they pin:**
+  - on 527c386c's code, before 842a3e5c, the resource that goes meanwhile and the vault's two cases fail, as 842a3e5c's own three do; the refused read's two pass, since that code sent every delete;
+  - with a refused read counted as gone, both refused-read cases fail; with a delete's 404 counted as deleted, the meanwhile case fails; with the purge only for a vault the run deleted itself, the meanwhile case and the vault's two fail.
+- Pester with StrictMode: DbHubDemo.ActivityControl, DbHubDemo.Destroy, DbHubDemo.Teardown, and DbHubDemo.SafetyStop, 369 passed, 5 more than 842a3e5c's, and 1 failed that fails the same way with the previous code, Teardown's "stay out of the static run", as in 842a3e5c's section.
+- PSScriptAnalyzer 1.25.0 with the tests' settings: no findings in the test file. markdownlint: clean. The changed files are ASCII, with LF line endings.
+
+**Risks.** None: tests and docs.
+
+### The review of b5023826, fc7ffa8d, and 51bb1aa3: two claims narrowed (2026-11-23)
+
+**Why.** The review of b5023826, fc7ffa8d, and 51bb1aa3 found all three ready to ship: every pin, mutation, old-code, and rebase claim it checked held. Its two Lows were wording that still said more than the code does.
+
+- **`f35Check`'s agreement:** b5023826 said that its two measures agree but for the two known differences. They can also differ where a window's edge falls inside a coarser bin that holds a remainder: `snapshotValues` shows the remainder at its own bin's start, and `finestPerInterval` at the start of each uncovered stretch.
+  - **The reviewer's probe,** on the test file's own SQL fixture: LockWaitS is 0.55 s by the model and 0.396 by finest from 15:00 to 16:50, and 0.32 and 0.474 from 16:50 to 17:15, while 15:00 to 17:15 agrees at 0.87. On the replica-lag fixture, with its spikes lowered to 3, 16:00 to 16:50 peaks at 34 and 3.
+  - **Design (i) can't remove it:** a per-bin model always shows a remainder at its bin's start. So it's a condition on the comparison, not a third difference to align.
+- **The removal's statuses:** [842a3e5c's section](#the-session-controls-removal-says-what-was-already-gone-2026-11-22), [the review of 842a3e5c's](#the-review-of-842a3e5c-the-statuses-and-three-cases-pinned-2026-11-22), and the CHANGELOG said that, with a resource already gone, the run now passes and the rest is deleted. That holds only for a role that can purge the vault and delete the Automation account.
+  - The purge is still sent every time, and a refused purge still fails the run.
+  - An Automation account that's already gone is listed as already gone, not deleted.
+  - So after `destroy.ps1`, a role that can't purge still gets a **Fail**, with everything listed as already gone.
+- **The coordinator's decisions:** state the condition in both of `f35Check`'s comments and in the design note's live proof, and say the removal's change per resource, without the **Pass** and the deletions.
+
+**Work summary.**
+
+- **`snapshot-value.ts`:** `F35Check`'s measures and `f35Check`'s notes say that the two agree, but for the known differences, over a window whose edges fall on every save's bin grid: whole hours, when no save in it is coarser than an hour. An edge inside a coarser bin can set them apart, and no build changes that. Comments only.
+- **Every claim in this report that `snapshotValues`' totals and peaks agree with `finestPerInterval`'s, or that design (i) matches the app's views,** means over such windows: in [4944e22d's section](#f35s-per-bin-reference-takes-every-finer-save-against-every-earlier-one-2026-11-22), [67f08e7d's](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22), and [b5023826's](#the-review-of-67f08e7d-two-known-differences-pinned-2026-11-22), which points here, and in the groundwork's sections.
+  - The shared cases' parity already compares whole hours, and the design note's live proof now does too, in the coordinator's material for decision 3.
+  - The history helpers write an Azure Monitor save coarser than an hour only when a finer one would be too large; a window then has to fall on that save's grid as well.
+- **The removal:** the CHANGELOG's entry, 842a3e5c's section, and the review of 842a3e5c's say that a resource that's already gone is listed as already gone, so it no longer fails the run or holds back the Automation account. The latter adds that what else Azure refuses, the purge for example, still fails it.
+- **What doesn't change:** code, tests, and the app's views.
+
+**Changed files.** `fabric/app/src/data/snapshot-value.ts` (comments), the CHANGELOG, and this report.
+
+**Validation.**
+
+- **The reviewer's probe, again,** in a scratch copy of the test file's fixtures, not committed: the same figures, 0.55 and 0.396, 0.32 and 0.474, 0.87 for both, and 34 and 3. Every whole-hour window agrees: LockWaitS is 0.3 s from 15:00 to 16:00, 0.5 from 16:00 to 17:00, and 0.07 from 17:00 to 18:00, and the lag peaks at 34 from 16:00 to 17:00, by both.
+- vitest: the file's 18 tests pass. typecheck and eslint: clean. markdownlint: clean. The added lines are ASCII, and the comments keep the file's 120-column wrap.
+
+**Risks.** None: comments and docs.
+
 ### The Incident RCA, Phase 1 (2026-11-20)
 
 **Why.** The owner asked for the root cause of blocking, waits, and errors, down to the statement, the procedure, and who ran it: "displaying the query blocking chain and what was the first one and some recommendation analysis and next steps". Then, for the chat: "I want the chat to be the first base investigation and extended DBA assistant. Full with specific detailed information and RCA and suggestions". And on grading: "Real demo and DBA would not know what the scenarios are and we should be able to see these items." It's the first item of the Insights app's Wave 2 ([ADR 0031](adr/0031-incident-rca.md)), under the owner's standing rules: documented interfaces, each with its Microsoft Learn page; Contributor as the minimum, with no new role assignment; nothing beyond Azure and Fabric; nothing new for the person running the demo; the app working from saved history; and one-click updates that break no existing environment.
@@ -5013,7 +6553,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 
 ### The stacked branch, for the owner's review (2026-11-22)
 
-**What it is.** `marcbushong-microsoft-rca-postmortem-cause`: local commits stacked on the Incident RCA branch, rebased whenever that branch's head moves, not pushed, and deployed nowhere. They change the Insights app, its tests, the docs, one line of `stop-demo.ps1`'s output, and `capture-t2-golden.ps1`'s check of the session control's status. No runbook, notebook, capture, history table, semantic model, Azure resource, role, or setting changes, so `./scripts/deploy.ps1` updates an environment to it, as it does for any app change.
+**What it is.** `marcbushong-microsoft-rca-postmortem-cause`: local commits stacked on the Incident RCA branch, rebased whenever that branch's head moves, not pushed, and deployed nowhere. They change the Insights app, its tests, the docs, one line of `stop-demo.ps1`'s output, and `capture-t2-golden.ps1`'s check of the session control's status. No runbook, notebook, capture, history table, semantic model, Azure resource, role, or setting changes, so `./scripts/deploy.ps1` updates an environment to it, as it does for any app change. Stacked on it since 2026-11-23, `marcbushong-microsoft-rca-stop-tail-and-updates` adds the owner-approved fixes of the session control's status and of O1, one unit per commit; its first changes the control's template, `infra/control/control.bicep`, whose status variable an update now keeps ([its entry](#the-session-controls-status-kept-through-updates-2026-11-23)).
 
 **What it adds.** The entries below give each change in full.
 
@@ -5021,17 +6561,21 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The evaluation set's Phase 1 cases** ([its entry](#the-evaluation-sets-phase-1-cases-2026-11-22)): 12 blind questions on the contract's fixtures and B's and A's recorded rows, graded offline against their answer keys by the scoreboard's own rule, with what they miss reported. It's test-only: the scoreboard exports three of its functions for it, with its output unchanged.
 - **Final tests' findings** ([F4 to F6](#final-tests-should-fix-items-f4-to-f6-2026-11-22), [O1 to O4](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)). In the RCA's answers: the minutes that T5's throttled counts cover, in the statement and the errors table (F6); a replica's cause named only from the stall's own samples and their figures, slow replay only with WAL behind, and a conflict's lock, its cancels, and the capture's episode it cites read from its own stall too, and an interval cut short worded by its own minutes (F4); one instant written as one, not as a range, and a span across two UTC days with its dates (F5); and the clients waiting on a lock as some of the active ones (O2). On `stop-demo.ps1`'s handoff of a Run all session's stop, `STOP.CONTROL.AUTOSTOP` names the control's job (O3).
 - **The T2 golden capture in a tenant that encrypts Automation variables** ([its entry](#a-tenants-encrypted-status-variable-2026-11-23)): `capture-t2-golden.ps1` read the session control's status, once the tenant's policy had encrypted it, as a status that lists nothing, so it would have deleted T2's evidence that the status lists. It now captures nothing then, with a fix line that saves that evidence first.
-- **The reviews' fixes,** in each entry ([the latest](#the-review-of-a57539ed-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
+- **The session control's status kept through updates** ([its entry](#the-session-controls-status-kept-through-updates-2026-11-23)): every update wrote the variable `DbHubSessionStatus` again, empty, so the next start no longer had what the last stop listed of the evidence still on the VMs. The template now creates it only when it's missing, and an update keeps it, encrypted or not.
+- **The organized Root cause** ([ADR 0031, section 7](adr/0031-incident-rca.md#7-the-rca-view); [its entry](#the-organized-root-cause-2026-11-23)), from the owner's feedback that the page read as one big list: facets for severity, category, and server and database, each value with its count; the minutes it reads; the list grouped by category or by server and sorted by severity or by time; and the filters in the address, so a view can be shared. Severity is High, Medium, or Low from each incident's own measurements, with why. The chat's `find_incidents` and `triage_window` take the same filters.
+- **The reviews' fixes,** in each entry ([the latest](#the-review-of-40124992-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
 
 **What still needs live proof.** All of it but the evaluation set, which reads recorded rows. Each change is unit-tested, and the RCA's answers are checked on B's and A's recorded rows, but none has run on a live environment. Its live check waits for the owner: dbhubrc stays at dbee7d53 for the owner's testing on Monday, 2026-11-23. On an environment deployed or updated from this branch, after a Run all session:
 
 - **The postmortem** of that session: its Cause against the Root cause view's first six incidents, how long the investigation takes within Execute Queries' 120 queries a minute, **Download Markdown**, and the answer key with the page's filter on fewer targets.
 - **The RCA's answers,** where the session has such incidents: a T5 storm with intervals under 100 % among those at 100 %, a replica's lag rising after the stop, a replica stall the capture sampled, two replica stalls under a minute apart, an interval cut short, an incident of one instant, a question over a day or across UTC midnight, and a T4 surge with clients waiting on a lock at its peak. Final tests' headless harness can also check these on a live history, with no deploy.
 - **The scoreboard's** T4 and T5 rows marked Not supported, and their signal.
+- **The Root cause page's facets:** their counts against the list; 6 and 24 hours, where a busy day's read can reach its limit, which the page says; a shared address opening the same view; the Incidents page's and the scoreboard's **Root cause** landing filtered; T4's and T5's names from Azure Monitor; the severities of a live session's incidents; and the chat's `find_incidents` and `triage_window` with filters.
 - **`./scripts/stop-demo.ps1` during a Run all session,** from this checkout: its `STOP.CONTROL.AUTOSTOP` line.
-- **`./scripts/capture-t2-golden.ps1`** while a tenant's policy has the control's variable encrypted: its `GOLDEN.CAPTURE.RCA` refusal, which comes before the capture changes anything; and, after `./scripts/deploy.ps1` there, a Variable - Get that reads the variable unencrypted.
+- **`./scripts/capture-t2-golden.ps1`** while a tenant's policy has the control's variable encrypted: its `GOLDEN.CAPTURE.RCA` refusal, which comes before the capture changes anything; and, after `./scripts/deploy.ps1` there, `CONTROL.RESOURCES` saying it kept the variable, encrypted.
+- **An update between a session's stop and the next start,** of an environment whose stop listed something: `CONTROL.RESOURCES` says the variable was kept, and the next Run all's start fetches what that stop listed ([its entry](#the-session-controls-status-kept-through-updates-2026-11-23)).
 
-**For the owner's decision.** O1, the capture's tail after the control's stop, is assessed but not built ([its entry](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)): the full fix, about 2 to 3 days and its own live proof, or naming the tail only, about half a day. And ADR 0031's [Phase 2 candidates](adr/0031-incident-rca.md#phase-2-candidates), each a capture change: each cancel count's span, which a failed read of the counter can stretch across a stall's bound ([the review of b29d733d](#the-review-of-b29d733d-2026-11-23)), and who held T4's idle connections. And the session control's status ([its entry](#a-tenants-encrypted-status-variable-2026-11-23)): an update between a session's stop and the next start loses what the stop's status lists, and a tenant that encrypts the variable keeps the golden capture from reading it. The recommended fix keeps the lists through an update, about half a day, and reads them for the capture with a runbook job, 1 to 1.5 days, with one live round for both; O1's full fix would leave most sessions with nothing listed to lose. Smaller, and only shortening the fix line's procedure: the stop's lines also name what its status carries for other sessions, about half a day, a runbook change.
+**For the owner's decision.** O1, the capture's tail after the control's stop, is assessed but not built ([its entry](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)): the full fix, about 2 to 3 days and its own live proof, or naming the tail only, about half a day. And ADR 0031's [Phase 2 candidates](adr/0031-incident-rca.md#phase-2-candidates), each a capture change: each cancel count's span, which a failed read of the counter can stretch across a stall's bound ([the review of b29d733d](#the-review-of-b29d733d-2026-11-23)), and who held T4's idle connections. And the session control's status ([its entry](#a-tenants-encrypted-status-variable-2026-11-23)): an update between a session's stop and the next start loses what the stop's status lists, and a tenant that encrypts the variable keeps the golden capture from reading it. The recommended fix keeps the lists through an update, about half a day, and reads them for the capture with a runbook job, 1 to 1.5 days, with one live round for both; O1's full fix would leave most sessions with nothing listed to lose. Smaller, and only shortening the fix line's procedure: the stop's lines also name what its status carries for other sessions, about half a day, a runbook change. The owner approved O1's full fix and the recommended fix of the status on 2026-11-23: the update that keeps the lists is built ([its entry](#the-session-controls-status-kept-through-updates-2026-11-23)), and O1's full fix and the runbook job follow as units of their own.
 
 ### The postmortem's Cause from the blind investigation (2026-11-22)
 
@@ -5512,6 +7056,373 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 
 **What its live check needs.** The entry above's, with the Variable - Get after `./scripts/deploy.ps1` in a governed tenant.
 
+### Decision 2a: `deploy.ps1` updates the notebooks that nobody edited (2026-11-23)
+
+**Why.** The owner approved follow-ups decision 2a (the coordinator's recommendation, 2026-11-23): `deploy.ps1` updates the demo's own notebooks when they're older than the code and nobody edited them, and still keeps an edited one. With `fabric.importNotebooks` false, `deploy.ps1` passed `-NewNotebooksOnly` and kept every notebook that was in the workspace (Phase 26a), so an update never brought the live-activity notebook's fixes, F34's and F36's for example, and the history's fixes named a `configure-fabric.ps1` run that replaced both notebooks, edited or not. The same decision narrows the release's history fixes (`STOP.FABRIC.SAVEHISTORY`, `DEPLOY.FABRIC.HISTORY`) to the activity notebook, as the Incident RCA's are.
+
+**Work summary.**
+
+- **Reading a notebook** (`Read-DemoFabricItemDefinition`, in the new `Private/FabricNotebookVersionHelpers.ps1`): Items - Get Item Definition with `?format=ipynb` ([Get Item Definition](https://learn.microsoft.com/rest/api/fabric/core/items/get-item-definition), [notebook definition](https://learn.microsoft.com/rest/api/fabric/articles/item-management/definitions/notebook-definition)), a 202 followed to its result ([long-running operations](https://learn.microsoft.com/rest/api/fabric/articles/long-running-operation)). It returns each part's bytes, or the error, with `CapacityInactive` for a paused capacity, and never throws.
+- **The fingerprint** (`Get-DemoNotebookFingerprint`, pure): one SHA-256 of each cell's type and source, in order, without outputs, execution counts, metadata, line endings, spaces at a line's end, blank lines at a cell's ends, and empty cells. The five values the import binds in the parameters cell (`WORKSPACE_ID`, `LAKEHOUSE_ID`, `LAKEHOUSE_NAME`, `GITHUB_REPOSITORY`, `GITHUB_ENVIRONMENT`) are blanked, and returned apart; they're the only values the import has bound since 470514a4.
+- **The versions** (`fabric/notebooks/published-versions.json`, read by `Get-DemoNotebookPublishedVersion`): every version of each notebook in this branch's Git history, oldest first, with the day it first appeared, 8 of `NB_DatabaseHub_Deployment` (2026-10-27 to 2026-11-19) and 18 of `NB_DatabaseHub_LiveActivity` (2026-10-27 to 2026-11-22). `tests/unit/Fabric.Notebooks.Tests.ps1` checks that each current version is listed, and with `DBHUB_WRITE_NOTEBOOK_VERSIONS=1` writes the file from `git log --full-history`, with the current version when it's new. `origin/main`'s and `b059c91d`'s versions are listed. The Incident RCA's aren't, so a workspace that the RCA's branch updated counts as edited and is kept, never downgraded; the RCA release's merge runs the writer to list them.
+- **The state** (`Get-DemoFabricNotebookState`): the notebook listed by name ([List Items](https://learn.microsoft.com/rest/api/fabric/core/items/list-items)), read, and compared with the version the run uploads and with the list: Current (this version and this run's values), Rebind (this version, other values), Older (with its day), Edited, Unread, or Missing, Duplicate, and ListFailed.
+- **The import** (`Import-DemoFabricNotebook -KeepEdited`, from `configure-fabric.ps1 -KeepEditedNotebooks`, which `Invoke-DemoFabricStage` passes for both deploy paths while `fabric.importNotebooks` is false):
+  - Older and Rebind are updated, as before with `importNotebooks` true: a **Pass** whose note names the version's day.
+  - Current sends nothing: a **Pass**, "is this version already".
+  - Edited is kept: **Not selected**, with `./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook <name>` as the command that replaces it, and `fabric.importNotebooks` true as the standing choice.
+  - Unread is kept: a **Warning**, or **Manual action required** with the resume steps when Fabric refuses the read with `CapacityNotActive`.
+  - Missing, Duplicate, and ListFailed go to the create-only import, so their records are as before.
+  - The evidence adds `notebookState`, `operation` (`unchanged` when nothing was sent), and `publishedSince`. `-WhatIf` says that it reads the notebook first, and sends nothing. `-NewNotebooksOnly` stays for a caller that wants it; it can't be combined with `-KeepEditedNotebooks`.
+- **The fixes name the activity notebook alone** (`configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity`, after `./scripts/deploy.ps1`, which updates it unless someone edited it; `Get-DemoLiveNotebookUpdateFix`): `STOP.FABRIC.SAVEHISTORY`'s, for a notebook from before T4's or T5's history and for an unresolved workspace; `FABRIC.T4.HISTORY`'s and `FABRIC.T5.HISTORY`'s; the fix for a lakehouse that was just created; `DEPLOY.FABRIC.HISTORY`'s for a missing notebook; and `Invoke-DemoFabricNotebookRun`'s for a missing notebook of the demo's. The fixes that only run the notebook again skip the import (`-SkipHubChecks -SkipNotebookImport -RunLiveActivity`): `FABRIC.SEMANTICMODEL.MEASURES`'s and the one for a partial capture of T5's metrics. `INIT.EXISTING`'s and `INIT.FABRIC.WORKSPACE`'s notes say what `deploy.ps1` now does with a workspace's notebooks.
+- **Docs:** [ADR 0021's amendment](adr/0021-fabric-resources-by-name.md#amendment-2026-11-23-an-update-brings-the-notebooks-that-nobody-edited-up-to-date-follow-ups-decision-2a), `fabric.importNotebooks` in the schema and [configuration](configuration.md#fabric), [deployment](deployment.md#an-older-demo-a-plain-deployps1-upgrades-it-2026-11-09) (a 2026-11-23 row, the stages, the options, and the first run), the [Fabric guide](../fabric/README.md#import-or-update-the-notebooks) (how it tells a version from an edit, and the writer), the README's upgrade notes, the automation support matrix, two new troubleshooting rows and three updated, the CHANGELOG, R853's residual, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/FabricNotebookVersionHelpers.ps1` (new), `fabric/notebooks/published-versions.json` (new), `Public/Import-DemoFabricNotebook.ps1`, `scripts/configure-fabric.ps1`, `Private/DeployHelpers.ps1`, `Public/Invoke-DemoDeployment.ps1`, `Private/TrackHelpers.ps1`, `Private/FabricCapacityHelpers.ps1`, `Private/HistorySnapshotHelpers.ps1`, `Private/CosmosHistoryHelpers.ps1`, `Public/Invoke-DemoFabricNotebookRun.ps1`, `Private/ExistingEnvironmentHelpers.ps1`, `Public/Initialize-DemoConfig.ps1`, `Public/Import-DemoFabricItem.ps1` (help only), `config/environment.schema.json`; tests in `tests/unit/DbHubDemo.Fabric.Tests.ps1`, `Fabric.Notebooks.Tests.ps1`, `DbHubDemo.Lifecycle.Tests.ps1`, `DbHubDemo.Tracks.Tests.ps1`, and `DbHubDemo.FirstRun.Tests.ps1`; the docs above.
+
+**Validation.**
+
+- **New tests:**
+  - `DbHubDemo.Fabric.Tests.ps1`, through `Import-DemoFabricNotebook -KeepEdited` with a workspace copy built as Fabric returns it (one string per cell, CRLF, outputs, metadata): an earlier version is updated; an edited one is kept, with no definition sent; this version is a **Pass** with nothing sent, and the same version bound to another lakehouse is updated; a definition Fabric refuses is a **Warning**, or **Manual action required** for `CapacityNotActive`; a missing notebook is created; and `-WhatIf` reads and sends nothing. And `configure-fabric.ps1 -KeepEditedNotebooks` end to end, with one notebook edited and one earlier, and its refusal beside `-NewNotebooksOnly`.
+  - `Fabric.Notebooks.Tests.ps1`: the list holds each current version, once, oldest first; the fingerprint of the bound upload and of a copy as Fabric returns it equals the file's.
+  - `DbHubDemo.Lifecycle.Tests.ps1` and `DbHubDemo.Tracks.Tests.ps1`: `deploy.ps1`'s Fabric stage and its parallel Fabric track pass `-KeepEditedNotebooks`, and `Invoke-DemoFabricStage` gives `configure-fabric.ps1` `-KeepEditedNotebooks`, nothing with `-ImportNotebooks`, or `-SkipNotebookImport`.
+- **On f780670e's code with the new tests:** in the five test files, 20 fail and 694 pass. The 20 are the 2 version tests, the 8 `-KeepEdited` cases, 4 `configure-fabric.ps1` tests (the 2 new ones, `-NewNotebooksOnly`'s note, and `FABRIC.T4.HISTORY`'s fix with `-PostgresMetricsPath`), 3 tests whose texts changed (`INIT.EXISTING`'s and `INIT.FABRIC.WORKSPACE`'s notes, and `STOP.FABRIC.SAVEHISTORY`'s fix for T4's metrics), and the 3 deploy-path tests.
+- Pester with StrictMode, the 19 suites that cover the changed code (ActivityControl, CosmosHistory, Fabric, FabricApp, FabricAppSignIn, FabricItem, FabricResolve, FabricTrack, FirstRun, HistorySnapshot, HubReadiness, JumpstartStatus, Lifecycle, OneCommand, PostgresHistory, PowerBI, Tracks, Fabric.Notebooks, and Repo.LifecycleScripts): 1,534 passed, 0 failed, 15 skipped, 0 az calls.
+- PSScriptAnalyzer 1.25.0 with the repository's settings: 0 findings on the 18 changed PowerShell files. markdownlint: clean. The PowerShell files are ASCII; every changed file has LF line endings.
+
+**Risks.**
+
+- **Not run live:** that Fabric's ipynb export of an imported notebook gives the repository file's fingerprint. A normalization this doesn't cover makes every copy count as edited, so `deploy.ps1` keeps it, as before this change: safe, but the update then doesn't happen. The live round on an update should see `FABRIC.IMPORT.*` **Pass** "It was the demo's version of ..." for a workspace an earlier version imported, **Pass** "is this version already" on the next run, and **Not selected** after an edit in Fabric.
+- **An edit only to what the fingerprint leaves out,** a cell's metadata or outputs for example, is replaced by an update. An edit to the code is always kept.
+- **A notebook changed without the writer** makes copies of its version count as edited; the unit test fails first.
+- **One Get Item Definition per notebook per run,** a long-running operation when Fabric answers 202, bounded by the import's timeout.
+
+### Expected notes: a new VM's by-design notes are a Pass everywhere (2026-11-23)
+
+**Why.** [F32](#a-health-warning-thats-expected-says-so-f32-2026-11-22) made `INFRA.HEALTH.<vm>` and `STATUS.VM_<vm>` say that a new VM's one-off notes are expected, and why, but left them a **Warning**, health.json's own status: calling them a **Pass** would have differed from health.json, which was the owner's call. The owner chose option a (2026-11-23, the coordinator's recommendation): make expected-only notes a **Pass** everywhere, by having the VM record them as information rather than warnings, so health.json, `validate.ps1`, `status.ps1`, and the status page agree.
+
+**Work summary.**
+
+- **The VM** (`vm/bootstrap/lib/State.ps1`, `Runner.ps1`): `New-DemoVmStepResult -NoteMessage` carries a step's by-design notes, and the runner adds each to the state's `notes`, naming its step (`Add-DemoVmNote`), once. `Write-DemoVmHealth` writes them to health.json's new `notes`; its status rule doesn't change, so a Ready VM with notes and no warnings is a **Pass**. Notes are one-off, as one-off warnings are: `Clear-DemoVmTransientWarning` clears them at a new generation, and `Remove-DemoVmStepWarning` drops a step's own when its Set runs to its end.
+- **The four producers,** F32's expected notes, now return `-NoteMessage` where they returned `-TransientWarningMessage`: the sign-in cleanup's cleared event logs (`vm/hyperv-guest/GuestSql.ps1`), the restart SQL Server setup asks for after removing Analysis Services and Integration Services, and the sysadmin recovery (`vm/bootstrap/Invoke-SqlVmBootstrap.ps1`), and the image checked by its pinned SHA-256 for want of a Content-MD5 (`vm/hyperv-guest/GuestJumpstart.ps1`, as the decision's new `Info`). The image checked by its length alone, with no pinned SHA-256, stays a one-off warning, and so do automatic sign-in left armed and media trusted on first use, which F32 doesn't call expected either.
+- **health.json's schema** (`vm/health/health.schema.json`, `additionalProperties` false) gets `notes`, not required, so an older file still matches. `Get-DemoHealth.ps1 -View Summary` prints the first two, each cut to 240 characters, with `noteCount`; with two warnings and two notes at 240 characters, the summary stays under 3,500 bytes.
+- **The checks** (`Get-DemoHealthNoteText`): `INFRA.HEALTH.<vm>` and `STATUS.VM_<vm>` keep health.json's status, and for a Ready VM add "Its bootstrap noted, as information: `<Step>: ...`" with why each is expected, from F32's reasons (`Get-DemoHealthExpectedReason`, now shared with `Get-DemoHealthWarningNote`); the evidence adds `noteCount` and, for `INFRA.HEALTH`, the notes. The status page shows those results, so it says **Pass** too.
+- **An older bundle** still gives these notes as warnings, and F32's text still says they're expected; the checks keep its **Warning**, so they agree with its health.json. The next `./scripts/deploy.ps1` sends the new bundle (its content changed), whose first generation clears them, as it clears every one-off note.
+- **Docs:** [ADR 0012's amendment](adr/0012-validation-model.md#2026-11-23-a-new-vms-by-design-notes-are-information-so-a-ready-vm-is-a-pass), `vm/health/README.md`, two troubleshooting rows, the CHANGELOG, and this report.
+
+**Changed files.** `vm/bootstrap/lib/State.ps1`, `vm/bootstrap/lib/Runner.ps1`, `vm/bootstrap/Invoke-SqlVmBootstrap.ps1`, `vm/hyperv-guest/GuestSql.ps1`, `vm/hyperv-guest/GuestJumpstart.ps1`, `vm/health/Get-DemoHealth.ps1`, `vm/health/health.schema.json`, `vm/health/README.md`, `scripts/modules/DbHubDemo/Private/ValidationHelpers.ps1`, `Private/ValidationAreas.ps1`, `Public/Get-DemoEnvironmentStatus.ps1`; tests in `tests/unit/Vm.StateMachine.Tests.ps1`, `Vm.SqlVmPlan.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, `Vm.JumpstartImage.Tests.ps1`, `Vm.WorkloadSteps.Tests.ps1`, `DbHubDemo.Validation.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`; `docs/adr/0012-validation-model.md`, `docs/troubleshooting.md`, the CHANGELOG, and this report.
+
+**Validation.**
+
+- **New tests:** the state machine records a note as information, naming its step, so a Ready VM is a **Pass** whose health.json matches the schema; a warning beside it alone makes it a **Warning**; the next generation clears the note and keeps the lasting warning. T1's 3010 restart is a note, with no warning. The host's sign-in cleanup returns a note and no one-off warning. The image without a Content-MD5, checked by its pinned SHA-256, returns a note and no warning, and one checked by its length alone a one-off warning. The summary prints two notes and `noteCount`, within the bound. `INFRA.HEALTH.ARCHOST01` is a **Pass** with two notes and their reasons, and a **Warning** beside a real warning, naming both; `STATUS.VM_SQLVM01` is a **Pass** with the sysadmin recovery's note.
+- **On 42acec35's code with the new tests:** in the seven test files, 7 fail and 608 pass. The 7 are each new or changed test: the state machine's note, T1's restart, the host's sign-in cleanup, the image check, the summary, `INFRA.HEALTH`'s **Pass**, and `STATUS.VM_`'s.
+- Pester with StrictMode, every `Vm.*.Tests.ps1` with DbHubDemo.Validation, DbHubDemo.Lifecycle, and Repo.Conventions (21 files): 1,073 passed, 0 failed, 0 az calls.
+- PSScriptAnalyzer 1.25.0 with the repository's settings: 0 findings on the 16 changed PowerShell files. markdownlint: clean. The PowerShell files are ASCII, with LF line endings, and the VM files keep to Windows PowerShell 5.1's syntax (`Repo.Conventions`).
+
+**Risks.**
+
+- **Not run live:** a net-new deployment's first `validate.ps1` and `status.ps1` should show `INFRA.HEALTH.ARCHOST01`, `INFRA.HEALTH.SQLVM01`, and their `STATUS.VM_` rows as **Pass**, naming the notes; an update shows no notes, since the new bundle's first generation clears the earlier ones.
+- **A note is information now,** so a person who wants to know that a sign-in cleanup cleared an event log, which endpoint protection may report, reads it in a **Pass**'s message rather than a **Warning**'s.
+
+### The Insights app in earth tones (2026-11-23)
+
+**Why.** The owner, on 2026-11-23: "For the overall Fabric App, make the color scheme more pleasing to the eye. Instead of white do creams and do more earth tones. There is some stark contrast for both the light and dark themes." The coordinator asked for a new scheme in both themes: creams and earth tones in light, espresso and cream in dark, softer contrast that still meets WCAG 2.2 AA, earth-toned statuses that stay apart for color-blind viewers, earth-toned chart series, high contrast unchanged, and no color left outside the theme; in theme tokens and CSS only, since another session is reorganizing the Root cause page on the same base. One commit, after edd01c86 ([ADR 0030, the look](adr/0030-insights-app-mission-control.md#the-look-earth-tones)).
+
+- **Fluent's grays, warmed:** `warmTheme` (`src/theme/fluent.ts`) gives every gray token of Fluent 2's light and dark themes, a pure gray or a translucent one, the warm color at its level in `WARM_NEUTRALS` (`identity.ts`), interpolated between anchors, so hover, pressed, selected, and disabled states keep Fluent's steps between them, and Fluent's own controls, menus, dialogs, and message bars follow with no change to them. Shadows take a warm brown, a fifth lighter in light. Light: ivory cards (`#FCF7EE`) on a sand-cream page (`#F2EADB`) and soft espresso text (`#3E322A`); dark: espresso a step lighter than Fluent's near-black (`#221B17` and `#322924`) and cream text (`#F0E9D9`).
+- **The brand:** a terracotta ramp (`TERRACOTTA_BRAND`, `#99512D` at 80) on buttons, links, and the current page. Microsoft blue and Fabric's teal stay for a one-line swap back of `APP_BRAND`.
+- **Statuses:** brick, ochre, pine, and slate for Fail, Warning, Pass, and Manual action required, chosen apart by lightness as well as hue; Fluent's danger, warning, and success families, and its red, dark orange, yellow, and green badges, take the same tones (`EARTH_STATUS`, `EARTH_STATUS_FAMILIES`).
+- **Targets and charts:** slate, moss, ochre, clay, plum, and verdigris for T1 to T5 and T4's read replica, then stone and rose (`EARTH_ACCENTS`), chosen so the six stay apart under simulated protanopia, deuteranopia, and tritanopia.
+- **The stage:** the warm neutrals and shadows, sage for its accent (calm), and brick for its alert (`stage.ts`), apart from the terracotta on buttons.
+- **The last colors outside the theme:** the Copilot mark's purple-to-blue gradient (`copilot-dock.css`), now `--copilot-mark` (terracotta into plum; high contrast keeps the old gradient); the chart stylesheet's own palette and its incident band, whose `--chart-band` and `--chart-band-ink` are now app tokens, so a chart on the dark stage of the light app takes the stage's band and not the page's; the hard-coded white and gray fallbacks in the dock's and the charts' stylesheets; and the Fabric account's avatar, which took Fluent's "colorful" lavender and now takes the brand's color (`AccountChips.tsx`, its one prop).
+- **High contrast and Windows forced colors are unchanged:** `FLUENT_THEMES.contrast` is still Fluent's `teamsHighContrastTheme`, and the contrast tokens and F22's rules are as they were.
+
+**Measured** (the app's own tokens; before is 2026-11-20's palette):
+
+| Pair | Needs | Before | After |
+|---|---|---|---|
+| Light: body text on a card, on the page | 4.5 | 15.5:1, 14.2:1 | 11.6:1, 10.4:1 |
+| Dark: body text on a card, on the page | 4.5 | 14.5:1, 18.4:1 | 11.7:1, 14.0:1 |
+| Captions, worst surface (light, dark) | 4.5 | 5.4:1, 5.6:1 | 5.0:1, 5.6:1 |
+| Links, worst surface (light, dark) | 4.5 | 5.8:1, 6.0:1 | 5.7:1, 5.6:1 |
+| Status text, worst (light, dark) | 4.5 | 5.8:1, 5.2:1 | 4.7:1, 4.7:1 |
+| Targets and chart series, worst (light, dark) | 3 | 3.5:1, 3.6:1 | 3.1:1, 3.3:1 |
+| Statuses' closest pair, OKLab, protanopia / deuteranopia / tritanopia (light) | | 0.025 / 0.022 / 0.041 | 0.096 / 0.095 / 0.109 |
+| The same (dark) | | 0.035 / 0.051 / 0.048 | 0.114 / 0.116 / 0.144 |
+| Targets' closest pair, the same visions (light) | | 0.042 / 0.015 / 0.036 | 0.077 / 0.087 / 0.094 |
+| The same (dark) | | 0.021 / 0.059 / 0.057 | 0.095 / 0.102 / 0.104 |
+
+**Changed files.** `fabric/app/src/theme/identity.ts`, `fluent.ts`, and `stage.ts`; `copilot/copilot-dock.css`, `visuals/chart-view.css`, and `mission/mission.css` (its header comment); `shell/AccountChips.tsx` (the avatar's color); `lib/app.test.ts`, `test/color-vision.ts` (new: the color-vision simulation the tests use), and `test/overrides.test.ts` (the lint check's list of `src/test` files); ADR 0030, ADR 0031 (the Root cause view's look, one sentence), the ADR index, the app's README, the CHANGELOG, and this report.
+
+**Validation.** On edd01c86 with this commit:
+
+- **`npm run verify` passed:** the typecheck, lint, 686 tests in 36 files, the license check (136 production packages), and the build. The main chunk is 945.17 kB (270.24 kB gzip), 4.45 kB more than at edd01c86 (940.72 kB); the build's warning about chunks over 700 kB was there before.
+- **The new tests in `src/lib/app.test.ts` fail with the earlier palette:** Fluent's text, links, buttons, inputs, and focus ring at AA on the warm surfaces; body text between 7:1 and 12.5:1 on a card (15.5:1 and 14.5:1 before); no Fluent gray left; message bars and badges at AA on their own fills; the statuses 0.12 apart in normal vision and 0.09 under each simulated deficiency (0.022 before), the targets 0.10 and 0.07 (0.015 before), and the charts' eight 0.06 in normal vision; the stage's accent and alert 0.08 apart for every vision; the Copilot mark's glyph at 3:1 on both ends of its fill; no literal color in `app.css`, `mission.css`, `rca.css`, `copilot-dock.css`, or `chart-view.css` (the dock's gradient and the charts' palette before), with every app and stage token they use defined in every theme; and `applyAppTokens` setting the band and the mark. The first run of the badge test found the success outline badge's text at 4.4:1 on the light page, fixed before the commit.
+- **Screenshots** from the sample-data preview, before and after, in light and dark: Mission Control, Root cause, Estate, T3's charts, and the Copilot dock with a sample answer and chart; and, after, the scoreboard, the replay, the kiosk, Manage's message bars, Findings, and Readiness.
+- The leak check finds no identifier in what this commit adds.
+
+**Risks.** The colored text and marks sit closer to AA than before, since the surfaces are cream and not white (the ochre series at 3.1:1 on the light page, the status text at 4.7:1); the tests hold each pair, so a later tweak can't drop one below. The terracotta brand and the brick of Fail are both warm reds: a status always has its icon and word, and in light they're 0.12 apart, in dark 0.07. A Fluent upgrade's new gray token takes the warm ramp too, and the test that finds no gray left fails on one it misses. The Root cause page's reorganization touches the same view: this commit changes no component or rule there, only the stage tokens it reads.
+
+**What its live check needs.** The deployed app in Fabric's frame: light, dark, and the system setting; Mission Control, Root cause, the Copilot dock, the kiosk, and a dialog; and Windows high contrast, unchanged.
+
+### Query Store unit 1, part 1: "not captured" describes the history, never the target (2026-11-23)
+
+**Why.** The owner, 2026-11-23: "We would want query store enabled wherever possible", after the Insights chat said that T1 doesn't have Query Store. T1 to T3 have it on (`database/{sqlvm01,arcsql01,azuresql}/030-configure.sql`: `READ_WRITE`, `AUTO` capture, 15-minute intervals, 14 days; T1's bootstrap runs it again whenever the state isn't `READ_WRITE`). The chat read `explain_incident`'s note on a CPU incident, "the CPU's cause (Query Store's plans, waits per query) isn't captured yet", and the playbook's "the capture of plans and waits per query comes later", as the target lacking Query Store. This is part 1 of unit 1 of the Query Store design, which the coordinator accepted: the wording. Part 2 turns on T4's Query Store and wait sampling, and part 3 adds validate.ps1's `T1.QUERYSTORE` to `T4.QUERYSTORE`. It changes no capture, contract, notebook, or model column. It builds on the design's author's head start, reviewed and reworded where it asserted the target's state.
+
+- **`explain_incident`'s `TELEMETRY-ONLY` cause, note, and next step, per target** ([`rca/query-store.ts`](../fabric/app/src/rca/query-store.ts), called from `rca/tools.ts`). For CPU and the wait classes, which no rule explains by query yet:
+  - **T1 to T3:** the cause ends "Which queries drove it isn't in this history: the capture doesn't collect Query Store's per-query statistics yet, a limit of the capture, not of T1." The note says the same, and that Query Store on the target keeps those minutes' plans and per-query CPU, duration, and waits, and that validate.ps1's `<target>.QUERYSTORE` says whether it's on. The next step names where to read them for the incident's minutes: SQL Server Management Studio's Top Resource Consuming Queries and Regressed Queries reports for CPU, Query Wait Statistics for a wait class with its category as `sys.query_store_wait_stats` names it, or the catalog views ([Learn](https://learn.microsoft.com/sql/relational-databases/performance/monitoring-performance-by-using-the-query-store)).
+  - **T4:** the same, at every size but Burstable, in its `azure_sys` database: `query_store.qs_view`, and `query_store.pgms_wait_sampling_view` for the waits ([Learn](https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store)).
+  - **T4's read replica:** its queries are in neither this history nor Query Store, which "doesn't record the queries executed on any read replicas" (the same page); no next step.
+  - **T5** has no telemetry-only family (its throttling and RU are explained), so its words, "which requests drove it isn't in this history", are only a default.
+  - **Not kept from the head start:** its note said "the demo keeps Query Store on in ContosoCare on T1". That's the deployment's intent, not something this history measured, and the grounding rules make the chat cite a tool for every claim, so the note says where Query Store keeps the data and that validate.ps1 says whether it's on, as the design does.
+- **The playbook** (`rca/playbook.ts`): step 3 says CPU and the wait classes as "this history doesn't hold Query Store's per-query statistics yet, which is the capture's limit, not the target's", with explain_incident's next step. A new grounding rule: "not captured" describes this history, never the target, so the chat never says that a target has no Query Store, or that a feature or setting is off, because the capture didn't record its data; whether Query Store is on is validate.ps1's to say. Its documented exceptions: a read replica's queries, and Azure Cosmos DB, which has none.
+- **The model's RCA Queries and RCA Waits,** Phase 2's tables, which no capture writes: their table descriptions, which the chat reads in the model guide, start "Not written yet", and say that their emptiness says nothing about a target, never that a target has no Query Store. Their columns don't change, `rca/history-tables.json` doesn't (the design's unit 2 changes it), and the model test checks only that a table has a description. The guide is regenerated (`npm run guide:build`).
+- **Docs:** ADR 0031's section 8, the history model's README, and the CHANGELOG.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts` (new), `rca/tools.ts`, `rca/playbook.ts`, and `rca/tools.test.ts`; `fabric/app/src/copilot/model-guide.generated.ts` and `copilot/guide.test.ts`; `RCA Queries.tmdl` and `RCA Waits.tmdl` in `SM_DatabaseHub_History`; ADR 0031, `fabric/powerbi/README.md`, `CHANGELOG.md`, and this report.
+
+**Validation.** On edd01c86 with this commit:
+
+- **The app:** `npm run verify` passed: type check, lint, 682 tests in 36 files, the licenses, and the build.
+- **The new tests fail without the change:** with edd01c86's `tools.ts`, `playbook.ts`, and model guide, all 4 fail: the cause, note, and next step on T1, T2's buffer latch waits, and T3; on T4 and its replica; that no tool's result (`explain_incident` on each, `triage_window`, `find_incidents`) says a target has no Query Store or that it's off, or keeps the old words, and that the playbook says it only as what never to say and for Azure Cosmos DB; and the two tables' descriptions in the guide.
+- **The suites that read the model and the docs:** under strict mode, with the Azure CLI guard, the six `Repo` suites, `Docs.Walkthrough`, `Rca.Contract`, and `Fabric.PowerBI` passed: 319, with 4 skipped, and the guard saw no Azure CLI call.
+- markdownlint found no issue; every link this commit adds resolves, each relative one to one heading.
+- The leak check finds nothing in what this commit adds.
+
+**What its live check needs.** In the Insights app, on a history with a CPU or wait-class incident on T1 to T4: **Explain this incident** and the chat's answer say what the history lacks, with the next step, and never that the target has no Query Store.
+
+### Query Store unit 1, part 2: T4's Query Store and its wait sampling at every size but Burstable (2026-11-23)
+
+**Why.** The owner, 2026-11-23: "We would want query store enabled wherever possible". T1 to T3 have Query Store on; T4 had it only with autonomous tuning (`top`, on 4 vCores or more), and wait sampling nowhere. Part 2 of unit 1 of the Query Store design. It builds on the design's author's head start, with the independent review's changes: `all` rather than `top`, and the "no restart" claim worded as these two parameters'.
+
+- **The template** (`infra/modules/pgflex01.bicep`): `pg_qs.query_capture_mode` and `pgms_wait_sampling.query_capture_mode` on every server, `all` at every General Purpose and Memory Optimized size, whatever `t4AutonomousTuning` says, and `none` at Burstable ("Don't enable query store on the Burstable pricing tier as it causes performance problems", [Query Store](https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store)). The capture mode keeps its existing resource, now unconditional, and wait sampling's new one is spliced between it and the tuning's in the dependency chain: one resource per parameter, as a test checks. The read replica's template sets neither: Query Store "doesn't record the queries executed on any read replicas".
+- **`all`, not `top`** (the review's finding 7): `top` tracks top-level statements only, and the workload's statements run inside its functions, so Query Store would have seen only the calls; `all` also tracks "nested queries (the ones that execute inside a function or procedure)". Learn's autonomous tuning takes either: `index_tuning.mode` "Requires query store to be enabled by setting pg_qs.query_capture_mode to TOP or ALL" ([autonomous tuning](https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning)), so the capture mode no longer depends on tuning at all: `postgresql.autonomousTuning` loses its `queryCaptureMode`, and `postgresql.queryStore` holds both values (`config/versions.json`, passed through `infra/modules/demo.bicep`).
+- **An existing server:** Learn lists both parameters as dynamic ([parameters](https://learn.microsoft.com/azure/postgresql/parameters/parameters-query-store)), so `./scripts/deploy.ps1`'s template run sets them, and setting them restarts nothing. A run can still restart T4 for a pending `max_connections` (`Invoke-DemoDeployment.ps1`, ADR 0019's 2026-11-03), as before; the docs say "these two parameters", never that a deploy doesn't restart T4.
+- **Cost:** none on the bill ("Query store is available at no extra charge"); its data takes a little of T4's storage and CPU in `azure_sys`, kept 7 days. Plan storage stays off.
+- **Words:** `Get-DemoT4Tuning`'s messages say Query Store's state whatever the tuning ("Query Store and its wait sampling stay on, as at every size but Burstable", or off at a Burstable size), and no longer that the Query Store parameters are left as they are; the template's parameter descriptions and the configuration schema's `t4AutonomousTuning` say the same.
+- **Docs:** ADR 0019's amendment, `docs/deployment.md`'s T4 section, `docs/limitations.md`, the configuration schema's description, and the CHANGELOG.
+
+**Changed files.** `config/versions.json`, `config/environment.schema.json`; `infra/main.bicep`, `infra/modules/demo.bicep`, and `infra/modules/pgflex01.bicep`, with `azuredeploy.json` rebuilt; `scripts/modules/DbHubDemo/Private/T4Helpers.ps1` with `tests/unit/DbHubDemo.T4.Tests.ps1`; ADR 0019, `docs/deployment.md`, `docs/limitations.md`, `CHANGELOG.md`, and this report.
+
+**Validation.** On part 1's commit with this one:
+
+- **The template:** the pinned Bicep 0.47.16 builds `infra/main.bicep` to the committed `azuredeploy.json` byte for byte, and lints it with no finding.
+- **The T4 suite:** under strict mode, with the Azure CLI guard, `DbHubDemo.T4` passed: 105, none failed, and the guard saw no Azure CLI call. Its tests check the values, `all` and no tuning-dependent capture mode, the chain's order with wait sampling before the tuning's, one resource per parameter, the compiled template's expressions, and the tuning check's words at General Purpose and Burstable, with the switch false or unset. They fail at edd01c86.
+- **The suites that read the configuration, the template, and the docs:** under strict mode, with the Azure CLI guard, `DbHubDemo.T4`, `DbHubDemo.T4Fallback`, `DbHubDemo.Config`, `DbHubDemo.Cost`, `DbHubDemo.OneClick`, `Infra.T3`, `Repo.Conventions`, and `Docs.Walkthrough` passed: 586, none failed or skipped, and the guard saw no Azure CLI call.
+- PSScriptAnalyzer, with the repo's settings, found nothing in the two PowerShell files this commit changes, which are ASCII-only; markdownlint found no issue.
+- The leak check finds nothing in what this commit adds.
+
+**What its live check needs.** `./scripts/deploy.ps1` on an existing environment with T4 at `Standard_D4ds_v5`: both parameters `all` afterwards (`az postgres flexible-server parameter show`, read-only), no restart for them (the server's `isConfigPendingRestart` false for both), and `query_store.qs_view` in `azure_sys` listing statements from inside the workload's functions after a session.
+
+### The session control's status kept through updates (2026-11-23)
+
+**Why.** The owner approved the coordinator's recommendations for [the session control's status](#a-tenants-encrypted-status-variable-2026-11-23): option 1, an update that keeps the status, and option 2, the golden capture reading its lists through a runbook job. The coordinator asked for option 1 first, as its own unit, for the next release's cut-off; option 2 and O1's full fix follow as units of their own. Every `./scripts/deploy.ps1` deployed `infra/control/control.bicep`, which wrote the variable `DbHubSessionStatus` again, unencrypted and empty, so a session's next start after an update no longer had what the last stop's status listed: the documents its export couldn't fetch, the capture no export took, its bundles that no saved index lists, and earlier sessions' carries ((a) in that entry).
+
+- **The template:** `infra/control/control.bicep` has a parameter, `createSessionStatus` (true by default), and creates the variable only when it's true. The deployment stays incremental, Azure's default for `az deployment group create`, which leaves a resource the template doesn't deploy as it is ([deployment modes](https://learn.microsoft.com/azure/azure-resource-manager/templates/deployment-modes)), so an existing variable keeps its value and its encryption.
+- **The read before it:** `Invoke-DemoActivityControlTemplate` reads the variable first (`Get-DemoActivityControlStatusVariable`, [Variable - Get](https://learn.microsoft.com/rest/api/automation/variable/get), which answers for an encrypted variable too, without its value), with the read access the scripts already use on the control's account, and passes `createSessionStatus` true only when Azure says it's missing: a new environment, whose account doesn't exist yet, or a control from before 2026-11-16. A read that fails otherwise is tried once more, 5 seconds later; when it still fails, the template leaves the variable as it is, never emptied, and `CONTROL.RESOURCES` is a **Warning** that says so, with `./scripts/deploy.ps1` again as the fix. A missing variable then waits for a run that reads it, and the runbooks log that they couldn't keep the status, as for a control from before 2026-11-16; an existing one keeps the last status, which is the point.
+- **What `CONTROL.RESOURCES` says:** its evidence's `sessionStatus` is `created`, `kept`, `kept, encrypted`, or `unread, left as it is`, and its message says when an existing variable was kept, and whether encrypted.
+- **The golden capture's fix line:** in a tenant whose policy encrypts the variable, an update no longer makes it readable, since it keeps it. So the line's last step, after the Run all sessions that leave nothing listed, is now: delete the variable (the line gives the `az rest --method delete` command for this environment's account, or the account's Variables in the Azure portal), run `./scripts/deploy.ps1`, which creates it again, unencrypted and empty, and capture, before the policy encrypts it again. Deleting it after those sessions loses nothing listed, as the update's emptying did before. Option 2's job, the next unit, reads the lists of an encrypted variable, so the capture won't need the deletion then.
+- **Whether the tenant's nightly re-creation keeps the value**, which isn't known yet ([that entry's live check](#a-tenants-encrypted-status-variable-2026-11-23)): if it does, the runbooks go on reading the same status after each night, and an update now keeps it too, so nothing is lost. If it doesn't, each night empties the status as an update did before, whatever this change does: the next start has no earlier session's lists, and only the vault's copy, which the runbooks can't read, still has them. This change neither helps nor hurts that case; Final tests' live round tells which.
+- **Docs:** ADR 0031's risks (the update now keeps the variable, the deletion in the golden fix, and the open question), `rca/README.md`'s bundles, ADR 0026's and ADR 0020's notes on the variable, `docs/deployment.md`'s golden capture, two rows in `docs/troubleshooting.md` (`CONTROL.RESOURCES`'s new **Warning**, and `GOLDEN.CAPTURE.RCA` for an encrypted status), and the CHANGELOG.
+
+**Changed files.** `infra/control/control.bicep`; `scripts/modules/DbHubDemo/Private/ActivityControlHelpers.ps1` and `Public/New-DemoT2GoldenSnapshot.ps1`, with `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` and `DbHubDemo.Golden.Tests.ps1`; ADR 0020, 0026, and 0031, `rca/README.md`, `docs/deployment.md`, `docs/troubleshooting.md`, `CHANGELOG.md`, and this report: this entry, and the stacked branch's summary.
+
+**Validation.** On edd01c86 with this commit:
+
+- **The control's suite:** under strict mode, with the Azure CLI guard, `DbHubDemo.ActivityControl` passed: 135 passed, none failed, and the guard saw no unmocked Azure CLI call. Its 2 new tests: the template step with a missing, an unencrypted, an encrypted, and an unreadable variable (the parameter it passes, the result, its evidence and message, that the variable is only read, that the read is tried twice, and that the deployment names no `--mode`), and the template's conditional variable. With edd01c86's `ActivityControlHelpers.ps1` and `control.bicep`, both fail.
+- **The golden suite:** under strict mode, with the Azure CLI guard, `DbHubDemo.Golden` passed: 119 passed, none failed. The capture's encrypted-status test now expects the new fix line, with this environment's account in its command, and fails with edd01c86's.
+- **The template:** `bicep build` and `bicep lint` of `infra/control/control.bicep` found nothing; its JSON has the variable with `"condition": "[parameters('createSessionStatus')]"`. `azuredeploy.json` doesn't include the control's template, so it doesn't change.
+- **The suites that read the docs and the module:** under strict mode, with the Azure CLI guard, `Repo.Conventions`, `Repo.FunctionNames`, `Repo.Gitleaks`, `Repo.LifecycleScripts`, `Repo.NeutralWording`, `Repo.TestAzGuard`, `Docs.Walkthrough`, `Rca.Contract`, `Agent.PromptPack`, `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+- **Alone:** every suite above ran on a checkout of edd01c86 with only this commit's files in it, so the work of the units after it, in the same branch's worktree, played no part.
+- PSScriptAnalyzer, with the repo's settings, found nothing in the four PowerShell files this commit changes, which are ASCII-only; markdownlint found no issue.
+- Every link this commit adds resolves, each relative one to one heading.
+- The leak check finds no identifier in what this commit adds: no tenant, application, subscription, or environment ID.
+- No app code changed, so `npm run verify` stands as it was at edd01c86.
+
+**What its live check needs.** `./scripts/deploy.ps1` on an environment whose last session's stop listed something: `CONTROL.RESOURCES` says the variable was kept, a Variable - Get reads the same value as before the update (or, encrypted, still `isEncrypted` true), and the next Run all's start prints `RCA.EARLIER` for what that stop listed. On a new environment, `CONTROL.RESOURCES` with `sessionStatus` `created`, and the runbooks writing the variable as before. In a governed tenant, after the nightly policy has run, `CONTROL.RESOURCES` with `kept, encrypted`; and a stop after the policy ran, of a session that began before it, whose status has `planKept` true, which shows that the re-creation keeps the value.
+
+### The review of 40124992 (2026-11-23)
+
+**Why.** A fresh reviewer read 40124992 and said **SHIP**, with two Lows; the coordinator asked for both in one follow-up commit, for the same release. The reviewer also checked, with the real functions and only the Azure CLI faked, that no failure other than a 404 makes the step create the variable, that the template builds and only the variable is conditional, that nothing else deploys or reads the variable through Resource Manager, and that the fix line's command and API version are right.
+
+- **Low 1: the variable could stay missing while sessions ran, and the golden guard read that as nothing listed.** Before 40124992 every update wrote the variable, so a 404 meant a control from before 2026-11-16. Since then it's created only when a read finds it missing, so two reads that failed for another reason (throttling, a 5xx, the network) on a variable that really was missing, on a new environment's first deployment or after the fix line's deletion, left it missing, with only a `CONTROL.RESOURCES` **Warning**; so did the fix line's deletion without a successful `./scripts/deploy.ps1` after it. Sessions then ran without it: the runbooks keep the status only in the control vault, which they can't read back, and `capture-t2-golden.ps1` read the 404 as a status that lists nothing, so Prepare would have deleted T2's evidence that those stops listed.
+  - **The template step** (`Invoke-DemoActivityControlTemplate`): when the read before the deployment failed, it reads the variable again after it, when the account exists. A missing one is then created as the template creates it, unencrypted, empty, and with its description ([Variable - Create Or Update](https://learn.microsoft.com/rest/api/automation/variable/create-or-update); `$script:ActivityControlStatusVariableDescription`, which the test holds to the template's), and `CONTROL.RESOURCES` says so. One found then is kept, as before. One that can't be created is a **Warning**, `missing, not created`, with `./scripts/deploy.ps1` again; one still unread is the **Warning** it was.
+  - **The golden guard** (`Get-DemoGoldenControlRcaPending`): a 404 on the variable reads the control's account ([Automation Account - Get](https://learn.microsoft.com/rest/api/automation/automation-account/get)). Only an account that doesn't exist, which has had no session, still lists nothing. Otherwise it fails closed: `Missing`, and `GOLDEN.CAPTURE.RCA` is a **Fail**, "couldn't be read (it doesn't exist, though ... does)", whose fix is `./scripts/deploy.ps1`, which creates it, then the capture again. An account that can't be read fails closed too, with `Missing` and the same fix, `./scripts/deploy.ps1`, then the capture again; its error says the account couldn't be read.
+- **Low 2: the evidence said `created` when the deployment failed.** `sessionStatus` is now `to create` until the deployment succeeds, and `created` only then.
+- **Docs:** ADR 0031's risks, `docs/deployment.md`'s golden capture, two rows of `docs/troubleshooting.md` (`CONTROL.RESOURCES`'s **Warning**, and `GOLDEN.CAPTURE.RCA` for a missing variable), and the CHANGELOG.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/ActivityControlHelpers.ps1`, `Private/GoldenHelpers.ps1`, and `Public/New-DemoT2GoldenSnapshot.ps1`, with `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` and `DbHubDemo.Golden.Tests.ps1`; ADR 0031, `docs/deployment.md`, `docs/troubleshooting.md`, `CHANGELOG.md`, and this report.
+
+**Validation.** On 40124992 with this commit:
+
+- **The control's suite:** under strict mode, with the Azure CLI guard, `DbHubDemo.ActivityControl` passed: 137 passed, none failed, and the guard saw no unmocked Azure CLI call. Its 2 new tests: a read that fails twice before the deployment, then a 404 after it, which creates the variable as the template does (its body, and the template's description), or keeps one found then, or is a **Warning** when Azure refuses the creation; and a failed deployment, whose evidence says `to create`. The template step's test now counts four reads of an unreadable variable, two before the deployment and two after it.
+- **The golden suite:** `DbHubDemo.Golden` passed: 121 passed, none failed. Its 2 new tests: the guard fails closed on a variable missing from an account that exists, or one that can't be read, and lists nothing when the account doesn't exist; and the capture captures nothing then, with `./scripts/deploy.ps1` as the fix.
+- **Without the fix:** with 40124992's three PowerShell files, the 4 new tests and the template step's changed one fail.
+- **The suites that read the docs and the module's names:** under strict mode, with the Azure CLI guard, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.FunctionNames`, `Docs.Walkthrough`, and `Rca.Contract` passed: 226 passed, none failed.
+- PSScriptAnalyzer, with the repo's settings, found nothing in the five PowerShell files this commit changes, which are ASCII-only; markdownlint found no issue; every link this commit adds resolves, each relative one to one heading; and the leak check finds no identifier in it.
+- No app code changed, so `npm run verify` stands as it was at edd01c86.
+
+**Limits.** Accepted by the re-check of af7e8f5b, as in 40124992's template path: a variable created between the step's read after the deployment, which found none, and its own creation would be written again, empty. Only the tenant's nightly re-creation could do that, and only during a deployment whose first read failed twice.
+
+**What its live check needs.** The entry above's, and `CONTROL.RESOURCES` on a new environment, with `sessionStatus` `created`.
+
+### The review of 319b3ae1 and a2f776db (2026-11-23)
+
+**Why.** A fresh reviewer found parts 1 and 2 correct, their Learn quotes verbatim, and their tests real, and said **SHIP WITH FIXES**: two Medium and two Low. The coordinator asked for the fixes in one commit, beside part 3. One commit, after a2f776db.
+
+- **Medium: the notes name `T1.QUERYSTORE` to `T4.QUERYSTORE`, which only part 3 adds.** Part 3 ships with parts 1 and 2 today (its entry follows this one), so the names stay; without it they'd have to point at `sys.database_query_store_options` and `az postgres flexible-server parameter show` instead.
+- **Medium: "keeps those minutes" ignored retention.** T1 to T3 keep 14 days (`STALE_QUERY_THRESHOLD_DAYS`, less when size-based cleanup runs first) and T4 7 (`pg_qs.retention_period_in_days`' default), and T4 runs only during demos, so its newest incident can already be older. The note was then false, and the next step sent the owner to an empty view, which reads as "Query Store is off".
+  - **Now** (`rca/query-store.ts`): within the retention, the note says it ("for 14 days (less when it fills up)", "for 7 days"); past it, the note says Query Store no longer keeps those minutes either, how old they are, and that validate.ps1 says whether it's on, and there's no next step. The playbook's step 3 says "while it keeps those minutes".
+  - **Counted on the viewer's clock** (`InvestigationDeps.now`, which `rca/client.ts` passes from its own clock), not on `deps.latest`, as the review suggested: `latest` is the history's newest telemetry, which stays put while the demo is stopped, so a 10-day-old incident from the last session would read as fresh against it, the review's own case.
+  - **Tests:** 8 days later, T4's note says its 7 days are past, with no next step, while T1's still has one; 15 days later, T1's says its 14 are past. A test pins the 14 days to each `030-configure.sql`, and that the template leaves T4's retention at Learn's default.
+- **Low: the tuning check's Pass still said "Query Store captures the top queries"** and left out Query Store's state, which every other message of `Get-DemoT4Tuning` says. It now says that index tuning runs on what Query Store records, every statement, top-level and nested (`all`), and ends with Query Store's state, with a Pass case in the test that fails before it. `scenarios/missing-index/README.md` no longer says Query Store is `TOP`.
+- **Low: the playbook's step 3 contradicted the replica's exception:** it now says "except T4-replica, whose queries Query Store doesn't record", and that the next step is given "when it has one".
+- **Docs:** ADR 0031's section 8 and the CHANGELOG say the retention.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts`, `rca/tools.ts`, `rca/client.ts`, `rca/playbook.ts`, and `rca/tools.test.ts`; `scripts/modules/DbHubDemo/Private/T4Helpers.ps1` with `tests/unit/DbHubDemo.T4.Tests.ps1`; `scenarios/missing-index/README.md`; ADR 0031, `CHANGELOG.md`, and this report.
+
+**Validation.** On a2f776db with this commit:
+
+- **The app:** `npm run verify` passed: type check, lint, 684 tests in 36 files, the licenses, and the build. The two new tests, retention in the notes and the next steps, and its 14 days pinned to the scripts, fail at a2f776db, whose notes say neither.
+- **The T4 suite:** under strict mode, with the Azure CLI guard, `DbHubDemo.T4` passed with the tuning check's Pass case, which fails at a2f776db on its "top queries", beside the docs' suites (`Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, `Rca.Contract`): 345 passed, 3 skipped because this PC lacks gitleaks, with part 3's commit, whose T4 tests run in the same file.
+- PSScriptAnalyzer, with the repo's settings, found nothing in the two PowerShell files this commit changes, which are ASCII-only; markdownlint found no issue; every link this commit adds resolves, each relative one to one heading.
+- The leak check finds nothing in what this commit adds.
+
+**What its live check needs.** The Insights app's **Explain this incident** on a CPU incident on T4 more than 7 days old: the note says Query Store no longer keeps those minutes, and there's no next step; on one within 7 days, the next step's `qs_view` holds those minutes.
+
+### Query Store unit 1, part 3: validate.ps1's T1.QUERYSTORE to T4.QUERYSTORE (2026-11-23)
+
+**Why.** The owner, 2026-11-23: "We would want query store enabled wherever possible". Parts 1 and 2 say where Query Store keeps a target's per-query statistics and turn it on for T4; this part checks that it is on, as the design's table says, with the independent review's changes (finding 6): the runner's Query Store state is read before the relay cuts the output, unread is a **Warning**, and `READ_ONLY` gets its measured reason's fix rather than always a redeploy.
+
+- **The runner** (`workload-generator`): `status --json` on T1 to T3 writes `queryStore` last but one, before `host`: `sys.database_query_store_options`'s actual and desired state, read-only reason, capture mode, interval, and storage against its limit, or the read's error, at most 200 characters (`DemoDatabase.ReadQueryStoreAsync`, which returns a refusal rather than throwing; `CommandLine.QueryStore.cs`). The text status says it in one line.
+- **The relay on the VMs** (`vm/bootstrap/Invoke-DemoWorkloadControl.ps1`): the result keeps 1,800 characters of stdout, and a status with runs and sessions is longer, so the relay reads `queryStore` from the whole output, as it does the profile, keeps only its known members, each string at most 64 characters and the error 200, and puts it in the result's evidence: under 400 characters escaped, and the 5-run status's result line under 3,500 characters, within a Run Command's 4 KB.
+- **The checks** (`scripts/modules/DbHubDemo/Private/QueryStoreHelpers.ps1`, [ADR 0012](adr/0012-validation-model.md#2026-11-23-query-store-on-t1-to-t4)):
+  - **`T1.QUERYSTORE`, `T2.QUERYSTORE`** (areas `t1`, `t2`), with the Workload area's status read: the relay's node, or the kept output's for a relay from before it. **Pass** at `READ_WRITE`. **Fail** at `OFF`, `READ_ONLY`, or `ERROR`: a state someone set gets `./scripts/deploy.ps1`, whose bootstrap runs `030-configure.sql` again whenever the state isn't `READ_WRITE`; a `READ_ONLY` with a read-only reason gets that reason's fix from Learn (the size limit: raise `MAX_STORAGE_SIZE_MB` or remove queries, since a redeploy only sets `READ_WRITE` again; the statements' memory limit; a full, read-only, single-user, or emergency database). **Warning** when Learn says the reason is temporary, for a runner or relay from before it (fix: `./scripts/deploy.ps1`), and whenever the status wasn't read: a stopped VM, a T2 host not Ready or waiting for a manual step, a read that failed; **Not selected** for the evaluation-only T2.
+  - **`T3.QUERYSTORE`** (`t3`): from T3's status row, which `Test-DemoT3` already reads through T1, with five more columns from the same view (`database/azuresql/900-status.sql`); the same statuses, its redeploy step being the T3 stage; a **Warning** when the row wasn't read, **Not selected** with `-SkipSqlCheck`.
+  - **`T4.QUERYSTORE`** (`t4`): both parameters through Azure Resource Manager, as `T4.MAXCONNECTIONS` reads its own. **Pass** with `top` or `all` and wait sampling `all` on General Purpose or Memory Optimized; **Fail** with Query Store off there; **Warning** with wait sampling off, or Query Store on at Burstable; **Not supported** at Burstable with it off, with the fix (a General Purpose `t4SkuName`); a stopped T4, or a read that failed, a **Warning**.
+  - **Only `validate.ps1` runs them:** `Test-DemoT3` and `Test-DemoT4` add them with `-IncludeQueryStore`, which only the validation areas pass. `deploy.ps1` stops its T3 stage on any T3 **Fail**, and skips T4's setup on any T4 **Fail**, so Query Store's state never does either.
+- **Docs:** ADR 0012's catalog and its 2026-11-23 section, `docs/architecture.md`'s T3 checks, `Invoke-DemoValidation`'s help, the runner's README, `database/azuresql/README.md`, and the CHANGELOG.
+
+**Changed files.** `workload-generator/src/ContosoCare.Workload/Sql/DemoDatabase.cs`, `Cli/CommandLine.cs`, and `Cli/CommandLine.QueryStore.cs` (new), with `tests/ContosoCare.Workload.Tests/StatusQueryStoreTests.cs` (new); `vm/bootstrap/Invoke-DemoWorkloadControl.ps1` with `tests/unit/Vm.WorkloadSteps.Tests.ps1`; `database/azuresql/900-status.sql`; `scripts/modules/DbHubDemo/Private/QueryStoreHelpers.ps1` (new), `Private/ValidationAreas.ps1`, `Public/Test-DemoT3.ps1`, `Public/Test-DemoT4.ps1`, and `Public/Invoke-DemoValidation.ps1`, with `tests/unit/DbHubDemo.QueryStore.Tests.ps1` (new), `DbHubDemo.T3.Tests.ps1`, `DbHubDemo.T4.Tests.ps1`, and `DbHubDemo.Validation.Tests.ps1`; ADR 0012, `docs/architecture.md`, `workload-generator/README.md`, `database/azuresql/README.md`, `CHANGELOG.md`, and this report.
+
+**Validation.** On part 2's commit with this one:
+
+- **The runner:** with the pinned SDK 10.0.403, `dotnet build --configuration Release` built with no warning, and `dotnet test` passed: 812 tests, 791 passed and 21 skipped, the integration tests that need a disposable SQL Server or PostgreSQL. The 4 new tests check the status's members and order, the error's bound, the text line, and, with ScriptDom, that T3's status row reads its six Query Store columns from `sys.database_query_store_options`.
+- **The relay:** under strict mode, with the Azure CLI guard, `Vm.WorkloadSteps` passed: 111. Its new tests read Query Store's state from a status of 2 and 5 runs, whose kept tail loses it, with the result line under 3,500 characters, and bound each string by its escaped length, which a first version that cut the raw text failed: 200 quotes escape to 400.
+- **The checks:** under strict mode, with the Azure CLI guard, `DbHubDemo.QueryStore` (new), `DbHubDemo.T3`, `DbHubDemo.T4`, `DbHubDemo.Validation`, `Vm.Compatibility`, `Repo.Conventions`, `Repo.FunctionNames`, `Repo.NeutralWording`, and `Docs.Walkthrough` passed 478 of 479, and the guard saw no Azure CLI call; the 479th, the link check, needed this entry's heading, and passed with it when `DbHubDemo.T4` and the docs' suites ran again with the review's fix commit: 345 passed, 3 skipped because this PC lacks gitleaks.
+- PSScriptAnalyzer, with the repo's settings (the VM's for the relay), found nothing in the 11 PowerShell files this commit changes or adds, which are ASCII-only; markdownlint found no issue; every link this commit adds resolves, each relative one to one heading.
+- The leak check finds nothing in what this commit adds.
+
+**What its live check needs.** After `./scripts/deploy.ps1` on an existing environment, which updates the runner and the relay on both VMs: `./scripts/validate.ps1` with every area, or `-Area Workload, T3, T4`, during a session with the profile running: `T1.QUERYSTORE`, `T2.QUERYSTORE`, and `T3.QUERYSTORE` **Pass** at `READ_WRITE`, and `T4.QUERYSTORE` **Pass** with `all` and `all` after part 2's update; and the size of the relay's result line for a status with 5 runs, which a test bounds at 3,500 characters.
+
+### The organized Root cause (2026-11-23)
+
+**Why.** The owner liked the Root cause experience, but it read as one big list. They asked for structure: categories, severity, and filtering by server and database, so it can be sliced and diced. The coordinator's brief added:
+
+- the time window, grouping by category or by target, a count per facet value, and sorting by severity or time;
+- the filters in the app's address, so a view can be shared and the Incidents page's **Root cause** lands filtered;
+- severity from measured evidence only, blind, as High, Medium, or Low, with its reason on hover;
+- the same filters in the chat's `find_incidents` and `triage_window`;
+- theme tokens only for color, since the earth-tone theme's session changes the tokens and the CSS on the same base.
+
+One commit, after edd01c86. Before-and-after screenshots of the page, in light and dark, went to the coordinator first.
+
+**What it adds** ([ADR 0031, section 7](adr/0031-incident-rca.md#7-the-rca-view), and [section 8](adr/0031-incident-rca.md#8-the-chat-as-the-first-line-investigator) for the chat):
+
+- **One rule for the page and the chat** (`rca/facets.ts`, its ids in `rca/facet-ids.ts`): an incident's category from its signal's family; its severity, and why; the matching; the counts per value, each facet's beside the other facets as they are; the grouping and the sorting; and the chat's arguments, which refuse a value they don't know, so a filtered list is never taken for a whole one.
+- **The page** (`pages/RcaPage.tsx`, `rca/view/IncidentList.tsx`):
+  - a facet bar above the list: Severity, Category, and Server and database, each value with its count (a value with none is disabled unless it's selected); the minutes, the history's newest 90 minutes, 6 hours, or 24 hours, or the viewer's own, at most 24 hours; Group by; Sort by; **Clear the filters**; and "Showing N of M incidents";
+  - the list in groups, each incident with its severity as a word and bars, never color alone, and its reason on hover and for screen readers;
+  - the selected incident's report with its severity among its chips, and its reason in a line of its own;
+  - a note when no incident matches, with **Clear the filters**, and when the filters hide the incident that's open.
+- **The servers' names:** T1 to T3's server and database from Database Hub's telemetry, and T4's server, its replica's, and T5's account from the Azure Monitor captures, which the tools now return as `details.servers`. A target with no name reads by its target alone.
+- **The address** (`lib/view-state.ts`): `cat`, `sev`, `tg`, `win`, `group`, and `sort` on `#/rca`, with the defaults left out and an unknown value dropped; an older link's window key reads as its target and minutes. The Incidents page's and the scoreboard's **Root cause** pass a target and minutes only, never a category, since an Incident Window's family can come from the answer key.
+- **The chat** (`rca/tools.ts`, `rca/playbook.ts`): `find_incidents` and `triage_window` take `categories` and `severities` beside `targets`; each episode and hypothesis has its category, severity, and `severityReason`; with filters, `details.filters` and `details.leftOut` say what they left out, while `nothingAbnormal` and `quiet` stay about the whole window. Triage's findings take their incident's severity (High critical, Medium a warning, Low information) rather than the triage score's 9 or more. The playbook's triage step says how to slice, and to quote the reason rather than judge.
+- **The detector** (`rca/detector.ts`): each episode's `farMs`, its time at its far mark in all, which the rule reads. Nothing else in its output changes.
+
+**The severity rule, and the coordinator's question.** The first cut made 32 of the preview's 49 incidents High, and 14 of B's 18, so the facet barely sliced. The coordinator asked for a tighter High if the same measurements support one, or the rule kept and why.
+
+- **What supports one:** the time at the far mark, four times the level or 90 % of a capacity, rather than over the level. High now needs 5 minutes there in all; far at its peak but there for less is Medium. It counts in all rather than in a row, since a dip of one sample would split a run: in a row, the preview would read 30, 16, and 3, and B's day 9, 8, and 1, with the preview's T1 chain at 14:02 Medium, though it was at its far mark, 4 or more blocked processes, for 6.8 of its 9.1 minutes, at most 2 in a row as it re-formed, and so B's two connection surges that came in waves and one of T5's storms whose RU dipped under 100 %.
+- **The result:** the preview reads 31 High, 15 Medium, and 3 Low; B's day 12, 5, and 1; A's 0, 2, and 0.
+- **Why the measurements support no more:**
+  - The preview's incidents are made up: flat plateaus of 7 to 20 minutes at 4 to 20 times their levels, built to show each beat.
+  - B's twelve are sustained saturation: T5's three storms, at 100 % normalized RU and peaks of 2,187 to 6,522 throttled requests for 9 to 30 minutes, each counted once for its 429s and once for its RU; T4's CPU at 90 % or more, peaking at 95 to 96 %, for 7 to 15 minutes, four times; and two of T4's connection surges, at the limit for 5 and 6 minutes. B's other three surges, its two replica stalls, far for a minute each, and a one-sample lag are Medium or Low.
+  - A tighter High would call sustained saturation Medium, with a threshold no measurement suggests. So the rule stays, and ADR 0031 says why; the coordinator allowed it to change in a later release.
+
+**Blind, and theme tokens only.** The rule reads each episode's own unit, level, peak, times, support, and time at its far mark, nothing else; the facets read the detector's incidents, and no link passes a category. The tools' specs name no scenario or injection, which a test checks, and `Rca.Contract`'s blind scan is clean. Every color is a token: the stage's, or the app's status and target tokens, whose contrast on the stage's surfaces `app.test.ts` checks in every theme; `rca-view.test.tsx` allows no other color.
+
+**For the release's integration.** The commit goes after edd01c86. It shares `rca/view/rca.css`, and the tokens it reads, with the earth-tone theme: its rules name tokens only, so the theme re-colors them, and a merge of the two keeps both sets of rules.
+
+**Changed files.** New: `fabric/app/src/rca/facets.ts`, `facet-ids.ts`, `facets.test.ts`, and `view/IncidentList.tsx`. Changed: in `fabric/app/src/`, `App.tsx`, `lib/view-state.ts`, `pages/RcaPage.tsx`, `pages/IncidentsPage.tsx`, `pages/ScoreboardPage.tsx`, and, in `rca/`, `detector.ts`, `playbook.ts`, `tools.ts`, `triage.ts`, `types.ts`, `view/facts.ts`, `view/RcaReport.tsx`, and `view/rca.css`, with the tests `lib/app.test.ts`, `rca/detector.test.ts`, `rca/postmortem.test.ts`, `rca/tools.test.ts`, and `rca/view/rca-view.test.tsx`; ADR 0031, the app's README, the CHANGELOG, and this report: this entry, and the stacked branch's summary. No PowerShell, runbook, notebook, capture, history table, or semantic model changes.
+
+**Validation.** On edd01c86 with this commit:
+
+- **The app:** `npm run verify` passed, run alone: typecheck, lint, Vitest's 697 tests in 37 files, the license check (136 production packages), and the build, whose main chunk is 940.87 kB, from 940.72 kB.
+- **The new tests fail without the change:** with edd01c86's code and this commit's tests, `facets.test.ts` and `postmortem.test.ts` don't load, since they import `facets.ts`, and the new cases fail: the address's 1, the detector's 2, the chat's 3, and the view's 4 with its changed link test. The chat's spec test also pins the `severities` description to the rule as `severityOf` applies it, and fails on a description of "far at its peak and over its level 5 minutes".
+- **Timing.** In two full runs while other work held this PC at 100 % CPU, the view's first test ran past its 20 seconds. It mounts the whole page and pays Fluent's first styles: alone, it takes 5 to 7 seconds, against 4 to 5 at edd01c86. The view's tests now get 30 seconds, as Mission Control's do, and the facet bar and the list are memoized, so the report's arrival doesn't render them again. The same runs timed out `sources.test.ts`'s read cut short, which takes 7.2 seconds alone, as at edd01c86 (7.6), and once Overview's, which this change doesn't touch. The run above passed with none of them.
+- **The B/A sweep:** of the investigation tools' 1,134 answers on B's and A's recorded rows, 907 are byte-identical to edd01c86's, 227 differ only by the facets (each episode's and hypothesis's category, severity, and `severityReason`, `details.servers`, and triage's findings' severity), and none differ otherwise. Triage's findings' severities moved: 21 warnings to critical, 9 critical to warnings, and 5 warnings to information. B's day lists 12 High, 5 Medium, and 1 Low; A's, 2 Medium.
+- **The suites that read the docs and the app:** under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Rca.Contract`, `Agent.PromptPack`, `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks; no unit test reached the Azure CLI, and `Rca.Contract`'s blind scan is clean.
+- markdownlint found no issue in 152 files, and every link this commit adds resolves, each relative one to one heading.
+- The leak check finds no identifier in what this commit adds: no tenant, application, subscription, or environment ID, no email address, and no secret.
+- **The screenshots,** from the preview harness in light and dark, before and after, went to the coordinator, and were taken again under the final rule (31, 15, and 3).
+
+**What its live check needs.** As the summary above lists: the facets and their counts on a live session's incidents, 6 and 24 hours, a shared address, the links landing filtered, T4's and T5's names, the severities, and the chat's filters.
+
+### The re-review of bbdcd05c and 8e2cb06b (2026-11-23)
+
+**Why.** The re-review said **SHIP** for both, with one Low: past a target's retention, the note gave the minutes' age rounded down, so for the whole day after the retention ran out it said Query Store "no longer keeps those minutes ... it keeps 7 days, and they're 7 days old". One commit, after 8e2cb06b.
+
+- **The fix** (`rca/query-store.ts`): past the retention, the note says "they're more than 7 days old" (14 on T1 to T3), which holds at any age past it.
+- **Test:** T4's incident at its last kept minute still has its next step, and 7 days and 18 hours after it, its note says "more than 7 days old" and never "7 days old"; T1's and T3's the same around 14 days, one minute apart. It fails at 8e2cb06b.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts` and `rca/tools.test.ts`; ADR 0031 and this report.
+
+**Validation.** On 8e2cb06b with this commit: the type check and lint passed, and so did `src/rca` and `src/copilot`'s 384 tests, one of which, `ask-blind.test.tsx`'s Overview, timed out on this loaded PC and passed when its file ran alone (32 of 32). markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+
+**What its live check needs.** Nothing beyond part 1's and the review's: a T4 incident more than 7 days old reads "more than 7 days old".
+
+### The RCA release: the Incident RCA merged onto the release's follow-ups (2026-11-23)
+
+**Why.** The owner wants the releases after the Ignite release out as soon as possible: the release's follow-ups first (PR #67), then the Incident RCA. This branch is the RCA release: the RCA line merged onto the follow-ups, proven live by Final tests before it merges, right after the follow-ups.
+
+**How.** One merge, never a rebase, so each reviewed commit keeps its SHA: `marcbushong-microsoft-rca-postmortem-cause` at edd01c86 (Phase 1, 4a1781c5, and the 19 reviewed commits stacked on it) into `marcbushong-microsoft-release-follow-ups` at f780670e, as 28d8960a. The fixes the merge needed are separate commits after it. Then the units reviewed for this release merge in the same way, each from its own branch (below).
+
+**The conflicts: 19 files, each resolved for both sides' behavior.**
+
+| File | The follow-ups | The RCA | Combined |
+|---|---|---|---|
+| `automation/runbooks/DbHubControl.Common.ps1` (`Write-DbHubStopStatus`) | `takenOver` in a taken-over end's status | `stoppedUtc`, and the metrics' final version | All three |
+| `scripts/modules/DbHubDemo/Private/RunCommandHelpers.ps1` | `RecentDeletes` (F31's review) | `StartUtc` on each item | The help names both; the RCA export's `DbHubDemo-Rca-*-<yyyyMMddHHmmss>` names are deletes in flight too |
+| `fabric/app/src/data/queries.ts` | F35 part 1: T4's and T5's reads take every save in the latest capture's window, `MONITOR_SERIES_ROW_LIMIT` | `measured`: Ask's DAX reads the latest run from Telemetry Snapshots alone (`latestRunWithPoints`), never Analysis Findings | The measured variant takes F35's window too, so the chat's DAX reads the saves the page shows, still blind |
+| `fabric/app/src/lib/scoreboard.ts` | F34: T4's connection surge scored by its connections; `CAPTURE_SIGNALS` | T4's and T5's Not supported rows read the scenario's title | F34's score, and the title on every other T4 and T5 row |
+| `fabric/app/src/pages/OverviewPage.tsx`, `mission/use-mission.ts`, `lib/mission.test.ts` | `latest*Capture`, `percent`, `pgPending`, `cosmosHealth`, `episodesIn` | `newestSessionWindow`, `measuredFindings`, `askSpecs`, the postmortem's Cause | Both sides' imports and members |
+| `scripts/modules/DbHubDemo/Public/Get-DemoCostEstimate.ps1`, `tests/unit/DbHubDemo.Cost.Tests.ps1` | 80 job minutes a session, 5 Run all sessions, the minutes past the 500 included priced at the next tier | 60 a session with the export, 300 a month, at the included tier | The RCA's merge note, followed: 116 a session (80, and the export's 36), 580 a month, 200 past the 500 with the nightly stop's 120, about $0.40 a month; every month total in the tests $0.36 higher; the RCA's "fits in the 500" test now checks that each minute past it is priced at the next tier |
+| `tests/unit/Fabric.ControlNotebook.Tests.ps1` | The takeover and `DURATION_MINUTES` scenarios | The RCA scenarios | Both |
+| `CHANGELOG.md` | `[Unreleased]`: the follow-ups | `[Unreleased]`: the RCA | The RCA on top as `[Unreleased]`, and the follow-ups as `[2026-11-23]`, their expected merge day: correct the date if #67 merges on another day. The RCA's cost lines and its scoreboard line follow the combined behavior |
+| `README.md`, `docs/cost-management.md`, `docs/deployment.md`, `docs/adr/0031-incident-rca.md` (no conflict there, but stale) | 520 job minutes, $0.04 | Within the 500 included, no figure changes | The merge note's figures, line by line: 700 minutes, 200 past the 500, $0.40; one environment passes the 500 after about three such sessions; two environments, 1,400 minutes, 900 billed, $1.80. The At a glance figures stay 2026-11-19's, and say they don't include the $0.40 |
+| `automation/README.md`, `fabric/app/README.md`, `fabric/control/README.md`, `docs/adr/0026-one-run-all-session.md` | The takeover, T2's follow, F26, F33, F18, F28 to F30 | The export, Root cause, the handoff | Both sides' words; both sides' ADR 0026 amendments, by date |
+| `docs/implementation-report.md` | Its entries | Its entries | The follow-ups' first, then the RCA's, then this one |
+
+**The interactions that merged cleanly but needed a fix, each its own commit with a test that fails without it:**
+
+| Where | The follow-ups | The RCA | What happened together | Fix |
+|---|---|---|---|---|
+| A taken-over session's end (`Complete-DbHubTakenOverSession`) | The end stops nothing and saves the metrics | Every stop exports the evidence first, and the metrics' final version lists its bundles, which the notebook reads | The end saved the metrics without the index, so the session's history had none of its evidence, and the status had no `rca`, so a session shorter than a re-check read "the control's runbook is from before" the RCA | The end does the session's own part as a stop does: the claim, the export, the metrics with the index, and the status with its lines and version; the notebook prints the lines after "Taken over: ..." |
+| Stop now again after a taken-over end | The notebook sends a stop with no session ID and waits for a stopped status without `takenOver` | A second whole stop of a session leaves its status to the first (`Resolve-DbHubStopClaim`) | The demo stopped, but the status kept `takenOver`, so the notebook waited 25 minutes and printed a **Warning** that the stop didn't come back | That stop writes the end's status again without `takenOver`, with its own `done`, `failed`, and `stoppedBy` (`Complete-DbHubTakenOverStatus`); `stoppedUtc`, the metrics' version, and the lines stay the end's |
+| The postmortem's answer key for hidden T4 and T5 (`PostmortemDialog.tsx`) | F35: the series queries return every save in the window | The key loads them with `toPostgresCapture` and `toCosmosCapture` | A later day-long save's points sat unmerged beside the session's own: a peak at 14:20 read from 14:15 | `latestPostgresCapture` and `latestCosmosCapture`, as every page |
+| The scoreboard's Signal column | F34's test: idle-in-transaction reads its ID | The RCA's test: the surge reads its title, and `expectedFamilies("connection-surge")` is `["io"]` | Each test expected its own side's behavior | The tests expect the combined one: "active connections" for the surge, the title for the other beats |
+
+**Checked, and nothing needed:**
+
+- **Run all's plan and session length (F25, F27, F33) and the RCA's steps:** a moved auto-shutdown gets the same `shutdownMarginMinutes` (2) as the nightly one, so a session that ends there leaves its stop's export the same room as before, and what an export doesn't take stays on the VMs for the next start (`RCA.EARLIER`). F33's bounds and the RCA's re-checks don't meet: a re-check within 10 minutes of the end leaves its minutes to the stop. F27's settle runs after `stop-demo.ps1`'s handoff, from the state the handoff read again.
+- **Fresh-name Run Commands (F31) and the RCA's:** the RCA adds no `Invoke-DemoVmRunCommand` caller; its Run Commands are created with `az rest` under names that never repeat, `DbHubDemo-Rca-<vm>-x-<time>` and `-<ddpp>-<time>` from the scripts and `DbHubControl-rca-...` from the runbooks, so the handler's skip of a reused name can't reach them. `STATUS.RUNCOMMANDS` lists them by prefix, and leaves out one being deleted for 15 minutes, as F31's reads. `Wait-DemoStopHandoffHostPassword` reads `RecentDeletes`, as its merge note asked: the follow-ups return those names, and the host password's fresh name ends in `-yyyyMMddHHmmss`.
+- **`stop-demo.ps1`'s handoff and the follow-ups' takeover:** with a `start-demo.ps1` auto-stop pending, the handoff doesn't apply (`StartDemo`), and `stop-demo.ps1` stops the demo itself, as before.
+- **The runbooks' common module:** 564 KB, 26 KB more than the RCA's, which published live; `deploy.ps1` republishes it with the RCA's settings (`CONTROL.RUNBOOKS`).
+- **F35 and the RCA's own reader:** `finest-per-interval.ts` and its test are byte for byte one copy, as both sides had them; the RCA's `rca/sources.ts` reads through it. The model is the release's on the follow-ups' side, so the RCA's TMDL and generated guide stand, and `npm run guide:build` rewrites nothing.
+- **F28 to F30 and the control:** the RCA adds no account, secret, or role, so `PREFLIGHT.P3.AUTOMATION` and `DEPLOY.CONTROL`'s reads are unchanged.
+- **The notebooks:** both merged line by line with no conflict; each is valid nbformat 4.5 JSON with no outputs, and no top-level function is defined twice.
+
+**A test that the date broke, not the merge.** `Fabric.Notebooks.Tests.ps1`'s "keeps a staged file it wrote nothing from" (73149836) staged its file as `20261120T172500Z-...`, and the activity notebook's inbox sweep deletes a file staged more than 24 hours ago, so the test has failed on any branch since 2026-11-21 17:25 UTC. Its file is now named from the time it runs, as the sweep's own test names its files.
+
+**The upgrade from f780670e.** One `./scripts/deploy.ps1`, as from b059c91 (the RCA's [upgrade matrix](adr/0031-incident-rca.md)): it updates the runner, the bundle, the runbooks (`CONTROL.RUNBOOKS`), the notebooks (when `fabric.importNotebooks` is true, or with the units below, when nobody edited them), the history model's RCA tables once the activity notebook has run (`FABRIC.SEMANTICMODEL.RCA`), and the Insights app. Nothing in the follow-ups changes that path. What the merge changes there: the month's estimate is $0.36 higher, far under every ceiling, and a taken-over session's end exports its evidence once the runbooks are republished; before that, an end from the follow-ups' runbooks says "the control's runbook is from before" the RCA, which the update clears.
+
 ### Query Store's evidence: the sidecar's contract (2026-11-23)
 
 **Why.** The owner, investigating in the Insights app's chat, was told T1 had no Query Store. T1 to T3 have it on, and the capture never read it. Unit 2 brings Query Store's evidence into the RCA. After an independent review (RETHINK) and the coordinator's decisions 1 to 7, the evidence travels in a sidecar beside the evidence document, which stays version 1, byte for byte ([ADR 0031's amendment](adr/0031-incident-rca.md#amendment-2026-11-23-query-stores-evidence-in-a-sidecar)). This entry is the contract's step, C0, which the parallel builders started from. Ten commits on `marcbushong-microsoft-rca-query-store-evidence`, on edd01c86:
@@ -5584,3 +7495,55 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The harness's marks (unit H) land after the realistic names' unit A.** Until then the rules leave out the capture's own statements only.
 - **A Run all session's Query Store evidence** reaches the history with the next scripts' save, until Run all's path ships.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
+
+### Query Store's evidence: the scripts' transport and the golden guard (T2a, 2026-11-23)
+
+**Why.** Unit 2's evidence reaches the history only when something carries it from the VMs. This entry is T2a, the operator scripts' side: each of the scripts' three history saves fetches the VMs' sidecars right after the evidence document's export, sends them with its history run, and tells each runner what the history holds ([the sidecar](../rca/README.md#the-sidecar), [the acknowledgement](../rca/README.md#acknowledgement)). The contract is C0's at 4083d329 and 61eced5d; T2b's f6f3f7f1 gives the VMs' control script the two new actions, T1a's runner keeps the sidecars and its ledger, and unit B's notebook writes them. Commit 9ca9f8ab on `marcbushong-microsoft-qs-evidence-scripts-sidecar-transport`, after three merges with no conflict outside this report: the RCA release at 83a6fcb1 (c4124fff), and the contract at 27c14daa (795237c0) and 61eced5d (a3066a68).
+
+**What the saves do.**
+
+- **Fetch, per VM** (`Invoke-DemoRcaSidecarFetch`), in `stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s snapshot, and `configure-fabric.ps1 -RunLiveActivity`:
+  1. the acknowledgements an earlier save deferred, first (`RcaAck`, `rca ack`, at most 32 IDs a Run Command);
+  2. the index (`RcaSidecarExport`, `rca sidecar-export --session none`, with `--final` on the stop's save), every page up to 16;
+  3. each part, through the `Rca` action's `part` command, reassembled and checked against its SHA-256, as the evidence document's are.
+
+  Managed Run Commands named `DbHubDemo-Rca-<vm>-k`, `-i`, or `-s` and the time, each deleted once read. On the T2 host, one at a time, once Azure lists none of the scripts' others (R871).
+- **Each VM's outcome is its own:** `OldBundle`, `OldRunner`, `Failed`, `TimedOut`, `NoRoom`, or `Busy`; one VM's never stops another's or the evidence document's. `OldBundle` is an "Unknown action" answer that doesn't name the action it ran: today's bundle names `Rca` in its list, so v1's rule would have missed it (T2b's interface note), and a test holds today's exact answer to both actions.
+- **Staged** (`Send-DemoRcaSidecarBatch`) as `Files/rca/inbox/sidecar-<UTC>-script-<8 hex>.json`, `RCA_SIDECAR_FILE`, only for a notebook that declares it: whole sidecars, at most 64 parts and 262,144 bytes a run, those of no session in the save's first run only, since they go under the reading run's `RUN_ID` (F7).
+- **Acknowledged** (`Read-DemoRcaSidecarAck`, `Complete-DemoRcaSidecarSave`): only what the run's acknowledgement says is `written` or `already`, and only an acknowledgement that names that payload and exactly its documents (F1, F3, F4). At once while the VMs run (the snapshot, `configure-fabric.ps1`); deferred on the stop, which runs the notebook after the VMs deallocate, and sent first at the next save (F5, F6). The scripts delete a payload only when no run read it.
+- **More runs** (`Invoke-DemoRcaSidecarDrain`, F9): `RCA_ONLY` runs for what the first couldn't take, each after the last one's acknowledgement, at most 3 runs in all, and none started more than 15 minutes after the first ended. The stop's save takes one run.
+- **The PC's lists,** in `out/history-pending/`, with IDs only, never evidence; written through a temporary file, and one that can't be read is moved aside as `<name>.unreadable-<UTC>.json`, never deleted:
+  - `rca-sidecar-pending-<resource group>.json`: `{"kind":"DbHubDemo.RcaSidecarPending","version":1,"sidecars":[{documentId, vm, sessionId, parts, sha256, reason, firstSeenUtc, expiresUtc}]}`. `expiresUtc` is 30 days after the ID's time, the earliest the runner deletes it; one leaves the list when its VM, read whole, no longer offers it, and is "expired unread" past `expiresUtc`, or 30 days after `firstSeenUtc`.
+  - `rca-sidecar-acks-<resource group>.json`: `{"kind":"DbHubDemo.RcaSidecarAcks","version":1,"acknowledgements":[{documentId, vm, status, recordedUtc}]}`, with `status` `written` or `already`, each dropped 30 days after `recordedUtc`.
+- **The lines:** `STOP.RCA.SIDECAR` and `FABRIC.RCA.SIDECAR`, and `DEPLOY.RCA.SIDECAR` in `DEPLOY.FABRIC.HISTORY`'s message and evidence (`rca.sidecar`), as the evidence document's lines go there. **Pass**, a **Warning** while sidecars wait or anything above went wrong, with the command that takes them, or **Not selected** when there was nothing to fetch and nothing waits.
+- **The golden guard** (`Test-DemoGoldenRcaSidecar`, step 5a of `capture-t2-golden.ps1`, after T2's activity is off and before the host password's rotation): the acknowledgements a stop deferred to `archost01` go first; then the guest is asked, read-only (`Invoke-DemoGoldenGuest.ps1 -Action RcaSidecars`), for sealed sidecars its ledger doesn't mark acknowledged, spans with `sidecar-*.rows`, and a ledger it can't read. Any of them: `GOLDEN.CAPTURE.RCA` **Fail**, nothing captured, and the fix a history save from the scripts. Prepare's clear block counts the same with the runner stopped, and refuses to delete a store that holds one (`GOLDEN.CAPTURE.PREPARE`). It reads only `documentId` and `acknowledgedUtc` from T1a's `sidecars\ledger.json`, in one function.
+- **Two shared helpers:** `WorkloadHelpers.ps1`'s two `ValidateSet`s take `RcaSidecarExport` and `RcaAck`; `Invoke-DemoOneLakeRequest` returns a file that OneLake sends as bytes as its UTF-8 text, as the acknowledgement needs.
+
+**The coordinator's decisions (2026-11-23).**
+
+1. `rca ack` exits 0 for IDs the runner no longer holds; T1a, and T1c's command wiring, keep it.
+2. A stop handed to the session control fetches no sidecars, as v1 exports nothing there; Run all's path is a later release.
+3. Any other file in the guest's `sidecars\` counts as unacknowledged, so the golden guard fails safe.
+4. The changes outside T2a's files are accepted: the two `ValidateSet`s, the UTF-8 decoding, and the save paths' test mocks.
+
+**Changed files.**
+
+- **The module:** `Private/RcaExportHelpers.ps1` (the sidecar's functions; v1's keep their behavior), `HistorySnapshotHelpers.ps1`, `FabricCapacityHelpers.ps1`, `GoldenHelpers.ps1`, `WorkloadHelpers.ps1`, `OneLakeHelpers.ps1`, and `Public/Stop-DemoEnvironment.ps1` and `New-DemoT2GoldenSnapshot.ps1`;
+- **the scripts:** `scripts/configure-fabric.ps1`;
+- **the VM:** `vm/bootstrap/Invoke-DemoGoldenGuest.ps1`;
+- **the tests:** `DbHubDemo.RcaSidecar.Tests.ps1` (new), and additions to `DbHubDemo.HistorySnapshot`, `DbHubDemo.Golden`, `Vm.GoldenGuest`, `DbHubDemo.FirstRun`, `DbHubDemo.Lifecycle`, and `DbHubDemo.Fabric`;
+- **the docs:** `AGENTS.md`, `docs/troubleshooting.md`, and this report.
+
+**Validation.**
+
+- **Pester,** under strict mode with the Azure CLI guard, one file at a time while the PC's CPU was saturated: `DbHubDemo.RcaSidecar` 24, `DbHubDemo.HistorySnapshot` 37, `DbHubDemo.Golden` 124, `Vm.GoldenGuest` 29, `DbHubDemo.FirstRun` 105, `DbHubDemo.Lifecycle` 298, and `DbHubDemo.Fabric` 53 passed, with no Azure CLI call.
+- **The spec's cases,** each a test that fails without its change: F1, F3 to F9, F11, L3, M2 with both kinds of older VM, the order in each save path, the golden guard (refused for a sidecar alone with nothing deleted, captured after its acknowledgement, and the clear block's own refusal), and lists and a ledger that can't be read.
+- **Lint and checks:** PSScriptAnalyzer found nothing in the 17 changed PowerShell files (the VM settings for `vm/bootstrap`), all ASCII; markdownlint-cli2 0.23.3 on the docs; the leak check prints nothing.
+
+**Risks and what its live check needs.**
+
+- **Nothing has met a real runner yet:** T1a's runner, T2b's control script, and B's notebook meet first in the live proof, on a new deployment and on an update. It needs: `rca ack`'s exit code for IDs it no longer holds; a 3,400-character index line through T2's host within the Run Command's 4 KB; OneLake's answer for the acknowledgement; and the drain's bounds behind a real capacity queue.
+- **Run all's sessions leave their sidecars on the VMs** until a history save from the scripts, or Run all's own path in a later release; one sealed more than 30 days before such a save is lost, which the line says ("expired unread").
+- **A stop handed to the session control** fetches none, so after Run all sessions the scripts' save that brings them in is `./scripts/start-demo.ps1`, then `./scripts/stop-demo.ps1 -SaveHistory` ([troubleshooting](troubleshooting.md#the-incident-rcas-capture)).
+
+**The contract at 8afcca24 (T1c's codec).** `rca sidecar-export` exits 2 only when nothing is offerable, and prints its index line either way, whose status stands: a **Warning** counts sidecars the runner let expire unread. The scripts now read that line whatever the control script's result: Not selected (exit code 2, today's control script), **Warning** (T2b's next, for a Warning line), or Pass. Its message goes into the line after the VM's name ("sqlvm01's runner says: ..."), once a VM, with the expired fix, which now also names the save that brings in Run all's sessions' sidecars. A **Warning** without a line it can read keeps that VM's pending sidecars, since its index isn't known whole. Merge 260945d0, then the change with four tests that fail without it (`DbHubDemo.RcaSidecar` 28 passed).

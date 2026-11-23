@@ -586,6 +586,13 @@ function Invoke-DemoSafetyStopTemplate {
         Remove-DemoPrivateDirectory -Path $directory -Confirm:$false -WhatIf:$false | Out-Null
     }
     if ($run.ExitCode -ne 0) {
+        # The subscription's quota for Automation accounts in the region (F28, 2026-11-21): said in plain words, with its fix.
+        $quota = Get-DemoAutomationQuotaText -Text ([string]$run.StdErr) -Location ([string]$Config['location'])
+        if ($null -ne $quota) {
+            $evidence['error'] = Get-DemoDeploymentErrorText -Text ([string]$run.StdErr) -MaxLength 1200
+            $evidence['quotaUsedUp'] = $true
+            return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'SAFETYSTOP.RESOURCES' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('The nightly safety stop isn''t set up: infra/safetystop/safetystop.bicep couldn''t be deployed: Azure refused {0} because {1} (Conflict).' -f $Name.AutomationAccount, $quota.Reason) -Evidence $evidence -Remediation ('{0} Meanwhile the VMs'' nightly auto-shutdown and T3''s auto-pause still apply.' -f $quota.Remediation) -DocUrl 'https://learn.microsoft.com/azure/automation/automation-limits-quotas'); Outputs = $null }
+        }
         return [pscustomobject]@{ Result = (New-DemoResult -CheckId 'SAFETYSTOP.RESOURCES' -Area 'infra' -Target 'subscription' -Status 'Warning' -Message ('The nightly safety stop isn''t set up: infra/safetystop/safetystop.bicep couldn''t be deployed: {0}' -f (Get-DemoDeploymentErrorText -Text ([string]$run.StdErr) -MaxLength 600)) -Evidence $evidence -Remediation 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again. Meanwhile the VMs'' nightly auto-shutdown and T3''s auto-pause still apply.' -DocUrl $doc); Outputs = $null }
     }
     $raw = $null

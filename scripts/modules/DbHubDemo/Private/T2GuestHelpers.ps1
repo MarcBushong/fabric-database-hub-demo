@@ -94,16 +94,133 @@ function Get-DemoT2GuestInstallMode {
 function Get-DemoT2RebuildText {
     # The console's and the status page's words for a rebuild of an unfinished guest, with the measured time (the live test of
     # 2026-11-06: T2's host build with the image took about 27 minutes, the 34.1 GiB download about 11 at about 51 MiB/s, and
-    # Arc onboarding about 33). Pure. Internal.
+    # Arc onboarding about 33). -Requested (2026-11-21): one that reset-demo.ps1 -RebuildGuest asked for. Pure. Internal.
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [AllowEmptyString()]
-        [string] $OldMode = ''
+        [string] $OldMode = '',
+
+        [switch] $Requested
     )
 
+    $timing = 'That takes about 27 minutes, measured on 2026-11-06, including the 34 GiB download at about 51 MiB/s, then about 33 for Arc onboarding. T1, T3, T4, Fabric, and archost01 itself are untouched.'
+    if ($Requested) {
+        return ('archost01 deleted its guest arcsql01, as ./scripts/reset-demo.ps1 -RebuildGuest asked, and makes T2 again from Arc Jumpstart''s image (t2SqlInstallMode JumpstartImage), with no step for a person. {0}' -f $timing)
+    }
     $mode = if ($OldMode) { $OldMode } else { 'PaygWizard' }
-    return ('archost01''s guest arcsql01 was built in {0} mode, and its SQL Server setup was never finished, so it had nothing to keep: archost01 deleted it and makes T2 again from Arc Jumpstart''s image (t2SqlInstallMode JumpstartImage), with no step for a person. That takes about 27 minutes, measured on 2026-11-06, including the 34 GiB download at about 51 MiB/s, then about 33 for Arc onboarding. T1, T3, T4, Fabric, and archost01 itself are untouched.' -f $mode)
+    return ('archost01''s guest arcsql01 was built in {0} mode, and its SQL Server setup was never finished, so it had nothing to keep: archost01 deleted it and makes T2 again from Arc Jumpstart''s image (t2SqlInstallMode JumpstartImage), with no step for a person. {1}' -f $mode, $timing)
+}
+
+function Get-DemoT2GuestGoldenHold {
+    # Why a golden capture holds the T2 guest, from the host's health (t2Guest, as T2.GUEST.STATE reads it), or '' when none
+    # does or the health doesn't say: a capture in progress, or whose marker can't be read; a capture record that isn't
+    # released; or a released copy whose Arc identity was never reset (2026-11-21, reset-demo.ps1 -RebuildGuest). Pure.
+    # Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $Health
+    )
+
+    $guest = Get-DemoMemberValue -InputObject $Health -Name 't2Guest'
+    $capture = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $guest -Name 'capture') -Name 'state')
+    if ($capture -in 'Active', 'Unknown', 'Unreadable') {
+        return 'a golden capture is in progress on archost01, or its marker can''t be read (T2.GUEST.STATE)'
+    }
+    $golden = Get-DemoMemberValue -InputObject $guest -Name 'golden'
+    if ($null -eq $golden) {
+        return ''
+    }
+    if (-not [bool](Get-DemoMemberValue -InputObject $golden -Name 'released')) {
+        return 'arcsql01 carries a golden capture record that isn''t released (T2.GUEST.STATE)'
+    }
+    if ([string](Get-DemoMemberValue -InputObject $golden -Name 'role') -eq 'Copy' -and -not [bool](Get-DemoMemberValue -InputObject $golden -Name 'reset')) {
+        return 'arcsql01 is a copy restored from a golden snapshot whose Arc identity was never reset (T2.GUEST.STATE)'
+    }
+    return ''
+}
+
+function Request-DemoT2GuestRebuild {
+    <#
+    .SYNOPSIS
+    RESET.GUEST (reset-demo.ps1 -RebuildGuest, 2026-11-21): asks the T2 host to make its guest arcsql01 again from Arc
+    Jumpstart's image, which the deploy.ps1 run that reset-demo.ps1 starts next (-FromStage Artifacts) does, and finishes.
+    Internal.
+
+    .DESCRIPTION
+    Writes the request on archost01 (vm/bootstrap/Set-DemoGuestRebuildRequest.ps1 in the managed Run Command
+    DbHubDemo-GuestRebuild): an ID and when, nothing secret. The deploy's bootstrap generation acts on it in the host's
+    GuestSource step: the guest goes as an unfinished one does (its disk, records, and protected password), the image's steps
+    make a new arcsql01, and deploy.ps1 deletes the old guest's Arc resources in Azure and onboards the new one
+    (DEPLOY.T2.REBUILD). Not supported in the evaluation-only mode and in the build modes (ProductKey and Developer), whose
+    guest the image doesn't make; Not selected while archost01 isn't running, and with -WhatIf. A Fail, with nothing asked,
+    while a golden capture holds the guest (Get-DemoT2GuestGoldenHold, from the host's health); the host checks that again
+    before it deletes anything (fail closed). A health read that fails doesn't stop the request: the host's check stands.
+    #>
+    [CmdletBinding(SupportsShouldProcess)]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [ValidatePattern('^$|^[A-Za-z0-9-]{8,64}$')]
+        [string] $RequestId = ''
+    )
+
+    $docUrl = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
+    $over = 'To start T2 over instead, run ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1, which keeps the Fabric workspaces with their history.'
+    $result = {
+        param([string] $Status, [string] $Message, [string] $Remediation = '', [System.Collections.IDictionary] $Evidence = $null)
+        $parameters = @{ CheckId = 'RESET.GUEST'; Area = 'workload'; Target = 'T2'; Status = $Status; Message = $Message; Remediation = $Remediation; DocUrl = $docUrl }
+        if ($null -ne $Evidence) {
+            $parameters['Evidence'] = $Evidence
+        }
+        New-DemoResult @parameters
+    }
+    if ((Get-DemoHostVmName -Config $Config) -ne 'archost01') {
+        return (& $result 'Not supported' 'T2 has no nested guest in the evaluation-only mode, so there''s none to make again.' $over)
+    }
+    $mode = (Get-DemoArcTarget -Config $Config).InstallMode
+    if ($mode -notin 'JumpstartImage', 'PaygWizard') {
+        return (& $result 'Not supported' ('T2 runs {0} mode, which builds its guest from media rather than Arc Jumpstart''s image, so reset-demo.ps1 doesn''t make it again.' -f $mode) $over)
+    }
+    $power = Get-DemoVmPowerState -SubscriptionId ([string]$Config['subscriptionId']) -ResourceGroupName (Get-DemoResourceGroupName -Config $Config) -VmName 'archost01'
+    if ($power -ne 'PowerState/running') {
+        return (& $result 'Not selected' ('archost01 isn''t running ({0}), so it can''t be asked to make its guest again now.' -f $(if ($power) { $power } else { 'its power state couldn''t be read' })) 'Start the demo with ./scripts/start-demo.ps1, then run ./scripts/reset-demo.ps1 -RebuildGuest again.')
+    }
+    $health = $null
+    try {
+        $health = Get-DemoVmHealth -Config $Config -VmName 'archost01' -View Summary
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('archost01''s health couldn''t be read, so its own check before the rebuild decides whether a golden capture holds the guest: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
+    $hold = Get-DemoT2GuestGoldenHold -Health $health
+    if ($hold) {
+        return (& $result 'Fail' ('arcsql01 wasn''t asked to be made again: {0}, and only the golden flows end that.' -f $hold) 'Read T2.GUEST.STATE (./scripts/status.ps1) and do what it says: ./scripts/deploy.ps1 or a session''s start releases the guest. Then run ./scripts/reset-demo.ps1 -RebuildGuest again.')
+    }
+    if (-not $PSCmdlet.ShouldProcess('archost01', 'Ask it to make its guest arcsql01 again from Arc Jumpstart''s image')) {
+        return (& $result 'Not selected' 'What if: archost01 would be asked to make its guest arcsql01 again from Arc Jumpstart''s image, and ./scripts/deploy.ps1 -FromStage Artifacts would run to do it.')
+    }
+    $id = if ($RequestId) { $RequestId } else { 'rebuild-{0}' -f [System.DateTime]::UtcNow.ToString('yyyyMMdd-HHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+    $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Set-DemoGuestRebuildRequest.ps1') -Raw
+    $run = $null
+    $problem = ''
+    try {
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName 'archost01' -RunCommandName 'DbHubDemo-GuestRebuild' -Script $script -Parameter @{ RequestId = $id } -TimeoutSeconds 300 -FreshAction -Confirm:$false
+    }
+    catch {
+        $problem = Protect-DemoText -Text $_.Exception.Message
+    }
+    if (-not $problem -and ($null -eq $run -or -not $run.Succeeded)) {
+        $problem = if ($null -eq $run) { 'no result' } elseif ($run.Error) { [string]$run.Error } else { [string]$run.Output }
+    }
+    if ($problem) {
+        return (& $result 'Fail' ('archost01 couldn''t be asked to make its guest again, so nothing changed: {0}' -f $problem) 'Run ./scripts/reset-demo.ps1 -RebuildGuest again in a few minutes.')
+    }
+    return (& $result 'Pass' ('archost01 is asked to make its guest arcsql01 again from Arc Jumpstart''s image ({0}). The ./scripts/deploy.ps1 -FromStage Artifacts run that follows does it: archost01 deletes the guest with its disk and records and makes a new arcsql01 from the image (about 27 minutes, measured on 2026-11-06), then deploy.ps1 deletes the old guest''s Arc resources, onboards the new guest to Azure Arc (about 33), and sets its database and activity up (DEPLOY.T2.REBUILD). Nothing else is made again.' -f $id) '' ([ordered]@{ requestId = $id }))
 }
 
 function Get-DemoT2RebuildArcDecision {
@@ -181,11 +298,11 @@ function Complete-DemoT2GuestRebuild {
     }
     $results = [System.Collections.Generic.List[object]]::new()
     $oldMode = [string](Get-DemoMemberValue -InputObject $Health -Name 'rebuildMode')
-    $text = Get-DemoT2RebuildText -OldMode $oldMode
+    $text = Get-DemoT2RebuildText -OldMode $oldMode -Requested:([bool](Get-DemoMemberValue -InputObject $Health -Name 'rebuildRequested'))
     Write-DemoLog -Level Warning -Message ('T2: {0}' -f $text)
     Set-DemoProgressStep -Path $ProgressPath -Id 'T2.HostBuild' -State 'Running' -Message $text
     $rebuildUtc = Get-DemoMemberValue -InputObject $Health -Name 'rebuildUtc'
-    $evidence = [ordered]@{ oldMode = $(if ($oldMode) { $oldMode } else { 'PaygWizard' }); rebuildUtc = [string]$rebuildUtc; rebuildState = $state; arcResourceId = [string](Get-DemoMemberValue -InputObject $Health -Name 'rebuildArcId'); arcNew = $(if ($arcNew -is [bool]) { $arcNew } else { $null }); arcAction = 'Keep'; arcDeleted = @(); arcProblem = '' }
+    $evidence = [ordered]@{ oldMode = $(if ($oldMode) { $oldMode } else { 'PaygWizard' }); requested = [bool](Get-DemoMemberValue -InputObject $Health -Name 'rebuildRequested'); rebuildUtc = [string]$rebuildUtc; rebuildState = $state; arcResourceId = [string](Get-DemoMemberValue -InputObject $Health -Name 'rebuildArcId'); arcNew = $(if ($arcNew -is [bool]) { $arcNew } else { $null }); arcAction = 'Keep'; arcDeleted = @(); arcProblem = '' }
     $later = ' configure-arc.ps1 deletes a disconnected Arc machine, with its SQL Server instances, before it onboards the new guest.'
     $arcText = ''
     if ($arcNew -isnot [bool]) {

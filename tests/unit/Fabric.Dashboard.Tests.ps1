@@ -262,7 +262,16 @@ Describe 'The dashboard''s KQL (rules in the telemetry article)' {
                 $cumulative++
                 $text | Should -Match 'Keep = ResourceID == prev\(ResourceID\) and SqlServerInstanceName == prev\(SqlServerInstanceName\)'
                 $text | Should -Match 'iff\(Keep, '
-                $text | Should -Not -Match '\b(sum|avg|max|min)\((WaitTimeMs|WaitingTasksCount|SignalWaitTimeMs|NumOfBytesRead|NumOfBytesWritten|IOStallReadMs|IOStallWriteMs|NumOfReads|NumOfWrites|CounterValue|V|W|C|R)\)'
+                foreach ($statement in @($text -split "`n(?=\|)")) {
+                    if ($statement -match '(?s)^\| summarize .*\bby [^\n]*, SampleTimeUTC$') {
+                        # F36: the files of a key added within one sample, by SampleTimeUTC itself, are a cumulative
+                        # counter again; rule 2 forbids a sum across samples, never this one.
+                        $statement | Should -Not -Match '\b(avg|max|min)\('
+                    }
+                    else {
+                        $statement | Should -Not -Match '\b(sum|avg|max|min)\((WaitTimeMs|WaitingTasksCount|SignalWaitTimeMs|NumOfBytesRead|NumOfBytesWritten|IOStallReadMs|IOStallWriteMs|NumOfReads|NumOfWrites|CounterValue|V|W|C|R)\)'
+                    }
+                }
                 $text | Should -Not -Match 'max\([^)]*\)\s*-\s*min\('
             }
         }
@@ -309,6 +318,25 @@ Describe 'The shared KQL and the live-activity notebook' {
         }
         $files = @(Get-ChildItem -LiteralPath $script:kqlRoot -Filter 'Live.*.kql' | ForEach-Object { $_.BaseName.Substring(5) } | Where-Object { $_ -ne 'Prelude' } | Sort-Object)
         $files | Should -Be @($script:liveMap.Values | Sort-Object)
+    }
+
+    It 'adds the files of a key within each sample before the storage IO deltas, and skips a step whose number of files changed (F36)' {
+        # Live (2026-11-21), every sample of T3 held two files under each of DatabaseID and FileID 1 and 2, with their own
+        # counters. A series by file key stepped between them in its first and last samples, and T3's IO in a session
+        # read 735,042 MB, where its files' counters rose by 10,358 MB.
+        $statements = @((Get-TestKqlBody -Name 'Live.StorageIoDeltas') -split "`n(?=\|)")
+        $perSample = @($statements | Where-Object { $_ -match '(?s)^\| summarize .*\bby [^\n]*, SampleTimeUTC$' })
+        $perSample.Count | Should -Be 1
+        $perSample[0] | Should -Match '^\| summarize Files = count\(\), R = sum\(NumOfBytesRead\), W = sum\(NumOfBytesWritten\), RS = sum\(IOStallReadMs\), WS = sum\(IOStallWriteMs\),\n\s+NR = sum\(NumOfReads\), NW = sum\(NumOfWrites\)\n'
+        $perSample[0] | Should -Match '\n\s+by Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, SampleTimeUTC$'
+        $index = [array]::IndexOf($statements, $perSample[0])
+        $later = $statements[($index + 1)..($statements.Count - 1)]
+        ($later -join "`n") | Should -Not -Match 'NumOfBytesRead|NumOfBytesWritten|IOStallReadMs|IOStallWriteMs|NumOfReads|NumOfWrites'
+        $later[0] | Should -Match '= arg_min\(SampleTimeUTC, Files, R, W, RS, WS, NR, NW\),'
+        $later[0] | Should -Match '= arg_max\(SampleTimeUTC, Files, R, W, RS, WS, NR, NW\)\n'
+        $keep = @($later | Where-Object { $_ -match '^\| extend Keep = ' })
+        $keep.Count | Should -Be 1
+        $keep[0] | Should -Match 'and FileID == prev\(FileID\) and F == prev\(F\)\n'
     }
 
     It 'mirrors the notebook''s kql_prelude() in Kql/Live.Prelude.kql, line for line' {

@@ -60,7 +60,7 @@
 
 ### The size fallback
 
-Only Azure's `SkuNotAvailable` for the size an attempt sent, read from the deployment's operations, moves it on, as for T4 ([ADR 0019](0019-t4-postgresql-flexible-server.md#2026-11-09-user-directed-a-size-t4skuname-sets-falls-back-too-and-every-automatic-size-change-says-what-it-cost)):
+Only Azure's `SkuNotAvailable` for the size an attempt sent, read from the deployment's operations, moves it on, as for T4 ([ADR 0019](0019-t4-postgresql-flexible-server.md#2026-11-09-user-directed-a-size-t4skuname-sets-falls-back-too-and-every-automatic-size-change-says-what-it-cost)), and, since 2026-11-22, its refusal over the subscription's vCore quota, without the same size in another zone ([the amendment](#amendment-a-refusal-over-the-subscriptions-vcore-quota-f37-2026-11-22)):
 
 1. The size the last replica used (`DbHubT4ReplicaSize`, `<size>@<zone or any>`), first when it's a documented General Purpose size with T4's vCores, so a size Azure refused isn't asked for at every session again.
 2. T4's size with no zone preference, then once in another zone the region lists for it, the way T4's own fallback retries.
@@ -139,6 +139,14 @@ Only Azure's `SkuNotAvailable` for the size an attempt sent, read from the deplo
 - **What a person sees:** the replica appears during a deployment and is gone after it; Database Hub's Estate lists it and its Read replica lag has data during each session, as before.
 - **Tests:** `DbHubDemo.T4Replica.Tests.ps1` (a new environment, an existing one's stopped replica, each kind of session, the auto-stop that has passed, a mark that's passed, too far ahead, or not a time, a control that can't be read, a replica being created or started, a delete that fails, no replica; the template's tags through each size it tries; the mark before the warm-up), `DbHubDemo.Tracks.Tests.ps1` and `DbHubDemo.Lifecycle.Tests.ps1` (the order: after the history snapshot and before `DEPLOY.SUMMARY`, after a **Fail** too, and never with `-WhatIf`).
 
+## Amendment: a refusal over the subscription's vCore quota (F37, 2026-11-22)
+
+**Who decided:** the project's coordinator, with ADR 0019's amendment of the same day, which has the evidence: Azure created read replicas in West US 3 past the readings of the subscription's PostgreSQL vCore quota, so preflight only logs them.
+
+- **The size fallback:** Azure's refusal "exceeding approved ... Cores quota" ([exceeded quota](https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors#exceeded-quota)) moves it on as `SkuNotAvailable` does, in `deploy.ps1` and `start-demo.ps1` (`Get-DemoT4ReplicaCreateFailure` reads it from the deployment's operations) and in Run all's sessions (the runbook reads it from Azure's answer to the replica's creation). The size Azure refused isn't asked for in another zone: a quota is the subscription's in the region. The notice gives Azure's reason and figures.
+- **When Azure refuses every size,** the fix names the quota and the ways out: free vCores in the region, request more quota ([request a quota increase](https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-request-quota-increase)), then run the script, or Run all, again; with a Region access request too for sizes refused as `SkuNotAvailable` in the same run. Run all's status says so in its replica's **Refused** note and fix.
+- **Tests:** `DbHubDemo.T4Replica.Tests.ps1` (the reader, a refused size skipped in another zone, every size refused in `deploy.ps1` and `start-demo.ps1`) and `Automation.Runbooks.Tests.ps1` (a session's next size, and every size refused). Not proven live.
+
 ## Validation
 
 - Static: Bicep build, Pester (`tests/unit/DbHubDemo.T4Replica.Tests.ps1` and the cost, preflight, lifecycle, tracks, safety stop, and control tests), and the runner's tests.
@@ -151,5 +159,7 @@ Only Azure's `SkuNotAvailable` for the size an attempt sent, read from the deplo
 - **Not yet live:** the replica's size fallback (Azure took every size asked). The deletion at `deploy.ps1`'s end (2026-11-16) is tested offline; its live test is the merge's.
 
 ## Sources
+
+Checked 2026-11-22: [exceeded quota](https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors#exceeded-quota), [request a quota increase](https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-request-quota-increase).
 
 Checked 2026-11-13: [read replicas](https://learn.microsoft.com/azure/postgresql/read-replica/concepts-read-replicas), [create a read replica](https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica), [stop a server](https://learn.microsoft.com/azure/postgresql/configure-maintain/how-to-stop-server), [monitor PostgreSQL in Database Hub](https://learn.microsoft.com/fabric/database/hub/monitor-postgresql), [flexibleServers 2025-08-01 template reference](https://learn.microsoft.com/azure/templates/microsoft.dbforpostgresql/2025-08-01/flexibleservers), [capacity errors](https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors), [Azure Retail Prices API](https://learn.microsoft.com/rest/api/cost-management/retail-prices/azure-retail-prices), [hot standby](https://www.postgresql.org/docs/current/hot-standby.html).

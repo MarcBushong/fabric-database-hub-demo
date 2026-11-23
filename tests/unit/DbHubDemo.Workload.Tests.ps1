@@ -522,6 +522,13 @@ Describe 'Workload control through action Run Command' {
         $request = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encoded)) | ConvertFrom-Json
         $request.target | Should -Be 'T3'
         $request.arguments | Should -Be @('profile', 'set', '--name', 'off')
+        $request.PSObject.Properties['bounds'] | Should -BeNullOrEmpty -Because 'only validate.ps1''s status asks for the bounds'
+
+        # validate.ps1's status asks the VM for the running runs' bounds, read from the runner's whole output (F20).
+        Invoke-DemoWorkloadCommand -Config $config -Target T1 -ArgumentList 'status', '--json', '--runs', '5' -Bounds -Confirm:$false | Out-Null
+        $last = $script:azCalls | Where-Object { $_.Arguments[0] -eq 'vm' } | Select-Object -Last 1
+        $encoded = [regex]::Match($last.Script, "-RequestBase64 '([A-Za-z0-9+/=]+)'").Groups[1].Value
+        ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encoded)) | ConvertFrom-Json).bounds | Should -BeTrue
     }
 
     It 'takes a single JSON object, such as profile get''s, as one record' {

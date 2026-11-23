@@ -6,7 +6,7 @@ Azure SQL Database specifics for T3: logical server `azuresql01-<deploymentId>`,
 |---|---|---|
 | `030-configure.sql` | `ContosoCare` | Query Store with T1's settings (read-write, 1 GB, 15-minute intervals) and the `contosocare_runner` role with data access to the `care` and `demo` schemas. No file caps or recovery model: Azure SQL Database manages them, and the template caps the database at 32 GB. |
 | `040-performance-monitoring.sql` | `ContosoCare` | Microsoft's documented script for Database Hub performance monitoring: adds the database-level extended property `MS_EnablePerformanceMonitoringPreview = 'true'`, or updates it. Never in `master`. |
-| `900-status.sql` | `ContosoCare` | Read-only status in one row: the extended property, Query Store state, the seed procedure and state, the runner role, and whether the connection is `dbo`. |
+| `900-status.sql` | `ContosoCare` | Read-only status in one row: the extended property, Query Store's state with its desired state, read-only reason, capture mode, and storage against its limit (`validate.ps1`'s `T3.QUERYSTORE`, 2026-11-23), the seed procedure and state, the runner role, and whether the connection is `dbo`. |
 
 ## Script sets
 

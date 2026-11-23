@@ -8,8 +8,8 @@
 // integration's events (docs/architecture.md). Which of T1 and T2 is billing and which the front desk is this file's
 // choice: change it here, in one place.
 
-import { formatDuration, formatLevel, formatNumber, percent, type NumberKind } from "./format";
-import { timesText } from "./insights";
+import { formatBeside, formatDuration, formatLevel, formatNumber, percent, type NumberKind } from "./format";
+import { POSTGRES_USABLE_CONNECTIONS, timesText } from "./insights";
 import type { EstateTarget } from "./view-state";
 
 export interface BusinessService {
@@ -36,7 +36,7 @@ export function serviceOf(target: string): BusinessService | null {
 /** What a measured signal was, for the lens: its family, how long it was visible, and its numbers. */
 export interface ImpactInput {
     target: EstateTarget;
-    /** cpu, blocking, io, log_rate, tran_log, latch, memory, parallelism, network, throttle (T5), replica_lag (T4's replica), connections (T4). */
+    /** cpu, blocking, io, log_rate, tran_log, latch, memory, parallelism, network, throttle (T5), replica_lag (T4's replica), connections (T4: its active connections, F34). */
     family: string;
     /** Minutes from the signal showing to its recovery, or null when the telemetry doesn't say. */
     durationMin: number | null;
@@ -80,7 +80,7 @@ const WORDING: Record<string, Wording> = {
     parallelism: { what: "queries spread over parallel scans", signal: "Parallelism waits", kind: "seconds" },
     network: { what: "results held by a slow client", signal: "Network IO waits", kind: "seconds" },
     replica_lag: { what: "behind its primary", signal: "read replica lag", kind: "seconds" },
-    connections: { what: "connections refused", signal: "failed connections", kind: "int" },
+    connections: { what: "connections at the server's limit", signal: "active connections", kind: "int" },
 };
 
 function forDuration(input: Pick<ImpactInput, "durationMin" | "ongoing">): string {
@@ -105,8 +105,16 @@ export function impactOf(input: ImpactInput): Impact {
         headline = minutes !== null ? `${service}: ${minutes >= 1 ? `${minutes.toFixed(1)} min` : formatNumber(input.peak, "seconds")} behind its primary${span}` : `${service}: behind its primary${span}`;
         evidence = input.peak !== null ? `read replica lag peak ${formatNumber(input.peak, "seconds")}` : "read replica lag";
     } else if (input.family === "connections") {
-        headline = input.peak !== null ? `${service}: ${formatNumber(input.peak, "int")} connection attempts refused${span}` : `${service}: connection attempts refused${span}`;
-        evidence = "failed connections";
+        // T4's connection surge (F34): its active connections against the slots clients can use, as Azure Monitor measured
+        // them. Never refused attempts: Azure Monitor's failed connections didn't count them live (2026-11-21), so nothing
+        // here measures them.
+        const limit = POSTGRES_USABLE_CONNECTIONS;
+        const reached = input.peak === null || input.peak >= limit;
+        headline = `${service}: connections ${reached ? "at" : "short of"} the server's limit${span}`;
+        evidence =
+            input.peak !== null
+                ? `active connections peak ${formatBeside(input.peak, "int", limit)}, ${reached ? "at or above" : "under"} the ${limit} slots clients can use`
+                : `active connections at the ${limit} slots clients can use`;
     } else {
         const wording = WORDING[input.family] ?? { what: "a signal above its baseline", signal: input.family.replace(/_/g, " "), kind: "decimal" as NumberKind };
         headline = `${service}: ${wording.what}${span}`;

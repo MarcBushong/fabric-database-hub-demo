@@ -67,6 +67,12 @@ BeforeAll {
         [pscustomobject]@{ ExitCode = $ExitCode; StdOut = $StdOut; StdErr = $StdErr }
     }
 
+    # Azure's answer when the subscription's quota for Automation accounts in the region is used up (F28; live on dbhubra,
+    # 2026-11-21, with 10 Automation accounts in westus3).
+    function Get-QuotaError([string] $Account = 'aa-dbhub-control') {
+        'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","target":"/subscriptions/<subscription>/resourceGroups/rg-dbhub-control/providers/Microsoft.Resources/deployments/dbhub-control","message":"At least one resource deployment operation failed. Please list deployment operations for details. Please see https://aka.ms/arm-deployment-operations for usage details.","details":[{"code":"Conflict","target":"/subscriptions/<subscription>/resourceGroups/rg-dbhub-control/providers/Microsoft.Automation/automationAccounts/' + $Account + '","message":"{\r\n  \"code\": \"Conflict\",\r\n  \"message\": \"The operation could not be completed because it exceeded your quota for Automation accounts in your subscription in the region. Please check the applicable quotas for your subscription. Requests for quota increase are subject to approval and resource availability in the region.  Learn more- https://aka.ms/Azure-Automation-Quotas-and-Limits\"\r\n}"}]}}'
+    }
+
     function Get-ArgumentValue([object[]] $Arguments, [string] $Name) {
         $index = [array]::IndexOf($Arguments, $Name)
         if ($index -ge 0 -and $index + 1 -lt $Arguments.Count) {
@@ -108,6 +114,10 @@ BeforeAll {
     function Invoke-FakeArm([string] $Method, [string] $Url, [string] $Body, [string] $Query = '') {
         $path = ([uri]$Url).AbsolutePath
         $query = [uri]::UnescapeDataString(([uri]$Url).Query) + $Query
+        # The control's group gone (2026-11-22: destroy.ps1 deletes it once it's empty): everything in it is a 404.
+        if ($script:controlGroupGone -and $path -match '/resourceGroups/rg-dbhub-control(/|$)') {
+            return (New-AzResult -ExitCode 3 -StdErr "ERROR: (ResourceGroupNotFound) Resource group 'rg-dbhub-control' could not be found.")
+        }
         switch -Regex ($path) {
             '/providers/Microsoft\.Authorization/permissions$' {
                 $actions = if ($script:canAssign) { @('*') } else { @('*/read') }
@@ -151,7 +161,25 @@ BeforeAll {
                 return (New-AzResult -StdOut '{}')
             }
             '/userAssignedIdentities/' {
+                # Resource Manager checks access before it looks for the resource (the review of 842a3e5c): a role without
+                # the action gets 403 whether the identity is there or not.
+                if ($Method -in $script:identityRefuses) {
+                    $action = if ($Method -eq 'get') { 'read' } else { $Method }
+                    return (New-AzResult -ExitCode 1 -StdErr ("ERROR: (AuthorizationFailed) The client has no access to perform action 'Microsoft.ManagedIdentity/userAssignedIdentities/{0}'." -f $action))
+                }
+                # Another run deletes the control's group after this identity's read, just before its delete.
+                if ($Method -eq 'delete' -and $script:groupGoesAtDelete -and $script:identityExists) {
+                    $script:controlGroupGone = $true
+                    $script:identityExists = $false
+                    $script:vaultExists = $false
+                    $script:accountExists = $false
+                    return (New-AzResult -ExitCode 3 -StdErr "ERROR: (ResourceGroupNotFound) Resource group 'rg-dbhub-control' could not be found.")
+                }
                 if (-not $script:identityExists) {
+                    # Resource Manager answers a delete of a resource that doesn't exist with 204 No Content.
+                    if ($Method -eq 'delete') {
+                        return (New-AzResult)
+                    }
                     return (Get-NotFound 'id-dbhub-automation')
                 }
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ principalId = $script:identityPrincipal } }))
@@ -184,9 +212,31 @@ BeforeAll {
             }
             '/automationAccounts/aa-dbhub-control$' {
                 if (-not $script:accountExists) {
+                    if ($Method -eq 'delete') {
+                        return (New-AzResult)
+                    }
                     return (Get-NotFound 'aa-dbhub-control')
                 }
                 return (New-AzResult -StdOut '{"name":"aa-dbhub-control"}')
+            }
+            '/automationAccounts/aa-dbhub-control/variables/DbHubSessionStatus$' {
+                # The session's status variable (2026-11-23): '' when there's none, Plain or Encrypted as Variable - Get
+                # answers (an encrypted one without its value), Forbidden, or Throttled. A put creates it (the review of
+                # 40124992), unless $script:statusVariablePutFails.
+                if ($Method -eq 'put') {
+                    if ($script:statusVariablePutFails) {
+                        return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (RequestDisallowedByPolicy) A policy denied the variable.')
+                    }
+                    $script:statusVariable = 'Plain'
+                    return (New-AzResult -StdOut '{"name":"DbHubSessionStatus","properties":{"isEncrypted":false}}')
+                }
+                switch ($script:statusVariable) {
+                    'Plain' { return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ name = 'DbHubSessionStatus'; properties = @{ isEncrypted = $false; value = (ConvertTo-Json -InputObject '{"sessionId":"5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21","phase":"stopped"}') } } -Depth 4)) }
+                    'Encrypted' { return (New-AzResult -StdOut '{"name":"DbHubSessionStatus","properties":{"isEncrypted":true}}') }
+                    'Forbidden' { return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to read the variable.') }
+                    'Throttled' { return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (TooManyRequests) The request was throttled.') }
+                    default { return (Get-NotFound 'DbHubSessionStatus') }
+                }
             }
             '/runbooks/DbHub-Control/content$' {
                 # The published DbHub-Control's content (Runbook - Get Content, 2026-11-19): with the start-demo.ps1 marker
@@ -219,6 +269,12 @@ BeforeAll {
                 return (New-AzResult -StdOut '{}')
             }
             '/vaults/kv-dbhub-ctl-[0-9a-f]{6}$' {
+                if (-not $script:vaultExists) {
+                    if ($Method -eq 'delete') {
+                        return (New-AzResult)
+                    }
+                    return (Get-NotFound 'kv-dbhub-ctl')
+                }
                 # systemData (2026-11-19): who last changed the vault, as Azure records it, which names the environment's deployer.
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ properties = @{ publicNetworkAccess = $script:vaultAccess }; systemData = $script:vaultSystemData } -Depth 4))
             }
@@ -331,6 +387,9 @@ BeforeAll {
                 return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ value = $value } -Depth 4))
             }
             '/deletedVaults/.+/purge$' {
+                if (-not $script:vaultPurgeable) {
+                    return (Get-NotFound 'kv-dbhub-ctl')
+                }
                 return (New-AzResult -StdOut '{}')
             }
         }
@@ -358,10 +417,15 @@ BeforeAll {
         $script:writerExists = $true
         $script:writerRoleId = 'eeeeeeee-0000-0000-0000-000000000006'
         $script:identityExists = $true
+        $script:identityRefuses = @()
+        $script:groupGoesAtDelete = $false
         $script:demoGroupExists = $true
         $script:secretExists = $true
         $script:accountExists = $true
         $script:groupExists = $true
+        $script:vaultExists = $true
+        $script:vaultPurgeable = $true
+        $script:controlGroupGone = $false
         $script:leftInGroup = 0
         $script:vaultAccess = 'Enabled'
         $script:vaultSystemData = $null
@@ -385,6 +449,13 @@ BeforeAll {
         $script:safetyStopLinked = $true
         $script:safetyStopReadFails = $false
         $script:connections = [System.Collections.Generic.List[object]]::new()
+        $script:controlTemplateError = ''
+        $script:statusVariable = ''
+        # What the variable is once a deployment ran ($null: as it was), whether creating it fails, and whether the
+        # deployment fails (the review of 40124992).
+        $script:statusVariableAfterDeploy = $null
+        $script:statusVariablePutFails = $false
+        $script:deployFails = $false
     }
 
     function Register-FakeAzure {
@@ -427,12 +498,24 @@ BeforeAll {
                 'deployment group create*' {
                     $file = (Get-ArgumentValue $words '--parameters').Substring(1)
                     $script:deployments.Add([pscustomobject]@{ Text = $text; File = $file; Parameters = (Get-Content -LiteralPath $file -Raw) })
+                    if ($script:controlTemplateError -and $text -match 'control\.bicep') {
+                        return (New-AzResult -ExitCode 1 -StdErr $script:controlTemplateError)
+                    }
+                    if ($script:deployFails) {
+                        return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (InvalidTemplateDeployment) The template deployment failed.')
+                    }
+                    if ($null -ne $script:statusVariableAfterDeploy) {
+                        $script:statusVariable = $script:statusVariableAfterDeploy
+                    }
                     return (New-AzResult -StdOut '{"identityClientId":{"value":"99999999-9999-9999-9999-999999999999"}}')
                 }
                 'deployment group delete*' { return (New-AzResult) }
                 # The group's resources by name (2026-11-17): a deleted account's runbook can still be listed for a moment,
                 # and doesn't count; $script:leftInGroup is what else is there.
                 'resource list*' {
+                    if ($script:controlGroupGone) {
+                        return (New-AzResult -ExitCode 3 -StdErr "ERROR: (ResourceGroupNotFound) Resource group 'rg-dbhub-control' could not be found.")
+                    }
                     $names = @('aa-dbhub-control/DbHub-Control') + @(if ($script:leftInGroup -gt 0) { 1..$script:leftInGroup | ForEach-Object { 'id-github-oidc-{0}' -f $_ } })
                     return (New-AzResult -StdOut (ConvertTo-Json -InputObject @($names) -Compress))
                 }
@@ -931,15 +1014,35 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
         Mock -ModuleName DbHubDemo -CommandName Set-DemoProgressStep -MockWith { $script:steps.Add([pscustomobject]@{ Id = (@($PesterBoundParameters['Id']) -join ','); State = $PesterBoundParameters['State']; Status = $PesterBoundParameters['Status']; Message = $PesterBoundParameters['Message'] }) }
         $script:clientId = 'cccccccc-0000-0000-0000-000000000003'
         $script:vaultAnswer = 'Disabled'
+        # What Run all needs in Azure (F28, 2026-11-21): the control's account, a live webhook for DbHub-Control, and the
+        # secrets; all there by default. 'Missing' answers HTTP 404, 'Error' a read that fails otherwise.
+        $script:accountAnswer = 'Ok'
+        $script:hookSecretAnswer = 'Ok'
+        $script:statusSecretAnswer = 'Ok'
+        $script:controlHooks = @(@{ name = 'dbhub-activity-202611140000'; properties = @{ isEnabled = $true; expiryTime = [DateTime]::UtcNow.AddDays(300).ToString('o'); runbook = @{ name = 'DbHub-Control' } } })
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            $missing = [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' }
             if ($Url -match '/vaults/') {
-                if ($script:vaultAnswer -eq 'Missing') {
-                    return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' }
+                if ($script:vaultAnswer -eq 'Missing' -or ($Url -match '/secrets/dbhub-activity-webhook\?' -and $script:hookSecretAnswer -eq 'Missing') -or ($Url -match '/secrets/dbhub-session-status\?' -and $script:statusSecretAnswer -eq 'Missing')) {
+                    return $missing
                 }
                 return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ publicNetworkAccess = $script:vaultAnswer } }; Error = '' }
             }
             if ($Url -match '/userAssignedIdentities/') {
                 return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ clientId = $script:clientId } }; Error = '' }
+            }
+            if ($Url -match '/automationAccounts/aa-dbhub-control(/webhooks)?\?') {
+                $isHooks = [bool]$Matches[1]
+                if ($script:accountAnswer -eq 'Missing') {
+                    return $missing
+                }
+                if ($script:accountAnswer -eq 'Error') {
+                    return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'AuthorizationFailed' }
+                }
+                if ($isHooks) {
+                    return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ value = @($script:controlHooks | Where-Object { $null -ne $_ }) }; Error = '' }
+                }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'aa-dbhub-control' }; Error = '' }
             }
             throw ('unexpected ARM call: {0}' -f $Url)
         }
@@ -1082,6 +1185,143 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
         $script:recorded | Should -BeNullOrEmpty
     }
 
+    Context 'what Run all needs in Azure (F28, live on dbhubra 2026-11-21)' {
+        BeforeEach {
+            Mock -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -MockWith {
+                New-DemoResult -CheckId 'CONTROL.FABRIC.NOTEBOOK' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'NB_DatabaseHub_Control was updated.' -Evidence ([ordered]@{ workspace = $Name.FabricWorkspace; folder = ''; mode = $Mode })
+            }
+            # This run's Azure part, as Invoke-DemoActivityControlSetup returns it: by default, the template refused for the
+            # subscription's quota for Automation accounts, where the setup stops.
+            $script:quotaFix = 'Free an Automation account in westus3: ./scripts/destroy.ps1 on a demo environment you no longer use deletes its two, the session control''s and the nightly safety stop''s. Or raise the subscription''s quota for Automation accounts in westus3 (the Azure portal''s Quotas page, provider Automation accounts, or a support request; Free Trial and Azure for Students subscriptions can''t be raised). Then run ./scripts/deploy.ps1 again.'
+            $script:setupResults = @(
+                [pscustomobject]@{ CheckId = 'CONTROL.MODE'; Status = 'Pass'; Message = 'The vault is private.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.PROVIDER'; Status = 'Pass'; Message = 'The Microsoft.Automation resource provider is registered.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.GROUP'; Status = 'Pass'; Message = 'rg-dbhub-control exists; destroy.ps1 keeps it.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.RESOURCES'; Status = 'Fail'; Message = 'infra/control/control.bicep couldn''t be deployed: Azure refused aa-dbhub-control because the subscription''s quota for Azure Automation accounts in westus3 is used up (Conflict).'; Remediation = $script:quotaFix }
+                [pscustomobject]@{ CheckId = 'CONTROL.SUMMARY'; Status = 'Fail'; Message = '1 step(s) failed; fix them and run ./scripts/deploy.ps1 again.'; Remediation = '' }
+            )
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlSetup -MockWith {
+                foreach ($item in $script:setupResults) {
+                    New-DemoResult -CheckId $item.CheckId -Area 'workload' -Target 'subscription' -Status $item.Status -Message $item.Message -Remediation $item.Remediation
+                }
+            }
+            $script:bothParts = {
+                $azure = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoControlDeployStep -Config $Config -Part Azure -ProgressPath 'out/progress.json' })
+                $fabric = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig); Prior = $azure } { Invoke-DemoControlDeployStep -Config $Config -Part Fabric -ProgressPath 'out/progress.json' -PriorResult $Prior })
+                [pscustomobject]@{ All = @($azure) + @($fabric); Control = ($fabric | Where-Object checkId -EQ 'DEPLOY.CONTROL') }
+            }
+        }
+
+        It 'never says Run all is ready when Azure refused the control''s Automation account: a Warning with the quota and its fix, on the status page and in DONE' {
+            $script:accountAnswer = 'Missing'
+            $run = & $script:bothParts
+            $control = $run.Control
+            $control.status | Should -Be 'Warning'
+            $control.message | Should -BeExactly 'NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", but Run all can''t start a session yet: the session control''s Azure Automation account aa-dbhub-control isn''t in rg-dbhub-control: Azure refused it because the subscription''s quota for Azure Automation accounts in westus3 is used up.'
+            $control.remediation | Should -BeExactly ('{0} Meanwhile ./scripts/start-demo.ps1 runs a session from this PC.' -f $script:quotaFix)
+            $control.evidence['ready'] | Should -BeFalse -Because 'DONE then names only the scripts for each session'
+            $control.evidence['missing'] | Should -Be 'Account'
+            $control.evidence['cause'] | Should -Be 'CONTROL.RESOURCES'
+            @($run.All | Where-Object status -In 'Fail', 'Manual action required') | Should -BeNullOrEmpty -Because 'the session control never keeps the run from DONE (ADR 0026)'
+            $script:steps[-1].Id | Should -Be 'Control'
+            $script:steps[-1].Status | Should -Be 'Warning'
+            $script:steps[-1].Message | Should -Match '^NB_DatabaseHub_Control is in .*, but Run all can''t start a session yet: .* is used up\. Free an Automation account in westus3: '
+            # DONE's line says it once, with the fix, and doesn't repeat the template's refusal under "In Azure".
+            $note = InModuleScope -ModuleName DbHubDemo -Parameters @{ All = $run.All } { Get-DemoControlDeployNote -Result $All }
+            $note | Should -Match '^NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", but Run all can''t start a session yet: '
+            $note | Should -Not -Match 'Run all is ready|In Azure:'
+            ([regex]::Matches($note, 'is used up')).Count | Should -Be 1
+            $note | Should -Match 'Meanwhile \./scripts/start-demo\.ps1 runs a session from this PC\.$'
+            # The notebook says it too, at Run all (F29): what deploy.ps1 found goes into its CONTROL_PROBLEM.
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -Times 1 -Exactly -ParameterFilter { $ControlProblem -match '^\./scripts/deploy\.ps1 found on \d{4}-\d{2}-\d{2} \d{2}:\d{2} UTC that Run all can''t start a session: the session control''s Azure Automation account aa-dbhub-control isn''t in rg-dbhub-control: Azure refused it because the subscription''s quota for Azure Automation accounts in westus3 is used up\. Fix: Free an Automation account in westus3: .* Then run \./scripts/deploy\.ps1 again\. Meanwhile \./scripts/start-demo\.ps1 runs a session from a PC, and \./scripts/stop-demo\.ps1 stops the demo\.$' }
+        }
+
+        It 'names a missing <Case>, with this run''s step that says why' -ForEach @(
+            @{ Case = 'webhook'; Hooks = 'none'; HookSecret = 'Ok'; Status = 'Ok'; Failing = 'CONTROL.WEBHOOK'; Message = 'The webhook or its secret couldn''t be created: Conflict.'; Missing = 'Webhook'; Text = 'has no webhook that starts DbHub-Control, or the control vault kv-dbhub-ctl-[0-9a-f]{6} doesn''t keep its URL \(dbhub-activity-webhook\); this run''s CONTROL\.WEBHOOK says: The webhook or its secret couldn''t be created: Conflict\.$' }
+            @{ Case = 'webhook, only an expired one left'; Hooks = 'expired'; HookSecret = 'Ok'; Status = 'Ok'; Failing = 'CONTROL.WEBHOOK'; Message = 'The webhook or its secret couldn''t be created: Conflict.'; Missing = 'Webhook'; Text = 'has no webhook that starts DbHub-Control' }
+            @{ Case = 'webhook URL in the vault'; Hooks = 'live'; HookSecret = 'Missing'; Status = 'Ok'; Failing = 'CONTROL.WEBHOOK'; Message = 'The webhook or its secret couldn''t be created: Conflict.'; Missing = 'Webhook'; Text = 'doesn''t keep its URL \(dbhub-activity-webhook\)' }
+            @{ Case = 'session status'; Hooks = 'live'; HookSecret = 'Ok'; Status = 'Missing'; Failing = 'CONTROL.SECRETS'; Message = 'The session''s secret dbhub-session-status couldn''t be created: Forbidden.'; Missing = 'StatusSecret'; Text = 'the control vault kv-dbhub-ctl-[0-9a-f]{6} has no session status \(dbhub-session-status\), which Run all reads first; this run''s CONTROL\.SECRETS says: The session''s secret dbhub-session-status couldn''t be created: Forbidden\.$' }
+        ) {
+            $script:setupResults = @(
+                [pscustomobject]@{ CheckId = 'CONTROL.MODE'; Status = 'Pass'; Message = 'The vault is private.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.PROVIDER'; Status = 'Pass'; Message = 'Registered.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.GROUP'; Status = 'Pass'; Message = 'It exists.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.RESOURCES'; Status = 'Pass'; Message = 'Deployed.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = 'CONTROL.RUNBOOKS'; Status = 'Pass'; Message = 'Published.'; Remediation = '' }
+                [pscustomobject]@{ CheckId = $Failing; Status = 'Fail'; Message = $Message; Remediation = 'Run setup-activity-control.ps1 again; a webhook without its secret is replaced.' }
+            )
+            $script:controlHooks = switch ($Hooks) {
+                'none' { @() }
+                'expired' { @(@{ name = 'dbhub-activity-202601010000'; properties = @{ isEnabled = $true; expiryTime = [DateTime]::UtcNow.AddDays(-1).ToString('o'); runbook = @{ name = 'DbHub-Control' } } }) }
+                default { $script:controlHooks }
+            }
+            $script:hookSecretAnswer = $HookSecret
+            $script:statusSecretAnswer = $Status
+            $control = (& $script:bothParts).Control
+            $control.status | Should -Be 'Warning'
+            $control.message | Should -Match ('^NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", but Run all can''t start a session yet: .*{0}' -f $Text)
+            $control.remediation | Should -BeExactly 'Run ./scripts/deploy.ps1 again; a webhook without its secret is replaced. Meanwhile ./scripts/start-demo.ps1 runs a session from this PC.'
+            $control.evidence['ready'] | Should -BeFalse
+            $control.evidence['missing'] | Should -Be $Missing
+            $control.evidence['cause'] | Should -Be $Failing
+        }
+
+        It 'says this run''s setup stopped, as a Warning, when what an earlier deploy.ps1 set up still starts a session' {
+            $script:setupResults[3] = [pscustomobject]@{ CheckId = 'CONTROL.RESOURCES'; Status = 'Fail'; Message = 'infra/control/control.bicep couldn''t be deployed: ERROR: (RequestDisallowedByPolicy) Resource ''kv-dbhub-ctl-000000'' was disallowed by policy.'; Remediation = 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.' }
+            $run = & $script:bothParts
+            $control = $run.Control
+            $control.status | Should -Be 'Warning' -Because 'this run''s Azure part didn''t finish'
+            $control.message | Should -Match '^NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", and Run all starts a session with the session control an earlier \./scripts/deploy\.ps1 set up in rg-dbhub-control: this run''s setup of the session control stopped at CONTROL\.RESOURCES: infra/control/control\.bicep couldn''t be deployed: .*RequestDisallowedByPolicy'
+            $control.remediation | Should -BeExactly 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.'
+            $control.evidence['ready'] | Should -BeTrue
+            $control.evidence['missing'] | Should -Be ''
+            $control.evidence['cause'] | Should -Be 'CONTROL.RESOURCES'
+            $script:steps[-1].Status | Should -Be 'Warning'
+            $note = InModuleScope -ModuleName DbHubDemo -Parameters @{ All = $run.All } { Get-DemoControlDeployNote -Result $All }
+            $note | Should -Not -Match 'In Azure:'
+            ([regex]::Matches($note, 'RequestDisallowedByPolicy')).Count | Should -Be 1
+
+            # When the control's account can't be read, Run all may not start a session: not ready.
+            $script:accountAnswer = 'Error'
+            $control = (& $script:bothParts).Control
+            $control.status | Should -Be 'Warning'
+            $control.message | Should -Match '^NB_DatabaseHub_Control is in the workspace "Database Hub Demo Control", but Run all may not start a session: this run''s setup of the session control stopped at CONTROL\.RESOURCES: '
+            $control.remediation | Should -BeExactly 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again. Meanwhile ./scripts/start-demo.ps1 runs a session from this PC.'
+            $control.evidence['ready'] | Should -BeFalse
+        }
+
+        It 'claims nothing it couldn''t read, and is Pass, as before, when the setup finished' {
+            $script:setupResults = @($script:setupResults | Select-Object -First 3) + @([pscustomobject]@{ CheckId = 'CONTROL.RESOURCES'; Status = 'Pass'; Message = 'Deployed.'; Remediation = '' })
+            foreach ($answer in 'Ok', 'Error') {
+                $script:accountAnswer = $answer
+                $control = (& $script:bothParts).Control
+                $control.status | Should -Be 'Pass' -Because $answer
+                $control.message | Should -BeExactly 'Run all is ready: open NB_DatabaseHub_Control in the workspace "Database Hub Demo Control" and select Run all. It runs the whole session and stops it.'
+                $control.evidence['ready'] | Should -BeTrue
+            }
+            # The notebook's CONTROL_PROBLEM is cleared, so a problem an earlier run put there goes (F29).
+            Should -Invoke -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -Times 2 -Exactly -ParameterFilter { $ControlProblem -eq '' }
+        }
+
+        It 'counts CONTROL.MODE as where the setup stopped only when nothing after it ran' {
+            $stopAt = {
+                param([string[]] $Pairs)
+                $items = @(foreach ($pair in $Pairs) {
+                        $id, $status = $pair -split '='
+                        [pscustomobject]@{ checkId = $id; status = $status; message = $id; remediation = '' }
+                    })
+                $stop = InModuleScope -ModuleName DbHubDemo -Parameters @{ Items = $items } { Get-DemoControlSetupStop -Result $Items }
+                if ($null -eq $stop) { '' } else { [string]$stop.checkId }
+            }
+            & $stopAt @('CONTROL.MODE=Warning', 'CONTROL.PROVIDER=Pass', 'CONTROL.GROUP=Pass', 'CONTROL.RESOURCES=Pass') | Should -Be '' -Because 'a note about the vault''s mode'
+            & $stopAt @('CONTROL.MODE=Warning') | Should -Be 'CONTROL.MODE' -Because 'a vault mode the policy refuses stops the setup'
+            & $stopAt @('CONTROL.MODE=Pass', 'CONTROL.PROVIDER=Pass', 'CONTROL.GROUP=Warning') | Should -Be 'CONTROL.GROUP'
+            & $stopAt @('CONTROL.SETUP=Warning') | Should -Be 'CONTROL.SETUP'
+            & $stopAt @('CONTROL.MODE=Pass', 'CONTROL.RESOURCES=Pass', 'CONTROL.RUNBOOKS=Warning', 'CONTROL.WEBHOOK=Warning') | Should -Be '' -Because 'the runbooks have their own note'
+            & $stopAt @() | Should -Be ''
+        }
+    }
+
     Context 'the Fabric workspaces it uses, recorded on its resource group (2026-11-17)' {
         BeforeEach {
             Mock -ModuleName DbHubDemo -CommandName Set-DemoActivityControlFabric -MockWith {
@@ -1157,7 +1397,7 @@ Describe 'The session control in every deployment (deploy.ps1, ADR 0026, 2026-11
                 # Only the safety stop's plan Warning comes between them (2026-11-19, the coordinator's option 2).
                 @([regex]::Matches($match.Groups[1].Value, '\b[A-Z][a-z]+-Demo[A-Za-z]+') | ForEach-Object { $_.Value } | Sort-Object -Unique) | Should -Be @('Add-DemoProgressStepNote', 'New-DemoSafetyStopPlanResult', 'Write-DemoLog') -Because $file
             }
-            $text | Should -Match 'Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Fabric -ProgressPath \$ProgressPath' -Because $file
+            $text | Should -Match 'Invoke-DemoControlDeployStep -Config \$Config -ConfigPath \$ConfigPath -Part Fabric -ProgressPath \$ProgressPath -PriorResult \$results\.ToArray\(\)' -Because ('{0}: the notebook''s part reads where the Azure part stopped (F28)' -f $file)
             $text | Should -Not -Match 'Invoke-DemoActivityControlRegrant' -Because $file
             # Since Phase 28 both paths build DEPLOY.SUMMARY in one place.
             $text | Should -Match 'Get-DemoDeploySummary -Result \$all' -Because $file
@@ -1235,6 +1475,130 @@ Describe 'Setting up the control (setup-activity-control.ps1)' {
         $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig -Mode 'public') -Confirm:$false)
         ($results | Where-Object checkId -EQ 'CONTROL.MODE').status | Should -Be 'Fail'
         $script:azCalls.Count | Should -Be 0
+    }
+
+    It 'says the subscription''s quota for Automation accounts in the region is used up, with how to free one or raise it, and stops there (F28, live 2026-11-21)' {
+        $script:controlTemplateError = Get-QuotaError
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -SkipFabric -Confirm:$false)
+        $template = $results | Where-Object checkId -EQ 'CONTROL.RESOURCES'
+        $template.status | Should -Be 'Fail'
+        $template.message | Should -BeExactly 'infra/control/control.bicep couldn''t be deployed: Azure refused aa-dbhub-control because the subscription''s quota for Azure Automation accounts in westus3 is used up (Conflict).'
+        $template.remediation | Should -BeExactly 'Free an Automation account in westus3: ./scripts/destroy.ps1 on a demo environment you no longer use deletes its two, the session control''s and the nightly safety stop''s. Or raise the subscription''s quota for Automation accounts in westus3 (the Azure portal''s Quotas page, provider Automation accounts, or a support request; Free Trial and Azure for Students subscriptions can''t be raised). Then run ./scripts/deploy.ps1 again.'
+        $template.evidence['quotaUsedUp'] | Should -BeTrue
+        $template.evidence['error'] | Should -Match 'exceeded your quota for Automation accounts'
+        $template.docUrl | Should -Be 'https://learn.microsoft.com/azure/automation/automation-limits-quotas'
+        @($results | Where-Object checkId -In 'CONTROL.RUNBOOKS', 'CONTROL.WEBHOOK', 'CONTROL.SECRETS') | Should -BeNullOrEmpty -Because 'the setup stops at its template'
+        # Any other refusal keeps its own words and fix.
+        $script:controlTemplateError = 'ERROR: (RequestDisallowedByPolicy) Resource ''aa-dbhub-control'' was disallowed by policy.'
+        $other = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -SkipFabric -Confirm:$false) | Where-Object checkId -EQ 'CONTROL.RESOURCES'
+        $other.message | Should -Match 'RequestDisallowedByPolicy'
+        $other.remediation | Should -Be 'Fix the cause (a policy denial names its policy), then run ./scripts/deploy.ps1 again.'
+    }
+
+    It 'creates the session''s status variable only when Azure has none, so an update keeps a stopped session''s lists, encrypted or not (2026-11-23)' {
+        # Every update deployed control.bicep, which wrote DbHubSessionStatus again empty: a start after it no longer had what
+        # the stop's status listed of the Incident RCA's evidence still on the VMs (ADR 0031).
+        $deploy = {
+            $script:deployments.Clear()
+            $answer = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoActivityControlTemplate -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -Mode 'public' -Confirm:$false }
+            $script:deployments.Count | Should -Be 1
+            $script:deployments[0].Text | Should -Match 'control\.bicep'
+            $script:deployments[0].Text | Should -Not -Match '--mode' -Because 'only an incremental deployment, the default, leaves a variable the template doesn''t deploy as it is'
+            return [pscustomobject]@{ Result = $answer.Result; Create = ($script:deployments[0].Parameters | ConvertFrom-Json -AsHashtable)['parameters']['createSessionStatus']['value'] }
+        }
+        $script:statusVariable = ''
+        $new = & $deploy
+        $new.Create | Should -BeTrue
+        $new.Result.status | Should -Be 'Pass'
+        $new.Result.evidence.sessionStatus | Should -Be 'created'
+        $new.Result.message | Should -Not -Match 'DbHubSessionStatus'
+
+        $script:statusVariable = 'Plain'
+        $kept = & $deploy
+        $kept.Create | Should -BeFalse
+        $kept.Result.status | Should -Be 'Pass'
+        $kept.Result.evidence.sessionStatus | Should -Be 'kept'
+        $kept.Result.message | Should -Match 'Its variable DbHubSessionStatus was kept as it was: the last session''s status, which the next session''s start reads\.$'
+
+        $script:statusVariable = 'Encrypted'
+        $encrypted = & $deploy
+        $encrypted.Create | Should -BeFalse
+        $encrypted.Result.evidence.sessionStatus | Should -Be 'kept, encrypted'
+        $encrypted.Result.message | Should -Match 'was kept as it was, encrypted:'
+        @($script:rest | Where-Object { $_.Url -match '/variables/' } | ForEach-Object Method | Select-Object -Unique) | Should -Be @('get') -Because 'the variable is only read: the template creates it'
+
+        # One that can't be read, read twice before the deployment and twice after it, is left as it is, never emptied, and
+        # says so.
+        $script:statusVariable = 'Forbidden'
+        $script:rest.Clear()
+        $unread = & $deploy
+        $unread.Create | Should -BeFalse
+        $unread.Result.status | Should -Be 'Warning'
+        $unread.Result.evidence.sessionStatus | Should -Be 'unread, left as it is'
+        $unread.Result.message | Should -Match 'Its variable DbHubSessionStatus couldn''t be read \(ERROR: \(AuthorizationFailed\) The client has no access to read the variable\), so it was left as it was, never emptied'
+        $unread.Result.remediation | Should -Be 'Run ./scripts/deploy.ps1 again.'
+        @($script:rest | Where-Object { $_.Url -match '/variables/DbHubSessionStatus\?api-version=2024-10-23$' }).Count | Should -Be 4
+        @($script:rest | Where-Object { $_.Url -match '/variables/' } | ForEach-Object Method | Select-Object -Unique) | Should -Be @('get')
+    }
+
+    It 'reads a variable it couldn''t read again after the deployment, and creates it then when it''s missing, as the template does (the review of 40124992)' {
+        # A new environment's first deployment, or one after the variable's deletion, whose read failed twice (throttling,
+        # a 5xx, the network) left createSessionStatus false, and the runbooks without the variable.
+        $deploy = {
+            $script:deployments.Clear()
+            $script:rest.Clear()
+            InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { (Invoke-DemoActivityControlTemplate -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -Mode 'public' -Confirm:$false).Result }
+        }
+        $script:statusVariable = 'Throttled'
+        $script:statusVariableAfterDeploy = ''
+        $created = & $deploy
+        ($script:deployments[0].Parameters | ConvertFrom-Json -AsHashtable)['parameters']['createSessionStatus']['value'] | Should -BeFalse
+        $created.status | Should -Be 'Pass'
+        $created.evidence.sessionStatus | Should -Be 'created'
+        $created.message | Should -Match 'Its variable DbHubSessionStatus couldn''t be read before the deployment \(ERROR: \(TooManyRequests\) The request was throttled\), and it was missing after it, so it was created, empty, as the template creates it\.$'
+        $puts = @($script:rest | Where-Object { $_.Method -eq 'put' -and $_.Url -match '/automationAccounts/aa-dbhub-control/variables/DbHubSessionStatus\?api-version=2024-10-23$' })
+        $puts.Count | Should -Be 1
+        $body = $puts[0].Body | ConvertFrom-Json -AsHashtable
+        $body['name'] | Should -Be 'DbHubSessionStatus'
+        $body['properties']['isEncrypted'] | Should -BeFalse
+        $body['properties']['value'] | Should -Be '""'
+        $template = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/control/control.bicep') -Raw
+        $template | Should -Match ([regex]::Escape(("description: '{0}'" -f $body['properties']['description'].Replace("'", "\'")))) -Because 'it''s created as the template creates it'
+        $script:statusVariable | Should -Be 'Plain'
+
+        # Kept when the read after the deployment finds it, and created by nothing.
+        $script:statusVariable = 'Throttled'
+        $script:statusVariableAfterDeploy = 'Encrypted'
+        $kept = & $deploy
+        $kept.status | Should -Be 'Pass'
+        $kept.evidence.sessionStatus | Should -Be 'kept, encrypted'
+        $kept.message | Should -Match 'was kept as it was, encrypted:'
+        @($script:rest | Where-Object { $_.Method -ne 'get' -and $_.Url -match '/variables/' }) | Should -BeNullOrEmpty
+
+        # Missing, and refused: a Warning, with deploy.ps1 again.
+        $script:statusVariable = 'Throttled'
+        $script:statusVariableAfterDeploy = ''
+        $script:statusVariablePutFails = $true
+        $refused = & $deploy
+        $refused.status | Should -Be 'Warning'
+        $refused.evidence.sessionStatus | Should -Be 'missing, not created'
+        $refused.message | Should -Match 'it was missing after it, but it couldn''t be created \(ERROR: \(RequestDisallowedByPolicy\) A policy denied the variable\): the runbooks can''t keep the session''s status until it exists\.$'
+        $refused.remediation | Should -Be 'Run ./scripts/deploy.ps1 again.'
+    }
+
+    It 'says the variable was created only once the deployment that creates it succeeded (the review of 40124992)' {
+        $script:statusVariable = ''
+        $script:deployFails = $true
+        $result = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { (Invoke-DemoActivityControlTemplate -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -Mode 'public' -Confirm:$false).Result }
+        $result.status | Should -Be 'Fail'
+        $result.evidence.sessionStatus | Should -Be 'to create'
+        $result.message | Should -Match 'control\.bicep couldn''t be deployed'
+    }
+
+    It 'makes the template create the variable only when asked' {
+        $template = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/control/control.bicep') -Raw
+        $template | Should -Match 'param createSessionStatus bool = true'
+        $template | Should -Match "resource sessionStatus 'Microsoft\.Automation/automationAccounts/variables@[0-9-]+' = if \(createSessionStatus\) \{"
     }
 
     It 'stores the webhook URL only through the secure template parameter, never in a result or the log' {
@@ -1610,6 +1974,88 @@ Describe 'Removing the control (setup-activity-control.ps1 -Remove)' {
         $null = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
         @($script:azCalls | Where-Object { $_ -like 'group delete --name rg-dbhub-control*' }).Count | Should -Be 1
         @($script:ops | Where-Object { $_ -like 'fabric *' }) | Should -BeNullOrEmpty -Because '-SkipFabric leaves Fabric alone'
+    }
+
+    It 'says which resources were already gone, and sends them no delete: <Case>' -ForEach @(
+        # Live, 2026-11-22: after destroy.ps1 had deleted the control, -Remove -Force -SkipFabric said "Deleted: " for all
+        # three. Resource Manager answers a delete of what doesn't exist with 204, or 404 when its group is gone too.
+        @{ Case = 'everything gone, the group too, as after destroy.ps1'; Identity = $false; Vault = $false; Account = $false; GroupGone = $true; Left = 0; Deleted = @(); Expected = 'Already gone: id-dbhub-automation, {vault}, aa-dbhub-control. rg-dbhub-control is already gone.' }
+        @{ Case = 'everything gone, the group kept for what else it holds'; Identity = $false; Vault = $false; Account = $false; GroupGone = $false; Left = 1; Deleted = @(); Expected = 'Already gone: id-dbhub-automation, {vault}, aa-dbhub-control. rg-dbhub-control was kept: it holds 1 other resource(s): id-github-oidc-1.' }
+        @{ Case = 'only the identity gone'; Identity = $false; Vault = $true; Account = $true; GroupGone = $false; Left = 0; Deleted = @('vaults', 'automationAccounts'); Expected = 'Deleted: {vault}, the vault purge, aa-dbhub-control. Already gone: id-dbhub-automation. rg-dbhub-control was empty and is being deleted.' }
+    ) {
+        $script:identityExists = $Identity
+        $script:vaultExists = $Vault
+        $script:vaultPurgeable = $Vault
+        $script:secretExists = $Vault
+        $script:accountExists = $Account
+        $script:controlGroupGone = $GroupGone
+        $script:leftInGroup = $Left
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
+
+        $resources = $results | Where-Object checkId -EQ 'CONTROL.REMOVE.RESOURCES'
+        $resources.status | Should -Be 'Pass'
+        $resources.message | Should -BeExactly ($Expected -replace '\{vault\}', (Get-ControlName (New-ControlConfig)).KeyVault)
+        # The resources themselves, not the role assignments on the vault's secrets, which the roles' removal deletes.
+        $deletes = @($script:ops | Where-Object { $_ -match '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$' } | ForEach-Object { $_ -replace '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$', '$1' })
+        ($deletes -join ', ') | Should -Be ($Deleted -join ', ') -Because 'a resource that''s already gone gets no delete'
+    }
+
+    # The review of 842a3e5c probed these three (2026-11-22); destroy.ps1 runs the same code for DESTROY.CONTROL.RESOURCES.
+    It 'sends the delete when Azure refuses the read, and never calls the resource already gone: <Case>' -ForEach @(
+        @{ Case = 'the delete allowed'; Refuses = @('get'); Status = 'Pass'; Deleted = @('userAssignedIdentities', 'vaults', 'automationAccounts') }
+        @{ Case = 'the delete refused too'; Refuses = @('get', 'delete'); Status = 'Fail'; Deleted = @('userAssignedIdentities', 'vaults') }
+    ) {
+        $script:identityRefuses = $Refuses
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
+
+        $vault = (Get-ControlName (New-ControlConfig)).KeyVault
+        $resources = $results | Where-Object checkId -EQ 'CONTROL.REMOVE.RESOURCES'
+        $resources.status | Should -Be $Status
+        $resources.message | Should -Not -Match 'Already gone' -Because 'a refused read doesn''t say whether the identity is there'
+        if ($Status -eq 'Pass') {
+            $resources.message | Should -BeExactly ('Deleted: id-dbhub-automation, {0}, the vault purge, aa-dbhub-control. rg-dbhub-control was empty and is being deleted.' -f $vault)
+        }
+        else {
+            $resources.message | Should -BeLike ('Deleted: {0}, the vault purge. Failed: id-dbhub-automation: ERROR: (AuthorizationFailed) *userAssignedIdentities/delete*; aa-dbhub-control: kept until the rest is deleted.*' -f $vault)
+        }
+        $deletes = @($script:ops | Where-Object { $_ -match '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$' } | ForEach-Object { $_ -replace '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$', '$1' })
+        ($deletes -join ', ') | Should -Be ($Deleted -join ', ') -Because 'the identity''s delete is still sent'
+    }
+
+    It 'calls a resource that goes between its read and its delete already gone' {
+        # Another run deletes the control's group after the identity's read, so Resource Manager answers the identity's
+        # delete with 404, and every later read in the group too. The vault went with the group, soft-deleted, so its purge
+        # still runs.
+        $script:groupGoesAtDelete = $true
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
+
+        $resources = $results | Where-Object checkId -EQ 'CONTROL.REMOVE.RESOURCES'
+        $resources.status | Should -Be 'Pass'
+        $resources.message | Should -BeExactly ('Deleted: the vault purge. Already gone: id-dbhub-automation, {0}, aa-dbhub-control. rg-dbhub-control is already gone.' -f (Get-ControlName (New-ControlConfig)).KeyVault)
+        $deletes = @($script:ops | Where-Object { $_ -match '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$' } | ForEach-Object { $_ -replace '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$', '$1' })
+        ($deletes -join ', ') | Should -Be 'userAssignedIdentities' -Because 'the identity was there when it was read'
+    }
+
+    It 'purges a vault that''s deleted but not purged yet, and calls it already gone: <Case>' -ForEach @(
+        @{ Case = 'the rest still there'; Rest = $true; GroupGone = $false; Deleted = @('userAssignedIdentities', 'automationAccounts'); Expected = 'Deleted: id-dbhub-automation, the vault purge, aa-dbhub-control. Already gone: {vault}. rg-dbhub-control was empty and is being deleted.' }
+        @{ Case = 'the rest gone with the group'; Rest = $false; GroupGone = $true; Deleted = @(); Expected = 'Deleted: the vault purge. Already gone: id-dbhub-automation, {vault}, aa-dbhub-control. rg-dbhub-control is already gone.' }
+    ) {
+        # A deleted vault stays, soft-deleted, until it's purged: a read of it is 404, and its purge works
+        # (https://learn.microsoft.com/azure/key-vault/general/soft-delete-overview).
+        $script:vaultExists = $false
+        $script:vaultPurgeable = $true
+        $script:secretExists = $false
+        $script:identityExists = $Rest
+        $script:accountExists = $Rest
+        $script:controlGroupGone = $GroupGone
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
+
+        $resources = $results | Where-Object checkId -EQ 'CONTROL.REMOVE.RESOURCES'
+        $resources.status | Should -Be 'Pass'
+        $resources.message | Should -BeExactly ($Expected -replace '\{vault\}', (Get-ControlName (New-ControlConfig)).KeyVault)
+        @($script:rest | Where-Object { $_.Method -eq 'post' -and $_.Url -match '/deletedVaults/.+/purge' }).Count | Should -Be 1
+        $deletes = @($script:ops | Where-Object { $_ -match '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$' } | ForEach-Object { $_ -replace '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$', '$1' })
+        ($deletes -join ', ') | Should -Be ($Deleted -join ', ') -Because 'a vault that''s deleted gets its purge, not a delete'
     }
 }
 

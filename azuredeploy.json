@@ -6,7 +6,7 @@
     "_generator": {
       "name": "bicep",
       "version": "0.47.16.16243",
-      "templateHash": "9827529834521370362"
+      "templateHash": "6646629441020519667"
     },
     "name": "Fabric Database Hub hybrid SQL demo",
     "description": "Subscription-scope entry point (ADR 0001, ADR 0002). Creates the demo resource group and deploys the demo into it."
@@ -443,7 +443,7 @@
       "type": "bool",
       "defaultValue": false,
       "metadata": {
-        "description": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): Query Store capturing the top queries and index tuning in REPORT mode every 60 minutes, set only on a size that runs it (General Purpose or Memory Optimized with at least 4 vCores). deploy.ps1 decides from t4AutonomousTuning and the size (Get-DemoT4Tuning). When false, those parameters are left as they are, except that Query Store is turned off on a Burstable size."
+        "description": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): index tuning in REPORT mode every 60 minutes, with the first sample of each query's parameters, set only on a size that runs it (General Purpose or Memory Optimized with at least 4 vCores). deploy.ps1 decides from t4AutonomousTuning and the size (Get-DemoT4Tuning). When false, those parameters are left as they are. Query Store and its wait sampling are on at every size but Burstable, whatever this says (2026-11-23)."
       }
     },
     "t4AvailabilityZone": {
@@ -470,7 +470,7 @@
       "type": "bool",
       "defaultValue": true,
       "metadata": {
-        "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Microsoft Entra only (local authentication off), a private endpoint in snet-pe in both network modes with public network access off, and the patient-events container at 400 RU/s. T1's managed identity gets the Cosmos DB Built-in Data Contributor data-plane role (2026-11-18, ADR 0027)."
+        "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Microsoft Entra only (local authentication off), reached from T1's subnet only (through a private endpoint in snet-pe, with public network access off, when t5PrivateAccess; otherwise through T1's subnet's service endpoint), and the patient-events container at 400 RU/s. T1's managed identity gets the Cosmos DB Built-in Data Contributor data-plane role (2026-11-18, ADR 0027)."
       }
     },
     "t5FreeTier": {
@@ -478,6 +478,20 @@
       "defaultValue": false,
       "metadata": {
         "description": "T5 uses the subscription's one free-tier account (the first 1,000 RU/s and 25 GB free), which Azure sets only when the account is created. deploy.ps1 sets it when the subscription has no free-tier account yet and t5UseFreeTier is true, and passes an existing account's own value (ADR 0027)."
+      }
+    },
+    "t5PrivateAccess": {
+      "type": "bool",
+      "defaultValue": true,
+      "metadata": {
+        "description": "T5 keeps a private endpoint and its DNS zone, with public network access off (true, the default, and always in private mode). deploy.ps1 passes false only in public mode, for a new account (or one with public network access already on) when no policy turns Azure Cosmos DB public network access off or denies it and the policies could all be read: public network access is then limited to T1's subnet through its Microsoft.AzureCosmosDB service endpoint, as T3 in public mode, which saves the endpoint and its zone. An account that has its endpoint keeps it (DEPLOY.T5.NETWORK; ADR 0027, 2026-11-21)."
+      }
+    },
+    "t5WasPublic": {
+      "type": "bool",
+      "defaultValue": false,
+      "metadata": {
+        "description": "T5's account has public network access on before this deployment, which deploy.ps1 reads. snet-sqlvm then keeps its Microsoft.AzureCosmosDB service endpoint, in either network mode, even when the account moves to its private endpoint, so T1 still reaches T5 if Azure refuses the move; the next deployment drops it once the account reads public network access off. False, the default, changes nothing (ADR 0027, 2026-11-22)."
       }
     }
   },
@@ -660,6 +674,12 @@
           },
           "t5FreeTier": {
             "value": "[parameters('t5FreeTier')]"
+          },
+          "t5PrivateAccess": {
+            "value": "[parameters('t5PrivateAccess')]"
+          },
+          "t5WasPublic": {
+            "value": "[parameters('t5WasPublic')]"
           }
         },
         "template": {
@@ -670,7 +690,7 @@
             "_generator": {
               "name": "bicep",
               "version": "0.47.16.16243",
-              "templateHash": "16425786594711647420"
+              "templateHash": "7522053352323123798"
             },
             "description": "Resource-group scope entry point for the demo: network, budget, and optional lock (Phase 5), the T1 and T2 host VMs with their bootstraps (Phase 6), and the optional Arc onboarding identity and the opt-in evaluation-only T2 VM (Phase 7)."
           },
@@ -969,7 +989,7 @@
               "type": "bool",
               "defaultValue": false,
               "metadata": {
-                "description": "T4's autonomous tuning (Query Store and index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019)."
+                "description": "T4's autonomous tuning (index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019). Query Store and its wait sampling are on at every size but Burstable either way (2026-11-23)."
               }
             },
             "t4AvailabilityZone": {
@@ -996,7 +1016,7 @@
               "type": "bool",
               "defaultValue": true,
               "metadata": {
-                "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Entra-only, a private endpoint in snet-pe in both network modes, and one container at 400 RU/s (ADR 0027)."
+                "description": "Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Entra-only, reached from T1's subnet only, and one container at 400 RU/s (ADR 0027)."
               }
             },
             "t5FreeTier": {
@@ -1004,6 +1024,20 @@
               "defaultValue": false,
               "metadata": {
                 "description": "T5 uses the subscription's one free-tier account, which Azure sets only at creation; deploy.ps1 decides, and passes an existing account's own value (ADR 0027)."
+              }
+            },
+            "t5PrivateAccess": {
+              "type": "bool",
+              "defaultValue": true,
+              "metadata": {
+                "description": "T5 keeps a private endpoint in snet-pe, with public network access off (true, the default; always in private mode). False, which deploy.ps1 passes only in public mode, for a new account or one without an endpoint, when no policy needs one and the policies could all be read: public network access limited to T1's subnet through its service endpoint, as T3 (ADR 0027, 2026-11-21)."
+              }
+            },
+            "t5WasPublic": {
+              "type": "bool",
+              "defaultValue": false,
+              "metadata": {
+                "description": "T5's account has public network access on before this deployment: snet-sqlvm keeps its Azure Cosmos DB service endpoint, in either network mode, while the account moves to its private endpoint, so T1 reaches T5 until that move succeeds (ADR 0027, 2026-11-22)."
               }
             }
           },
@@ -1180,13 +1214,12 @@
               "tokenResource": "https://ossrdbms-aad.database.windows.net",
               "enhancedMetricsParameter": "metrics.collector_database_activity",
               "maxConnections": 50,
-              "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_D4ds_v5 and Standard_D4ads_v5 (default 1,718), Standard_D2ds_v5 (859), and Standard_B2s (429) refuse the surge's overshoot too, and Database Hub's Failed connections fill on every size. Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
+              "maxConnectionsNote": "The template sets max_connections to this value on every T4 size (ADR 0019, 2026-11-03): Standard_B1ms's own default, below connection-surge's cap of 60, so Standard_D4ds_v5 and Standard_D4ads_v5 (default 1,718), Standard_D2ds_v5 (859), and Standard_B2s (429) refuse the surge's overshoot too, and Database Hub's Connections chart shows the surge at the limit on every size (its refused attempts aren't in Failed connections: Azure Monitor counted none of them live, 2026-11-21). Allowed values 25-5000; a static parameter, applied at the next restart, which deploy.ps1 does when one is pending (serverParameters and restartServer below, checked 2026-11-03). 15 slots stay reserved (reserved_connections 5, superuser_reserved_connections 10), which leaves 35 for the runner (limits).",
               "autoStartAfterStoppedDays": 7,
               "capabilitiesApiVersion": "2025-08-01",
               "autonomousTuning": {
-                "note": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): set by the template only when Get-DemoT4Tuning allows it, on a General Purpose or Memory Optimized size with at least minVCores vCores ('supported on any currently supported compute SKU with at least 4 vCores'; Query Store, which it needs, shouldn't run on Burstable). Query Store captures the top queries, with the first sample of each parameterized query's parameters (the runner's queries are parameterized), and index tuning runs in report mode every 60 minutes, its minimum, because T4 runs only during demos; the interval is set before the mode, because the first session is scheduled from the interval in effect when tuning is turned on. All four parameters are dynamic (no restart; checked 2026-11-04). The recommendations show in the Azure portal (the server's Intelligent Performance > Autonomous tuning) and through az postgres flexible-server autonomous-tuning, not in Database Hub.",
+                "note": "T4's autonomous tuning (2026-11-04, user-directed; ADR 0019): set by the template only when Get-DemoT4Tuning allows it, on a General Purpose or Memory Optimized size with at least minVCores vCores ('supported on any currently supported compute SKU with at least 4 vCores'; Query Store, which it needs, shouldn't run on Burstable). Query Store, which it needs, is queryStore's below, on at every size but Burstable whatever this says (2026-11-23); with tuning, Query Store also keeps the first sample of each parameterized query's parameters (the runner's queries are parameterized), and index tuning runs in report mode every 60 minutes, its minimum, because T4 runs only during demos; the interval is set before the mode, because the first session is scheduled from the interval in effect when tuning is turned on. All four parameters are dynamic (no restart; checked 2026-11-04). The recommendations show in the Azure portal (the server's Intelligent Performance > Autonomous tuning) and through az postgres flexible-server autonomous-tuning, not in Database Hub.",
                 "minVCores": 4,
-                "queryCaptureMode": "top",
                 "parametersCaptureMode": "capture_first_sample",
                 "analysisIntervalMinutes": 60,
                 "mode": "report",
@@ -1197,6 +1230,15 @@
                   "tuningParameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-autonomous-tuning",
                   "cli": "https://learn.microsoft.com/cli/azure/postgres/flexible-server/autonomous-tuning",
                   "scaling": "https://learn.microsoft.com/azure/postgresql/scale/concepts-scaling-resources"
+                }
+              },
+              "queryStore": {
+                "note": "T4's Query Store and its wait sampling (2026-11-23, user-directed: 'We would want query store enabled wherever possible'; ADR 0019): the template sets pg_qs.query_capture_mode to queryCaptureMode and pgms_wait_sampling.query_capture_mode to waitSamplingCaptureMode on every size but Burstable, whatever t4AutonomousTuning says, and both to none on Burstable, because Learn says 'Don't enable query store on the Burstable pricing tier as it causes performance problems'. all, not top: top tracks only top-level statements, and the workload's statements run inside its functions, which all also tracks ('nested queries (the ones that execute inside a function or procedure)'); autonomous tuning takes either ('Requires query store to be enabled by setting pg_qs.query_capture_mode to TOP or ALL'). pg_qs.query_capture_mode supersedes the wait sampling setting. Query Store doesn't record the queries run on a read replica, so the replica gets neither. Both parameters are dynamic, so setting them restarts nothing, and deploy.ps1 sets them on an existing server. Query Store is available at no extra charge; its data lives in the server's azure_sys database (query_store.qs_view and query_store.pgms_wait_sampling_view), kept pg_qs.retention_period_in_days (7 by default). Plan storage (pg_qs.store_query_plans) stays off, its default. Checked 2026-11-23.",
+                "queryCaptureMode": "all",
+                "waitSamplingCaptureMode": "all",
+                "docUrls": {
+                  "queryStore": "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store",
+                  "parameters": "https://learn.microsoft.com/azure/postgresql/parameters/parameters-query-store"
                 }
               },
               "metrics": {
@@ -1327,6 +1369,7 @@
                 "dataPlaneRbac": "https://learn.microsoft.com/azure/cosmos-db/nosql/how-to-grant-data-plane-access",
                 "disableLocalAuth": "https://learn.microsoft.com/azure/cosmos-db/how-to-connect-role-based-access-control",
                 "privateEndpoint": "https://learn.microsoft.com/azure/cosmos-db/how-to-configure-private-endpoints",
+                "vnetServiceEndpoint": "https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint",
                 "freeTier": "https://learn.microsoft.com/azure/cosmos-db/free-tier",
                 "normalizedRu": "https://learn.microsoft.com/azure/cosmos-db/monitor-normalized-request-units",
                 "requestRateTooLarge": "https://learn.microsoft.com/azure/cosmos-db/nosql/troubleshoot-request-rate-too-large",
@@ -1355,6 +1398,7 @@
             "t4ReplicaServerFqdn": "[if(startsWith(parameters('t4SkuName'), 'Standard_B'), '', format('{0}.postgres.database.azure.com', variables('t4ReplicaServerName')))]",
             "t5AccountName": "[format('{0}-{1}', variables('cosmos').accountNamePrefix, parameters('deploymentId'))]",
             "t5AccountHost": "[format('{0}.documents.azure.com', variables('t5AccountName'))]",
+            "t5Private": "[or(parameters('t5PrivateAccess'), equals(parameters('networkMode'), 'private'))]",
             "workloadSettings": {
               "runnerSha256": "[toLower(parameters('workloadRunnerSha256'))]",
               "runnerChunkCount": "[parameters('workloadRunnerChunkCount')]",
@@ -1414,6 +1458,9 @@
                   },
                   "tags": {
                     "value": "[parameters('tags')]"
+                  },
+                  "cosmosServiceEndpoint": {
+                    "value": "[and(parameters('t5Enabled'), or(not(variables('t5Private')), parameters('t5WasPublic')))]"
                   }
                 },
                 "template": {
@@ -1424,7 +1471,7 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "14048794027523245067"
+                      "templateHash": "6840453450869620926"
                     },
                     "description": "Virtual network, subnets, and NSGs (ADR 0007), with the outbound mode from ADR 0017."
                   },
@@ -1478,6 +1525,13 @@
                       "defaultValue": false,
                       "metadata": {
                         "description": "Golden snapshot boot test only (ADR 0018, guardrail 8): deny every outbound flow from snet-archost before the restored host first boots. The main template never sets it."
+                      }
+                    },
+                    "cosmosServiceEndpoint": {
+                      "type": "bool",
+                      "defaultValue": false,
+                      "metadata": {
+                        "description": "Add the Microsoft.AzureCosmosDB service endpoint to snet-sqlvm: in public mode for a T5 reached from T1's subnet without a private endpoint (ADR 0027, 2026-11-21), and in either mode while an account that's public now moves to its private endpoint (2026-11-22). False, the default, leaves snet-sqlvm's service endpoints as they were."
                       }
                     }
                   },
@@ -5296,7 +5350,7 @@
                                 "name": "snet-sqlvm",
                                 "addressPrefix": "[variables('subnetPrefixes').sqlvm]",
                                 "networkSecurityGroupResourceId": "[reference('nsgSqlvm').outputs.resourceId.value]",
-                                "serviceEndpoints": "[if(equals(parameters('networkMode'), 'public'), createArray('Microsoft.Sql'), createArray())]",
+                                "serviceEndpoints": "[if(equals(parameters('networkMode'), 'public'), if(parameters('cosmosServiceEndpoint'), createArray('Microsoft.Sql', 'Microsoft.AzureCosmosDB'), createArray('Microsoft.Sql')), if(parameters('cosmosServiceEndpoint'), createArray('Microsoft.AzureCosmosDB'), createArray()))]",
                                 "privateEndpointNetworkPolicies": "Disabled",
                                 "defaultOutboundAccess": "[variables('useDefaultOutbound')]",
                                 "natGatewayResourceId": "[variables('natGatewayId')]"
@@ -9880,6 +9934,9 @@
                   },
                   "tuning": {
                     "value": "[variables('postgres').autonomousTuning]"
+                  },
+                  "queryStore": {
+                    "value": "[variables('postgres').queryStore]"
                   }
                 },
                 "template": {
@@ -9889,9 +9946,9 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "17417311977485402231"
+                      "templateHash": "5645679099821475783"
                     },
-                    "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, the free enhanced metrics turned on, and max_connections at 50 on every size."
+                    "description": "T4 pgflex01 (Phase 24, ADR 0019): an Azure Database for PostgreSQL flexible server, at the smallest Burstable size by default or the General Purpose size deploy.ps1 falls back to, with the contosocare database, Microsoft Entra-only authentication with the P6 group as administrator, virtual network integration with no public endpoint, the free enhanced metrics turned on, max_connections at 50 on every size, and Query Store with its wait sampling on at every size but Burstable."
                   },
                   "parameters": {
                     "location": {
@@ -9997,26 +10054,35 @@
                       "minValue": 25,
                       "maxValue": 5000,
                       "metadata": {
-                        "description": "max_connections on every size, from config/versions.json (postgresql.maxConnections): Standard_B1ms's own default of 50, so connection-surge reaches the limit, and Database Hub's Failed connections fill, on the larger sizes too (ADR 0019, 2026-11-03). A static parameter: the value takes effect at the next restart, which deploy.ps1 does when one is pending."
+                        "description": "max_connections on every size, from config/versions.json (postgresql.maxConnections): Standard_B1ms's own default of 50, so connection-surge reaches the limit, which Database Hub's Connections chart shows, on the larger sizes too (ADR 0019, 2026-11-03). A static parameter: the value takes effect at the next restart, which deploy.ps1 does when one is pending."
                       }
                     },
                     "autonomousTuning": {
                       "type": "bool",
                       "defaultValue": false,
                       "metadata": {
-                        "description": "Autonomous tuning (2026-11-04, ADR 0019): Query Store and index tuning in REPORT mode, only on a size that runs them (4 vCores or more, not Burstable); deploy.ps1 decides (Get-DemoT4Tuning). When false, these parameters are left as they are, except that Query Store is turned off on a Burstable size."
+                        "description": "Autonomous tuning (2026-11-04, ADR 0019): index tuning in REPORT mode, only on a size that runs it (4 vCores or more, not Burstable); deploy.ps1 decides (Get-DemoT4Tuning). When false, its parameters are left as they are. Query Store and its wait sampling don't depend on it (queryStore)."
                       }
                     },
                     "tuning": {
                       "type": "object",
                       "defaultValue": {
-                        "queryCaptureMode": "top",
                         "parametersCaptureMode": "capture_first_sample",
                         "analysisIntervalMinutes": 60,
                         "mode": "report"
                       },
                       "metadata": {
-                        "description": "The autonomous tuning values from config/versions.json (postgresql.autonomousTuning): queryCaptureMode, parametersCaptureMode, analysisIntervalMinutes, and mode."
+                        "description": "The autonomous tuning values from config/versions.json (postgresql.autonomousTuning): parametersCaptureMode, analysisIntervalMinutes, and mode. Query Store's capture mode is queryStore's."
+                      }
+                    },
+                    "queryStore": {
+                      "type": "object",
+                      "defaultValue": {
+                        "queryCaptureMode": "all",
+                        "waitSamplingCaptureMode": "all"
+                      },
+                      "metadata": {
+                        "description": "Query Store and its wait sampling (2026-11-23, user-directed; ADR 0019), from config/versions.json (postgresql.queryStore): queryCaptureMode and waitSamplingCaptureMode, set on every size but Burstable whatever autonomousTuning says, and none on Burstable."
                       }
                     }
                   },
@@ -10126,16 +10192,28 @@
                       ]
                     },
                     {
-                      "condition": "[or(parameters('autonomousTuning'), equals(parameters('sizing').tier, 'Burstable'))]",
                       "type": "Microsoft.DBforPostgreSQL/flexibleServers/configurations",
                       "apiVersion": "2025-08-01",
                       "name": "[format('{0}/{1}', parameters('serverName'), 'pg_qs.query_capture_mode')]",
                       "properties": {
-                        "value": "[if(parameters('autonomousTuning'), string(parameters('tuning').queryCaptureMode), 'none')]",
+                        "value": "[if(equals(parameters('sizing').tier, 'Burstable'), 'none', string(parameters('queryStore').queryCaptureMode))]",
                         "source": "user-override"
                       },
                       "dependsOn": [
                         "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'max_connections')]",
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
+                      ]
+                    },
+                    {
+                      "type": "Microsoft.DBforPostgreSQL/flexibleServers/configurations",
+                      "apiVersion": "2025-08-01",
+                      "name": "[format('{0}/{1}', parameters('serverName'), 'pgms_wait_sampling.query_capture_mode')]",
+                      "properties": {
+                        "value": "[if(equals(parameters('sizing').tier, 'Burstable'), 'none', string(parameters('queryStore').waitSamplingCaptureMode))]",
+                        "source": "user-override"
+                      },
+                      "dependsOn": [
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'pg_qs.query_capture_mode')]",
                         "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
                       ]
                     },
@@ -10149,8 +10227,8 @@
                         "source": "user-override"
                       },
                       "dependsOn": [
-                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'pg_qs.query_capture_mode')]",
-                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]"
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers', parameters('serverName'))]",
+                        "[resourceId('Microsoft.DBforPostgreSQL/flexibleServers/configurations', parameters('serverName'), 'pgms_wait_sampling.query_capture_mode')]"
                       ]
                     },
                     {
@@ -10266,6 +10344,12 @@
                   "enableFreeTier": {
                     "value": "[parameters('t5FreeTier')]"
                   },
+                  "privateAccess": {
+                    "value": "[variables('t5Private')]"
+                  },
+                  "allowedSubnetId": {
+                    "value": "[reference('network').outputs.subnetIds.value[0]]"
+                  },
                   "privateEndpointSubnetId": {
                     "value": "[reference('network').outputs.subnetIds.value[2]]"
                   },
@@ -10289,9 +10373,9 @@
                     "_generator": {
                       "name": "bicep",
                       "version": "0.47.16.16243",
-                      "templateHash": "2303203040589875174"
+                      "templateHash": "10812435109822503450"
                     },
-                    "description": "T5 cosmos01: an Azure Cosmos DB for NoSQL account with local (key) authentication off, the contosocare database, and the patient-events container at 400 RU/s, reached through a private endpoint in snet-pe in both network modes (ADR 0027)."
+                    "description": "T5 cosmos01: an Azure Cosmos DB for NoSQL account with local (key) authentication off, the contosocare database, and the patient-events container at 400 RU/s, reached from T1's subnet only: through a private endpoint in snet-pe when something needs it, otherwise through T1's subnet's service endpoint (ADR 0027)."
                   },
                   "parameters": {
                     "location": {
@@ -10366,6 +10450,19 @@
                         "description": "Use the subscription's one free-tier account (1,000 RU/s and 25 GB free). Azure sets it only when the account is created, so deploy.ps1 passes an existing account's own value (ADR 0027)."
                       }
                     },
+                    "privateAccess": {
+                      "type": "bool",
+                      "defaultValue": true,
+                      "metadata": {
+                        "description": "Keep T5 behind its private endpoint, with public network access off (true, the default): in private mode, under a policy that turns Azure Cosmos DB public network access off or denies it, when the policies couldn't all be read, and for an account that already has its endpoint; deploy.ps1 decides (DEPLOY.T5.NETWORK). False: public network access on, limited to T1's subnet by a virtual network rule, with no private endpoint or DNS zone, as T3 in public mode (ADR 0027, 2026-11-21)."
+                      }
+                    },
+                    "allowedSubnetId": {
+                      "type": "string",
+                      "metadata": {
+                        "description": "Resource ID of snet-sqlvm, T1's subnet: the one subnet the account's virtual network rule allows when privateAccess is false. Its Microsoft.AzureCosmosDB service endpoint is network.bicep's."
+                      }
+                    },
                     "privateEndpointSubnetId": {
                       "type": "string",
                       "metadata": {
@@ -10422,8 +10519,9 @@
                         "enableMultipleWriteLocations": false,
                         "disableLocalAuth": true,
                         "disableKeyBasedMetadataWriteAccess": true,
-                        "publicNetworkAccess": "Disabled",
-                        "isVirtualNetworkFilterEnabled": false,
+                        "publicNetworkAccess": "[if(parameters('privateAccess'), 'Disabled', 'Enabled')]",
+                        "isVirtualNetworkFilterEnabled": "[not(parameters('privateAccess'))]",
+                        "virtualNetworkRules": "[if(parameters('privateAccess'), createArray(), createArray(createObject('id', parameters('allowedSubnetId'), 'ignoreMissingVNetServiceEndpoint', false())))]",
                         "ipRules": [],
                         "minimalTlsVersion": "Tls12"
                       }
@@ -10468,6 +10566,7 @@
                       ]
                     },
                     {
+                      "condition": "[parameters('privateAccess')]",
                       "type": "Microsoft.Network/privateDnsZones",
                       "apiVersion": "2024-06-01",
                       "name": "[parameters('privateDnsZoneName')]",
@@ -10475,6 +10574,7 @@
                       "tags": "[parameters('tags')]"
                     },
                     {
+                      "condition": "[parameters('privateAccess')]",
                       "type": "Microsoft.Network/privateDnsZones/virtualNetworkLinks",
                       "apiVersion": "2024-06-01",
                       "name": "[format('{0}/{1}', parameters('privateDnsZoneName'), format('link-{0}', last(split(parameters('virtualNetworkId'), '/'))))]",
@@ -10491,6 +10591,7 @@
                       ]
                     },
                     {
+                      "condition": "[parameters('privateAccess')]",
                       "type": "Microsoft.Network/privateEndpoints",
                       "apiVersion": "2025-09-01",
                       "name": "[parameters('privateEndpointName')]",
@@ -10518,6 +10619,7 @@
                       ]
                     },
                     {
+                      "condition": "[parameters('privateAccess')]",
                       "type": "Microsoft.Network/privateEndpoints/privateDnsZoneGroups",
                       "apiVersion": "2025-09-01",
                       "name": "[format('{0}/{1}', parameters('privateEndpointName'), 'default')]",
@@ -10548,7 +10650,7 @@
                     "documentEndpoint": {
                       "type": "string",
                       "metadata": {
-                        "description": "The T5 account's document endpoint (https://<account>.documents.azure.com:443/). Inside the VNet it resolves to the private endpoint."
+                        "description": "The T5 account's document endpoint (https://<account>.documents.azure.com:443/). With privateAccess it resolves to the private endpoint inside the VNet."
                       },
                       "value": "[reference(resourceId('Microsoft.DocumentDB/databaseAccounts', parameters('accountName')), '2025-10-15').documentEndpoint]"
                     },
@@ -10576,9 +10678,9 @@
                     "privateEndpointId": {
                       "type": "string",
                       "metadata": {
-                        "description": "Resource ID of the T5 private endpoint."
+                        "description": "Resource ID of the T5 private endpoint, or empty without privateAccess."
                       },
-                      "value": "[resourceId('Microsoft.Network/privateEndpoints', parameters('privateEndpointName'))]"
+                      "value": "[if(parameters('privateAccess'), resourceId('Microsoft.Network/privateEndpoints', parameters('privateEndpointName')), '')]"
                     }
                   }
                 }

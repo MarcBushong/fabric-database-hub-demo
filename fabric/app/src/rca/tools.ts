@@ -8,8 +8,11 @@ import { COSMOS_METRICS, cosmosSeries, POSTGRES_METRICS, postgresSeries, type Bi
 import { analyzeConnections } from "./connections";
 import { describeEpisode, findEpisodes, SOURCES } from "./detector";
 import { analyzeErrorsResult, AZURE_MONITOR } from "./errors";
+import { RCA_CATEGORY_IDS, RCA_SEVERITY_IDS, type RcaCategory, type RcaSeverity } from "./facet-ids";
+import { categoryOf, facetArgs, FAR_PERCENT, FAR_TIMES, LONG_MINUTES, matches, severityOf } from "./facets";
 import { isPagedTable, MONITOR_PAGES, MONITOR_ROW_LIMIT, RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
+import { queryStoreNextStep, queryStoreNote, unexplainedByQuery } from "./query-store";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
@@ -42,17 +45,34 @@ const COMMON =
     " It reads the demo's saved history (what the capture recorded, and the telemetry from Database Hub and Azure Monitor), never the live estate, as the signed-in viewer. " +
     "It returns JSON: window (UTC and the viewer's local time), episodes (what the detector found, each with its support and source), findings with evidence rows (table, target, time), " +
     "rootCause with its confidence, recommendations (each with its Microsoft Learn page), nextSteps, and notCaptured. Quote its facts and times; don't add causes it doesn't give.";
+/** The Root cause page's facets, as find_incidents and triage_window take them beside targets (facets.ts). */
+const FACET_PROPS = {
+    categories: {
+        type: "array",
+        items: { type: "string", enum: RCA_CATEGORY_IDS },
+        description:
+            "Only incidents of these categories, by the family of their signal: blocking; deadlocks; cpu; waits (buffer latch, memory, parallelism, network); errors; connections (T4's against the limit); replica_lag; throttling (T5's 429s and normalized RU at 100 %, and T3's log rate governor); io (PAGEIOLATCH and transaction log IO). All of them when omitted.",
+    },
+    severities: {
+        type: "array",
+        items: { type: "string", enum: RCA_SEVERITY_IDS },
+        description: `Only incidents of these severities, from each one's own measurements, where far is ${FAR_TIMES} times its level, or ${FAR_PERCENT} % of a capacity: high (at or over far for ${LONG_MINUTES} minutes or more in all), medium (far at its peak, or over its level ${LONG_MINUTES} minutes or more), low (neither); a step lower when it was seen in one sample. All of them when omitted.`,
+    },
+};
+const FACETS_NOTE =
+    " Each episode has its category, its severity (high, medium, or low), and severityReason, the measurements behind it; details.servers names the servers the telemetry reported. " +
+    "With categories or severities, details.filters says which, and details.leftOut how many episodes they left out, by category: nothingAbnormal and quiet stay about every incident in the window.";
 
 export const INVESTIGATION_TOOL_SPECS: ToolSpec[] = [
     {
         name: "find_incidents",
-        description: "Lists the incidents around a time or in a window, per target: the episodes the detector finds in the capture and the telemetry (blocking, deadlocks, CPU, wait classes, error bursts, read replica lag, T4's connections, T5's throttling), each with its key, how it was seen, and whether the capture covered it. Use it when the viewer asks what happened, or to find an incident's key." + COMMON,
-        parameters: { type: "object", properties: WINDOW_PROPS, additionalProperties: false },
+        description: "Lists the incidents around a time or in a window, per target: the episodes the detector finds in the capture and the telemetry (blocking, deadlocks, CPU, wait classes, error bursts, read replica lag, T4's connections, T5's throttling), each with its key, how it was seen, and whether the capture covered it. Use it when the viewer asks what happened, or to find an incident's key. Narrow it by targets, categories, and severities, as the Root cause page does." + FACETS_NOTE + COMMON,
+        parameters: { type: "object", properties: { ...WINDOW_PROPS, ...FACET_PROPS }, additionalProperties: false },
     },
     {
         name: "triage_window",
-        description: "First-line triage for a time or window: what was abnormal on each target (blocking, deadlocks, CPU, wait classes, errors, T4's connections against the limit, T5 throttling and RU, read replica lag), ranked, each with the tool that explains it. Call it first for 'why was it slow at ...' questions; it also says when nothing was abnormal." + COMMON,
-        parameters: { type: "object", properties: WINDOW_PROPS, additionalProperties: false },
+        description: "First-line triage for a time or window: what was abnormal on each target (blocking, deadlocks, CPU, wait classes, errors, T4's connections against the limit, T5 throttling and RU, read replica lag), ranked, each with the tool that explains it. Call it first for 'why was it slow at ...' questions; it also says when nothing was abnormal. Narrow it by targets, categories, and severities." + FACETS_NOTE + COMMON,
+        parameters: { type: "object", properties: { ...WINDOW_PROPS, ...FACET_PROPS }, additionalProperties: false },
     },
     {
         name: "explain_incident",
@@ -114,6 +134,11 @@ export interface InvestigationDeps {
     latestDay: Date;
     /** The history's newest telemetry time: without a time, a window is the NEWEST_MINUTES before it. */
     latest?: Date;
+    /**
+     * The viewer's clock, for how old an incident's minutes are now, which is what a target's Query Store retention counts
+     * (query-store.ts); the current time by default. Not the history's newest time, which stays put while the demo is stopped.
+     */
+    now?: () => Date;
 }
 
 const RESULT_CHARS = 60_000;
@@ -216,19 +241,30 @@ interface Gathered {
     evidence: Evidence;
     episodes: Episode[];
     keyIntervals?: ReadonlyMap<string, number>;
+    /** The servers the window's Azure Monitor metrics name: T4's, its replica's, and T5's account. */
+    servers?: Partial<Record<RcaTarget, string>>;
 }
 
-const episodeView = (e: Episode) => ({
-    key: e.key,
-    target: e.target,
-    family: e.family,
-    signal: e.signal,
-    support: e.support,
-    source: e.source,
-    start: iso(e.start),
-    end: e.end ? iso(e.end) : null,
-    peak: `${Math.round(e.peak * 10) / 10}${e.unit === "%" ? " %" : ` ${e.unit}`}`,
-});
+const episodeView = (e: Episode) => {
+    const s = severityOf(e);
+    return {
+        key: e.key,
+        target: e.target,
+        family: e.family,
+        signal: e.signal,
+        support: e.support,
+        source: e.source,
+        start: iso(e.start),
+        end: e.end ? iso(e.end) : null,
+        peak: `${Math.round(e.peak * 10) / 10}${e.unit === "%" ? " %" : ` ${e.unit}`}`,
+        category: categoryOf(e.family),
+        severity: s.severity,
+        severityReason: s.reason,
+    };
+};
+
+/** A triage finding's severity, from its incident's (facets.ts): High is critical, Medium a warning, Low information. */
+const FINDING_SEVERITY: Readonly<Record<RcaSeverity, "critical" | "warning" | "info">> = { high: "critical", medium: "warning", low: "info" };
 
 /**
  * The note for a target with no capture in a window, and whether a line is one: an incident says it once. A line is one in
@@ -351,7 +387,9 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const cut = [...(loaded.cut ?? []), ...(telemetry.cut ?? [])];
         const evidence: Evidence = { ...emptyEvidence(), ...loaded, metrics: [...loaded.metrics, ...monitorMetrics(telemetry)], ...(cut.length ? { cut } : {}) };
         const episodes = findEpisodes({ evidence, bins: telemetry.bins, postgres: telemetry.postgres, cosmos: telemetry.cosmos, intervals: telemetry.intervals, grains: telemetry.grains, sources: telemetry.sources, upperBounds: telemetry.upperBounds, wholes: telemetry.wholes }, from, to).filter((e) => targets.includes(e.target));
-        return { evidence, episodes, keyIntervals: telemetry.keyIntervals };
+        const named: Partial<Record<RcaTarget, string>> = { ...(telemetry.postgres?.servers ?? {}), ...(telemetry.cosmos?.account ? { T5: telemetry.cosmos.account } : {}) };
+        const servers = Object.fromEntries(Object.entries(named).filter(([t, name]) => name && targets.includes(t as RcaTarget))) as Partial<Record<RcaTarget, string>>;
+        return { evidence, episodes, keyIntervals: telemetry.keyIntervals, servers };
     }
 
     async function locking(args: Record<string, unknown>): Promise<InvestigationResult | string> {
@@ -507,6 +545,9 @@ export function createInvestigationTools(deps: InvestigationDeps) {
     async function triage(args: Record<string, unknown>, tool = "triage_window"): Promise<InvestigationResult | string> {
         const w = windowOf(args, deps);
         if (typeof w === "string") return w;
+        // The Root cause page's facets (facets.ts): what they leave out is counted, and the window's own verdicts stay whole.
+        const facets = facetArgs(args);
+        if (typeof facets === "string") return facets;
         const targets = targetsOf(args);
         const g = await gather(w.from, w.to, targets);
         const stop = readStoppedAt(g.evidence);
@@ -514,12 +555,25 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const base = envelope(tool, w.from, w.to, targets, deps, g, w.at);
         // Quiet, or nothing abnormal, only up to where a read stopped short (the review of d431edb4).
         const upTo = stop ? { readStoppedAt: iso(stop), quietUpTo: iso(stop), ...(t.hypotheses.length === 0 ? { nothingAbnormalUpTo: iso(stop) } : {}) } : {};
+        const hypotheses = facets ? t.hypotheses.filter((h) => matches(h, facets)) : t.hypotheses;
+        const episodes = facets ? base.episodes.filter((e) => matches(e, facets)) : base.episodes;
+        const leftOut = base.episodes.filter((e) => !episodes.includes(e));
+        const byCategory: Partial<Record<RcaCategory, number>> = {};
+        for (const e of leftOut) byCategory[e.category] = (byCategory[e.category] ?? 0) + 1;
         return {
             ...base,
-            findings: t.hypotheses.map((h) => ({ ruleId: `TRIAGE-${h.family.toUpperCase()}`, target: h.target, severity: h.score >= 9 ? "critical" : "warning", title: h.summary, detail: `Next: ${h.nextTool}${h.episodeKey ? ` (episodeKey ${h.episodeKey})` : ""}.`, evidence: [] })),
+            episodes,
+            findings: hypotheses.map((h) => ({ ruleId: `TRIAGE-${h.family.toUpperCase()}`, target: h.target, severity: FINDING_SEVERITY[h.severity], title: h.summary, detail: `Next: ${h.nextTool}${h.episodeKey ? ` (episodeKey ${h.episodeKey})` : ""}.`, evidence: [] })),
             rootCause: null,
-            nextSteps: t.hypotheses.slice(0, 3).map((h) => `${h.nextTool} for ${h.target}${h.episodeKey ? ` (episode ${h.episodeKey})` : ""}`),
-            details: { hypotheses: t.hypotheses, quiet: t.quiet, nothingAbnormal: t.hypotheses.length === 0 && !stop, ...upTo },
+            nextSteps: hypotheses.slice(0, 3).map((h) => `${h.nextTool} for ${h.target}${h.episodeKey ? ` (episode ${h.episodeKey})` : ""}`),
+            details: {
+                hypotheses,
+                quiet: t.quiet,
+                nothingAbnormal: t.hypotheses.length === 0 && !stop,
+                ...upTo,
+                ...(Object.keys(g.servers ?? {}).length ? { servers: g.servers } : {}),
+                ...(facets ? { filters: facets, leftOut: { episodes: leftOut.length, byCategory } } : {}),
+            },
         };
     }
 
@@ -602,12 +656,14 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         }
         const stopped = readStoppedAt(g.evidence);
         const parts = (await Promise.all(chosen.map((e) => explainEpisode(e, stopped)))).filter((p): p is InvestigationResult => !!p && typeof p !== "string");
-        // A signal Phase 1 doesn't investigate yet (CPU, the wait classes): the episode is the fact, and its cause isn't captured.
+        // A signal Phase 1 doesn't investigate yet (CPU, the wait classes): the episode is the fact, and which queries drove
+        // it isn't in this history, which is the capture's limit, never the target's (query-store.ts): live, the chat read
+        // "isn't captured yet" as "T1 doesn't have Query Store" (the owner, 2026-11-23).
         const telemetryOnly = chosen.filter((e) => !EXPLAINED_FAMILIES.includes(e.family));
         const causes = [
             ...parts.filter((p) => p.rootCause).map((p) => p.rootCause!),
             ...telemetryOnly.map((e) => ({
-                statement: `${describeEpisode(e)} What drove it (the plans and waits per query) isn't captured yet.`,
+                statement: `${describeEpisode(e)} ${unexplainedByQuery(e)}`,
                 confidence: "low" as Confidence,
                 ruleIds: ["TELEMETRY-ONLY"],
                 evidence: [{ table: e.source === "the RCA capture" ? "RCA Resource" : "Telemetry Snapshots", at: iso(e.peakAt), target: e.target, text: `${e.signal} ${Math.round(e.peak * 10) / 10} ${e.unit} (peak)` }],
@@ -618,7 +674,9 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         // capture" note again with other times: two such lines for one T5 storm (the coordinator's note on 803f2b1a). The
         // incident's own note says it once.
         const partNotes = parts.flatMap((p) => p.notCaptured).filter((line) => !RCA_TARGETS.some((t) => isNoCaptureNote(t, line) && base.notCaptured.some((b) => isNoCaptureNote(t, b))));
-        const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => `${e.target}: the ${e.signal}'s cause (Query Store's plans, waits per query) isn't captured yet.`)])];
+        // Whether the target's Query Store still keeps those minutes is judged now, by the viewer's clock (the review of 319b3ae1).
+        const now = (deps.now ?? (() => new Date()))();
+        const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => queryStoreNote(e, now))])];
         // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
         if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded ${fromTo(e.start, e.end ?? e.last)} UTC explains the ${e.signal}.`));
         return {
@@ -626,7 +684,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             findings: parts.flatMap((p) => p.findings),
             rootCause: rootCause ?? null,
             recommendations: [...new Map(parts.flatMap((p) => p.recommendations).map((r) => [r.id, r])).values()],
-            nextSteps: [...new Set(parts.flatMap((p) => p.nextSteps))],
+            nextSteps: [...new Set([...parts.flatMap((p) => p.nextSteps), ...telemetryOnly.map((e) => queryStoreNextStep(e, now)).filter((s): s is string => s !== null)])],
             notCaptured,
             details: {
                 episodes: chosen.map((e) => ({ ...episodeView(e), text: describeEpisode(e) })),

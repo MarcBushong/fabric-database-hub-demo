@@ -114,6 +114,14 @@ BeforeAll {
             if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/configurations/metrics\.collector_database_activity\?') {
                 return (New-AzResult -Json @{ properties = @{ value = $script:t4.Enhanced } })
             }
+            if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/configurations/(pg_qs\.query_capture_mode|pgms_wait_sampling\.query_capture_mode)\?') {
+                # Query Store and its wait sampling (T4.QUERYSTORE, 2026-11-23).
+                $value = if ($Matches[1] -eq 'pg_qs.query_capture_mode') { $script:t4.QueryCapture } else { $script:t4.WaitSampling }
+                if ($null -eq $value) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'A fake read error.')
+                }
+                return (New-AzResult -Json @{ name = $Matches[1]; properties = @{ value = $value; isConfigPendingRestart = $false; isDynamicConfig = $true; source = 'user-override' } })
+            }
             if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/configurations/max_connections\?') {
                 if (-not $script:t4.MaxConnections) {
                     return (New-AzResult -ExitCode 1 -StdErr 'A fake read error.')
@@ -135,7 +143,7 @@ BeforeAll {
     }
 
     function Reset-T4State {
-        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_D4ds_v5'; MaxConnections = '50'; MaxPending = $false; Restarts = 0; ReadErrors = @{} }
+        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_D4ds_v5'; MaxConnections = '50'; MaxPending = $false; QueryCapture = 'all'; WaitSampling = 'all'; Restarts = 0; ReadErrors = @{} }
         $script:events = [System.Collections.Generic.List[string]]::new()
     }
 }
@@ -236,9 +244,9 @@ Describe 'Test-DemoT4' {
     }
 
     It 'checks max_connections against config/versions.json: <Name> (2026-11-03)' -ForEach @(
-        @{ Name = 'in effect'; Value = '50'; Pending = $false; Status = 'Pass'; Pattern = '^max_connections is 50 and in effect' }
+        @{ Name = 'in effect'; Value = '50'; Pending = $false; Status = 'Pass'; Pattern = '^max_connections is 50 and in effect, so connection-surge reaches the limit on this size: Database Hub''s Connections chart shows it there\.$' }
         @{ Name = 'waiting for a restart'; Value = '50'; Pending = $true; Status = 'Warning'; Pattern = 'waits for a restart' }
-        @{ Name = 'a size''s own default'; Value = '859'; Pending = $false; Status = 'Warning'; Pattern = '^max_connections is 859, not 50' }
+        @{ Name = 'a size''s own default'; Value = '859'; Pending = $false; Status = 'Warning'; Pattern = '^max_connections is 859, not 50, so connection-surge may not reach the limit on this size, and Database Hub''s Connections chart won''t show it there\.$' }
         @{ Name = 'a read that failed'; Value = ''; Pending = $false; Status = 'Warning'; Pattern = 'couldn''t be read: A fake read error' }
     ) {
         $script:t4.MaxConnections = $Value
@@ -246,6 +254,9 @@ Describe 'Test-DemoT4' {
         $check = Test-DemoT4 -Config (New-TestConfig) | Where-Object checkId -EQ 'T4.MAXCONNECTIONS'
         $check.status | Should -Be $Status
         $check.message | Should -Match $Pattern
+        # F34 (live, 2026-11-21): Azure Monitor's failed connections didn't count the surge's refused attempts, so no message
+        # promises them.
+        $check.message | Should -Not -Match 'Failed connections'
         $check.evidence.wanted | Should -Be '50'
         @($script:azCalls | Where-Object { $_ -match '--method (post|put|patch|delete)' }).Count | Should -Be 0 -Because 'the check only reads; deploy.ps1 restarts'
     }
@@ -296,6 +307,50 @@ Describe 'Test-DemoT4' {
         $database = Test-DemoT4 -Config (New-TestConfig) | Where-Object checkId -EQ 'T4.DATABASE'
         $database.status | Should -Be 'Fail'
         $database.message | Should -Be 'T4''s database contosocare wasn''t found: ERROR: (AuthorizationFailed) A fake read error.'
+    }
+
+    # 2026-11-23 (user-directed: "We would want query store enabled wherever possible"): T4.QUERYSTORE, which only validate.ps1
+    # asks for, so Query Store never stops a deployment.
+    It 'checks Query Store and its wait sampling with -IncludeQueryStore: <Name> (2026-11-23)' -ForEach @(
+        @{ Name = 'all and all on General Purpose'; Sku = 'Standard_D4ds_v5'; Capture = 'all'; Wait = 'all'; Status = 'Pass'; Pattern = '^Query Store is on on T4 \(Standard_D4ds_v5\): pg_qs\.query_capture_mode all \(top-level and nested statements\) and its wait sampling all' }
+        @{ Name = 'top, which still records the top-level statements'; Sku = 'Standard_D4ds_v5'; Capture = 'top'; Wait = 'all'; Status = 'Pass'; Pattern = 'pg_qs\.query_capture_mode top \(top-level statements only\)' }
+        @{ Name = 'wait sampling off'; Sku = 'Standard_D2ds_v5'; Capture = 'all'; Wait = 'none'; Status = 'Warning'; Pattern = 'but its wait sampling is off \(pgms_wait_sampling\.query_capture_mode none\)' }
+        @{ Name = 'off on General Purpose'; Sku = 'Standard_D4ds_v5'; Capture = 'none'; Wait = 'none'; Status = 'Fail'; Pattern = '^Query Store is off on T4 \(Standard_D4ds_v5; pg_qs\.query_capture_mode none\), so it records no queries\.$' }
+        @{ Name = 'off on Burstable, as Learn advises'; Sku = 'Standard_B1ms'; Capture = 'none'; Wait = 'none'; Status = 'Not supported'; Pattern = '^Query Store is off at T4''s Burstable size \(Standard_B1ms\), as Learn advises' }
+        @{ Name = 'on at Burstable'; Sku = 'Standard_B2s'; Capture = 'top'; Wait = 'none'; Status = 'Warning'; Pattern = '^Query Store is on at T4''s Burstable size \(Standard_B2s; pg_qs\.query_capture_mode top\), where Learn says' }
+        @{ Name = 'a read that failed'; Sku = 'Standard_D4ds_v5'; Capture = $null; Wait = 'all'; Status = 'Warning'; Pattern = '^T4''s Query Store parameters couldn''t be read: A fake read error\.$' }
+    ) {
+        $script:t4.Sku = $Sku
+        $script:t4.QueryCapture = $Capture
+        $script:t4.WaitSampling = $Wait
+        $config = New-TestConfig
+        $config['t4SkuName'] = $Sku
+        $results = @(Test-DemoT4 -Config $config -IncludeQueryStore)
+        $check = $results | Where-Object checkId -EQ 'T4.QUERYSTORE'
+        $check.area | Should -Be 't4'
+        $check.status | Should -Be $Status
+        $check.message | Should -Match $Pattern
+        $check.evidence.wanted.queryCaptureMode | Should -Be 'all'
+        if ($Status -in 'Fail', 'Warning' -and $Capture) {
+            $check.remediation | Should -Match '\./scripts/deploy\.ps1'
+        }
+        if ($Status -eq 'Not supported') {
+            $check.remediation | Should -Match 'General Purpose size'
+        }
+        @($script:azCalls | Where-Object { $_ -match '--method (post|put|patch|delete)' }).Count | Should -Be 0 -Because 'the check only reads'
+        # deploy.ps1's own T4 checks don't ask for it.
+        @(Test-DemoT4 -Config $config | Where-Object checkId -EQ 'T4.QUERYSTORE') | Should -BeNullOrEmpty
+    }
+
+    It 'says a stopped T4''s Query Store parameters weren''t read, as a Warning, and Not selected without T4' {
+        $script:t4.State = 'Stopped'
+        $script:t4.ReadErrors['configurations'] = 'ERROR: Bad Request({"error":{"code":"ServerStoppedError","message":"Server ''pgflex01-abc123'' is in ''Stopped'' state. Start the server ..."}})'
+        $check = Test-DemoT4 -Config (New-TestConfig) -IncludeQueryStore | Where-Object checkId -EQ 'T4.QUERYSTORE'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Be 'T4 (pgflex01-abc123) is Stopped between sessions, so its Query Store parameters can''t be read.'
+        $check.remediation | Should -Match 'start-demo\.ps1'
+        $script:t4.Exists = $false
+        (Test-DemoT4 -Config (New-TestConfig) -IncludeQueryStore | Where-Object checkId -EQ 'T4.QUERYSTORE').status | Should -Be 'Not selected'
     }
 
     It 'doesn''t call the enhanced metrics off when their setting couldn''t be read on a running T4' {
@@ -422,6 +477,29 @@ Describe 'T4 sizes (Phase 24)' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -Times 1 -Exactly -ParameterFilter { $Filter -match "productName eq 'Azure Database for PostgreSQL Flexible Server General Purpose Ddsv5 Series Compute'" -and $Filter -match "armRegionName eq 'westus3'" }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { throw 'offline' }
         InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4HourlyPrice -Config $Config } | Should -BeNullOrEmpty
+    }
+
+    It 'reads a General Purpose series'' per-vCore price from its "1 vCore" row first, then its "vCore" row, then the cheapest: <Case>' -ForEach @(
+        # Obviously fake prices (ADR 0016), in the shapes the Retail Prices API listed on 2026-11-22: Indonesia Central's Dadsv5,
+        # one meter listed as a "vCore" row at about a tenth of its "1 vCore" row; and UAE Central's Dadsv5, a "vCore" meter
+        # and a newer, dearer "1 vCore" one. The cheapest row read both "vCore" rows; the coordinator's decision, 2026-11-22.
+        # A "vCore" row beside a size row listed lower pins the middle step: "1 vCore", then the cheapest, would read the size
+        # row (a0e1fd6a's review).
+        @{ Case = 'one meter at two prices, as Indonesia Central''s'; Rows = @(@('vCore', 0.03, 'meter-a'), @('1 vCore', 0.3, 'meter-a'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.3 }
+        @{ Case = 'two meters, the "1 vCore" one dearer, as UAE Central''s'; Rows = @(@('vCore', 0.3, 'meter-a'), @('1 vCore', 0.35, 'meter-c'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.35 }
+        @{ Case = 'the "vCore" row only'; Rows = @(@('vCore', 0.3, 'meter-a'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.3 }
+        @{ Case = 'a "vCore" row and a cheaper size row'; Rows = @(@('vCore', 0.3, 'meter-a'), @('2 vCore', 0.2, 'meter-d')); Expected = 0.3 }
+        @{ Case = 'neither row, as before'; Rows = @(@('2 vCore', 0.6, 'meter-d'), @('4 vCore', 1.2, 'meter-b')); Expected = 0.6 }
+    ) {
+        $items = @(foreach ($row in $Rows) { [pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Dadsv5 Series Compute'; skuName = $row[0]; meterName = 'vCore'; meterId = $row[2]; retailPrice = $row[1]; unitOfMeasure = '1 Hour' } })
+        $items += [pscustomobject]@{ productName = 'Azure Database for PostgreSQL Flexible Server General Purpose Dadsv5 Series Compute'; skuName = '1 vCore'; meterName = 'vCore'; meterId = 'meter-a'; retailPrice = 0.001; unitOfMeasure = '1 Year' }
+        $picked = InModuleScope DbHubDemo -Parameters @{ Items = $items } { Select-DemoT4ComputePrice -Item $Items -Spec (Get-DemoT4SkuSpec -SkuName 'Standard_D4ads_v5') }
+        $picked.retailPrice | Should -Be $Expected
+        # T4's hour at Standard_D4ads_v5: 4 vCores at the row read.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoRetailPrice -MockWith { $items }
+        $config = New-TestConfig
+        $config['t4SkuName'] = 'Standard_D4ads_v5'
+        [System.Math]::Round((InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4HourlyPrice -Config $Config }), 6) | Should -Be ([System.Math]::Round(4 * $Expected, 6))
     }
 }
 
@@ -1003,23 +1081,69 @@ Describe 'T4 autonomous tuning (2026-11-04)' {
         (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoDeploymentParameter -Config $Config -NetworkMode private -T3UseFreeLimit $false }).parameters['t4AutonomousTuning'].value | Should -BeFalse
     }
 
-    It 'sets Query Store and index tuning in the template, the interval before the mode, only when it''s on, and Query Store off on Burstable' {
+    It 'sets Query Store and its wait sampling at every size but Burstable whatever tuning says, and index tuning only when it''s on, the interval before the mode' {
         $postgres = InModuleScope DbHubDemo { Get-DemoPostgresSetting }
         $postgres['autonomousTuning']['minVCores'] | Should -Be 4
-        $postgres['autonomousTuning']['queryCaptureMode'] | Should -Be 'top'
+        $postgres['autonomousTuning'].Contains('queryCaptureMode') | Should -BeFalse -Because 'Query Store''s capture mode is queryStore''s, whatever the tuning'
         $postgres['autonomousTuning']['parametersCaptureMode'] | Should -Be 'capture_first_sample'
         $postgres['autonomousTuning']['analysisIntervalMinutes'] | Should -Be 60
         $postgres['autonomousTuning']['mode'] | Should -Be 'report'
+        # 2026-11-23 (user-directed): "We would want query store enabled wherever possible". all, so Query Store records the
+        # statements the workload's functions run, not only the calls ("top" is top-level statements only), whatever the tuning:
+        # autonomous tuning takes "TOP or ALL".
+        $postgres['queryStore']['queryCaptureMode'] | Should -Be 'all'
+        $postgres['queryStore']['waitSamplingCaptureMode'] | Should -Be 'all'
         $bicep = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/pgflex01.bicep') -Raw
-        $order = @('max_connections', 'pg_qs.query_capture_mode', 'pg_qs.parameters_capture_mode', 'index_tuning.analysis_interval', 'index_tuning.mode') | ForEach-Object { $bicep.IndexOf("name: '$_'") }
+        $order = @('max_connections', 'pg_qs.query_capture_mode', 'pgms_wait_sampling.query_capture_mode', 'pg_qs.parameters_capture_mode', 'index_tuning.analysis_interval', 'index_tuning.mode') | ForEach-Object { $bicep.IndexOf("name: '$_'") }
         $order | Should -Not -Contain -1
         @($order | Sort-Object) | Should -Be $order -Because 'each depends on the one before, so the interval is in effect when the mode turns tuning on'
-        $bicep | Should -Match "resource queryCaptureMode '[^']+' = if \(autonomousTuning \|\| sizing\.tier == 'Burstable'\)"
-        $bicep | Should -Match "value: autonomousTuning \? string\(tuning\.queryCaptureMode\) : 'none'"
+        # Query Store and its wait sampling on every server, off on Burstable ("Don't enable query store on the Burstable
+        # pricing tier as it causes performance problems").
+        $bicep | Should -Match "resource queryCaptureMode '[^']+' = \{"
+        $bicep | Should -Match "value: sizing\.tier == 'Burstable' \? 'none' : string\(queryStore\.queryCaptureMode\)"
+        $bicep | Should -Not -Match 'tuning\.queryCaptureMode' -Because 'the tuning never changes what Query Store records'
+        # One resource per parameter, with the wait sampling in the chain between the capture mode and the tuning's.
+        @([regex]::Matches($bicep, "(?m)^  name: 'pg_qs\.query_capture_mode'$")).Count | Should -Be 1
+        @([regex]::Matches($bicep, "(?m)^  name: 'pgms_wait_sampling\.query_capture_mode'$")).Count | Should -Be 1
+        $bicep | Should -Match "resource waitSamplingCaptureMode [^\n]+\n(?:[^\n]*\n)*?  dependsOn: \[\n    queryCaptureMode\n  \]"
+        $bicep | Should -Match "resource parametersCaptureMode [^\n]+\n(?:[^\n]*\n)*?  dependsOn: \[\n    waitSamplingCaptureMode\n  \]"
+        $bicep | Should -Match "resource waitSamplingCaptureMode '[^']+' = \{\s+parent: server\s+name: 'pgms_wait_sampling\.query_capture_mode'"
+        $bicep | Should -Match "value: sizing\.tier == 'Burstable' \? 'none' : string\(queryStore\.waitSamplingCaptureMode\)"
         foreach ($name in 'parametersCaptureMode', 'tuningInterval', 'tuningMode') {
             $bicep | Should -Match ("resource {0} '[^']+' = if \(autonomousTuning\)" -f $name)
         }
-        (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw) | Should -Match 'tuning: postgres\.autonomousTuning'
+        $demo = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw
+        $demo | Should -Match 'tuning: postgres\.autonomousTuning'
+        $demo | Should -Match 'queryStore: postgres\.queryStore'
+        # The template deploy.ps1 deploys has them too: both parameters on every server, so an update sets them.
+        $template = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'azuredeploy.json') -Raw
+        $template | Should -Match ([regex]::Escape(@'
+"name": "[format('{0}/{1}', parameters('serverName'), 'pgms_wait_sampling.query_capture_mode')]",
+'@.Trim()))
+        $template | Should -Match ([regex]::Escape(@'
+"value": "[if(equals(parameters('sizing').tier, 'Burstable'), 'none', string(parameters('queryStore').queryCaptureMode))]",
+'@.Trim()))
+        $template | Should -Not -Match ([regex]::Escape("or(parameters('autonomousTuning'), equals(parameters('sizing').tier, 'Burstable'))")) -Because 'Query Store no longer waits for tuning'
+    }
+
+    It 'says Query Store''s state in the tuning check''s words, whatever the tuning: on at General Purpose, off at Burstable' -ForEach @(
+        @{ Switch = 'unset'; Sku = ''; Pattern = '^T4 gets autonomous tuning at Standard_D4ds_v5 \(General Purpose, 4 vCores\): index tuning runs in REPORT mode every 60 minutes on what Query Store records, every statement, top-level and nested \(pg_qs\.query_capture_mode all\), .* Query Store and its wait sampling stay on, as at every size but Burstable\.$' }
+        @{ Switch = 'false'; Sku = ''; Pattern = 'Query Store and its wait sampling stay on, as at every size but Burstable\.$' }
+        @{ Switch = 'false'; Sku = 'Standard_B1ms'; Pattern = 'Query Store stays off at this size, where Learn advises against it\.$' }
+        @{ Switch = 'unset'; Sku = 'Standard_D2ds_v5'; Pattern = 'Query Store and its wait sampling stay on, as at every size but Burstable\.$' }
+        @{ Switch = 'unset'; Sku = 'Standard_B2s'; Pattern = 'Query Store stays off at this size, where Learn advises against it\.$' }
+    ) {
+        $config = New-TestConfig
+        if ($Switch -ne 'unset') {
+            $config['t4AutonomousTuning'] = $Switch -eq 'true'
+        }
+        if ($Sku) {
+            $config['t4SkuName'] = $Sku
+        }
+        $tuning = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4Tuning -Config $Config }
+        $tuning.Message | Should -Match $Pattern
+        $tuning.Message | Should -Not -Match 'Query Store and index-tuning parameters are left as they are'
+        $tuning.Message | Should -Not -Match 'top queries' -Because 'Query Store records every statement since 2026-11-23'
     }
 
     It 'reads the zones the region lists for a General Purpose size, and nothing when it can''t' {

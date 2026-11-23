@@ -21,7 +21,7 @@ import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTi
 import { baselineText, compareIncident, familySignal, incidentInsight, incidentPadMinutes, incidentsOverview, signalValue, timesShort, timesText, waitFamilyInsight, type IncidentComparison } from "@/lib/insights";
 import { findIncidentsAsk } from "@/rca/entry";
 import { isRcaTarget } from "@/rca/types";
-import { windowKey } from "@/rca/view/selection";
+import { DEFAULT_RCA_FILTERS } from "@/rca/facet-ids";
 import { PageHeader } from "@/shell/PageHeader";
 import { ChartView } from "@/visuals/ChartView";
 import { IncidentReplay } from "@/visuals/IncidentReplay";
@@ -321,8 +321,9 @@ export default function IncidentsPage() {
                             toolbar={
                                 <>
                                     {rca === true && rcaTarget && range ? (
-                                        // One way only: the Root cause view gets the target and the minutes, never the window's name (ADR 0031).
-                                        <Button size="small" appearance="subtle" icon={<TextBulletListTree16Regular />} onClick={() => navigate("rca", { incident: windowKey(rcaTarget, range.start, range.end) })}>
+                                        // One way only: the Root cause view gets the target and the minutes, never the window's name or its family,
+                                        // which can be the answer key's (ADR 0031): its other filters stay its own.
+                                        <Button size="small" appearance="subtle" icon={<TextBulletListTree16Regular />} onClick={() => navigate("rca", { rcaFilters: { ...DEFAULT_RCA_FILTERS, targets: [rcaTarget], window: { from: range.start, to: range.end } } })}>
                                             Root cause
                                         </Button>
                                     ) : null}

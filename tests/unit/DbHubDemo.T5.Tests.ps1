@@ -25,7 +25,7 @@ BeforeAll {
     $script:principalId = '99999999-8888-7777-6666-555555555555'
 
     function New-AccountJson {
-        param([string] $State = 'Succeeded', [string] $LocalAuthOff = 'true', [string] $Public = 'Disabled', [string] $FreeTier = 'true', [string] $Connection = 'Approved')
+        param([string] $State = 'Succeeded', [string] $LocalAuthOff = 'true', [string] $Public = 'Disabled', [string] $FreeTier = 'true', [string] $Connection = 'Approved', [string] $Filter = 'false', [string[]] $Subnets = @(), [string[]] $IpRules = @(), [switch] $NoEndpoint)
         @{
             id         = $script:accountId
             name       = 'cosmos01-abc123'
@@ -37,8 +37,14 @@ BeforeAll {
                 disableKeyBasedMetadataWriteAccess = 'true'
                 publicNetworkAccess                = $Public
                 enableFreeTier                     = $FreeTier
+                # Its network in public mode without a private endpoint (2026-11-21): T1's subnet through a virtual network rule.
+                isVirtualNetworkFilterEnabled      = $Filter
+                virtualNetworkRules                = @($Subnets | ForEach-Object { @{ id = ('/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Network/virtualNetworks/vnet-dbhub-demo/subnets/{0}' -f $_); ignoreMissingVNetServiceEndpoint = $false } })
+                ipRules                            = @($IpRules | ForEach-Object { @{ ipAddressOrRange = $_ } })
                 privateEndpointConnections         = @(
-                    @{ properties = @{ privateEndpoint = @{ id = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Network/privateEndpoints/pe-dbhub-demo-cosmos01' }; privateLinkServiceConnectionState = @{ status = $Connection } } }
+                    if (-not $NoEndpoint) {
+                        @{ properties = @{ privateEndpoint = @{ id = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-dbhub-demo/providers/Microsoft.Network/privateEndpoints/pe-dbhub-demo-cosmos01' }; privateLinkServiceConnectionState = @{ status = $Connection } } }
+                    }
                 )
             }
         }
@@ -61,6 +67,9 @@ BeforeAll {
             Puts        = 0
             Deletes     = 0
             LastBody    = ''
+            # snet-sqlvm's service endpoints (2026-11-22), and the error its read gets when set.
+            SubnetEndpoints = @('Microsoft.Sql', 'Microsoft.AzureCosmosDB')
+            SubnetError     = ''
         }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
@@ -99,6 +108,12 @@ BeforeAll {
             }
             if ($text -like 'group show*') {
                 return [pscustomobject]@{ tags = [pscustomobject]@{ deploymentId = 'abc123' } }
+            }
+            if ($text -like 'network vnet subnet show *') {
+                if ($script:t5.SubnetError) {
+                    return (New-AzResult -ExitCode 1 -StdErr $script:t5.SubnetError)
+                }
+                return (New-AzResult -Json @{ name = 'snet-sqlvm'; serviceEndpoints = @($script:t5.SubnetEndpoints | ForEach-Object { @{ service = $_; locations = @('westus3'); provisioningState = 'Succeeded' } }) })
             }
             if ($text -match 'providers/Microsoft\.Insights/metrics' -and $null -ne $query) {
                 $key = if ($query.Contains('$filter')) { 'Throttled' } else { [string]$query['metricnames'] }
@@ -390,6 +405,51 @@ Describe 'Test-DemoT5' {
         ($results | Where-Object checkId -EQ 'T5.ACCESS').remediation | Should -Match 'deploy\.ps1'
     }
 
+    It 'passes T5 reached from T1''s subnet alone, without a private endpoint, and fails one open wider (2026-11-21, ADR 0027)' {
+        $script:t5.Account = New-AccountJson -Public 'Enabled' -Filter 'true' -Subnets 'snet-sqlvm' -NoEndpoint
+        $network = @(Test-DemoT5 -Config (New-TestConfig) -DeploymentId 'abc123') | Where-Object checkId -EQ 'T5.NETWORK'
+        $network.status | Should -Be 'Pass'
+        $network.evidence['path'] | Should -Be 'ServiceEndpoint'
+        $network.evidence['virtualNetworkRules'] | Should -Be 'snet-sqlvm'
+        $network.evidence['subnetServiceEndpoint'] | Should -BeTrue
+        $network.message | Should -Match 'limited to snet-sqlvm by a virtual network rule'
+        $network.message | Should -Match 'Database Hub''s Security page lists T5''s public network access, as it does T3''s'
+        @($script:azCalls | Where-Object { $_ -eq 'network vnet subnet show --resource-group rg-dbhub-demo --vnet-name vnet-dbhub-demo --name snet-sqlvm --output json' }).Count | Should -Be 1 -Because 'it reads the subnet that the rule names'
+        $elsewhere = New-AccountJson -Public 'Enabled' -Filter 'true' -Subnets 'snet-sqlvm' -NoEndpoint
+        $elsewhere.properties.virtualNetworkRules = @(@{ id = '/subscriptions/11111111-2222-3333-4444-555555555555/resourceGroups/rg-other/providers/Microsoft.Network/virtualNetworks/vnet-other/subnets/snet-sqlvm'; ignoreMissingVNetServiceEndpoint = $false })
+        foreach ($open in @((New-AccountJson -Public 'Enabled' -Filter 'true' -Subnets 'snet-sqlvm', 'snet-archost' -NoEndpoint), (New-AccountJson -Public 'Enabled' -Filter 'true' -Subnets 'snet-sqlvm' -IpRules '203.0.113.7' -NoEndpoint), (New-AccountJson -Public 'Enabled' -Filter 'false' -Subnets 'snet-sqlvm' -NoEndpoint), $elsewhere)) {
+            $script:t5.Account = $open
+            $wide = @(Test-DemoT5 -Config (New-TestConfig) -DeploymentId 'abc123') | Where-Object checkId -EQ 'T5.NETWORK'
+            $wide.status | Should -Be 'Fail'
+            $wide.evidence['path'] | Should -Be 'Open'
+            $wide.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which sets T5''s network again'
+        }
+    }
+
+    It 'fails a T5 limited to snet-sqlvm when snet-sqlvm has no Azure Cosmos DB service endpoint, and warns when it can''t tell (the review of 31ccf40, 2026-11-22)' {
+        $script:t5.Account = New-AccountJson -Public 'Enabled' -Filter 'true' -Subnets 'snet-sqlvm' -NoEndpoint
+        # A move to the private endpoint that dropped it and that Azure then refused: the rule's subnet without the endpoint.
+        $script:t5.SubnetEndpoints = @('Microsoft.Sql')
+        $network = @(Test-DemoT5 -Config (New-TestConfig) -DeploymentId 'abc123') | Where-Object checkId -EQ 'T5.NETWORK'
+        $network.status | Should -Be 'Fail'
+        $network.evidence['path'] | Should -Be 'ServiceEndpoint'
+        $network.evidence['subnetServiceEndpoint'] | Should -BeFalse
+        $network.message | Should -Match '^T5''s public network access is limited to snet-sqlvm by a virtual network rule, but snet-sqlvm has no Azure Cosmos DB service endpoint, so T1 can''t reach T5: Azure Cosmos DB answers its requests with 403 \(Forbidden\)\.$'
+        $network.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which gives snet-sqlvm its Microsoft\.AzureCosmosDB service endpoint again'
+        $network.docUrl | Should -Be 'https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint'
+        # The subnet couldn't be read: a Warning that says what's unconfirmed.
+        $script:t5.SubnetError = 'ERROR: (AuthorizationFailed) The client does not have authorization to perform action ''Microsoft.Network/virtualNetworks/subnets/read''.'
+        $unread = @(Test-DemoT5 -Config (New-TestConfig) -DeploymentId 'abc123') | Where-Object checkId -EQ 'T5.NETWORK'
+        $unread.status | Should -Be 'Warning'
+        $unread.evidence['subnetServiceEndpoint'] | Should -BeNullOrEmpty
+        $unread.message | Should -Match 'snet-sqlvm couldn''t be read to confirm its Azure Cosmos DB service endpoint, which that rule needs: .*AuthorizationFailed'
+        # A T5 behind its private endpoint needs nothing from snet-sqlvm, so its check doesn't read it.
+        $script:azCalls.Clear()
+        $script:t5.Account = New-AccountJson
+        (@(Test-DemoT5 -Config (New-TestConfig) -DeploymentId 'abc123') | Where-Object checkId -EQ 'T5.NETWORK').status | Should -Be 'Pass'
+        @($script:azCalls | Where-Object { $_ -like 'network vnet subnet show *' }) | Should -BeNullOrEmpty
+    }
+
     It 'warns when the container has other throughput than ru-storm is sized for' {
         $script:t5.Throughput = 1000
         $container = @(Test-DemoT5 -Config (New-TestConfig) -DeploymentId 'abc123') | Where-Object checkId -EQ 'T5.CONTAINER'
@@ -558,7 +618,7 @@ Describe 'T5''s container, only during a session (2026-11-19)' {
         @($script:azCalls) | Should -BeNullOrEmpty
     }
 
-    It 'deletes the container at a stop when a session can create it again, and says only the endpoint and zone bill then' {
+    It 'deletes the container at a stop when a session can create it again, and says only the endpoint and zone bill then, or nothing without them' {
         Mock -ModuleName DbHubDemo -CommandName Resolve-DemoT5ContainerLifecycle -MockWith { [pscustomobject]@{ Lifecycle = 'Session'; Recorded = 'Session'; Changed = $false; Known = $true; Why = ''; RoleName = 'DbHub Demo Activity Operator' } }
         $stop = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $script:t5State } { Invoke-DemoT5ContainerStop -Config $Config -State $State -DeploymentState ([pscustomobject]@{ T5Container = 'Session' }) -Confirm:$false }
         $stop.checkId | Should -Be 'STOP.T5'
@@ -571,6 +631,13 @@ Describe 'T5''s container, only during a session (2026-11-19)' {
         $again = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $script:t5State } { Invoke-DemoT5ContainerStop -Config $Config -State $State -DeploymentState ([pscustomobject]@{ T5Container = 'Session' }) -Confirm:$false }
         $again.status | Should -Be 'Pass'
         $again.message | Should -Match 'isn''t there'
+        $again.message | Should -Match 'so only its private endpoint and private DNS zone bill between sessions'
+        # An account with public network access on (T1's subnet rule, 2026-11-21) has no endpoint, so nothing bills.
+        $script:t5State.Account = [pscustomobject]@{ properties = [pscustomobject]@{ publicNetworkAccess = 'Enabled' } }
+        $script:t5.Container = $true
+        $open = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $script:t5State } { Invoke-DemoT5ContainerStop -Config $Config -State $State -DeploymentState ([pscustomobject]@{ T5Container = 'Session' }) -Confirm:$false }
+        $open.message | Should -Match 'was deleted .+ and nothing of T5 bills between sessions: it has no private endpoint \(DEPLOY\.T5\.NETWORK\)\.$'
+        $open.message | Should -Not -Match 'private DNS zone'
     }
 
     It 'keeps the container, and deletes nothing, while Run all couldn''t create it again; a Warning with the grant command, a Pass on the free tier' {
@@ -1104,5 +1171,151 @@ Describe 'Invoke-DemoT5WarmUp' {
         $result.status | Should -Be 'Fail'
         $result.evidence['attempts'] | Should -Be 1
         $result.remediation | Should -Match 'validate\.ps1 -Area T5'
+    }
+
+    It 'waits at least 20 minutes for T1''s subnet''s new service endpoint, which Learn says can take up to 15 (2026-11-21, ADR 0027)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $script:attempt++
+            if ($script:attempt -lt 2) {
+                return [pscustomobject]@{ Status = 'Fail'; ExitCode = 1; StdErr = ''; Records = @(); Result = [pscustomobject]@{ message = 'T5: 403 Forbidden: Request originated from IP 10.42.0.4 through public internet. This is blocked by your Cosmos DB account firewall settings.' } }
+            }
+            [pscustomobject]@{ Status = 'Pass'; ExitCode = 0; StdErr = ''; Records = @([pscustomobject]@{ checkId = 'WORKLOAD.T5.WARMUP'; message = 'Read, upserted, and read back one document.' }); Result = [pscustomobject]@{ message = 'ok' } }
+        }
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT5WarmUp -Config $Config -WaitMinutes 0 -RetrySeconds 30 -ServiceEndpoint }
+        $result.status | Should -Be 'Pass'
+        $result.evidence['attempts'] | Should -Be 2
+        $result.evidence['waitMinutes'] | Should -Be 20
+        $result.message | Should -Match 'through T1''s subnet''s service endpoint after 2 attempts'
+        # Through the private endpoint, the same refusal with no time left is the answer.
+        $script:attempt = 0
+        $private = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Invoke-DemoT5WarmUp -Config $Config -WaitMinutes 0 -RetrySeconds 30 }
+        $private.status | Should -Be 'Fail'
+        $private.evidence['attempts'] | Should -Be 1
+        $private.remediation | Should -Match 'privatelink\.documents\.azure\.com'
+    }
+}
+
+Describe 'T5''s network: a private endpoint only when something needs it (2026-11-21, ADR 0027)' {
+    BeforeAll {
+        function New-T5State {
+            param([object] $Account = $null, [string] $State = 'Succeeded', [string] $Problem = '')
+            $names = [pscustomobject]@{ AccountName = 'cosmos01-abc123'; PrivateEndpointName = 'pe-dbhub-demo-cosmos01' }
+            [pscustomobject]@{ Names = $names; Exists = ($null -ne $Account -and $State -eq 'Succeeded'); State = $(if ($null -eq $Account -and -not $Problem) { 'NotFound' } else { $State }); FreeTier = $false; Account = $Account; Error = $Problem }
+        }
+        $script:policyNone = @{ privateEndpointRequired = $false; reason = 'None'; policies = @(); complete = $true }
+        $script:policyNeeds = @{ privateEndpointRequired = $true; reason = 'Policy'; policies = @('Azure Cosmos DB should disable public network access'); complete = $true }
+        $script:policyUnread = @{ privateEndpointRequired = $true; reason = 'Unknown'; policies = @(); complete = $false }
+    }
+
+    It 'changes nothing in an existing account''s network on an update: its private endpoint, DNS zone, and public access setting stay, whatever the policies say' {
+        $existing = New-T5State -Account (New-AccountJson)
+        foreach ($policy in @($script:policyNone, $script:policyUnread, $null)) {
+            $resolved = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $existing; Policy = $policy } { Resolve-DemoT5NetworkAccess -Config $Config -NetworkMode public -Policy $Policy -AccountState $State }
+            $resolved.PrivateAccess | Should -BeTrue
+            $resolved.Reason | Should -Be 'Existing'
+            $resolved.Result.checkId | Should -Be 'DEPLOY.T5.NETWORK'
+            $resolved.Result.status | Should -Be 'Pass'
+            $resolved.Result.message | Should -Match '^T5 \(cosmos01-abc123\) keeps its private endpoint pe-dbhub-demo-cosmos01 in snet-pe, with public network access off, and its private DNS zone: an update changes nothing'
+            # And the template gets it as before: the endpoint, its zone, and snet-sqlvm without Azure Cosmos DB's service endpoint.
+            $parameters = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Private = $resolved.PrivateAccess } { Get-DemoDeploymentParameter -Config $Config -NetworkMode public -ExistingResourceGroupTags @{ deploymentId = 'abc123' } -T3UseFreeLimit $true -T5PrivateAccess $Private }
+            $parameters['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        }
+    }
+
+    It 'gives a new account no private endpoint in public mode when the policies were all read and none needs one' {
+        $resolved = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-T5State); Policy = $script:policyNone } { Resolve-DemoT5NetworkAccess -Config $Config -NetworkMode public -Policy $Policy -AccountState $State }
+        $resolved.PrivateAccess | Should -BeFalse
+        $resolved.Reason | Should -Be 'Public'
+        $resolved.Result.status | Should -Be 'Pass'
+        $resolved.Result.message | Should -Match 'limited to T1''s subnet \(snet-sqlvm\) through that subnet''s service endpoint, as T3''s'
+        $resolved.Result.message | Should -Match 'Database Hub''s Security page lists T5''s public network access, as it does T3''s'
+        $resolved.Result.docUrl | Should -Be 'https://learn.microsoft.com/azure/cosmos-db/how-to-configure-vnet-service-endpoint'
+        $parameters = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoDeploymentParameter -Config $Config -NetworkMode public -ExistingResourceGroupTags @{ deploymentId = 'abc123' } -T3UseFreeLimit $true -T5PrivateAccess $false }
+        $parameters['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+    }
+
+    It 'keeps a new account''s private endpoint <Case>' -ForEach @(
+        @{ Case = 'in private mode'; Mode = 'private'; Policy = @{ privateEndpointRequired = $false; reason = 'None'; policies = @(); complete = $true }; Reason = 'NetworkMode' }
+        @{ Case = 'under a policy that needs it'; Mode = 'public'; Policy = @{ privateEndpointRequired = $true; reason = 'Policy'; policies = @('Azure Cosmos DB should disable public network access'); complete = $true }; Reason = 'Policy' }
+        @{ Case = 'when the policies couldn''t all be read'; Mode = 'public'; Policy = @{ privateEndpointRequired = $true; reason = 'Unknown'; policies = @(); complete = $false }; Reason = 'PolicyUnknown' }
+        @{ Case = 'when preflight didn''t read the policies'; Mode = 'public'; Policy = $null; Reason = 'PolicyUnknown' }
+    ) {
+        $resolved = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-T5State); Policy = $Policy; Mode = $Mode } { Resolve-DemoT5NetworkAccess -Config $Config -NetworkMode $Mode -Policy $Policy -AccountState $State }
+        $resolved.PrivateAccess | Should -BeTrue
+        $resolved.Reason | Should -Be $Reason
+        $resolved.Result.evidence['privateEndpoint'] | Should -Be 'pe-dbhub-demo-cosmos01'
+    }
+
+    It 'keeps an existing public account as it is, and moves it to a private endpoint only when a policy now needs it' {
+        $public = New-T5State -Account (New-AccountJson -Public 'Enabled' -Filter 'true' -Subnets 'snet-sqlvm' -NoEndpoint)
+        foreach ($policy in @($script:policyNone, $script:policyUnread, $null)) {
+            $kept = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $public; Policy = $policy } { Resolve-DemoT5NetworkAccess -Config $Config -NetworkMode public -Policy $Policy -AccountState $State }
+            $kept.PrivateAccess | Should -BeFalse
+            $kept.Reason | Should -Be 'ExistingPublic'
+        }
+        $moved = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = $public; Policy = $script:policyNeeds } { Resolve-DemoT5NetworkAccess -Config $Config -NetworkMode public -Policy $Policy -AccountState $State }
+        $moved.PrivateAccess | Should -BeTrue
+        $moved.Reason | Should -Be 'Policy'
+        $moved.Result.message | Should -Match 'moves to a private endpoint .*\(Azure Cosmos DB should disable public network access\)'
+    }
+
+    It 'keeps, or gets, the private endpoint when the account can''t be read, with a Warning' {
+        $resolved = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); State = (New-T5State -State 'Unknown' -Problem 'AuthorizationFailed'); Policy = $script:policyNone } { Resolve-DemoT5NetworkAccess -Config $Config -NetworkMode public -Policy $Policy -AccountState $State }
+        $resolved.PrivateAccess | Should -BeTrue
+        $resolved.Reason | Should -Be 'Unread'
+        $resolved.Result.status | Should -Be 'Warning'
+        $resolved.Result.message | Should -Match 'couldn''t be read \(AuthorizationFailed\)'
+    }
+
+    It 'tells the cost estimate what the account has, and nothing for a new one without preflight''s policy read' {
+        $status = { param($State, $Policy, $Mode = 'public', $Config = (New-TestConfig)) InModuleScope DbHubDemo -Parameters @{ Config = $Config; State = $State; Policy = $Policy; Mode = $Mode } { Get-DemoT5PrivateEndpointStatus -Config $Config -NetworkMode $Mode -Policy $Policy -AccountState $State } }
+        & $status (New-T5State -Account (New-AccountJson)) $null | Should -BeTrue
+        & $status (New-T5State -Account (New-AccountJson -Public 'Enabled' -Filter 'true' -Subnets 'snet-sqlvm' -NoEndpoint)) $null | Should -BeFalse
+        & $status (New-T5State) $null | Should -BeNullOrEmpty
+        & $status (New-T5State) $script:policyNone | Should -BeFalse
+        & $status (New-T5State) $script:policyUnread | Should -BeTrue
+        & $status (New-T5State) $script:policyNone 'private' | Should -BeTrue
+        & $status (New-T5State) $script:policyNone 'public' (New-TestConfig -Override @{ t5Enabled = $false }) | Should -BeNullOrEmpty
+    }
+
+    It 'always sends a private endpoint to the template in private mode or with T5 off' {
+        $private = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoDeploymentParameter -Config $Config -NetworkMode private -ExistingResourceGroupTags @{ deploymentId = 'abc123' } -T3UseFreeLimit $true -T5PrivateAccess $false }
+        $private['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        $off = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Override @{ t5Enabled = $false }) } { Get-DemoDeploymentParameter -Config $Config -NetworkMode public -ExistingResourceGroupTags @{ deploymentId = 'abc123' } -T3UseFreeLimit $true -T5PrivateAccess $false }
+        $off['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        $default = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoDeploymentParameter -Config $Config -NetworkMode public -ExistingResourceGroupTags @{ deploymentId = 'abc123' } -T3UseFreeLimit $true }
+        $default['parameters']['t5PrivateAccess']['value'] | Should -BeTrue -Because 'a caller that doesn''t decide keeps the endpoint'
+    }
+
+    It 'tells the template whether the account is public now, in either network mode, and never with T5 off (the review of 31ccf40, 2026-11-22)' {
+        foreach ($mode in 'public', 'private') {
+            $moving = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig); Mode = $mode } { Get-DemoDeploymentParameter -Config $Config -NetworkMode $Mode -ExistingResourceGroupTags @{ deploymentId = 'abc123' } -T3UseFreeLimit $true -T5PrivateAccess $true -T5WasPublic $true }
+            $moving['parameters']['t5WasPublic']['value'] | Should -BeTrue -Because $mode
+            $moving['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        }
+        $default = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig) } { Get-DemoDeploymentParameter -Config $Config -NetworkMode public -ExistingResourceGroupTags @{ deploymentId = 'abc123' } -T3UseFreeLimit $true }
+        $default['parameters']['t5WasPublic']['value'] | Should -BeFalse
+        $off = InModuleScope DbHubDemo -Parameters @{ Config = (New-TestConfig -Override @{ t5Enabled = $false }) } { Get-DemoDeploymentParameter -Config $Config -NetworkMode public -ExistingResourceGroupTags @{ deploymentId = 'abc123' } -T3UseFreeLimit $true -T5WasPublic $true }
+        $off['parameters']['t5WasPublic']['value'] | Should -BeFalse
+    }
+
+    It 'reads whether the account is public now from the account, and from snet-sqlvm only when the account couldn''t be read (the review of 31ccf40, 2026-11-22)' {
+        $script:subnetAnswer = New-AzResult -Json @{ name = 'snet-sqlvm'; serviceEndpoints = @(@{ service = 'Microsoft.Sql'; provisioningState = 'Succeeded' }, @{ service = 'Microsoft.AzureCosmosDB'; provisioningState = 'Succeeded' }) }
+        $script:subnetReads = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { (@($ArgumentList) -join ' ') -like 'network vnet subnet show *' } -MockWith { $script:subnetReads++; $script:subnetAnswer }
+        $wasPublic = { param($State, $Config = (New-TestConfig)) InModuleScope DbHubDemo -Parameters @{ Config = $Config; State = $State } { Test-DemoT5WasPublic -Config $Config -AccountState $State } }
+        & $wasPublic (New-T5State -Account (New-AccountJson -Public 'Enabled' -Filter 'true' -Subnets 'snet-sqlvm' -NoEndpoint)) | Should -BeTrue
+        & $wasPublic (New-T5State -Account (New-AccountJson)) | Should -BeFalse -Because 'every T5 deployed before 2026-11-21 has public network access off'
+        & $wasPublic (New-T5State) | Should -BeFalse -Because 'a new account isn''t public yet'
+        & $wasPublic (New-T5State -Account (New-AccountJson -Public 'Enabled' -Filter 'true' -Subnets 'snet-sqlvm' -NoEndpoint)) (New-TestConfig -Override @{ t5Enabled = $false }) | Should -BeFalse
+        $script:subnetReads | Should -Be 0 -Because 'the account answered'
+        # Not read: snet-sqlvm decides, because the demo gives it the service endpoint only for a public T5.
+        & $wasPublic (New-T5State -State 'Unknown' -Problem 'TooManyRequests') | Should -BeTrue
+        & $wasPublic $null | Should -BeTrue
+        $script:subnetAnswer = New-AzResult -Json @{ name = 'snet-sqlvm'; serviceEndpoints = @(@{ service = 'Microsoft.Sql'; provisioningState = 'Succeeded' }) }
+        & $wasPublic $null | Should -BeFalse -Because 'a T5 with its private endpoint never gets one'
+        $script:subnetAnswer = New-AzResult -ExitCode 1 -StdErr 'ERROR: (TooManyRequests) Too many requests.'
+        & $wasPublic $null | Should -BeFalse -Because 'a subnet that can''t be read counts as without, as before'
+        $script:subnetReads | Should -Be 4
     }
 }

@@ -80,7 +80,11 @@ BeforeAll {
             # What the other demo environments record (Get-DemoFabricWorkspaceClaim, 2026-11-19): nobody else's workspace
             # unless a test says so (New-InitClaim).
             Claim        = (New-InitClaim)
+            # A new configuration's monthly ceiling (decision 8b, 2026-11-20): what this region's prices give, with no
+            # Retail Prices API call here.
+            Ceiling      = [pscustomobject]@{ Ceiling = 415; WorstCase = 398.23; Priced = $true; DefenderIncluded = $true; Note = 'The monthly ceiling is 415 USD, the default: it holds this region''s worst case for a Contributor''s new deployment, 398.23 USD a month.' }
         }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoInitialMonthlyCeiling -MockWith { $script:init.Ceiling }
         Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoAzProfileSubscription -MockWith { $script:calls.Add('Profile'); $script:init.Profile }
         Mock -ModuleName DbHubDemo -CommandName Test-DemoInteractiveSession -MockWith { $script:init.Interactive }
@@ -226,6 +230,17 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
         Test-Path -LiteralPath (Join-Path -Path $location -ChildPath 'config/proof.local.json') -PathType Leaf | Should -BeTrue
         Test-Path -LiteralPath (Join-Path -Path $elsewhere -ChildPath 'config/proof.local.json') | Should -BeFalse
         (Get-InitResult $init 'INIT.CONFIG').evidence.path | Should -Be ([System.IO.Path]::Combine($location, 'config', 'proof.local.json'))
+    }
+
+    It 'writes a new configuration''s monthly ceiling from its region''s worst case, and says so (decision 8b, 2026-11-20)' {
+        $script:init.Ceiling = [pscustomobject]@{ Ceiling = 470; WorstCase = 451.88; Priced = $true; DefenderIncluded = $true; Note = 'The monthly ceiling is 470 USD, not the default 415: this region''s worst case for a Contributor''s new deployment is 451.88 USD a month.' }
+        $init = Initialize-DemoConfig -Path $script:path -Location 'westeurope' -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
+        $init.Written | Should -BeTrue
+        (Get-DemoConfig -Path $script:path)['monthlyCeilingUsd'] | Should -Be 470
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoInitialMonthlyCeiling -Times 1 -Exactly -ParameterFilter { $Config['location'] -eq 'westeurope' -and $Floor -eq 415 -and $SubscriptionId -eq $script:subA }
+        $config = Get-InitResult $init 'INIT.CONFIG'
+        $config.message | Should -Match 'matches the schema\. The monthly ceiling is 470 USD, not the default 415: this region''s worst case for a Contributor''s new deployment is 451\.88 USD a month\.'
+        @($config.evidence.keys) | Should -Contain 'monthlyCeilingUsd'
     }
 
     It 'writes a schema-valid configuration from the sign-in, with the notebooks imported into a new workspace and the capacity never managed' {
@@ -461,6 +476,55 @@ Describe 'Initialize-DemoConfig (init.ps1)' {
     }
 }
 
+Describe 'The monthly ceiling init.ps1 writes for a new configuration (Get-DemoInitialMonthlyCeiling, decision 8b, 2026-11-20)' {
+    BeforeEach {
+        $script:example = Get-Content -LiteralPath (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json') -Raw | ConvertFrom-Json -AsHashtable -Depth 32
+        $script:worst = 451.88
+        $script:plansThrow = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDefenderPlan -MockWith { if ($script:plansThrow) { throw 'AuthorizationFailed: no read on Microsoft.Security/pricings.' }; @([pscustomobject]@{ name = 'VirtualMachines'; pricingTier = 'Standard'; subPlan = 'P2' }) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -MockWith {
+            if ($script:worst -lt 0) { throw 'Too many requests at this point. Please retry after some time.' }
+            [pscustomobject]@{ MonthlyWorstCase = $script:worst; DefenderIncluded = $PesterBoundParameters.ContainsKey('DefenderPlans'); MissingPrices = @() }
+        }
+    }
+
+    It 'gives <Location> <Expected> USD for a worst case of <Worst> USD: 4% headroom, rounded up to 5 USD, never below 415' -ForEach @(
+        @{ Location = 'westus3'; Worst = 398.23; Expected = 415 }
+        @{ Location = 'centralus'; Worst = 435.86; Expected = 455 }
+        @{ Location = 'westeurope'; Worst = 451.88; Expected = 470 }
+        @{ Location = 'australiaeast'; Worst = 510.75; Expected = 535 }
+        @{ Location = 'westus3'; Worst = 353.36; Expected = 415 }
+    ) {
+        $script:worst = $Worst
+        $config = $script:example.Clone()
+        $config['location'] = $Location
+        $ceiling = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoInitialMonthlyCeiling -Config $Config -SubscriptionId '11111111-2222-3333-4444-555555555555' -Floor 415 }
+        $ceiling.Ceiling | Should -Be $Expected
+        $ceiling.Priced | Should -BeTrue
+        $ceiling.WorstCase | Should -Be $Worst
+        $ceiling.Note | Should -Match ('^The monthly ceiling is {0} USD' -f $Expected)
+        $ceiling.Note | Should -Match 'with your subscription''s Defender for Cloud plans'
+        # A Contributor's first deployment: T4's restart for the rest of the month, T5's container all month, no free offer.
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 1 -Exactly -ParameterFilter {
+            $T5ContainerLifecycle -eq 'AlwaysOn' -and $T5ManualDeleteOnly -and $null -eq $T4RestartCoverage -and -not $PesterBoundParameters.ContainsKey('T3UseFreeLimit') -and -not $PesterBoundParameters.ContainsKey('T5FreeTier') -and -not $PesterBoundParameters.ContainsKey('T4RestartCoverage') -and @($DefenderPlans).Count -eq 1
+        }
+    }
+
+    It 'keeps 415 and says why when the prices can''t be read, and prices without the Defender plans it can''t read' {
+        $script:worst = -1
+        $config = $script:example.Clone()
+        $failed = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoInitialMonthlyCeiling -Config $Config -SubscriptionId '11111111-2222-3333-4444-555555555555' -Floor 415 }
+        $failed.Ceiling | Should -Be 415
+        $failed.Priced | Should -BeFalse
+        $failed.Note | Should -Match '^The monthly ceiling is 415 USD, the example''s: this region''s worst case couldn''t be priced now \(Too many requests'
+        $script:worst = 398.23
+        $script:plansThrow = $true
+        $without = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoInitialMonthlyCeiling -Config $Config -SubscriptionId '11111111-2222-3333-4444-555555555555' -Floor 415 }
+        $without.Ceiling | Should -Be 415
+        $without.Note | Should -Match 'without your subscription''s Defender for Cloud plans, which couldn''t be read: AuthorizationFailed'
+    }
+}
+
 Describe 'A first run in a subscription that already has the environment (issue 60)' {
     BeforeEach {
         Set-InitMock
@@ -483,6 +547,7 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $written['ownerEmail'] | Should -Be 'budget@contoso.example'
         $written['costCenter'] | Should -Be 'contoso-demo'
         $written['monthlyCeilingUsd'] | Should -Be 250
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoInitialMonthlyCeiling -Times 0 -Exactly -Because 'a ceiling the deployment recorded keeps its value (decision 8b)'
         $written['autoShutdownTime'] | Should -Be '2000'
         $written['autoShutdownTimeZone'] | Should -Be 'W. Europe Standard Time' -Because 'the schedule stays, whatever this machine''s time zone is'
         $written['securityType']['t1'] | Should -Be 'Standard'
@@ -692,8 +757,8 @@ Describe 'A first run in a subscription that already has the environment (issue 
         $shared = Join-Path -Path $TestDrive -ChildPath ('shared.{0}.json' -f [guid]::NewGuid().ToString('N'))
         $init = Initialize-DemoConfig -Path $shared -CreateAdminGroup -NonInteractive -BackupDirectory $script:backup -Confirm:$false
         (Get-DemoConfig -Path $shared)['fabric']['importNotebooks'] | Should -BeFalse -Because 'a workspace that holds anything else, and none of the demo''s notebooks, keeps a first run''s rule'
-        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match ('fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), and none of the demo''s notebooks, so deploy\.ps1 adds only the notebooks that are missing and keeps the copies there \(\./scripts/configure-fabric\.ps1 -ConfigPath "{0}" updates them\)\.' -f [regex]::Escape([System.IO.Path]::GetFullPath($shared))) -Because 'the script it names updates this configuration''s workspace, not config/demo.config.json''s (2026-11-19)'
-        (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 adds only the notebooks that are missing'
+        (Get-InitResult $init 'INIT.EXISTING').message | Should -Match ('fabric\.importNotebooks is false: "Database Hub Demo" holds what the demo didn''t create \(Notebook Sales Forecast, Report Quarterly\), and none of the demo''s notebooks, so deploy\.ps1 adds a missing notebook, brings one that nobody edited up to date, and keeps an edited one \(\./scripts/configure-fabric\.ps1 -ConfigPath "{0}" updates them all\)\.' -f [regex]::Escape([System.IO.Path]::GetFullPath($shared))) -Because 'the script it names updates this configuration''s workspace, not config/demo.config.json''s (2026-11-19)'
+        (Get-InitResult $init 'INIT.FABRIC.WORKSPACE').message | Should -Match 'and deploy\.ps1 adds the notebooks that are missing, and brings one that nobody edited up to date'
 
         $script:init.ItemsError = 'HTTP 403: InsufficientWorkspaceRole'
         $unlisted = Join-Path -Path $TestDrive -ChildPath ('unlisted.{0}.json' -f [guid]::NewGuid().ToString('N'))
@@ -880,7 +945,7 @@ Describe 'A second environment''s Fabric workspace (2026-11-19, the final tests'
         (Get-DemoConfig -Path $script:path)['fabric']['workspaceName'] | Should -Be 'Database Hub Demo'
         $workspace = Get-InitResult $init 'INIT.FABRIC.WORKSPACE'
         $workspace.status | Should -Be 'Warning'
-        $workspace.message | Should -Match 'exists; the scripts use it, and deploy\.ps1 adds only the notebooks that are missing\. Whether another demo environment records it couldn''t be checked \(HTTP 503: ServiceUnavailable\), so it may be another environment''s\.$'
+        $workspace.message | Should -Match 'exists; the scripts use it, and deploy\.ps1 adds the notebooks that are missing, and brings one that nobody edited up to date\. Whether another demo environment records it couldn''t be checked \(HTTP 503: ServiceUnavailable\), so it may be another environment''s\.$'
         $workspace.remediation | Should -Be ('If it''s another environment''s, run {0} -Force -Prefix dbhub -WorkspaceName <a name no other environment uses>. deploy.ps1 checks again before it creates anything (DEPLOY.FABRIC.SHARED).' -f (Get-InitCommand $script:path))
     }
 }
@@ -1515,7 +1580,7 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C -PostgresMetrics '{"version":1}' }
         $saved.Result.status | Should -Be 'Warning'
         $saved.Result.message | Should -Match 'T4''s metrics weren''t sent: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history \(2026-11-13\), so it would ignore them\.$'
-        $saved.Result.remediation | Should -Match '^Run \./scripts/configure-fabric\.ps1, which updates the notebook \(fabric\.importNotebooks is false, so deploy\.ps1 keeps the workspace''s copy\)\. T4''s metrics are kept in out/history-pending'
+        $saved.Result.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which updates the notebook unless someone edited it; \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates that notebook alone, edited or not\. T4''s metrics are kept in out/history-pending' -Because 'deploy.ps1 brings an unedited notebook up to date, and the fix leaves NB_DatabaseHub_Deployment as it is (2026-11-23)'
         $saved.PostgresDropped | Should -BeTrue
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { -not $Parameter.Contains('POSTGRES_METRICS') }
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq '13131313-1313-1313-1313-131313131313' -and $Name -eq 'NB_DatabaseHub_LiveActivity' -and $Parameter -eq 'POSTGRES_METRICS' }
@@ -1567,6 +1632,23 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             $Name -eq 'NB_DatabaseHub_LiveActivity' -and $TimeoutMinutes -eq 15 -and $Parameter['SAVE_RESULTS'] -eq $true -and $Parameter['CONFIRM'] -eq $false -and $Parameter['STOP_ACTIVITY'] -eq $false -and $Parameter['KEY_VAULT_URL'] -eq '' -and $Parameter['RESOURCE_GROUP'] -eq 'rg-dbhub-demo' -and $Config['fabric']['workspaceId']
         }
         Should -Invoke -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -Times 1 -Exactly -ParameterFilter { -not $Create }
+    }
+
+    It 'ends its SQL window when it runs: it sends no WINDOW_END_UTC, so the notebook takes now (the review of da68aed5)' {
+        # Ending it 15 minutes early, so that it held only minutes whose SQL telemetry had arrived, left the stop's last 15
+        # minutes out of the history whenever no later save followed within a day, and the coordinator undid it.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -MockWith {
+            $script:sent = $Parameter
+            New-DemoResult -CheckId 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'ran' -Evidence @{ status = 'Completed'; seconds = 95 }
+        }
+        $saved = InModuleScope DbHubDemo -Parameters @{ C = $script:historyConfig } { Save-DemoFabricHistory -Config $C }
+        $script:sent['WINDOW_MINUTES'] | Should -Be 720
+        $script:sent.Contains('WINDOW_END_UTC') | Should -BeFalse
+        $saved.Result.message | Should -BeLike 'Saved the session''s history: NB_DatabaseHub_LiveActivity ran on demand over the last 720 minutes. *'
+        # The notebook's window ends now when WINDOW_END_UTC is empty, its default.
+        $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        $cell = (@($notebook['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]['source']) -join ''
+        $cell | Should -Match '(?m)^WINDOW_END_UTC = ""'
     }
 
     It 'is Manual action required, and runs nothing, when the capacity isn''t running' {
@@ -1621,7 +1703,7 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
         $saved.PostgresDropped | Should -BeFalse
         $saved.RcaNote | Should -Be 'the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA (2026-11-20), so it would ignore it'
         $saved.Result.message | Should -Match 'The RCA evidence wasn''t sent: the workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA \(2026-11-20\), so it would ignore it; it stays on the VMs for the next save \(STOP\.RCA\.PENDING\)\.$'
-        $saved.Result.remediation | Should -Be 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which updates that notebook alone (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copies); the next history save then sends the RCA evidence.' -Because 'the fix leaves NB_DatabaseHub_Deployment as the person left it (the review of e716ff8)'
+        $saved.Result.remediation | Should -Be 'Run ./scripts/deploy.ps1, which updates the notebook unless someone edited it; ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity updates that notebook alone, edited or not; the next history save then sends the RCA evidence.' -Because 'decision 2a''s one fix: deploy.ps1 updates an unedited notebook, and the command updates that notebook alone, leaving NB_DatabaseHub_Deployment as the person left it (the review of e716ff8)'
         $saved.Result.evidence['rcaEvidence'] | Should -Be 'withheld'
         Should -Invoke -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -Times 1 -Exactly -Because 'only the first run staged it'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { $Parameter['POSTGRES_METRICS'] -eq '{"version":1}' -and -not $Parameter.Contains('RCA_EVIDENCE_FILE') }
@@ -1653,6 +1735,10 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
     Context 'in Stop-DemoEnvironment' {
         BeforeEach {
             $script:order = [System.Collections.Generic.List[string]]::new()
+            # The RCA sidecars (2026-11-23): none, unless a test says otherwise.
+            $script:sidecarState = $null
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $script:sidecarState }
+            Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarSave -MockWith { $null }
             $script:still = $false
             $script:stopConfig = Get-DemoConfig -Path (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json')
             $script:stopConfig['subscriptionId'] = $script:subA
@@ -1727,6 +1813,25 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
                 $script:order.Clear()
                 Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false @case | Out-Null
                 @($script:order | Where-Object { $_ -like 'RcaExport:*' -or $_ -like 'Pending:*' }) | Should -BeNullOrEmpty
+            }
+        }
+
+        It 'fetches the RCA sidecars right after the evidence''s export, before the VMs stop, sends them with the history run, and defers their acknowledgements (2026-11-23)' {
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaScriptExport -MockWith { $script:order.Add('RcaExport'); [pscustomobject]@{ Evidence = ''; Documents = @(); Pending = @(); PendingFound = $false; Results = @() } }
+            $script:sidecarState = [pscustomobject]@{ Fetched = [ordered]@{}; Batches = @() }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $script:order.Add(('SidecarFetch:{0}:{1}' -f [bool]$PesterBoundParameters['Final'], $CheckPrefix)); $script:sidecarState }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -MockWith { $script:order.Add(('SaveHistory:{0}' -f [object]::ReferenceEquals($PesterBoundParameters['RcaSidecar'], $script:sidecarState))); [pscustomobject]@{ Result = (New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'saved'); StillRunning = $false; RcaSaved = $true; RcaNote = '' } }
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -MockWith { $script:order.Add('Pending') }
+            Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarSave -MockWith { $script:order.Add(('SidecarComplete:{0}' -f [bool]$PesterBoundParameters['Now'])); New-DemoResult -CheckId 'STOP.RCA.SIDECAR' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'deferred' }
+            $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
+            $script:order | Should -Be @('RcaExport', 'SidecarFetch:True:STOP', 'Deallocate:archost01', 'Deallocate:sqlvm01', 'SaveHistory:True', 'Pending', 'SidecarComplete:False', 'Pause') -Because 'the stop runs the notebook after the VMs deallocate, so the acknowledgements wait for the next export'
+            ($results | Where-Object { $_.checkId -eq 'STOP.RCA.SIDECAR' }).status | Should -Be 'Pass'
+
+            # Without a history save, or with -ParkT2 or -SkipFabric, nothing is fetched: it stays on the VMs.
+            foreach ($case in @(@{}, @{ SaveHistory = $true; ParkT2 = $true }, @{ SaveHistory = $true; SkipFabric = $true })) {
+                $script:order.Clear()
+                Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false @case | Out-Null
+                @($script:order | Where-Object { $_ -like 'Sidecar*' }) | Should -BeNullOrEmpty
             }
         }
 

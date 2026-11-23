@@ -128,6 +128,17 @@ describe("Overview", () => {
         expect(navigate).toHaveBeenCalledWith("findings", { category: "security" });
     });
 
+    it("writes Live now's Cosmos DB peak and lowest availability just under 100 % as they are, beside its Pass (2026-11-21)", async () => {
+        const sample = sampleLiveAnswers("2026-10-21T21:00:00.000Z");
+        const data = liveDataOf(sample.health);
+        if (!data?.cosmosDb) throw new Error("The sample has Cosmos DB's health.");
+        const health = { ...sample.health, data: { ...data, cosmosDb: { ...data.cosmosDb, maximumNormalizedRu: 99.96, minimumServiceAvailability: 99.996 } } };
+        renderWithApp(<OverviewPage />, { live: (view) => Promise.resolve((view === "health" ? health : sample[view]) as never) });
+        const live = await screen.findByRole("region", { name: "Live now" });
+        await waitFor(() => expect(within(live).getByRole("button", { name: /^Cosmos DB, last 24 hours: 99\.96 %\./ })).toBeInTheDocument());
+        expect(within(live).getByText("peak normalized RU · lowest availability 99.996 %")).toBeInTheDocument();
+    });
+
     it("says in one line when nothing is read live, with a neutral badge and one period per sentence", async () => {
         renderWithApp(<OverviewPage />);
         const line = await screen.findByText(/^The live estate function isn't deployed in this app\. Every page shows the history; Database Hub has the live view\.$/);
@@ -303,7 +314,23 @@ describe("Estate", () => {
         expect(within(glance).getByText("pgreplica01-test01")).toBeInTheDocument();
         expect(within(glance).getAllByText("Standard_D4ds_v5")).toHaveLength(2);
         const found = screen.getByRole("region", { name: "What the notebook found" });
-        expect(within(found).getAllByRole("listitem")).toHaveLength(3);
+        expect(within(found).getAllByRole("listitem")).toHaveLength(4);
+    });
+
+    it("grades T4's connections against the slots clients can use, and says what its failed connections leave out (F34)", async () => {
+        // As live (2026-11-21): the surge's connections at 37, at the limit, and Azure Monitor's failed connections at 0.
+        const pg = FIXTURES["postgres-series"].map((r) => (r.Metric === "active_connections" && r.TargetKey === "T4" && r.Value === 34 ? { ...r, Value: 37 } : r.Metric === "connections_failed" ? { ...r, Value: 0 } : r));
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T4" }, client: fakeQueryClient({ "postgres-series": pg }) });
+        const glance = await screen.findByRole("region", { name: "T4 at a glance" });
+        await waitFor(() => expect(within(glance).getByText("37")).toBeInTheDocument());
+        expect(within(glance).getByText("37").closest(".kpi")).toHaveClass("kpi-warning");
+        expect(within(glance).getByText("Connections, peak")).toBeInTheDocument();
+        // No tile grades failed connections: at 0, it read as a Pass while every attempt past the limit was refused.
+        expect(within(glance).queryByText("Failed connections")).not.toBeInTheDocument();
+        const chart = screen.getByRole("region", { name: "Connections" });
+        expect(within(chart).getByText(/^T4's active connections peaked at 37 at .+, at or above the 35 slots clients can use\. Azure Monitor counted 0 failed connections on T4, which leave out a client refused at the connection limit\.$/)).toBeInTheDocument();
+        expect(within(chart).getByText(/35 or more on T4 is a warning: the 35 slots clients can use \(max_connections 50, less 15 reserved\)\. At the limit, PostgreSQL refuses a new client \(too many connections\), and Azure Monitor's failed connections don't count that refusal\.$/)).toBeInTheDocument();
+        await waitFor(() => expect(within(chart).getByText("35: the slots clients can use")).toBeInTheDocument());
     });
 
     it("shows T5's normalized RU with its throttling episode, its 429s, and its recovery, and asks why it hit 100 %", async () => {
@@ -322,12 +349,70 @@ describe("Estate", () => {
         expect(client.ran).toEqual(expect.arrayContaining(["cosmos-series", "cosmos-findings"]));
     });
 
+    it("says when T5's window holds saves at different intervals, and shows its totals per minute (F35)", async () => {
+        const save = (capturedAt: string, windowStart: string, windowEnd: string) => (bucket: string, metric: string, value: number) => ({
+            Bucket: `2026-11-21T${bucket}:00`,
+            TargetKey: "T5",
+            ResourceName: "cosmos01-test01",
+            Metric: metric,
+            Value: value,
+            WindowStart: windowStart,
+            WindowEnd: windowEnd,
+            CapturedAt: capturedAt,
+        });
+        const day = save("2026-11-21T21:33:44", "2026-11-20T21:26:00", "2026-11-21T21:26:00");
+        const session = save("2026-11-21T17:09:30", "2026-11-21T15:15:00", "2026-11-21T15:17:00");
+        const rows = [
+            ...["11:30", "11:45"].flatMap((b) => [day(b, "NormalizedRUConsumption", 11), day(b, "TotalRequests", 300), day(b, "ThrottledRequests", 0)]),
+            ...["15:15", "15:16"].flatMap((b) => [session(b, "NormalizedRUConsumption", 4), session(b, "TotalRequests", 60), session(b, "ThrottledRequests", 0)]),
+        ];
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient({ "cosmos-series": rows }) });
+        await waitFor(() => expect(screen.getByText(/in 1- to 15-minute intervals, the latest capture's window, captured .+, with each interval from the finest save that has it\.$/)).toBeInTheDocument());
+        const chart = screen.getByRole("region", { name: "Requests and 429s" });
+        expect(within(chart).getByText(/The saves here have different intervals, so totals show per minute\.$/)).toBeInTheDocument();
+    });
+
     it("never writes T5's throttled share as 0.0 % when a request was throttled", async () => {
         // 3 of the capture's 7,710 requests answered 429: 0.04 %, which one decimal alone writes as 0.0 %.
         const rows = FIXTURES["cosmos-series"].map((r) => (r.Metric === "ThrottledRequests" ? { ...r, Value: r.Bucket === "2026-11-13T17:02:00" ? 3 : 0 } : r));
         renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient({ "cosmos-series": rows }) });
         const glance = await screen.findByRole("region", { name: "T5 at a glance" });
         await waitFor(() => expect(within(glance).getByText("less than 0.1 % of 7,710 requests")).toBeInTheDocument());
+    });
+
+    it("writes T5's normalized RU peak just under 100 % as it is: the tile beside its Pass, the summary, and the chart's marker (2026-11-21)", async () => {
+        // A peak of 99.96 % with no 429s, which one decimal alone writes as 100.0 %, the throttling line.
+        const rows = FIXTURES["cosmos-series"].map((r) => (r.Metric === "NormalizedRUConsumption" ? { ...r, Value: Math.min(Number(r.Value), 99.96) } : r.Metric === "ThrottledRequests" ? { ...r, Value: 0 } : r));
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient({ "cosmos-series": rows }) });
+        const glance = await screen.findByRole("region", { name: "T5 at a glance" });
+        await waitFor(() => expect(within(glance).getByText("99.96 %")).toBeInTheDocument());
+        const chart = screen.getByRole("region", { name: "Normalized RU, and when it throttled" });
+        expect(within(chart).getByText(/^Normalized RU peaked at 99\.96 %;/)).toBeInTheDocument();
+        await waitFor(() => expect(within(chart).getByText("peak 99.96 %")).toBeInTheDocument());
+    });
+
+    it("writes T5's lowest availability just under its 99.99 % line as it is, beside its Warning (2026-11-21)", async () => {
+        // Two decimals alone write 99.989 % as 99.99 %, the line under which the tile warns.
+        const rows = FIXTURES["cosmos-series"].map((r) => (r.Metric === "ServiceAvailability" ? { ...r, Value: 99.989 } : r));
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T5" }, client: fakeQueryClient({ "cosmos-series": rows }) });
+        const glance = await screen.findByRole("region", { name: "T5 at a glance" });
+        await waitFor(() => expect(within(glance).getByText("99.989 %")).toBeInTheDocument());
+        expect(within(glance).getByText("99.989 %").closest(".kpi")).toHaveClass("kpi-warning");
+    });
+
+    it("writes a chart's peak just under its warning line as it is: the SQL and T4 CPU at 80 %, the replica's lag at 60 s (2026-11-21)", async () => {
+        // One decimal alone writes 79.996 % as 80.0 % and 59.96 s as 60.0 s, the lines the charts draw.
+        const sqlBins = FIXTURES["signals-per-bin"].map((r) => (r["Target Key"] === "T3" && r.Cpu === 120 ? { ...r, Cpu: 79.996 } : r));
+        const { unmount } = renderWithApp(<EstatePage />, { view: { page: "estate", target: "T3" }, client: fakeQueryClient({ "signals-per-bin": sqlBins }) });
+        const sqlCpu = await screen.findByRole("region", { name: "CPU" });
+        expect(within(sqlCpu).getByText("CPU on T3; peak 79.996 %.")).toBeInTheDocument();
+        await waitFor(() => expect(within(sqlCpu).getByText("peak 79.996 %")).toBeInTheDocument());
+        unmount();
+        const pg = FIXTURES["postgres-series"].map((r) => (r.Value === 241.4 ? { ...r, Value: 59.96 } : r.TargetKey === "T4" && r.Value === 91.3 ? { ...r, Value: 79.996 } : r));
+        renderWithApp(<EstatePage />, { view: { page: "estate", target: "T4" }, client: fakeQueryClient({ "postgres-series": pg }) });
+        const lag = await screen.findByRole("region", { name: "Read replica lag" });
+        await waitFor(() => expect(within(lag).getByText("peak 59.96 s")).toBeInTheDocument());
+        expect(within(screen.getByRole("region", { name: "CPU" })).getByText("T4's CPU peaked at 79.996 %.")).toBeInTheDocument();
     });
 
     it("explains T5's page without a capture, and leaves T5 out of the inventory when it has no history", async () => {
@@ -589,6 +674,17 @@ describe("Readiness", () => {
         expect(await screen.findByRole("button", { name: "Demo readiness: –. Open readiness" })).toBeInTheDocument();
         expect(screen.getByText("Run all in NB_DatabaseHub_Control fills this")).toBeInTheDocument();
         expect(screen.queryByText(/0 failed · 0 manual · 0 warnings/)).not.toBeInTheDocument();
+    });
+
+    it("never writes readiness as 100 % until every check passes: the Ready tile and Overview's tile (2026-11-21)", async () => {
+        // 249 of 250 checks pass: 99.6 %, which a whole percent alone writes as 100 %.
+        const nearlyAll = { "readiness-summary": [{ Checks: 250, Failed: 0, Manual: 0, Warnings: 1, Passed: 249, NotSupported: 0, NotSelected: 0, Readiness: 0.996, RunLabel: "Run 20261121T090000Z" }] };
+        const { unmount } = renderWithApp(<ReadinessPage />, { client: fakeQueryClient(nearlyAll) });
+        const glance = await screen.findByRole("region", { name: "Readiness at a glance" });
+        await waitFor(() => expect(within(glance).getByText("more than 99 %")).toBeInTheDocument());
+        unmount();
+        renderWithApp(<OverviewPage />, { client: fakeQueryClient(nearlyAll) });
+        expect(await screen.findByRole("button", { name: "Demo readiness: more than 99 %. Open readiness" })).toBeInTheDocument();
     });
 });
 

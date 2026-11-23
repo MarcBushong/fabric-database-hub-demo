@@ -20,18 +20,27 @@ function New-DemoT2GoldenSnapshot {
        workspace's NB_DatabaseHub_LiveActivity, so when its copy is from before the Incident RCA (Get-DemoGoldenRcaNotebookState,
        read only then), the fix updates it first (./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook
        NB_DatabaseHub_LiveActivity, which leaves the workspace's other notebook as it is). A status that can't be read
-       captures nothing; one that's encrypted (a tenant's policy can re-create the variable so, and Resource Manager then
+       captures nothing, and neither does a variable missing from the control's account, which exists (the review of
+       40124992: since 2026-11-23 deploy.ps1 creates it only when it's missing, so a deletion, or a deployment that couldn't
+       create it, can leave it missing while sessions run), with ./scripts/deploy.ps1, which creates it, as the fix; one
+       that's encrypted (a tenant's policy can re-create the variable so, and Resource Manager then
        returns no value) gets the fix for a governed tenant: Run all sessions, each to its planned end, until one has no
        RCA.EARLIER line at its start about evidence still left, no RCA.EXPORT line about another session's documents, and
-       no RCA.PENDING line at its end; then, the same day, deploy.ps1, which re-creates it unencrypted and empty, and the
-       capture, before it's encrypted again (2026-11-23; the review of a57539ed).
+       no RCA.PENDING line at its end; then, the same day, the variable deleted, deploy.ps1, which creates it again
+       unencrypted and empty (since 2026-11-23 it keeps an existing one as it is, so an update no longer loses what it
+       lists), and the capture, before it's encrypted again (2026-11-23; the review of a57539ed).
     3. Starts archost01 when it's deallocated, and releases an air gap that an interrupted capture left (the
        host's Azure VM ID matches the capture record, so only the guest's network and start action return).
     4. Inspects the host and guest (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Inspect, read-only) and
        checks: the host's health is Ready, no SQL Server product key file, SQL Server Standard running, the
        guest's Arc agent connected to this environment's arcsql01, and, for a guest whose Windows is an evaluation,
        its evaluation more than 7 days from its end (a Warning within 30 days).
-    5. Turns T2's activity profile off and rotates the host administrator's password to a value nobody keeps.
+    5. Turns T2's activity profile off. Then the Incident RCA's sidecars in T2's guest (2026-11-23,
+       Test-DemoGoldenRcaSidecar): the acknowledgements a stop deferred to archost01 (the PC's list in
+       out/history-pending) go to the guest's runner first, then the guest is asked for sidecars that aren't in the history
+       yet, which Prepare would delete; any left is a GOLDEN.CAPTURE.RCA Fail, and nothing is captured: a scripts' history
+       save takes them first (Run all sessions leave theirs in the guest until Run all takes them itself). Then rotates the
+       host administrator's password to a value nobody keeps.
        Then the sign-in data gate (ADR 0009): vm/bootstrap/Invoke-DemoSignInResidue.ps1 removes the sign-in data
        left on the host and in the guest and scans again; anything left (GOLDEN.CAPTURE.SIGNIN Fail, or Manual
        action required for the Security log, which only an operator clears) means nothing is captured.
@@ -223,14 +232,24 @@ function New-DemoT2GoldenSnapshot {
     if ($controlPending.Error) {
         $readFix = 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
         $readEvidence = [ordered]@{ status = $controlPending.Variable }
-        if ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Encrypted')) {
-            # A tenant's policy can re-create the variable encrypted (2026-11-23): then only the runbooks read it, and
-            # deploy.ps1's control.bicep makes it readable again only by re-creating it empty, which loses what it lists.
-            # Run all prints what's left from the vault's copy of the status: RCA.EARLIER at a start, RCA.EXPORT's note of
-            # another session's documents, which the status then carries for that session, and RCA.PENDING at the end. A
-            # stop before the session's planned end can leave capture that none of them names (O1; the review of a57539ed).
+        if ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Missing')) {
+            # Missing from an account that exists (the review of 40124992): deploy.ps1 creates it only when it's missing, so a
+            # deletion, or a deployment that couldn't create it, can leave it so while sessions run, and their stops' lists
+            # are then only in the control vault, which the runbooks can't read back.
+            $readEvidence['missing'] = $true
+            $readFix = 'Run ./scripts/deploy.ps1, which creates it (CONTROL.RESOURCES says so), then ./scripts/capture-t2-golden.ps1 again. Until it exists, the runbooks keep each session''s status only in the control vault, which they can''t read back, so a session''s start doesn''t fetch what the last stop left on the VMs.'
+        }
+        elseif ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Encrypted')) {
+            # A tenant's policy can re-create the variable encrypted (2026-11-23): then only the runbooks read it, and since
+            # 2026-11-23 deploy.ps1 keeps an existing variable as it is, so that an update no longer loses what it lists; it
+            # creates one only when there's none. So it reads again only once deleted and created again, empty, which loses
+            # what it lists. Run all prints what's left from the vault's copy of the status: RCA.EARLIER at a start,
+            # RCA.EXPORT's note of another session's documents, which the status then carries for that session, and
+            # RCA.PENDING at the end. A stop before the session's planned end can leave capture that none of them names (O1;
+            # the review of a57539ed).
             $readEvidence['encrypted'] = $true
-            $readFix = 'Running the capture again won''t help by itself: only the control''s runbooks read an encrypted variable. To save what it may list first, run sessions with Run all in {0}, each to its planned end, by Run all''s own end or its auto-stop (a stop before it, by STOP_NOW, the Insights app''s Stop now, or ./scripts/stop-demo.ps1, can leave capture that the stop''s lines don''t name), until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, run ./scripts/deploy.ps1, which re-creates it unencrypted but empty, and then ./scripts/capture-t2-golden.ps1.' -f $controlPending.Notebook
+            $controlName = Get-DemoActivityControlName -Config $Config
+            $readFix = 'Running the capture again won''t help by itself: only the control''s runbooks read an encrypted variable, and ./scripts/deploy.ps1 keeps an existing one as it is. To save what it may list first, run sessions with Run all in {0}, each to its planned end, by Run all''s own end or its auto-stop (a stop before it, by STOP_NOW, the Insights app''s Stop now, or ./scripts/stop-demo.ps1, can leave capture that the stop''s lines don''t name), until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, delete it (az rest --method delete --url "https://management.azure.com{1}/variables/DbHubSessionStatus?api-version=2024-10-23", or {2}''s Variables in the Azure portal), run ./scripts/deploy.ps1, which creates it again, unencrypted and empty, and then ./scripts/capture-t2-golden.ps1.' -f $controlPending.Notebook, $controlName.AutomationAccountId, $controlName.AutomationAccount
         }
         & $add 'GOLDEN.CAPTURE.RCA' 'Fail' ('The session control''s status ({0}) couldn''t be read ({1}), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.' -f $controlPending.Variable, $controlPending.Error) $readEvidence $readFix
         return $results.ToArray()
@@ -381,6 +400,16 @@ function New-DemoT2GoldenSnapshot {
 
     # 5. Activity off, then the host password.
     $results.Add((Set-DemoTargetProfile -Config $Config -Target 'T2' -ProfileName 'off' -CheckPrefix 'STOP' -SkipReason '' -RequestedBy 'capture-t2-golden'))
+    # 5a. T2's Incident RCA sidecars (2026-11-23, Test-DemoGoldenRcaSidecar): with the activity off and the guest running,
+    # the acknowledgements a stop deferred to archost01 go first, then the guest is asked for sidecars that aren't in the
+    # history yet, which Prepare would delete. Any left captures nothing; the fix is a scripts' history save first.
+    $sidecarGuard = Test-DemoGoldenRcaSidecar -Config $Config
+    foreach ($item in @($sidecarGuard.Results)) {
+        $results.Add($item)
+    }
+    if ($sidecarGuard.Refused) {
+        return $results.ToArray()
+    }
     $password = Set-DemoVmLocalPassword -Config $Config -VmName 'archost01' -Rotate -Confirm:$false
     $results.Add($password)
     # A Warning: the password is rotated, and the Windows PowerShell log that recorded it was cleared (Phase 26f).

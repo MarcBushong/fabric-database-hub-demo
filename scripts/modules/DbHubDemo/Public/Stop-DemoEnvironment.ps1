@@ -30,7 +30,8 @@ function Stop-DemoEnvironment {
       T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), gets its profile off. An account has no stop, and a
       container's throughput can't be taken away, so its container is deleted at the end (2026-11-19, STOP.T5,
       Invoke-DemoT5ContainerStop): its throughput stops billing until the next session creates it again, and only its
-      private endpoint and DNS zone bill between sessions. It's kept, with a Warning and the grant command, while Run all
+      private endpoint and DNS zone, when it has them (2026-11-21), bill between sessions. It's kept, with a Warning and the
+      grant command, while Run all
       couldn't create it again (the session control's role lacks the container's actions; the DbHubT5Container tag isn't
       Session), so a session never runs without it. destroy.ps1 deletes the account.
       With the on-demand activity control (control.enabled, ADR 0020), it first removes a pending auto-stop, so
@@ -72,7 +73,10 @@ function Stop-DemoEnvironment {
       The Incident RCA's evidence (2026-11-20, ADR 0031) is exported from the runners before T2's guest and the VMs stop
       (Invoke-DemoRcaScriptExport: STOP.RCA.EXPORT and STOP.RCA.CAPTURE.<target>), staged in the lakehouse, and passed
       with that run as RCA_EVIDENCE_FILE; the documents the run didn't take stay listed in out/history-pending for the next
-      save, which fetches them again from the runner (STOP.RCA.PENDING, Save-DemoRcaPending).
+      save, which fetches them again from the runner (STOP.RCA.PENDING, Save-DemoRcaPending). Its sidecars (2026-11-23,
+      Query Store's evidence) are fetched right after that export (Invoke-DemoRcaSidecarFetch) and go with the run as
+      RCA_SIDECAR_FILE; what the run writes is acknowledged at the next export with each VM running, since they're
+      deallocated by then, and the rest waits on the VMs (STOP.RCA.SIDECAR, Complete-DemoRcaSidecarSave).
     Run Command needs a running VM: a password rotation on a deallocated host reports Manual action required
     with the steps, and a profile on a VM that isn't running is already inactive (Not selected).
 
@@ -378,13 +382,17 @@ function Stop-DemoEnvironment {
     # The Incident RCA's evidence (2026-11-20, ADR 0031), for the history save: the runners' export, now that the activity is
     # off and before T2's guest and the VMs stop, since it runs on them (Invoke-DemoRcaScriptExport, STOP.RCA.EXPORT and
     # STOP.RCA.CAPTURE.<target>). Without a save, nothing is exported: what the observers captured stays on the VMs for the
-    # next export. The control's stop of a Run all session ran its own export (Invoke-DemoStopHandoff).
+    # next export. The control's stop of a Run all session ran its own export (Invoke-DemoStopHandoff). The sidecars
+    # (2026-11-23) right after it, while the VMs run (Invoke-DemoRcaSidecarFetch): the save below runs the notebook once the
+    # VMs are deallocated, so what it writes is acknowledged at the next export with each VM running (STOP.RCA.SIDECAR).
     $rcaExport = $null
+    $rcaSidecar = $null
     if (-not $ParkT2 -and -not $SkipFabric -and -not $handedOff -and ($SaveHistory -or (Get-DemoFabricCapacitySetting -Config $Config).SaveHistoryOnStop)) {
         $rcaExport = Invoke-DemoRcaScriptExport -Config $Config -CheckPrefix STOP -Final -State $state -Power $power
         foreach ($item in @($rcaExport.Results)) {
             $results.Add($item)
         }
+        $rcaSidecar = Invoke-DemoRcaSidecarFetch -Config $Config -CheckPrefix STOP -Final -State $state -Power $power
     }
     if ($hostVm -eq 'archost01' -and $power[$hostVm] -eq 'PowerState/running') {
         # A clean guest shutdown before the host deallocates, as before, within the same bound; the guest's automatic stop
@@ -464,7 +472,7 @@ function Stop-DemoEnvironment {
                 }
             }
             try {
-                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' }) -RcaEvidence $(if ($null -ne $rcaExport) { [string]$rcaExport.Evidence } else { '' })
+                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' }) -RcaEvidence $(if ($null -ne $rcaExport) { [string]$rcaExport.Evidence } else { '' }) -RcaSidecar $rcaSidecar
                 if ($handedOff -and $null -ne $saved.Result -and ([string]$saved.Result.status -in 'Pass', 'Warning' -or [bool]$saved.StillRunning)) {
                     # The control's stop exported the session's evidence into the control vault, which this save can't read
                     # (review of f5972d2d): the session's own save takes it.
@@ -486,6 +494,12 @@ function Stop-DemoEnvironment {
             $rcaPending = Save-DemoRcaPending -Config $Config -CheckPrefix STOP -Export $rcaExport -Saved:$rcaSaved -Why $rcaReason -Confirm:$false
             if ($null -ne $rcaPending) {
                 $results.Add($rcaPending)
+            }
+            # The sidecars (2026-11-23): what the run wrote is acknowledged at the next export with each VM running, since the
+            # VMs are deallocated now (deferred, in out/history-pending), and the rest waits on the VMs (STOP.RCA.SIDECAR).
+            $sidecarLine = Complete-DemoRcaSidecarSave -Config $Config -Sidecar $rcaSidecar -Why 'the session''s history wasn''t saved (STOP.FABRIC.SAVEHISTORY says why)'
+            if ($null -ne $sidecarLine) {
+                $results.Add($sidecarLine)
             }
             # T4's read replica is deleted by now, and its metrics with it (ADR 0025): when the run that would have added them
             # to the history didn't (a paused capacity, for example), they're kept in out/history-pending, with the command

@@ -556,7 +556,7 @@ function Invoke-DemoGoldenGuestAction {
         [System.Collections.IDictionary] $Config,
 
         [Parameter(Mandatory)]
-        [ValidateSet('Inspect', 'Prepare', 'Release', 'RotateGuestPassword')]
+        [ValidateSet('Inspect', 'Prepare', 'Release', 'RotateGuestPassword', 'RcaSidecars')]
         [string] $Action,
 
         [System.Collections.IDictionary] $Parameter = @{},
@@ -582,6 +582,8 @@ function Invoke-DemoGoldenGuestAction {
         Parameter           = $values
         TimeoutSeconds      = $TimeoutSeconds
         PollIntervalSeconds = 15
+        # A fresh name each time: the VM's Run Command handler can skip a name it ran before (the review of F31).
+        FreshAction         = $true
         Confirm             = $false
     }
     if ($ResourceGroupName) {
@@ -903,8 +905,11 @@ function Get-DemoT2GuestStateResult {
         $problems.Add(('it''s {0}' -f $(if ($evidence['state']) { $evidence['state'] } else { 'in no state' })))
     }
     if ($problems.Count -gt 0) {
-        # Scripted fixes first; the by-hand command is the last resort (the coordinator's decision, 2026-11-19).
-        $fix = if ($evidence['connected'] -lt $evidence['adapters'] -or $evidence['adapters'] -eq 0) { 'Run ./scripts/deploy.ps1; if T2.GUEST.STATE still says this, deploy the environment again: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1. As a last resort, connect, set, and start it on archost01: {0}' -f $connect } else { 'Use {0}, which starts an off guest and sets its automatic start. As a last resort, run on archost01: {1}' -f $fabricStart, $connect }
+        # Scripted fixes first; the by-hand command is the last resort (the coordinator's decision, 2026-11-19). Since
+        # 2026-11-21, deploy.ps1's GuestNetwork step connects the adapter again, and reset-demo.ps1 -RebuildGuest makes a
+        # guest that has none again, where Arc Jumpstart's image makes T2.
+        $rebuild = if ((Get-DemoArcTarget -Config $Config).InstallMode -in 'JumpstartImage', 'PaygWizard') { 'run ./scripts/reset-demo.ps1 -RebuildGuest, which makes {0} again from Arc Jumpstart''s image and onboards it (about an hour), or ' -f $guestName } else { '' }
+        $fix = if ($evidence['connected'] -lt $evidence['adapters'] -or $evidence['adapters'] -eq 0) { 'Run ./scripts/deploy.ps1: archost01''s GuestNetwork step connects {0}''s network adapter to {1} again. If T2.GUEST.STATE still says this (a guest with no adapter, say), {2}deploy the environment again: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1. As a last resort, connect, set, and start it on archost01: {3}' -f $guestName, $switchName, $rebuild, $connect } else { 'Use {0}, which starts an off guest and sets its automatic start. As a last resort, run on archost01: {1}' -f $fabricStart, $connect }
         return (& $new 'Fail' ('{0} can''t be in Database Hub while archost01 runs: {1} ({2}).' -f $guestName, ($problems -join '; '), $seen) $fix)
     }
     $notes = [System.Collections.Generic.List[string]]::new()
@@ -1003,10 +1008,15 @@ function Get-DemoGoldenControlRcaPending {
     An encrypted variable is unreadable here (2026-11-23): a tenant's policy can re-create Automation variables encrypted,
     and then only a runbook's Get-AutomationVariable reads the value, while Resource Manager returns the variable with no
     value, which would otherwise read as a status that lists nothing. So isEncrypted, or a variable with no value, is an
-    Error, and Encrypted says why.
+    Error, and Encrypted says why. So is a variable that's missing from an account that exists (the review of 40124992):
+    since 2026-11-23 deploy.ps1 creates it only when it's missing, so a deletion, or a deployment that couldn't create it,
+    can leave it missing while sessions run, and their stops' lists are then only in the control vault, which the runbooks
+    can't read back; Missing says so. Only a control whose account doesn't exist has had no session that listed any.
     Returns Read (a status was read), Documents, Error (a read that failed), Encrypted (Resource Manager returned no value:
-    the variable is encrypted, or came with none), Variable, and Notebook. Never throws. Internal.
+    the variable is encrypted, or came with none), Missing (the variable doesn't exist, though its account does),
+    Variable, and Notebook. Never throws. Internal.
     https://learn.microsoft.com/rest/api/automation/variable/get,
+    https://learn.microsoft.com/rest/api/automation/automation-account/get,
     https://learn.microsoft.com/azure/automation/shared-resources/variables
     #>
     [CmdletBinding()]
@@ -1019,15 +1029,28 @@ function Get-DemoGoldenControlRcaPending {
     )
 
     $name = Get-DemoActivityControlName -Config $Config
-    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
+    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Missing = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
     if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
         return $answer
     }
     $read = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/variables/DbHubSessionStatus' -f $name.AutomationAccountId) -ApiVersion '2024-10-23')
     if (-not $read.Ok) {
-        # A control from before 2026-11-16 has no such variable, and so no session that listed any.
         if (-not $read.Missing) {
             $answer.Error = [string]$read.Error
+            return $answer
+        }
+        # Missing: from an account that doesn't exist, which has had no session, or from one that does, whose sessions' stops
+        # can have listed evidence the runbooks couldn't keep there (the review of 40124992), so the capture fails closed.
+        $account = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $name.AutomationAccountId -ApiVersion '2024-10-23')
+        if ($account.Missing) {
+            return $answer
+        }
+        $answer.Missing = $true
+        $answer.Error = if ($account.Ok) {
+            'it doesn''t exist, though {0} does' -f $name.AutomationAccount
+        }
+        else {
+            'it doesn''t exist, and whether {0} does couldn''t be read: {1}' -f $name.AutomationAccount, ([string]$account.Error).TrimEnd('.')
         }
         return $answer
     }
@@ -1133,5 +1156,122 @@ function Get-DemoGoldenRcaNotebookState {
     catch {
         $answer.Error = Protect-DemoText -Text $_.Exception.Message
     }
+    return $answer
+}
+
+function Test-DemoGoldenRcaSidecar {
+    <#
+    .SYNOPSIS
+    capture-t2-golden.ps1's guard for the Incident RCA's sidecars in T2's guest (2026-11-23, rca/README.md, The sidecar):
+    Query Store's evidence waits in the guest's store until the history has it, and Prepare deletes that store. Returns
+    Refused and Results (GOLDEN.CAPTURE.RCA). Never throws, except for a stop of the run. Internal.
+
+    .DESCRIPTION
+    With archost01 and its guest running, before Prepare:
+    1. The acknowledgements a stop deferred to archost01 (the PC's list, Read-DemoRcaSidecarList) go to the guest's runner
+       first ('rca ack', the RcaAck action: Invoke-DemoRcaSidecarRunCommand), and those it takes leave the list.
+    2. The guest is asked, over PowerShell Direct as Prepare's RCA step does it (Invoke-DemoGoldenGuest.ps1 -Action
+       RcaSidecars), for sidecars that aren't in the history yet: sealed ones its runner's ledger doesn't mark
+       acknowledged, spans with rows not sealed yet, and a ledger it can't read, which counts as holding some.
+    Any left, or an answer that can't be read: a Fail, and nothing is captured; the fix is a scripts' history save,
+    which fetches them and has the runner acknowledge them, then the capture again. Until Run all takes the sidecars
+    itself (a later release), Run all sessions leave theirs in T2's guest, so the fix says a scripts' save brings them in.
+    Nothing left: a Pass when acknowledgements went to the guest, and no result otherwise. Prepare's own RCA step refuses
+    to delete a store that holds one, so a check that went stale can't lose one.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $PendingDirectory = (Join-Path -Path $script:RepoRoot -ChildPath 'out/history-pending'),
+
+        [ValidateRange(1, 60)]
+        [int] $PollSeconds = 10,
+
+        [ValidateRange(0, 1800)]
+        [int] $HostDeleteWaitSeconds = 300
+    )
+
+    $answer = [pscustomobject]@{ Refused = $false; Results = @() }
+    $result = {
+        param([string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence, [string] $Fix = '')
+        New-DemoResult -CheckId 'GOLDEN.CAPTURE.RCA' -Area 't2' -Target 'T2' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Fix -DocUrl 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
+    }
+    # 1. The acknowledgements a stop deferred to archost01.
+    $list = Read-DemoRcaSidecarList -Config $Config -Directory $PendingDirectory
+    $deferred = @($list.Acks.Values | Where-Object { [string]$_['vm'] -eq 'archost01' } | ForEach-Object { [string]$_['documentId'] })
+    $delivered = 0
+    $ackWhy = ''
+    if ($deferred.Count -gt 0) {
+        $nowUtc = Get-DemoUtcNow
+        $plan = New-DemoRcaSidecarAckPlan -Vm 'archost01' -OneAtATime -DocumentId $deferred -Stamp $nowUtc.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
+        try {
+            $pass = @(Invoke-DemoRcaSidecarRunCommand -Config $Config -Plan @($plan) -Deadline $nowUtc.AddMinutes(10) -PollSeconds $PollSeconds -HostDeleteWaitSeconds $HostDeleteWaitSeconds) | Select-Object -First 1
+            if ($null -ne $pass) {
+                $ack = Get-DemoRcaSidecarAckAnswer -Pass $pass -Plan $plan
+                foreach ($id in $ack.Acked) {
+                    $null = $list.Acks.Remove($id)
+                    $delivered++
+                }
+                $ackWhy = [string]$ack.Why
+            }
+        }
+        catch {
+            if ($_.Exception -is [System.Management.Automation.PipelineStoppedException] -or ($_.Exception -is [System.OperationCanceledException] -and (Test-DemoRunCancelled))) {
+                throw
+            }
+            $ackWhy = Protect-DemoText -Text $_.Exception.Message
+        }
+        $null = Save-DemoRcaSidecarList -List $list -Confirm:$false
+    }
+    # 2. What the guest still holds.
+    $check = Invoke-DemoGoldenGuestAction -Config $Config -Action 'RcaSidecars' -TimeoutSeconds 900
+    $rca = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $check -Name 'Data') -Name 'rca'
+    $evidence = [ordered]@{ deferred = $deferred.Count; delivered = $delivered }
+    $listShown = Get-DemoRcaShownPath -Path ([string]$list.Paths.Acks)
+    if (-not [bool](Get-DemoMemberValue -InputObject $check -Name 'Succeeded') -or $null -eq $rca) {
+        $why = [string](Get-DemoMemberValue -InputObject $check -Name 'Error')
+        $answer.Refused = $true
+        $answer.Results = @(& $result 'Fail' ('Whether T2''s guest holds Incident RCA sidecars that aren''t in the history yet couldn''t be read ({0}), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.' -f $(if ($why) { $why.TrimEnd('.') } else { 'the guest didn''t answer' })) $evidence 'Run ./scripts/capture-t2-golden.ps1 again once T2''s guest runs; ./scripts/status.ps1 shows it (T2.GUEST.STATE).')
+        return $answer
+    }
+    $sealed = [int](Get-DemoMemberValue -InputObject $rca -Name 'sealed')
+    $unsealed = [int](Get-DemoMemberValue -InputObject $rca -Name 'unsealed')
+    $ledger = [string](Get-DemoMemberValue -InputObject $rca -Name 'ledger')
+    $evidence['sealed'] = $sealed
+    $evidence['unsealed'] = $unsealed
+    $evidence['ledger'] = $ledger
+    # Into a variable first: Get-DemoMemberValue returns the array whole, and @() around the call would nest it.
+    $sidecarIds = Get-DemoMemberValue -InputObject $rca -Name 'sidecars'
+    $evidence['sidecars'] = @(@($sidecarIds) | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    if ($sealed -eq 0 -and $unsealed -eq 0 -and $ledger -ne 'unreadable') {
+        if ($delivered -gt 0) {
+            $answer.Results = @(& $result 'Pass' ('{0} acknowledgement(s) that a stop deferred went to T2''s guest first, and no Incident RCA sidecar waits there for the history.' -f $delivered) $evidence)
+        }
+        return $answer
+    }
+    $answer.Refused = $true
+    $what = [System.Collections.Generic.List[string]]::new()
+    if ($sealed -gt 0) {
+        $what.Add(('{0} sealed sidecar(s) its runner hasn''t been told are in the history' -f $sealed))
+    }
+    if ($unsealed -gt 0) {
+        $what.Add(('{0} observation span(s) with rows not sealed into a sidecar yet' -f $unsealed))
+    }
+    if ($ledger -eq 'unreadable') {
+        $what.Add('a ledger of acknowledged sidecars that can''t be read, so it counts as holding some')
+    }
+    $message = 'T2''s guest holds Incident RCA sidecars that aren''t in the history yet ({0}), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.' -f ($what -join '; ')
+    if ($ackWhy) {
+        $message += ' The acknowledgements a stop deferred to it ({0} lists them) didn''t all reach it: {1}' -f $listShown, $ackWhy.TrimEnd('.')
+        $message = $message.TrimEnd('.') + '.'
+    }
+    $hostPower = Get-DemoVmPowerState -SubscriptionId ([string]$Config['subscriptionId']) -ResourceGroupName (Get-DemoResourceGroupName -Config $Config) -VmName 'archost01'
+    $evidence['hostPower'] = [string]$hostPower
+    $save = if ($hostPower -eq 'PowerState/running') { './scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity' } else { './scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory' }
+    $fix = 'Save the history first: {0}, which fetches them from T2 and has its runner acknowledge them, again while its RCA.SIDECAR line says sidecars wait. Run all sessions leave their sidecars in T2''s guest until Run all takes them itself (a later release), so a scripts'' save brings them in. Then run ./scripts/capture-t2-golden.ps1 again.' -f $save
+    $answer.Results = @(& $result 'Fail' $message $evidence $fix)
     return $answer
 }

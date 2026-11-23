@@ -27,7 +27,7 @@
 
 - Windows Server 2022 Datacenter **Evaluation**, Desktop Experience.
 - The media URL and SHA-256 are pinned in `config/versions.json` and can be overridden by parameters. The media downloads directly from that Microsoft URL and is checked against the SHA-256; the artifact cache that used to hold a copy was dropped on 2026-10-20 (ADR 0016, C9).
-- `status.ps1` warns 30 days and 7 days before the evaluation expires. `reset-demo.ps1 -RebuildGuest` rebuilds the guest.
+- `status.ps1` warns 30 days and 7 days before the evaluation expires. `reset-demo.ps1 -RebuildGuest` rebuilds the guest. (Amended 2026-11-21: it makes the guest again from Arc Jumpstart's image, for `JumpstartImage` and a kept `PaygWizard` guest; in `ProductKey` and `Developer` mode it's **Not supported**, and `destroy.ps1 -KeepFabric`, then `deploy.ps1`, rebuilds T2.)
 
 ### T2: SQL Server install modes (`t2SqlInstallMode`)
 

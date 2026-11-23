@@ -3,6 +3,7 @@
 import { isTargetKey, SQL_TARGETS, type TargetKey } from "../lib/dax";
 import { isNumber, toDate } from "../lib/format";
 import type { FindingsTab } from "../lib/view-state";
+import { finestPerInterval, HOURLY_METRICS, pointKey } from "./finest-per-interval";
 import type { Row } from "./query-client";
 
 export const TARGET_INFO: Record<TargetKey, { name: string; short: string; platform: string; resource: string }> = {
@@ -570,27 +571,73 @@ export interface PostgresPoint {
     server: string;
     metric: string;
     value: number;
+    /** Its span in minutes, when known (F35): what it covers, its save's step or less where a window or a finer save cuts it. */
+    minutes?: number;
+    /** Its save's step in minutes, when known (F35): Azure Monitor's interval, to step runs by and name. */
+    grain?: number;
+    /** The coarser point it's a piece of (F35), by pointKey: the pieces of one source are one reading. */
+    source?: string;
+    /** A peak given to each of its source's uncovered stretches (F35): an upper bound for each. */
+    upperBound?: boolean;
 }
 
-/** The latest PostgreSQL capture: its window, its servers, and its points, oldest first. */
+/**
+ * The latest PostgreSQL capture's window, servers, and step, with its points, oldest first. For the app's views,
+ * latestPostgresCapture puts every save's points in that window into it, one per interval (F35).
+ */
 export interface PostgresCapture {
     capturedAt: Date | null;
     windowStart: Date | null;
     windowEnd: Date | null;
-    /** Minutes between consecutive points of one series, or null with single points only. */
+    /** Minutes between consecutive points of one of the latest capture's series, or null with single points only. */
     intervalMinutes: number | null;
     /** Each target's server name. */
     servers: Partial<Record<PostgresTarget, string>>;
     points: PostgresPoint[];
+    /** How many saves its points come from (F35); one when absent. */
+    saves?: number;
+}
+
+/** A point's span in minutes (F35), or the capture's step when the point doesn't say: for its end, sums, and rates. */
+export function spanMinutes(point: { minutes?: number }, fallback: number): number {
+    return point.minutes !== undefined && point.minutes > 0 ? point.minutes : fallback;
+}
+
+/** A point's save's step in minutes (F35), or the capture's step when the point doesn't say: to step runs by and name. */
+export function grainMinutes(point: { grain?: number }, fallback: number): number {
+    return point.grain !== undefined && point.grain > 0 ? point.grain : fallback;
+}
+
+/**
+ * A total's points per minute of their span (F35), for a capture whose points come from saves at different intervals:
+ * there a 15-minute total beside 1-minute ones would read as a spike. A capture from one save keeps each interval's own.
+ */
+export function perMinute<P extends { value: number; minutes?: number }>(points: readonly P[], capture: { intervalMinutes: number | null; saves?: number } | null): P[] {
+    if (!capture || (capture.saves ?? 1) <= 1) return [...points];
+    return points.map((p) => ({ ...p, value: p.value / spanMinutes(p, capture.intervalMinutes ?? 1) }));
+}
+
+/**
+ * A series' points with each reading once (F35): of the pieces a coarser point left in several uncovered stretches, only
+ * the first, so a run or an episode doesn't count one reading twice. Charts and totals keep every piece.
+ */
+export function oneReadingEach<P extends { source?: string }>(points: readonly P[]): P[] {
+    const seen = new Set<string>();
+    return points.filter((p) => {
+        if (p.source === undefined) return true;
+        if (seen.has(p.source)) return false;
+        seen.add(p.source);
+        return true;
+    });
 }
 
 const METRIC_NAME = /^[a-z0-9_]{1,64}$/;
 
-function intervalOf(points: readonly PostgresPoint[]): number | null {
+function intervalOf(points: ReadonlyArray<{ at: Date; metric: string; target?: string }>): number | null {
     const previous = new Map<string, number>();
     let best: number | null = null;
     for (const p of points) {
-        const key = `${p.target}|${p.metric}`;
+        const key = `${p.target ?? ""}|${p.metric}`;
         const before = previous.get(key);
         const time = p.at.getTime();
         if (before !== undefined && time > before) {
@@ -602,31 +649,110 @@ function intervalOf(points: readonly PostgresPoint[]): number | null {
     return best;
 }
 
-/** The postgres-series rows as one capture, or null without a valid row (no capture yet). */
-export function toPostgresCapture(rows: readonly Row[]): PostgresCapture | null {
-    const points: PostgresPoint[] = [];
-    const servers: Partial<Record<PostgresTarget, string>> = {};
-    let capturedAt: Date | null = null;
-    let windowStart: Date | null = null;
-    let windowEnd: Date | null = null;
-    for (const r of rows) {
-        const at = toDate(r.Bucket);
-        const value = num(r.Value);
-        const metric = text(r.Metric);
-        const target = r.TargetKey;
-        if (!at || value === null || !isPostgresTarget(target) || !METRIC_NAME.test(metric)) continue;
-        const server = safeName(r.ResourceName) ?? "";
-        points.push({ at, target, server, metric, value });
-        if (server && !servers[target]) servers[target] = server;
-        capturedAt ??= toDate(r.CapturedAt);
-        windowStart ??= toDate(r.WindowStart);
-        windowEnd ??= toDate(r.WindowEnd);
-    }
-    if (points.length === 0) return null;
-    points.sort((a, b) => a.at.getTime() - b.at.getTime());
-    return { capturedAt, windowStart, windowEnd, intervalMinutes: intervalOf(points), servers, points };
+/** What finestPerInterval returns beside its kept rows (F35), by pointKey. */
+export type PointMarks = Pick<ReturnType<typeof finestPerInterval>, "intervals" | "grains" | "sources" | "upperBounds">;
+
+/** What a decoder takes beside merged rows (F35): finestPerInterval's marks, the latest capture's own rows, and its step. */
+export interface MergedSaves {
+    marks: PointMarks;
+    /** The newest capture's rows, as read: its window, its resources, and its step without marks. */
+    latest: readonly Row[];
+    /** The newest capture's own step in minutes (its kept points' grain, hourly metrics aside), or null when it has none. */
+    step: number | null;
 }
 
+/** A decoded point with its span, grain, and marks from finestPerInterval, by its key (F35). */
+function marked<P extends { at: Date; metric: string; minutes?: number; grain?: number; source?: string; upperBound?: boolean }>(point: P, target: string, marks: PointMarks | undefined): P {
+    if (!marks) return point;
+    const key = pointKey(target, point.metric, point.at);
+    const span = marks.intervals.get(key);
+    const grain = marks.grains.get(key);
+    const source = marks.sources.get(key);
+    if (span !== undefined) point.minutes = span / 60000;
+    if (grain !== undefined) point.grain = grain / 60000;
+    if (source !== undefined) point.source = source;
+    if (marks.upperBounds.has(key)) point.upperBound = true;
+    return point;
+}
+
+const capturedOf = (r: Row) => toDate(r.CapturedAt)?.getTime() ?? null;
+
+function newestOf(rows: readonly Row[]): Row[] {
+    let newest: number | null = null;
+    for (const r of rows) {
+        const captured = capturedOf(r);
+        if (captured !== null && (newest === null || captured > newest)) newest = captured;
+    }
+    return rows.filter((r) => capturedOf(r) === newest);
+}
+
+/**
+ * Every save's rows in the latest capture's window, each interval's finest (F35), for the app's T4 and T5 views: the newest
+ * capture (Captured At) gives the window and the resources, and finestPerInterval merges the saves. Rows of another
+ * resource than the newest capture's for the same target (an environment deployed again since) are left out, and so are
+ * other saves' points outside its window (the query reads a day before it, for their steps). Its own points all stay.
+ */
+export function latestWindowSaves(rows: readonly Row[]): { rows: Row[]; merged: MergedSaves } {
+    const latest = newestOf(rows);
+    const newest = latest[0] ? capturedOf(latest[0]) : null;
+    const resources = new Map<string, string>();
+    for (const r of latest) {
+        const name = safeName(r.ResourceName);
+        if (name && !resources.has(text(r.TargetKey))) resources.set(text(r.TargetKey), name);
+    }
+    const same = rows.filter((r) => {
+        const want = resources.get(text(r.TargetKey));
+        return !want || safeName(r.ResourceName) === want;
+    });
+    const { kept, intervals, grains, sources, upperBounds } = finestPerInterval(same);
+    const from = latest[0] ? (toDate(latest[0].WindowStart)?.getTime() ?? null) : null;
+    const to = latest[0] ? (toDate(latest[0].WindowEnd)?.getTime() ?? null) : null;
+    const out: Row[] = [];
+    let step: number | null = null;
+    for (const row of kept) {
+        const at = toDate(row.Bucket);
+        if (!at) continue;
+        const key = pointKey(text(row.TargetKey), text(row.Metric), at);
+        const span = intervals.get(key);
+        const grain = grains.get(key);
+        const start = at.getTime();
+        const inWindow = (to === null || start < to) && (from === null || start + (span ?? 0) > from || start >= from);
+        const own = capturedOf(row) === newest;
+        if (!own && !inWindow) continue;
+        if (own && grain !== undefined && !HOURLY_METRICS.has(text(row.Metric))) step = Math.min(step ?? Infinity, grain / 60000);
+        out.push(row);
+    }
+    return { rows: out, merged: { marks: { intervals, grains, sources, upperBounds }, latest, step } };
+}
+
+const isPostgresRow = (r: Row) => toDate(r.Bucket) !== null && num(r.Value) !== null && isPostgresTarget(r.TargetKey) && METRIC_NAME.test(text(r.Metric));
+
+/**
+ * The postgres-series rows as one capture, as given, or null without a valid row (no capture yet). With `merged`
+ * (latestPostgresCapture's), each point also has its span, its save's grain, and its marks, and the capture takes the
+ * latest capture's window and step from it. Without it, the newest capture among the rows gives them.
+ */
+export function toPostgresCapture(rows: readonly Row[], merged?: MergedSaves): PostgresCapture | null {
+    const valid = rows.filter(isPostgresRow);
+    if (valid.length === 0) return null;
+    const latest = merged ? merged.latest.filter(isPostgresRow) : newestOf(valid);
+    const toPoint = (r: Row): PostgresPoint => ({ at: toDate(r.Bucket) as Date, target: r.TargetKey as PostgresTarget, server: safeName(r.ResourceName) ?? "", metric: text(r.Metric), value: num(r.Value) as number });
+    const servers: Partial<Record<PostgresTarget, string>> = {};
+    for (const r of [...latest, ...valid]) {
+        const server = safeName(r.ResourceName);
+        if (server && !servers[r.TargetKey as PostgresTarget]) servers[r.TargetKey as PostgresTarget] = server;
+    }
+    const points = valid.map((r) => marked(toPoint(r), text(r.TargetKey), merged?.marks)).sort((a, b) => a.at.getTime() - b.at.getTime());
+    const first = latest[0] ?? valid[0];
+    const intervalMinutes = merged?.step ?? intervalOf(latest.map(toPoint).sort((a, b) => a.at.getTime() - b.at.getTime()));
+    return { capturedAt: toDate(first.CapturedAt), windowStart: toDate(first.WindowStart), windowEnd: toDate(first.WindowEnd), intervalMinutes, servers, points, saves: new Set(valid.map(capturedOf)).size };
+}
+
+/** The app's T4 capture (F35): every save's postgres-series points in the latest capture's window, each interval's finest. */
+export function latestPostgresCapture(rows: readonly Row[]): PostgresCapture | null {
+    const { rows: kept, merged } = latestWindowSaves(rows.filter(isPostgresRow));
+    return toPostgresCapture(kept, merged);
+}
 /** One series of the capture, oldest first; empty without a capture or without that series. */
 export function postgresSeries(capture: PostgresCapture | null, target: PostgresTarget, metric: string): PostgresPoint[] {
     return capture ? capture.points.filter((p) => p.target === target && p.metric === metric) : [];
@@ -658,13 +784,14 @@ export const REPLICA_RESTART_GAP_MINUTES = 10;
  */
 export function replicaCatchUp(capture: PostgresCapture | null, lag: readonly PostgresPoint[]): PostgresPoint[] {
     if (!capture || lag.length === 0) return [];
-    const intervalMs = (capture.intervalMinutes ?? 5) * 60000;
-    const gapMs = Math.max(REPLICA_RESTART_GAP_MINUTES * 60000, 2 * intervalMs);
+    const fallback = capture.intervalMinutes ?? 5;
     let anchor = (capture.windowStart ?? lag[0].at).getTime();
     let resumed: number | null = null;
     const caught: PostgresPoint[] = [];
     for (const p of lag) {
         const at = p.at.getTime();
+        const intervalMs = spanMinutes(p, fallback) * 60000;
+        const gapMs = Math.max(REPLICA_RESTART_GAP_MINUTES * 60000, 2 * grainMinutes(p, fallback) * 60000);
         if (at - anchor >= gapMs) resumed = anchor;
         if (resumed !== null && p.value >= (0.5 * (at + intervalMs - resumed)) / 1000) caught.push(p);
         else resumed = null;
@@ -731,63 +858,88 @@ export interface CosmosPoint {
     at: Date;
     metric: string;
     value: number;
+    /** Its span in minutes, when known (F35): what it covers, its save's step or less where a window or a finer save cuts it. */
+    minutes?: number;
+    /** Its save's step in minutes, when known (F35): Azure Monitor's interval, to step runs by and name. */
+    grain?: number;
+    /** The coarser point it's a piece of (F35), by pointKey: the pieces of one source are one reading. */
+    source?: string;
+    /** A peak given to each of its source's uncovered stretches (F35): an upper bound for each. */
+    upperBound?: boolean;
 }
 
-/** The latest Cosmos DB capture: its account, its window, and its points, oldest first. */
+/**
+ * The latest Cosmos DB capture's account, window, and step, with its points, oldest first. For the app's views,
+ * latestCosmosCapture puts every save's points in that window into it, one per interval (F35), as for T4.
+ */
 export interface CosmosCapture {
     account: string;
     capturedAt: Date | null;
     windowStart: Date | null;
     windowEnd: Date | null;
-    /** Minutes between consecutive points of one per-interval series, or null with single points only. */
+    /** Minutes between consecutive points of the latest capture's per-interval series, or null with single points only. */
     intervalMinutes: number | null;
     points: CosmosPoint[];
+    /** How many saves its points come from (F35); one when absent. */
+    saves?: number;
 }
 
 const COSMOS_METRIC = /^[A-Za-z0-9_]{1,64}$/;
 
-/** The cosmos-series rows as one capture, or null without a valid row (no capture yet, or T5 is off). */
-export function toCosmosCapture(rows: readonly Row[]): CosmosCapture | null {
-    const points: CosmosPoint[] = [];
-    let account = "";
-    let capturedAt: Date | null = null;
-    let windowStart: Date | null = null;
-    let windowEnd: Date | null = null;
-    for (const r of rows) {
-        const at = toDate(r.Bucket);
-        const value = num(r.Value);
-        const metric = text(r.Metric);
-        if (!at || value === null || !COSMOS_METRIC.test(metric)) continue;
-        points.push({ at, metric, value });
-        account ||= safeName(r.ResourceName) ?? "";
-        capturedAt ??= toDate(r.CapturedAt);
-        windowStart ??= toDate(r.WindowStart);
-        windowEnd ??= toDate(r.WindowEnd);
-    }
-    if (points.length === 0) return null;
-    points.sort((a, b) => a.at.getTime() - b.at.getTime());
-    const series = points.filter((p) => p.metric === COSMOS_METRICS.normalizedRu);
+const isCosmosRow = (r: Row) => toDate(r.Bucket) !== null && num(r.Value) !== null && COSMOS_METRIC.test(text(r.Metric));
+
+/**
+ * The cosmos-series rows as one capture, as given, or null without a valid row (no capture yet, or T5 is off). With
+ * `merged` (latestCosmosCapture's), each point also has its span, its save's grain, and its marks, as for T4.
+ */
+export function toCosmosCapture(rows: readonly Row[], merged?: MergedSaves): CosmosCapture | null {
+    const valid = rows.filter(isCosmosRow);
+    if (valid.length === 0) return null;
+    const latest = merged ? merged.latest.filter(isCosmosRow) : newestOf(valid);
+    const toPoint = (r: Row): CosmosPoint => ({ at: toDate(r.Bucket) as Date, metric: text(r.Metric), value: num(r.Value) as number });
+    const points = valid.map((r) => marked(toPoint(r), "T5", merged?.marks)).sort((a, b) => a.at.getTime() - b.at.getTime());
+    const series = latest
+        .map(toPoint)
+        .filter((p) => p.metric === COSMOS_METRICS.normalizedRu)
+        .sort((a, b) => a.at.getTime() - b.at.getTime());
     const gaps = series.slice(1).map((p, i) => (p.at.getTime() - series[i].at.getTime()) / 60000).filter((g) => g > 0);
-    return { account, capturedAt, windowStart, windowEnd, intervalMinutes: gaps.length > 0 ? Math.min(...gaps) : null, points };
+    const first = latest[0] ?? valid[0];
+    const account = [...latest, ...valid].map((r) => safeName(r.ResourceName)).find((name) => name !== null) ?? "";
+    const intervalMinutes = merged?.step ?? (gaps.length > 0 ? Math.min(...gaps) : null);
+    return { account, capturedAt: toDate(first.CapturedAt), windowStart: toDate(first.WindowStart), windowEnd: toDate(first.WindowEnd), intervalMinutes, points, saves: new Set(valid.map(capturedOf)).size };
 }
 
+/** The app's T5 capture (F35): every save's cosmos-series points in the latest capture's window, each interval's finest. */
+export function latestCosmosCapture(rows: readonly Row[]): CosmosCapture | null {
+    const t5 = rows.filter(isCosmosRow).map((r) => (r.TargetKey === undefined || r.TargetKey === null ? { ...r, TargetKey: "T5" } : r));
+    const { rows: kept, merged } = latestWindowSaves(t5);
+    return toCosmosCapture(kept, merged);
+}
 /** One metric of the capture, oldest first. */
 export function cosmosSeries(capture: CosmosCapture | null, metric: string): CosmosPoint[] {
     return capture ? capture.points.filter((p) => p.metric === metric) : [];
 }
 
-/** The runs of intervals that throttled: a 429 in the interval, or normalized RU at 100 %. */
+/**
+ * The runs of intervals that throttled: a 429 in the interval, or normalized RU at 100 %, each to its own span's end, and a
+ * reading split across stretches once (F35: oneReadingEach).
+ */
 export function throttledRuns(capture: CosmosCapture | null): Array<{ from: Date; to: Date }> {
     if (!capture) return [];
-    const step = (capture.intervalMinutes ?? 1) * 60000;
-    const hot = new Set<number>();
-    for (const p of cosmosSeries(capture, COSMOS_METRICS.throttled)) if (p.value > 0) hot.add(p.at.getTime());
-    for (const p of cosmosSeries(capture, COSMOS_METRICS.normalizedRu)) if (p.value >= 100) hot.add(p.at.getTime());
+    const fallback = capture.intervalMinutes ?? 1;
+    const hot = new Map<number, number>();
+    const mark = (p: CosmosPoint) => {
+        const at = p.at.getTime();
+        hot.set(at, Math.max(hot.get(at) ?? at, at + spanMinutes(p, fallback) * 60000));
+    };
+    for (const p of oneReadingEach(cosmosSeries(capture, COSMOS_METRICS.throttled))) if (p.value > 0) mark(p);
+    for (const p of oneReadingEach(cosmosSeries(capture, COSMOS_METRICS.normalizedRu))) if (p.value >= 100) mark(p);
     const runs: Array<{ from: Date; to: Date }> = [];
-    for (const at of [...hot].sort((a, b) => a - b)) {
+    for (const [at, end] of [...hot].sort((a, b) => a[0] - b[0])) {
         const last = runs[runs.length - 1];
-        if (last && at <= last.to.getTime()) last.to = new Date(at + step);
-        else runs.push({ from: new Date(at), to: new Date(at + step) });
+        if (last && at <= last.to.getTime()) {
+            if (end > last.to.getTime()) last.to = new Date(end);
+        } else runs.push({ from: new Date(at), to: new Date(end) });
     }
     return runs;
 }

@@ -201,11 +201,31 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $script:controlPending = @()
         $script:controlError = ''
         $script:controlEncrypted = $false
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Encrypted = $script:controlEncrypted; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
+        $script:controlMissing = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Encrypted = $script:controlEncrypted; Missing = $script:controlMissing; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
         # The demo workspace's NB_DatabaseHub_LiveActivity, read only when T2's documents are listed: this release's copy,
         # unless a test sets another.
         $script:notebookState = [pscustomobject]@{ Known = $true; Current = $true; Error = '' }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenRcaNotebookState -MockWith { $script:notebookState }
+        # The Incident RCA's sidecars (2026-11-23): this PC's lists hold no deferred acknowledgement, and T2's guest holds no
+        # sidecar that isn't in the history, unless a test sets some.
+        $script:sidecarAcks = [ordered]@{}
+        $script:guestSidecars = [ordered]@{ spans = 0; sealed = 0; unsealed = 0; ledger = 'none'; sidecars = @() }
+        $script:ackOutcome = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Read-DemoRcaSidecarList -MockWith { [pscustomobject]@{ Paths = [pscustomobject]@{ Pending = (Join-Path -Path $repoRoot -ChildPath 'out/history-pending/rca-sidecar-pending-rg-dbhub-demo.json'); Acks = (Join-Path -Path $repoRoot -ChildPath 'out/history-pending/rca-sidecar-acks-rg-dbhub-demo.json') }; Pending = [ordered]@{}; Acks = $script:sidecarAcks; Writable = @{ Pending = $true; Acks = $true }; Problems = [System.Collections.Generic.List[string]]::new() } }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaSidecarList -MockWith { $script:calls.Add(('save acks {0}' -f @($List.Acks.Keys).Count)); @() }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarRunCommand -MockWith {
+            $script:calls.Add(('rca ack {0}' -f (@($Plan[0].Steps | ForEach-Object { @($_.Request['documentIds']) }) -join ',')))
+            $results = [ordered]@{}
+            foreach ($step in @($Plan[0].Steps)) {
+                $results[$step.Key] = [pscustomobject]@{ State = 'Read'; Out = [pscustomobject]@{ Status = $script:ackOutcome; Message = 'runner rca ack: exit code 3.'; OldRunner = $false; OldBundle = $false; Line = '' }; Error = '' }
+                if ($script:ackOutcome -eq 'Pass') {
+                    # The runner took them: the guest's ledger marks them acknowledged.
+                    $script:guestSidecars['sealed'] = 0
+                }
+            }
+            [pscustomobject]@{ Vm = 'archost01'; Outcome = ''; Message = ''; Results = $results; Leftover = @() }
+        }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' }
@@ -237,6 +257,7 @@ Describe 'New-DemoT2GoldenSnapshot' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
             $script:calls.Add('guest ' + $Action)
             switch ($Action) {
+                'RcaSidecars' { [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 30; Data = [pscustomobject]@{ succeeded = $true; rca = [pscustomobject]$script:guestSidecars } } }
                 'Release' { [pscustomobject]@{ Succeeded = $true; Data = [pscustomobject]@{ succeeded = $true; captured = $false }; Error = ''; Seconds = 5 } }
                 'Inspect' {
                     [pscustomobject]@{
@@ -386,6 +407,62 @@ Describe 'New-DemoT2GoldenSnapshot' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoGoldenRcaNotebookState -Times 0 -Exactly -Because 'the notebook is read only when T2''s documents are listed'
     }
 
+    It 'captures nothing while T2''s guest holds a sidecar that isn''t in the history, its only pending evidence, and deletes nothing (2026-11-23)' {
+        $script:hostPower = 'PowerState/running'
+        $script:guestSidecars['sealed'] = 1
+        $script:guestSidecars['sidecars'] = @('20261123T100000Z-arcsql01-0001-sidecar')
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be 'T2''s guest holds Incident RCA sidecars that aren''t in the history yet (1 sealed sidecar(s) its runner hasn''t been told are in the history), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+        $rca.remediation | Should -Be 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches them from T2 and has its runner acknowledge them, again while its RCA.SIDECAR line says sidecars wait. Run all sessions leave their sidecars in T2''s guest until Run all takes them itself (a later release), so a scripts'' save brings them in. Then run ./scripts/capture-t2-golden.ps1 again.'
+        @($rca.evidence.sidecars) | Should -Be @('20261123T100000Z-arcsql01-0001-sidecar')
+        @($script:calls | Where-Object { $_ -in 'power Start', 'profile off', 'guest RcaSidecars' }) | Should -Be @('power Start', 'profile off', 'guest RcaSidecars') -Because 'the guest is asked with its activity off'
+        foreach ($step in 'password', 'guest Prepare', 'power Deallocate') {
+            $script:calls | Should -Not -Contain $step
+        }
+        $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.SNAPSHOT' | Should -BeNullOrEmpty
+
+        # Rows not sealed yet count the same, and so does a ledger that can't be read; with the host deallocated, the save is
+        # a session's stop.
+        $script:calls.Clear()
+        $script:hostPower = 'PowerState/deallocated'
+        $script:guestSidecars['sealed'] = 0
+        $script:guestSidecars['unsealed'] = 1
+        $script:guestSidecars['ledger'] = 'unreadable'
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Match '\(1 observation span\(s\) with rows not sealed into a sidecar yet; a ledger of acknowledged sidecars that can''t be read, so it counts as holding some\)'
+        $rca.remediation | Should -Match '^Save the history first: \./scripts/start-demo\.ps1, then \./scripts/stop-demo\.ps1 -SaveHistory, which fetches them'
+        $script:calls | Should -Not -Contain 'guest Prepare'
+    }
+
+    It 'sends the acknowledgements a stop deferred to archost01 first, then captures once nothing waits in its guest (2026-11-23)' {
+        $script:sidecarAcks['20261123T100000Z-arcsql01-0001-sidecar'] = [ordered]@{ documentId = '20261123T100000Z-arcsql01-0001-sidecar'; vm = 'archost01'; status = 'written'; recordedUtc = '2026-11-23T12:00:00Z' }
+        $script:sidecarAcks['20261123T100000Z-sqlvm01-0001-sidecar'] = [ordered]@{ documentId = '20261123T100000Z-sqlvm01-0001-sidecar'; vm = 'sqlvm01'; status = 'written'; recordedUtc = '2026-11-23T12:00:00Z' }
+        # Until its acknowledgement arrives, the guest's ledger doesn't mark it.
+        $script:guestSidecars['sealed'] = 1
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        ($results | Where-Object checkId -EQ 'GOLDEN.CAPTURE').status | Should -Be 'Pass'
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Pass'
+        $rca.message | Should -Be '1 acknowledgement(s) that a stop deferred went to T2''s guest first, and no Incident RCA sidecar waits there for the history.'
+        @($script:calls | Where-Object { $_ -like 'rca ack *' -or $_ -in 'guest RcaSidecars', 'guest Prepare' }) | Should -Be @('rca ack 20261123T100000Z-arcsql01-0001-sidecar', 'guest RcaSidecars', 'guest Prepare')
+        $script:calls | Should -Contain 'save acks 1' -Because 'sqlvm01''s acknowledgement stays for its next export'
+
+        # One that doesn't reach the guest: the capture says so, and captures nothing.
+        $script:calls.Clear()
+        $script:ackOutcome = 'Fail'
+        $script:guestSidecars['sealed'] = 1
+        $script:sidecarAcks['20261123T100000Z-arcsql01-0001-sidecar'] = [ordered]@{ documentId = '20261123T100000Z-arcsql01-0001-sidecar'; vm = 'archost01'; status = 'written'; recordedUtc = '2026-11-23T12:00:00Z' }
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Match 'didn''t all reach it: runner rca ack: exit code 3\.$'
+        $script:calls | Should -Not -Contain 'guest Prepare'
+    }
+
     It 'captures nothing while the session control''s status lists T2''s documents its runbooks couldn''t fetch, and says to run a session (the review of 3f6cd14)' {
         $script:controlPending = @([ordered]@{ documentId = 'archost01-20261120T190000Z-2'; vm = 'archost01' }, [ordered]@{ documentId = 'sqlvm01-20261120T190000Z-2'; vm = 'sqlvm01' })
         $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
@@ -455,6 +532,22 @@ Describe 'New-DemoT2GoldenSnapshot' {
         }
     }
 
+    It 'captures nothing when the session control''s status variable is missing from its account, and names ./scripts/deploy.ps1, which creates it (the review of 40124992)' {
+        # Since 2026-11-23 deploy.ps1 creates the variable only when it's missing, so a deletion, or a deployment that couldn't
+        # create it, can leave it missing while sessions run: their stops' lists are then only in the control vault.
+        $script:controlError = 'it doesn''t exist, though aa-dbhub-control does'
+        $script:controlMissing = $true
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (it doesn''t exist, though aa-dbhub-control does), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
+        $rca.remediation | Should -Be 'Run ./scripts/deploy.ps1, which creates it (CONTROL.RESOURCES says so), then ./scripts/capture-t2-golden.ps1 again. Until it exists, the runbooks keep each session''s status only in the control vault, which they can''t read back, so a session''s start doesn''t fetch what the last stop left on the VMs.'
+        $rca.evidence.missing | Should -BeTrue
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+    }
+
     It 'captures nothing when a tenant''s policy encrypted the session control''s status, and says how to save what it lists first, since running it again can''t help (2026-11-23)' {
         $script:controlError = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
         $script:controlEncrypted = $true
@@ -462,7 +555,9 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
         $rca.status | Should -Be 'Fail'
         $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
-        $rca.remediation | Should -Be 'Running the capture again won''t help by itself: only the control''s runbooks read an encrypted variable. To save what it may list first, run sessions with Run all in NB_DatabaseHub_Control, each to its planned end, by Run all''s own end or its auto-stop (a stop before it, by STOP_NOW, the Insights app''s Stop now, or ./scripts/stop-demo.ps1, can leave capture that the stop''s lines don''t name), until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, run ./scripts/deploy.ps1, which re-creates it unencrypted but empty, and then ./scripts/capture-t2-golden.ps1.' -Because 'deploy.ps1 makes the variable readable again only by emptying it, so the evidence it lists goes first, including another session''s that a session''s exports found and its status carries, which only RCA.EXPORT''s note counts (the review of a57539ed)'
+        $accountId = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } { (Get-DemoActivityControlName -Config $Config).AutomationAccountId }
+        $accountId | Should -Match '/resourceGroups/rg-dbhub-control/providers/Microsoft\.Automation/automationAccounts/aa-dbhub-control$'
+        $rca.remediation | Should -Be ('Running the capture again won''t help by itself: only the control''s runbooks read an encrypted variable, and ./scripts/deploy.ps1 keeps an existing one as it is. To save what it may list first, run sessions with Run all in NB_DatabaseHub_Control, each to its planned end, by Run all''s own end or its auto-stop (a stop before it, by STOP_NOW, the Insights app''s Stop now, or ./scripts/stop-demo.ps1, can leave capture that the stop''s lines don''t name), until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, delete it (az rest --method delete --url "https://management.azure.com{0}/variables/DbHubSessionStatus?api-version=2024-10-23", or aa-dbhub-control''s Variables in the Azure portal), run ./scripts/deploy.ps1, which creates it again, unencrypted and empty, and then ./scripts/capture-t2-golden.ps1.' -f $accountId) -Because 'since 2026-11-23 deploy.ps1 keeps the variable as it is, so the evidence it lists goes first, including another session''s that a session''s exports found and its status carries, which only RCA.EXPORT''s note counts (the review of a57539ed), and then it''s deleted, to be created again readable'
         $rca.evidence.encrypted | Should -BeTrue
         foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
             $script:calls | Should -Not -Contain $step
@@ -1236,7 +1331,7 @@ Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
         @{ Case = 'a reset copy isn''t released'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $true; role = 'Copy' }) }; Status = 'Fail'; Match = 'was reset, but it isn''t released yet'; Fix = 'deploy\.ps1' }
         @{ Case = 'the host''s role can''t be read'; Guest = { New-Guest -State 'Off' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Unknown' }) }; Status = 'Fail'; Match = 'can''t tell a source from a copy'; Fix = 'Don''t connect the guest by hand' }
         @{ Case = 'the guest is off without a capture'; Guest = { New-Guest -State 'Off' -Heartbeat '' }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'start of T2 \(Run all in NB_DatabaseHub_Control\), which starts an off guest.*As a last resort, run on archost01: .*Start-VM -Name arcsql01' }
-        @{ Case = 'its adapter is disconnected'; Guest = { New-Guest -Connected 0 }; Status = 'Fail'; Match = 'isn''t connected to DbHubDemoNat'; Fix = "^Run \./scripts/deploy\.ps1; .*\./scripts/destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1\. As a last resort, .*--name archost01 --command-id RunPowerShellScript --scripts 'Connect-VMNetworkAdapter -VMName arcsql01 -SwitchName DbHubDemoNat" }
+        @{ Case = 'its adapter is disconnected'; Guest = { New-Guest -Connected 0 }; Status = 'Fail'; Match = 'isn''t connected to DbHubDemoNat'; Fix = "^Run \./scripts/deploy\.ps1: archost01's GuestNetwork step connects arcsql01's network adapter to DbHubDemoNat again\. If T2\.GUEST\.STATE still says this \(a guest with no adapter, say\), run \./scripts/reset-demo\.ps1 -RebuildGuest, which makes arcsql01 again from Arc Jumpstart's image and onboards it \(about an hour\), or deploy the environment again: \./scripts/destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1\. As a last resort, .*--name archost01 --command-id RunPowerShellScript --scripts 'Connect-VMNetworkAdapter -VMName arcsql01 -SwitchName DbHubDemoNat" }
         @{ Case = 'a released capture''s guest is off'; Guest = { New-Guest -State 'Off' -Heartbeat '' -Golden ([pscustomobject]@{ released = $true; reset = $false; role = '' }) }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'Start-VM' }
         @{ Case = 'it won''t start with the host'; Guest = { New-Guest -StartAction 'StartIfRunning' }; Status = 'Warning'; Match = 'doesn''t start with the host \(automatic start action StartIfRunning\)'; Fix = 'AutomaticStartAction Start' }
         @{ Case = 'its heartbeat isn''t OK yet'; Guest = { New-Guest -Heartbeat 'NoContact' }; Status = 'Warning'; Match = 'heartbeat is NoContact'; Fix = 'again in a few minutes' }
@@ -1263,6 +1358,16 @@ Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
     It 'never offers to connect a copy that may hold the captured identity' {
         $result = Get-GuestState (New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Copy' }))
         $result.remediation | Should -Not -Match 'Connect-VMNetworkAdapter|run-command'
+    }
+
+    It 'offers reset-demo.ps1 -RebuildGuest only where Arc Jumpstart''s image makes T2 (2026-11-21)' {
+        $productKey = New-TestConfig
+        $productKey['t2SqlInstallMode'] = 'ProductKey'
+        $health = [pscustomobject]@{ status = 'Pass'; state = 'Ready'; currentStep = 'Watchdog'; t2Guest = (New-Guest -Adapters 0 -Connected 0) }
+        $result = & (Get-Module -Name DbHubDemo) { param($c, $h) Get-DemoT2GuestStateResult -Config $c -Health $h } $productKey $health
+        $result.status | Should -Be 'Fail'
+        $result.remediation | Should -Match '^Run \./scripts/deploy\.ps1: archost01''s GuestNetwork step'
+        $result.remediation | Should -Not -Match 'RebuildGuest'
     }
 
     It 'waits for a guest the build hasn''t created yet, fails one a Ready host lost, and says nothing without a Hyper-V read' {
@@ -1414,10 +1519,18 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $script:variable = $null
         $script:readFail = ''
         $script:missing = $false
+        $script:accountMissing = $false
+        $script:accountReadFail = ''
         $script:url = ''
         # The variable's properties as Resource Manager returns them, when a test sets them (an encrypted variable's).
         $script:properties = $null
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            if ($Url -notmatch '/variables/') {
+                # The control's account (Automation Account - Get), read only when the variable is missing.
+                if ($script:accountMissing) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
+                if ($script:accountReadFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = $script:accountReadFail } }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'aa-dbhub-control' }; Error = '' }
+            }
             $script:url = $Url
             if ($script:readFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = $script:readFail } }
             if ($script:missing) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
@@ -1459,16 +1572,19 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         @($answer.Documents) | Should -BeNullOrEmpty
     }
 
-    It 'lists nothing for a status the runbooks haven''t written, or a control with no such variable, and says when the read failed' {
+    It 'lists nothing for a status the runbooks haven''t written, or a control whose account doesn''t exist, and says when the read failed' {
         $script:variable = '""'
         $empty = Get-ControlPending
         $empty.Read | Should -BeTrue
         @($empty.Documents) | Should -BeNullOrEmpty
         $script:missing = $true
+        $script:accountMissing = $true
         $missing = Get-ControlPending
         $missing.Read | Should -BeFalse
-        $missing.Error | Should -BeNullOrEmpty -Because 'a control from before 2026-11-16 has no such variable, and so no session that listed any'
+        $missing.Missing | Should -BeFalse
+        $missing.Error | Should -BeNullOrEmpty -Because 'a control whose account doesn''t exist has had no session that listed any'
         $script:missing = $false
+        $script:accountMissing = $false
         $script:readFail = 'Forbidden'
         $failed = Get-ControlPending
         $failed.Read | Should -BeFalse
@@ -1476,6 +1592,22 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $script:readFail = ''
         $script:variable = '{not json'
         (Get-ControlPending).Error | Should -Be 'its value isn''t the JSON of a status'
+    }
+
+    It 'fails closed on a variable that''s missing from an account that exists, which sessions can run without (the review of 40124992)' {
+        # Since 2026-11-23 deploy.ps1 creates the variable only when it's missing: a deletion, or a deployment that couldn't
+        # create it, leaves it missing while sessions run, and their stops' lists are then only in the control vault.
+        $script:missing = $true
+        $missing = Get-ControlPending
+        $missing.Read | Should -BeFalse
+        $missing.Missing | Should -BeTrue
+        $missing.Error | Should -Be 'it doesn''t exist, though aa-dbhub-control does'
+        @($missing.Documents) | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -Times 1 -Exactly -ParameterFilter { $Method -eq 'get' -and $Url -match '/automationAccounts/aa-dbhub-control\?api-version=2024-10-23$' }
+        $script:accountReadFail = 'Timeout'
+        $unknown = Get-ControlPending
+        $unknown.Missing | Should -BeTrue
+        $unknown.Error | Should -Be 'it doesn''t exist, and whether aa-dbhub-control does couldn''t be read: Timeout'
     }
 
     It 'can''t read a variable a tenant''s policy encrypted, which Resource Manager returns with no value, rather than reading it as a status that lists nothing (2026-11-23)' {

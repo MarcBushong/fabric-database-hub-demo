@@ -265,6 +265,60 @@ Describe 'Invoke-DemoPreflight' {
         @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU').Count | Should -Be 0
     }
 
+    It 'counts a refusal over the subscription''s vCore quota on record like SkuNotAvailable, with no zone to try, and says why (F37, 2026-11-22)' {
+        Set-HappyAzMock
+        $refused = { param([string] $Sku, [string] $Zone) ConvertTo-Json -Depth 20 -InputObject @{ name = 'pgflex01'; properties = @{ provisioningState = 'Failed'; timestamp = '2026-10-26T14:11:42Z'; parameters = @{ sizing = @{ value = @{ skuName = $Sku; tier = 'GeneralPurpose' } }; availabilityZone = @{ value = $Zone } }; error = @{ code = 'DeploymentFailed'; details = @(@{ code = 'ResourceDeploymentFailure'; details = $null }) } } } }
+        # Learn's message (Resolve capacity errors, "Exceeded quota"), with obviously round figures.
+        $script:pgOperationsJson = ConvertTo-Json -Depth 20 -InputObject @(@{ properties = @{ provisioningState = 'Failed'; targetResource = @{ resourceType = 'Microsoft.DBforPostgreSQL/flexibleServers' }; statusMessage = @{ status = 'Failed'; error = @{ code = 'QuotaExceeded'; message = 'Operation could not be completed as it results in exceeding approved standardDDSv5Family Cores quota. Additional details - Current Limit: 24, Current Usage: 24, Additional Required: 4, (Minimum) New Limit Required: 28.' } } } })
+        $script:pgDeploymentJson = & $refused 'Standard_D4ds_v5' ''
+        $check = Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Match '^Azure refused T4''s Standard_D4ds_v5 at 2026-10-26T14:11:42Z \(over the subscription''s vCore quota for Azure Database for PostgreSQL here, its standardDDSv5Family Cores quota: 24 of 24 in use, 4 more needed\), so deploy\.ps1 starts with Standard_D4ads_v5'
+        $check.evidence.startSku | Should -Be 'Standard_D4ads_v5'
+
+        # A zone the configuration names isn't another place to try: a quota is the subscription's in the region.
+        $zoned = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $zoned[$key] = $config[$key] }
+        $zoned['t4AvailabilityZone'] = '2'
+        $check = Invoke-DemoPreflight -Config $zoned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Not -Match 'once more in zone'
+        $check.evidence.startSku | Should -Be 'Standard_D4ads_v5'
+
+        # A size t4SkuName sets is tried again, since room in the quota can come back, but never in another zone.
+        $zoned['t4SkuName'] = 'Standard_D4ds_v5'
+        $check = Invoke-DemoPreflight -Config $zoned -SkipWhatIf -SkipPolicyInventory | Where-Object checkId -eq 'PREFLIGHT.T4.SKU'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Match 'so deploy\.ps1 tries it again, since room in the quota can come back, and then the next size Azure accepts, cheapest first \(Standard_D4ads_v5, Standard_D2ds_v5, Standard_B2s, Standard_B1ms\)\.'
+    }
+
+    It 'logs the region''s PostgreSQL vCore usage for diagnosis only, keeps it in PREFLIGHT.T4.REPLICA''s evidence, and never judges it (F37, 2026-11-22)' {
+        Set-HappyAzMock
+        # Azure created servers past such readings (2026-11-21), so even readings over their limits change no status.
+        $script:pgUsagesJson = ConvertTo-Json -Depth 10 -InputObject @{ value = @(@{ name = @{ value = 'cores' }; currentValue = 24; limit = 24 }, @{ name = @{ value = 'standardDDSv5Family' }; currentValue = 24; limit = 4 }, @{ name = @{ value = 'standardBSFamily' }; currentValue = 0; limit = 8 }) }
+        $script:pgUsagesExit = 0
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -match '^rest --method get --url https://management\.azure\.com/subscriptions/11111111-2222-3333-4444-555555555555/providers/Microsoft\.DBforPostgreSQL/locations/westus3/resourceType/flexibleServers/usages\?api-version=\S+ ' } -MockWith {
+            if ($script:pgUsagesExit -ne 0) {
+                return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = "ERROR: (AuthorizationFailed) The client does not have authorization.`nMore lines." }
+            }
+            [pscustomobject]@{ ExitCode = 0; StdOut = $script:pgUsagesJson; StdErr = '' }
+        }
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -ceq 'For diagnosis only: Azure Database for PostgreSQL flexible server''s vCore usage in westus3 reads cores 24 of 24, standardDDSv5Family 24 of 4; T4 at Standard_D4ds_v5 takes 4 vCores, and its read replica 4 vCores more while it exists. Azure has created servers past such readings, so preflight doesn''t judge them: a refusal at creation moves the size fallback on, and says so.' }
+        $replica = $results | Where-Object checkId -EQ 'PREFLIGHT.T4.REPLICA'
+        $replica.status | Should -Be 'Pass'
+        @($replica.evidence.quotaUsage.readings) | Should -Be @('cores 24 of 24', 'standardDDSv5Family 24 of 4')
+        $replica.evidence.quotaUsage.family | Should -Be 'standardDDSv5Family'
+        @($results | Where-Object { [string]$_.status -in 'Fail', 'Warning' -and [string]$_.message -match 'quota' }) | Should -BeNullOrEmpty
+
+        # A read that fails is a line too, and preflight goes on as before.
+        $script:pgUsagesExit = 1
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -ceq 'For diagnosis only: Azure Database for PostgreSQL flexible server''s vCore usage in westus3 couldn''t be read (ERROR: (AuthorizationFailed) The client does not have authorization); T4 at Standard_D4ds_v5 takes 4 vCores, and its read replica 4 vCores more while it exists.' }
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.T4.REPLICA').status | Should -Be 'Pass'
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.T4.REPLICA').evidence.quotaUsage.error | Should -Match '^ERROR: \(AuthorizationFailed\)'
+    }
+
     It 'checks that the region offers T4''s size and PostgreSQL version, from the Location Based Capabilities API (Phase 24)' {
         Set-HappyAzMock
         $capabilities = { param([string[]] $Versions) ConvertTo-Json -Depth 10 -InputObject @{ value = @(@{ supportedServerEditions = @(@{ name = 'Burstable'; supportedServerSkus = @(@{ name = 'Standard_B1ms' }, @{ name = 'Standard_B2s' }) }, @{ name = 'GeneralPurpose'; supportedServerSkus = @(@{ name = 'Standard_D4ds_v5' }, @{ name = 'Standard_D4ads_v5' }, @{ name = 'Standard_D2ds_v5' }) }); supportedServerVersions = @($Versions | ForEach-Object { @{ name = $_ } }) }) } }
@@ -741,6 +795,126 @@ Describe 'Invoke-DemoPreflight' {
         Invoke-DemoPreflight -Config $config | Out-Null
         $script:whatIfParameters.parameters.networkMode.value | Should -Be 'public'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 2 -Exactly -ParameterFilter { $NetworkMode -eq 'public' }
+    }
+
+    It 'leaves a new T5''s private endpoint out of the estimate only after a complete inventory, and keeps it when the inventory is skipped or fails (2026-11-21, ADR 0027)' {
+        Set-HappyAzMock
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith { [pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos-dbhub-t5'; PrivateEndpointName = 'pe-cosmos-dbhub-t5' }; Exists = $false; State = 'NotFound'; FreeTier = $false; Account = $null; Error = '' } }
+        $public = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $public[$key] = $config[$key] }
+        $public['networkMode'] = 'public'
+
+        # A complete inventory without a policy on Azure Cosmos DB's public network access: no endpoint, so none is priced.
+        $complete = Invoke-DemoPreflight -Config $public -SkipWhatIf
+        $cosmos = $complete | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC'
+        $cosmos.status | Should -Be 'Pass'
+        $cosmos.evidence.privateEndpointRequired | Should -BeFalse
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 2 -Exactly -ParameterFilter { $T5PrivateEndpoint -eq $false }
+
+        # Skipped: the endpoint, which works under any policy, and the estimate prices it.
+        $skipped = Invoke-DemoPreflight -Config $public -SkipWhatIf -SkipPolicyInventory
+        $cosmos = $skipped | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC'
+        $cosmos.status | Should -Be 'Not selected'
+        $cosmos.evidence.privateEndpointRequired | Should -BeTrue
+        $cosmos.evidence.complete | Should -BeFalse
+        $cosmos.message | Should -Match 'The policy inventory didn''t run \(-SkipPolicyInventory\), so a new T5 gets a private endpoint'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 2 -Exactly -ParameterFilter { $T5PrivateEndpoint -eq $true }
+
+        # Failed: the same.
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoPolicyConstraint -MockWith { throw 'Resource Graph throttled the read' }
+        $failed = Invoke-DemoPreflight -Config $public -SkipWhatIf
+        $cosmos = $failed | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC'
+        $cosmos.status | Should -Be 'Not selected'
+        $cosmos.evidence.privateEndpointRequired | Should -BeTrue
+        $cosmos.message | Should -Match '\(the inventory failed\)'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 4 -Exactly -ParameterFilter { $T5PrivateEndpoint -eq $true }
+    }
+
+    It 'checks the T5 the template step deploys, and moves it behind its endpoint when a policy the inventory doesn''t read denies it with public network access (the review of fae05b4, 2026-11-22)' {
+        Set-HappyAzMock
+        $script:t5StateRead = 'NotFound'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoT5State -MockWith {
+            $names = [pscustomobject]@{ AccountName = 'cosmos01-abc123'; PrivateEndpointName = 'pe-dbhub-demo-cosmos01' }
+            if ($script:t5StateRead -eq 'Public') {
+                return [pscustomobject]@{ Names = $names; Exists = $true; State = 'Succeeded'; FreeTier = $false; Account = [pscustomobject]@{ properties = [pscustomobject]@{ publicNetworkAccess = 'Enabled' } }; Error = '' }
+            }
+            [pscustomobject]@{ Names = $names; Exists = $false; State = $script:t5StateRead; FreeTier = $false; Account = $null; Error = $(if ($script:t5StateRead -eq 'NotFound') { '' } else { 'AuthorizationFailed' }) }
+        }
+        # A policy assigned to the existing demo resource group, which the inventory doesn't read, as Azure refuses it.
+        $script:whatIfSent = [System.Collections.Generic.List[object]]::new()
+        $script:whatIfDenies = @('cosmos01-abc123')
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -ParameterFilter { ($ArgumentList -join ' ') -like 'deployment sub what-if *' } -MockWith {
+            $parameterFile = ($ArgumentList | Where-Object { $_ -like '@*' } | Select-Object -First 1).Substring(1)
+            $sent = Get-Content -LiteralPath $parameterFile -Raw | ConvertFrom-Json -AsHashtable
+            $script:whatIfSent.Add($sent)
+            if (@($script:whatIfDenies).Count -gt 0 -and -not $sent['parameters']['t5PrivateAccess']['value']) {
+                $details = @(foreach ($name in $script:whatIfDenies) { '{{"code":"RequestDisallowedByPolicy","target":"{0}","message":"Resource ''{0}'' was disallowed by policy. Policy identifiers: ''[{{\"policyAssignment\":{{\"name\":\"Deny public Cosmos DB (example)\"}}}}]''."}}' -f $name }) -join ','
+                return [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = ('ERROR: {{"error":{{"code":"InvalidTemplateDeployment","message":"The template deployment failed because of policy violation.","details":[{0}]}}}}' -f $details) }
+            }
+            [pscustomobject]@{ ExitCode = 0; StdOut = '{"status":"Succeeded","changes":[{"changeType":"Create"},{"changeType":"Create"}]}'; StdErr = '' }
+        }
+        $public = Get-DemoConfig -Path (Join-Path -Path $PSScriptRoot -ChildPath '../../config/demo.config.example.json')
+        foreach ($key in 'subscriptionId', 'tenantId', 't3AdminGroupObjectId') { $public[$key] = $config[$key] }
+        $public['networkMode'] = 'public'
+
+        # The inventory finds nothing, so T5 would be public: the what-if checks that, Azure denies it, and T5 gets its endpoint.
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 2
+        $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse -Because 'the what-if checks the public T5 the template step would deploy'
+        $script:whatIfSent[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        @($script:whatIfSent | ForEach-Object { [bool]$_['parameters']['t5WasPublic']['value'] }) | Should -Be @($false, $false) -Because 'a new T5 isn''t public yet'
+        $whatIf = $results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF'
+        $whatIf.status | Should -Be 'Pass'
+        $whatIf.message | Should -Match 'with T5 behind its private endpoint, because Azure Policy denies it with public network access'
+        $cosmos = @($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC')
+        $cosmos.Count | Should -Be 1
+        $cosmos[0].status | Should -Be 'Pass'
+        $cosmos[0].evidence.privateEndpointRequired | Should -BeTrue
+        $cosmos[0].evidence.reason | Should -Be 'Policy'
+        $cosmos[0].evidence.complete | Should -BeTrue
+        $cosmos[0].evidence.whatIfDenied | Should -Be 'RequestDisallowedByPolicy: Azure Policy disallowed cosmos01-abc123'
+        $cosmos[0].message | Should -Match '^The what-if found that Azure Policy denies T5 with public network access .*one assigned to the resource group'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoCostEstimate -Times 2 -Exactly -ParameterFilter { $T5PrivateEndpoint -eq $true }
+        # The template step decides from that evidence: the endpoint.
+        $decided = InModuleScope DbHubDemo -Parameters @{ Config = $public; Policy = $cosmos[0].evidence } { Resolve-DemoT5NetworkAccess -Config $Config -NetworkMode public -Policy $Policy -AccountState ([pscustomobject]@{ Names = [pscustomobject]@{ AccountName = 'cosmos01-abc123'; PrivateEndpointName = 'pe-dbhub-demo-cosmos01' }; Exists = $false; State = 'NotFound'; Account = $null; Error = '' }) }
+        $decided.PrivateAccess | Should -BeTrue
+        $decided.Reason | Should -Be 'Policy'
+
+        # A denial that names another resource too isn't T5's alone: one what-if, and its Fail, as before.
+        $script:whatIfSent.Clear()
+        $script:whatIfDenies = @('cosmos01-abc123', 'vnet-dbhub-demo')
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 1
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF').status | Should -Be 'Fail'
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.COSMOSPUBLIC').evidence.privateEndpointRequired | Should -BeFalse
+
+        # Without the policy: one what-if, of the public T5.
+        $script:whatIfSent.Clear()
+        $script:whatIfDenies = @()
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 1
+        $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF').message | Should -Not -Match 'T5'
+
+        # Not known (an account that can't be read): the endpoint, the template's default, in the what-if as in the template step.
+        $script:whatIfSent.Clear()
+        $script:whatIfDenies = @('cosmos01-abc123')
+        $script:t5StateRead = 'Unknown'
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 1
+        $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF').status | Should -Be 'Pass'
+
+        # An existing public T5 under such a policy (2026-11-22): both what-ifs keep snet-sqlvm's Azure Cosmos DB service
+        # endpoint, as the template step does while the account moves.
+        $script:whatIfSent.Clear()
+        $script:t5StateRead = 'Public'
+        $results = @(Invoke-DemoPreflight -Config $public)
+        $script:whatIfSent.Count | Should -Be 2
+        $script:whatIfSent[0]['parameters']['t5PrivateAccess']['value'] | Should -BeFalse
+        $script:whatIfSent[1]['parameters']['t5PrivateAccess']['value'] | Should -BeTrue
+        @($script:whatIfSent | ForEach-Object { [bool]$_['parameters']['t5WasPublic']['value'] }) | Should -Be @($true, $true)
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.POLICY.WHATIF').status | Should -Be 'Pass'
     }
 
     It 'skips the policy inventory with -SkipPolicyInventory and resolves auto to private' {
@@ -1365,5 +1539,260 @@ Describe 'Get-DemoDeploymentParameter' {
         { Get-DemoDeploymentParameter -Config $config -T3UseFreeLimit $true -NetworkMode private -BootstrapBundleSha256 ('a' * 64) } | Should -Throw '*BootstrapChunkCount is required*'
         { Get-DemoDeploymentParameter -Config $config -T3UseFreeLimit $true -NetworkMode private -BootstrapChunkCount 2 } | Should -Throw '*needs -BootstrapBundleSha256*'
         { Get-DemoDeploymentParameter -Config $config -T3UseFreeLimit $true -NetworkMode private -BootstrapBundleSha256 'abc' -BootstrapChunkCount 1 } | Should -Throw
+    }
+}
+
+Describe 'The Azure Automation accounts a deployment adds (PREFLIGHT.P3.AUTOMATION, F30)' {
+    BeforeEach {
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith {}
+        # Whether Azure Resource Manager has each of the two accounts: there, missing (HTTP 404), or unread.
+        $script:accountState = @{ control = 'missing'; safety = 'missing' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            $state = if ($Url -match '/automationAccounts/aa-dbhub-control\?') { $script:accountState['control'] } elseif ($Url -match '/automationAccounts/aa-dbhub-demo-safetystop\?') { $script:accountState['safety'] } else { throw ('unexpected ARM call: {0}' -f $Url) }
+            switch ($state) {
+                'there' { [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'account' }; Error = '' } }
+                'missing' { [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'ResourceNotFound' } }
+                default { [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = 'AuthorizationFailed' } }
+            }
+        }
+        # The accounts Azure Resource Graph lists in the region, by name. Live, 2026-11-21: 10 in westus3 (five environments,
+        # two each), in a Microsoft internal subscription. The fake leaves out the names a query's name !in~ (...) lists,
+        # case-insensitively, as Resource Graph does.
+        $script:others = { param([int] $Count) if ($Count -gt 0) { 1..$Count | ForEach-Object { 'aa-env{0}-account' -f $_ } } }
+        $script:regionAccounts = @(& $script:others 10)
+        $script:graphFails = $false
+        $script:graphQueries = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHubResourceGraph -MockWith {
+            $script:graphQueries.Add($Query)
+            if ($script:graphFails) {
+                return [pscustomobject]@{ Succeeded = $false; Error = 'AuthorizationFailed.'; Rows = @(); Truncated = $false }
+            }
+            $leftOut = if ($Query -match 'name !in~ \(([^)]*)\)') { @([regex]::Matches($Matches[1], "'([^']*)'") | ForEach-Object { $_.Groups[1].Value }) } else { @() }
+            $total = @($script:regionAccounts | Where-Object { $leftOut -notcontains $_ }).Count
+            [pscustomobject]@{ Succeeded = $true; Error = ''; Rows = @([pscustomobject]@{ total = $total }); Truncated = $false }
+        }
+        $script:quotaId = 'Internal_2014-09-01'
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionQuotaId -MockWith { $script:quotaId }
+        # The demo resource group: missing, deployed (a stage recorded), created (tags, no stage), or unread.
+        $script:group = 'missing'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -ParameterFilter { $ArgumentList[0] -eq 'group' -and $ArgumentList[1] -eq 'exists' } -MockWith {
+            switch ($script:group) {
+                'missing' { [pscustomobject]@{ ExitCode = 0; StdOut = "false`n"; StdErr = '' } }
+                'unread' { [pscustomobject]@{ ExitCode = 1; StdOut = ''; StdErr = 'ERROR: The operation timed out.' } }
+                default { [pscustomobject]@{ ExitCode = 0; StdOut = "true`n"; StdErr = '' } }
+            }
+        }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoResourceGroupTag -MockWith {
+            switch ($script:group) {
+                'deployed' { @{ solution = 'fabric-database-hub-demo'; DbHubDeployStage = 'Validation' } }
+                'created' { @{ costCenter = 'demo' } }
+                default { @{} }
+            }
+        }
+        $script:check = {
+            param([System.Collections.IDictionary] $Settings = $config)
+            InModuleScope -ModuleName DbHubDemo -Parameters @{ Settings = $Settings } { Get-DemoAutomationAccountQuotaResult -Config $Settings }
+        }
+    }
+
+    It 'stops a new deployment whose two accounts don''t fit, before anything is created (live, dbhubra: 10 of 10 in westus3)' {
+        $result = & $script:check
+        $result.checkId | Should -Be 'PREFLIGHT.P3.AUTOMATION'
+        $result.status | Should -Be 'Fail'
+        # Microsoft's internal offer isn't on Learn, so its default is labeled as observed (the review of F30).
+        $result.message | Should -BeExactly 'The subscription has 10 other Azure Automation account(s) in westus3; with this deployment''s aa-dbhub-control (for the session control) and aa-dbhub-demo-safetystop (for the nightly safety stop), it would have 12, more than the default quota of 10 for a Microsoft internal subscription (as observed; Learn doesn''t list this offer), so Azure would refuse them unless the subscription''s quota there is higher. Nothing was created.'
+        $result.remediation | Should -BeExactly 'The default quota for a Microsoft internal subscription is 10 per region, as observed (Learn doesn''t list this offer). If the subscription''s quota for Automation accounts in westus3 is higher (the Azure portal''s Quotas page, provider Automation accounts, shows it), set automationAccountQuota in your configuration to it, and preflight checks it. Otherwise free an Automation account in westus3: ./scripts/destroy.ps1 on a demo environment you no longer use deletes its two (Azure Resource Graph can list a deleted one for a few more minutes). Or raise the subscription''s quota for Automation accounts in westus3 (the Azure portal''s Quotas page, provider Automation accounts, or a support request), then set automationAccountQuota in your configuration to it. Or set location to another region. Then run ./scripts/deploy.ps1 again.'
+        $result.docUrl | Should -Be 'https://learn.microsoft.com/azure/azure-resource-manager/management/azure-subscription-service-limits#automation-limits'
+        $result.evidence['adds'] | Should -Be 2
+        $result.evidence['existing'] | Should -Be 10
+        $result.evidence['needed'] | Should -Be 12
+        $result.evidence['quota'] | Should -Be 10
+        $result.evidence['quotaSource'] | Should -Be 'offer'
+        $result.evidence['newDeployment'] | Should -BeTrue
+        @($script:graphQueries) | Should -Be @("resources | where type =~ 'microsoft.automation/automationaccounts' and location =~ 'westus3' and name !in~ ('aa-dbhub-control', 'aa-dbhub-demo-safetystop') | summarize total = count()")
+        # A resource group created ahead, which no run has deployed into, is a new deployment too.
+        $script:group = 'created'
+        (& $script:check).status | Should -Be 'Fail'
+    }
+
+    It 'counts the accounts it adds once when Resource Graph still lists them, deleted minutes ago (deploy.ps1 right after destroy.ps1; the review of F30)' {
+        # Resource Manager answers 404 for both, and Resource Graph still lists them, in any case.
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:regionAccounts = @('aa-dbhub-control', 'AA-DBHUB-DEMO-SAFETYSTOP')
+        $result = & $script:check
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -BeExactly 'The subscription has 0 other Azure Automation account(s) in westus3; with this deployment''s aa-dbhub-control (for the session control) and aa-dbhub-demo-safetystop (for the nightly safety stop), it would have 2, within Learn''s default quota of 2 for a pay-as-you-go subscription.'
+        $result.evidence['existing'] | Should -Be 0
+        $result.evidence['needed'] | Should -Be 2
+        # Another environment's account, deleted minutes ago, still counts: the fix says so.
+        $script:regionAccounts += 'aa-env1-account'
+        $result = & $script:check
+        $result.status | Should -Be 'Fail'
+        $result.remediation | Should -Match 'Azure Resource Graph can list a deleted one for a few more minutes'
+    }
+
+    It 'never stops an update whose accounts are there, and reads nothing more' {
+        $script:accountState = @{ control = 'there'; safety = 'there' }
+        $result = & $script:check
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -BeExactly 'This deployment adds no Azure Automation account: aa-dbhub-control and aa-dbhub-demo-safetystop are there.'
+        $script:graphQueries | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoSubscriptionQuotaId -Times 0 -Exactly
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAz -Times 0 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'group' }
+    }
+
+    It 'warns, and never stops, an environment that has deployed before and lacks its accounts (dbhubra''s next run), or when that can''t be read' {
+        $script:group = 'deployed'
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'so Azure would refuse them unless the subscription''s quota there is higher\. This environment has deployed before, so its update goes on, and DEPLOY\.CONTROL and SAFETYSTOP\.RESOURCES say what''s missing\.$'
+        $result.remediation | Should -Match '^The default quota for a Microsoft internal subscription is 10 per region, as observed '
+        $result.evidence['newDeployment'] | Should -BeFalse
+        foreach ($unreadable in 'unread', 'tagsunread') {
+            $script:group = $unreadable
+            $result = & $script:check
+            $result.status | Should -Be 'Warning' -Because $unreadable
+            $result.message | Should -Match 'Whether this is a new deployment couldn''t be read, so it goes on' -Because $unreadable
+        }
+    }
+
+    It 'passes when they fit: <Case>' -ForEach @(
+        @{ Case = 'an Enterprise subscription with 8'; QuotaId = 'EnterpriseAgreement_2014-09-01'; Others = 8; Control = 'missing'; Adds = 2; Needed = 10; Quota = 'Learn''s default quota of 10 for an Enterprise Agreement or Microsoft Customer Agreement subscription' }
+        @{ Case = 'a pay-as-you-go subscription with none'; QuotaId = 'PayAsYouGo_2014-09-01'; Others = 0; Control = 'missing'; Adds = 2; Needed = 2; Quota = 'Learn''s default quota of 2 for a pay-as-you-go subscription' }
+        @{ Case = 'Learn''s spelling of pay-as-you-go'; QuotaId = 'Pay-as-you-go_2014-09-01'; Others = 0; Control = 'missing'; Adds = 2; Needed = 2; Quota = 'Learn''s default quota of 2 for a pay-as-you-go subscription' }
+        @{ Case = 'a new environment of a prefix whose session control is there'; QuotaId = 'MSDN_2014-09-01'; Others = 0; Control = 'there'; Adds = 1; Needed = 2; Quota = 'Learn''s default quota of 2 for a Visual Studio \(MSDN\) subscription' }
+    ) {
+        $script:quotaId = $QuotaId
+        $script:regionAccounts = @(& $script:others $Others)
+        $script:accountState['control'] = $Control
+        $listed = $Others
+        if ($Control -eq 'there') {
+            # Resource Graph counts an account that's there: Resource Manager answered for the ones the deployment adds.
+            $script:regionAccounts += 'aa-dbhub-control'
+            $listed++
+        }
+        $result = & $script:check
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match ('^The subscription has {0} other Azure Automation account\(s\) in westus3; with this deployment''s .+, it would have {1}, within {2}\.$' -f $listed, $Needed, $Quota)
+        $result.evidence['adds'] | Should -Be $Adds
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoAz -Times 0 -Exactly -ParameterFilter { $ArgumentList[0] -eq 'group' }
+    }
+
+    It 'stops a new pay-as-you-go deployment that one account already in the region leaves no room for' {
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:regionAccounts = @(& $script:others 1)
+        $result = & $script:check
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match '^The subscription has 1 other Azure Automation account\(s\) in westus3; with this deployment''s .+, it would have 3, more than Learn''s default quota of 2 for a pay-as-you-go subscription, so Azure would refuse them unless the subscription''s quota there is higher\. Nothing was created\.$'
+    }
+
+    It 'calls an offer''s default the default, not the quota, and leads its fix with automationAccountQuota (the review of F30: an Enterprise subscription with 9)' {
+        $script:quotaId = 'EnterpriseAgreement_2014-09-01'
+        $script:regionAccounts = @(& $script:others 9)
+        $result = & $script:check
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -BeExactly 'The subscription has 9 other Azure Automation account(s) in westus3; with this deployment''s aa-dbhub-control (for the session control) and aa-dbhub-demo-safetystop (for the nightly safety stop), it would have 11, more than Learn''s default quota of 10 for an Enterprise Agreement or Microsoft Customer Agreement subscription, so Azure would refuse them unless the subscription''s quota there is higher. Nothing was created.'
+        $result.message | Should -Not -Match 'where its quota is'
+        $result.remediation | Should -Match '^Learn''s default quota for an Enterprise Agreement or Microsoft Customer Agreement subscription is 10 per region\. If the subscription''s quota for Automation accounts in westus3 is higher \(the Azure portal''s Quotas page, provider Automation accounts, shows it\), set automationAccountQuota in your configuration to it, and preflight checks it\. Otherwise free an Automation account in westus3: '
+    }
+
+    It 'uses automationAccountQuota, a quota that was raised, in place of the offer''s default' {
+        $config['automationAccountQuota'] = 15
+        try {
+            $script:regionAccounts = @(& $script:others 13)
+            $result = & $script:check
+            $result.status | Should -Be 'Pass'
+            $result.message | Should -Match ', it would have 15, within its quota of 15 \(automationAccountQuota\)\.$'
+            $result.evidence['quotaSource'] | Should -Be 'configuration'
+            $script:regionAccounts = @(& $script:others 14)
+            $result = & $script:check
+            $result.status | Should -Be 'Fail'
+            # The quota the configuration gives is the quota: no "unless", and the fix frees or raises.
+            $result.message | Should -Match ', it would have 16, more than its quota of 15 \(automationAccountQuota\), so Azure would refuse them\. Nothing was created\.$'
+            $result.remediation | Should -Match '^Free an Automation account in westus3: '
+        }
+        finally {
+            $config.Remove('automationAccountQuota')
+        }
+    }
+
+    It 'warns when the region has more accounts than the offer''s default: a raised quota it can''t read' {
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:regionAccounts = @(& $script:others 5)
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match '^The subscription has 5 other Azure Automation account\(s\) in westus3, more than Learn''s default quota of 2 for a pay-as-you-go subscription, so its quota there is higher, by how much can''t be read'
+        $result.remediation | Should -Match '^Set automationAccountQuota in your configuration to the subscription''s quota for Automation accounts in westus3 '
+    }
+
+    It 'passes two accounts in an empty region for an offer Learn names no default for, and warns above that' {
+        $script:quotaId = 'MSDNDevTest_2014-09-01'
+        $script:regionAccounts = @()
+        $result = & $script:check
+        $result.status | Should -Be 'Pass'
+        $result.evidence['quotaSource'] | Should -Be 'unknown'
+        $script:regionAccounts = @(& $script:others 3)
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match 'Learn names no default quota of Automation accounts for its offer, MSDNDevTest_2014-09-01, so whether '
+        $script:quotaId = ''
+        (& $script:check).message | Should -Match 'for its offer, which couldn''t be read, so whether '
+    }
+
+    It 'stops a new deployment in a Free Trial subscription, whose one account per region can''t be raised' {
+        $script:quotaId = 'FreeTrial_2014-09-01'
+        $script:regionAccounts = @()
+        $result = & $script:check
+        $result.status | Should -Be 'Fail'
+        $result.message | Should -Match ', it would have 2, more than Learn''s default quota of 1 for a Free Trial subscription, which can''t be raised, so Azure would refuse them\. Nothing was created\.$'
+        $result.remediation | Should -Match '^A Free Trial subscription has at most one Automation account per region, in East US, East US 2, West US, North Europe, Southeast Asia, and Japan West 2 only, and its quota can''t be raised, while every demo environment has two: use a pay-as-you-go or Enterprise subscription'
+    }
+
+    It 'warns when the accounts can''t be counted, or only an account it can''t read would be over' {
+        $script:graphFails = $true
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -BeExactly 'The subscription''s Azure Automation accounts in westus3 couldn''t be counted (AuthorizationFailed), so whether this deployment''s aa-dbhub-control (for the session control) and aa-dbhub-demo-safetystop (for the nightly safety stop) fit its quota there isn''t known.'
+        $script:graphFails = $false
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:regionAccounts = @('aa-dbhub-demo-safetystop', 'aa-env1-account')
+        $script:accountState = @{ control = 'unread'; safety = 'there' }
+        $result = & $script:check
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -BeExactly 'The subscription has 2 other Azure Automation account(s) in westus3; with this deployment''s aa-dbhub-control (for the session control), it would have 3, more than Learn''s default quota of 2 for a pay-as-you-go subscription. Whether aa-dbhub-control is there couldn''t be read: if it isn''t, Azure would refuse it unless the subscription''s quota there is higher; if it is, nothing is added. So preflight goes on, and DEPLOY.CONTROL and SAFETYSTOP.RESOURCES say what''s missing.'
+        $result.remediation | Should -Match '^Nothing to do now\. '
+    }
+
+    It 'counts an account it can''t read once, whether it''s there or not' {
+        $script:quotaId = 'PayAsYouGo_2014-09-01'
+        $script:accountState = @{ control = 'unread'; safety = 'missing' }
+        foreach ($listed in @(@('aa-env1-account'), @('aa-env1-account', 'aa-dbhub-control'))) {
+            # The region after the deployment has the other account, the session control's, and the safety stop's: 3 of 2.
+            $script:regionAccounts = $listed
+            $result = & $script:check
+            $result.status | Should -Be 'Fail' -Because ($listed -join ', ')
+            $result.evidence['needed'] | Should -Be 3 -Because ($listed -join ', ')
+            $result.message | Should -Match ' Whether aa-dbhub-control is there couldn''t be read, so it counts as added\. Nothing was created\.$'
+        }
+        # One account of room: it fits either way.
+        $script:regionAccounts = @()
+        $result = & $script:check
+        $result.status | Should -Be 'Pass'
+        $result.message | Should -Match ', it would have 2, within Learn''s default quota of 2 for a pay-as-you-go subscription\. Whether aa-dbhub-control is there couldn''t be read, so it counts as added\.$'
+    }
+
+    It 'runs in preflight after the public IP check, and a Fail there fails preflight' {
+        $script:policyAssignmentsJson = '{"value":[]}'
+        $script:groupOwnersJson = '{"value":[{"id":"88888888-8888-8888-8888-888888888888"}]}'
+        $script:whatIfParameters = $null
+        $script:pgCapabilitiesJson = '{}'
+        $script:pgDeploymentJson = '{}'
+        $script:pgOperationsJson = '[]'
+        Set-HappyAzMock
+        $results = @(Invoke-DemoPreflight -Config $config -SkipWhatIf -SkipPolicyInventory)
+        $ids = @($results | ForEach-Object { [string]$_.checkId })
+        $ids.IndexOf('PREFLIGHT.P3.AUTOMATION') | Should -Be ($ids.IndexOf('PREFLIGHT.P3.PUBLICIP') + 1)
+        ($results | Where-Object checkId -EQ 'PREFLIGHT.P3.AUTOMATION').status | Should -Be 'Fail'
+        (Get-DemoExitCode -Result $results) | Should -Not -Be 0
     }
 }

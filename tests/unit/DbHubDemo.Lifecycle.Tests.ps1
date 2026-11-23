@@ -1014,6 +1014,20 @@ Describe 'Invoke-DemoDeployment' {
         ($results | Where-Object { $_.checkId -eq 'WORKLOAD.T5.WARMUP' }).status | Should -Be 'Pass'
     }
 
+    It 'gives T5''s warm-up the service endpoint''s wait only when T5.NETWORK found T1''s subnet rule (-Sequential; 2026-11-21, ADR 0027)' {
+        Mock -ModuleName DbHubDemo -CommandName Restore-DemoSqlVmMonitoringPlugin -MockWith { New-TestResult 'DEPLOY.T1.MONITORING' 'Pass' 't1' 'T1' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT5 -MockWith { New-DemoResult -CheckId 'T5.NETWORK' -Area 't5' -Target 'T5' -Status 'Pass' -Message 'T5''s network.' -Evidence @{ path = $script:t5Path } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -MockWith { New-TestResult 'WORKLOAD.T5.WARMUP' 'Pass' 'workload' 'T5' }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoT4 -MockWith { New-TestResult 'T4.SERVER' 'Pass' 't4' 'T4' }
+        foreach ($path in 'ServiceEndpoint', 'PrivateEndpoint') {
+            $script:t5Path = $path
+            $script:state = New-TestState @{ Stage = 'T3'; BundleSha256 = $script:sha; BundleChunkCount = 1; BundleSentTo = @('archost01', 'sqlvm01'); RunnerSha256 = $script:runnerSha; RunnerChunkCount = 7; RunnerSentTo = @('archost01', 'sqlvm01') }
+            $null = Invoke-DemoDeployment -Config (New-TestConfig -WithT5) -Resume -StopAfter T4
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -Times 1 -Exactly -ParameterFilter { [bool]$ServiceEndpoint }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -Times 1 -Exactly -ParameterFilter { -not [bool]$ServiceEndpoint }
+    }
+
     It 'goes on without T5 when the template left it out, and says so on the Infrastructure stage (-Sequential; review, 2026-11-19)' {
         Mock -ModuleName DbHubDemo -CommandName Test-DemoT5 -MockWith { $script:order.Add('TestT5'); New-TestResult 'T5.ACCOUNT' 'Pass' 't5' 'T5' }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT5WarmUp -MockWith { $script:order.Add('WarmT5'); New-TestResult 'WORKLOAD.T5.WARMUP' 'Pass' 'workload' 'T5' }
@@ -1187,6 +1201,11 @@ Describe 'Invoke-DemoDeployment' {
         $failed = Invoke-DemoDeployment -Config $config
         ($failed | Where-Object { $_.checkId -eq 'DEPLOY.STAGE.FABRIC' }).status | Should -Be 'Fail'
         $script:order | Should -Not -Contain 'DoneGate'
+    }
+
+    It 'brings the demo''s notebooks that nobody edited up to date while fabric.importNotebooks is false, and keeps an edited one: the Fabric stage asks configure-fabric.ps1 for -KeepEditedNotebooks (follow-ups decision 2a, 2026-11-23)' {
+        $null = Invoke-DemoDeployment -Config $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['KeepEditedNotebooks'] -and -not $PesterBoundParameters.ContainsKey('NewNotebooksOnly') }
     }
 
     It 'starts the Insights app''s sign-in before its stages and runs the app''s step after the report; a failed app never stops the stage or keeps the run from DONE (-Sequential, 2026-11-05)' {
@@ -1637,6 +1656,26 @@ Describe 'Invoke-DemoDeployment' {
         $script:order.Clear()
         Invoke-DemoDeployment -Config $config -StopAfter Infrastructure | Out-Null
         $script:order | Should -Not -Contain 'KeyVault' -Because 'the default path creates no vault'
+    }
+}
+
+Describe 'Invoke-DemoFabricStage: the notebook mode it gives configure-fabric.ps1 (follow-ups decision 2a, 2026-11-23)' {
+    BeforeAll {
+        $config = New-TestConfig
+    }
+
+    It 'asks for -KeepEditedNotebooks while fabric.importNotebooks is false, every notebook with -ImportNotebooks, and no import with neither' {
+        # -KeepEditedNotebooks: a notebook that nobody edited is brought up to date, and an edited one is kept. With
+        # -ImportNotebooks (fabric.importNotebooks true, or deploy.ps1 -ImportNotebooks), every notebook is updated, edited
+        # or not; with neither (validate.ps1's checklist), none is imported.
+        $script:modes = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRepositoryScript -MockWith { $script:modes.Add((@($Argument.Keys | Where-Object { [string]$_ -in 'KeepEditedNotebooks', 'NewNotebooksOnly', 'SkipNotebookImport' } | Sort-Object) -join ',')) }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } {
+            $null = Invoke-DemoFabricStage -Config $Config -KeepEditedNotebooks
+            $null = Invoke-DemoFabricStage -Config $Config -KeepEditedNotebooks -ImportNotebooks
+            $null = Invoke-DemoFabricStage -Config $Config
+        }
+        $script:modes.ToArray() | Should -Be @('KeepEditedNotebooks', '', 'SkipNotebookImport')
     }
 }
 
@@ -2145,6 +2184,9 @@ Describe 'Stop-DemoEnvironment' {
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningRelease -MockWith { $script:order.Add('Release'); [pscustomobject]@{ Ran = $true; Released = $true; RestoredState = 'DEFAULT'; Error = '' } }
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3AutoTuningCheck -MockWith { $script:order.Add('AutoTuning'); New-TestResult 'STOP.T3.AUTOTUNING' 'Pass' 'infra' 'T3' }
             Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaScriptExport -MockWith { $script:order.Add('ScriptsExport'); [pscustomobject]@{ Results = @(); Evidence = '' } }
+            # The RCA sidecars (2026-11-23): fetched only beside the scripts' own export.
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $script:order.Add('SidecarFetch'); $null }
+            Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarSave -MockWith { $null }
             # The T2 host's Run Commands, which the handoff reads for the host password's (review of f5972d2d): none by default.
             $script:hostCommands = @()
             Mock -ModuleName DbHubDemo -CommandName Get-DemoVmRunCommandLeftover -MockWith { $script:order.Add('HostList'); [pscustomobject]@{ Ok = $true; Error = ''; Items = @($script:hostCommands) } }
@@ -2213,6 +2255,7 @@ Describe 'Stop-DemoEnvironment' {
             Mock -ModuleName DbHubDemo -CommandName Suspend-DemoFabricCapacity -MockWith { New-TestResult 'STOP.FABRIC.CAPACITY' 'Not selected' 'fabric' 'fabric' }
             $results = @(Stop-DemoEnvironment -Config $config -SaveHistory -Confirm:$false)
             $script:order | Should -Not -Contain 'ScriptsExport'
+            $script:order | Should -Not -Contain 'SidecarFetch' -Because 'the sidecars stay on the VMs for the next save, as the evidence goes to the control''s stop'
             Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -Times 1 -Exactly -ParameterFilter { $RcaEvidence -eq '' }
             # It says so (review of f5972d2d): the session's evidence is the control vault's, for the session's own save.
             (@($results | Where-Object { $_.checkId -eq 'STOP.FABRIC.SAVEHISTORY' })[0]).message | Should -Match ' It''s without the Run all session''s Incident RCA evidence, which the session control''s stop kept in the control vault: the next Run all that starts a session within 7 days saves it, or Run all''s own save at the session''s planned end does, if the capacity stays on; after 7 days, nothing saves it\. To save it at once, stop a session with Stop now in NB_DatabaseHub_Control instead\.$'
@@ -2221,6 +2264,7 @@ Describe 'Stop-DemoEnvironment' {
             $script:power = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
             $results = @(Stop-DemoEnvironment -Config $config -SaveHistory -Confirm:$false)
             $script:order | Should -Contain 'ScriptsExport'
+            $script:order | Should -Contain 'SidecarFetch'
             $script:order | Should -Not -Contain 'Handoff'
             (@($results | Where-Object { $_.checkId -eq 'STOP.FABRIC.SAVEHISTORY' })[0]).message | Should -Not -Match 'Incident RCA evidence'
         }
@@ -3121,6 +3165,23 @@ Describe 'Get-DemoEnvironmentStatus' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoSqlVmMonitoring -Times 1 -Exactly
     }
 
+    It 'names the step behind a Ready VM''s Warning on STATUS.VM_SQLVM01 (F24, 2026-11-20)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'sqlvm01') { 'PowerState/running' } else { 'PowerState/deallocated' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ status = 'Warning'; state = 'Ready'; message = 'Every step is in the desired state.'; warningCount = 1; warnings = @('AssociatedServices: SQL Server setup asked for a restart; the next start completes it.') } }
+        $vm = Get-DemoEnvironmentStatus -Config $config | Where-Object { $_.checkId -eq 'STATUS.VM_SQLVM01' }
+        $vm.status | Should -Be 'Warning'
+        $vm.message | Should -Be 'sqlvm01 is running; bootstrap Ready: Every step is in the desired state. Its bootstrap has a warning: AssociatedServices: SQL Server setup asked for a restart; the next start completes it. That''s expected: SQL Server setup asks for a restart when it removes Analysis Services and Integration Services from a new T1.'
+        $vm.evidence.warningCount | Should -Be 1
+    }
+
+    It 'passes STATUS.VM_SQLVM01 for a Ready VM whose bootstrap recorded its by-design notes as information, and names them (2026-11-23)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'sqlvm01') { 'PowerState/running' } else { 'PowerState/deallocated' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ status = 'Pass'; state = 'Ready'; message = 'Every step is in the desired state.'; warningCount = 0; warnings = @(); noteCount = 1; notes = @('SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.') } }
+        $vm = Get-DemoEnvironmentStatus -Config $config | Where-Object { $_.checkId -eq 'STATUS.VM_SQLVM01' }
+        $vm.status | Should -Be 'Pass'
+        $vm.message | Should -Be 'sqlvm01 is running; bootstrap Ready: Every step is in the desired state. Its bootstrap noted, as information: SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure. That''s expected: a new T1 needs the sysadmin recovery, because its image''s SQL IaaS Agent least-privilege mode doesn''t make SYSTEM a sysadmin.'
+        $vm.evidence.noteCount | Should -Be 1
+    }
     It 'flags T2''s guest that a golden capture left air-gapped while archost01 runs, from the same health read (live, 2026-11-03)' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'archost01') { 'PowerState/running' } else { 'PowerState/deallocated' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {
@@ -3558,6 +3619,69 @@ Describe 'Leftover managed Run Commands: start-demo.ps1''s cleanup and status.ps
         $script:listed['arcsql01'] = @(New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-001' 'Succeeded' 'Deleting')
         $other = InModuleScope DbHubDemo -Parameters @{ Config = $evaluation } { Get-DemoRunCommandStatus -Config $Config -VmName @('arcsql01') -Running @{} }
         $other.status | Should -Be 'Pass'
+    }
+
+    It 'status.ps1 leaves out a time-stamped Run Command Azure began deleting minutes ago, such as its own health read on the T2 host, and older ones still warn (the review of F31)' {
+        $now = [DateTime]::UtcNow
+        $at = { param([double] $MinutesAgo) $now.AddMinutes(-$MinutesAgo).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+        # status.ps1's own health read runs under a fresh name whose delete isn't waited for (F31): seconds later, Azure
+        # lists it in Deleting. The control's names end in a time too.
+        $read = 'DbHubDemo-HealthRead-{0}' -f (& $at 0.5)
+        $control = 'DbHubControl-archost01-{0}' -f (& $at 14)
+        $script:listed['archost01'] = @(
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand $read 'Succeeded' 'Deleting'
+            New-RunCommand $control 'Succeeded' 'Deleting'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('archost01') -Running @{ archost01 = $true } }
+        $result.status | Should -Be 'Pass'
+        @($result.evidence.deletingRecently) | Should -Be @(('archost01/{0}' -f $read), ('archost01/{0}' -f $control))
+        @($result.evidence.markedForDeletion) | Should -BeNullOrEmpty
+
+        # A delete that has gone on longer still goes with a VM agent that isn't working (R871), and so does a name with no time.
+        $old = 'DbHubDemo-HealthRead-{0}' -f (& $at 20)
+        $script:listed['archost01'] += @(
+            New-RunCommand $old 'Succeeded' 'Deleting'
+            New-RunCommand 'DbHubDemo-Chunk-a8a10d93133c-001' 'Succeeded' 'Deleting'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('archost01') -Running @{ archost01 = $true } }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Match ('^2 Run Command\(s\) on archost01, T2''s host, are marked for deletion, and Azure hasn''t finished deleting them: archost01/{0}, archost01/DbHubDemo-Chunk-a8a10d93133c-001\. ' -f [regex]::Escape($old))
+        @($result.evidence.deletingRecently).Count | Should -Be 2
+    }
+
+    It 'status.ps1 counts every chunk Azure is deleting on the T2 host, whatever its name, even one that ends in a time minutes old (the review of 8ff25e95: R871''s sign)' {
+        $now = [DateTime]::UtcNow
+        $recent = $now.AddMinutes(-2).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
+        # A chunk whose name Azure held runs under <name>-<time> (2026-11-16); a send's own suffix is no time.
+        $heldChunk = 'DbHubDemo-Chunk-a8a10d93133c-001-s5e0d01-{0}' -f $recent
+        $sentChunk = 'DbHubDemo-Chunk-a8a10d93133c-002-s5e0d01'
+        $read = 'DbHubDemo-HealthRead-{0}' -f $recent
+        $script:listed['archost01'] = @(
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand $heldChunk 'Succeeded' 'Deleting'
+            New-RunCommand $sentChunk 'Succeeded' 'Deleting'
+            New-RunCommand $read 'Succeeded' 'Deleting'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('archost01') -Running @{ archost01 = $true } }
+        $result.status | Should -Be 'Warning'
+        @($result.evidence.markedForDeletion) | Should -Be @(('archost01/{0}' -f $heldChunk), ('archost01/{0}' -f $sentChunk))
+        @($result.evidence.deletingRecently) | Should -Be @(('archost01/{0}' -f $read)) -Because 'a read''s delete in flight is still left out'
+    }
+
+    It 'status.ps1 counts an action''s finished copy under a fresh name as left over, not as the loader that stays by design, and leaves one that runs (the review of F31)' {
+        $now = [DateTime]::UtcNow
+        $at = { param([double] $MinutesAgo) $now.AddMinutes(-$MinutesAgo).ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture) }
+        $loaderCopy = 'DbHubDemo-Bootstrap-{0}' -f (& $at 90)
+        $script:listed['sqlvm01'] = @(
+            New-RunCommand 'DbHubDemo-Bootstrap'
+            New-RunCommand $loaderCopy 'Succeeded'
+            New-RunCommand ('DbHubDemo-HostPassword-{0}' -f (& $at 1)) 'Running'
+        )
+        $result = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoRunCommandStatus -Config $Config -VmName @('sqlvm01') -Running @{ sqlvm01 = $true } }
+        $result.status | Should -Be 'Warning'
+        $result.message | Should -Be ('1 managed Run Command(s) are left on the demo VMs: sqlvm01/{0}.' -f $loaderCopy)
+        $result.remediation | Should -Match ([regex]::Escape('the next run of the step that made a DbHubDemo-* one deletes it first (one under a fresh name, DbHubDemo-<name>-<time>, once its own run has stopped waiting for it, an hour or more after its time)'))
     }
 
     It 'a control Run Command is finished when its state is terminal, or empty or Unknown an hour after the time in its name: <Name> <State>' -ForEach @(
@@ -4736,12 +4860,91 @@ Describe 'Reset-DemoWorkload' {
         ($results | Where-Object { $_.checkId -eq 'RESET.T1' }).message | Should -Match 'activity profile is off'
     }
 
-    It 'skips targets whose VM isn''t running, and doesn''t support rebuilding the guest yet' {
+    It 'skips targets whose VM isn''t running' {
         $script:power = 'PowerState/deallocated'
-        $results = Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false
+        $results = Reset-DemoWorkload -Config $config -Confirm:$false
         $script:calls.Count | Should -Be 0
-        ($results | Where-Object { $_.checkId -eq 'RESET.GUEST' }).status | Should -Be 'Not supported'
         ($results | Where-Object { $_.checkId -eq 'RESET.T1' }).status | Should -Be 'Not selected'
+    }
+}
+
+Describe 'Reset-DemoWorkload -RebuildGuest: the T2 guest made again from Arc Jumpstart''s image (2026-11-21)' {
+    BeforeAll {
+        $config = New-TestConfig
+    }
+
+    BeforeEach {
+        $script:calls = [System.Collections.Generic.List[object]]::new()
+        $script:power = 'PowerState/running'
+        $script:health = [pscustomobject]@{ state = 'Ready'; t2Guest = [pscustomobject]@{ present = $true; state = 'Running'; adapters = 1; connected = 0 } }
+        $script:runSucceeded = $true
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' 'Pass' 'preflight' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoDeploymentState -MockWith { New-TestState @{ RunnerSha256 = $script:runnerSha; RunnerSentTo = @('sqlvm01', 'archost01') } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { $script:power }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:health }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { $script:calls.Add($Target); [pscustomobject]@{ Status = 'Pass'; ExitCode = 0; Records = @(); Result = (New-TestResult 'WORKLOAD.T1.COMMAND' 'Pass' 'workload' 'T1') } }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -MockWith {
+            $script:calls.Add(('{0}:{1}:{2}' -f $VmName, $RunCommandName, $Parameter['RequestId']))
+            [pscustomobject]@{ Succeeded = $script:runSucceeded; Output = 'DBHUBDEMO-GUESTREBUILD requested'; Error = $(if ($script:runSucceeded) { '' } else { 'The guest rebuild request failed: access denied' }) }
+        }
+    }
+
+    It 'asks archost01 for the rebuild with the request script, and resets no target' {
+        $results = @(Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false)
+        $guest = $results | Where-Object checkId -EQ 'RESET.GUEST'
+        $guest.status | Should -Be 'Pass'
+        $guest.message | Should -Match '^archost01 is asked to make its guest arcsql01 again from Arc Jumpstart''s image \(rebuild-\d{8}-\d{6}\)\. The \./scripts/deploy\.ps1 -FromStage Artifacts run that follows does it'
+        $guest.evidence.requestId | Should -Match '^rebuild-\d{8}-\d{6}$'
+        @($script:calls) | Should -HaveCount 1
+        $script:calls[0] | Should -Be ('archost01:DbHubDemo-GuestRebuild:{0}' -f $guest.evidence.requestId)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 1 -Exactly -ParameterFilter { $Script -match 'guest-rebuild-request\.json' -and $Script -match 'DBHUBDEMO-GUESTREBUILD' }
+        @($results | Where-Object { [string]$_.checkId -like 'RESET.T*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'asks nothing <Case>' -ForEach @(
+        @{ Case = 'while archost01 isn''t running'; Power = 'PowerState/deallocated'; Health = $null; Status = 'Not selected'; Message = 'archost01 isn''t running \(PowerState/deallocated\)'; Fix = 'start-demo\.ps1, then run \./scripts/reset-demo\.ps1 -RebuildGuest again' }
+        @{ Case = 'while a golden capture is in progress'; Power = 'PowerState/running'; Health = [pscustomobject]@{ t2Guest = [pscustomobject]@{ present = $true; capture = [pscustomobject]@{ state = 'Active' } } }; Status = 'Fail'; Message = 'a golden capture is in progress on archost01'; Fix = 'T2\.GUEST\.STATE' }
+        @{ Case = 'for a copy whose golden record isn''t released'; Power = 'PowerState/running'; Health = [pscustomobject]@{ t2Guest = [pscustomobject]@{ present = $true; golden = [pscustomobject]@{ released = $false; reset = $false; role = 'Copy' } } }; Status = 'Fail'; Message = 'golden capture record that isn''t released'; Fix = 'T2\.GUEST\.STATE' }
+        @{ Case = 'for a released copy that was never reset'; Power = 'PowerState/running'; Health = [pscustomobject]@{ t2Guest = [pscustomobject]@{ present = $true; golden = [pscustomobject]@{ released = $true; reset = $false; role = 'Copy' } } }; Status = 'Fail'; Message = 'Arc identity was never reset'; Fix = 'T2\.GUEST\.STATE' }
+    ) {
+        $script:power = $Power
+        $script:health = $Health
+        $guest = @(Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false) | Where-Object checkId -EQ 'RESET.GUEST'
+        $guest.status | Should -Be $Status
+        $guest.message | Should -Match $Message
+        $guest.remediation | Should -Match $Fix
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
+    }
+
+    It 'asks nothing in a build mode or the evaluation-only mode, and says how to start T2 over' {
+        foreach ($override in @(@{ t2SqlInstallMode = 'ProductKey' }, @{ t2SqlInstallMode = 'Developer' }, @{ t2Mode = 'EvaluationOnlyAzureVm' })) {
+            $modeConfig = New-TestConfig
+            foreach ($key in $override.Keys) {
+                $modeConfig[$key] = $override[$key]
+            }
+            $guest = @(Reset-DemoWorkload -Config $modeConfig -RebuildGuest -Confirm:$false) | Where-Object checkId -EQ 'RESET.GUEST'
+            $guest.status | Should -Be 'Not supported' -Because ($override | ConvertTo-Json -Compress)
+            $guest.remediation | Should -Match 'destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1'
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
+    }
+
+    It 'asks anyway when the host''s health can''t be read, since the host checks again; and fails, changing nothing, when the request can''t be written' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'Run Command conflict' }
+        (@(Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false) | Where-Object checkId -EQ 'RESET.GUEST').status | Should -Be 'Pass'
+        $script:runSucceeded = $false
+        $failed = @(Reset-DemoWorkload -Config $config -RebuildGuest -Confirm:$false) | Where-Object checkId -EQ 'RESET.GUEST'
+        $failed.status | Should -Be 'Fail'
+        $failed.message | Should -Match 'access denied'
+        $failed.remediation | Should -Match 'reset-demo\.ps1 -RebuildGuest again'
+    }
+
+    It 'only says what it would do with -WhatIf' {
+        $guest = @(Reset-DemoWorkload -Config $config -RebuildGuest -WhatIf) | Where-Object checkId -EQ 'RESET.GUEST'
+        $guest.status | Should -Be 'Not selected'
+        $guest.message | Should -Match '^What if: archost01 would be asked'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoVmRunCommand -Times 0 -Exactly
     }
 }
 

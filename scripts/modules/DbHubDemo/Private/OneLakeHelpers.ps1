@@ -103,10 +103,16 @@ function Invoke-DemoOneLakeRequest {
         $request['ContentType'] = 'application/octet-stream'
     }
     $response = Invoke-DemoTransientRetry -Send { param([hashtable] $Call) Invoke-WebRequest @Call } -State $request -Target ([uri]$uri).Host -NotIdempotent:$NotIdempotent
+    # A file's content (Path - Read) comes back as bytes unless its content type is text: as UTF-8 text here (2026-11-23,
+    # the RCA sidecar's acknowledgement), never as a list of byte values.
+    $content = $response.Content
+    if ($content -is [byte[]]) {
+        $content = [System.Text.Encoding]::UTF8.GetString($content)
+    }
     [pscustomobject]@{
         StatusCode = [int]$response.StatusCode
         Headers    = $response.Headers
-        Content    = [string]$response.Content
+        Content    = [string]$content
     }
 }
 

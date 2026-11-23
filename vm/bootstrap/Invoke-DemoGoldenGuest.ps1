@@ -24,7 +24,8 @@ Actions:
   removes the sign-in data that setup leaves on the VM again and
   checks that none remains, turns IE ESC back on when it's off, deletes the Incident RCA's capture in the guest
   (C:\ProgramData\DbHubDemo\rca, after stopping the workload runner, which the next boot starts again) so the
-  snapshot carries none, writes the capture record
+  snapshot carries none, unless it holds sidecars that aren't in the history yet (2026-11-23; then nothing is
+  captured), writes the capture record
   C:\ProgramData\DbHubDemo\golden\capture.json (the snapshot name, this host's Azure VM ID, and the guest's
   Arc identity), applies the air gap (the guest's automatic start action becomes Nothing, and its network
   adapter is disconnected), then shuts the guest down cleanly and confirms it's off.
@@ -50,6 +51,10 @@ Actions:
   security group denies all outbound traffic). With KeepIsolated, the adapter stays disconnected.
 - RotateGuestPassword: a new random password for the guest administrator, stored with DPAPI as pending,
   set in the guest, proven with a new session, then promoted; the old one is set back if the new one fails.
+- RcaSidecars: read-only (2026-11-23). The Incident RCA's sidecars in the guest's store that aren't in the history
+  yet: sealed ones its runner's ledger doesn't mark acknowledged, spans with rows not sealed yet, and whether the
+  ledger can be read, counted as Prepare's RCA step counts them. Prepare also refuses to delete a store that holds
+  any of them, so a check that went stale can't lose one.
 
 Sources (checked 2026-10-21):
 - https://learn.microsoft.com/azure/azure-arc/servers/azcmagent-disconnect (--force-local-only)
@@ -64,7 +69,7 @@ The last line of output is one compact JSON object; errors go to standard error.
 action succeeded.
 
 .PARAMETER Action
-Inspect, Prepare, Release, or RotateGuestPassword.
+Inspect, Prepare, Release, RotateGuestPassword, or RcaSidecars.
 
 .PARAMETER SnapshotName
 The golden snapshot's name, recorded by Prepare.
@@ -630,9 +635,106 @@ $script:GuestRcaClearBlock = {
     # Stop-DemoVmWorkload does: the DbHubDemo-Workload task, then any runner process on the workload's .NET runtime. The
     # guest shuts down next, and the task starts the runner again at its next boot. When the store can't be deleted, the
     # task starts again at once, and the caller captures nothing.
-    param($StoreRoot, $RuntimeRoot, $WaitSeconds)
+    # The sidecar (2026-11-23, rca/README.md, The sidecar): the store also keeps Query Store's evidence until the history
+    # has it, sealed in sidecars\ until the runner's ledger marks it acknowledged, and as rows not sealed yet in a span's
+    # own file. Once the runner is stopped, the store isn't deleted while it holds either, or a ledger that can't be
+    # read, so a check that went stale can't lose one (the capture's guard asked first: Invoke-GoldenRcaSidecarCheck). With
+    # CheckOnly, the block only counts them, and changes nothing.
+    param($StoreRoot, $RuntimeRoot, $WaitSeconds, $CheckOnly)
     $ErrorActionPreference = 'Continue'
-    $result = [ordered]@{ spans = 0; notExported = 0; runnersStopped = 0; taskStopped = $false; left = $false; error = '' }
+    # The runner's names for what isn't in the history yet (T1a's hand-off and the contract's 61eced5d, 2026-11-23): a
+    # span's unsealed rows, sidecar-<target>.rows (the one constant for them; a span's *.jsonl is evidence, never a
+    # sidecar), a sealed sidecar's file in sidecars\ (<documentId>.json.gz), and the ledger beside them (ledger.json, with
+    # its lock and the copies the runner keeps aside, all ledger.*).
+    $unsealedFilter = 'sidecar-*.rows'
+    $sidecarIdPattern = '[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar'
+    function Read-SidecarLedger {
+        # The runner's sidecars\ledger.json (T1a's hand-off, 2026-11-23): version 1, and for each sidecar only its
+        # documentId and its acknowledgedUtc, which is null until the history has it; the rest is the runner's. The one
+        # place that reads the ledger. Anything else is unreadable, which counts as holding unacknowledged sidecars.
+        param([string] $Path, [string] $Pattern)
+        $answer = @{ readable = $false; listed = @(); acknowledged = @() }
+        try {
+            $ledger = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch {
+            return $answer
+        }
+        if ($null -eq $ledger -or $ledger -is [array]) {
+            return $answer
+        }
+        $version = $ledger.PSObject.Properties['version']
+        $list = $ledger.PSObject.Properties['sidecars']
+        if ($null -eq $version -or [string]$version.Value -ne '1' -or $null -eq $list) {
+            return $answer
+        }
+        $listed = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        $acknowledged = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        foreach ($item in @($list.Value)) {
+            $id = if ($null -ne $item) { $item.PSObject.Properties['documentId'] } else { $null }
+            if ($null -eq $id -or [string]$id.Value -cnotmatch ('^' + $Pattern + '$')) {
+                return $answer
+            }
+            $listed.Add([string]$id.Value)
+            $when = $item.PSObject.Properties['acknowledgedUtc']
+            if ($null -ne $when -and $null -ne $when.Value -and [string]$when.Value) {
+                $acknowledged.Add([string]$id.Value)
+            }
+        }
+        $answer['readable'] = $true
+        $answer['listed'] = $listed.ToArray()
+        $answer['acknowledged'] = $acknowledged.ToArray()
+        return $answer
+    }
+    function Get-SidecarState {
+        # The sidecars in the store that aren't in the history yet: sealed ones the ledger doesn't mark acknowledged (any
+        # other file in sidecars\ counts as one), and the spans whose rows aren't sealed yet.
+        param([string] $Root)
+        $pattern = $sidecarIdPattern
+        $state = @{ sealed = 0; unsealed = 0; ledger = 'none'; ids = @() }
+        $waiting = New-Object -TypeName 'System.Collections.Generic.HashSet[string]' -ArgumentList ([System.StringComparer]::Ordinal)
+        $unknown = 0
+        $sidecarRoot = Join-Path -Path $Root -ChildPath 'sidecars'
+        if (Test-Path -LiteralPath $sidecarRoot) {
+            foreach ($file in @(Get-ChildItem -LiteralPath $sidecarRoot -File -Recurse -Force -ErrorAction SilentlyContinue)) {
+                if ($file.Name -like 'ledger.*') {
+                    continue
+                }
+                $match = [regex]::Match($file.Name, ('^({0})(\.|$)' -f $pattern))
+                if ($match.Success) {
+                    [void]$waiting.Add($match.Groups[1].Value)
+                }
+                else {
+                    $unknown++
+                }
+            }
+            $ledgerPath = Join-Path -Path $sidecarRoot -ChildPath 'ledger.json'
+            if (Test-Path -LiteralPath $ledgerPath) {
+                $ledger = Read-SidecarLedger -Path $ledgerPath -Pattern $pattern
+                if (-not $ledger['readable']) {
+                    $state['ledger'] = 'unreadable'
+                }
+                else {
+                    $state['ledger'] = 'read'
+                    foreach ($id in @($ledger['listed'])) {
+                        [void]$waiting.Add($id)
+                    }
+                    foreach ($id in @($ledger['acknowledged'])) {
+                        [void]$waiting.Remove($id)
+                    }
+                }
+            }
+        }
+        foreach ($folder in @(Get-ChildItem -LiteralPath $Root -Directory -Force -ErrorAction SilentlyContinue)) {
+            if ((Test-Path -LiteralPath (Join-Path -Path $folder.FullName -ChildPath 'span.json')) -and @(Get-ChildItem -LiteralPath $folder.FullName -File -Filter $unsealedFilter -Force -ErrorAction SilentlyContinue).Count -gt 0) {
+                $state['unsealed']++
+            }
+        }
+        $state['sealed'] = $waiting.Count + $unknown
+        $state['ids'] = @($waiting | Sort-Object | Select-Object -First 8)
+        return $state
+    }
+    $result = [ordered]@{ spans = 0; notExported = 0; runnersStopped = 0; taskStopped = $false; left = $false; error = ''; sealed = 0; unsealed = 0; ledger = 'none'; sidecars = @() }
     if (-not (Test-Path -LiteralPath $StoreRoot)) {
         return [pscustomobject]$result
     }
@@ -657,6 +759,17 @@ $script:GuestRcaClearBlock = {
             $result['notExported']++
         }
     }
+    $copySidecars = {
+        param($State)
+        $result['sealed'] = [int]$State['sealed']
+        $result['unsealed'] = [int]$State['unsealed']
+        $result['ledger'] = [string]$State['ledger']
+        $result['sidecars'] = @($State['ids'])
+    }
+    if ($CheckOnly) {
+        & $copySidecars (Get-SidecarState -Root $StoreRoot)
+        return [pscustomobject]$result
+    }
     $taskName = 'DbHubDemo-Workload'
     $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
     if ($task) {
@@ -673,6 +786,29 @@ $script:GuestRcaClearBlock = {
     $clock = [System.Diagnostics.Stopwatch]::StartNew()
     while ($runners.Count -gt 0 -and $clock.Elapsed.TotalSeconds -lt [int]$WaitSeconds -and @($runners | Where-Object { Get-Process -Id ([int]$_.ProcessId) -ErrorAction SilentlyContinue }).Count -gt 0) {
         Start-Sleep -Seconds 1
+    }
+    # Counted with the runner stopped, so nothing is sealed or written between the count and the delete.
+    $sidecars = Get-SidecarState -Root $StoreRoot
+    & $copySidecars $sidecars
+    if ([int]$sidecars['sealed'] -gt 0 -or [int]$sidecars['unsealed'] -gt 0 -or [string]$sidecars['ledger'] -eq 'unreadable') {
+        $result['left'] = $true
+        $what = @()
+        if ([int]$sidecars['sealed'] -gt 0) {
+            $what += ('{0} sidecar(s) the runner''s ledger doesn''t mark acknowledged' -f $sidecars['sealed'])
+        }
+        if ([int]$sidecars['unsealed'] -gt 0) {
+            $what += ('{0} span(s) with rows not sealed yet' -f $sidecars['unsealed'])
+        }
+        if ([string]$sidecars['ledger'] -eq 'unreadable') {
+            $what += 'a ledger that can''t be read'
+        }
+        $text = 'it holds Incident RCA sidecars that aren''t in the history yet ({0})' -f ($what -join ', ')
+        $result['error'] = $text.Substring(0, [Math]::Min(200, $text.Length))
+        if ($task) {
+            Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            $result['taskStopped'] = $false
+        }
+        return [pscustomobject]$result
     }
     Remove-Item -LiteralPath $StoreRoot -Recurse -Force -ErrorAction SilentlyContinue -ErrorVariable removeErrors
     if (Test-Path -LiteralPath $StoreRoot) {
@@ -971,6 +1107,27 @@ function Invoke-GoldenInspect {
     return $result
 }
 
+function Invoke-GoldenRcaSidecarCheck {
+    # Read-only (2026-11-23, the capture's guard for the Incident RCA's sidecars, rca/README.md, The sidecar): the sidecars
+    # in the guest's store that aren't in the history yet, over PowerShell Direct, counted as Prepare's RCA step counts them
+    # before it deletes the store (GuestRcaClearBlock with CheckOnly), with nothing stopped or changed.
+    param([hashtable] $Setting)
+    $result = [ordered]@{ action = 'RcaSidecars'; succeeded = $false }
+    $vm = Get-VM -Name $GuestName -ErrorAction SilentlyContinue
+    $state = if ($vm) { [string]$vm.State } else { 'Missing' }
+    if ($state -ne 'Running') {
+        throw ('The guest is {0}; its Incident RCA sidecars are read while it runs.' -f $state)
+    }
+    $credential = (Wait-GoldenGuest -UserName $Setting['AdministratorName'] -TimeoutSeconds 300).Credential
+    $rca = Invoke-Command -VMName $GuestName -Credential $credential -ScriptBlock $script:GuestRcaClearBlock -ArgumentList $script:GuestRcaStore, $script:GuestRuntime, 0, $true -ErrorAction Stop
+    if ($null -eq $rca -or $null -eq $rca.PSObject.Properties['sealed']) {
+        throw 'The guest didn''t say which Incident RCA sidecars it holds.'
+    }
+    $result['rca'] = [ordered]@{ spans = [int]$rca.spans; sealed = [int]$rca.sealed; unsealed = [int]$rca.unsealed; ledger = [string]$rca.ledger; sidecars = @($rca.sidecars) }
+    $result['succeeded'] = $true
+    return $result
+}
+
 function Invoke-GoldenPrepare {
     param([hashtable] $Setting)
     if ($script:Options.SnapshotName -notmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,79}$') {
@@ -1250,7 +1407,7 @@ function Invoke-GoldenRelease {
 if ($MyInvocation.InvocationName -ne '.') {
     $exitCode = 1
     try {
-        if ($Action -notin 'Inspect', 'Prepare', 'Release', 'RotateGuestPassword') {
+        if ($Action -notin 'Inspect', 'Prepare', 'Release', 'RotateGuestPassword', 'RcaSidecars') {
             throw ('Unknown action {0}.' -f $Action)
         }
         if ($GuestName -notmatch '^[A-Za-z0-9-]{1,15}$') {
@@ -1273,12 +1430,13 @@ if ($MyInvocation.InvocationName -ne '.') {
         }
         $setting = Get-GoldenHostSetting
         $lock = $null
-        if ($Action -ne 'Inspect') {
+        if ($Action -notin 'Inspect', 'RcaSidecars') {
             $lock = Enter-GoldenLock
         }
         try {
             $outcome = switch ($Action) {
                 'Inspect' { Invoke-GoldenInspect -Setting $setting }
+                'RcaSidecars' { Invoke-GoldenRcaSidecarCheck -Setting $setting }
                 'Prepare' { Invoke-GoldenPrepare -Setting $setting }
                 'Release' { Invoke-GoldenRelease -Setting $setting }
                 'RotateGuestPassword' {

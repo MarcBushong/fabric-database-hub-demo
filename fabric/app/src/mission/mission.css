@@ -1,6 +1,6 @@
-/* Wave 1 (ADR 0030): the app's own stage, in Microsoft's colors (Fluent 2's layered neutrals and shadows, Microsoft blue,
-   and the logo's colors as accents), for Mission Control, the scoreboard,
-   the replay, and the kiosk. Colors come only from the stage's tokens and the app's (src/theme/identity.ts, fluent.ts);
+/* Wave 1 (ADR 0030): the app's own stage, in its earth tones (the warm neutrals and shadows, sage for the accent, brick for
+   an alert, and earth-toned accents for the targets), for Mission Control, the scoreboard,
+   the replay, and the kiosk. Colors come only from the stage's tokens and the app's (src/theme/stage.ts, fluent.ts);
    motion carries meaning (health pulses, an incident's shockwave) and stops with reduced motion. */
 
 /* ---------- The stage ---------- */

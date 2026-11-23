@@ -29,6 +29,8 @@ BeforeAll {
         Mock -CommandName Test-DemoHostMedia -MockWith { $true }
         Mock -CommandName Test-DemoGuestVhdx -MockWith { $true }
         Mock -CommandName Test-DemoGuestVm -MockWith { $true }
+        # The GuestNetwork step (2026-11-21): the guest is on its switch.
+        Mock -CommandName Test-DemoHostGuestNetwork -MockWith { $true }
         Mock -CommandName Test-DemoHostGuestReachable -MockWith { $true }
         Mock -CommandName Wait-DemoHostGuest -MockWith { $true }
         Mock -CommandName Get-DemoGuestCredential -MockWith {
@@ -57,12 +59,43 @@ AfterAll {
     Remove-Module -Name DbHubDemo.Vm -ErrorAction SilentlyContinue
 }
 
+Describe 'The T2 host''s database check on a new guest (2026-11-20)' {
+    BeforeEach {
+        $script:context = New-TestHostContext -Mode 'JumpstartImage'
+        $script:logged = [System.Collections.Generic.List[object]]::new()
+        Mock -CommandName Write-DemoVmLog -MockWith { $script:logged.Add([pscustomobject]@{ Level = [string]$Level; Message = [string]$Message }) }
+        Mock -CommandName Get-DemoGuestCredential -MockWith {
+            $secure = [System.Security.SecureString]::new()
+            foreach ($character in 'not-a-real-secret'.ToCharArray()) { $secure.AppendChar($character) }
+            [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+        }
+        # PowerShell Direct, run here: the guest's tools folder is a folder of the test drive.
+        Mock -CommandName Invoke-Command -MockWith { & $ScriptBlock @ArgumentList }
+        $script:context.Guest.ToolsFolder = Join-Path -Path $TestDrive -ChildPath ('guest-tools-' + [guid]::NewGuid().ToString('N'))
+    }
+
+    It 'says plainly in the guest that its tools aren''t copied in yet, and the step''s check logs that as no warning' {
+        $secure = [System.Security.SecureString]::new()
+        foreach ($character in 'not-a-real-secret'.ToCharArray()) { $secure.AppendChar($character) }
+        $credential = [System.Management.Automation.PSCredential]::new('Administrator', $secure)
+        { Invoke-DemoGuestSqlQuery -Name 'arcsql01' -Credential $credential -GuestToolsFolder $script:context.Guest.ToolsFolder -Query 'SELECT 1' } | Should -Throw '*The guest has no demo tools at * yet; the database step copies them in.*'
+        Test-DemoHostDatabase -Context $script:context | Should -BeFalse
+        @($script:logged | Where-Object Level -EQ 'Warning') | Should -BeNullOrEmpty -Because 'the step''s Set copies the tools in next'
+        @($script:logged | Where-Object { $_.Message -match '^The guest has no database tools yet; this step copies them in' }).Count | Should -Be 1
+    }
+
+    It 'still warns when the check fails for another reason' {
+        Mock -CommandName Invoke-DemoGuestSqlQuery -MockWith { throw 'A network-related or instance-specific error occurred while establishing a connection to SQL Server.' }
+        Test-DemoHostDatabase -Context $script:context -Seeded | Should -BeFalse
+        @($script:logged | Where-Object { $_.Level -eq 'Warning' -and $_.Message -match '^Database check in the guest: A network-related' }).Count | Should -Be 1
+    }
+}
 Describe 'T2 host step plan' {
     It 'follows the ADR 0003 order' {
         $plan = Get-DemoHostStepPlan -Context (New-TestHostContext -Mode 'PaygWizard')
         $plan.Name | Should -Be @(
             'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'GuestSource', 'DataDisk', 'GuestOsMedia',
-            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall',
+            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestNetwork', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2', 'SqlUnattendedInstall',
             'JumpstartImageCheck', 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard', 'GuestSignInCleanup', 'ConfigureSql',
             'SeedDatabase', 'WorkloadRunner')
     }
@@ -573,7 +606,8 @@ Describe 'GuestSignInCleanup step' {
         Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestSweep -Pass $true -Cleaned $true -Cleared @('Windows PowerShell') }
         $warned = Clear-DemoHostGuestSignIn -Context $context
         $warned.Outcome | Should -Be 'Done'
-        $warned.WarningMessage[0] | Should -Match 'Windows PowerShell on archost01.*endpoint protection may report'
+        $warned.NoteMessage[0] | Should -Match 'Windows PowerShell on archost01.*endpoint protection may report' -Because 'what the cleanup did after Arc onboarding is a one-off note, by design, recorded as information (2026-11-23)'
+        @($warned.TransientWarningMessage).Count | Should -Be 0 -Because 'it isn''t a warning'
 
         Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestSweep -Pass $true -Cleaned $true -Security 2 }
         $manual = Clear-DemoHostGuestSignIn -Context $context

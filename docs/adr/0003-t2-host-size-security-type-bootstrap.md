@@ -188,6 +188,18 @@ The script, and so the file the VM writes (`chunk-<nnn>.bin`), is the same, and 
 
 Sources (checked 2026-11-16): [managed Run Command](https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed), [Run Command overview](https://learn.microsoft.com/azure/virtual-machines/run-command-overview) (25 per VM).
 
+### 2026-11-22 amendment: a name of its own for each send (the review of 8ff25e95)
+
+**Why:** a chunk's Run Command had the same name, `DbHubDemo-Chunk-<sha12>-<nnn>`, each time the same content went to the same VM: after a stalled or interrupted transfer, or after the loader's missing-chunk recovery (`-RemoveBundleVm`, then the same bundle again). The VM's Run Command handler can skip a name it ran before until that name's delete reaches it ([ADR 0012](0012-validation-model.md#2026-11-22-a-health-read-that-doesnt-answer-isnt-a-missing-loader-f31)), which leaves a chunk Pending for its whole wait (its timeout plus 5 minutes) and then fails the send. Chunks are also the only Run Commands whose state is read without `-NotBeforeUtc`, so a reused name could report an earlier run's **Succeeded** (the 2026-10-21 finding), and the loader then finds the chunk missing. A rebuilt host isn't exposed: its rebuild deletes the VM and its disks.
+
+**Decision:** each `Send-DemoChunkSet` call gives every chunk it sends one suffix, new for each call (`Get-DemoChunkSendSuffix`): `DbHubDemo-Chunk-<sha12>-<nnn>-s<6 hex digits>`.
+
+- **Not a time:** the suffix is never a 14-digit time, and `STATUS.RUNCOMMANDS` never takes a chunk that Azure is deleting on the T2 host for a delete in flight, whatever its name, since that's R871's sign.
+- **Nothing else changes:** the script, and so the file the VM writes (`downloads\<sha12>\chunk-<nnn>.bin`), is the same whatever the name, a chunk already there is skipped, and the loader verifies the whole bundle. Resuming goes by `BundleSentTo` and `RunnerSentTo`, and every cleanup matches `DbHubDemo-Chunk-*`.
+- **The fallback stays:** a name Azure keeps marked for deletion still runs as `<name>-yyyyMMddHHmmss`.
+
+Unit-tested in `tests/unit/DbHubDemo.Bundle.Tests.ps1` and `DbHubDemo.Lifecycle.Tests.ps1`. **Not run live: it needs a live proof before it ships.**
+
 ## Amendment: the host's steps for JumpstartImage (2026-11-05)
 
 **Why:** since 2026-11-05 the default install mode is `JumpstartImage` (user-directed, [ADR 0006](0006-sql-editions-and-licensing.md#2026-11-05-user-directed-jumpstartimage-arc-jumpstarts-sql-server-standard-image-by-default)): the host makes the guest from Arc Jumpstart's prebuilt SQL Server 2022 Standard disk instead of building it. This supersedes the context's "`PaygWizard` (default)" and its one guest image in every mode (the guest now has two sources, the Jumpstart image or the build), and, in this mode, replaces steps 5, 6, 9, and 10 above and changes steps 4 and 7. The state machine is unchanged: one step list in every mode, each step checks before it acts, and a step that a mode doesn't use reports **Not selected** with the reason.

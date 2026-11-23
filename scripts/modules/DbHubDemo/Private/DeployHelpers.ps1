@@ -125,6 +125,11 @@ function Get-DemoDeploymentStateTagName {
         # nightly stop waited for, which ended), or session. The safety stop's runbook reads them (Get-DbHubBusyMarker).
         BusyUntilUtc             = 'DbHubBusyUntilUtc'
         BusyBy                   = 'DbHubBusyBy'
+        # 2026-11-21 (F25): the times (HHmm, comma-separated) the VMs' auto-shutdown is at when the busy marker's steps left
+        # it away from autoShutdownTime (Sync-DemoAutoShutdownForBusy), empty once it's back. The control's runbook reads it
+        # (Get-DbHubMovedShutdownUtc): its role has no DevTest Labs action, so a session ends before the earliest. It outlives
+        # the marker, which a session overwrites, so start-demo.ps1, stop-demo.ps1, and status.ps1 still see it.
+        AutoShutdownMoved        = 'DbHubAutoShutdownMoved'
         # 2026-11-17: the Fabric workspaces this environment uses, by ID: the demo's, and the one with the control notebook
         # (its own workspace, or the demo's when the notebook is in its folder). destroy.ps1 in another environment keeps a
         # workspace that one of these names, or that an environment without them might use (Get-DemoFabricWorkspaceGuard).
@@ -796,10 +801,11 @@ function Invoke-DemoFabricStage {
     notebooks and the Real-Time Dashboard while the targets deploy, and leaves the Hub checklist, the T3
     gate, and the dashboard's tile check to the validation, which passes -CheckDashboardData once telemetry
     flows, and -T3PerformanceMonitoringCheck with the T3.PROPERTY result, so the gate's extended-property part
-    isn't left as a manual step. While fabric.importNotebooks is false, deploy passes -NewNotebooksOnly: notebooks
-    that aren't in the workspace yet are imported without asking, and existing ones stay as they are (Phase 26a). The
-    track also passes -HistoryRunWaitMinutes and -ProgressPath (#68): a first deployment's first history run waits that
-    long while the capacity keeps it queued, and the status page's Fabric row shows the wait.
+    isn't left as a manual step. While fabric.importNotebooks is false, deploy passes -KeepEditedNotebooks: notebooks
+    that aren't in the workspace yet are imported without asking, one that's an earlier version of the demo's, which
+    nobody edited, is brought up to date, and an edited one stays as it is (Phase 26a; follow-ups decision 2a,
+    2026-11-23). The track also passes -HistoryRunWaitMinutes and -ProgressPath (#68): a first deployment's first
+    history run waits that long while the capacity keeps it queued, and the status page's Fabric row shows the wait.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -811,7 +817,7 @@ function Invoke-DemoFabricStage {
 
         [switch] $ImportNotebooks,
 
-        [switch] $NewNotebooksOnly,
+        [switch] $KeepEditedNotebooks,
 
         [switch] $ImportDashboard,
 
@@ -851,8 +857,8 @@ function Invoke-DemoFabricStage {
                 $arguments['T3PerformanceMonitoringCheck'] = $T3PerformanceMonitoringCheck
             }
         }
-        if ($NewNotebooksOnly -and -not $ImportNotebooks) {
-            $arguments['NewNotebooksOnly'] = $true
+        if ($KeepEditedNotebooks -and -not $ImportNotebooks) {
+            $arguments['KeepEditedNotebooks'] = $true
         }
         elseif (-not $ImportNotebooks) {
             $arguments['SkipNotebookImport'] = $true
@@ -1012,7 +1018,7 @@ function Merge-DemoBlankMeasureResult {
         return $all
     }
     $ids = @($blank | ForEach-Object { [string]$_.checkId })
-    $merged = New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURES' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The history report is empty until NB_DatabaseHub_LiveActivity saves its first snapshots; that''s expected right after a first deployment ({0} measures are blank for now).' -f $blank.Count) -Evidence ([ordered]@{ blankMeasures = $ids }) -Remediation 'Nothing to do now: ./scripts/stop-demo.ps1 -SaveHistory (or ./scripts/configure-fabric.ps1 -RunLiveActivity) runs NB_DatabaseHub_LiveActivity, which saves the snapshots the report shows; ./scripts/configure-powerbi.ps1 -CheckModelData then checks every measure again.' -DocUrl 'https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group'
+    $merged = New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURES' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The history report is empty until NB_DatabaseHub_LiveActivity saves its first snapshots; that''s expected right after a first deployment ({0} measures are blank for now).' -f $blank.Count) -Evidence ([ordered]@{ blankMeasures = $ids }) -Remediation 'Nothing to do now: ./scripts/stop-demo.ps1 -SaveHistory (or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity) runs NB_DatabaseHub_LiveActivity, which saves the snapshots the report shows; ./scripts/configure-powerbi.ps1 -CheckModelData then checks every measure again.' -DocUrl 'https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group'
     $kept = [System.Collections.Generic.List[object]]::new()
     $placed = $false
     foreach ($item in $all) {
@@ -1362,6 +1368,169 @@ function Complete-DemoInsightsAppManage {
         }
     }
     return $records
+}
+
+function Get-DemoEndStopUploadText {
+    # When T2's first migration assessment uploaded as the stop at the end of an update waited for it (DEPLOY.ENDSTOP's
+    # evidence t2AssessmentUploadedAt, F18), as text, or ''. The evidence went through JSON (New-DemoResult), which turns an
+    # ISO 8601 time into a DateTime: that's "yyyy-MM-dd HH:mm UTC" again. Pure. Internal.
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowNull()]
+        [object] $EndStop = $null
+    )
+
+    $value = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $EndStop -Name 'evidence') -Name 't2AssessmentUploadedAt'
+    if ($value -is [datetime] -or $value -is [System.DateTimeOffset]) {
+        return (ConvertTo-DemoUtcDate -Value $value).ToString("yyyy-MM-dd HH:mm 'UTC'", [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+    return [string]$value
+}
+
+function Get-DemoInsightsAppMigrationGap {
+    <#
+    .SYNOPSIS
+    Why the Insights app's step runs once more at the end of an update, or '' when it doesn't (F18, 2026-11-20): the stop
+    at the end waited for T2's first migration assessment and saw it upload, after this run had deployed the app with no
+    readiness saved. Pure. Internal.
+
+    .DESCRIPTION
+    The app shows T2's readiness as Azure had it when configure-fabric-app.ps1 last deployed it (dbhub-app.json's
+    t2Migration, R924). On the first update that turns T2's assessment on, the app deploys a few minutes before that
+    assessment's first upload, so its Migration card showed only the Azure portal's path until the next deploy.ps1
+    (dbhubfu, 2026-11-20). The stop at the end of an update already waits for that upload (Wait-DemoUpdateStopWork), and
+    DEPLOY.ENDSTOP's evidence t2AssessmentUploadedAt says when it came. The step runs once more when that time is set, this
+    run deployed the app (FABRIC.APP.DEPLOY Pass), and its FABRIC.APP.ESTATE has no t2MigrationReadAt.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [AllowNull()]
+        [object] $EndStop = $null
+    )
+
+    $uploadedAt = Get-DemoEndStopUploadText -EndStop $EndStop
+    if (-not $uploadedAt) {
+        return ''
+    }
+    $app = @($Result | Where-Object { $null -ne $_ -and (Test-DemoInsightsAppRecord -Result $_) })
+    $deploy = @($app | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' }) | Select-Object -Last 1
+    $estate = @($app | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.ESTATE' }) | Select-Object -Last 1
+    if ($null -eq $deploy -or [string]$deploy.status -ne 'Pass' -or $null -eq $estate) {
+        return ''
+    }
+    if ([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $estate -Name 'evidence') -Name 't2MigrationReadAt')) {
+        return ''
+    }
+    return ('T2''s first migration assessment uploaded at {0}, after this run deployed the Insights app, so the app is deployed once more and its Migration card shows T2''s readiness now, not at the next ./scripts/deploy.ps1.' -f $uploadedAt)
+}
+
+function Complete-DemoInsightsAppMigration {
+    <#
+    .SYNOPSIS
+    The Insights app's step once more at the end of an update, once T2's first migration assessment uploaded
+    (Get-DemoInsightsAppMigrationGap, F18, 2026-11-20), so the app's Migration card shows T2's readiness from this run on.
+    Returns the records the run's results get, or nothing when the step isn't needed. Internal.
+
+    .DESCRIPTION
+    Complete-DemoDeploymentRun calls it after the stop at the end, so the VMs are deallocated already: the app's step needs
+    only Fabric, and the readiness comes from T2's SQL Server instance resource in Azure, which keeps it.
+    - The app deployed again (FABRIC.APP.DEPLOY Pass): its records, which replace the earlier ones with the same check IDs
+      in the run's results (Merge-DemoRunResult), so FABRIC.APP.ESTATE has t2MigrationReadAt; their FABRIC.APP.DEPLOY's
+      evidence says why (redeployedFor t2Migration).
+    - It didn't: the earlier records stay, since the app deployed earlier in this run still works, and FABRIC.APP.MIGRATION
+      (a Warning) says that its Migration card shows the Azure portal's path until the next deploy, with the fix. The
+      status page's Insights app and Ask rows show the earlier records again, with that Warning.
+    Never a Fail and never in DONE's way: the app's records are non-blocking (ConvertTo-DemoInsightsAppRecord).
+    #>
+    [CmdletBinding()]
+    [OutputType([object[]])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [string] $ConfigPath = '',
+
+        [AllowEmptyCollection()]
+        [object[]] $Result = @(),
+
+        [AllowNull()]
+        [object] $EndStop = $null,
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    $reason = Get-DemoInsightsAppMigrationGap -Result $Result -EndStop $EndStop
+    if (-not $reason) {
+        return @()
+    }
+    Write-DemoLog -Message $reason
+    $earlier = @($Result | Where-Object { $null -ne $_ -and (Test-DemoInsightsAppRecord -Result $_) })
+    $records = $null
+    try {
+        $records = @(Invoke-DemoInsightsAppStep -Config $Config -ConfigPath $ConfigPath -FabricResult $Result -ProgressPath $ProgressPath | Where-Object { $null -ne $_ })
+    }
+    finally {
+        if ($null -eq $records) {
+            # Stopped (Ctrl+C) during the deploy once more (the review of 2026-11-20): the step set both rows to Running and
+            # let the stop through, so they show the app as this run deployed it earlier, whose records the results keep.
+            Restore-DemoInsightsAppRow -Record $earlier -ProgressPath $ProgressPath
+        }
+    }
+    $deploy = @($records | Where-Object { [string]$_.checkId -eq 'FABRIC.APP.DEPLOY' }) | Select-Object -Last 1
+    if ($null -ne $deploy -and [string]$deploy.status -eq 'Pass') {
+        # The script's records come back through JSON, so their evidence is an object; a test's may be a dictionary.
+        $evidence = Get-DemoMemberValue -InputObject $deploy -Name 'evidence'
+        if ($evidence -is [System.Collections.IDictionary]) {
+            $evidence['redeployedFor'] = 't2Migration'
+        }
+        elseif ($null -ne $evidence -and $evidence -isnot [string] -and $evidence -isnot [System.ValueType]) {
+            $evidence | Add-Member -NotePropertyName 'redeployedFor' -NotePropertyValue 't2Migration' -Force
+        }
+        return $records
+    }
+    $why = if ($null -ne $deploy) { '{0}: {1}' -f [string]$deploy.checkId, [string]$deploy.message } else { (Get-DemoInsightsAppSummary -Result $records).Reason }
+    $warning = ConvertTo-DemoInsightsAppRecord -Record (New-DemoResult -CheckId 'FABRIC.APP.MIGRATION' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('{0} But the app''s deploy once more didn''t pass ({1}), so its Migration card shows the Azure portal''s path to T2''s assessment until the next deploy. The app deployed earlier in this run works as before.' -f $reason, $why.TrimEnd('.')) -Evidence ([ordered]@{ t2AssessmentUploadedAt = (Get-DemoEndStopUploadText -EndStop $EndStop) }) -Remediation 'Run ./scripts/configure-fabric-app.ps1: it deploys the app with T2''s readiness as Azure has it now, without the rest of the deployment.' -DocUrl 'https://learn.microsoft.com/sql/sql-server/azure-arc/migration-assessment')
+    # The status page shows the app as this run deployed it, with the Warning, not the deploy once more that didn't pass.
+    Restore-DemoInsightsAppRow -Record (@($earlier) + @($warning)) -ProgressPath $ProgressPath
+    Write-DemoLog -Level Warning -Message ('{0} {1}' -f $warning.message, $warning.remediation)
+    return @($warning)
+}
+
+function Restore-DemoInsightsAppRow {
+    <#
+    .SYNOPSIS
+    The status page's Insights app and Ask rows from Record, the app's records as this run deployed it earlier, after the
+    app's step once more at the end of an update didn't pass or was stopped (Complete-DemoInsightsAppMigration, F18,
+    2026-11-20): that step sets both rows to Running first. Never throws. Internal.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyCollection()]
+        [object[]] $Record = @(),
+
+        [AllowEmptyString()]
+        [string] $ProgressPath = ''
+    )
+
+    try {
+        $app = Get-DemoInsightsAppSummary -Result $Record
+        if ($null -ne $app) {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.App' -State $app.State -Status $app.Status -Message $app.StepMessage -MaxLength 1200
+        }
+        $ask = Get-DemoAskSummary -Result $Record
+        if ($null -ne $ask) {
+            Set-DemoProgressStep -Path $ProgressPath -Id 'Fabric.Ask' -State $ask.State -Status $ask.Status -Message $ask.StepMessage -MaxLength 1200
+        }
+    }
+    catch {
+        Write-DemoLog -Level Warning -Message ('The Insights app''s rows couldn''t be shown again on the status page: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+    }
 }
 
 function Get-DemoResolvedWorkspaceId {

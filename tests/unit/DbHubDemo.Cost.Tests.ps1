@@ -555,11 +555,12 @@ Describe 'Get-DemoCostEstimate' {
         $estimate.HourlyRunning | Should -Be 2.3
         ($estimate.Components | Where-Object Name -EQ 'T3 compute (serverless)').Quantity | Should -Be 2
         $estimate.BastionHourly | Should -Be 0.2
-        # Idle: 2 x E10 OS disks at 10.00 (lowest-cost has no data disks) + T3 32 GB x 0.10 = 23.20 per month, and the session
-        # control's vault operations, 0.03 (every deployment since 2026-11-14). There's no artifact cache.
-        $estimate.IdleMonthly | Should -Be 23.23
+        # Idle: 2 x E10 OS disks at 10.00 (lowest-cost has no data disks) + T3 32 GB x 0.10 = 23.20 per month, the session
+        # control's vault operations, 0.03 (every deployment since 2026-11-14), and its 200 job minutes past the 500 included,
+        # 0.40 (5 Run all sessions of 116 minutes with the Incident RCA's export). There's no artifact cache.
+        $estimate.IdleMonthly | Should -Be 23.63
         $estimate.SessionCost | Should -Be 11.7
-        $estimate.LightUseMonthly | Should -Be 46.43
+        $estimate.LightUseMonthly | Should -Be 46.83
         $estimate.MissingPrices | Should -BeNullOrEmpty
         $estimate.Components.Name | Should -Not -Match 'cache|data disk'
     }
@@ -647,6 +648,34 @@ Describe 'Get-DemoCostEstimate' {
         $monthly = ($free.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message
         $monthly | Should -Match 'has the subscription''s free tier'
         $monthly | Should -Not -Match 'adds about|saves about'
+    }
+
+    It 'prices T5''s private endpoint and DNS zone only when it has, or gets, them, and as an upper bound when that wasn''t told (2026-11-21, ADR 0027)' {
+        $config = New-TestConfig -Override @{ t5Enabled = $true }
+        $estimate = { param([object] $Endpoint, [string] $Mode = 'public', [string] $Lifecycle = 'Session') $parameters = @{ Config = $config; ProfileName = 'lowest-cost'; DemoHours = 5; LightUseHoursPerMonth = 40; BastionHours = 1; NetworkMode = $Mode; T5FreeTier = $false; T5ContainerLifecycle = $Lifecycle }; if ($null -ne $Endpoint) { $parameters['T5PrivateEndpoint'] = $Endpoint }; Get-DemoCostEstimate @parameters }
+        $none = & $estimate $false
+        @($none.Components | Where-Object Name -Match '^T5 private') | Should -BeNullOrEmpty
+        $none.T5FixedMonthly | Should -Be 0
+        $monthly = $none.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $monthly.message | Should -Match 'T5 \(Azure Cosmos DB\) has no private endpoint \(in public mode, T1''s subnet reaches it through its service endpoint, as T3\), so it costs nothing while the demo is stopped\. Its container exists only during a session'
+        $monthly.message | Should -Not -Match 'wasn''t checked, so the endpoint'
+        $monthly.evidence.t5PrivateEndpoint | Should -BeFalse
+        $monthly.evidence.t5PrivateEndpointChecked | Should -BeTrue
+        # All month too: its throughput and storage, and nothing of an endpoint.
+        ((& $estimate $false public AlwaysOn).Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'costs 23\.61 USD a month whether the demo runs or not \(its 400 RU/s of throughput and storage\)'
+        # An account that has them, or gets them: 7.80 a month.
+        $kept = & $estimate $true
+        $kept.T5FixedMonthly | Should -Be 7.8
+        [System.Math]::Round($kept.IdleMonthly - $none.IdleMonthly, 2) | Should -Be 7.8
+        ($kept.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY').message | Should -Not -Match 'wasn''t checked, so the endpoint'
+        # Not told: priced, an upper bound, and said.
+        $unknown = & $estimate $null
+        $unknown.T5FixedMonthly | Should -Be 7.8
+        $unknownCheck = $unknown.Results | Where-Object checkId -EQ 'PREFLIGHT.COST.MONTHLY'
+        $unknownCheck.message | Should -Match 'Whether a policy needs its private endpoint wasn''t checked, so the endpoint and its private DNS zone are counted, an upper bound; preflight checks it'
+        $unknownCheck.evidence.t5PrivateEndpointChecked | Should -BeFalse
+        # Private mode always has it.
+        (& $estimate $false private).T5FixedMonthly | Should -Be 7.8
     }
 
     It 'prices Defender for Azure Cosmos DB on T5''s provisioned throughput while its container exists, and attributes the plan (2026-11-19, ADR 0027)' {
@@ -757,37 +786,69 @@ Describe 'Get-DemoCostEstimate' {
         $operations.Meter | Should -Be 'Key Vault / Standard / Operations'
         $operations.Quantity | Should -Be 1
         $operations.Basis | Should -Be 'idle'
-        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced. A light-use month's
-        # 5 Run all sessions take at most about 60 job minutes each with the Incident RCA's export (ADR 0031).
+        # The first 500 job minutes a month are included: the tier that starts at 0 is the one priced. Five Run all sessions in
+        # the light-use month (10 running hours at about 2 each; the coordinator's decision, 2026-11-21), at 116 minutes each
+        # (80 with the time the start follows T2 after a cold start, and 36 of the Incident RCA's export, ADR 0031), are 580:
+        # with the nightly stop's 120, 700, so 380 are included and 200 are priced at the next tier.
         $minutes = $with.Components | Where-Object { $_.Name -like 'Activity control job minutes*' }
-        $minutes.UnitPrice | Should -Be 0
-        $minutes.Quantity | Should -Be 300
+        @($minutes).Count | Should -Be 2
+        $included = $minutes | Where-Object { $_.Name -eq 'Activity control job minutes (the first 500 a month are included)' }
+        $included.UnitPrice | Should -Be 0
+        $included.Quantity | Should -Be 380
+        $past = $minutes | Where-Object { $_.Name -eq 'Activity control job minutes past the 500 included' }
+        $past.Quantity | Should -Be 200
+        $past.UnitPrice | Should -Be 0.002
+        $past.Cost | Should -Be 0.4
+        $past.Basis | Should -Be 'idle'
         $operations.Cost | Should -Be 0.03
         $with.MissingPrices | Should -BeNullOrEmpty
+        # The count follows the light-use month's running hours, not the session -DemoHours prices: 10-hour sessions would
+        # have been 1 a month.
+        $longer = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 10 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
+        ($longer.Components | Where-Object { $_.Name -eq 'Activity control job minutes past the 500 included' }).Quantity | Should -Be 200
     }
 
-    It 'counts no more job minutes than Azure Automation includes a month, so the included tier is the right price (ADR 0031)' {
+    It 'prices the session control''s job minutes past the 500 included at the next tier, 116 a session, with the time it follows T2 after a cold start (2026-11-20) and the Incident RCA''s export (ADR 0031)' {
+        # Business hours: 176 running hours are 88 Run all sessions of about 2 hours, 10,208 minutes; the nightly stop's 120
+        # leave 380 of the 500.
+        $busy = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 176 -BastionHours 1 -NetworkMode public
+        $included = $busy.Components | Where-Object { $_.Name -eq 'Activity control job minutes (the first 500 a month are included)' }
+        $included.Quantity | Should -Be 380
+        $included.Cost | Should -Be 0
+        $paid = $busy.Components | Where-Object { $_.Name -eq 'Activity control job minutes past the 500 included' }
+        $paid.Quantity | Should -Be 9828
+        $paid.UnitPrice | Should -Be 0.002
+        $paid.Cost | Should -Be 19.656
+        $busy.MissingPrices | Should -BeNullOrEmpty
+    }
+
+    It 'prices the job minutes Azure Automation includes a month at the included tier, and every minute past them at the next one (ADR 0031)' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         $minutes = @($estimate.Components | Where-Object { $_.Unit -eq 'minute' -and $_.Meter -like 'Automation*' })
-        $minutes.Name | Should -Be @('Nightly safety stop job minutes (the first 500 a month are included)', 'Activity control job minutes (the first 500 a month are included)')
-        # Past 500 a month, Automation bills each minute (the fixture's 0.002), which the estimate doesn't price: a change
-        # that counts more minutes must price the tier past the included ones too.
-        ($minutes | Measure-Object -Property Quantity -Sum).Sum | Should -BeLessOrEqual 500
-        foreach ($component in $minutes) {
+        $included = @($minutes | Where-Object { $_.Name -like '*(the first 500 a month are included)' })
+        $included.Name | Should -Be @('Nightly safety stop job minutes (the first 500 a month are included)', 'Activity control job minutes (the first 500 a month are included)')
+        # Past 500 a month, Automation bills each minute (the fixture's 0.002): a change that counts more minutes is priced at
+        # that tier, never at the included one.
+        ($included | Measure-Object -Property Quantity -Sum).Sum | Should -BeLessOrEqual 500
+        foreach ($component in $included) {
             $component.Cost | Should -Be 0
         }
+        $past = @($minutes | Where-Object { $_.Name -notin $included.Name })
+        $past.Name | Should -Be @('Activity control job minutes past the 500 included')
+        $past[0].UnitPrice | Should -BeGreaterThan 0
+        ($minutes | Measure-Object -Property Quantity -Sum).Sum | Should -Be (120 + 5 * 116)
     }
 
     It 'subtracts the free-offer allowance from the light-use month and keeps the session at list price' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $true
-        # Storage: the offer covers 32 GB, so idle is 2 x E10 at 10.00 = 20.00.
-        $estimate.IdleMonthly | Should -Be 20.03
+        # Storage: the offer covers 32 GB, so idle is 2 x E10 at 10.00 = 20.00, with the session control's 0.43.
+        $estimate.IdleMonthly | Should -Be 20.43
         # The session stays at list price: 2.30 x 5 + 0.20 = 11.70.
         $estimate.SessionCost | Should -Be 11.7
         # Allowance: 10 hours x 2 vCores = 20 vCore-hours (72,000 vCore-seconds, within the 100,000) x 0.50 = 10.00.
         # Month: 20 + 2.30 x 10 + 0.20 - 10.00 = 33.20, as at 1 vCore: the allowance covers T3 at light use either way.
         $estimate.T3FreeOfferCreditMonthly | Should -Be 10
-        $estimate.LightUseMonthly | Should -Be 33.23
+        $estimate.LightUseMonthly | Should -Be 33.63
         $estimate.T3FreeOffer | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer'
     }
@@ -800,7 +861,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless when the free offer is unavailable' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public -T3UseFreeLimit $false
-        $estimate.LightUseMonthly | Should -Be 46.43
+        $estimate.LightUseMonthly | Should -Be 46.83
         $estimate.T3FreeOffer | Should -BeFalse
         $estimate.T3FreeOfferUnchecked | Should -BeFalse
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Not -Match 'free offer'
@@ -808,7 +869,7 @@ Describe 'Get-DemoCostEstimate' {
 
     It 'prices T3 as regular serverless and says so when the free offer was not checked' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
-        $estimate.LightUseMonthly | Should -Be 46.43
+        $estimate.LightUseMonthly | Should -Be 46.83
         $estimate.T3FreeOfferUnchecked | Should -BeTrue
         ($estimate.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').message | Should -Match 'free offer wasn''t checked'
     }
@@ -922,10 +983,10 @@ Describe 'Get-DemoCostEstimate' {
 
         # Running: 2.30 + Servers 3 x 0.025 + SQL 2 x 0.02 + CSPM 2 x 0.012 = 2.439 per hour.
         $estimate.HourlyRunning | Should -Be 2.44
-        # Idle: 23.20 + Defender for Azure SQL 0.02 x 730 + CSPM 0.012 x 730 = 46.56 per month.
-        $estimate.IdleMonthly | Should -Be 46.59
+        # Idle: 23.20 + Defender for Azure SQL 0.02 x 730 + CSPM 0.012 x 730 = 46.56 per month, with the session control's 0.43.
+        $estimate.IdleMonthly | Should -Be 46.99
         $estimate.SessionCost | Should -Be 9.96
-        $estimate.LightUseMonthly | Should -Be 71.18
+        $estimate.LightUseMonthly | Should -Be 71.58
         $estimate.DefenderSession | Should -Be 0.56
         $estimate.DefenderMonthly | Should -Be 24.75
     }
@@ -968,7 +1029,7 @@ Describe 'Get-DemoCostEstimate' {
     }
 
     It 'checks the hard monthly ceiling against totals that include Defender' {
-        # Without Defender the light-use month is 46.43; with it, 71.18.
+        # Without Defender the light-use month is 46.83; with it, 71.58.
         $config = New-TestConfig -Override @{ monthlyCeilingUsd = 50 }
         $without = Get-DemoCostEstimate -Config $config -ProfileName 'lowest-cost' -NetworkMode public -DefenderPlans @()
         ($without.Results | Where-Object checkId -eq 'PREFLIGHT.COST.MONTHLY').status | Should -Be 'Pass'
@@ -1089,8 +1150,8 @@ Describe 'Get-DemoCostEstimate' {
         $estimate = Get-DemoCostEstimate -Config (New-TestConfig -Override @{ dataDiskSku = 'E10' }) -ProfileName 'lowest-cost' -DemoHours 5 -LightUseHoursPerMonth 10 -BastionHours 1 -NetworkMode public
         ($estimate.Components | Where-Object Name -eq 'T1 data disk (E10)').Cost | Should -Be 10
         ($estimate.Components | Where-Object Name -eq 'T2 host data disk (E10)').Cost | Should -Be 10
-        # The two data disks add 2 x 10.00 to the default 46.43.
-        $estimate.LightUseMonthly | Should -Be 66.43
+        # The two data disks add 2 x 10.00 to the default 46.83.
+        $estimate.LightUseMonthly | Should -Be 66.83
     }
 
     It 'removes the demo-day data disks when dataDiskSku is None' {
