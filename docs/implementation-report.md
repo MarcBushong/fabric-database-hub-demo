@@ -8965,6 +8965,7 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
   - **The CHANGELOG** is this branch's, with #69's date for the Ignite updates, 2026-11-23. From the Incident RCA's heading on, it's #69's byte for byte.
   - **What else it brings:** #69's secret-scan fix (`.gitleaksignore`'s fingerprints, and `episodeKeyOf` in the RCA's incident tests, beside Query Store's tests), and its service stubs for CI on Linux.
   - **#69's RCA-XE-00 fix, f16b9cb9** (12156f1c), reviewed SHIP, came later: RCA-XE-00 reads `sys.dm_xe_object_columns` alone, since its join took about 8 s of CPU at each observer start on SQL Server 2022 and timed out on a fresh T1. `Rca.Contract`: 32 passed.
+  - **C0's test-only fix on it, f78458d6** (afcda8fc), which #69 doesn't take since CI never runs that test: the opt-in SQL Server integration test's head blocker carries the chain's run token, its login, its input buffer, and an open transaction, not a module. It passed end to end on SQL Server 2022 CU25.
   - **Main:** main at 4c2c1850 already merges into it without a change.
 
 **Conflicts, and how they were resolved,** besides this report (each merge's message says more):
