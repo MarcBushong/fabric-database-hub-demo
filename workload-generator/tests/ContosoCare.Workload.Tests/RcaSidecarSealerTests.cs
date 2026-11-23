@@ -349,6 +349,42 @@ public sealed class RcaSidecarSealerTests : IDisposable
         Assert.IsType<long>(Assert.Single(draft.Tables[RcaContract.QueryCoverage]).Get("interval_minutes"));
     }
 
+    [Fact]
+    public void ATargetWithRowsAndNoQueryStoreReadIsLeftForTheReducersCoverageRow()
+    {
+        // T1c's reducer adds the row that says no read is recorded: the sealer adds none, so there's never a second one.
+        var rig = new SidecarRig(root, T0);
+        var span = rig.Open(T0, "T1", "T4");
+        rig.Sink.Write(SidecarRig.Coverage("T1", T0, T0.AddMinutes(15)));
+        rig.Sink.Write(new CaptureRow(RcaContract.Connections, "T4", T0.AddMinutes(16), "RCA-PG-17").Set("captured_at_utc", T0.AddMinutes(16)).Set("target", "T4").Set("state", "idle").Set("connections", 40L).Set("is_demo", true));
+        rig.Sink.Write(new CaptureRow(RcaContract.Connections, "T4", T0.AddMinutes(17), "RCA-PG-17").Set("captured_at_utc", T0.AddMinutes(17)).Set("target", "T4").Set("state", "idle").Set("connections", 41L).Set("is_demo", true));
+        span.Close(T0.AddMinutes(20));
+
+        rig.Seal(rig.Bind(rig.Span(span.Id), SidecarRig.Session));
+
+        var draft = Assert.Single(rig.Reducer.Calls).Draft;
+        Assert.Equal(["T1", "T4"], draft.Targets);
+        Assert.Equal(["T1"], draft.Tables[RcaContract.QueryCoverage].Select(r => r.Target));
+        Assert.Equal(2, draft.Tables[RcaContract.Connections].Count);
+        Assert.Equal((T0, T0.AddMinutes(17).AddMilliseconds(1)), (draft.WindowStartUtc, draft.WindowEndUtc));
+    }
+
+    [Fact]
+    public void SealAllReturnsTheIdsThisCallSealedAndNoEarlierOnes()
+    {
+        // The page index lists a sidecar this call sealed as new, and every other offerable one as pending.
+        var rig = new SidecarRig(root, T0);
+        rig.Observe(T0, T0.AddMinutes(30), SidecarRig.Session, "T1");
+        var first = rig.Sealer.SealAll();
+        rig.Observe(T0.AddHours(1), T0.AddHours(2), SidecarRig.Session, "T1");
+
+        var second = rig.Sealer.SealAll();
+
+        Assert.Equal([Assert.Single(first.Sealed).DocumentId], first.SealedIds);
+        Assert.Equal([Assert.Single(second.Sealed).DocumentId], second.SealedIds);
+        Assert.Equal(first.SealedIds.Concat(second.SealedIds), rig.Store.Offerable().Select(s => s.DocumentId));
+    }
+
     private static List<CaptureValues> T4Settings(DateTimeOffset now) =>
     [
         Row(("captured_at", now.UtcDateTime), ("in_recovery", false), ("name", "pg_qs.interval_length_minutes"), ("setting", "15"), ("unit", "min")),

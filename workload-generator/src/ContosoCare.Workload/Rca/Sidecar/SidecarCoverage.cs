@@ -50,13 +50,18 @@ internal sealed class SidecarCoverage
 
     /// <summary>
     /// Merges one target's per-read coverage rows, in the order they were written, and takes the capture IDs of its other
-    /// rows too (who held T4's connections has no coverage row of its own). A target with rows and no coverage row gets
-    /// one that says no Query Store read is in the sidecar.
+    /// rows too (who held T4's connections has no coverage row of its own). A target needs at least one read: one with
+    /// rows and none gets its coverage row from the reducer, which says no read is recorded.
     /// </summary>
     public static SidecarCoverage Merge(string target, IReadOnlyList<CaptureRow> coverage, IReadOnlyList<CaptureRow> rows)
     {
         ArgumentNullException.ThrowIfNull(coverage);
         ArgumentNullException.ThrowIfNull(rows);
+        if (coverage.Count == 0)
+        {
+            throw new ArgumentException($"{target} has no Query Store read to merge; the reducer gives it its coverage row.", nameof(coverage));
+        }
+
         var merged = new SidecarCoverage(target);
         var reads = coverage.Select((row, index) => (Row: row, Index: index))
             .OrderBy(r => Time(r.Row, "window_end_utc") ?? r.Row.At)
@@ -77,14 +82,6 @@ internal sealed class SidecarCoverage
         }
 
         merged.Sources = [.. SourceOrder.Where(sources.Contains), .. sources.Where(s => !SourceOrder.Contains(s)).Order(StringComparer.Ordinal)];
-        if (reads.Count == 0)
-        {
-            merged.WindowStart = rows.Count == 0 ? DateTimeOffset.UnixEpoch : rows.Min(r => r.At);
-            merged.WindowEnd = rows.Count == 0 ? merged.WindowStart : rows.Max(r => r.At).AddMilliseconds(1);
-            merged.Gaps = [string.Create(CultureInfo.InvariantCulture, $"This sidecar holds no Query Store read of {target}, only rows from {(merged.Sources.Count == 0 ? "the observer" : string.Join(", ", merged.Sources))}.")];
-            return merged;
-        }
-
         merged.WindowStart = reads.Min(r => Time(r, "window_start_utc") ?? r.At);
         merged.WindowEnd = reads.Max(r => Time(r, "window_end_utc") ?? r.At);
         if (reads.LastOrDefault(r => r.Get("state") is not null || r.Get("capture_mode") is not null || r.Get("interval_minutes") is not null) is { } state)

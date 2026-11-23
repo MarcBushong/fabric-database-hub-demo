@@ -7,7 +7,11 @@ using ContosoCare.Workload.Rca.Store;
 namespace ContosoCare.Workload.Rca.Sidecar;
 
 /// <summary>What one sealing call made, and the spans it couldn't seal, with why (they're tried again at the next).</summary>
-internal sealed record SidecarSealing(IReadOnlyList<SealedSidecar> Sealed, IReadOnlyList<string> Problems);
+internal sealed record SidecarSealing(IReadOnlyList<SealedSidecar> Sealed, IReadOnlyList<string> Problems)
+{
+    /// <summary>The IDs this call sealed, which the page index lists as new (and every other offerable sidecar as pending).</summary>
+    public IReadOnlyList<string> SealedIds => [.. Sealed.Select(s => s.DocumentId)];
+}
 
 /// <summary>
 /// The sealer (rca/README.md, The sidecar): takes a span's sidecar rows out of its folder into one sealed sidecar in
@@ -251,16 +255,20 @@ internal sealed class SidecarSealer
 
     /// <summary>
     /// Makes one sidecar of a span's rows (under the lock): each target's coverage merged, the draft fitted to what's left
-    /// of its budget by the reducer, the gzip written, and its entry and budget use recorded.
+    /// of its budget by the reducer, the gzip written, and its entry and budget use recorded. A target with rows and no
+    /// Query Store read of its own (who held T4's connections, say, before the next read) has no coverage row here: the
+    /// reducer adds the one that says no read is recorded, and the target's rows set the window then.
     /// </summary>
     private SealedSidecar Write(SidecarLedger ledger, string spanId, IReadOnlyList<CaptureRow> rows, string? session, bool provisional, bool final, bool backfill, IReadOnlyCollection<string> spanTargets, DateTimeOffset now)
     {
-        var coverage = rows.GroupBy(r => r.Target, StringComparer.Ordinal)
-            .OrderBy(g => g.Key, StringComparer.Ordinal)
+        var groups = rows.GroupBy(r => r.Target, StringComparer.Ordinal).OrderBy(g => g.Key, StringComparer.Ordinal).ToList();
+        var coverage = groups
+            .Where(g => g.Any(r => r.Table == RcaContract.QueryCoverage))
             .Select(g => SidecarCoverage.Merge(g.Key, [.. g.Where(r => r.Table == RcaContract.QueryCoverage)], [.. g.Where(r => r.Table != RcaContract.QueryCoverage)]))
             .ToList();
-        var windowStart = coverage.Min(c => c.WindowStart);
-        var windowEnd = coverage.Max(c => c.WindowEnd);
+        var unread = groups.Where(g => !g.Any(r => r.Table == RcaContract.QueryCoverage)).ToList();
+        var windowStart = coverage.Select(c => c.WindowStart).Concat(unread.Select(g => g.Min(r => r.At))).Min();
+        var windowEnd = coverage.Select(c => c.WindowEnd).Concat(unread.Select(g => g.Max(r => r.At).AddMilliseconds(1))).Max();
         var tables = new Dictionary<string, List<CaptureRow>>(StringComparer.Ordinal);
         foreach (var table in RcaContract.SidecarTables.Where(t => t.Name != RcaContract.QueryCoverage))
         {
@@ -271,9 +279,13 @@ internal sealed class SidecarSealer
             }
         }
 
-        tables[RcaContract.QueryCoverage] = [.. coverage.Select(c => c.Row())];
+        if (coverage.Count > 0)
+        {
+            tables[RcaContract.QueryCoverage] = [.. coverage.Select(c => c.Row())];
+        }
+
         var (documentId, sequence) = Store.NextDocumentId(ledger, windowStart);
-        var draft = new SidecarDraft(documentId, session, Store.Host, sequence, final, windowStart, windowEnd, now, producerVersion, [.. coverage.Select(c => c.Target)], tables);
+        var draft = new SidecarDraft(documentId, session, Store.Host, sequence, final, windowStart, windowEnd, now, producerVersion, [.. groups.Select(g => g.Key)], tables);
         var budget = SidecarStore.BudgetKey(session, spanId);
         var remaining = (int)Math.Clamp(sessionBudget(spanTargets) - (ledger.Budgets.TryGetValue(budget, out var use) ? use.Bytes : 0L), 0L, int.MaxValue);
         if (provisional)

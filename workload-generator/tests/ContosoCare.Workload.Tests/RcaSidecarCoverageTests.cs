@@ -81,16 +81,11 @@ public sealed class RcaSidecarCoverageTests : IDisposable
     }
 
     [Fact]
-    public void ATargetWithRowsAndNoReadGetsACoverageRowThatSaysSo()
+    public void MergeTakesOnlyATargetWithAQueryStoreRead()
     {
-        var holders = new[] { new CaptureRow(RcaContract.Connections, "T4", T0.AddMinutes(3), "RCA-PG-17"), new CaptureRow(RcaContract.Connections, "T4", T0.AddMinutes(4), "RCA-PG-17") };
+        var holders = new[] { new CaptureRow(RcaContract.Connections, "T4", T0.AddMinutes(3), "RCA-PG-17") };
 
-        var merged = SidecarCoverage.Merge("T4", [], holders).Row();
-
-        Assert.Equal((T0.AddMinutes(3), T0.AddMinutes(4).AddMilliseconds(1)), ((DateTimeOffset)merged.Get("window_start_utc")!, (DateTimeOffset)merged.Get("window_end_utc")!));
-        Assert.Equal(("RCA-PG-17", false), ((string?)merged.Get("sources"), (bool)merged.Get("backfill")!));
-        Assert.Equal("This sidecar holds no Query Store read of T4, only rows from RCA-PG-17.", merged.Get("gaps"));
-        Assert.Null(merged.Get("state"));
+        Assert.Throws<ArgumentException>(() => SidecarCoverage.Merge("T4", [], holders));
     }
 
     [Fact]
