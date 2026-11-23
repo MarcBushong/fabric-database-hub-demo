@@ -8782,3 +8782,18 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - **The flaky check:** `dotnet test`, the `CosmosRunnerTests` class, 51 passed. With each storm write's arrival delayed 120 ms of real time, about 5 seconds on the run's clock, as a busy machine can, the test as it was fails as the review saw it ("A storm write at 34.0 s fell in a calm."), and the fixed test passes.
 
 **The re-check (SHIP), and its two optional nits.** The re-check found both functions that call `Invoke-DbHubRcaStop`, and saw the takeover assertion fail on 07dc860c. Its nits: `automation/README.md` now names a taken-over session's end among the exports that never end the capture, and the ru-storm test counts the waves by each write's start too. `CosmosRunnerTests` passed, 51 of 51.
+
+### Zod in the functions' lock: Dependabot alert 14 (2026-11-23)
+
+**Why.** Dependabot alert 14 is high: [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), "Zod can exhaust memory while validating oversized constrained collections", in zod before 4.6.6. `fabric/app/rayfin/functions/package-lock.json` resolved zod 4.3.6, which the app's functions load at run time through `@microsoft/fabric-user-data-functions` 1.36.2 and `@microsoft/rayfin-tools-common` 1.36.2. That package declares `~4.3.6`, and so does its newest release, 2.0.1, so `npm update` can't reach the fix. The app's own `package.json` already overrides zod to 4.6.7 (`config/versions.json`), but an override reaches only its own package's lock.
+
+**The fix.**
+
+- `fabric/app/rayfin/functions/package.json` overrides zod to 4.6.7, the version the app's override pins.
+- Its lock's zod entry is the app's lock's 4.6.7 entry, from registry.npmjs.org with SHA-512: npm on this PC reaches only a feed proxy, and the public registry refused its TLS handshake. `npm install --package-lock-only` then found the lock up to date and changed nothing.
+- `config/versions.json`'s note on the overrides records the functions' override.
+- **The test** (`DbHubDemo.FabricApp.Tests.ps1`): no `package-lock.json` in the repository resolves an overridden package below its fix, and every `package.json`'s override is recorded there, at its version.
+
+**Changed files.** `fabric/app/rayfin/functions/package.json` and `package-lock.json`, `config/versions.json`, `tests/unit/DbHubDemo.FabricApp.Tests.ps1`, the CHANGELOG, and this report.
+
+**Validation.** `DbHubDemo.FabricApp.Tests.ps1` with StrictMode and the Azure CLI guard: 115 passed, 0 az calls. With the functions' `package.json` and lock as they were, the new test fails: "fabric/app/rayfin/functions/package-lock.json: node_modules/zod@4.3.6, below GHSA-mrhx-c7xc-m3w5's fix (4.6.6)". The functions' `npm ci` and build, the app's license check, and the vitest files that run the functions' code wait for the end of the coordinator's CPU quiet window, in the release's full validation.

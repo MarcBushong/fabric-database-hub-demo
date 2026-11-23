@@ -36,6 +36,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 ### Security
 
 - **Two network join actions for the session control** (2026-11-23): `Microsoft.Network/virtualNetworks/subnets/join/action` and `Microsoft.Network/privateDnsZones/join/action`, at the demo resource group, for T4's read replica. They let a PostgreSQL server the control creates join `snet-pg`, the only subnet there delegated to PostgreSQL, and use T4's private DNS zone; nothing else it can create joins a network ([permissions](docs/permissions.md)).
+- **zod 4.6.7 in the Insights app's functions** (2026-11-23, Dependabot alert 14, high: [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), "Zod can exhaust memory while validating oversized constrained collections"). The functions' lock, `fabric/app/rayfin/functions/package-lock.json`, resolved zod 4.3.6 at run time through `@microsoft/rayfin-tools-common`, which declares `~4.3.6`, as its newest release, 2.0.1, does too. Their `package.json` now overrides zod to 4.6.7, as the app's already did, and a test checks that no lock in the repository resolves an overridden package below its fix.
 
 ## [2026-11-23] - The Incident RCA
 

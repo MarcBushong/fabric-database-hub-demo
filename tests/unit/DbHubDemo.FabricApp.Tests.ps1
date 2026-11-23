@@ -146,6 +146,39 @@ Describe 'Fabric App source' {
         }
     }
 
+    It 'resolves no copy of an overridden package below its fix in any package-lock.json, and pins every package.json''s override as recorded (Dependabot alert 14, 2026-11-23)' {
+        # The functions' lock resolved zod 4.3.6, which @microsoft/rayfin-tools-common's ~4.3.6 allows, below
+        # GHSA-mrhx-c7xc-m3w5's fix: the app's own override reaches only the app's lock.
+        $recorded = $script:appSettings['overrides']
+        $lockFiles = @(git -C $repoRoot ls-files --cached --others --exclude-standard -- '*package-lock.json' 2>$null)
+        $lockFiles | Should -Contain 'fabric/app/rayfin/functions/package-lock.json'
+        $bad = foreach ($file in $lockFiles) {
+            $lock = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath $file) -Raw | ConvertFrom-Json -AsHashtable
+            $package = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath ($file -replace 'package-lock\.json$', 'package.json')) -Raw | ConvertFrom-Json -AsHashtable
+            $overrides = if ($package.ContainsKey('overrides')) { $package['overrides'] } else { @{} }
+            foreach ($key in $overrides.Keys) {
+                if (-not $recorded.ContainsKey($key)) {
+                    '{0}: the override {1} isn''t recorded in config/versions.json' -f $file, $key
+                }
+                elseif ($overrides[$key] -cne $recorded[$key]['version']) {
+                    '{0}: the override {1} is {2}, not {3}' -f $file, $key, $overrides[$key], $recorded[$key]['version']
+                }
+            }
+            foreach ($key in @($recorded.Keys | Where-Object { $_ -ne 'note' })) {
+                $name = $key -replace '(?<=.)@>=.*$', ''
+                $from = if ($key -match '@>=(\d+\.\d+\.\d+) <') { [version]$Matches[1] } else { [version]'0.0.0' }
+                $fixed = [version]$recorded[$key]['fixedIn']
+                foreach ($entry in @($lock['packages'].GetEnumerator() | Where-Object { $_.Key -match ('(^|/)node_modules/{0}$' -f [regex]::Escape($name)) })) {
+                    $version = [string]$entry.Value['version']
+                    if ($version -match '^\d+\.\d+\.\d+$' -and [version]$version -ge $from -and [version]$version -lt $fixed) {
+                        '{0}: {1}@{2}, below {3}''s fix ({4})' -f $file, $entry.Key, $version, $recorded[$key]['advisory'], $recorded[$key]['fixedIn']
+                    }
+                }
+            }
+        }
+        @($bad) | Should -BeNullOrEmpty
+    }
+
     It 'keeps deploy-time files out of Git' {
         $ignore = Get-Content -LiteralPath (Join-Path -Path $script:appRoot -ChildPath '.gitignore')
         foreach ($entry in 'rayfin/.env', 'rayfin/.deployments.json', 'rayfin/.temp/', '.env.*', 'public/rayfin.config.json', 'public/dbhub-app.json') {
