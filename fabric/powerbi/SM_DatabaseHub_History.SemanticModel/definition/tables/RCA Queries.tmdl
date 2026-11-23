@@ -1,4 +1,4 @@
-/// One Query Store plan over one phase of a capture episode. The Incident RCA's evidence (ADR 0031): what the observer beside the workload captured, which NB_DatabaseHub_LiveActivity writes from its evidence documents (rca/history-tables.json).
+/// Not written yet: the capture doesn't collect Query Store's statistics yet, so this table is empty, and its emptiness says nothing about a target's Query Store: never that a target has none (validate.ps1's T1.QUERYSTORE to T3.QUERYSTORE say whether it's on). Its grain, once a later release writes it: one Query Store plan over one phase of a capture episode. The Incident RCA's evidence (ADR 0031), which NB_DatabaseHub_LiveActivity writes from the observer's evidence documents (rca/history-tables.json).
 table 'RCA Queries'
 
     /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.
