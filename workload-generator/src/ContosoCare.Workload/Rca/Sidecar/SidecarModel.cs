@@ -26,7 +26,7 @@ internal sealed class SidecarLedger
     public List<SidecarEntry> Sidecars { get; set; } = [];
 
     /// <summary>Each budget's use (<see cref="SidecarEntry.Budget"/>): a session's, or a span's without a session.</summary>
-    public Dictionary<string, SidecarBudget> Budgets { get; set; } = new(StringComparer.Ordinal);
+    public Dictionary<string, SidecarBudgetUse> Budgets { get; set; } = new(StringComparer.Ordinal);
 
     /// <summary>The spans the sidecars belong to, by span ID, kept after a span's folder is gone, so a backfill finds its session.</summary>
     public Dictionary<string, SidecarSpan> Spans { get; set; } = new(StringComparer.Ordinal);
@@ -81,7 +81,7 @@ internal sealed class SidecarEntry
 }
 
 /// <summary>One budget's use: the gzip of the sidecars sealed against it.</summary>
-internal sealed class SidecarBudget
+internal sealed class SidecarBudgetUse
 {
     public long Bytes { get; set; }
 

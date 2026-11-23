@@ -614,7 +614,7 @@ internal sealed partial class SidecarStore : ISidecarCatalog
     {
         if (!ledger.Budgets.TryGetValue(key, out var use))
         {
-            ledger.Budgets[key] = use = new SidecarBudget();
+            ledger.Budgets[key] = use = new SidecarBudgetUse();
         }
 
         use.Bytes = Math.Max(0, use.Bytes + bytes);
