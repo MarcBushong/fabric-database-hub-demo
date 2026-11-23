@@ -7832,3 +7832,28 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 - The docs describe A's and B's behavior as of their heads above: the refusal `out-of-step`, which on T4 also covers a step the runner's role can't run yet; setup's drops; the match by run; and the prompts that read an incident's sessions by its run. A review that changes one changes its sentence here.
 
 **What its live check needs.** Nothing of its own: the fixtures and tests are offline. A's and B's live round shows what the docs describe: Database Hub's sessions as `ContosoCare.Demo/<service>/<run>`, Query Store's modules in the application schemas, and the cheat sheet's services matching what Database Hub shows.
+
+### Realistic names: merged with the RCA release, and plan-regression's stored text (2026-11-23)
+
+**Why.** Wednesday's release takes the names as one branch, `marcbushong-microsoft-names-integration`: units A, B, and C merged onto the RCA release. The release's checked switch for plan-regression (F26) came with the old names and wording, after unit A had made every stored module neutral.
+
+- **The merge's resolutions** (0bf5d4cd, onto the release's 32a2dcac; the release's later heads merged with no conflict):
+  - **`120-scenario-procedures.sql`:** the release's checked switch, without `@quiet_until`, under unit A's names. Its retry block, which merged with no conflict marker, ran the dropped `demo.usp_visit_summary_lookup`; it runs `frontdesk.usp_visit_summary` now.
+  - **The release's test,** `SqlScriptTests.PlanRegressionsSwitchIsQuietCheckedAndTriedAgainBounded`, reads `frontdesk.usp_refresh_visit_summaries`.
+  - **Eight docs** keep the release's text with the renames, and the walkthrough's cheat sheet keeps its service column. `Agent.PromptPack.Tests.ps1` keeps both sides.
+- **The stored text no longer narrates the fault** (the resolution re-check's one Low). SQL Server stores the procedure's whole body, where a DBA or Database Agents reads it in `sys.sql_modules`, and the release's comments and event details there said "plan A", "plan B", "the regression runs", "ran and was corrected", and "didn't start". The RCA strips comments and literals, so its evidence wasn't affected.
+  - **The comments:** their explanations moved to the header above the `GO`, which isn't stored. The body's comments say "attempt", "the seek plan", and "the scan plan".
+  - **The event details say what the check read:** "The lookup's cached plan scans care.appointments (attempt 1 of 3).", "... still seeks ix_appointments_patient after 3 attempts. The next run tries again.", or "... couldn't be read: ...".
+  - **The event names stay:** `plan-switch`, `plan-switch-retry`, and `plan-switch-unverified`. The control notebook reads the last, and ADR 0031 leaves event names to a follow-up.
+  - **The test:** `SqlScriptTests.NoStoredModuleNamesAScenario` also refuses "regression", "plan A" or "plan B", "corrected", and "didn't start" in every stored module. It failed on 0bf5d4cd's text, at "the regression runs", and passes here. PostgreSQL's function bodies have none of these words.
+
+**Changed files.** `database/common/120-scenario-procedures.sql`, `workload-generator/tests/ContosoCare.Workload.Tests/SqlScriptTests.cs`, and this report.
+
+**Validation.** Before 2 PM, targeted, one suite at a time, as the coordinator asked:
+
+- **The runner's tests that read the script:** `SqlScriptTests`, 33 passed, with ScriptDom's parse of every script; `CatalogTests`, 160 passed; `RcaBlindTests`, 4 passed. `SqlIntegrationTests`' 19 were skipped: they need a disposable SQL Server.
+- **markdownlint** found no issue in this report, and the leak check prints nothing.
+
+**Risks.** The details' new words reach `demo.scenario_run_events` only, and nothing parses them: the control notebook reads the event's name, and the plan-regression README and the troubleshooting page say what the events mean, not their words.
+
+**What its live check needs.** T3's plan-regression run in Wednesday's proof: its `plan-switch` event reads as above, and `sp_helptext 'frontdesk.usp_refresh_visit_summaries'` shows none of the header.

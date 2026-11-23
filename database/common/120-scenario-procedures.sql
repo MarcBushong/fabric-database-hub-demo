@@ -1654,11 +1654,19 @@ GO
 --
 -- The switch is checked (F26, 2026-11-21): sp_recompile only drops the cached plan, and the lookup's next run compiles
 -- it with its own patients (Learn: sp_recompile), so a lookup of another worker that compiled around the switch could put
--- plan A back within the same second. The other workers now stay out from 2 seconds before the switch, so worker 1's
--- compilation is the only one. Then worker 1 reads the lookup's cached plan (sys.dm_exec_procedure_stats,
--- sys.dm_exec_text_query_plan): one that still seeks ix_appointments_patient is switched again, 20 and 40 seconds later,
--- in the other workers' quiet windows then. Events: plan-switch, plan-switch-retry, or plan-switch-unverified, a Warning
--- that the regression didn't start, or couldn't be checked.
+-- plan A back within the same second. The other workers now stay out from 2 seconds before each switch until 5 seconds
+-- after it, in windows at @switch_at and @switch_gap_ms apart, whether worker 1 needs them or not, since the workers
+-- don't talk to each other; so worker 1's compilation is the only one. Then worker 1 reads the lookup's cached plan
+-- (sys.dm_exec_procedure_stats, sys.dm_exec_text_query_plan): plan A names ix_appointments_patient, and plan B, which
+-- scans care.appointments, doesn't. Plan B, or plan A that automatic tuning has forced already (the regression ran and
+-- was corrected), is event plan-switch and @switch_verified = 1. Plan A otherwise is switched again, 20 and 40 seconds
+-- after the first, in the other workers' quiet windows then (plan-switch-retry). After 3 switches, or when the plan
+-- can't be read, plan-switch-unverified, a Warning that the regression didn't start or couldn't be checked, and
+-- @switch_verified = 0; -1 is a run that ended or responded before its check.
+--
+-- The procedure's stored text says "attempt" for a switch, "the seek plan" for plan A, and "the scan plan" for plan B,
+-- and its comments and event details don't narrate the regression: SQL Server stores the body, comments included, where a
+-- DBA or Database Agents reads it (ADR 0031: no stored definition narrates its fault). This header isn't stored.
 --
 -- The Database Agent beat (2026-11-18, the showcase's second cycle on T3): @hold_auto_correction = 1 turns
 -- FORCE_LAST_GOOD_PLAN off for the run, after demo.auto_tuning_hold records how it was, so the regression lasts until
@@ -1705,9 +1713,9 @@ BEGIN
     DECLARE @held bit = 0, @was_held bit = 0, @released bit = 0, @restored nvarchar(60), @prior nvarchar(60);
     DECLARE @responded bit = 0, @responded_after_seconds int = 0, @already_forced bit = 0;
     DECLARE @response_query_id bigint = NULL, @forced_plan_id bigint = NULL, @regressed_plan_id bigint = NULL, @response_detail nvarchar(400);
-    -- The switch's attempts (F26): at @switch_at and @switch_gap_ms apart, @switch_attempts_max at most; each checked once
-    -- the other workers have run the lookup again for 2 seconds. @switch_verified: 1 the regression runs (or automatic
-    -- tuning has corrected it already), 0 it doesn't or couldn't be read, -1 not checked (the run ended or responded first).
+    -- Attempts at @switch_at and @switch_gap_ms apart, @switch_attempts_max at most, each read once the other workers have
+    -- run the lookup again for 2 seconds. @switch_verified: 1 the scan plan, or a plan forced already; 0 the seek plan after
+    -- the last attempt, or a plan that can't be read; -1 not read (the run ended or responded first).
     DECLARE @switch_gap_ms int = 20000, @switch_attempts_max int = 3, @switch_attempts int = 0, @switch_verified int = -1;
     DECLARE @attempt_at datetime2(3) = NULL, @verify_at datetime2(3) = NULL, @scans int, @since bigint, @switch_detail nvarchar(400);
 
@@ -1781,9 +1789,8 @@ BEGIN
 
         IF @worker = 1 AND @responded = 0 AND @verify_at IS NOT NULL AND SYSUTCDATETIME() >= @verify_at
         BEGIN
-            -- Is the plan the lookup runs now the scanning one? Plan A seeks ix_appointments_patient; plan B scans
-            -- care.appointments and names no other index. A plan that can't be read leaves it unknown. Plan A that automatic
-            -- tuning forced already (FORCE_LAST_GOOD_PLAN on) means the regression ran and was corrected.
+            -- Which plan does the lookup run now? @scans: 1 the scan plan, 0 the seek plan (it names ix_appointments_patient),
+            -- 2 a seek plan that automatic tuning has forced already (FORCE_LAST_GOOD_PLAN), NULL a plan that can't be read.
             SET @verify_at = NULL;
             SET @scans = NULL;
             SET @switch_detail = NULL;
@@ -1806,25 +1813,25 @@ BEGIN
 
                 SET @switch_verified = 1;
                 SET @switch_detail = CASE WHEN @scans = 1
-                    THEN CONCAT(N'The lookup''s cached plan scans care.appointments: the regression runs (switch ', @switch_attempts, N' of ', @switch_attempts_max, N').')
-                    ELSE N'The regression ran, and automatic tuning has forced plan A back already (FORCE_LAST_GOOD_PLAN).' END;
+                    THEN CONCAT(N'The lookup''s cached plan scans care.appointments (attempt ', @switch_attempts, N' of ', @switch_attempts_max, N').')
+                    ELSE N'The lookup''s cached plan seeks ix_appointments_patient, and automatic tuning has forced a plan for it already (FORCE_LAST_GOOD_PLAN).' END;
                 EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'plan-switch', @session_id = @@SPID, @detail = @switch_detail;
             END;
             ELSE IF @scans = 0 AND @switch_attempts < @switch_attempts_max
             BEGIN
                 SET @attempt_at = DATEADD(millisecond, @switch_gap_ms * @switch_attempts, @switch_at);
-                SET @switch_detail = CONCAT(N'The lookup''s cached plan still seeks ix_appointments_patient after switch ', @switch_attempts,
-                    N': another compilation put plan A back, so the switch runs again ', @switch_gap_ms * @switch_attempts / 1000, N' seconds after the first.');
+                SET @switch_detail = CONCAT(N'The lookup''s cached plan still seeks ix_appointments_patient after attempt ', @switch_attempts,
+                    N': another compilation cached the seek plan, so attempt ', @switch_attempts + 1, N' runs ', @switch_gap_ms * @switch_attempts / 1000, N' seconds after the first.');
                 EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'plan-switch-retry', @session_id = @@SPID, @detail = @switch_detail;
             END;
             ELSE
             BEGIN
                 SET @switch_verified = 0;
                 SET @switch_detail = LEFT(CASE WHEN @scans = 0
-                    THEN CONCAT(N'The regression didn''t start: the lookup''s cached plan still seeks ix_appointments_patient after ', @switch_attempts,
-                        N' switches, so CPU stays low. The next run tries again.')
-                    ELSE CONCAT(N'Whether the regression started couldn''t be checked: ', ISNULL(@switch_detail, N'the lookup''s plan isn''t in the plan cache'),
-                        N'. CPU shows it: it rises within minutes when it did.') END, 400);
+                    THEN CONCAT(N'The lookup''s cached plan still seeks ix_appointments_patient after ', @switch_attempts,
+                        N' attempts. The next run tries again.')
+                    ELSE CONCAT(N'The lookup''s cached plan couldn''t be read: ', ISNULL(@switch_detail, N'it isn''t in the plan cache'),
+                        N'. The database''s CPU shows which plan runs.') END, 400);
                 EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'plan-switch-unverified', @session_id = @@SPID, @detail = @switch_detail;
             END;
         END;
@@ -1872,10 +1879,8 @@ BEGIN
             END;
         END;
 
-        -- The other workers stay out of the lookup from 2 seconds before each of worker 1's switches until 5 seconds after it,
-        -- so the lookup compiles only for every patient then (F26): a lookup that was compiling around the switch, with its
-        -- few patients, could put plan A back. Windows at @switch_at and @switch_gap_ms apart, whether worker 1 needs them
-        -- or not, since the workers don't talk to each other.
+        -- The other workers stay out of the lookup from 2 seconds before each of worker 1's attempts until 5 seconds after
+        -- it, in windows at @switch_at and @switch_gap_ms apart, whether worker 1 needs them or not.
         SET @since = DATEDIFF_BIG(millisecond, @switch_at, SYSUTCDATETIME());
         IF @worker > 1 AND @since >= -2000 AND @since < CAST(@switch_gap_ms AS bigint) * (@switch_attempts_max - 1) + 5000 AND (@since + 2000) % @switch_gap_ms < 7000
             WAITFOR DELAY '00:00:01';

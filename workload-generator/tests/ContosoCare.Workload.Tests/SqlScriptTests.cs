@@ -154,9 +154,12 @@ public sealed class SqlScriptTests
     public void NoStoredModuleNamesAScenario()
     {
         // SQL Server stores a module's whole batch, comments before CREATE included, so each header comment is a batch of
-        // its own and every module batch starts at its CREATE. What a DBA reads with sp_helptext names no scenario.
+        // its own and every module batch starts at its CREATE. What a DBA reads with sp_helptext names no scenario, and
+        // doesn't narrate its fault (ADR 0031): no regression, no plan A or B, nothing corrected or that didn't start.
+        // The header above the GO, which isn't stored, explains it.
         var scenarioIds = Directory.GetDirectories(RepositoryPaths.Combine("scenarios")).Select(d => Path.GetFileName(d)!).Where(id => File.Exists(RepositoryPaths.Combine("scenarios", id, "scenario.json"))).ToList();
         var modules = Sql.SqlScripts.SplitBatches(Script("120-scenario-procedures.sql")).Where(b => Regex.IsMatch(b, @"(?m)^CREATE OR ALTER (PROCEDURE|FUNCTION) ")).ToList();
+        var narration = new Regex(@"(?i:regression|\bcorrected\b|didn'+t start|did not start)|\b[Pp]lan [AB]\b");
 
         Assert.Equal(26, modules.Count);
         Assert.All(modules, module =>
@@ -164,6 +167,7 @@ public sealed class SqlScriptTests
             Assert.StartsWith("CREATE OR ALTER ", module, StringComparison.Ordinal);
             Assert.DoesNotContain("scenario", module, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain(scenarioIds, id => Regex.IsMatch(module, $@"(?<![A-Za-z0-9_./-]){Regex.Escape(id)}(?![A-Za-z0-9_./-])"));
+            Assert.DoesNotMatch(narration, module);
         });
     }
 
