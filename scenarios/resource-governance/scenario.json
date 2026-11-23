@@ -21,7 +21,7 @@
   "expectedHubSignals": [
     { "signal": "SqlServerCPUUtilization at the tier limit on T3 (or near 100% of the VM on T1 and T2)", "surface": "Performance" },
     { "signal": "SqlServerWaitStats: CPU wait category (SOS_SCHEDULER_YIELD) with healthy plans", "surface": "Performance" },
-    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/resource-governance sessions running in parallel", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/reporting-jobs sessions running in parallel", "surface": "Performance" },
     { "signal": "A capacity or CPU-limit finding for the database", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
   ],
   "expectedSymptoms": [

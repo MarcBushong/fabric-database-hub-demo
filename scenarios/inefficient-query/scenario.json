@@ -18,7 +18,7 @@
   },
   "expectedHubSignals": [
     { "signal": "SqlServerCPUUtilization and Batch Requests/sec above the baseline", "surface": "Performance" },
-    { "signal": "SqlServerActiveSessions: many short ContosoCare.Demo/inefficient-query requests", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: many short ContosoCare.Demo/frontdesk-app requests", "surface": "Performance" },
     { "signal": "An inefficient-query finding that names the non-SARGable predicate", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
   ],
   "expectedSymptoms": [

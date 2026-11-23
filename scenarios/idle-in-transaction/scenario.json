@@ -40,5 +40,5 @@
     "pg_stat_activity where state = 'idle in transaction', with pg_blocking_pids(pid) for the writers",
     "demo.scenario_run_events records idle-acquired and idle-rolled-back with backend PIDs"
   ],
-  "reset": "Every idle transaction rolls back, so the claims stay as seeded; reset ends any leftover ContosoCare.Demo/idle-in-transaction session with pg_terminate_backend and verifies no demo transaction is open."
+  "reset": "Every idle transaction rolls back, so the claims stay as seeded; reset ends any leftover ContosoCare.Demo/billing-worker session with pg_terminate_backend and verifies no demo transaction is open."
 }

@@ -94,8 +94,8 @@ internal static class RcaSimulation
     {
         const string Graph =
             "<deadlock><victim-list><victimProcess id=\"p2\"/></victim-list><process-list>" +
-            "<process id=\"p1\" spid=\"81\" lockMode=\"U\" waitresource=\"KEY: 5:72057594045071360 (aa11)\" clientapp=\"" + ChainApp + "\" hostname=\"SQLVM01\" loginname=\"NT AUTHORITY\\SYSTEM\" currentdb=\"5\" currentdbname=\"ContosoCare\"><executionStack><frame procname=\"ContosoCare.demo.usp_transfer\" line=\"12\">UPDATE care.inventory SET qty = qty - 1 WHERE id = 42</frame></executionStack><inputbuf>Proc [Database Id = 5 Object Id = 1]</inputbuf></process>" +
-            "<process id=\"p2\" spid=\"82\" lockMode=\"U\" waitresource=\"KEY: 5:72057594045071360 (bb22)\" clientapp=\"" + ChainApp + "\" hostname=\"SQLVM01\" loginname=\"NT AUTHORITY\\SYSTEM\" currentdb=\"5\" currentdbname=\"ContosoCare\"><executionStack><frame procname=\"ContosoCare.demo.usp_transfer\" line=\"12\">UPDATE care.inventory SET qty = qty - 1 WHERE id = 43</frame></executionStack><inputbuf>Proc [Database Id = 5 Object Id = 1]</inputbuf></process>" +
+            "<process id=\"p1\" spid=\"81\" lockMode=\"U\" waitresource=\"KEY: 5:72057594045071360 (aa11)\" clientapp=\"" + ChainApp + "\" hostname=\"SQLVM01\" loginname=\"NT AUTHORITY\\SYSTEM\" currentdb=\"5\" currentdbname=\"ContosoCare\"><executionStack><frame procname=\"ContosoCare.supply.usp_transfer_stock\" line=\"12\">UPDATE care.inventory SET qty = qty - 1 WHERE id = 42</frame></executionStack><inputbuf>Proc [Database Id = 5 Object Id = 1]</inputbuf></process>" +
+            "<process id=\"p2\" spid=\"82\" lockMode=\"U\" waitresource=\"KEY: 5:72057594045071360 (bb22)\" clientapp=\"" + ChainApp + "\" hostname=\"SQLVM01\" loginname=\"NT AUTHORITY\\SYSTEM\" currentdb=\"5\" currentdbname=\"ContosoCare\"><executionStack><frame procname=\"ContosoCare.supply.usp_transfer_stock\" line=\"12\">UPDATE care.inventory SET qty = qty - 1 WHERE id = 43</frame></executionStack><inputbuf>Proc [Database Id = 5 Object Id = 1]</inputbuf></process>" +
             "</process-list><resource-list>" +
             "<keylock hobtid=\"1\" dbid=\"5\" objectname=\"ContosoCare.care.inventory\" indexname=\"pk_inventory\" mode=\"X\"><owner-list><owner id=\"p1\" mode=\"X\"/></owner-list><waiter-list><waiter id=\"p2\" mode=\"U\" requestType=\"wait\"/></waiter-list></keylock>" +
             "<keylock hobtid=\"1\" dbid=\"5\" objectname=\"ContosoCare.care.inventory\" indexname=\"pk_inventory\" mode=\"X\"><owner-list><owner id=\"p2\" mode=\"X\"/></owner-list><waiter-list><waiter id=\"p1\" mode=\"U\" requestType=\"wait\"/></waiter-list></keylock>" +
@@ -165,20 +165,20 @@ internal static class RcaSimulation
         if (InFormation(now, out var start))
         {
             var elapsed = (long)(now - start).TotalMilliseconds;
-            rows.Add(Row(("captured_at_utc", at), ("session_id", 63), ("blocking_session_id", 0), ("session_status", "sleeping"), ("request_status", null), ("open_transaction_count", 1), ("transaction_age_ms", elapsed + 1000), ("idle_ms", Math.Max(0, elapsed - 1000)), ("login_name", "NT AUTHORITY\\SYSTEM"), ("host_name", "SQLVM01"), ("program_name", ChainApp), ("module_name", "[demo].[usp_scenario_chain_acquire]"), ("statement_text", null), ("input_buffer_type", "RPC Event"), ("input_buffer", "demo.usp_scenario_chain_acquire;1")));
+            rows.Add(Row(("captured_at_utc", at), ("session_id", 63), ("blocking_session_id", 0), ("session_status", "sleeping"), ("request_status", null), ("open_transaction_count", 1), ("transaction_age_ms", elapsed + 1000), ("idle_ms", Math.Max(0, elapsed - 1000)), ("login_name", "NT AUTHORITY\\SYSTEM"), ("host_name", "SQLVM01"), ("program_name", ChainApp), ("module_name", "[scheduling].[usp_assign_work_item]"), ("statement_text", null), ("input_buffer_type", "RPC Event"), ("input_buffer", "scheduling.usp_assign_work_item;1")));
             foreach (var (session, blocker, key, depth) in new[] { (64, 63, "93162f043aad", 1), (65, 63, "93162f043aad", 1), (66, 64, "8cba823e2e93", 2), (67, 65, "8d45c50527d3", 2), (68, 66, "68f1c63b7f46", 3), (69, 67, "7178166c0443", 3) })
             {
                 // A link times out after 60 s (its lock timeout, error 1222) and queues again: its wait starts over.
                 var wait = ((elapsed + 28000) % 60000) - ((depth - 1) * 2000);
-                rows.Add(Row(("captured_at_utc", at), ("session_id", session), ("blocking_session_id", blocker), ("session_status", "running"), ("request_status", "suspended"), ("wait_type", "LCK_M_U"), ("wait_time_ms", wait), ("wait_resource", $"KEY: 5:72057594045071360 ({key})"), ("open_transaction_count", 1), ("transaction_age_ms", wait + 40), ("login_name", "NT AUTHORITY\\SYSTEM"), ("host_name", "SQLVM01"), ("program_name", ChainApp), ("module_name", "[demo].[usp_scenario_chain_link]"), ("statement_text", "UPDATE care.work_queues SET priority = CASE WHEN priority >= 5 THEN 5 ELSE priority + 1 END WHERE work_item_id = @parent")));
+                rows.Add(Row(("captured_at_utc", at), ("session_id", session), ("blocking_session_id", blocker), ("session_status", "running"), ("request_status", "suspended"), ("wait_type", "LCK_M_U"), ("wait_time_ms", wait), ("wait_resource", $"KEY: 5:72057594045071360 ({key})"), ("open_transaction_count", 1), ("transaction_age_ms", wait + 40), ("login_name", "NT AUTHORITY\\SYSTEM"), ("host_name", "SQLVM01"), ("program_name", ChainApp), ("module_name", "[scheduling].[usp_route_work_item]"), ("statement_text", "UPDATE care.work_queues SET priority = CASE WHEN priority >= 5 THEN 5 ELSE priority + 1 END WHERE work_item_id = @parent")));
             }
         }
 
         if (EscalatorHolds(now))
         {
             var held = (long)(now - Escalations.Last(e => e <= now)).TotalMilliseconds;
-            rows.Add(Row(("captured_at_utc", at), ("session_id", 71), ("blocking_session_id", 0), ("session_status", "running"), ("request_status", "suspended"), ("wait_type", "WAITFOR"), ("wait_time_ms", 400), ("open_transaction_count", 1), ("transaction_age_ms", held + 1600), ("login_name", "NT AUTHORITY\\SYSTEM"), ("host_name", "SQLVM01"), ("program_name", ChainApp), ("module_name", "[demo].[usp_scenario_chain_escalate]"), ("statement_text", "WAITFOR DELAY '00:00:00.400'")));
-            rows.Add(Row(("captured_at_utc", at), ("session_id", 74), ("blocking_session_id", 71), ("session_status", "running"), ("request_status", "suspended"), ("wait_type", "LCK_M_IS"), ("wait_time_ms", held), ("wait_resource", "OBJECT: 5:1205579333:0 "), ("open_transaction_count", 0), ("login_name", "NT AUTHORITY\\SYSTEM"), ("host_name", "SQLVM01"), ("program_name", BaselineApp), ("module_name", "[demo].[usp_scenario_healthy_baseline]"), ("statement_text", "SELECT @count = COUNT(*) FROM care.appointments WHERE provider_id = @id AND scheduled_start >= @day AND scheduled_start < DATEADD(day, 1, @day)")));
+            rows.Add(Row(("captured_at_utc", at), ("session_id", 71), ("blocking_session_id", 0), ("session_status", "running"), ("request_status", "suspended"), ("wait_type", "WAITFOR"), ("wait_time_ms", 400), ("open_transaction_count", 1), ("transaction_age_ms", held + 1600), ("login_name", "NT AUTHORITY\\SYSTEM"), ("host_name", "SQLVM01"), ("program_name", ChainApp), ("module_name", "[scheduling].[usp_bulk_reschedule]"), ("statement_text", "WAITFOR DELAY '00:00:00.400'")));
+            rows.Add(Row(("captured_at_utc", at), ("session_id", 74), ("blocking_session_id", 71), ("session_status", "running"), ("request_status", "suspended"), ("wait_type", "LCK_M_IS"), ("wait_time_ms", held), ("wait_resource", "OBJECT: 5:1205579333:0 "), ("open_transaction_count", 0), ("login_name", "NT AUTHORITY\\SYSTEM"), ("host_name", "SQLVM01"), ("program_name", BaselineApp), ("module_name", "[frontdesk].[usp_process_requests]"), ("statement_text", "SELECT @count = COUNT(*) FROM care.appointments WHERE provider_id = @id AND scheduled_start >= @day AND scheduled_start < DATEADD(day, 1, @day)")));
         }
 
         return rows;
@@ -219,7 +219,7 @@ internal static class RcaSimulation
     {
         foreach (var at in Escalations.Where(e => e.AddSeconds(1) <= now))
         {
-            yield return Event("lock_escalation", at, [("escalation_cause", "1", "Lock threshold"), ("escalated_lock_count", "6248", null), ("mode", "5", "X"), ("object_id", "1205579333", null)], [("client_app_name", ChainApp), ("session_id", "71"), ("sql_text", "exec demo.usp_scenario_chain_escalate @run_id=@p0")]);
+            yield return Event("lock_escalation", at, [("escalation_cause", "1", "Lock threshold"), ("escalated_lock_count", "6248", null), ("mode", "5", "X"), ("object_id", "1205579333", null)], [("client_app_name", ChainApp), ("session_id", "71"), ("sql_text", "exec scheduling.usp_bulk_reschedule @run_id=@p0")]);
         }
 
         foreach (var minute in TimeoutMinutes)
@@ -229,7 +229,7 @@ internal static class RcaSimulation
                 var at = minute.AddSeconds(5 + (i * 9));
                 if (at.AddSeconds(1) <= now)
                 {
-                    yield return Event("error_reported", at, [("error_number", "1222", null), ("severity", "16", null), ("is_intercepted", "true", null), ("message", "Lock request time out period exceeded.", null)], [("client_app_name", ChainApp), ("session_id", (64 + (i % 6)).ToString(CultureInfo.InvariantCulture)), ("username", "NT AUTHORITY\\SYSTEM"), ("client_hostname", "SQLVM01"), ("sql_text", "exec demo.usp_scenario_chain_link @run_id=@p0")]);
+                    yield return Event("error_reported", at, [("error_number", "1222", null), ("severity", "16", null), ("is_intercepted", "true", null), ("message", "Lock request time out period exceeded.", null)], [("client_app_name", ChainApp), ("session_id", (64 + (i % 6)).ToString(CultureInfo.InvariantCulture)), ("username", "NT AUTHORITY\\SYSTEM"), ("client_hostname", "SQLVM01"), ("sql_text", "exec scheduling.usp_route_work_item @run_id=@p0")]);
                 }
             }
         }
@@ -339,10 +339,10 @@ internal static class RcaSimulation
                 if (locked)
                 {
                     var elapsed = (now - start).TotalSeconds;
-                    activity.Add(Row(("captured_at", at), ("pid", 20432), ("backend_type", "client backend"), ("usename", "contosocare_runner"), ("application_name", LockingApp), ("state", "idle in transaction"), ("wait_event_type", "Client"), ("wait_event", "ClientRead"), ("blocked_by", Array.Empty<int>()), ("xact_age_s", (decimal)Math.Round(elapsed + 0.2, 1)), ("state_age_s", (decimal)Math.Round(Math.Max(0, elapsed - 0.2), 1)), ("query", "SELECT run_id, locked_rows FROM demo.usp_scenario_locking_acquire($1, $2)")));
+                    activity.Add(Row(("captured_at", at), ("pid", 20432), ("backend_type", "client backend"), ("usename", "contosocare_runner"), ("application_name", LockingApp), ("state", "idle in transaction"), ("wait_event_type", "Client"), ("wait_event", "ClientRead"), ("blocked_by", Array.Empty<int>()), ("xact_age_s", (decimal)Math.Round(elapsed + 0.2, 1)), ("state_age_s", (decimal)Math.Round(Math.Max(0, elapsed - 0.2), 1)), ("query", "SELECT run_id, locked_rows FROM billing.usp_reprioritize_queue($1, $2)")));
                     foreach (var pid in Waiters)
                     {
-                        activity.Add(Row(("captured_at", at), ("pid", pid), ("backend_type", "client backend"), ("usename", "contosocare_runner"), ("application_name", LockingApp), ("state", "active"), ("wait_event_type", "Lock"), ("wait_event", "transactionid"), ("blocked_by", HeadOnly), ("xact_age_s", (decimal)Math.Min(20.03, elapsed + 0.03)), ("state_age_s", (decimal)Math.Min(20, elapsed)), ("query", "SELECT updates, waited_ms FROM demo.usp_scenario_locking_contend($1, $2, $3)")));
+                        activity.Add(Row(("captured_at", at), ("pid", pid), ("backend_type", "client backend"), ("usename", "contosocare_runner"), ("application_name", LockingApp), ("state", "active"), ("wait_event_type", "Lock"), ("wait_event", "transactionid"), ("blocked_by", HeadOnly), ("xact_age_s", (decimal)Math.Min(20.03, elapsed + 0.03)), ("state_age_s", (decimal)Math.Min(20, elapsed)), ("query", "SELECT updates, waited_ms FROM billing.usp_claim_work_item($1, $2, $3)")));
                     }
                 }
 

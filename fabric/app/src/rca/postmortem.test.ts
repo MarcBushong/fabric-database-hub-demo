@@ -78,10 +78,10 @@ describe("the postmortem's blind Cause (ADR 0031, section 9)", () => {
         ]);
         const [chain] = rca.causes;
         expect(chain.confidence).toBe("high");
-        expect(chain.statement).toMatch(/^\[demo\]\.\[usp_scenario_chain_acquire\] \(session 63; ContosoCare\.Demo, login .+\) sat idle with its transaction open for up to \d+ s, holding X KEY lock on \[care\]\.\[work_queues\]/);
+        expect(chain.statement).toMatch(/^\[scheduling\]\.\[usp_assign_work_item\] \(session 63; ContosoCare\.Demo, login .+\) sat idle with its transaction open for up to \d+ s, holding X KEY lock on \[care\]\.\[work_queues\]/);
         expect(chain.statement).toContain("in 2 branches, 4 levels deep at the peak");
         expect(chain.evidence).toHaveLength(3);
-        expect(chain.evidence[0]).toMatch(/^head 63: sleeping, open transactions 1, idle \d+ s, \[demo\]\.\[usp_scenario_chain_acquire\] \(RCA Sessions, 14:03:00 UTC\)$/);
+        expect(chain.evidence[0]).toMatch(/^head 63: sleeping, open transactions 1, idle \d+ s, \[scheduling\]\.\[usp_assign_work_item\] \(RCA Sessions, 14:03:00 UTC\)$/);
         // One with only the telemetry says why it has no root cause.
         const telemetryOnly = rca.causes[4];
         expect(telemetryOnly.statement).toBeNull();

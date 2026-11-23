@@ -18,7 +18,7 @@ The `contosocare` database on T5, the Azure Cosmos DB for NoSQL account `cosmos0
 
 ## Documents
 
-Every document keeps `id`, `patientId` (the partition key), `type`, `at` (an ISO 8601 UTC time), and `source` at the top level, where they're indexed. `source` is the tag of whatever wrote it: `ContosoCare.Demo/<scenario>/<run>` for a run, `ContosoCare.Demo/control/<command>` for setup and warmup, the same tag every request's User-Agent starts with. A document's bulk is one top-level string, `payload`, which the indexing policy leaves out, so its size changes what it costs to store and write, not its index.
+Every document keeps `id`, `patientId` (the partition key), `type`, `at` (an ISO 8601 UTC time), and `source` at the top level, where they're indexed. `source` is the tag of whatever wrote it: `ContosoCare.Demo/<service>/<run>` for a run (`careportal-api` for the baseline, `patient-events-ingest` for `ru-storm`), `ContosoCare.Demo/control/<command>` for setup and warmup, the same tag every request's User-Agent starts with. A document's bulk is one top-level string, `payload`, which the indexing policy leaves out, so its size changes what it costs to store and write, not its index.
 
 | Document | `id` | `patientId` | `type` | Also | Size | Written by |
 |---|---|---|---|---|---|---|

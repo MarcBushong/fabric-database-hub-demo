@@ -573,7 +573,7 @@ describe("the postmortem", () => {
     });
 
     describe("with the Incident RCA's tables, its Cause is the blind investigation (ADR 0031, section 9)", () => {
-        const chain = "[demo].[usp_scenario_chain_acquire] (session 63; ContosoCare.Demo, login runner, host SQLVM01) sat idle with its transaction open for up to 79 s, holding X KEY lock on [care].[work_queues] (pk_work_queues).";
+        const chain = "[scheduling].[usp_assign_work_item] (session 63; ContosoCare.Demo, login runner, host SQLVM01) sat idle with its transaction open for up to 79 s, holding X KEY lock on [care].[work_queues] (pk_work_queues).";
         const rca: BlindCauses = {
             from: plan.start,
             to: new Date(plan.end.getTime() + 15 * 60000),

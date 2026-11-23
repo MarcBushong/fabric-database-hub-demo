@@ -5511,3 +5511,47 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - No app code changed, so `npm run verify` and the B/A sweep stand as they were at a57539ed.
 
 **What its live check needs.** The entry above's, with the Variable - Get after `./scripts/deploy.ps1` in a governed tenant.
+
+### Realistic names, unit C: the readers and the docs (2026-11-23)
+
+**Why.** Unit C of ADR 0031's decision 6, which the owner approved on 2026-11-23: what reads the workload's names, besides the code. It was built from the design's tables on the shared base (59d9dfb7) and checked against units A's and B's heads (45f37c4c and c6ed5d2e). One commit after the base.
+
+- **The RCA fixtures carry the new module names.** Only their string dictionaries change, so every row, index, and fact stays:
+  - **T1's document:** `[scheduling].[usp_assign_work_item]`, the head blocker, whose last call is now `scheduling.usp_assign_work_item;1`; `[scheduling].[usp_route_work_item]`; `[scheduling].[usp_bulk_reschedule]`; and `[frontdesk].[usp_process_requests]`.
+  - **T4's document:** `billing.usp_reprioritize_queue` and `billing.usp_claim_work_item`, with their top-level statements.
+  - **The transport forms, regenerated:** each document's compact JSON, as the runner wrote it in the committed parts, with the same renames, was checked equal to the edited document. It was then gzipped at `SmallestSize` and cut into 2,400-byte parts, as `PartCodec` does, and each document still has 2 parts. `rca-evidence.parameter.json` and `metrics-bundle.json` carry the new lines, and `export-index.json` and `metrics-rca-member.json` the new SHA-256s.
+  - **The run IDs and their tokens stay,** as the coordinator settled with unit B: `RcaSimulation`'s application names keep their run segments, which `RcaExportTests` binds to the fixtures' tokens, and an older runner's run ID is still a valid one. The fixtures' README says so.
+- **The runner's RCA tests:** `RcaSimulation` and `RcaObserverTests` give and expect the new module names, input buffer, and Extended Events statements. Their synthetic deadlock frame is `supply.usp_transfer_stock`, since `demo` now keeps only the control plane.
+- **The app:** the evaluation set's `mustContain` for P01, P02, and P04, and the rules', postmortem's, Root cause view's, and Mission Control's tests. The preview's T4 evidence, `pg-local.evidence.json`, a real capture, has its four module strings renamed in place, and its code comment says so. The preview's sample finding names a service.
+- **The docs:**
+  - **`scenarios/`:** every scenario page's sessions and procedures; every `scenario.json`'s prose, never its `procedure` line, which is unit A's; and the scenarios README, with a new rule, **Named as an application's**, and its SSMS example.
+  - **`rca/README.md`'s Names:** the observer drops the service with the run segment. It said that it would keep a per-service name, which decision 6 leaves for later. Its deadlock example names `[supply].[usp_transfer_stock]`.
+  - **The ADRs:** ADR 0031's §2 and decision 6, now decided, with what changed and what still reads as a demo; ADR 0010's amendment, with the tagging, the schemas, the match by run, and the upgrade; and ADRs 0019 and 0025's tags.
+  - **The rest:** `workload-generator/README.md`; the `database/common`, `database/postgresql`, and `database/cosmosdb` READMEs; `docs/architecture.md`; `docs/security-model.md`; `docs/deployment.md`, with the upgrade's row and the schemas; `docs/demo-walkthrough.md`, whose cheat sheet now names each scenario's service, so a presenter can tell whose sessions are whose; the report spec's option D; and the CHANGELOG.
+  - **Left as history:** earlier CHANGELOG entries, this report's earlier entries, and ADR 0010's dated phase notes, which name the tags and procedures as they were then.
+- **Rerunnable** (the coordinator asked for it, since the Query Store work adds fixtures that still name the earlier modules, such as `t3-plan-regression.sidecar.json`'s `[demo].[usp_visit_summary_lookup]`):
+  - **`./tests/Update-RcaFixtures.ps1 -RenameWorkloadModules -Path <files>`** renames every retired module name in the fixture documents and in the files given, with the design's 33 old and new pairs. It then writes the part lines of each document whose parts no longer decode to it, evidence and sidecar alike, and puts the new lines and SHA-256 in the other fixture files. A second run changes nothing.
+  - **Checked both ways:** from the base, it reproduces this commit's fixtures byte for byte, SHA-256s included. On the Query Store branch's dabe263c, it renamed the plan-regression sidecar, wrote its part again, and updated `sidecar-index.json` and `rca-sidecar.parameter.json`, and that branch's own `Rca.Contract` passed, 59 tests.
+  - **A new contract test,** in `Rca.Contract.Tests.ps1`, fails while a fixture, an app RCA test or its data, the preview's data, or a runner `Rca*` test names a retired module. It fails at the base and passes here.
+- **Honest detection holds:** no detection file changed. The evaluation set's questions still name no scenario; its `mustContain` names the modules a DBA reads, and only its `key` names a scenario, for grading.
+
+**Changed files.** In `rca/fixtures/`: both documents and their parts, `rca-evidence.parameter.json`, `metrics-bundle.json`, `metrics-rca-member.json`, `export-index.json`, and the README; and `rca/README.md`. In the runner's tests, `RcaSimulation.cs` and `RcaObserverTests.cs`. In `fabric/app/src`: `rca/testdata/eval-set.ts`, `rca/rules.test.ts`, `rca/postmortem.test.ts`, `rca/view/rca-view.test.tsx`, `pages/mission.test.tsx`, `lib/mission.test.ts`, `preview/data/pg-local.evidence.json`, `preview/sample-data.ts`, and `preview/sample-rca.ts`, a comment. Every scenario README, every `scenario.json`'s prose, and `scenarios/README.md`. The docs above, `CHANGELOG.md`, and this entry. New: `tests/Update-RcaFixtures.ps1`, and one test in `tests/unit/Rca.Contract.Tests.ps1`.
+
+**Validation.** On 59d9dfb7 with this commit, on this PC (ARM64, with a .NET 10.0.403 SDK and an npm cache in the session's own folder):
+
+- **The runner's tests:** 808, of which 787 passed, 21 were skipped, and none failed. The skipped ones are the integration tests, which need a disposable SQL Server or PostgreSQL server.
+- **The app's suites that read what changed,** in one process with one worker, as the coordinator asked until 2 PM: 13 files and 281 tests, all passed.
+- **Pester,** under strict mode, with the Azure CLI guard, none failing:
+  - `Rca.Contract`, whose 31 include the fixtures' blind checks, their parts' decode, and the new test of retired names, with the doc suites `Repo.Conventions` (every relative link and fragment), `Repo.NeutralWording`, and `Docs.Walkthrough`: 225 passed.
+  - The fixtures' other readers, `DbHubDemo.HistorySnapshot`, `Vm.WorkloadSteps`, `Automation.Runbooks`, `Fabric.ControlNotebook`, and `Fabric.Notebooks`: 582 passed and 88 skipped, the notebook cases that need Python with pandas, which this PC lacks.
+- **markdownlint** found no issue, and PSScriptAnalyzer, with the repo's settings, found nothing in `tests/Update-RcaFixtures.ps1` or the changed test file, both ASCII-only.
+- **Merges:** `git merge-tree` of this commit with A's head and with B's head shows no conflict. `RcaSimulation.cs` and the `scenario.json` files, which A or B change too, merge by hunk.
+- **The leak check** prints nothing.
+
+**Risks.**
+
+- The fixtures' module names postdate their 2026-11-20 session, and their run IDs are in the earlier form; their README says both.
+- A module renamed again in unit A's review means the same rename here: one more pair in `Update-RcaFixtures.ps1`'s table and in the contract test's list, then the script. The Query Store session's fixtures and app tests take the script as they are, whichever branch lands second.
+- The docs describe A's and B's behavior as of their heads above: the refusal `out-of-step`, setup's drops, and the match by run. A review that changes one changes its sentence here.
+
+**What its live check needs.** Nothing of its own: the fixtures and tests are offline. A's and B's live round shows what the docs describe: Database Hub's sessions as `ContosoCare.Demo/<service>/<run>`, Query Store's modules in the application schemas, and the cheat sheet's services matching what Database Hub shows.
