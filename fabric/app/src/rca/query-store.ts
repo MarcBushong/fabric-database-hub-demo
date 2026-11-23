@@ -57,7 +57,7 @@ export const QUERY_STORE_RETENTION_DAYS: Readonly<Record<"sql" | "postgresql", n
 
 const DAY_MS = 86_400_000;
 
-/** Whether the target's Query Store still keeps the episode's minutes now, and how old they are, in whole days. */
+/** Whether the target's Query Store still keeps the episode's minutes now, and how old they are, in whole days (rounded down). */
 export function queryStoreAge(e: Pick<Episode, "target" | "end" | "last" | "readEnd">, now: Date): { kept: boolean; days: number; retentionDays: number } | null {
     const kind = queryStoreKind(e.target);
     if (kind !== "sql" && kind !== "postgresql") return null;
@@ -71,7 +71,7 @@ export function queryStoreNote(e: Pick<Episode, "target" | "signal" | "end" | "l
     const t = e.target;
     const lacks = `${t}: which queries drove the ${e.signal} isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not ${t}'s:`;
     const age = queryStoreAge(e, now);
-    const gone = age && !age.kept ? ` Query Store on ${t} no longer keeps those minutes either: it keeps ${age.retentionDays} days${queryStoreKind(t) === "sql" ? " (less when it fills up)" : ""}, and they're ${age.days} days old.` : "";
+    const gone = age && !age.kept ? ` Query Store on ${t} no longer keeps those minutes either: it keeps ${age.retentionDays} days${queryStoreKind(t) === "sql" ? " (less when it fills up)" : ""}, and they're more than ${age.retentionDays} days old.` : "";
     switch (queryStoreKind(t)) {
         case "sql":
             return gone

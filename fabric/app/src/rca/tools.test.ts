@@ -764,14 +764,33 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         // 8 days later: T4 keeps 7, T1 14.
         const week = toolsAt(new Date("2026-11-28T16:00:00Z"));
         const t4 = await incidentOn("T4", "cpu", week);
-        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T4's: Query Store on T4 no longer keeps those minutes either: it keeps 7 days, and they're 8 days old. validate.ps1's T4.QUERYSTORE says whether it's on.");
+        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T4's: Query Store on T4 no longer keeps those minutes either: it keeps 7 days, and they're more than 7 days old. validate.ps1's T4.QUERYSTORE says whether it's on.");
         expect(t4.nextSteps.join(" ")).not.toMatch(/Query Store/);
         const t1 = await incidentOn("T1", "cpu", week);
         expect(t1.nextSteps).toEqual(expect.arrayContaining([expect.stringMatching(/^Read Query Store on T1 for the queries and plans that used the CPU from 15:40:00 to 15:50:00 UTC/)]));
         // 15 days later: past T1's too.
         const later = await incidentOn("T1", "cpu", toolsAt(new Date("2026-12-05T16:00:00Z")));
-        expect(later.notCaptured).toContain("T1: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T1's: Query Store on T1 no longer keeps those minutes either: it keeps 14 days (less when it fills up), and they're 15 days old. validate.ps1's T1.QUERYSTORE says whether it's on.");
+        expect(later.notCaptured).toContain("T1: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T1's: Query Store on T1 no longer keeps those minutes either: it keeps 14 days (less when it fills up), and they're more than 14 days old. validate.ps1's T1.QUERYSTORE says whether it's on.");
         expect(later.nextSteps.join(" ")).not.toMatch(/Query Store/);
+    });
+
+    // The re-review of bbdcd05c: the whole day after a retention ran out, the note said "they're 7 days old" beside "no longer
+    // keeps", from the age rounded down.
+    it("says the minutes are more than the retention old, the whole day after it ran out, and keeps them up to its last minute", async () => {
+        // The incident ends at 15:50:00 UTC on 2026-11-20.
+        const lastMinute = await incidentOn("T4", "cpu", toolsAt(new Date("2026-11-27T15:50:00Z")));
+        expect(lastMinute.nextSteps).toEqual(expect.arrayContaining([expect.stringMatching(/^Read Query Store on T4 /)]));
+        const t4 = await incidentOn("T4", "cpu", toolsAt(new Date("2026-11-28T09:50:00Z")));
+        expect(t4.notCaptured.join(" ")).toContain("it keeps 7 days, and they're more than 7 days old.");
+        expect(t4.notCaptured.join(" ")).not.toMatch(/they're 7 days old/);
+        expect(t4.nextSteps.join(" ")).not.toMatch(/Query Store/);
+        for (const target of ["T1", "T3"] as const) {
+            const kept = await incidentOn(target, "cpu", toolsAt(new Date("2026-12-04T15:50:00Z")));
+            expect(kept.nextSteps, target).toEqual(expect.arrayContaining([expect.stringMatching(new RegExp(`^Read Query Store on ${target} `))]));
+            const r = await incidentOn(target, "cpu", toolsAt(new Date("2026-12-04T15:51:00Z")));
+            expect(r.notCaptured.join(" "), target).toContain("it keeps 14 days (less when it fills up), and they're more than 14 days old.");
+            expect(r.nextSteps.join(" "), target).not.toMatch(/Query Store/);
+        }
     });
 
     it("counts T1 to T3's 14 days from their configure scripts, and leaves T4's retention at Learn's 7-day default", () => {
