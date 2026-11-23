@@ -144,14 +144,14 @@
     },
     "sidecarFile": {
       "type": "string",
-      "pattern": "^Files/rca/inbox/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\.json$",
-      "description": "RCA_SIDECAR_FILE, NB_DatabaseHub_LiveActivity's parameter for sidecars: a path in the demo's lakehouse to a file holding exactly one #/$defs/sidecarParameter document, read as RCA_EVIDENCE_FILE is. The notebook deletes it only when its acknowledgement says every document in it is written or already written."
+      "pattern": "^Files/rca/inbox/sidecar-[0-9]{8}T[0-9]{6}Z(-[A-Za-z0-9][A-Za-z0-9._-]{0,63})?\\.json$",
+      "description": "RCA_SIDECAR_FILE, NB_DatabaseHub_LiveActivity's parameter for sidecars: a path in the demo's lakehouse, Files/rca/inbox/sidecar-<yyyyMMddTHHmmssZ>[-<name>].json, to a file holding exactly one #/$defs/sidecarParameter document, read as RCA_EVIDENCE_FILE is. The sweep of evidence files staged more than a day ago never matches the name. The notebook deletes it only when its acknowledgement says every document in it is written or already written."
     },
     "ack": {
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "version", "payload", "runId", "documents"],
-      "description": "The notebook's acknowledgement of one payload file, Files/rca/acks/<payload's name>.ack.json: what it did with each document in it, by ID. The scripts read it, never the payload's disappearance, and acknowledge to the runner only the documents it says are written or already written.",
+      "description": "The notebook's acknowledgement of one payload file, Files/rca/acks/<the payload's name without .json>.ack.json, written once every document in the payload is committed: what it did with each, by ID. None when the run doesn't save its results or can't read the payload. The scripts read it, never the payload's disappearance, and acknowledge to the runner only the documents it says are written or already written; one naming another payload or other documents counts as missing.",
       "properties": {
         "kind": { "const": "ContosoCare.RcaAck" },
         "version": { "const": 1 },

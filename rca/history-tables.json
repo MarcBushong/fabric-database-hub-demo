@@ -11,7 +11,7 @@
     "date": { "document": "not in the document: the notebook derives it", "model": "dateTime" }
   },
   "notebookColumns": [
-    { "name": "run_id", "type": "string", "model": { "column": "Run ID", "hidden": true }, "description": "The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables." },
+    { "name": "run_id", "type": "string", "model": { "column": "Run ID", "hidden": true }, "description": "The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables. A sidecar's rows take their own session's, session-<sessionId>, whichever run wrote them (rca/README.md, The sidecar)." },
     { "name": "document_id", "type": "string", "model": { "column": "Document ID", "hidden": true }, "description": "The document the row came from (documentId): an evidence document's, or a sidecar's." },
     { "name": "report_date_utc", "type": "date", "model": { "column": "Report Date UTC", "hidden": true }, "description": "The UTC date of the row's primary time; relates the table to Date, as the other history tables." }
   ],
@@ -261,7 +261,7 @@
         { "name": "plan_id", "type": "long", "model": { "column": "Plan ID" }, "description": "The plan forced or unforced; null for a state change." },
         { "name": "forcing_type", "type": "string", "model": { "column": "Forcing Type" }, "description": "MANUAL or AUTO for a forcing (plan_forcing_type_desc): forced by a person (sys.sp_query_store_force_plan) or by automatic plan correction." },
         { "name": "state", "type": "string", "model": { "column": "State" }, "description": "The state after the change: Query Store's actual state (READ_WRITE, READ_ONLY, OFF, ERROR) or capture mode on PostgreSQL (top, all, none), automatic tuning's actual state, or the recommendation's state." },
-        { "name": "previous_state", "type": "string", "model": { "column": "Previous State" }, "description": "The state the read before saw." },
+        { "name": "previous_state", "type": "string", "model": { "column": "Previous State" }, "description": "The state the read before saw; null when a recommendation first appears." },
         { "name": "detail", "type": "string", "model": { "column": "Detail" }, "description": "The change in plain words, normalized: for READ_ONLY, its readonly_reason in words (for example, the storage limit); for a recommendation, its reason." }
       ]
     },
@@ -276,7 +276,7 @@
       "key": ["run_id", "target", "window_start_utc"],
       "captureIds": ["RCA-SQL-15", "RCA-PG-13"],
       "columns": [
-        { "name": "target", "type": "string", "required": true, "model": { "column": "Target Key", "hidden": true }, "description": "T1, T2, T3, or T4." },
+        { "name": "target", "type": "string", "required": true, "model": { "column": "Target Key", "hidden": true }, "description": "T1, T2, T3, T4, or T4-replica, whose row says the replica records nothing in Query Store." },
         { "name": "window_start_utc", "type": "timestamp", "required": true, "model": { "column": "Window Start UTC", "formatString": "yyyy-mm-dd hh:nn:ss" }, "description": "Start of the sidecar's window for the target." },
         { "name": "window_end_utc", "type": "timestamp", "required": true, "model": { "column": "Window End UTC", "formatString": "yyyy-mm-dd hh:nn:ss" }, "description": "End of the window." },
         { "name": "state", "type": "string", "model": { "column": "Query Store State" }, "description": "Query Store's actual state as last read: READ_WRITE, READ_ONLY, OFF, or ERROR on SQL Server; the capture mode on PostgreSQL (top, all, or none); null when it couldn't be read (gaps says why)." },
@@ -288,7 +288,7 @@
         { "name": "pending_to_utc", "type": "timestamp", "model": { "column": "Pending To UTC", "formatString": "yyyy-mm-dd hh:nn" }, "description": "PostgreSQL only: the end of that time." },
         { "name": "backfill", "type": "boolean", "required": true, "model": { "column": "Backfill" }, "description": "True when the sidecar holds intervals read after the session, which Query Store published later (rca/README.md, Pending publication)." },
         { "name": "sources", "type": "string", "model": { "column": "Sources" }, "description": "Comma-separated capture IDs that returned rows for the target in the window." },
-        { "name": "gaps", "type": "string", "model": { "column": "Gaps" }, "description": "One gap per line: what wasn't read and why (Query Store off or read-only, a permission, a timeout, pending publication that expired, the sidecar's budget)." }
+        { "name": "gaps", "type": "string", "model": { "column": "Gaps" }, "description": "One gap per line: what wasn't read and why (Query Store off or read-only, a permission, a timeout, pending publication that expired or was lost when T4 stopped, the sidecar's budget)." }
       ]
     },
     {
