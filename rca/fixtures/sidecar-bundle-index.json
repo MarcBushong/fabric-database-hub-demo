@@ -1,0 +1,26 @@
+{
+  "kind": "ContosoCare.RcaSidecarBundleIndex",
+  "version": 1,
+  "sessionId": "5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21",
+  "bundles": [
+    "8af9856a74c6b96a40017a1a22eb492e"
+  ],
+  "documents": [
+    {
+      "documentId": "20261120T165000Z-sqlvm01-0001-sidecar",
+      "sessionId": "5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21",
+      "parts": 2,
+      "sha256": "cb628c1e58cdb04a1245b58c992645451f45519bd7aed1cd8f3ef639c6d1cdf2",
+      "state": "new"
+    },
+    {
+      "documentId": "20261120T170000Z-sqlvm01-0002-sidecar",
+      "sessionId": "5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21",
+      "parts": 1,
+      "sha256": "aecf0fba7bbb6ad5befc39791139c7f1fa0cccdec56d62440ec66eb6afa21f9e",
+      "state": "new"
+    }
+  ],
+  "status": "Pass",
+  "message": "2 sidecars, 3 parts, in 1 bundle: the session's T3 and T4 Query Store sidecars, fetched at its stop."
+}

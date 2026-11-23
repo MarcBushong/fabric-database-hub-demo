@@ -5612,5 +5612,5 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
   - whether `qs_view` keeps each window's `search_path`, or the first one it saw. The catalog-text rule covers the observer's statements either way.
 - **The harness's marks (unit H)** merge after the realistic names' release. H's T-SQL block first runs on an engine at the rehearsal: its opt-in test against a disposable SQL Server, and S10's check after two deployments.
 - **The runner's own ad hoc statements (item 3) wait on A1's build.** Until then RCA-SQL-10 and 14 keep the polled stop check, so the rehearsal's blindness check (S7) needs A1's commit. Which form Query Store keeps for a statement under simple parameterization is proven only by A1's opt-in real-engine test and by S7.
-- **A Run all session's Query Store evidence** reaches the history with the next scripts' save, until Run all's path ships.
+- **A Run all session's Query Store evidence** comes through Run all's own path (T2c), which joins this release by the coordinator's decision. If it isn't reviewed by 2026-11-24 18:00, it reaches the history with the next scripts' save until Run all's path ships as its own release.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
