@@ -2489,10 +2489,15 @@ def stamp(delta=dt.timedelta(0)):
 
 
 class Files:
-    """notebookutils.fs over the lakehouse's Files, in memory: files by their OneLake path, and folders."""
+    """notebookutils.fs over the lakehouse's Files, in memory: files by their OneLake path, and folders. A call whose
+    operation and path match one of broken's (operation, path prefix) pairs fails, as a cut-off call would."""
 
     def __init__(self):
-        self.files, self.folders, self.reads = {}, set(), []
+        self.files, self.folders, self.reads, self.broken = {}, set(), [], []
+
+    def fail(self, operation, path):
+        if any(operation == name and path[len(ROOT):].startswith(prefix) for name, prefix in self.broken):
+            raise IOError("%s was cut off" % operation)
 
     def add(self, relative, text):
         self.files[ROOT + relative] = text
@@ -2514,6 +2519,7 @@ class Files:
         return [types.SimpleNamespace(name=name) for name in sorted(names)]
 
     def rm(self, path, recurse=False):
+        self.fail("rm", path)
         if path in self.files:
             del self.files[path]
         elif self.ls(path) and not recurse:
@@ -2528,6 +2534,7 @@ class Files:
         return True
 
     def put(self, path, content, overwrite=False):
+        self.fail("put", path)
         if path in self.files and not overwrite:
             raise IOError("the file exists")
         self.add(path[len(ROOT):], content)
@@ -2566,6 +2573,8 @@ class Lake:
         self.tables, self.columns, self.log, self.views = {}, {}, [], {}
         self.catalog = types.SimpleNamespace(tableExists=lambda name: name in self.tables)
         self.conf = types.SimpleNamespace(get=lambda key: "UTC", set=lambda key, value: None)
+        # "<table>" fails an append to it, and "merge <table>" a MERGE into it, as a write cut off there would.
+        self.broken = set()
 
     def table(self, name):
         rows = Rows(self.tables[name])
@@ -2586,6 +2595,8 @@ class Lake:
                 return self
 
             def saveAsTable(self, table):
+                if table in lake.broken:
+                    raise IOError("the append to %s was cut off" % table)
                 lake.log.append("append %s %d" % (table, len(rows)))
                 lake.tables.setdefault(table, []).extend(rows)
 
@@ -2617,6 +2628,8 @@ class Lake:
                        "query_id": row["query_id"], "plan_id": row["plan_id"], "captured_ms": ms(row["captured_at_utc"])}
                       for row in self.tables[reads.group(1)] if low <= ms(row["interval_start_utc"]) <= high]
         elif merge:
+            if "merge " + merge.group(1) in self.broken:
+                raise IOError("the MERGE into %s was cut off" % merge.group(1))
             # <=> is null-safe: two null logins are equal, as SQL Server's rows have them.
             key = ("target", "interval_start_utc", "login_name", "query_id", "plan_id")
             source = self.views["rca_sidecar_reads"]
@@ -2638,7 +2651,7 @@ class Lake:
         return types.SimpleNamespace(collect=lambda: result)
 
 
-def run(lake, files, sidecar_file="", session_id="", rca_only=False, save=True):
+def run(lake, files, sidecar_file="", session_id="", rca_only=False, save=True, lakehouse=LH):
     """One run of the notebook: its setup, the sidecar's cell, section 3, and the persist cell when section 3 didn't end it."""
     exits, printed = [], io.StringIO()
     utils = types.SimpleNamespace(fs=files, notebook=types.SimpleNamespace(exit=exits.append))
@@ -2650,7 +2663,7 @@ def run(lake, files, sidecar_file="", session_id="", rca_only=False, save=True):
         for cell in setup[1:]:
             exec(cell, ns)
         lake.columns = ns["TABLE_COLUMNS"]
-        ns.update(_spark=lambda: lake, runtime_context=lambda: {"defaultLakehouseId": LH}, _notebookutils=lambda: utils,
+        ns.update(_spark=lambda: lake, runtime_context=lambda: {"defaultLakehouseId": lakehouse}, _notebookutils=lambda: utils,
                   REFERENCE_RUN=False, incident_window_rows=lambda: ([], []),
                   merge_incident_windows=lambda session, recorded, detected: (0, 0))
         exec(sidecar_cell, ns)
@@ -2664,7 +2677,8 @@ def run(lake, files, sidecar_file="", session_id="", rca_only=False, save=True):
             "ack": files.text(state["ack"]) if state["ack"] else None, "exits": exits, "runId": ns["RUN_ID"],
             "findings": [[row["status"], row["target"], row["finding"]] for row in findings],
             "counts": {name: len(lake.tables[name]) for name in SIDECAR if name in lake.tables},
-            "left": files.left(), "reads": list(files.reads)}, ns
+            "left": files.left(), "reads": list(files.reads),
+            "cleanup": [line for line in printed.getvalue().splitlines() if line.startswith("Files/rca wasn't cleaned up")]}, ns
 
 
 def encode(document, size=2400, marker="DBHUBDEMO-RCAS 1"):
@@ -2923,6 +2937,50 @@ run(lake, files, sidecar_file=stage(files, parameter(encode(T3_LATER))))
 report["earlierRead"] = dict(run(lake, files, sidecar_file=stage(files, parameter(encode(DOCUMENTS[T3])), suffix="-earlier"))[0], reads=latest(lake))
 lake, files = Lake(), Files()
 report["bothReads"] = dict(run(lake, files, sidecar_file=stage(files, parameter(encode(DOCUMENTS[T3]) + encode(T3_LATER))))[0], reads=latest(lake))
+
+# A later read's write cut off before its rows are in, or between them and the earlier read's deletion: the earlier read
+# is deleted only after the later one is written, so neither cut loses both. The later sidecar is skipped and its file
+# stays; the next run with the file leaves exactly one read.
+for case, broken in (("cutBefore", "rca_query_stats"), ("cutBetween", "merge rca_query_stats")):
+    lake, files = Lake(), Files()
+    run(lake, files, sidecar_file=stage(files, parameter(encode(DOCUMENTS[T3]))))
+    name = stage(files, parameter(encode(T3_LATER)), suffix="-later")
+    lake.broken.add(broken)
+    report[case] = dict(run(lake, files, sidecar_file=name)[0], reads=latest(lake), file=name)
+    lake.broken.clear()
+    before = len(lake.log)
+    report[case + "Again"] = dict(run(lake, files, sidecar_file=name)[0], reads=latest(lake), file=name, order=[
+        entry.split()[0] for entry in lake.log[before:] if entry.split()[1] == "rca_query_stats" and entry.split()[0] != "delete"])
+
+# No default lakehouse: every sidecar is skipped with why, and the file stays.
+files = Files()
+name = stage(files, json.dumps(PARAMETER))
+report["noLakehouse"] = dict(run(Lake(), files, sidecar_file=name, lakehouse="")[0], file=name)
+
+# The acknowledgement can't be written: the rows are in, but the file stays and its sidecars pending; the scripts' next
+# file of the same sidecars is acknowledged already, and that run's sweep takes the first file.
+lake, files = Lake(), Files()
+files.broken.append(("put", "Files/rca/acks/"))
+name = stage(files, json.dumps(PARAMETER))
+report["ackRefused"] = dict(run(lake, files, sidecar_file=name)[0], file=name)
+files.broken.clear()
+again = stage(files, json.dumps(PARAMETER), suffix="-again")
+report["ackRefusedAgain"] = dict(run(lake, files, sidecar_file=again)[0], file=again, first=name)
+
+# The file can't be removed after its acknowledgement: the run passes, the acknowledgement stays for the scripts, and a
+# later run's sweep removes the file, every sidecar in it being in the history.
+lake, files = Lake(), Files()
+name = stage(files, json.dumps(PARAMETER))
+files.broken.append(("rm", name))
+report["rmRefused"] = dict(run(lake, files, sidecar_file=name)[0], file=name)
+files.broken.clear()
+report["rmSwept"] = dict(run(lake, files)[0], file=name)
+
+# A file the scripts staged two days before the run that handles it: the acknowledgement this run wrote stays, however
+# old the file's name, because the scripts read it next.
+lake, files = Lake(), Files()
+name = stage(files, json.dumps(PARAMETER), delta=dt.timedelta(days=2), suffix="-late")
+report["latePayload"] = dict(run(lake, files, sidecar_file=name)[0], file=name)
 
 # A sidecar with a missing part, a bad SHA-256, a newer version, or lines in a part format this notebook can't read is
 # skipped and named, and the others are written; the file stays.
@@ -3214,6 +3272,104 @@ print(json.dumps(report, default=str))
         $sidecarReport['earlierRead']['superseded'] | Should -Be 3
         $sidecarReport['earlierRead']['message'] | Should -Match '\(3 not written because the history holds a later read\)'
         $sidecarReport['bothReads']['message'] | Should -Match '\(3 earlier read\(s\) among these sidecars left out\)'
+    }
+
+    It 'deletes an earlier read only once its later read is written, so a write cut off before or between the two loses neither (review of acde5510)' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $later = '20261120T165000Z-sqlvm01-0003-sidecar'
+        $key = 'T3 17:15 None 412 31'
+        # Cut off before the later read's rows are in: the earlier read stays.
+        $before = $sidecarReport['cutBefore']
+        @($before['reads']['rca_query_stats'][$key]) | Should -Be @('17:20:10')
+        @($before['reads']['rca_query_waits'][$key]) | Should -Be @('17:20:10')
+        # Cut off between them: both reads stay, which the history model's measures count once.
+        $between = $sidecarReport['cutBetween']
+        @($between['reads']['rca_query_stats'][$key]) | Should -Be @('17:20:10', '17:35:05')
+        foreach ($result in $before, $between) {
+            $result['status'] | Should -Be 'Warning'
+            $result['message'] | Should -Match ('skipped 1 sidecar\(s\) or line\(s\): {0}: the write failed \(the (append to|MERGE into) rca_query_stats was cut off\); the next save writes it again\. Acknowledged in .*, and the file stays\.$' -f $later)
+            Assert-SidecarAck -Result $result -Payload $result['file'] -Status @{ $later = 'skipped' }
+            @($result['left']) | Should -Contain $result['file']
+        }
+        # The next run with the same file writes the later read, then deletes the earlier one: one read of each.
+        foreach ($again in $sidecarReport['cutBeforeAgain'], $sidecarReport['cutBetweenAgain']) {
+            $again['status'] | Should -Be 'Pass'
+            @($again['order']) | Should -Be @('append', 'merge-delete')
+            foreach ($table in 'rca_query_stats', 'rca_query_waits') {
+                @($again['reads'][$table][$key]) | Should -Be @('17:35:05') -Because $table
+                foreach ($read in $again['reads'][$table].Keys) {
+                    @($again['reads'][$table][$read]).Count | Should -Be 1 -Because "$table $read"
+                }
+            }
+            Assert-SidecarAck -Result $again -Payload $again['file'] -Status @{ $later = 'written' }
+            @($again['left']) | Should -Not -Contain $again['file']
+        }
+    }
+
+    It 'skips every sidecar, and says why in its acknowledgement, without a default lakehouse; the file stays' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $unattached = $sidecarReport['noLakehouse']
+        $unattached['status'] | Should -Be 'Warning'
+        $unattached['message'] | Should -Match ('^Wrote no sidecar; and skipped 3 sidecar\(s\) or line\(s\): {0}: Spark or the default lakehouse isn''t available, so it wasn''t written \(attach LH_DatabaseHub and run again\);' -f $fixtureIds[0])
+        Assert-SidecarAck -Result $unattached -Payload $unattached['file'] -Status @{ $fixtureIds[0] = 'skipped'; $fixtureIds[1] = 'skipped'; $fixtureIds[2] = 'skipped' }
+        $unattached['counts'].Count | Should -Be 0
+        @($unattached['left']) | Should -Contain $unattached['file']
+    }
+
+    It 'keeps the file, and its sidecars pending, when the acknowledgement can''t be written; the scripts'' next file of them is acknowledged already' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $refused = $sidecarReport['ackRefused']
+        $refused['status'] | Should -Be 'Warning'
+        $refused['message'] | Should -Match '^Wrote 3 sidecar\(s\) .*\. The scripts keep its sidecars pending, because its acknowledgement couldn''t be written \(put was cut off\)\.$'
+        $refused['ackPath'] | Should -BeNullOrEmpty
+        @($refused['left'] | Where-Object { $_ -like 'Files/rca/acks/*.json' }) | Should -BeNullOrEmpty
+        @($refused['left']) | Should -Contain $refused['file']
+        foreach ($name in $sidecarReport['fixtures']['expectedCounts'].Keys) {
+            [int]$refused['counts'][$name] | Should -Be ([int]$sidecarReport['fixtures']['expectedCounts'][$name]) -Because $name
+        }
+        $again = $sidecarReport['ackRefusedAgain']
+        $again['status'] | Should -Be 'Pass'
+        Assert-SidecarAck -Result $again -Payload $again['file'] -Status @{ $fixtureIds[0] = 'already'; $fixtureIds[1] = 'already'; $fixtureIds[2] = 'already' }
+        # That run's sweep takes the first file too, every sidecar in it being in the history.
+        @($again['left'] | Where-Object { $_ -like 'Files/rca/inbox/*' }) | Should -BeNullOrEmpty
+    }
+
+    It 'passes when the file can''t be removed after its acknowledgement, which stays for the scripts, and a later run''s sweep removes the file' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $refused = $sidecarReport['rmRefused']
+        $refused['status'] | Should -Be 'Pass'
+        Assert-SidecarAck -Result $refused -Payload $refused['file'] -Status @{ $fixtureIds[0] = 'written'; $fixtureIds[1] = 'written'; $fixtureIds[2] = 'written' }
+        @($refused['left']) | Should -Contain $refused['file']
+        @($refused['cleanup']) | Should -Be @('Files/rca wasn''t cleaned up completely (rm was cut off); a later run, or the deployment notebook''s purge, finishes it.')
+        $swept = $sidecarReport['rmSwept']
+        $swept['status'] | Should -Be 'Not selected'
+        @($swept['left']) | Should -Not -Contain $refused['file']
+        @($swept['left']) | Should -Contain $refused['ackPath']
+    }
+
+    It 'keeps the acknowledgement it just wrote for a file staged days before, which the scripts read next (review of acde5510)' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $late = $sidecarReport['latePayload']
+        $late['status'] | Should -Be 'Pass'
+        $late['file'] | Should -Match '^Files/rca/inbox/sidecar-\d{8}T\d{6}Z-late\.json$'
+        Assert-SidecarAck -Result $late -Payload $late['file'] -Status @{ $fixtureIds[0] = 'written'; $fixtureIds[1] = 'written'; $fixtureIds[2] = 'written' }
+        @($late['left']) | Should -Contain $late['ackPath']
+        @($late['left'] | Where-Object { $_ -like 'Files/rca/inbox/*' }) | Should -BeNullOrEmpty
     }
 
     It 'skips a sidecar with <Case>, writes the others, keeps the file, and acknowledges which' -ForEach @(
