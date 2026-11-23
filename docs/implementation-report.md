@@ -8952,7 +8952,7 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 
 **What it holds,** each merge with the head it took:
 
-- **F35 design (i):** the integrated branch at 305df261 (663aa367) and its report entry, 4a3039e8 (07dc860c); the Livy steps' design A at 887fb1ed (82b9dd73); and the F35 session's typecheck fix, 792e9a19 (5eebcfa0).
+- **F35 design (i):** the integrated branch at 305df261 (663aa367) and its report entry, 4a3039e8 (07dc860c); the Livy steps' design A at 887fb1ed (82b9dd73) and its report line, 19af416e (12a5497d); and the F35 session's typecheck fix, 792e9a19 (5eebcfa0).
   - In the notebook, F35's kept values are the helpers' part 5, after the Incident RCA's part 4, and the persist cell works them out before the reference run's exit, since that exit ends the run. The notebooks' versions file was written again after each merge that changed a notebook.
   - With the Livy steps, the first history run's follow-up keeps the RCA release's wider condition (the model waiting for the Incident RCA's tables too) and deploys the form the track's step allowed.
 - **The realistic names,** ee9cb224 (75f370be).
@@ -8962,7 +8962,7 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - **The integration's own commits:**
   - the CHANGELOG's `[Unreleased]`, and each dated release named (d78bb1f0, the coordinator's decision);
   - [the review of the merges](#the-next-releases-integration-the-review-of-its-merges-2026-11-23): fff65c3b, d4154fde, and 1582e482, then the re-check's nits (ef551956);
-  - the app's typecheck (2a356245), replaced by F35's own fix;
+  - the app's typecheck (2a356245), replaced by F35's own fix, and [that fix's entry](#f35-design-i-the-filtered-saves-tests-rows-typed-as-rows-2026-11-23) in this report (7f1397de);
   - F35's docs for the Livy steps' design A (243ba79b);
   - [zod 4.6.7 in the functions](#zod-in-the-functions-lock-dependabot-alert-14-2026-11-23) (c0d61282).
 - **The CHANGELOG:** every piece's entries are under `[Unreleased]`, and the RCA release's section reads as 66cc5326 has it. Two merges had put theirs there: stop-tail's Fixed and Security entries, and High contrast's Fixed entries with an edit of the RCA's earth tones entry, which ships as it is.
@@ -8991,7 +8991,16 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - gitleaks 8.30.1, as CI pins it, checksum checked: the range's 69 commits, and its net diff, found no leak.
 - markdownlint is clean on every commit.
 
-The full validation runs once, at the final head, after the quiet window.
+**The full validation,** once, at 7f1397de, after the quiet window (18:06 to 18:49 ET), in a clean worktree, with StrictMode and the Azure CLI guard:
+
+- **Pester,** every file in `tests/unit` in one run, with Python 3.11 and gitleaks on the path: 5,814 passed, 1 failed, 78 skipped, and no call reached the Azure CLI, in 34 minutes. The failure is this PC's alone: Teardown's check that the live teardown tests skip runs them in a child `pwsh`, which loads Pester 5.9.1 from this PC's OneDrive copy, one without `Pester.ps1`. Its test file is unchanged since 66cc5326.
+- **PSScriptAnalyzer,** on the 48 PowerShell files changed since 66cc5326, each with its path's settings: no finding, and each file is ASCII with LF and parses.
+- **The Insights app:** the type check, lint, vitest (804 tests in 42 files, on 3 workers), the license check (136 production packages), and the build pass.
+- **The app's functions:** `npm ci` installs zod 4.6.7 from their lock, and `tsc --build` passes.
+- **The workload generator:** the locked restore, the Release build (no warning), and its tests: 844 passed, 25 skipped (the opt-in tests that need a SQL Server or PostgreSQL engine), and none failed.
+- **markdownlint:** 152 files, no issue.
+- **Leaks:** no commit since 66cc5326 adds or removes a deployment ID, and gitleaks 8.30.1 finds no leak in the 779 commits that 7f1397de reaches.
+- **Not run, since what they check is unchanged since 66cc5326:** Bicep and PSRule (`infra/` and `azuredeploy.json`), and the Ask relay's tests (`ask-relay/`).
 
 **What still needs live proof,** on a new deployment and an update at the final SHA:
 
@@ -8999,4 +9008,4 @@ The full validation runs once, at the final head, after the quiet window.
 - a Run all session that `start-demo.ps1` takes over, end to end, with the newer session's capture going on after the older one's end;
 - `stop-demo.ps1`'s kept-value step, and an update from 66cc5326;
 - design A on a real first deployment: the end's switch of the history model to the kept form;
-- the functions on zod 4.6.7 in Fabric: the app has run its own override, and the functions' build is part of the full validation.
+- the functions on zod 4.6.7 in Fabric: their install and build pass with it in the full validation.
