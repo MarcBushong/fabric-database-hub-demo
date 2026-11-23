@@ -50,6 +50,9 @@ internal sealed record ExportResult(IReadOnlyList<ExportedDocument> Documents, s
 /// A control session's documents share its budget over its exports; a sessionless export (<c>--session none</c>) has
 /// the budget to itself. A span that can't be exported is a Warning in the index, and the others still export.
 /// With <c>--final</c> it waits a bounded time for the observer to end its spans, so the session's last capture is in.
+/// With <c>--end-capture</c> (a session's stop, while the workload runs on), it first records the capture's end, which
+/// the observer reads within a second and ends its capture by, so that wait sees the spans end. When one still doesn't,
+/// the index's message says so first (<see cref="StillCapturing"/>), and the runbook names that VM's tail.
 /// </summary>
 internal sealed class Exporter(EvidenceStore store, RunnerLog log, string producerVersion)
 {
@@ -66,21 +69,40 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
 
     public const int MaximumDocuments = 16;
 
-    public ExportResult Export(string? sessionId, bool final, TimeSpan finalWait)
+    /// <summary>
+    /// The index's note when a final export's wait ran out while the observer still captured: right after the summary, so
+    /// it's never cut from the message. The session control's runbook reads it (DbHubControl.Common.ps1).
+    /// </summary>
+    public const string StillCapturing = "The observer was still capturing here, so what it captured after its last complete time stays for the next export.";
+
+    private const string NothingCaptured = "Nothing to export: the RCA observer hasn't captured anything on this host.";
+
+    /// <param name="endCapture">A session's stop: record the capture's end first (implies <paramref name="final"/>).</param>
+    public ExportResult Export(string? sessionId, bool final, TimeSpan finalWait, bool endCapture = false)
     {
-        if (!Directory.Exists(store.Root) || store.Spans().Count == 0)
+        final |= endCapture;
+        if (!endCapture && (!Directory.Exists(store.Root) || store.Spans().Count == 0))
         {
-            return new ExportResult([], "Not selected", "Nothing to export: the RCA observer hasn't captured anything on this host.");
+            return new ExportResult([], "Not selected", NothingCaptured);
         }
 
         using var exclusive = store.Lock(TimeSpan.FromSeconds(60));
         var now = store.Time.GetUtcNow();
-        store.Cleanup(now, log);
         var notes = new List<string>();
-        if (final && !WaitForSpans(finalWait))
+        var endFailed = endCapture && !EndCapture(now, sessionId);
+        if (endFailed)
         {
-            notes.Add("The observer was still capturing here, so what it captured after its last complete time stays for the next export.");
+            notes.Add("The capture's end couldn't be recorded, so the observer may go on capturing until the VM stops.");
         }
+
+        if (store.Spans().Count == 0)
+        {
+            return new ExportResult([], endFailed ? "Warning" : "Not selected", Message(NothingCaptured, notes, []));
+        }
+
+        store.Cleanup(now, log);
+        var capturing = final && !WaitForSpans(finalWait);
+        List<string> lead = capturing ? [StillCapturing] : [];
 
         now = store.Time.GetUtcNow();
         var ledger = store.ReadLedger();
@@ -128,8 +150,8 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
         if (documents.Count == 0)
         {
             return failures.Count > 0
-                ? new ExportResult([], "Fail", Message("No evidence document was exported.", [.. failures, .. notes], warnings))
-                : new ExportResult([], "Not selected", Message("Nothing new to export: the RCA observer captured nothing since the previous export.", notes, warnings));
+                ? new ExportResult([], "Fail", Message("No evidence document was exported.", [.. lead, .. failures, .. notes], warnings))
+                : new ExportResult([], "Not selected", Message("Nothing new to export: the RCA observer captured nothing since the previous export.", [.. lead, .. notes], warnings));
         }
 
         try
@@ -153,14 +175,31 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
             notes.Add(string.Create(CultureInfo.InvariantCulture, $"{late} row(s) arrived after their window was exported."));
         }
 
-        var status = failures.Count > 0 || warnings.Count > 0 || late > 0 || notes.Any(n => n.StartsWith("The observer was still", StringComparison.Ordinal)) ? "Warning" : "Pass";
-        return new ExportResult(documents, status, Message(summary, [.. failures, .. notes], warnings));
+        var status = failures.Count > 0 || warnings.Count > 0 || late > 0 || capturing || endFailed ? "Warning" : "Pass";
+        return new ExportResult(documents, status, Message(summary, [.. lead, .. failures, .. notes], warnings));
     }
+
     /// <summary>Prints part <paramref name="index"/> of a stored document, or null when the document or part doesn't exist.</summary>
     public string? Part(string documentId, int index)
     {
         var gzip = store.ReadDocument(documentId);
         return gzip is null || index < 1 || index > PartCodec.PartCount(gzip.Length) ? null : PartCodec.Line(documentId, gzip, index);
+    }
+
+    /// <summary>Records the capture's end (a session's stop); false, with the reason in the log, when it couldn't be written.</summary>
+    private bool EndCapture(DateTimeOffset at, string? sessionId)
+    {
+        try
+        {
+            store.EndCapture(at, sessionId);
+            log.Info("rca.end-recorded", "Recorded the capture's end: the observer ends its capture within a second, and captures again once a profile is set after it.", ("endedUtc", at), ("session", sessionId ?? "none"));
+            return true;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            log.Warn("rca.end-failed", "Couldn't record the capture's end; the export goes on, and waits for the observer as before.", ("error", Redactor.Redact(ex.Message)));
+            return false;
+        }
     }
 
     /// <summary>

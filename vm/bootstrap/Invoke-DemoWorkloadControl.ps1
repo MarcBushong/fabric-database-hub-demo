@@ -44,10 +44,11 @@ Actions:
   the readiness wait and the recovery above already cover.
 - StopGuest (archost01) { timeoutMinutes }: shuts the guest down cleanly (Stop-VM) and waits until it's
   off, so the host can be deallocated.
-- Rca (sqlvm01, and archost01 for T2's guest) { command, sessionId, final, documentId, part, timeoutSeconds,
+- Rca (sqlvm01, and archost01 for T2's guest) { command, sessionId, final, endCapture, documentId, part, timeoutSeconds,
   lockSeconds }: the Incident RCA's evidence export (ADR 0031): 'rca export' or 'rca part' with the runner on sqlvm01,
   or in T2's guest over PowerShell Direct, which it never starts or restarts. It prints the result line, then the
-  runner's own line (rca/README.md, Transport), last, so the instance view's 4 KB keeps it whole.
+  runner's own line (rca/README.md, Transport), last, so the instance view's 4 KB keeps it whole. endCapture (a
+  session's stop, 2026-11-23) adds --end-capture, and a runner from before it gets the export without it.
 
 .PARAMETER Action
 EnableT3, EnableT4, Runner, StopGuest, or Rca.
@@ -1614,8 +1615,10 @@ function Get-DemoControlRcaArgument {
     <#
     .SYNOPSIS
     The runner arguments of an Rca request (ADR 0031, rca/README.md, The runner's commands), from validated values only:
-    'rca export --session <id or none> [--final]', or 'rca part --document <documentId> --part <index>'. Throws on a
-    request that isn't one of them. Returns Arguments, Command, DocumentId, Part, and TimeoutSeconds.
+    'rca export --session <id or none> [--final] [--end-capture]', or 'rca part --document <documentId> --part <index>'.
+    Throws on a request that isn't one of them. Returns Arguments, Command, DocumentId, Part, TimeoutSeconds, and, for an
+    export with endCapture (a session's stop, 2026-11-23), EndCapture and Fallback: the same arguments without
+    --end-capture, for a runner that predates it.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -1626,6 +1629,8 @@ function Get-DemoControlRcaArgument {
 
     $command = if ($Request.Contains('command')) { [string]$Request['command'] } else { '' }
     $timeout = 600
+    $endCapture = $false
+    $fallback = @()
     if ($command -ceq 'export') {
         $session = if ($Request.Contains('sessionId') -and $null -ne $Request['sessionId']) { [string]$Request['sessionId'] } else { '' }
         if ($session -and $session -cnotmatch $script:ControlRcaSessionPattern) {
@@ -1637,6 +1642,11 @@ function Get-DemoControlRcaArgument {
         $arguments = @('rca', 'export', '--session', $session)
         if ($Request.Contains('final') -and [bool]$Request['final']) {
             $arguments += '--final'
+        }
+        if ($Request.Contains('endCapture') -and $Request['endCapture'] -is [bool] -and $Request['endCapture']) {
+            $endCapture = $true
+            $fallback = $arguments
+            $arguments += '--end-capture'
         }
         $documentId = ''
         $part = 0
@@ -1662,7 +1672,7 @@ function Get-DemoControlRcaArgument {
     if ($Request.Contains('timeoutSeconds') -and $null -ne $Request['timeoutSeconds'] -and [int]$Request['timeoutSeconds'] -ge 30) {
         $timeout = [System.Math]::Min(900, [int]$Request['timeoutSeconds'])
     }
-    return [pscustomobject]@{ Arguments = $arguments; Command = $command; DocumentId = $documentId; Part = $part; TimeoutSeconds = $timeout }
+    return [pscustomobject]@{ Arguments = $arguments; Command = $command; DocumentId = $documentId; Part = $part; TimeoutSeconds = $timeout; EndCapture = $endCapture; Fallback = $fallback }
 }
 
 function Get-DemoControlRcaLine {
@@ -1724,6 +1734,10 @@ function Invoke-DemoControlRca {
     there was nothing to export, Not supported for a runner older than the export, Fail otherwise), then the runner's own
     line, checked against the contract (Get-DemoControlRcaLine), last, so the 4 KB of output that the instance view keeps
     always holds it whole (https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed).
+    A session's stop asks for the capture's end (endCapture, 2026-11-23: --end-capture). A runner from before it refuses
+    the option before it exports anything, so the export runs again without it, as before, and the evidence says so
+    (endCaptureUnsupported): its observer goes on capturing until the VM stops, and the runner's index says what's left.
+    When the runner got the option, the evidence has endCapture, so the runbook can tell a control script that predates it.
     #>
     [CmdletBinding()]
     param(
@@ -1747,6 +1761,8 @@ function Invoke-DemoControlRca {
     }
     $label = 'runner rca {0}' -f $rca.Command
     $evidence = [ordered]@{ host = $role; command = $rca.Command }
+    # The runner's refusal of an option it doesn't know (System.CommandLine's parse error), before it runs anything.
+    $olderThanEnd = { param([object] $Run) [int]$Run.ExitCode -ne 0 -and ([string]$Run.StdErr + [string]$Run.StdOut) -match 'Unrecognized command or argument ''--end-capture''' }
     if ($role -eq 'SqlVm') {
         $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $StateRoot).InstallRecord
         if ($null -eq $install) {
@@ -1754,6 +1770,10 @@ function Invoke-DemoControlRca {
             return
         }
         $run = Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $rca.Arguments -TimeoutSeconds $rca.TimeoutSeconds
+        if ($rca.EndCapture -and (& $olderThanEnd $run)) {
+            $evidence['endCaptureUnsupported'] = $true
+            $run = Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $rca.Fallback -TimeoutSeconds $rca.TimeoutSeconds
+        }
     }
     elseif ($role -eq 'ArcHost') {
         $guest = Import-PowerShellDataFile -Path ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'dsc', 'guest.psd1'))
@@ -1768,6 +1788,10 @@ function Invoke-DemoControlRca {
         }
         try {
             $attempt = Invoke-DemoControlT2Attempt -StateRoot $StateRoot -GuestName $guestName -Guest $guest -Arguments $rca.Arguments -TimeoutSeconds $rca.TimeoutSeconds -Activity $false -LockSeconds $lockSeconds
+            if ($rca.EndCapture -and (& $olderThanEnd $attempt.Run)) {
+                $evidence['endCaptureUnsupported'] = $true
+                $attempt = Invoke-DemoControlT2Attempt -StateRoot $StateRoot -GuestName $guestName -Guest $guest -Arguments $rca.Fallback -TimeoutSeconds $rca.TimeoutSeconds -Activity $false -LockSeconds $lockSeconds
+            }
         }
         catch {
             $text = [string]$_.Exception.Message
@@ -1785,6 +1809,10 @@ function Invoke-DemoControlRca {
         return
     }
 
+    if ($rca.EndCapture -and -not $evidence.Contains('endCaptureUnsupported')) {
+        # The runner got --end-capture, so the runbook can tell this from a control script that predates it, which sends none.
+        $evidence['endCapture'] = $true
+    }
     $evidence['exitCode'] = [int]$run.ExitCode
     $line = Get-DemoControlRcaLine -Text $run.StdOut -Command $rca.Command -DocumentId $rca.DocumentId -Part $rca.Part
     $errorText = Get-DemoControlTail -Text $run.StdErr -Length 300

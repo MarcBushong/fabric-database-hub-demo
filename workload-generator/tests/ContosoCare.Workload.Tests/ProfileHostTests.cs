@@ -218,6 +218,49 @@ public sealed class ProfileHostTests
         Assert.Equal("locking-blocking", recorded.Result.ScenarioId);
     }
 
+    [Fact]
+    public async Task AfterAStopsEndTheGateFollowsOnlyAProfileSetAfterIt()
+    {
+        // O1: the session control's stop records the capture's end while the workload runs on until the VMs deallocate
+        // (ADR 0031). The runs that profile started go on, but only the next session's profile is captured again.
+        var at = DateTimeOffset.UtcNow - TimeSpan.FromSeconds(1);
+        var store = new FakeStore(new ProfileState("incident:locking-blocking", at, "test", at + TimeSpan.FromMinutes(30), null));
+        var work = new FakeWork();
+        await using var host = HostHarness.Start(store, work, Options(), answerKey: new RecordingAnswerKey());
+        await Until(() => work.Starts.Count >= 2);
+
+        var end = DateTimeOffset.UtcNow;
+        Assert.True(host.Host.IsActive(DemoTarget.T1));
+        Assert.False(host.Host.IsActiveAfter(DemoTarget.T1, end));
+        Assert.True(host.Host.IsActiveAfter(DemoTarget.T1, at - TimeSpan.FromSeconds(1)));
+
+        store.Set(new ProfileState("incident:locking-blocking", end + TimeSpan.FromMilliseconds(10), "test", end + TimeSpan.FromMinutes(30), null));
+        await Until(() => host.Host.IsActiveAfter(DemoTarget.T1, end));
+    }
+
+    [Fact]
+    public async Task AfterAStopsEndAFaultRunThatEndedByThenHoldsTheGateUntilItsLaneHandsItToTheAnswerKey()
+    {
+        // A fault run that ended right before the stop's end goes into the span that the stop's export takes; one that ends
+        // after it is cut by the stop, as the VMs' deallocation cuts the runs still going.
+        var at = DateTimeOffset.UtcNow - TimeSpan.FromSeconds(1);
+        var store = new FakeStore(new ProfileState("incident:locking-blocking", at, "test", at + TimeSpan.FromMinutes(30), null));
+        var work = new FakeWork { Behavior = FakeWork.EndsAfter(TimeSpan.FromMilliseconds(300)) };
+        var sink = new RecordingAnswerKey();
+        await using var host = HostHarness.Start(store, work, Options() with { Poll = TimeSpan.FromSeconds(6), StallLimit = TimeSpan.FromSeconds(30) }, answerKey: sink);
+        await Until(() => work.Starts.Count >= 2);
+        var before = DateTimeOffset.UtcNow;
+
+        await Until(() => work.Ended >= 2);
+        var end = DateTimeOffset.UtcNow;
+
+        Assert.Empty(sink.Runs);
+        Assert.True(host.Host.IsActiveAfter(DemoTarget.T1, end), "The fault run ended by the end, and its lane hasn't handed it over yet.");
+        Assert.False(host.Host.IsActiveAfter(DemoTarget.T1, before), "The fault run ended after that end.");
+        await Until(() => sink.Runs.Count >= 1);
+        Assert.False(host.Host.IsActiveAfter(DemoTarget.T1, end));
+    }
+
     private static ProfileHostOptions Options() => new()
     {
         Poll = TimeSpan.FromMilliseconds(50),
@@ -324,6 +367,8 @@ public sealed class ProfileHostTests
         }
 
         public bool IsPending(DemoTarget target) => false;
+
+        public bool IsPending(DemoTarget target, DateTimeOffset endedBy) => false;
     }
 
     private sealed class LockedWriter : StringWriter
@@ -480,6 +525,22 @@ public sealed class ProfileHostTests
             var rest = UntilCancelled(TimeSpan.Zero);
             return (plan, token) => Interlocked.Increment(ref calls) == 1 ? Task.FromResult(Result(plan, "Refused", reason)) : rest(plan, token);
         }
+
+        /// <summary>A run that ends on its own after <paramref name="after"/>, with its start and end times.</summary>
+        public static Func<RunPlan, CancellationToken, Task<RunResult>> EndsAfter(TimeSpan after) => async (plan, token) =>
+        {
+            var started = DateTimeOffset.UtcNow;
+            try
+            {
+                await Task.Delay(after, token);
+            }
+            catch (OperationCanceledException)
+            {
+                // Stopped by the host first: it ends now.
+            }
+
+            return Result(plan, "Completed", null) with { StartedAt = started, EndedAt = DateTimeOffset.UtcNow };
+        };
 
         public async Task<RunResult> RunAsync(RunPlan plan, CancellationToken cancellationToken)
         {

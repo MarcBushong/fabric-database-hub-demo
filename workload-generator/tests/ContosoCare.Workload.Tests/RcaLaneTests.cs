@@ -54,6 +54,73 @@ public sealed class RcaLaneTests
     }
 
     [Fact]
+    public async Task AStopsEndOfCaptureEndsItWithinASecondWhileTheSessionRunsOnAndOnlyAProfileSetAfterItIsCapturedAgain()
+    {
+        // O1 (Final tests' live round at d7df4f9f): the session control's stop sends nothing to stop the profiles, so the
+        // workload runs on until the VMs deallocate. The end that its export records ends the capture all the same, as a
+        // profile's end does, so the export's --final wait sees the span close.
+        var connector = RcaSimulation.T1(new ManualTime(RcaSimulation.T1From));
+        var gate = new Gate();
+        var store = new Store();
+        var lane = new ObserverLane([new SqlTargetObserver("T1", DemoTarget.T1, connector, new ObserverOptions(), RunnerLog.Null)], [DemoTarget.T5], gate, store, RunnerLog.Null, TimeProvider.System);
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            gate.Set(DemoTarget.T1, true);
+            gate.Set(DemoTarget.T5, true);
+            await Until(() => Calls(connector).Contains("RCA-SQL-09") && store.Spans.Count == 1 && store.Spans[0].Membership.Any(m => m.Target == "T5" && m.Began));
+            var span = store.Spans[0];
+
+            store.EndedAt = DateTimeOffset.UtcNow;
+            var ended = DateTime.UtcNow;
+            await Until(() => span.ClosedAt is not null);
+            Assert.True(DateTime.UtcNow - ended < TimeSpan.FromSeconds(5), "The capture didn't end within a few seconds of the stop's end.");
+            Assert.True(gate.IsActive(DemoTarget.T1), "The workload runs on: the profile host still says T1 is in its session.");
+            Assert.Equal("RCA-XE-05", Calls(connector)[^1]);
+            Assert.Contains(span.Membership, m => m.Target == "T5" && !m.Began);
+            var calls = Calls(connector).Count;
+            await Task.Delay(TimeSpan.FromSeconds(1.5), TestContext.Current.CancellationToken);
+            Assert.Equal(calls, Calls(connector).Count);
+            Assert.Single(store.Spans);
+
+            // The next session sets T1's profile again, after the end: captured again, in a span of its own.
+            gate.Set(DemoTarget.T1, true, profileSetAt: DateTimeOffset.UtcNow);
+            await Until(() => store.Spans.Count == 2 && Calls(connector).Count > calls);
+            Assert.Contains(store.Spans[1].Membership, m => m.Target == "T1" && m.Began);
+            Assert.DoesNotContain(store.Spans[1].Membership, m => m.Target == "T5");
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task AnEndLaterThanTheLanesClockAllowsIsIgnoredAndCaptureGoesOn()
+    {
+        var connector = RcaSimulation.T1(new ManualTime(RcaSimulation.T1From));
+        var gate = new Gate();
+        var store = new Store { EndedAt = DateTimeOffset.UtcNow + ObserverLane.FutureEndLimit + TimeSpan.FromMinutes(5) };
+        var lane = new ObserverLane([new SqlTargetObserver("T1", DemoTarget.T1, connector, new ObserverOptions(), RunnerLog.Null)], [], gate, store, RunnerLog.Null, TimeProvider.System);
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            gate.Set(DemoTarget.T1, true);
+            await Until(() => Calls(connector).Contains("RCA-SQL-09"));
+            await Task.Delay(TimeSpan.FromSeconds(1.5), TestContext.Current.CancellationToken);
+            Assert.Null(Assert.Single(store.Spans).ClosedAt);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
     public async Task TheReplicaJoinsTheSpanOnlyOnceItAnswers()
     {
         var replica = new ScriptedConnector((_, _) => []) { OpenFailure = new CaptureException(CaptureFailureKind.Connection, "No such host is known.") };
@@ -105,15 +172,18 @@ public sealed class RcaLaneTests
     private sealed class Gate : IObservationGate
     {
         private readonly HashSet<DemoTarget> active = [];
+        private readonly Dictionary<DemoTarget, DateTimeOffset> setAt = [];
         private readonly Lock sync = new();
 
-        public void Set(DemoTarget target, bool on)
+        /// <summary>A target in a session or not; with <paramref name="profileSetAt"/>, when its profile was set (an hour ago by default).</summary>
+        public void Set(DemoTarget target, bool on, DateTimeOffset? profileSetAt = null)
         {
             lock (sync)
             {
                 if (on)
                 {
                     active.Add(target);
+                    setAt[target] = profileSetAt ?? DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
                 }
                 else
                 {
@@ -129,11 +199,42 @@ public sealed class RcaLaneTests
                 return active.Contains(target);
             }
         }
+
+        public bool IsActiveAfter(DemoTarget target, DateTimeOffset end)
+        {
+            lock (sync)
+            {
+                return active.Contains(target) && setAt[target] > end;
+            }
+        }
     }
 
     private sealed class Store : ICaptureStore
     {
+        private readonly Lock sync = new();
+        private DateTimeOffset? endedAt;
+
         public List<MemorySink> Spans { get; } = [];
+
+        /// <summary>The capture's end, as rca export --end-capture records it.</summary>
+        public DateTimeOffset? EndedAt
+        {
+            get
+            {
+                lock (sync)
+                {
+                    return endedAt;
+                }
+            }
+
+            set
+            {
+                lock (sync)
+                {
+                    endedAt = value;
+                }
+            }
+        }
 
         public ICaptureSpan Open(DateTimeOffset at)
         {
@@ -145,5 +246,7 @@ public sealed class RcaLaneTests
 
             return span;
         }
+
+        public DateTimeOffset? CaptureEndedAt() => EndedAt;
     }
 }

@@ -23,8 +23,9 @@ internal sealed record SpanInfo(string Directory, SpanFile Span, SpanExport Expo
 /// <summary>
 /// The local evidence store (ADR 0031): <c>C:\ProgramData\DbHubDemo\rca\</c>, SYSTEM and Administrators only, one folder
 /// per observation span with a JSON-lines file per target (at most 20 MB each), the span's answer key, and what the
-/// export took; the exported documents' gzip in <c>exports\</c>. A span is deleted 7 days after its export took all of
-/// it, and one never exported after 30 days; an exported document after 7 days.
+/// export took; the exported documents' gzip in <c>exports\</c>; and the capture's end that the last session's stop
+/// recorded (<c>capture-end.json</c>). A span is deleted 7 days after its export took all of it, and one never exported
+/// after 30 days; an exported document after 7 days.
 /// </summary>
 internal sealed class EvidenceStore : ICaptureStore
 {
@@ -39,6 +40,7 @@ internal sealed class EvidenceStore : ICaptureStore
     private readonly Lock gate = new();
     private SpanWriter? current;
     private (SpanWriter Writer, DateTimeOffset At)? lastClosed;
+    private (DateTime WrittenUtc, long Length, DateTimeOffset? EndedUtc)? captureEnd;
 
     public EvidenceStore(string root, TimeProvider? time = null, long targetCap = DefaultTargetCap, bool secure = false, string? host = null)
     {
@@ -69,6 +71,9 @@ internal sealed class EvidenceStore : ICaptureStore
     public string LockPath => Path.Combine(Root, "export.lock");
 
     public string LedgerPath => Path.Combine(Root, "sessions.json");
+
+    /// <summary>capture-end.json: the capture's end that the last session's stop recorded (rca export --end-capture).</summary>
+    public string CaptureEndPath => Path.Combine(Root, "capture-end.json");
 
     /// <summary>The span this process has open, if any: the answer key's runs go into it.</summary>
     public SpanWriter? Current
@@ -168,6 +173,8 @@ internal sealed class EvidenceStore : ICaptureStore
     }
 
     ICaptureSpan ICaptureStore.Open(DateTimeOffset at) => Open(at);
+
+    DateTimeOffset? ICaptureStore.CaptureEndedAt() => CaptureEndedAt();
 
     /// <summary>
     /// Adds one answer-key row to the span this process has open, or to the one it closed in the last hour (a run that
@@ -272,6 +279,61 @@ internal sealed class EvidenceStore : ICaptureStore
     public SessionLedger ReadLedger() => ReadJson(LedgerPath, RcaStoreJsonContext.Default.SessionLedger) ?? new SessionLedger();
 
     public void WriteLedger(SessionLedger ledger) => WriteJson(LedgerPath, ledger, RcaStoreJsonContext.Default.SessionLedger);
+
+    /// <summary>
+    /// Records the capture's end (rca export --end-capture, a session's stop): the observer lane of 'profile run' reads it
+    /// at its next tick and ends its capture, as a profile's end does, while the workload runs on. Call under the export's
+    /// lock.
+    /// </summary>
+    public void EndCapture(DateTimeOffset at, string? sessionId)
+    {
+        EnsureRoot();
+        WriteJson(CaptureEndPath, new CaptureEndFile { EndedUtc = at, SessionId = sessionId }, RcaStoreJsonContext.Default.CaptureEndFile);
+    }
+
+    /// <summary>
+    /// The capture's end the last session's stop recorded, or null for none. The file is read again only when it changed,
+    /// so the observer's loops can ask at every tick; one that can't be read keeps what was read last.
+    /// </summary>
+    public DateTimeOffset? CaptureEndedAt()
+    {
+        var file = new FileInfo(CaptureEndPath);
+        if (!file.Exists)
+        {
+            lock (gate)
+            {
+                captureEnd = null;
+            }
+
+            return null;
+        }
+
+        lock (gate)
+        {
+            if (captureEnd is { } known && known.WrittenUtc == file.LastWriteTimeUtc && known.Length == file.Length)
+            {
+                return known.EndedUtc;
+            }
+        }
+
+        try
+        {
+            var ended = ReadJson(CaptureEndPath, RcaStoreJsonContext.Default.CaptureEndFile)?.EndedUtc;
+            lock (gate)
+            {
+                captureEnd = (file.LastWriteTimeUtc, file.Length, ended);
+            }
+
+            return ended;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            lock (gate)
+            {
+                return captureEnd?.EndedUtc;
+            }
+        }
+    }
 
     public static void WriteExport(SpanInfo span) => WriteJson(Path.Combine(span.Directory, "export.json"), span.Export, RcaStoreJsonContext.Default.SpanExport);
 
