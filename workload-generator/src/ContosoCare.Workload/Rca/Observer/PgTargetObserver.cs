@@ -220,7 +220,8 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
 
     /// <summary>
     /// Who holds the connections (RCA-PG-17), into the sidecar: with every sample of a connection episode, its first
-    /// included, and once when it ends. Detail capture, so none once the observer stopped its detail on T4.
+    /// included, and once when it ends. Detail capture, so none once the observer stopped its detail on T4; untimed, so
+    /// its duration never changes the cadence the evidence document's samples keep.
     /// </summary>
     private async Task HoldersAsync(DateTimeOffset now, EpisodeChange change, CancellationToken cancellationToken)
     {
@@ -229,7 +230,7 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
             return;
         }
 
-        var rows = await RunAsync(ConnectionHolders.Block, now, cancellationToken).ConfigureAwait(false);
+        var rows = await RunAsync(ConnectionHolders.Block, now, cancellationToken, timed: false).ConfigureAwait(false);
         if (rows is null)
         {
             return;

@@ -278,22 +278,27 @@ ORDER BY s.name;
 -- Query Store's top queries per interval on T4 (the sidecar): for each interval persisted after $2 that starts before $6,
 -- the queries among its top 10 by total time, top 5 by shared blocks hit and read, and top 5 by sampled waits; one row
 -- per interval, role, query, and plan, with the workload's own role named and every other role's rows summed under none.
--- Read every 15 minutes, 2 minutes after an interval ends, for the intervals persisted since the previous read; at the
--- observer's start for the 2 hours before it; and at its end. An interval shows only once it ends, so the observer keeps
--- a watermark of the time still pending and reads it later for the same session (rca/README.md, Pending publication).
--- Connected to azure_sys, whose query_store views the public role reads. qs_view's times are timestamps without a time
--- zone, which the read takes as UTC and returns as such. Parameters: $1 text, the database (contosocare); $2 timestamptz,
--- the end of the last interval read; $3 text[], the harness's functions; $4 text[], the tables only the harness writes;
--- $5 text[], every other table; $6 timestamptz, the end of the time read (the read's own time, or a pending range's
--- end). $3 to $5 come from RCA-PG-16, never from the answer key, as regular-expression literals; an empty array leaves
--- out nothing. At most 600 rows, earliest intervals first: a read that gets 600 reads again from the end of the last
--- interval it got whole. A wait sample with no event is a backend on CPU, not waiting (pg_stat_activity's wait_event_type,
--- which the view's events follow), so it isn't counted.
+-- Read every 15 minutes, 2 minutes after an interval ends; at the observer's start for the 2 hours before it; and at its
+-- end. Each read starts where an earlier read found every interval surely published (20 minutes after it ended), so an
+-- interval whose counts or waits Query Store published late is read again. An interval shows only once it ends, so the
+-- observer keeps a watermark of the time still unsettled and reads it later for the same session (rca/README.md, Pending
+-- publication). Connected to azure_sys, whose query_store views the public role reads. qs_view's times are timestamps
+-- without a time zone, which the read takes as UTC and returns as such. Parameters: $1 text, the database (contosocare);
+-- $2 timestamptz, where the read starts; $3 text[], the harness's functions; $4 text[], the tables only the harness
+-- writes; $5 text[], every other table; $6 timestamptz, the end of the time read (the read's own time, or a pending
+-- range's end); $7 text[], every statement the observer sends to contosocare, as it sends them. $3 to $5 come from
+-- RCA-PG-16, as regular-expression literals, and $7 from the runner's own catalog and code, never from the answer key; an
+-- empty array leaves out nothing. At most 600 rows, earliest intervals first: a read that gets 600 reads again from the
+-- end of the last interval it got whole. A wait sample with no event is a backend on CPU, not waiting
+-- (pg_stat_activity's wait_event_type, which the view's events follow), so it isn't counted. A row whose text Query
+-- Store didn't keep is evidence.
 -- Left out, by two fixed rules and nothing else (rca/README.md, What the capture leaves out): the capture's own
--- statements, whose connections' search_path names dbhubdemo_rca_observer (qs_view records it per row) and whose text
--- carries the marker; and the harness's: a call of one of its functions, or a statement that references a table only
--- the harness writes and no other table, since Query Store records a statement nested in a function without its
--- function (pg_qs.query_capture_mode all). Everything else is measured evidence.
+-- statements, whose connections' search_path names dbhubdemo_rca_observer (qs_view records it per row), whose text
+-- carries the marker, or whose text is one of $7's once comments are stripped, white space collapsed, and a final
+-- semicolon dropped, which also catches what the observer sent before either marker existed (its blocks then were these
+-- same statements without the marker's comment); and the harness's: a call of one of its functions, or a statement that
+-- references a table only the harness writes and no other table, since Query Store records a statement nested in a
+-- function without its function (pg_qs.query_capture_mode all). Everything else is measured evidence.
 SELECT /* dbhubdemo:rca-observer */ clock_timestamp() AS captured_at,
        r.start_time AT TIME ZONE 'UTC' AS interval_start_utc,
        r.end_time AT TIME ZONE 'UTC' AS interval_end_utc,
@@ -357,11 +362,14 @@ FROM (SELECT s.start_time,
                     AND q.end_time > ($2::timestamptz AT TIME ZONE 'UTC')
                     AND q.start_time < ($6::timestamptz AT TIME ZONE 'UTC')
                     AND COALESCE(q.search_path, '') NOT LIKE '%dbhubdemo_rca_observer%'
-                    AND q.query_sql_text NOT LIKE '%dbhubdemo:rca-observer%'
-                    AND NOT (cardinality($3::text[]) > 0 AND q.query_sql_text ~* ('\m(' || array_to_string($3::text[], '|') || ')\s*\('))
+                    AND (q.query_sql_text IS NULL OR q.query_sql_text NOT LIKE '%dbhubdemo:rca-observer%')
+                    AND btrim(regexp_replace(regexp_replace(regexp_replace(COALESCE(q.query_sql_text, ''), '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59))
+                        <> ALL (SELECT btrim(regexp_replace(regexp_replace(regexp_replace(o.statement, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59))
+                                FROM unnest($7::text[]) AS o(statement))
+                    AND NOT (cardinality($3::text[]) > 0 AND COALESCE(q.query_sql_text, '') ~* ('\m(' || array_to_string($3::text[], '|') || ')\s*\('))
                     AND NOT (cardinality($4::text[]) > 0
-                             AND q.query_sql_text ~* ('\m(' || array_to_string($4::text[], '|') || ')\M')
-                             AND NOT (cardinality($5::text[]) > 0 AND q.query_sql_text ~* ('\m(' || array_to_string($5::text[], '|') || ')\M')))) AS g
+                             AND COALESCE(q.query_sql_text, '') ~* ('\m(' || array_to_string($4::text[], '|') || ')\M')
+                             AND NOT (cardinality($5::text[]) > 0 AND COALESCE(q.query_sql_text, '') ~* ('\m(' || array_to_string($5::text[], '|') || ')\M')))) AS g
             GROUP BY g.start_time, g.end_time, g.login_name, g.query_id, g.plan_id) AS s
       LEFT JOIN (SELECT v.start_time, v.login_name, v.query_id, sum(v.calls) AS samples
                  FROM (SELECT ws.start_time,
@@ -423,12 +431,17 @@ ORDER BY r.start_time, r.query_id, r.samples DESC, r.event_type, r.event;
 -- name: RCA-PG-16
 -- The harness, for RCA-PG-14's leave-out (the sidecar): the functions the demo marks as its harness (COMMENT ON FUNCTION
 -- ... IS 'dbhubdemo:harness', which database/postgresql sets on its own control functions), and every user table, as
--- harness_table when only marked functions write it and as table otherwise (the workload's scratch tables among them).
--- A function writes a table when its source inserts into, updates, deletes from, truncates, or merges into it (the table's
--- name matched as written, any character that isn't a letter, digit, or underscore escaped). At the observer's start,
--- and again with each RCA-PG-14 read until it has been read once, in contosocare, on T4. It reads the database's own
--- catalog and nothing the workload plans; with no function marked, it names no harness, and RCA-PG-14 leaves out nothing
--- as the harness's.
+-- harness_table when only marked functions write it and as table otherwise. A marked function writes a table when its
+-- source inserts into, updates, deletes from, truncates, or merges into it, by the table's name as written (any
+-- character that isn't a letter, digit, or underscore escaped). When unsure, a table is the workload's, since a statement
+-- left out is measured evidence lost: a table is another's when any unmarked function's source names it at all (to read
+-- it, quoted, after ONLY, or as a TRUNCATE's later table), and no table is the harness's alone when an unmarked function
+-- runs dynamic SQL (EXECUTE) or keeps no source in pg_proc (a BEGIN ATOMIC body), since either could write any table; a
+-- row of kind unsure then says which (dynamic_sql, no_source). A statement the workload's client sends itself is in no
+-- function: the runner's tests check that only the harness's own code sends one that writes a table only the harness
+-- writes. At the observer's start, and again with each RCA-PG-14 read until it has been read once, in contosocare, on
+-- T4. It reads the database's own catalog and nothing the workload plans; with no function marked, it names no harness,
+-- and RCA-PG-14 leaves out nothing as the harness's.
 SELECT /* dbhubdemo:rca-observer */ clock_timestamp() AS captured_at,
        x.kind,
        x.name
@@ -436,13 +449,23 @@ FROM (SELECT 'function' AS kind, p.proname::text AS name
       FROM pg_proc AS p
       WHERE obj_description(p.oid, 'pg_proc') = 'dbhubdemo:harness'
       UNION ALL
-      SELECT CASE WHEN t.by_harness AND NOT t.by_other THEN 'harness_table' ELSE 'table' END AS kind, t.relname AS name
+      SELECT DISTINCT 'unsure' AS kind, CASE WHEN u.prosrc !~ '\S' THEN 'no_source' ELSE 'dynamic_sql' END AS name
+      FROM (SELECT COALESCE(p.prosrc, '') AS prosrc
+            FROM pg_proc AS p
+            JOIN pg_namespace AS pn ON pn.oid = p.pronamespace
+            WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')
+              AND pn.nspname NOT LIKE 'pg\_%'
+              AND obj_description(p.oid, 'pg_proc') IS DISTINCT FROM 'dbhubdemo:harness') AS u
+      WHERE u.prosrc !~ '\S' OR u.prosrc ~* '\mexecute\M'
+      UNION ALL
+      SELECT CASE WHEN t.by_harness AND NOT t.by_other AND NOT t.unsure THEN 'harness_table' ELSE 'table' END AS kind, t.relname AS name
       FROM (SELECT c.relname::text AS relname,
                    COALESCE(bool_or(f.harness AND f.prosrc ~* ('(insert\s+into|update|delete\s+from|truncate(\s+table)?|merge\s+into)\s+(\w+[.])?' || regexp_replace(c.relname, '\W', '\\\&', 'g') || '\M')), false) AS by_harness,
-                   COALESCE(bool_or(NOT f.harness AND f.prosrc ~* ('(insert\s+into|update|delete\s+from|truncate(\s+table)?|merge\s+into)\s+(\w+[.])?' || regexp_replace(c.relname, '\W', '\\\&', 'g') || '\M')), false) AS by_other
+                   COALESCE(bool_or(NOT f.harness AND f.prosrc ~* ('(^|[^[:alnum:]_$])' || regexp_replace(c.relname, '\W', '\\\&', 'g') || '($|[^[:alnum:]_$])')), false) AS by_other,
+                   COALESCE(bool_or(NOT f.harness AND (f.prosrc !~ '\S' OR f.prosrc ~* '\mexecute\M')), false) AS unsure
             FROM pg_class AS c
             JOIN pg_namespace AS n ON n.oid = c.relnamespace
-            LEFT JOIN (SELECT p.prosrc, COALESCE(obj_description(p.oid, 'pg_proc') = 'dbhubdemo:harness', false) AS harness
+            LEFT JOIN (SELECT COALESCE(p.prosrc, '') AS prosrc, COALESCE(obj_description(p.oid, 'pg_proc') = 'dbhubdemo:harness', false) AS harness
                        FROM pg_proc AS p
                        JOIN pg_namespace AS pn ON pn.oid = p.pronamespace
                        WHERE pn.nspname NOT IN ('pg_catalog', 'information_schema')

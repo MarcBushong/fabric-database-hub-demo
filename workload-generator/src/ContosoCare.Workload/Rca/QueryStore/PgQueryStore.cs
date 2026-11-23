@@ -123,17 +123,37 @@ internal sealed record PgQueryStoreSettings(
 
 /// <summary>
 /// The harness, as RCA-PG-16 read it from contosocare's own catalog: the functions the demo marks as its harness, the
-/// tables only they write, and every other table, each as a regular-expression literal for RCA-PG-14's leave-out. With no
-/// function marked, every list but the other tables is empty, and RCA-PG-14 leaves out nothing as the harness's.
+/// tables only they write, and every other table, each as a regular-expression literal for RCA-PG-14's leave-out; and
+/// why no table is the harness's alone, when RCA-PG-16 was unsure (an unmarked function that runs dynamic SQL, or keeps
+/// no source in pg_proc). With no function marked, every list but the other tables is empty, and RCA-PG-14 leaves out
+/// nothing as the harness's.
 /// </summary>
-internal sealed record PgHarness(IReadOnlyList<string> Functions, IReadOnlyList<string> HarnessTables, IReadOnlyList<string> OtherTables)
+internal sealed record PgHarness(IReadOnlyList<string> Functions, IReadOnlyList<string> HarnessTables, IReadOnlyList<string> OtherTables, IReadOnlyList<string> Unsure)
 {
     public static PgHarness Parse(IReadOnlyList<CaptureValues> rows)
     {
         List<string> Names(string kind) =>
-            [.. rows.Where(r => string.Equals(r.Text("kind"), kind, StringComparison.Ordinal)).Select(r => r.Text("name")).OfType<string>().Where(n => n.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal).Select(Literal)];
+            [.. rows.Where(r => string.Equals(r.Text("kind"), kind, StringComparison.Ordinal)).Select(r => r.Text("name")).OfType<string>().Where(n => n.Length > 0).Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)];
 
-        return new PgHarness(Names("function"), Names("harness_table"), Names("table"));
+        var unsure = Names("unsure");
+        return new PgHarness([.. Names("function").Select(Literal)], unsure.Count > 0 ? [] : [.. Names("harness_table").Select(Literal)], [.. Names("table").Select(Literal)], unsure);
+    }
+
+    /// <summary>What RCA-PG-16's unsure rows mean, in the coverage's words; null when it was sure.</summary>
+    public string? UnsureGap(string database)
+    {
+        if (Unsure.Count == 0)
+        {
+            return null;
+        }
+
+        var why = Unsure.Select(u => u switch
+        {
+            "dynamic_sql" => "runs dynamic SQL (EXECUTE)",
+            "no_source" => "keeps no source in pg_proc (a BEGIN ATOMIC body)",
+            _ => "can't be read (" + u + ")",
+        });
+        return $"A function in {database} that isn't the harness's {string.Join(", and one ", why)}, so it could write any table: no table is left out as only the harness's, and the statements the harness's functions run stay in the evidence.";
     }
 
     /// <summary>

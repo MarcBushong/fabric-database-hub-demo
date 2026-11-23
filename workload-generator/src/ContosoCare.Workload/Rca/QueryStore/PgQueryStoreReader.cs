@@ -5,16 +5,17 @@ namespace ContosoCare.Workload.Rca.QueryStore;
 /// <summary>What one read of T4's Query Store returned: whole intervals only, and the first failure, if any.</summary>
 /// <param name="Statistics">RCA-PG-14's rows, of whole intervals.</param>
 /// <param name="Waits">RCA-PG-15's rows for those intervals, roles, and queries.</param>
-/// <param name="Through">The end of the newest interval read whole, statistics and waits both; null when there's none.</param>
+/// <param name="Through">The end of the newest interval the statistics hold; null when they hold none.</param>
+/// <param name="Complete">True when the read reached the end of the time it asked for, with no failure.</param>
 /// <param name="Failure">Why a block failed, or null.</param>
 /// <param name="FailedBlock">The block that failed, or null.</param>
-internal sealed record PgQueryStoreRead(IReadOnlyList<CaptureValues> Statistics, IReadOnlyList<CaptureValues> Waits, DateTimeOffset? Through, CaptureException? Failure, string? FailedBlock);
+internal sealed record PgQueryStoreRead(IReadOnlyList<CaptureValues> Statistics, IReadOnlyList<CaptureValues> Waits, DateTimeOffset? Through, bool Complete, CaptureException? Failure, string? FailedBlock);
 
 /// <summary>
 /// Reads T4's Query Store on a connection to azure_sys (RCA-PG-14 and RCA-PG-15): the intervals that end after a time and
-/// start before another, earliest first. RCA-PG-14 returns at most <see cref="PageRows"/> rows, so a read that gets that
-/// many keeps the intervals it got whole and reads on from the last one's end, up to <see cref="MaximumPages"/> times; what's
-/// left, the next read takes. A read whose waits failed reports no newest interval, so the next read takes both again.
+/// start before another, earliest first, but the observer's own statements and the harness's. RCA-PG-14 returns at most
+/// <see cref="PageRows"/> rows, so a read that gets that many keeps the intervals it got whole and reads on from the last
+/// one's end, up to <see cref="MaximumPages"/> times; what's left, the next read takes.
 /// </summary>
 internal static class PgQueryStoreReader
 {
@@ -24,12 +25,16 @@ internal static class PgQueryStoreReader
     /// <summary>At most 20 rows an interval, so a page holds at least 30 intervals; 8 pages are 60 hours of them.</summary>
     public const int MaximumPages = 8;
 
+    /// <summary>RCA-PG-14's $7: every statement the observer sends to contosocare.</summary>
+    private static readonly string[] OwnStatements = [.. PgObserverStatements.All];
+
     public static async Task<PgQueryStoreRead> ReadAsync(ICaptureConnection connection, string database, DateTimeOffset since, DateTimeOffset until, PgHarness harness, TimeSpan timeout, CancellationToken cancellationToken)
     {
         ArgumentNullException.ThrowIfNull(connection);
         ArgumentNullException.ThrowIfNull(harness);
         var statistics = new List<CaptureValues>();
         var from = since;
+        var complete = false;
         for (var page = 0; page < MaximumPages; page++)
         {
             IReadOnlyList<CaptureValues> rows;
@@ -38,14 +43,14 @@ internal static class PgQueryStoreReader
                 rows = await connection.QueryAsync(
                     PgQueryStoreRows.Statistics,
                     CaptureCatalog.Get(PgQueryStoreRows.Statistics),
-                    CaptureParameters.Positional(database, from, harness.Functions.ToArray(), harness.HarnessTables.ToArray(), harness.OtherTables.ToArray(), until),
+                    CaptureParameters.Positional(database, from, harness.Functions.ToArray(), harness.HarnessTables.ToArray(), harness.OtherTables.ToArray(), until, OwnStatements),
                     timeout,
                     cancellationToken).ConfigureAwait(false);
             }
             catch (CaptureException ex)
             {
                 // The pages before the failure hold whole intervals: they're kept, with their waits.
-                var partial = new PgQueryStoreRead(statistics, [], Newest(statistics), ex, PgQueryStoreRows.Statistics);
+                var partial = new PgQueryStoreRead(statistics, [], Newest(statistics), false, ex, PgQueryStoreRows.Statistics);
                 return await WithWaitsAsync(connection, database, since, until, partial, timeout, cancellationToken).ConfigureAwait(false);
             }
 
@@ -53,6 +58,7 @@ internal static class PgQueryStoreReader
             if (rows.Count < PageRows)
             {
                 statistics.AddRange(whole);
+                complete = true;
                 break;
             }
 
@@ -69,7 +75,7 @@ internal static class PgQueryStoreReader
             from = before.Max(r => r.Time("interval_end_utc")!.Value);
         }
 
-        return await WithWaitsAsync(connection, database, since, until, new PgQueryStoreRead(statistics, [], Newest(statistics), null, null), timeout, cancellationToken).ConfigureAwait(false);
+        return await WithWaitsAsync(connection, database, since, until, new PgQueryStoreRead(statistics, [], Newest(statistics), complete, null, null), timeout, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>RCA-PG-15 for the statistics' queries, keeping only the waits of the intervals, roles, and queries they hold.</summary>
@@ -94,7 +100,7 @@ internal static class PgQueryStoreReader
         }
         catch (CaptureException ex)
         {
-            return read with { Through = null, Failure = read.Failure ?? ex, FailedBlock = read.FailedBlock ?? PgQueryStoreRows.Waits };
+            return read with { Complete = false, Failure = read.Failure ?? ex, FailedBlock = read.FailedBlock ?? PgQueryStoreRows.Waits };
         }
 
         return read with { Waits = [.. waits.Where(w => keys.Contains(Key(w)))] };

@@ -1,4 +1,7 @@
+using System.Buffers.Binary;
 using System.Globalization;
+using System.Net;
+using System.Net.Sockets;
 using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using ContosoCare.Workload.Diagnostics;
@@ -14,8 +17,9 @@ namespace ContosoCare.Workload.Tests;
 /// <summary>
 /// T4's sidecar (rca/README.md, The sidecar): Query Store's reads (RCA-PG-13 to 16), the unread-interval watermark and its
 /// backfill, and who holds T4's connections (RCA-PG-17). azure_sys and pg_qs exist only on Azure, so a scripted Query
-/// Store answers the blocks from the contract's fixtures, and the leave-out rule is checked by evaluating the block's
-/// own patterns.
+/// Store answers the blocks from the contract's fixtures; the leave-out rules are checked by evaluating the blocks' own
+/// patterns, the harness's against database/postgresql's real sources; and what the observer's connections send is read
+/// from a listener that speaks PostgreSQL's protocol.
 /// </summary>
 public sealed partial class RcaQueryStorePgTests : IDisposable
 {
@@ -73,7 +77,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
-    public async Task EachReadTakesTheIntervalsSinceTheLastOneOnAzureSysWithTheHarnessList()
+    public async Task EachReadTakesTheUnsettledIntervalsOnAzureSysWithTheHarnessAndTheObserversStatements()
     {
         var store = new ScriptedQueryStore(T4Statistics(), T4Waits());
         var (capture, _, _) = Capture(store, SpanA);
@@ -88,22 +92,53 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.Equal(2, store.Connector.Opens);
         Assert.All(store.Connector.Calls, c => Assert.Equal(CaptureCatalog.Get(c.BlockId), c.Text));
         var first = store.Connector.ParameterCalls[0].Parameters;
-        Assert.Equal(6, first.Count);
+        Assert.Equal(7, first.Count);
         Assert.Equal("contosocare", first[0].Value);
         Assert.Equal(At(17, 2, 5610).AddHours(-2), first[1].Value);
         Assert.Equal(["fn\\$harness_begin", "fn_harness_event"], (string[])first[2].Value!);
         Assert.Equal(["harness_runs"], (string[])first[3].Value!);
         Assert.Equal(["patients", "work_queues"], (string[])first[4].Value!);
         Assert.Equal(At(17, 2, 5610), first[5].Value);
+        Assert.Equal(PgObserverStatements.All, (string[])first[6].Value!);
         var waits = store.Connector.ParameterCalls[1].Parameters;
         Assert.Equal(At(17, 2, 5610).AddHours(-2), waits[1].Value);
         Assert.Equal([Update, SizeCheck, Marks], (long[])waits[2].Value!);
         Assert.Equal(At(17, 2, 5610), waits[3].Value);
 
-        // The second read starts where the first one's newest interval ended.
-        Assert.Equal(At(17, 0), store.Connector.ParameterCalls[2].Parameters[1].Value);
+        // The second read starts where the first found every interval surely published, 20 minutes before it: the 16:45
+        // interval, read 2 minutes after it ended, is read again.
+        Assert.Equal(At(16, 42, 5610), store.Connector.ParameterCalls[2].Parameters[1].Value);
         Assert.Equal(At(17, 15), capture.Through);
+        Assert.Equal(At(16, 57, 5700), capture.Settled);
         Assert.Equal(At(17, 32), capture.NextRead);
+    }
+
+    [Fact]
+    public async Task CountsAndWaitsQueryStorePublishesLateAreReadOnceItDoes()
+    {
+        // Query Store shows each interval's statistics as soon as it ends, and its waits only 10 minutes later.
+        var fixture = new SidecarFixture("t4-query-store.sidecar.json");
+        var store = new ScriptedQueryStore(T4Statistics(), T4Waits()) { WaitsPublishedAfter = TimeSpan.FromMinutes(10) };
+        var (capture, sidecar, _) = Capture(store, SpanA);
+
+        await ReadAtAsync(capture, store, At(17, 2, 5610), Observer(store));
+        Assert.Empty(sidecar.Table(RcaContract.QueryWaits));
+        await ReadAtAsync(capture, store, At(17, 17, 5700), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 32), Observer(store));
+
+        // Every wait reached the sidecar, and each interval's latest statistics hold them, as the fixture's do.
+        AssertSameRows(fixture.Table(RcaContract.QueryWaits), sidecar.Table(RcaContract.QueryWaits), ["captured_at_utc"], "interval_start_utc", "query_id", "wait_category", "wait_event");
+        var latest = sidecar.Table(RcaContract.QueryStats)
+            .GroupBy(r => ((DateTimeOffset)r.Get("interval_start_utc")!, (long)r.Get("query_id")!, (string?)r.Get("login_name")))
+            .Select(g => g.OrderBy(r => (DateTimeOffset)r.Get("captured_at_utc")!).Last())
+            .ToList();
+        AssertSameRows(fixture.Table(RcaContract.QueryStats), latest, ["captured_at_utc"], "interval_start_utc", "query_id", "login_name");
+
+        // A row is written again only when a later read found it changed: the size check, with no waits, once an interval;
+        // the chain's UPDATE at 17:00 twice, before its waits were published and after.
+        Assert.Equal(2, sidecar.Table(RcaContract.QueryStats).Count(r => (long)r.Get("query_id")! == SizeCheck));
+        Assert.Equal(2, sidecar.Table(RcaContract.QueryStats).Count(r => (long)r.Get("query_id")! == Update && (DateTimeOffset)r.Get("interval_start_utc")! == At(17, 0)));
+        Assert.Equal(At(17, 12), capture.Settled);
     }
 
     [Fact]
@@ -179,6 +214,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.Equal(620, read.Statistics.Count);
         Assert.Equal(620, read.Statistics.Select(r => (r.Time("interval_start_utc"), r.Long("query_id"))).Distinct().Count());
         Assert.Equal(start.AddMinutes(15 * 31), read.Through);
+        Assert.True(read.Complete);
         Assert.Equal(["RCA-PG-14", "RCA-PG-14", "RCA-PG-15"], connector.ParameterCalls.Select(c => c.BlockId));
         Assert.Equal(start.AddMinutes(15 * 29), connector.ParameterCalls[1].Parameters[1].Value);
     }
@@ -220,10 +256,12 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         await ReadAtAsync(first, store, At(17, 17, 5700), Observer(store));
         store.Clock = At(17, 20);
         await first.EndAsync(store.Clock, Observer(store), TestContext.Current.CancellationToken);
-        var pending = Assert.Single(watermark.Read().Pending);
-        Assert.Equal((SpanA, At(17, 15), At(17, 20)), (pending.SpanId, pending.FromUtc, pending.ToUtc!.Value));
 
-        // The next session, in span B, at 18:00: the 17:15 interval is published now.
+        // What's unsettled at the end is kept: from 17:00, where the reads found every interval surely published.
+        var pending = Assert.Single(watermark.Read().Pending);
+        Assert.Equal((SpanA, At(17, 0), At(17, 20)), (pending.SpanId, pending.FromUtc, pending.ToUtc!.Value));
+
+        // The next session, in span B, at 18:00: the 17:15 interval is published now, and 17:00 surely whole.
         var spans = new MemorySpans { CurrentSpan = SpanB };
         var backfilled = spans.Add(SpanA);
         var sessionB = new MemorySidecar();
@@ -231,14 +269,14 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         await ReadAtAsync(second, store, At(18, 0), Observer(store));
 
         var rows = backfilled.Table(RcaContract.QueryStats);
-        Assert.Equal(2, rows.Count);
-        Assert.All(rows, r => Assert.Equal(At(17, 15), r.Get("interval_start_utc")));
+        Assert.Equal([At(17, 0), At(17, 0), At(17, 0), At(17, 0), At(17, 15), At(17, 15)], rows.Select(r => (DateTimeOffset)r.Get("interval_start_utc")!).Order());
         Assert.All(rows, r => Assert.Equal(At(18, 0), r.Get("captured_at_utc")));
+        Assert.Equal(3, backfilled.Table(RcaContract.QueryWaits).Count);
         var coverage = Assert.Single(backfilled.Table(RcaContract.QueryCoverage));
         Assert.True(coverage.Get("backfill") is true);
-        Assert.Equal(At(17, 15), coverage.Get("window_start_utc"));
+        Assert.Equal(At(17, 0), coverage.Get("window_start_utc"));
         Assert.Equal(At(17, 20), coverage.Get("window_end_utc"));
-        Assert.Equal(At(17, 15), coverage.Get("read_from_utc"));
+        Assert.Equal(At(17, 0), coverage.Get("read_from_utc"));
         Assert.Equal(At(17, 30), coverage.Get("read_to_utc"));
         Assert.Null(coverage.Get("pending_from_utc"));
         Assert.Null(coverage.Get("gaps"));
@@ -274,14 +312,17 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
-    public async Task ARangeOlderThanQueryStoresRetentionExpiresAsAGap()
+    public async Task ARangeOlderThanQueryStoresRetentionExpiresAsAGapInTheSpanItBelongsTo()
     {
+        // The span store still knows the span (T1's ledger keeps it past the span's folder): the range expires as a row.
         var store = new ScriptedQueryStore(T4Statistics(), T4Waits());
         var watermark = Watermark();
         watermark.Update(s => s.Pending.Add(new PendingRange { SpanId = SpanA, ObservedFromUtc = At(17, 0).AddDays(-8), FromUtc = At(17, 15).AddDays(-8), ToUtc = At(17, 20).AddDays(-8), RecordedUtc = At(17, 20).AddDays(-8) }));
         var spans = new MemorySpans { CurrentSpan = SpanB };
         var expired = spans.Add(SpanA);
-        var capture = new PgQueryStoreCapture("T4", new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), RcaSimulation.Options(), RunnerLog.Null);
+        using var logText = new StringWriter(CultureInfo.InvariantCulture);
+        using var log = new RunnerLog(logText);
+        var capture = new PgQueryStoreCapture("T4", new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), RcaSimulation.Options(), log);
 
         await ReadAtAsync(capture, store, At(17, 47), Observer(store));
 
@@ -291,6 +332,14 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.Empty(expired.Table(RcaContract.QueryStats));
         Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
         Assert.DoesNotContain(store.Connector.ParameterCalls, c => (DateTimeOffset)c.Parameters[1].Value! == At(17, 15).AddDays(-8));
+        Assert.DoesNotContain("rca.querystore-forgotten", logText.ToString(), StringComparison.Ordinal);
+
+        // A span the store no longer knows at all can't take a row: its range is dropped with a log line instead.
+        watermark.Update(s => s.Pending.Add(new PendingRange { SpanId = "20261101T090000Z", ObservedFromUtc = At(9, 0).AddDays(-19), FromUtc = At(9, 15).AddDays(-19), ToUtc = At(9, 20).AddDays(-19), RecordedUtc = At(9, 20).AddDays(-19) }));
+        await ReadAtAsync(capture, store, At(18, 2), Observer(store));
+        Assert.Contains("rca.querystore-forgotten", logText.ToString(), StringComparison.Ordinal);
+        Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == "20261101T090000Z");
+        Assert.Single(expired.Table(RcaContract.QueryCoverage));
     }
 
     [Fact]
@@ -457,6 +506,33 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.Equal(Lines(plain), Lines(evidence));
     }
 
+    [Fact]
+    public async Task ASlowHolderReadLeavesTheEvidenceAsItWas()
+    {
+        // RCA-PG-17 takes longer than a slow sample, in real time: untimed, it changes neither T4's cadence nor its gaps.
+        var options = RcaSimulation.Options() with { SlowSample = TimeSpan.FromSeconds(1), QuietFor = TimeSpan.FromSeconds(10) };
+        var from = RcaSimulation.T4From;
+        var busy = (From: from.AddSeconds(60), To: from.AddSeconds(70));
+        var clock = new ManualTime(from);
+        IReadOnlyList<CaptureValues> Answer(string block) => block switch
+        {
+            "RCA-PG-10" => [Row(("captured_at", clock.Now.UtcDateTime), ("max_connections", 50), ("reserved_connections", 3), ("client_connections", clock.Now >= busy.From && clock.Now < busy.To ? 45L : 10L), ("waiting_lock", 0L))],
+            "RCA-PG-17" => [HolderRow(clock.Now, "psql", "monitoring_reader", "idle", 40, 0, 1, 1)],
+            _ => [],
+        };
+        var slow = new SlowBlockConnector(new ScriptedConnector((block, _) => Answer(block)), "RCA-PG-17", TimeSpan.FromSeconds(1.5));
+        var sidecar = new MemorySidecar();
+        var evidence = new MemorySink();
+        await RcaSimulation.DriveAsync([new PgPrimaryObserver(slow, options, RunnerLog.Null, new ReplicaLink(), sidecar)], evidence, clock, from, from.AddMinutes(2), TestContext.Current.CancellationToken);
+        var plain = new MemorySink();
+        await RcaSimulation.DriveAsync([new PgPrimaryObserver(new ScriptedConnector((block, _) => Answer(block)), options, RunnerLog.Null, new ReplicaLink())], plain, clock, from, from.AddMinutes(2), TestContext.Current.CancellationToken);
+
+        Assert.Equal(2, slow.Slow);
+        Assert.Equal(2, sidecar.Table(RcaContract.Connections).Count);
+        Assert.Equal(Lines(plain), Lines(evidence));
+        Assert.Equal(plain.Notes, evidence.Notes);
+    }
+
     // ---- Phase 1 stays as it was -------------------------------------------------------------------------------------
 
     [Fact]
@@ -553,28 +629,132 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
-    public void RcaPg16FindsTheTablesAFunctionWritesByItsSource()
+    public void TheTextRuleLeavesOutEveryStatementTheObserverSendsTodayAndAtEdd01c86()
     {
-        var block = CaptureCatalog.Get("RCA-PG-16");
-        var writes = WritePattern().Match(block);
-        Assert.True(writes.Success);
-        bool Writes(string source, string table) => Regex.IsMatch(source, Pg(writes.Groups["prefix"].Value + PgHarness.Literal(table) + "\\M"), RegexOptions.IgnoreCase);
+        var rule = LeaveOut.FromCatalog();
+        var none = PgHarness.Parse([]);
+        var earlier = CaptureCatalog.Parse(RcaPgCatalogHistory.Edd01c86).Where(b => b.Key.StartsWith("RCA-PG-", StringComparison.Ordinal)).ToList();
+        Assert.Equal(12, earlier.Count);
+        Assert.All(earlier, b => Assert.DoesNotContain("dbhubdemo", b.Value, StringComparison.Ordinal));
+        foreach (var (id, text) in CaptureCatalog.All.Where(b => b.Key.StartsWith("RCA-PG-", StringComparison.Ordinal)).Concat(earlier))
+        {
+            // As Query Store may keep it, under the workload's role and search_path: as sent, without its final semicolon,
+            // or with a comment before it and its white space changed.
+            foreach (var kept in new[] { text, text.TrimEnd(';'), "/* sent */ " + WhiteSpace().Replace(text, "\n    ") })
+            {
+                Assert.True(rule.LeftOut(kept, WorkloadPath, none), id);
+            }
+        }
 
-        Assert.True(Writes("BEGIN INSERT INTO demo.harness_runs (run_id) VALUES (p_run); END", "harness_runs"));
-        Assert.True(Writes("UPDATE harness_runs SET ended_at = now() WHERE run_id = p_run;", "harness_runs"));
-        Assert.True(Writes("DELETE FROM demo.harness_runs WHERE ended_at < now();", "harness_runs"));
-        Assert.True(Writes("TRUNCATE TABLE demo.harness_runs;", "harness_runs"));
-        Assert.False(Writes("SELECT r.status FROM demo.harness_runs AS r FOR UPDATE OF r;", "harness_runs"));
-        Assert.False(Writes("INSERT INTO demo.harness_runs_archive SELECT 1;", "harness_runs"));
-        Assert.True(Writes("INSERT INTO demo.\"odd.table\" VALUES (1);".Replace("\"", string.Empty, StringComparison.Ordinal), "odd.table"));
-        Assert.Equal("odd\\.table", PgHarness.Literal("odd.table"));
-        Assert.Contains("regexp_replace(c.relname, '\\W', '\\\\\\&', 'g')", block, StringComparison.Ordinal);
+        foreach (var statement in new[] { PgCaptureConnector.ClearSnapshot, "SET statement_timeout = 10000", "SET statement_timeout = 30000", "SET lock_timeout = 1000", "SET idle_in_transaction_session_timeout = 60000" })
+        {
+            Assert.True(rule.LeftOut(statement, WorkloadPath, none), statement);
+        }
+    }
+
+    [Fact]
+    public void TheTextRuleKeepsAWorkloadStatementThatReadsTheSameViewsDifferently()
+    {
+        var rule = LeaveOut.FromCatalog();
+        var none = PgHarness.Parse([]);
+        var connections = CaptureCatalog.Parse(RcaPgCatalogHistory.Edd01c86)["RCA-PG-10"];
+        Assert.True(rule.LeftOut(connections, WorkloadPath, none));
+        foreach (var statement in new[]
+        {
+            "SELECT a.pid, a.state, a.query FROM pg_stat_activity AS a WHERE a.datname = current_database()",
+            "SELECT count(*) FROM pg_stat_activity",
+            "SELECT s.name, s.setting FROM pg_settings AS s WHERE s.name = 'max_connections'",
+            connections.Replace("AS waiting_lock", "AS lock_waiters", StringComparison.Ordinal),
+            connections.Replace("FROM pg_stat_activity AS a", "FROM pg_stat_activity AS a WHERE a.datname = current_database()", StringComparison.Ordinal),
+            "SET statement_timeout = 120000",
+            "SELECT pg_stat_clear_snapshot(), now()",
+        })
+        {
+            Assert.False(rule.LeftOut(statement, WorkloadPath, none), statement);
+        }
+    }
+
+    [Fact]
+    public void WhatTheObserverSentBeforeEitherMarkerIsLeftOutByItsTextAlone()
+    {
+        // Phase 1's statements carry neither marker: under the workload's role and search_path, only the text rule, read
+        // from RCA-PG-14's own SQL with the reader's own $7, leaves them out.
+        var rule = LeaveOut.FromCatalog();
+        var none = PgHarness.Parse([]);
+        var phase1 = CaptureCatalog.Parse(RcaPgCatalogHistory.Edd01c86)["RCA-PG-01"];
+
+        Assert.True(rule.LeftOut(phase1, WorkloadPath, none));
+        Assert.False(rule.LeftOut(phase1, WorkloadPath, none, ownStatements: []));
+    }
+
+    [Fact]
+    public void TheHarnessTablesOfDatabasePostgresqlAreTheRunAndControlTables()
+    {
+        // H marks every function the control script creates; nothing else is marked.
+        var (functions, tables) = RealSources();
+        var derived = Derivation.FromCatalog().Derive(functions, tables);
+
+        Assert.True(functions.Count(f => f.Marked) >= 10 && functions.Count(f => !f.Marked) >= 10, "database/postgresql's functions weren't all read.");
+        Assert.Empty(derived.Unsure);
+        Assert.Equal(["scenario_control", "scenario_run_events", "scenario_runs"], derived.HarnessTables);
+        Assert.Contains("work_queues", derived.OtherTables);
+        Assert.Contains("io_scratch", derived.OtherTables);
+        Assert.Contains("replica_lag_marks", derived.OtherTables);
+    }
+
+    [Theory]
+    [InlineData("UPDATE ONLY demo.scenario_control SET stop_requested = false WHERE scenario_id = p_id;", "scenario_control")]
+    [InlineData("INSERT INTO demo.\"scenario_runs\" (run_id) VALUES (p_run);", "scenario_runs")]
+    [InlineData("TRUNCATE demo.io_scratch, demo.scenario_run_events;", "scenario_run_events")]
+    [InlineData("PERFORM 1 FROM demo.scenario_runs AS r WHERE r.run_id = p_run;", "scenario_runs")]
+    public void ATableAnUnmarkedFunctionNamesAtAllIsTheWorkloads(string source, string table)
+    {
+        var (functions, tables) = RealSources();
+        var before = Derivation.FromCatalog().Derive(functions, tables).HarnessTables;
+        var after = Derivation.FromCatalog().Derive([.. functions, ("demo.fn_workload", false, source)], tables);
+
+        Assert.Contains(table, before);
+        Assert.DoesNotContain(table, after.HarnessTables);
+        Assert.Contains(table, after.OtherTables);
+        Assert.Equal(before.Where(t => t != table), after.HarnessTables);
+    }
+
+    [Theory]
+    [InlineData("BEGIN EXECUTE format('DELETE FROM %I.%I', p_schema, p_table); END", "dynamic_sql", "runs dynamic SQL (EXECUTE)")]
+    [InlineData("", "no_source", "keeps no source in pg_proc (a BEGIN ATOMIC body)")]
+    public void DynamicSqlOrABodyWithoutSourceLeavesNoTableToTheHarness(string source, string kind, string why)
+    {
+        var (functions, tables) = RealSources();
+        var derived = Derivation.FromCatalog().Derive([.. functions, ("demo.fn_workload", false, source)], tables);
+
+        Assert.Empty(derived.HarnessTables);
+        Assert.Equal([kind], derived.Unsure);
+        var harness = PgHarness.Parse([Row(("kind", "function"), ("name", "usp_run_end")), Row(("kind", "harness_table"), ("name", "scenario_runs")), Row(("kind", "unsure"), ("name", kind))]);
+        Assert.Empty(harness.HarnessTables);
+        Assert.Equal($"A function in contosocare that isn't the harness's {why}, so it could write any table: no table is left out as only the harness's, and the statements the harness's functions run stay in the evidence.", harness.UnsureGap("contosocare"));
+    }
+
+    [Fact]
+    public void OnlyTheHarnesssOwnCodeWritesAHarnessTableFromTheClient()
+    {
+        // A statement the runner sends itself is in no function, so RCA-PG-16 can't see it: none may write a harness table
+        // but the harness's own typed calls.
+        var (functions, tables) = RealSources();
+        var harnessTables = Derivation.FromCatalog().Derive(functions, tables).HarnessTables;
+        var writes = new Regex(@"(?i)\b(insert\s+into|update|delete\s+from|truncate(\s+table)?|merge\s+into)\s+(only\s+)?(""?\w+""?\.)?""?(" + string.Join('|', harnessTables) + @")\b");
+        var t4 = Directory.GetFiles(RepositoryPaths.Combine("workload-generator", "src", "ContosoCare.Workload"), "*.cs", SearchOption.AllDirectories)
+            .Where(f => !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.Ordinal) && !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
+            .Where(f => f.Contains($"{Path.DirectorySeparatorChar}Postgres{Path.DirectorySeparatorChar}", StringComparison.Ordinal) || File.ReadAllText(f).Contains("Npgsql", StringComparison.Ordinal))
+            .ToList();
+
+        Assert.True(t4.Count >= 5, "The runner's T4 code wasn't found.");
+        Assert.DoesNotContain(t4.Where(f => writes.IsMatch(File.ReadAllText(f))).Select(RepositoryPaths.Relative), f => f != "workload-generator/src/ContosoCare.Workload/Postgres/PgDemoDatabase.cs");
     }
 
     [Fact]
     public void TheReadsConvertQueryStoresTimesToUtcAndBoundEveryRead()
     {
-        foreach (var (id, parameters) in new[] { ("RCA-PG-14", 6), ("RCA-PG-15", 4) })
+        foreach (var (id, parameters) in new[] { ("RCA-PG-14", 7), ("RCA-PG-15", 4) })
         {
             var text = CaptureCatalog.Get(id);
             Assert.Equal(parameters, ParameterNumber().Matches(text).Select(m => int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture)).Max());
@@ -589,15 +769,166 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
-    public void TheObserversConnectionsNameTheirSchemaInSearchPath()
+    public async Task OnlyTheObserversConnectionsCarryTheMarkerFromTheirStartupPacketOn()
     {
-        Assert.Equal("""SELECT /* dbhubdemo:rca-observer */ set_config('search_path', concat_ws(', ', NULLIF(current_setting('search_path'), ''), 'dbhubdemo_rca_observer'), false)""", PgCaptureConnector.SearchPathStatement);
-        Assert.Contains(PgCaptureConnector.ObserverSchema, CaptureCatalog.Get("RCA-PG-14"), StringComparison.Ordinal);
-        Assert.Contains("COALESCE(q.search_path, '') NOT LIKE '%" + PgCaptureConnector.ObserverSchema + "%'", CaptureCatalog.Get("RCA-PG-14"), StringComparison.Ordinal);
-        Assert.Equal("azure_sys", PgCaptureConnector.QueryStore(Postgres.PgEndpoint.Create("pgflex01-x.postgres.database.azure.com", null, passwordFromEnvironment: false, null), RunnerLog.Null).Description.Split(' ')[1].Split('/')[1]);
+        using var server = new ListeningPostgres();
+        var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        using var credentials = new TestCredentials();
+        foreach (var (connector, database) in new[] { (new PgCaptureConnector(endpoint, RunnerLog.Null), "contosocare"), (PgCaptureConnector.QueryStore(endpoint, RunnerLog.Null), "azure_sys") })
+        {
+            var accepted = server.AcceptAsync(TestContext.Current.CancellationToken);
+            await Assert.ThrowsAsync<CaptureException>(() => connector.OpenAsync(TestContext.Current.CancellationToken));
+            var (startup, _) = await accepted;
+
+            Assert.Equal(PgCaptureConnector.StartupOptions, startup["options"]);
+            Assert.Equal(ApplicationNames.Observer, startup["application_name"]);
+            Assert.Equal(database, startup["database"]);
+
+            // As the server splits the options (a backslash escapes a space): the server's default with the marker last.
+            Assert.Equal(["-c", "search_path=\"$user\", public, dbhubdemo_rca_observer"], SplitOptions(startup["options"]));
+        }
+
+        // Any other connection the runner opens carries no marker.
+        var other = server.AcceptAsync(TestContext.Current.CancellationToken);
+        await Assert.ThrowsAnyAsync<Exception>(() => new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(ApplicationNames.Program + "/control/status", TestContext.Current.CancellationToken, retry: false));
+        var (plain, _) = await other;
+        Assert.DoesNotContain(PgCaptureConnector.ObserverSchema, plain.GetValueOrDefault("options") ?? string.Empty, StringComparison.Ordinal);
+        Assert.DoesNotContain(PgCaptureConnector.ObserverSchema, plain.GetValueOrDefault("search_path") ?? string.Empty, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task NpgsqlsTypeLoadingIsAmongTheObserversOwnStatements()
+    {
+        using var server = new ListeningPostgres();
+        var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        using var credentials = new TestCredentials();
+        var accepted = server.AcceptAsync(TestContext.Current.CancellationToken);
+        await Assert.ThrowsAsync<CaptureException>(() => new PgCaptureConnector(endpoint, RunnerLog.Null).OpenAsync(TestContext.Current.CancellationToken));
+        var (_, queries) = await accepted;
+
+        var rule = LeaveOut.FromCatalog();
+        var own = PgObserverStatements.All.Select(rule.Normalize).ToHashSet(StringComparer.Ordinal);
+
+        // Query Store may keep a query of several statements whole, or one statement at a time: both are left out.
+        var sent = queries.Select(rule.Normalize).SelectMany(q => Statements(q).Prepend(q)).Distinct(StringComparer.Ordinal).ToList();
+        var missing = sent.Where(q => !own.Contains(q)).ToList();
+        Assert.NotEmpty(queries);
+        Assert.True(missing.Count == 0, "Npgsql sends a statement that PgObserverStatements.NpgsqlTypeLoading doesn't hold:\n" + string.Join("\n----\n", missing));
+        Assert.Contains(rule.Normalize(PgObserverStatements.NpgsqlTypeLoadingQuery), sent);
     }
 
     // ---- Helpers -----------------------------------------------------------------------------------------------------
+
+    /// <summary>The workload's own search_path on T4: the server's default.</summary>
+    private const string WorkloadPath = "\"$user\", public";
+
+    /// <summary>
+    /// database/postgresql's functions and tables as RCA-PG-16 reads them from the catalog: each function's source (its
+    /// dollar-quoted body, which pg_proc keeps as prosrc), marked when the control script creates it, as H will mark it.
+    /// </summary>
+    private static (List<(string Name, bool Marked, string Source)> Functions, List<string> Tables) RealSources()
+    {
+        var functions = new List<(string Name, bool Marked, string Source)>();
+        var tables = new List<string>();
+        foreach (var file in Directory.GetFiles(RepositoryPaths.Combine("database", "postgresql"), "*.sql").Order(StringComparer.Ordinal))
+        {
+            var text = File.ReadAllText(file).Replace("\r\n", "\n", StringComparison.Ordinal);
+            var marked = string.Equals(Path.GetFileName(file), "110-demo-control.sql", StringComparison.Ordinal);
+            foreach (Match header in FunctionHeader().Matches(text))
+            {
+                var body = DollarBody().Match(text, header.Index + header.Length);
+                Assert.True(body.Success, $"{header.Groups["name"].Value} in {Path.GetFileName(file)} has no dollar-quoted body this test reads.");
+                functions.Add((header.Groups["name"].Value, marked, body.Groups["body"].Value));
+            }
+
+            tables.AddRange(TableHeader().Matches(text).Select(m => m.Groups["name"].Value));
+        }
+
+        return (functions, tables);
+    }
+
+    /// <summary>A normalized query's statements: split at each semicolon outside a quoted literal.</summary>
+    private static IEnumerable<string> Statements(string query)
+    {
+        var start = 0;
+        var quoted = false;
+        for (var i = 0; i < query.Length; i++)
+        {
+            if (query[i] == '\'')
+            {
+                quoted = !quoted;
+            }
+            else if (query[i] == ';' && !quoted)
+            {
+                if (query[start..i].Trim() is { Length: > 0 } statement)
+                {
+                    yield return statement;
+                }
+
+                start = i + 1;
+            }
+        }
+
+        if (query[start..].Trim() is { Length: > 0 } last)
+        {
+            yield return last;
+        }
+    }
+
+    /// <summary>A startup packet's options as the server splits them: at white space, a backslash escaping the next character.</summary>
+    private static List<string> SplitOptions(string options)
+    {
+        var words = new List<string>();
+        var word = new System.Text.StringBuilder();
+        var escaped = false;
+        var inWord = false;
+        foreach (var c in options)
+        {
+            if (escaped)
+            {
+                word.Append(c);
+                escaped = false;
+            }
+            else if (c == '\\')
+            {
+                escaped = true;
+                inWord = true;
+            }
+            else if (char.IsWhiteSpace(c))
+            {
+                if (inWord)
+                {
+                    words.Add(word.ToString());
+                    word.Clear();
+                    inWord = false;
+                }
+            }
+            else
+            {
+                word.Append(c);
+                inWord = true;
+            }
+        }
+
+        if (inWord)
+        {
+            words.Add(word.ToString());
+        }
+
+        return words;
+    }
+
+    [GeneratedRegex(@"^CREATE (?:OR REPLACE )?(?:FUNCTION|PROCEDURE) (?<name>[\w.]+)\s*\(", RegexOptions.Multiline)]
+    private static partial Regex FunctionHeader();
+
+    [GeneratedRegex(@"\bAS\s+\$(?<tag>\w*)\$(?<body>.*?)\$\k<tag>\$", RegexOptions.Singleline)]
+    private static partial Regex DollarBody();
+
+    [GeneratedRegex(@"^\s*CREATE (?:UNLOGGED )?TABLE (?:IF NOT EXISTS )?\w+\.(?<name>\w+)", RegexOptions.Multiline)]
+    private static partial Regex TableHeader();
+
+    [GeneratedRegex(@"\s+")]
+    private static partial Regex WhiteSpace();
 
     private static DateTimeOffset At(int hour, int minute, int milliseconds = 0) => new DateTimeOffset(2026, 11, 20, hour, minute, 0, TimeSpan.Zero).AddMilliseconds(milliseconds);
 
@@ -747,19 +1078,21 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         };
     }
 
-    private static void AssertSameRows(List<Dictionary<string, object?>> expected, List<CaptureRow> actual, params string[] key)
+    private static void AssertSameRows(List<Dictionary<string, object?>> expected, List<CaptureRow> actual, params string[] key) => AssertSameRows(expected, actual, [], key);
+
+    private static void AssertSameRows(List<Dictionary<string, object?>> expected, List<CaptureRow> actual, string[] ignore, params string[] key)
     {
         Assert.Equal(expected.Count, actual.Count);
         foreach (var row in expected)
         {
             var match = Assert.Single(actual, a => key.All(k => Equals(row.GetValueOrDefault(k), Normalize(a.Get(k)))));
-            AssertSameRow(row, match, string.Join(", ", key.Select(k => row.GetValueOrDefault(k))));
+            AssertSameRow(row, match, string.Join(", ", key.Select(k => row.GetValueOrDefault(k))), ignore);
         }
     }
 
-    private static void AssertSameRow(Dictionary<string, object?> expected, CaptureRow actual, string because)
+    private static void AssertSameRow(Dictionary<string, object?> expected, CaptureRow actual, string because, params string[] ignore)
     {
-        foreach (var column in RcaContract.Table(actual.Table).Columns.Select(c => c.Name))
+        foreach (var column in RcaContract.Table(actual.Table).Columns.Select(c => c.Name).Except(ignore, StringComparer.Ordinal))
         {
             var want = expected.GetValueOrDefault(column);
             var got = Normalize(actual.Get(column));
@@ -777,8 +1110,14 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     /// <summary>The evidence rows as the store writes them, byte for byte.</summary>
     private static List<string> Lines(MemorySink sink) => [.. sink.Rows.Select(r => System.Text.Encoding.UTF8.GetString(StoredLines.Row(r)))];
 
-    /// <summary>PostgreSQL's word boundaries in .NET's regular expressions: \m starts a word, \M ends one.</summary>
-    private static string Pg(string pattern) => pattern.Replace("\\m", "\\b(?=\\w)", StringComparison.Ordinal).Replace("\\M", "\\b(?<=\\w)", StringComparison.Ordinal);
+    /// <summary>
+    /// PostgreSQL's regular expressions in .NET's: \m starts a word and \M ends one; [:alnum:] is a letter or a digit
+    /// (https://www.postgresql.org/docs/18/functions-matching.html#POSIX-CONSTRAINT-ESCAPES-TABLE).
+    /// </summary>
+    private static string Pg(string pattern) => pattern
+        .Replace("\\m", "\\b(?=\\w)", StringComparison.Ordinal)
+        .Replace("\\M", "\\b(?<=\\w)", StringComparison.Ordinal)
+        .Replace("[:alnum:]", "\\p{L}\\p{N}", StringComparison.Ordinal);
 
     [GeneratedRegex(@"\$(\d+)::")]
     private static partial Regex ParameterNumber();
@@ -786,14 +1125,12 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [GeneratedRegex(@"\$\d+::timestamptz\)?(?<after> AT TIME ZONE 'UTC')?")]
     private static partial Regex TimestampParameter();
 
-    [GeneratedRegex(@"f\.prosrc ~\* \('(?<prefix>[^']*)' \|\| regexp_replace")]
-    private static partial Regex WritePattern();
-
     /// <summary>
-    /// RCA-PG-14's leave-out, evaluated in .NET from the block's own patterns: the observer's search_path and marker, a
-    /// call of a harness function ($3), and a statement that names a table only the harness writes ($4) and no other ($5).
+    /// RCA-PG-14's leave-out, evaluated in .NET from the block's own patterns: the observer's search_path and marker, its
+    /// own statements by their text ($7, normalized as the block normalizes both sides), a call of a harness function ($3),
+    /// and a statement that names a table only the harness writes ($4) and no other ($5).
     /// </summary>
-    private sealed partial class LeaveOut(Dictionary<int, (string Before, string After)> patterns)
+    private sealed partial class LeaveOut(Dictionary<int, (string Before, string After)> patterns, string comment, string line, string space)
     {
         public static LeaveOut FromCatalog()
         {
@@ -802,12 +1139,29 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             Assert.Contains("q.query_sql_text NOT LIKE '%dbhubdemo:rca-observer%'", text, StringComparison.Ordinal);
             var patterns = ArrayPattern().Matches(text).ToDictionary(m => int.Parse(m.Groups["n"].Value, CultureInfo.InvariantCulture), m => (m.Groups["before"].Value, m.Groups["after"].Value));
             Assert.Equal([3, 4, 5], patterns.Keys.Order());
-            return new LeaveOut(patterns);
+            var rule = TextRule().Match(text);
+            Assert.True(rule.Success, "RCA-PG-14 no longer compares Query Store's text with $7, both normalized alike, in the form this test reads.");
+            return new LeaveOut(patterns, rule.Groups["comment"].Value, rule.Groups["line"].Value, rule.Groups["space"].Value);
         }
 
-        public bool LeftOut(string text, string? searchPath, PgHarness harness)
+        /// <summary>A text as RCA-PG-14 compares it: comments stripped, white space collapsed, a final semicolon dropped.</summary>
+        public string Normalize(string text)
+        {
+            var result = Regex.Replace(text, comment, " ", RegexOptions.Singleline);
+            result = Regex.Replace(result, line, " ");
+            result = Regex.Replace(result, space, " ");
+            return result.Trim(' ', ';');
+        }
+
+        public bool LeftOut(string text, string? searchPath, PgHarness harness, IReadOnlyList<string>? ownStatements = null)
         {
             if ((searchPath ?? string.Empty).Contains("dbhubdemo_rca_observer", StringComparison.Ordinal) || text.Contains("dbhubdemo:rca-observer", StringComparison.Ordinal))
+            {
+                return true;
+            }
+
+            var normalized = Normalize(text);
+            if ((ownStatements ?? PgObserverStatements.All).Any(s => string.Equals(Normalize(s), normalized, StringComparison.Ordinal)))
             {
                 return true;
             }
@@ -821,12 +1175,65 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
         [GeneratedRegex(@"~\* \('(?<before>[^']*)' \|\| array_to_string\(\$(?<n>\d)::text\[\], '\|'\) \|\| '(?<after>[^']*)'\)")]
         private static partial Regex ArrayPattern();
+
+        [GeneratedRegex(@"btrim\(regexp_replace\(regexp_replace\(regexp_replace\(COALESCE\(q\.query_sql_text, ''\), '(?<comment>[^']*)', ' ', 'g'\), '(?<line>[^']*)', ' ', 'g'\), '(?<space>[^']*)', ' ', 'g'\), ' ' \|\| chr\(59\)\)\s*<> ALL \(SELECT btrim\(regexp_replace\(regexp_replace\(regexp_replace\(o\.statement, '\k<comment>', ' ', 'g'\), '\k<line>', ' ', 'g'\), '\k<space>', ' ', 'g'\), ' ' \|\| chr\(59\)\)\s*FROM unnest\(\$7::text\[\]\) AS o\(statement\)\)")]
+        private static partial Regex TextRule();
+    }
+
+    /// <summary>
+    /// RCA-PG-16's derivation, evaluated in .NET from the block's own patterns: a marked function writes a table, an
+    /// unmarked one names it at all, and an unmarked one that runs dynamic SQL or keeps no source makes it unsure.
+    /// </summary>
+    private sealed partial class Derivation(string writePrefix, string writeSuffix, string mentionPrefix, string mentionSuffix, string anything, string dynamic)
+    {
+        public static Derivation FromCatalog()
+        {
+            var block = CaptureCatalog.Get("RCA-PG-16");
+            var write = WriteRule().Match(block);
+            var mention = MentionRule().Match(block);
+            var unsure = UnsureRule().Match(block);
+            Assert.True(write.Success && mention.Success && unsure.Success, "RCA-PG-16 no longer has its three rules in the form this test reads.");
+            Assert.Contains("CASE WHEN t.by_harness AND NOT t.by_other AND NOT t.unsure THEN 'harness_table' ELSE 'table' END", block, StringComparison.Ordinal);
+            Assert.Contains("CASE WHEN u.prosrc !~ '" + unsure.Groups["anything"].Value + "' THEN 'no_source' ELSE 'dynamic_sql' END", block, StringComparison.Ordinal);
+            return new Derivation(write.Groups["prefix"].Value, write.Groups["suffix"].Value, mention.Groups["prefix"].Value, mention.Groups["suffix"].Value, unsure.Groups["anything"].Value, unsure.Groups["dynamic"].Value);
+        }
+
+        /// <summary>What RCA-PG-16 returns for these functions and tables: its harness tables, other tables, and unsure kinds.</summary>
+        public (List<string> HarnessTables, List<string> OtherTables, List<string> Unsure) Derive(IReadOnlyList<(string Name, bool Marked, string Source)> functions, IReadOnlyList<string> tables)
+        {
+            var unsure = functions
+                .Where(f => !f.Marked && (!Regex.IsMatch(f.Source, Pg(anything)) || Regex.IsMatch(f.Source, Pg(dynamic), RegexOptions.IgnoreCase)))
+                .Select(f => Regex.IsMatch(f.Source, Pg(anything)) ? "dynamic_sql" : "no_source")
+                .Distinct(StringComparer.Ordinal)
+                .Order(StringComparer.Ordinal)
+                .ToList();
+            var harness = new List<string>();
+            var other = new List<string>();
+            foreach (var table in tables.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal))
+            {
+                var byHarness = functions.Any(f => f.Marked && Regex.IsMatch(f.Source, Pg(writePrefix + PgHarness.Literal(table) + writeSuffix), RegexOptions.IgnoreCase));
+                var byOther = functions.Any(f => !f.Marked && Regex.IsMatch(f.Source, Pg(mentionPrefix + PgHarness.Literal(table) + mentionSuffix), RegexOptions.IgnoreCase));
+                (byHarness && !byOther && unsure.Count == 0 ? harness : other).Add(table);
+            }
+
+            return (harness, other, unsure);
+        }
+
+        [GeneratedRegex(@"bool_or\(f\.harness AND f\.prosrc ~\* \('(?<prefix>[^']*)' \|\| regexp_replace\(c\.relname, '\\W', '\\\\\\&', 'g'\) \|\| '(?<suffix>[^']*)'\)\)")]
+        private static partial Regex WriteRule();
+
+        [GeneratedRegex(@"bool_or\(NOT f\.harness AND f\.prosrc ~\* \('(?<prefix>[^']*)' \|\| regexp_replace\(c\.relname, '\\W', '\\\\\\&', 'g'\) \|\| '(?<suffix>[^']*)'\)\)")]
+        private static partial Regex MentionRule();
+
+        [GeneratedRegex(@"bool_or\(NOT f\.harness AND \(f\.prosrc !~ '(?<anything>[^']*)' OR f\.prosrc ~\* '(?<dynamic>[^']*)'\)\)")]
+        private static partial Regex UnsureRule();
     }
 
     /// <summary>
     /// T4's Query Store on azure_sys, scripted: RCA-PG-14 and 15 answer from the rows of the intervals published by the
-    /// clock (an interval shows once it ends, here after <see cref="PublishedAfter"/>), within the block's bounds, as the
-    /// blocks' SQL would; the observer's own connection answers RCA-PG-13 and 16.
+    /// clock (an interval's statistics show <see cref="PublishedAfter"/> after it ends, its waits
+    /// <see cref="WaitsPublishedAfter"/> after), within the block's bounds, as the blocks' SQL would: RCA-PG-14's
+    /// wait_samples counts the waits shown, events only. The observer's own connection answers RCA-PG-13 and 16.
     /// </summary>
     private sealed class ScriptedQueryStore
     {
@@ -852,6 +1259,9 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
         public TimeSpan PublishedAfter { get; set; }
 
+        /// <summary>When an interval's waits show; as its statistics when null.</summary>
+        public TimeSpan? WaitsPublishedAfter { get; set; }
+
         public string CaptureMode { get; set; } = "all";
 
         public bool HarnessFails { get; set; }
@@ -868,21 +1278,32 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         /// <summary>Answers by the simulation's clock instead of <see cref="Clock"/>.</summary>
         public void Follow(ManualTime time) => following = time;
 
+        private static CaptureValues With(CaptureValues row, string column, object? value)
+        {
+            var values = row.Raw.ToDictionary(v => v.Key, v => v.Value, StringComparer.OrdinalIgnoreCase);
+            values[column] = value;
+            return new CaptureValues(values);
+        }
+
+        private static bool Same(CaptureValues a, CaptureValues b) =>
+            a.Time("interval_start_utc") == b.Time("interval_start_utc") && a.Long("query_id") == b.Long("query_id") && string.Equals(a.Text("login_name"), b.Text("login_name"), StringComparison.Ordinal);
+
         private List<CaptureValues> Answer(string block, CaptureParameters parameters)
         {
             var since = (DateTimeOffset)parameters[1].Value!;
             var until = (DateTimeOffset)parameters[block == "RCA-PG-14" ? 5 : 3].Value!;
             var now = Clock;
-            bool Shown(CaptureValues row) => row.Time("interval_end_utc") > since && row.Time("interval_start_utc") < until && now >= row.Time("interval_end_utc") + PublishedAfter;
+            bool Shown(CaptureValues row, TimeSpan after) => row.Time("interval_end_utc") > since && row.Time("interval_start_utc") < until && now >= row.Time("interval_end_utc") + after;
+            var shownWaits = waits.Where(w => Shown(w, WaitsPublishedAfter ?? PublishedAfter)).ToList();
             var rows = block switch
             {
-                "RCA-PG-14" => statistics.Where(Shown),
-                "RCA-PG-15" => waits.Where(w => Shown(w) && ((long[])parameters[2].Value!).Contains(w.Long("query_id")!.Value)),
+                "RCA-PG-14" => statistics.Where(s => Shown(s, PublishedAfter)).Select(s => With(s, "wait_samples", shownWaits.Where(w => Same(w, s) && w.Text("wait_category") is not null).Sum(w => w.Long("samples") ?? 0))),
+                "RCA-PG-15" => shownWaits.Where(w => ((long[])parameters[2].Value!).Contains(w.Long("query_id")!.Value)),
                 _ => Enumerable.Empty<CaptureValues>(),
             };
 
             // captured_at is clock_timestamp() at the read.
-            return [.. rows.Select(r => new CaptureValues(r.Raw.ToDictionary(v => v.Key, v => v.Key == "captured_at" ? now.UtcDateTime : v.Value, StringComparer.OrdinalIgnoreCase)))];
+            return [.. rows.Select(r => With(r, "captured_at", now.UtcDateTime))];
         }
     }
 
@@ -913,6 +1334,195 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     private sealed class FailingSidecar : ISidecarSink
     {
         public void Write(CaptureRow row) => throw new IOException("There is not enough space on the disk.");
+    }
+
+    /// <summary>A connector whose one block takes longer than a slow sample, in real time; every other block answers at once.</summary>
+    private sealed class SlowBlockConnector(ICaptureConnector inner, string block, TimeSpan delay) : ICaptureConnector
+    {
+        private int slow;
+
+        /// <summary>How many times the slow block ran.</summary>
+        public int Slow => Volatile.Read(ref slow);
+
+        public string Description => inner.Description;
+
+        public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken) => new Connection(this, await inner.OpenAsync(cancellationToken));
+
+        private sealed class Connection(SlowBlockConnector owner, ICaptureConnection connection) : ICaptureConnection
+        {
+            public async Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken)
+            {
+                if (string.Equals(blockId, owner.Block, StringComparison.Ordinal))
+                {
+                    Interlocked.Increment(ref owner.slow);
+                    await Task.Delay(owner.Delay, cancellationToken);
+                }
+
+                return await connection.QueryAsync(blockId, text, parameter, timeout, cancellationToken);
+            }
+
+            public ValueTask DisposeAsync() => connection.DisposeAsync();
+        }
+
+        private string Block { get; } = block;
+
+        private TimeSpan Delay { get; } = delay;
+    }
+
+    /// <summary>The local test sign-in's variables, for one test, when they aren't set already; the listener asks for no password.</summary>
+    private sealed class TestCredentials : IDisposable
+    {
+        private readonly bool user = Environment.GetEnvironmentVariable(Postgres.PgEndpoint.UserVariable) is null;
+        private readonly bool password = Environment.GetEnvironmentVariable(Postgres.PgEndpoint.PasswordVariable) is null;
+
+        public TestCredentials()
+        {
+            if (user)
+            {
+                Environment.SetEnvironmentVariable(Postgres.PgEndpoint.UserVariable, "rca_observer_test");
+            }
+
+            if (password)
+            {
+                Environment.SetEnvironmentVariable(Postgres.PgEndpoint.PasswordVariable, FakeSecret(24));
+            }
+        }
+
+        public void Dispose()
+        {
+            if (user)
+            {
+                Environment.SetEnvironmentVariable(Postgres.PgEndpoint.UserVariable, null);
+            }
+
+            if (password)
+            {
+                Environment.SetEnvironmentVariable(Postgres.PgEndpoint.PasswordVariable, null);
+            }
+        }
+    }
+
+    /// <summary>
+    /// A PostgreSQL server that only listens (protocol 3: https://www.postgresql.org/docs/18/protocol-flow.html). It refuses
+    /// TLS and GSS encryption, lets the client in without a password, records the startup packet's parameters and every
+    /// query the client sends, and closes the connection once the client has been quiet for half a second, so the client's
+    /// open fails before it reaches any database.
+    /// </summary>
+    private sealed class ListeningPostgres : IDisposable
+    {
+        private static readonly (string Name, string Value)[] ServerParameters =
+        [
+            ("server_version", "18.1"), ("server_encoding", "UTF8"), ("client_encoding", "UTF8"), ("DateStyle", "ISO, MDY"),
+            ("IntervalStyle", "postgres"), ("integer_datetimes", "on"), ("standard_conforming_strings", "on"), ("TimeZone", "UTC"),
+        ];
+
+        private readonly TcpListener listener = new(IPAddress.Loopback, 0);
+
+        public ListeningPostgres() => listener.Start();
+
+        public int Port => ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        public void Dispose() => listener.Dispose();
+
+        public async Task<(Dictionary<string, string> Startup, List<string> Queries)> AcceptAsync(CancellationToken cancellationToken)
+        {
+            using var client = await listener.AcceptTcpClientAsync(cancellationToken);
+            await using var stream = client.GetStream();
+            var startup = new Dictionary<string, string>(StringComparer.Ordinal);
+            while (true)
+            {
+                var header = await ReadAsync(stream, 8, cancellationToken);
+                var length = BinaryPrimitives.ReadInt32BigEndian(header);
+                var code = BinaryPrimitives.ReadInt32BigEndian(header.AsSpan(4));
+                if (code is 80877103 or 80877104)
+                {
+                    // SSLRequest or GSSENCRequest: neither is offered.
+                    await stream.WriteAsync("N"u8.ToArray(), cancellationToken);
+                    continue;
+                }
+
+                var fields = System.Text.Encoding.UTF8.GetString(await ReadAsync(stream, length - 8, cancellationToken)).Split('\0');
+                for (var i = 0; i + 1 < fields.Length && fields[i].Length > 0; i += 2)
+                {
+                    startup[fields[i]] = fields[i + 1];
+                }
+
+                break;
+            }
+
+            await stream.WriteAsync(Message('R', Int32(0)), cancellationToken);
+            foreach (var (name, value) in ServerParameters)
+            {
+                await stream.WriteAsync(Message('S', [.. CString(name), .. CString(value)]), cancellationToken);
+            }
+
+            await stream.WriteAsync(Message('K', [.. Int32(4242), .. Int32(7)]), cancellationToken);
+            await stream.WriteAsync(Message('Z', "I"u8.ToArray()), cancellationToken);
+
+            var queries = new List<string>();
+            while (true)
+            {
+                byte[] head;
+                using (var quiet = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+                {
+                    quiet.CancelAfter(TimeSpan.FromMilliseconds(500));
+                    try
+                    {
+                        head = await ReadAsync(stream, 5, quiet.Token);
+                    }
+                    catch (Exception ex) when (ex is OperationCanceledException or EndOfStreamException or IOException)
+                    {
+                        break;
+                    }
+                }
+
+                var payload = await ReadAsync(stream, BinaryPrimitives.ReadInt32BigEndian(head.AsSpan(1)) - 4, cancellationToken);
+                switch ((char)head[0])
+                {
+                    case 'Q':
+                        queries.Add(CStringAt(payload, 0));
+                        break;
+                    case 'P':
+                        queries.Add(CStringAt(payload, Array.IndexOf(payload, (byte)0) + 1));
+                        break;
+                    case 'X':
+                        return (startup, queries);
+                }
+            }
+
+            return (startup, queries);
+        }
+
+        private static async Task<byte[]> ReadAsync(NetworkStream stream, int count, CancellationToken cancellationToken)
+        {
+            var buffer = new byte[count];
+            await stream.ReadExactlyAsync(buffer, cancellationToken);
+            return buffer;
+        }
+
+        private static byte[] Message(char type, byte[] payload)
+        {
+            var message = new byte[payload.Length + 5];
+            message[0] = (byte)type;
+            BinaryPrimitives.WriteInt32BigEndian(message.AsSpan(1), payload.Length + 4);
+            payload.CopyTo(message, 5);
+            return message;
+        }
+
+        private static byte[] Int32(int value)
+        {
+            var bytes = new byte[4];
+            BinaryPrimitives.WriteInt32BigEndian(bytes, value);
+            return bytes;
+        }
+
+        private static byte[] CString(string text) => [.. System.Text.Encoding.UTF8.GetBytes(text), 0];
+
+        private static string CStringAt(byte[] payload, int start)
+        {
+            var end = Array.IndexOf(payload, (byte)0, start);
+            return System.Text.Encoding.UTF8.GetString(payload, start, (end < 0 ? payload.Length : end) - start);
+        }
     }
 
     /// <summary>The span store's side of a backfill: a sink per span that the test adds.</summary>
