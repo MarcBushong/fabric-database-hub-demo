@@ -6,18 +6,21 @@ using ContosoCare.Workload.Rca.Observer;
 namespace ContosoCare.Workload.Rca.Sidecar;
 
 /// <summary>
-/// The sidecar's reducer (rca/README.md, Limits): encodes a draft as a sidecar and fits it to the smaller of a
-/// document's 64 KiB of gzip and what's left of its host's session budget. Over that, it cuts in the contract's order,
-/// each kind of cut only as far as the document needs:
+/// The sidecar's reducer (rca/README.md, Limits, A sidecar's cuts): encodes a draft as a sidecar and fits it to the
+/// smaller of a document's 64 KiB of gzip and what's left of its host's session budget, never less than 2 KiB. Over that,
+/// it cuts in the contract's order, each step only as far as the document needs:
 /// <list type="number">
-/// <item>waits past each plan's first three, by time waited;</item>
-/// <item>plan summaries, set to null, the lowest-ranked queries' plans first;</item>
+/// <item>waits: each plan's wait categories past its three largest (on T4, its events), by time waited summed across the
+/// sidecar's intervals, every interval's rows of those three kept;</item>
+/// <item>plan summaries, set to null plan by plan, the lowest-ranked queries' plans first; a forced plan, or one an event
+/// names, keeps its summary until every other plan's is cut;</item>
 /// <item>the lowest-ranked queries: all of a query's rows in its interval, and its plans' rows once it has none left,
-/// unless a plan is forced or an event names it.</item>
+/// unless a plan is forced or an event names it;</item>
+/// <item>connection samples, each target's thinned, its first, peak, and last kept;</item>
+/// <item>everything but the coverage.</item>
 /// </list>
-/// Past those, only so that a sidecar always fits: the connection samples thinned, keeping each target's first, peak,
-/// and last, and then everything but the coverage. It never cuts coverage: each cut is a line in its target's
-/// rca_query_coverage gaps (<see cref="GapPrefix"/>) and in <see cref="ReducedSidecar.Cuts"/>.
+/// It never cuts coverage: each cut is a line in its target's rca_query_coverage gaps (<see cref="GapPrefix"/>) and in
+/// <see cref="ReducedSidecar.Cuts"/>.
 /// <para>
 /// A query's rank in its interval is its best place in the top lists the reads rank by (rca/README.md, Query Store),
 /// from the latest read of each plan: CPU, duration, logical reads, and waits on SQL Server; total time, blocks, and
@@ -229,20 +232,26 @@ internal sealed class SidecarReducer : ISidecarReducer
         return builder.Length == 0 ? tail : builder.Append('\n').Append(tail).ToString();
     }
 
-    /// <summary>1. Waits past each plan's first three, by time waited: per target, login, query, and plan, across the sidecar's intervals.</summary>
+    /// <summary>
+    /// 1. Each plan's wait categories past its three largest (on T4, its wait events), by time waited summed across the
+    /// sidecar's rows, per target, login, query, and plan. Every interval's rows of those three stay, so a plan's baseline
+    /// intervals keep the waits the rules compare against; ties go to the category that sorts first.
+    /// </summary>
     private static Step WaitsPastTheFirstThree(Dictionary<string, List<CaptureRow>> tables)
     {
         var waits = Rows(tables, RcaContract.QueryWaits);
         var drop = new HashSet<int>();
         foreach (var plan in waits.Select((Row, Index) => (Row, Index)).GroupBy(w => (Target: TargetOf(w.Row), Login: Login(w.Row), Query: Id(w.Row, "query_id"), Plan: Id(w.Row, "plan_id"))))
         {
-            drop.UnionWith(plan
-                .OrderByDescending(w => Number(w.Row, "wait_ms"))
-                .ThenBy(w => Time(w.Row, "interval_start_utc"))
-                .ThenBy(w => w.Row.At)
-                .ThenBy(w => w.Index)
-                .Skip(KeptWaits)
-                .Select(w => w.Index));
+            var largest = plan.GroupBy(w => WaitKey(w.Row))
+                .Select(c => (c.Key, Waited: c.Sum(w => Number(w.Row, "wait_ms"))))
+                .OrderByDescending(c => c.Waited)
+                .ThenBy(c => c.Key.Category, StringComparer.Ordinal)
+                .ThenBy(c => c.Key.Event, StringComparer.Ordinal)
+                .Take(KeptWaits)
+                .Select(c => c.Key)
+                .ToHashSet();
+            drop.UnionWith(plan.Where(w => !largest.Contains(WaitKey(w.Row))).Select(w => w.Index));
         }
 
         if (drop.Count == 0)
@@ -260,20 +269,26 @@ internal sealed class SidecarReducer : ISidecarReducer
                 .GroupBy(w => w.Target, StringComparer.Ordinal)
                 .Where(g => g.Any(w => w.Dropped))
                 .OrderBy(g => g.Key, StringComparer.Ordinal)
-                .Select(g => new Cut(g.Key, GapPrefix + string.Create(CultureInfo.InvariantCulture, $"waits past each plan's first three, by time waited, left out: {g.Count(w => w.Dropped)} of {g.Count()} RCA Query Waits rows.")))
+                .Select(g => new Cut(g.Key, GapPrefix + string.Create(CultureInfo.InvariantCulture, $"wait {(IsPostgres(g.Key) ? "events" : "categories")} past each plan's three largest, by time waited across the sidecar's intervals, left out: {g.Count(w => w.Dropped)} of {g.Count()} RCA Query Waits rows.")))
                 .ToList();
             return (result, cuts);
         });
     }
 
-    /// <summary>2. Plan summaries set to null, plan by plan: the lowest-ranked queries' plans first, and within a query, its lowest-ranked plans.</summary>
+    /// <summary>
+    /// 2. Plan summaries set to null, plan by plan: the lowest-ranked queries' plans first, and within a query its
+    /// lowest-ranked plans. A forced plan, or a plan an event names, keeps its summary until every other plan's is cut.
+    /// </summary>
     private static Step PlanSummaries(Dictionary<string, List<CaptureRow>> tables, Ranking ranking)
     {
         var plans = Rows(tables, RcaContract.QueryPlans);
+        var events = Rows(tables, RcaContract.QueryEvents);
+        var kept = plans.Where(p => IsKept(p, events)).Select(PlanKey).ToHashSet();
         var order = plans.Where(p => p.Get("plan_summary") is not null)
             .Select(PlanKey)
             .Distinct()
-            .OrderByDescending(k => ranking.Queries.GetValueOrDefault((k.Target, k.Query), int.MaxValue))
+            .OrderBy(kept.Contains)
+            .ThenByDescending(k => ranking.Queries.GetValueOrDefault((k.Target, k.Query), int.MaxValue))
             .ThenByDescending(k => ranking.Plans.TryGetValue(k, out var standing) ? standing.Rank : int.MaxValue)
             .ThenBy(k => ranking.Plans.TryGetValue(k, out var standing) ? standing.Metric : 0)
             .ThenBy(k => k.Target, StringComparer.Ordinal)
@@ -321,6 +336,7 @@ internal sealed class SidecarReducer : ISidecarReducer
         var plans = Rows(tables, RcaContract.QueryPlans);
         var events = Rows(tables, RcaContract.QueryEvents);
         var queried = stats.Select(r => (TargetOf(r), Id(r, "query_id"))).ToHashSet();
+        var kept = plans.Where(p => IsKept(p, events)).Select(PlanKey).ToHashSet();
         return new Step(ranking.Units.Count, units =>
         {
             var cut = ranking.Units.Take(units).ToHashSet();
@@ -330,7 +346,7 @@ internal sealed class SidecarReducer : ISidecarReducer
             var plansKept = plans.Where(p =>
             {
                 var query = (TargetOf(p), Id(p, "query_id"));
-                return !queried.Contains(query) || left.Contains(query) || p.Get("is_forced_plan") is true || events.Any(e => NamesPlan(e, p));
+                return !queried.Contains(query) || left.Contains(query) || kept.Contains(PlanKey(p));
             }).ToList();
             var result = new Dictionary<string, List<CaptureRow>>(tables, StringComparer.Ordinal)
             {
@@ -352,12 +368,17 @@ internal sealed class SidecarReducer : ISidecarReducer
 
             return (result, cuts);
         });
-
-        static bool NamesPlan(CaptureRow queryEvent, CaptureRow plan) =>
-            TargetOf(queryEvent) == TargetOf(plan)
-            && queryEvent.Get("query_id") is long query && query == Id(plan, "query_id")
-            && (queryEvent.Get("plan_id") is not long id || id == Id(plan, "plan_id"));
     }
+
+    /// <summary>A plan the second and third cuts keep longest: one forced in any of its rows, or one an event names.</summary>
+    private static bool IsKept(CaptureRow plan, List<CaptureRow> events) =>
+        plan.Get("is_forced_plan") is true || events.Any(e => NamesPlan(e, plan));
+
+    /// <summary>An event names a plan: the same target and query, and the plan's ID or none.</summary>
+    private static bool NamesPlan(CaptureRow queryEvent, CaptureRow plan) =>
+        TargetOf(queryEvent) == TargetOf(plan)
+        && queryEvent.Get("query_id") is long query && query == Id(plan, "query_id")
+        && (queryEvent.Get("plan_id") is not long id || id == Id(plan, "plan_id"));
 
     /// <summary>Past the contract's cuts: each target's connection samples halved, its first, peak, and last always kept.</summary>
     private static Step ThinConnections(Dictionary<string, List<CaptureRow>> tables)
@@ -453,6 +474,10 @@ internal sealed class SidecarReducer : ISidecarReducer
     private static bool IsPostgres(string target) => target.StartsWith("T4", StringComparison.Ordinal);
 
     private static (string Target, long Query, long Plan) PlanKey(CaptureRow row) => (TargetOf(row), Id(row, "query_id"), Id(row, "plan_id"));
+
+    /// <summary>A wait row's category for the first cut: on T4 its event type and event, elsewhere its category.</summary>
+    private static (string? Category, string? Event) WaitKey(CaptureRow row) =>
+        (row.Get("wait_category") as string, IsPostgres(TargetOf(row)) ? row.Get("wait_event") as string : null);
 
     private static QueryUnit Unit(CaptureRow row) => new(TargetOf(row), Time(row, "interval_start_utc"), Time(row, "interval_end_utc"), Id(row, "query_id"));
 

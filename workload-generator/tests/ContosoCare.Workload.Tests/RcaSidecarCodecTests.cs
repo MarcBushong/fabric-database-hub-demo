@@ -35,8 +35,6 @@ public sealed class RcaSidecarCodecTests
 
     private static readonly string[] Fixtures = ["t3-plan-regression", "t4-query-store", "t4-connection-surge"];
 
-    private static readonly string[] HeaderTimes = ["exportedUtc", "windowStartUtc", "windowEndUtc", "epochUtc"];
-
     private static readonly string[] IndexProperties = ["kind", "version", "page", "pages", "documents", "status"];
 
     private static readonly string[] WaitCategories = ["CPU", "Buffer IO", "Parallelism", "Lock", "Network IO", "Memory"];
@@ -54,8 +52,6 @@ public sealed class RcaSidecarCodecTests
     private static readonly Lazy<Regex> SidecarPartLine = new(() => new Regex(TransportPattern("sidecarPartLine"), RegexOptions.CultureInvariant));
 
     private static readonly Lazy<Regex> EvidencePartLine = new(() => new Regex(RcaSchemas.PartLinePattern(), RegexOptions.CultureInvariant));
-
-    private static readonly Regex MillisecondUtc = new(@"\A[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z\z", RegexOptions.CultureInvariant);
 
     /// <summary>Base64's alphabet at random: text that gzip barely shrinks, to size a sidecar to the byte.</summary>
     private static readonly Lazy<string> PaddingText = new(() =>
@@ -81,11 +77,11 @@ public sealed class RcaSidecarCodecTests
         AssertSameDocument(expected, json);
         Assert.Empty(RcaSchemas.Errors(SidecarSchema, Encoding.UTF8.GetString(json)));
 
-        // The fixture's part lines carry the same document as the runner's. Their bytes differ: the fixtures' generator
-        // wrote doubles with ".0" and the window's times as it was given them, and gzipped at the default level.
+        // The fixture's part lines carry the same document as the runner's. Their bytes are illustrative (rca/fixtures):
+        // the fixtures' generator wrote doubles with ".0" and gzipped at the default level.
         var fixtureLines = File.ReadAllLines(FixturePath(fixture, ".sidecar-parts.txt")).Where(l => l.Length > 0).ToList();
         AssertPartLines(draft.DocumentId, fixtureLines);
-        AssertSameDocument(expected, PartCodec.Gunzip(Decode(fixtureLines)), byTheRunner: false);
+        AssertSameDocument(expected, PartCodec.Gunzip(Decode(fixtureLines)));
         var gzip = PartCodec.Gzip(json);
         var lines = SidecarParts.Lines(draft.DocumentId, gzip);
         AssertPartLines(draft.DocumentId, lines);
@@ -142,18 +138,22 @@ public sealed class RcaSidecarCodecTests
 
         Assert.InRange(cut.Gzip.Length, 1, 65_536);
         Assert.InRange(cut.Parts, 1, 28);
-        Assert.StartsWith("waits past each plan's first three", Assert.Single(CutLines(cut)), StringComparison.Ordinal);
+        Assert.StartsWith("wait categories past each plan's three largest", Assert.Single(CutLines(cut)), StringComparison.Ordinal);
         var view = new SidecarView(cut.Json);
         AssertCutsAreGaps(cut, view);
         Assert.Empty(RcaSchemas.Errors(SidecarSchema, Encoding.UTF8.GetString(cut.Json)));
 
-        // Only waits went: each plan keeps its three largest, and every statistic and plan summary stays.
+        // Only waits went: each plan keeps three of its wait categories, with every interval's rows of each, and every
+        // statistic and plan summary stays.
         var kept = view.Table(RcaContract.QueryWaits);
-        foreach (var plan in over.Tables[RcaContract.QueryWaits].GroupBy(w => (Query: (long)w.Get("query_id")!, Plan: (long)w.Get("plan_id")!)))
+        Assert.InRange(kept.Count, 1, over.Tables[RcaContract.QueryWaits].Count - 1);
+        foreach (var plan in kept.GroupBy(w => ((long)w["query_id"]!, (long)w["plan_id"]!)))
         {
-            Assert.Equal(
-                plan.Select(w => (double)w.Get("wait_ms")!).OrderDescending().Take(3).Order(),
-                kept.Where(w => (long)w["query_id"]! == plan.Key.Query && (long)w["plan_id"]! == plan.Key.Plan).Select(w => (double)w["wait_ms"]!).Order());
+            var categories = plan.GroupBy(w => (string)w["wait_category"]!).ToList();
+            Assert.InRange(categories.Count, 1, 3);
+            Assert.All(categories, c => Assert.Equal(
+                over.Tables[RcaContract.QueryWaits].Count(w => ((long)w.Get("query_id")!, (long)w.Get("plan_id")!) == plan.Key && (string)w.Get("wait_category")! == c.Key),
+                c.Count()));
         }
 
         Assert.Equal(over.Tables[RcaContract.QueryStats].Count, view.Table(RcaContract.QueryStats).Count);
@@ -161,28 +161,95 @@ public sealed class RcaSidecarCodecTests
     }
 
     [Fact]
+    public void TheFirstCutKeepsEachPlansThreeLargestWaitCategoriesInEveryInterval()
+    {
+        // T3's plan waits on CPU most, across 40 intervals; Buffer IO, Lock, and Parallelism tie for the other two places,
+        // which go to the categories that sort first; Network IO's one spike is the largest row, but not a largest
+        // category. T4's waits are its events: two of Lock's, LWLock's, and IO's, whose events count apart.
+        var t3 = new List<(string Category, string? Event, Func<int, double> Waited)>
+        {
+            ("CPU", null, i => 100 + i), ("Buffer IO", null, _ => 50), ("Lock", null, _ => 50), ("Parallelism", null, _ => 50),
+            ("Network IO", null, i => i == 7 ? 1_400 : 0),
+        };
+        var t4 = new List<(string Category, string? Event, Func<int, double> Waited)>
+        {
+            ("Lock", "transactionid", _ => 40), ("Lock", "tuple", _ => 30), ("LWLock", "LockManager", _ => 20), ("IO", "WALSync", _ => 10),
+        };
+        var draft = Waiting(40, ("T3", t3), ("T4", t4));
+
+        var reduced = new SidecarReducer().Reduce(draft, Gzip(draft).Length - 1);
+
+        Assert.Collection(
+            reduced.Cuts,
+            cut => Assert.StartsWith("T3: " + SidecarReducer.GapPrefix + "wait categories past each plan's three largest", cut, StringComparison.Ordinal),
+            cut => Assert.StartsWith("T4: " + SidecarReducer.GapPrefix + "wait events past each plan's three largest", cut, StringComparison.Ordinal));
+        var waits = new SidecarView(reduced.Json).Table(RcaContract.QueryWaits);
+        Assert.Equal(
+            ["T3 Buffer IO  40", "T3 CPU  40", "T3 Lock  40", "T4 LWLock LockManager 40", "T4 Lock transactionid 40", "T4 Lock tuple 40"],
+            waits.GroupBy(w => $"{w["target"]} {w["wait_category"]} {w.GetValueOrDefault("wait_event")}").Select(g => g.Key + " " + g.Count().ToString(CultureInfo.InvariantCulture)).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
+    public void AForcedPlanThatEventsNameKeepsItsSummaryLongest()
+    {
+        // T3's fixture: plan 31 is the last good plan, forced, and every tuning event names it. At every budget, from one
+        // byte under the whole to the floor, it never loses its summary while another plan keeps its own, and at some
+        // budget it keeps its summary after the regressed plan 58 has lost its own.
+        var draft = FixtureDraft("t3-plan-regression");
+        var reducer = new SidecarReducer();
+        var outlived = false;
+        for (var budget = Gzip(draft).Length - 1; budget >= SidecarBudget.MinimumDocumentBytes; budget -= 4)
+        {
+            var plans = new SidecarView(reducer.Reduce(draft, budget).Json).Table(RcaContract.QueryPlans);
+            var forced = plans.Where(p => (long)p["plan_id"]! == 31).Select(p => p.GetValueOrDefault("plan_summary")).ToList();
+            var others = plans.Where(p => (long)p["plan_id"]! != 31).ToList();
+            if (forced.Any(s => s is null))
+            {
+                Assert.All(others, p => Assert.Null(p.GetValueOrDefault("plan_summary")));
+            }
+
+            outlived |= forced.All(s => s is not null) && others.Any(p => (long)p["plan_id"]! == 58 && p.GetValueOrDefault("plan_summary") is null);
+        }
+
+        Assert.True(outlived, "No budget left plan 31's summary after plan 58's was cut.");
+    }
+
+    [Fact]
     public void TheReducerCutsInTheContractsOrderAndEachOnlyAsFarAsItMust()
     {
         var reducer = new SidecarReducer();
         var draft = Generated(Intervals, 12, Plans);
+
+        // The lowest-ranked query, 11, has a forced plan, and a plan an event names: their summaries go last.
+        draft.Tables[RcaContract.QueryPlans].Single(p => (long)p.Get("plan_id")! == 10_111L).Set("is_forced_plan", true).Set("forcing_type", "AUTO");
+        draft.Tables[RcaContract.QueryEvents].Add(Row(RcaContract.QueryEvents, Window.AddMinutes(20))
+            .Set("event_time_utc", Window.AddMinutes(20))
+            .Set("kind", "tuning")
+            .Set("query_id", 1011L)
+            .Set("plan_id", 10_110L)
+            .Set("state", "Active")
+            .Set("detail", "FORCE_LAST_GOOD_PLAN for query 1011: plan 10110."));
+        static bool Kept(Dictionary<string, object?> plan) => QueryIndex(plan) == 11;
         var whole = Gzip(draft).Length;
         var statistics = draft.Tables[RcaContract.QueryStats].Count;
         Assert.InRange(whole, 8 * 1024, SidecarBudget.DocumentBytes);
 
-        // 1. A byte less than the whole: the waits past each plan's first three, and nothing else.
+        // 1. A byte less than the whole: each plan's wait categories past its three largest, and nothing else.
         var waits = reducer.Reduce(draft, whole - 1);
-        Assert.StartsWith("waits past each plan's first three", Assert.Single(CutLines(waits)), StringComparison.Ordinal);
+        Assert.StartsWith("wait categories past each plan's three largest", Assert.Single(CutLines(waits)), StringComparison.Ordinal);
 
-        // 2. A byte less than that: plan summaries too, the lowest-ranked queries' first, and still every statistic.
+        // 2. A byte less than that: plan summaries too, the lowest-ranked queries' first, except the forced and the
+        // named plans, and still every statistic.
         var summaries = reducer.Reduce(draft, waits.Gzip.Length - 1);
         Assert.Collection(
             CutLines(summaries),
-            line => Assert.StartsWith("waits past each plan's first three", line, StringComparison.Ordinal),
+            line => Assert.StartsWith("wait categories past each plan's three largest", line, StringComparison.Ordinal),
             line => Assert.StartsWith("plan summaries left out for ", line, StringComparison.Ordinal));
         var summarized = new SidecarView(summaries.Json);
         var plans = summarized.Table(RcaContract.QueryPlans);
-        var nulled = plans.Where(p => p["plan_summary"] is null).Select(QueryIndex).ToList();
-        var described = plans.Where(p => p["plan_summary"] is not null).Select(QueryIndex).ToList();
+        Assert.All(plans.Where(Kept), p => Assert.NotNull(p["plan_summary"]));
+        var nulled = plans.Where(p => !Kept(p) && p["plan_summary"] is null).Select(QueryIndex).ToList();
+        var described = plans.Where(p => !Kept(p) && p["plan_summary"] is not null).Select(QueryIndex).ToList();
         Assert.NotEmpty(nulled);
         Assert.NotEmpty(described);
         Assert.True(nulled.Min() >= described.Max(), "A higher-ranked query's plan lost its summary before a lower-ranked query's.");
@@ -194,7 +261,7 @@ public sealed class RcaSidecarCodecTests
         Assert.InRange(queries.Gzip.Length, 1, budget);
         Assert.Collection(
             CutLines(queries),
-            line => Assert.StartsWith("waits past each plan's first three", line, StringComparison.Ordinal),
+            line => Assert.StartsWith("wait categories past each plan's three largest", line, StringComparison.Ordinal),
             line => Assert.StartsWith("every plan summary left out", line, StringComparison.Ordinal),
             line => Assert.StartsWith("the lowest-ranked queries left out", line, StringComparison.Ordinal));
         var view = new SidecarView(queries.Json);
@@ -207,10 +274,13 @@ public sealed class RcaSidecarCodecTests
             Assert.Equal(Enumerable.Range(0, left.Count), left);
         }
 
-        // A query's waits go with its interval's statistics, and its plans with its last interval.
+        // A query's waits go with its interval's statistics, and its plans with its last interval, except a forced plan and a
+        // plan an event names.
         var queried = stats.Select(s => ((DateTimeOffset)s["interval_start_utc"]!, QueryIndex(s))).ToHashSet();
         Assert.All(view.Table(RcaContract.QueryWaits), w => Assert.Contains(((DateTimeOffset)w["interval_start_utc"]!, QueryIndex(w)), queried));
-        Assert.All(view.Table(RcaContract.QueryPlans), p => Assert.Contains(QueryIndex(p), stats.Select(QueryIndex)));
+        Assert.DoesNotContain(11, stats.Select(QueryIndex));
+        Assert.Equal([10_110L, 10_111L], view.Table(RcaContract.QueryPlans).Where(Kept).Select(p => (long)p["plan_id"]!).Order());
+        Assert.All(view.Table(RcaContract.QueryPlans).Where(p => !Kept(p)), p => Assert.Contains(QueryIndex(p), stats.Select(QueryIndex)));
         foreach (var reduced in new[] { waits, summaries, queries })
         {
             AssertCutsAreGaps(reduced, new SidecarView(reduced.Json));
@@ -238,7 +308,7 @@ public sealed class RcaSidecarCodecTests
 
             // A byte over it: cut, in the contract's order, to what's left.
             var over = reducer.Reduce(draft, budget - used - 1);
-            Assert.StartsWith("waits past each plan's first three", CutLines(over)[0], StringComparison.Ordinal);
+            Assert.StartsWith("wait categories past each plan's three largest", CutLines(over)[0], StringComparison.Ordinal);
             Assert.InRange(over.Gzip.Length, 1, size - 1);
             AssertCutsAreGaps(over, new SidecarView(over.Json));
         }
@@ -391,28 +461,11 @@ public sealed class RcaSidecarCodecTests
 
     private static int QueryIndex(Dictionary<string, object?> row) => (int)((long)row["query_id"]! - 1000);
 
-    /// <summary>
-    /// The document equals the fixture: every field, table, and string the same, and the header's times the same
-    /// instants. The runner writes those with milliseconds, as the evidence document's (rca/README.md); the fixtures'
-    /// generator wrote the window's as it was given them.
-    /// </summary>
-    private static void AssertSameDocument(JsonNode expected, byte[] json, bool byTheRunner = true)
+    /// <summary>The document equals the fixture: every field, table, string, and header time the same.</summary>
+    private static void AssertSameDocument(JsonNode expected, byte[] json)
     {
-        var want = expected.DeepClone().AsObject();
-        var got = JsonNode.Parse(json)!.AsObject();
-        foreach (var time in HeaderTimes)
-        {
-            Assert.Equal(Utc(want[time]), Utc(got[time]));
-            if (byTheRunner)
-            {
-                Assert.Matches(MillisecondUtc, got[time]!.GetValue<string>());
-            }
-
-            want.Remove(time);
-            got.Remove(time);
-        }
-
-        Assert.True(JsonNode.DeepEquals(want, got), $"Expected {want.ToJsonString()}{Environment.NewLine}Actual {got.ToJsonString()}");
+        var actual = JsonNode.Parse(json)!;
+        Assert.True(JsonNode.DeepEquals(expected, actual), $"Expected {expected.ToJsonString()}{Environment.NewLine}Actual {actual.ToJsonString()}");
     }
 
     /// <summary>Each line is a sidecar's part line of one document, never an evidence document's: within 3,400 ASCII characters.</summary>
@@ -583,13 +636,15 @@ public sealed class RcaSidecarCodecTests
                         .Set("last_execution_utc", to.AddMilliseconds(-random.Next(1, 60_000))));
                     for (var w = 0; w < 3; w++)
                     {
+                        // Three categories an interval, turning over from one interval to the next: across the sidecar, a
+                        // plan waits in more than three.
                         waits.Add(Row(RcaContract.QueryWaits, read)
                             .Set("captured_at_utc", read)
                             .Set("interval_start_utc", from)
                             .Set("interval_end_utc", to)
                             .Set("query_id", 1000L + q)
                             .Set("plan_id", (10L * (1000 + q)) + p)
-                            .Set("wait_category", WaitCategories[(q + p + w) % WaitCategories.Length])
+                            .Set("wait_category", WaitCategories[(q + p + w + i) % WaitCategories.Length])
                             .Set("wait_ms", Math.Round(random.NextDouble() * 10_000, 3))
                             .Set("max_wait_ms", Math.Round(random.NextDouble() * 100, 3)));
                     }
@@ -700,6 +755,53 @@ public sealed class RcaSidecarCodecTests
     });
 
     private static CaptureRow Row(string table, DateTimeOffset at) => new CaptureRow(table, Target, at, "test").Set("target", Target);
+
+    /// <summary>
+    /// A sidecar of one plan's waits on each target, an interval at a time, with each target's coverage: a category
+    /// (on T4, an event) has a row in each interval it waited in.
+    /// </summary>
+    private static SidecarDraft Waiting(int intervals, params (string Target, List<(string Category, string? Event, Func<int, double> Waited)> Waits)[] plans)
+    {
+        var random = new Random(5);
+        var waits = new List<CaptureRow>();
+        var coverage = new List<CaptureRow>();
+        foreach (var (target, categories) in plans)
+        {
+            for (var i = 0; i < intervals; i++)
+            {
+                var from = Window.AddMinutes(15 * i);
+                foreach (var (category, waitEvent, waited) in categories.Where(c => c.Waited(i) > 0))
+                {
+                    waits.Add(new CaptureRow(RcaContract.QueryWaits, target, from.AddMinutes(17), "test")
+                        .Set("captured_at_utc", from.AddMinutes(17))
+                        .Set("target", target)
+                        .Set("interval_start_utc", from)
+                        .Set("interval_end_utc", from.AddMinutes(15))
+                        .Set("query_id", 1000L)
+                        .Set("plan_id", target == "T4" ? 0L : 10_000L)
+                        .Set("login_name", target == "T4" ? "contosocare_runner" : null)
+                        .Set("wait_category", category)
+                        .Set("wait_event", waitEvent)
+                        .Set("wait_ms", waited(i))
+                        .Set("max_wait_ms", Math.Round(random.NextDouble() * 100, 6)));
+                }
+            }
+
+            coverage.Add(new CaptureRow(RcaContract.QueryCoverage, target, Window, "test")
+                .Set("target", target)
+                .Set("window_start_utc", Window)
+                .Set("window_end_utc", Window.AddMinutes(15 * intervals))
+                .Set("backfill", false));
+        }
+
+        var tables = new Dictionary<string, List<CaptureRow>>(StringComparer.Ordinal)
+        {
+            [RcaContract.QueryWaits] = waits,
+            [RcaContract.QueryCoverage] = coverage,
+        };
+        var end = Window.AddMinutes(15 * intervals);
+        return new SidecarDraft(Id(Window, "sqlvm01", 1), Session, "sqlvm01", 1, true, Window, end, end.AddMinutes(3), "1.0.0", [.. plans.Select(p => p.Target)], tables);
+    }
 
     private static SealedSidecar Sealed(int i)
     {
