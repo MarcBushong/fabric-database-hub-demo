@@ -94,15 +94,18 @@ public sealed class CosmosRunnerTests : IDisposable
         var writes = account.Requests.Where(r => r.IsUpsert).ToList();
         Assert.NotEmpty(writes);
 
+        // A write's start: the run's time at which the runner checked the phase, which it puts in the document, to the
+        // millisecond. The account gets the write a moment later, which on a clock 40 times real time can be seconds when
+        // the machine is busy, so its arrival could fall in a calm.
+        static DateTimeOffset StartOf(RecordedRequest write) =>
+            DateTimeOffset.Parse(FakeCosmosAccount.Body(write)["at"]!.GetValue<string>(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
+
         // Tagged with the client service and the run, never the scenario (ADR 0031, decision 6).
         var tag = SessionNames.ForRun("patient-events-ingest", result.RunId);
         foreach (var write in writes)
         {
-            // A write starts only in a wave. The runner checks the phase at the time it puts in the document, on the run's
-            // clock, to the millisecond. The account gets it a moment later, which on a clock 40 times real time can be
-            // seconds when the machine is busy, so its arrival would fall in a calm.
-            var at = DateTimeOffset.Parse(FakeCosmosAccount.Body(write)["at"]!.GetValue<string>(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal | DateTimeStyles.AdjustToUniversal);
-            var elapsed = at - result.StartedAt!.Value;
+            // A write starts only in a wave.
+            var elapsed = StartOf(write) - result.StartedAt!.Value;
             Assert.True(RuStorm.PhaseAt(elapsed, 30, 30).Storm || RuStorm.PhaseAt(elapsed + TimeSpan.FromMilliseconds(1), 30, 30).Storm, $"A storm write started at {elapsed.TotalSeconds:0.000} s, in a calm.");
             Assert.Equal("p-storm-01", write.PartitionKey);
             Assert.Matches("^storm-01-0[0-9]{2}$", FakeCosmosAccount.Body(write)["id"]!.GetValue<string>());
@@ -111,7 +114,7 @@ public sealed class CosmosRunnerTests : IDisposable
             Assert.StartsWith(tag + " ", write.Header("User-Agent"), StringComparison.Ordinal);
         }
 
-        var waves = writes.Select(w => RuStorm.PhaseAt(w.At - result.StartedAt!.Value, 30, 30).Wave).Distinct().Count();
+        var waves = writes.Select(w => RuStorm.PhaseAt(StartOf(w) - result.StartedAt!.Value, 30, 30).Wave).Distinct().Count();
         Assert.True(waves >= 3, $"Writes fell in {waves} wave(s).");
         Assert.True(account.Throttled > 0);
         var stored = await new CosmosRunStore(StorePath).GetRunAsync(result.RunId, TestContext.Current.CancellationToken);
