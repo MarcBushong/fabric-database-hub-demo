@@ -243,6 +243,7 @@ SUMMARIZECOLUMNS(
 12. **One connection to T4 and one to its replica,** before the rehearsal's first session, with the runner's own connection code: each accepts the startup packet's `options` with `NoTypeLoading`.
     - **`current_setting('search_path')`** ends in `dbhubdemo_rca_observer` on every runner connection that isn't a workload session: the observer's, the answer-key recorder's, and the harness's control connections (a run's control and reset, status, warmup, and stop; A2's e8558a9a and dc485240). It never does on a workload session's.
     - **The stop path** now needs T4 to accept `options` too: a run's stop, with the startup packet's options, reaches T4. Final tests runs it at L0c.
+    - **No `rca.marker-refused`** (A2's 9ac571ed) in the runner's log on sqlvm01 after the rehearsal's sessions. If there is one, T4 refused the marked startup: report which connection, and the S7 sets its statements fell in. The fix is named from what L0c shows.
 
 ## The scripts' transport's live checks (S12)
 
