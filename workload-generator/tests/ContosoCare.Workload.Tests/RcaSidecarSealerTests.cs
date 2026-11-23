@@ -363,6 +363,82 @@ public sealed class RcaSidecarSealerTests : IDisposable
     }
 
     [Fact]
+    public void ABindTheLedgerNeverRecordedIsTakenFromTheFileOnceItsSpansFolderIsGone()
+    {
+        // Re-check, Low: the crash above, then v1's retention deletes the span's folder, its export.json with it, before
+        // anything seals again. The file's session is all that's left of the span's binding: the sidecar and its span take
+        // it with the file's hash, and the sidecar isn't offered with no session under a hash its file no longer has.
+        var rig = new SidecarRig(root, T0);
+        var span = rig.Capture(T0, T0.AddMinutes(30), "T1");
+        var provisional = rig.Seal(span);
+        var ledgerPath = Path.Combine(root, "sidecars", "ledger.json");
+        var before = File.ReadAllBytes(ledgerPath);
+        Assert.Null(rig.Sealer.SealSpan(rig.Bind(span, SidecarRig.Session)));
+        File.WriteAllBytes(ledgerPath, before);
+        Directory.Delete(span.Directory, recursive: true);
+
+        var offered = Assert.Single(rig.Store.Offerable());
+
+        var file = rig.Store.ReadGzip(provisional.DocumentId)!;
+        Assert.Equal((PartCodec.Sha256(file), PartCodec.PartCount(file.Length), (string?)SidecarRig.Session), (offered.Sha256, offered.Parts, offered.SessionId));
+        var ledger = ReadLedgerFile();
+        Assert.Equal((long)file.Length, ledger.Budgets[SidecarRig.Session].Bytes);
+        Assert.Equal(0, ledger.Budgets["span:" + span.Id].Bytes);
+        Assert.Equal((true, (string?)SidecarRig.Session), (ledger.Spans[span.Id].Bound, ledger.Spans[span.Id].SessionId));
+    }
+
+    [Fact]
+    public void ABindCutShortBetweenASpansDocumentsGivesThemAllItsSessionOnceTheSpansFolderIsGone()
+    {
+        // Re-check, Low: the crash comes between two of the span's documents, so the first names the session and the second
+        // doesn't. With the span's folder gone, the first one's session is the span's binding: the second takes it too,
+        // written as the bind would have written it, and the span keeps it for a backfill.
+        var rig = new SidecarRig(root, T0);
+        var span = rig.Capture(T0, T0.AddMinutes(30), "T1");
+        var first = rig.Seal(span);
+        rig.Sink.ForSpan(span.Id)!.Write(SidecarRig.Stats("T1", T0.AddMinutes(30), 902, 10));
+        var second = rig.Seal(rig.Span(span.Id));
+        var ledgerPath = Path.Combine(root, "sidecars", "ledger.json");
+        var secondPath = rig.Store.DocumentPath(second.DocumentId)!;
+        var before = File.ReadAllBytes(ledgerPath);
+        var secondUnbound = File.ReadAllBytes(secondPath);
+        Assert.Null(rig.Sealer.SealSpan(rig.Bind(rig.Span(span.Id), SidecarRig.Session)));
+        var secondBound = File.ReadAllBytes(secondPath);
+        Assert.NotEqual(secondUnbound, secondBound);
+        File.WriteAllBytes(ledgerPath, before);
+        File.WriteAllBytes(secondPath, secondUnbound);
+        Directory.Delete(span.Directory, recursive: true);
+
+        var offered = rig.Store.Offerable().ToDictionary(s => s.DocumentId, StringComparer.Ordinal);
+
+        Assert.Equal([SidecarRig.Session, SidecarRig.Session], new[] { first, second }.Select(s => offered[s.DocumentId].SessionId));
+        Assert.Equal(secondBound, rig.Store.ReadGzip(second.DocumentId));
+        Assert.All(offered.Values, s => Assert.Equal(PartCodec.Sha256(rig.Store.ReadGzip(s.DocumentId)!), s.Sha256));
+        var ledger = ReadLedgerFile();
+        Assert.Equal(offered.Values.Sum(s => (long)rig.Store.ReadGzip(s.DocumentId)!.Length), ledger.Budgets[SidecarRig.Session].Bytes);
+        Assert.Equal((true, (string?)SidecarRig.Session), (ledger.Spans[span.Id].Bound, ledger.Spans[span.Id].SessionId));
+    }
+
+    [Fact]
+    public void AGoneSpansDocumentThatCantBeReadIsSettledWithNoSessionAndStopsNoOtherSidecar()
+    {
+        // Re-check, Low: looking for a session in a gone span's documents never fails the listing: a document that can't
+        // be read names none, so its sidecar is settled with no session, as before, and the others are offered.
+        var rig = new SidecarRig(root, T0);
+        var gone = rig.Capture(T0, T0.AddMinutes(30), "T1");
+        var bound = rig.Capture(T0.AddHours(1), T0.AddHours(2), "T1");
+        rig.Sealer.SealAll();
+        var broken = rig.Store.ReadLedger().Sidecars.Single(s => string.Equals(s.SpanId, gone.Id, StringComparison.Ordinal));
+        File.WriteAllBytes(rig.Store.DocumentPath(broken.DocumentId)!, "not a gzip"u8.ToArray());
+        Directory.Delete(gone.Directory, recursive: true);
+        rig.Bind(bound, SidecarRig.Session);
+
+        var offered = rig.Store.Offerable();
+
+        Assert.Equal([null, SidecarRig.Session], offered.Select(s => s.SessionId));
+    }
+
+    [Fact]
     public void RowsSealedBeforeACrashThatKeptThemAreDeletedAndNeverSealedTwice()
     {
         // Review, Medium 3: a crash after the ledger's write and before the rows' deletion leaves the files the ledger lists

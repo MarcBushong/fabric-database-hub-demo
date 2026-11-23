@@ -258,8 +258,9 @@ internal sealed partial class SidecarStore : ISidecarCatalog
 
     /// <summary>
     /// New and pending sidecars, the oldest sealed first: every sidecar not acknowledged, after retention. A sidecar's
-    /// bytes are final once it's offered, so one sealed before its span was bound takes the span's binding now, or no
-    /// session when no export bound it.
+    /// bytes are final once it's offered, so one sealed before its span was bound takes the span's binding now: its
+    /// export's, or, with the span's folder gone, the session a bind the ledger never recorded left in the span's
+    /// documents (<see cref="Bind"/>), or else no session.
     /// </summary>
     public IReadOnlyList<SealedSidecar> Offerable()
     {
@@ -407,11 +408,16 @@ internal sealed partial class SidecarStore : ISidecarCatalog
     /// <summary>
     /// Gives the sidecars sealed before their span was bound the span's session (call under the lock): each document is
     /// written again with it, and its bytes move to that session's budget. <see cref="Offerable"/> settles every such
-    /// sidecar before it lists any, so an offered sidecar's bytes never change.
+    /// sidecar before it lists any, so an offered sidecar's bytes never change. Without a session to give, because the
+    /// span's folder is gone or no export bound it, a session that one of the span's documents already names is the
+    /// span's: a bind the ledger never recorded wrote it there from the span's export. Each of the span's sidecars and
+    /// the span then take it, as that bind would have.
     /// </summary>
     internal void Bind(SidecarLedger ledger, string spanId, string? sessionId)
     {
-        foreach (var entry in ledger.Sidecars.Where(s => !s.Bound && string.Equals(s.SpanId, spanId, StringComparison.Ordinal)).ToList())
+        var unbound = ledger.Sidecars.Where(s => !s.Bound && string.Equals(s.SpanId, spanId, StringComparison.Ordinal)).ToList();
+        sessionId ??= unbound.Select(DocumentSession).FirstOrDefault(s => s is not null);
+        foreach (var entry in unbound)
         {
             if (sessionId is not null)
             {
@@ -425,6 +431,20 @@ internal sealed partial class SidecarStore : ISidecarCatalog
         {
             span.Bound = true;
             span.SessionId = sessionId;
+        }
+    }
+
+    /// <summary>The session a sealed sidecar's document names: null for none, and for a document that can't be read.</summary>
+    private string? DocumentSession(SidecarEntry entry)
+    {
+        try
+        {
+            return ReadDocument(entry.DocumentId) is { } gzip ? TopLevelSession(PartCodec.Gunzip(gzip)).Session : null;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidDataException or JsonException)
+        {
+            log.Debug("rca.sidecar-unreadable", ex.Message, ("document", entry.DocumentId));
+            return null;
         }
     }
 
