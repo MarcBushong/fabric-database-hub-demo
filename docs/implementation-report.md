@@ -7504,8 +7504,8 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **The integration,** `marcbushong-microsoft-qs-evidence-integration`, takes only reviewed heads:
 
-- **B,** the notebook and the model, at e968004d (d6a77fa9), with two of its test expectations fixed (d8207618).
-- **A1,** SQL Server's reads, at f6fcdafa (893a3bf3), then its seam's hardening at 4fbd21b2 (ca66a103), which A2's head needed.
+- **B,** the notebook and the model, at e968004d (d6a77fa9), with two of its test expectations fixed (d8207618), then at 9b28eb81 (9550ed5f), with a one-line `fabric/powerbi/README.md` change. Its activity notebook reports `RCA.SIDECAR` (the history's finding `rca_sidecar`) beside `RCA.EVIDENCE`, which troubleshooting and the README name (20f5d98f).
+- **A1,** SQL Server's reads, at f6fcdafa (893a3bf3), then its seam's hardening at 4fbd21b2 (ca66a103), which A2's head needed. Then its harness statements at 9d7f1690 (7b8d9eea): RCA-SQL-16 and item 3's list, the answer-key recorder's marker and the hash of its earlier reads, and the backstop.
 - **T2a,** the scripts' transport, at 8e2ada18 (d76a028b).
   - It brings the RCA release integration's 83a6fcb1, T2a's approved base.
   - The generated model guide was rebuilt with the app's pinned `tsx`.
@@ -7550,8 +7550,8 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
   - whether stopping T4 keeps the window Query Store still holds in memory;
   - whether `qs_view` keeps each window's `search_path`, or the first one it saw. The catalog-text rule covers the observer's statements either way.
 - **The harness's marks (unit H)** merge after the realistic names' release. H's T-SQL block first runs on an engine at the rehearsal: its opt-in test against a disposable SQL Server, and S10's check after two deployments.
-- **The runner's own ad hoc statements (item 3) wait on A1's build.** Until then RCA-SQL-10 and 14 keep the polled stop check, so the rehearsal's blindness check (S7) needs A1's commit. Which form Query Store keeps for a statement under simple parameterization is proven only by A1's opt-in real-engine test and by S7.
-- **The answer-key recorder's markers wait on A1's and A2's fixes.** Until both are merged, its one read per fault run can reach the sidecar on T1 to T4, so A1's harness head stays out of the integration until its fix is re-checked. S7's `recorder` set and its name check prove it live.
+- **The runner's own ad hoc statements (item 3)** are A1's 9d7f1690, merged. Which form Query Store keeps for a statement under simple parameterization is proven only by A1's opt-in real-engine test and by S7.
+- **The answer-key recorder's T4 marker waits on A2's fix** (e8558a9a and dc485240, in review); A1's for T1 to T3 is merged. Until A2's is merged, only item 2's harness-table rule leaves the recorder's T4 reads out, and that needs H's marks. S7's `recorder` set and its name check prove both live.
 - **A Run all session's Query Store evidence** comes through Run all's own path (T2c), which joins this release by the coordinator's decision. If it isn't reviewed by 2026-11-24 18:00, it reaches the history with the next scripts' save until Run all's path ships as its own release.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
 
