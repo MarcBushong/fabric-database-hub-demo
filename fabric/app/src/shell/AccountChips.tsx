@@ -61,7 +61,7 @@ export function AccountChips({ email, onSignOut }: { email: string | null; onSig
             <Menu>
                 <MenuTrigger disableButtonEnhancement>
                     <Button appearance="subtle" size="small" className="account-chip" aria-label={email ? `Fabric: ${email}` : "Fabric account"}>
-                        <Avatar size={20} name={email ?? "Fabric"} color="colorful" />
+                        <Avatar size={20} name={email ?? "Fabric"} color="brand" />
                         <span className="account-text">
                             <span>{email ?? "Fabric"}</span>
                             <small>Fabric</small>
