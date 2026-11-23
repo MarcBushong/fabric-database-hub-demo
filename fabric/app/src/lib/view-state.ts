@@ -220,12 +220,13 @@ export function mergeView(...parts: Array<Partial<ViewState>>): ViewState {
 }
 
 /**
- * The view the app opens with: the browser's saved view under the address's. The Root cause page's filters come from its
- * address alone, so a link without them opens with the page's defaults, as whoever shared it saw, never the recipient's
- * last filters, which could hide the incident it shares (the review of 90e9d914).
+ * The view the app opens with: the browser's saved view under the address's. The Root cause page's filters and incident
+ * come from its address alone, so a link without them opens with the page's defaults and no incident, as whoever shared
+ * it saw. The recipient's last filters could hide what it shares (the review of 90e9d914); their last incident would
+ * replace it, and a saved older window key ("T1.<from>.<to>") would become their filters (the re-check of 62e5a18f).
  */
 export function openView(saved: Partial<ViewState>, fromHash: Partial<ViewState>): ViewState {
-    return mergeView(saved, fromHash, fromHash.page === "rca" ? { rcaFilters: fromHash.rcaFilters ?? null } : {});
+    return mergeView(saved, fromHash, fromHash.page === "rca" ? { rcaFilters: fromHash.rcaFilters ?? null, incident: fromHash.incident ?? null } : {});
 }
 
 const STORAGE_KEY = "dbhub-insights.view.v2";
