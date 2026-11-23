@@ -10,8 +10,9 @@ namespace ContosoCare.Workload.Rca.QueryStore;
 /// role, and Query Store keeps one row per role and query.
 /// RCA-PG-14 compares these with Query Store's texts once comments are stripped and white space collapsed, and only for
 /// the rows of the observer's own role, so a block's earlier versions that differ only there are the same statement:
-/// edd01c86's, before the observer's marker, which Query Store may still keep for the queries it saw then. It's built
-/// from the runner's own catalog and code, never from the answer key or what the workload plans.
+/// edd01c86's, before the observer's marker, which Query Store may still keep for the queries it saw then. A runner test
+/// fails when one of edd01c86's blocks no longer compares equal to one of these. It's built from the runner's own catalog
+/// and code, never from the answer key or what the workload plans.
 /// </summary>
 internal static class PgObserverStatements
 {

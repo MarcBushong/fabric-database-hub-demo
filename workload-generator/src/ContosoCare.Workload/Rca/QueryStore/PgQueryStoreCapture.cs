@@ -64,7 +64,8 @@ internal sealed record PgSidecarOptions
 /// surely published all of it. Until then each read takes it again, and writes its rows again only when they changed, so
 /// counts or waits that Query Store published late still reach the sidecar (the latest read of an interval wins). The time
 /// still unsettled at the observer's end is kept in the watermark for this span, and the coverage says what Query Store
-/// hadn't published yet, never that it wasn't captured.
+/// hadn't published yet, never that it wasn't captured. A later read that finds T4 started since then splits that time at
+/// T4's start: what Query Store doesn't show before it is lost, and the rest waits as before.
 /// </para>
 /// Without the harness's list, nothing is read: its bookkeeping would be in it.
 /// </summary>
@@ -417,6 +418,7 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         }
 
         var read = PgQueryStoreSettings.Parse(rows, now);
+        current.ServerStarted = read.ServerStarted;
         if (rows.Count > 0)
         {
             coverage.Sources.Add(PgQueryStoreRows.Settings);
@@ -646,14 +648,21 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
             Failed(coverage, read.FailedBlock ?? PgQueryStoreRows.Statistics, partial);
         }
 
-        // T4 started again since the range was recorded: what Query Store held in memory at the stop shows by now or never
-        // will, so what this read doesn't show is lost, never pending (rca/README.md, Pending publication).
-        var restarted = settings?.ServerStarted is { } started && range.ServerStartedUtc is { } before && started > before;
-        var done = read.Failure is null && read.Complete && (restarted || now >= to + schedule.Interval + PublishedAfter);
+        // T4's start as this read found it, against the range's (rca/README.md, A stop in the window). T4 started since the
+        // range was recorded, so the range splits at that start: before it, what Query Store held in memory at the stop
+        // shows by now or never will, so what this read doesn't show of it is lost, never pending; from it on, T4's new
+        // lifetime recorded it, so it waits for publication as any range does. Neither part is decided until an interval
+        // and the publication delay have passed after the start too, in case Query Store publishes a stopped window late
+        // (the live check L0a). A range with a recorded start waits while this read couldn't read T4's.
+        var started = current.ServerStarted;
+        DateTimeOffset? restart = started is { } start && range.ServerStartedUtc is { } before && start > before ? start : null;
+        var settledAt = (restart is { } after && after > to ? after : to) + schedule.Interval + PublishedAfter;
+        var done = read.Failure is null && read.Complete && (started is not null || range.ServerStartedUtc is null) && now >= settledAt;
         var shown = read.Through is { } reached && reached > reader.From ? reached : reader.From;
-        if (shown < to && restarted && done)
+        var lostUntil = restart is { } stop && stop < to ? stop : to;
+        if (done && restart is not null && shown < lostUntil)
         {
-            coverage.Gaps.Add(Lost(shown, to));
+            coverage.Gaps.Add(Lost(shown, lostUntil));
         }
         else if (!done && shown < to)
         {
@@ -836,6 +845,9 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         public Phase Phase { get; set; } = Phase.Settings;
 
         public Queue<PendingRange>? Ranges { get; set; }
+
+        /// <summary>T4's start, as this read's RCA-PG-13 found it; null when it couldn't read it.</summary>
+        public DateTimeOffset? ServerStarted { get; set; }
 
         public BackfillRead? Backfill { get; set; }
 

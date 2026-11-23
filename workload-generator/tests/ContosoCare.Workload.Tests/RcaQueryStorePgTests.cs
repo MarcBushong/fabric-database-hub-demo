@@ -297,11 +297,23 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.Equal(At(17, 15), backfilled.Table(RcaContract.QueryCoverage)[^1].Get("pending_from_utc"));
         Assert.Single(watermark.Read().Pending, p => p.SpanId == SpanA);
 
-        // T4 stopped and started again at 17:40: what it doesn't show now never will. Lost, not pending, and done.
+        // T4 stopped and started again at 17:40: what it doesn't show of the time before then never will, unless Query Store
+        // publishes a stopped window late (the live check L0a), so the backfill waits an interval and the publication delay
+        // after the start too. Pending at 17:47; at 18:17, lost, not pending, and done.
         store.ServerStarted = At(17, 40);
         spans.CurrentSpan = "20261120T174500Z";
         var third = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
         await ReadAtAsync(third, store, At(17, 47));
+        Assert.Equal(At(17, 15), backfilled.Table(RcaContract.QueryCoverage)[^1].Get("pending_from_utc"));
+        Assert.DoesNotContain("Lost", (string?)backfilled.Table(RcaContract.QueryCoverage)[^1].Get("gaps"), StringComparison.Ordinal);
+        Assert.Single(watermark.Read().Pending, p => p.SpanId == SpanA);
+
+        // 18:02: the range's own end has settled (17:55), but not the time after T4's start (18:15).
+        await ReadAtAsync(third, store, At(18, 2));
+        Assert.Equal(At(17, 15), backfilled.Table(RcaContract.QueryCoverage)[^1].Get("pending_from_utc"));
+        Assert.Single(watermark.Read().Pending, p => p.SpanId == SpanA);
+
+        await ReadAtAsync(third, store, At(18, 17));
         var coverage = backfilled.Table(RcaContract.QueryCoverage)[^1];
         Assert.Null(coverage.Get("pending_from_utc"));
         Assert.Equal("Lost when T4 stopped: Query Store shows nothing of 2026-11-20 17:15 to 2026-11-20 17:20 UTC, which it still held in memory when T4 stopped, and T4 has started again since, so none of it will show.", coverage.Get("gaps"));
@@ -326,10 +338,98 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         var second = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
         await ReadAtAsync(second, store, At(17, 47));
 
+        // Everything shows, so nothing is lost or pending, but the range is kept until an interval and the publication delay
+        // have passed after T4's start, and a later read, which writes nothing again, removes it.
         var coverage = Assert.Single(backfilled.Table(RcaContract.QueryCoverage));
         Assert.Null(coverage.Get("pending_from_utc"));
         Assert.Null(coverage.Get("gaps"));
         Assert.Equal(2, backfilled.Table(RcaContract.QueryStats).Count(r => (DateTimeOffset)r.Get("interval_start_utc")! == At(17, 15)));
+        Assert.Single(watermark.Read().Pending, p => p.SpanId == SpanA);
+
+        await ReadAtAsync(second, store, At(18, 17));
+        Assert.All(backfilled.Table(RcaContract.QueryCoverage), r => Assert.Null(r.Get("gaps")));
+        Assert.Equal(2, backfilled.Table(RcaContract.QueryStats).Count(r => (DateTimeOffset)r.Get("interval_start_utc")! == At(17, 15)));
+        Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
+    }
+
+    [Fact]
+    public async Task ARestartInsideTheRangeLeavesWhatCameAfterItToPublication()
+    {
+        // Session A's range, 17:00 to 17:20, kept T4's start as its last RCA-PG-13 found it: 08:00, but T4 started again at
+        // 17:10 (that read was before the restart, or failed after it). From 17:10 on, T4's new lifetime recorded the time,
+        // and Query Store publishes it as usual: 17:15's interval 10 minutes after it ends at 17:30.
+        var store = new T4QueryStore([.. T4Statistics(), .. Later()], T4Waits()) { ServerStarted = At(17, 10), PublishedAfter = TimeSpan.FromMinutes(10) };
+        var watermark = Watermark();
+        watermark.Update(s => s.Pending.Add(new PendingRange { SpanId = SpanA, ObservedFromUtc = At(17, 0), FromUtc = At(17, 0), ToUtc = At(17, 20), RecordedUtc = At(17, 20), ServerStartedUtc = ServerStart }));
+        var spans = new MemorySpans { CurrentSpan = SpanB };
+        var backfilled = spans.Add(SpanA);
+        var capture = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
+
+        // 17:32: Query Store shows through 17:15. What's after it, 17:15 to 17:20, came after the restart: pending, not lost.
+        await ReadAtAsync(capture, store, At(17, 32));
+        var waiting = Assert.Single(backfilled.Table(RcaContract.QueryCoverage));
+        Assert.Equal((At(17, 15), At(17, 20)), (waiting.Get("pending_from_utc"), waiting.Get("pending_to_utc")));
+        Assert.DoesNotContain("Lost", (string?)waiting.Get("gaps"), StringComparison.Ordinal);
+        Assert.Single(watermark.Read().Pending, p => p.SpanId == SpanA);
+
+        // 18:02: 17:15's interval has been published and read, and nothing was lost.
+        await ReadAtAsync(capture, store, At(18, 2));
+        var done = backfilled.Table(RcaContract.QueryCoverage)[^1];
+        Assert.Null(done.Get("pending_from_utc"));
+        Assert.Null(done.Get("gaps"));
+        Assert.Equal(2, backfilled.Table(RcaContract.QueryStats).Count(r => (DateTimeOffset)r.Get("interval_start_utc")! == At(17, 15)));
+        Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
+    }
+
+    [Fact]
+    public async Task ARestartInsideTheRangeLosesOnlyWhatCameBeforeIt()
+    {
+        // As above, but Query Store shows nothing from 17:00 on: it lost 17:00 to 17:10, the old lifetime's last minutes,
+        // and the new one recorded nothing.
+        var store = new T4QueryStore([.. T4Statistics().Where(s => s.Time("interval_start_utc") < At(17, 0))], T4Waits()) { ServerStarted = At(17, 10) };
+        var watermark = Watermark();
+        watermark.Update(s => s.Pending.Add(new PendingRange { SpanId = SpanA, ObservedFromUtc = At(17, 0), FromUtc = At(17, 0), ToUtc = At(17, 20), RecordedUtc = At(17, 20), ServerStartedUtc = ServerStart }));
+        var spans = new MemorySpans { CurrentSpan = SpanB };
+        var backfilled = spans.Add(SpanA);
+        var capture = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
+
+        await ReadAtAsync(capture, store, At(17, 32));
+        Assert.Equal(At(17, 0), backfilled.Table(RcaContract.QueryCoverage)[^1].Get("pending_from_utc"));
+
+        // 17:55 on, the whole range has settled: only what came before T4's start is lost.
+        await ReadAtAsync(capture, store, At(18, 2));
+        var coverage = backfilled.Table(RcaContract.QueryCoverage)[^1];
+        Assert.Null(coverage.Get("pending_from_utc"));
+        Assert.Equal("Lost when T4 stopped: Query Store shows nothing of 2026-11-20 17:00 to 2026-11-20 17:10 UTC, which it still held in memory when T4 stopped, and T4 has started again since, so none of it will show.", coverage.Get("gaps"));
+        Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
+    }
+
+    [Fact]
+    public async Task ARangeWithAStartTimeWaitsWhileT4sCantBeRead()
+    {
+        // 17:32: T4 hasn't restarted, and session A's range waits for publication. T4 stops and starts again at 17:40, and
+        // at 18:02 the observer's RCA-PG-13 fails (the evidence capture hasn't reconnected yet). The settings it last read
+        // say T4 started at 08:00, but that's not what this read found, so a restart can't be told from none: the range
+        // waits, though its own end has settled. At 18:17 T4's start is read, an interval and the publication delay have
+        // passed after it, and the range is lost.
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
+        var watermark = Watermark();
+        watermark.Update(s => s.Pending.Add(new PendingRange { SpanId = SpanA, ObservedFromUtc = At(17, 0), FromUtc = At(17, 15), ToUtc = At(17, 20), RecordedUtc = At(17, 20), ServerStartedUtc = ServerStart }));
+        var spans = new MemorySpans { CurrentSpan = SpanB };
+        var backfilled = spans.Add(SpanA);
+        var capture = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
+        await ReadAtAsync(capture, store, At(17, 32));
+        Assert.Equal(At(17, 15), backfilled.Table(RcaContract.QueryCoverage)[^1].Get("pending_from_utc"));
+
+        store.ServerStarted = At(17, 40);
+        store.Access.Failure = b => b == "RCA-PG-13" ? QuietResult.Failed(CaptureFailureKind.Connection, "Exception while reading from stream (a test's).") : null;
+        await ReadAtAsync(capture, store, At(18, 2));
+        Assert.Equal(At(17, 15), backfilled.Table(RcaContract.QueryCoverage)[^1].Get("pending_from_utc"));
+        Assert.Single(watermark.Read().Pending, p => p.SpanId == SpanA);
+
+        store.Access.Failure = null;
+        await ReadAtAsync(capture, store, At(18, 17));
+        Assert.Equal("Lost when T4 stopped: Query Store shows nothing of 2026-11-20 17:15 to 2026-11-20 17:20 UTC, which it still held in memory when T4 stopped, and T4 has started again since, so none of it will show.", backfilled.Table(RcaContract.QueryCoverage)[^1].Get("gaps"));
         Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
     }
 
@@ -850,6 +950,142 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         {
             Assert.All(rows, r => Assert.StartsWith("RCA-PG-13 couldn't be read on T4-replica at ", (string?)r.Get("gaps"), StringComparison.Ordinal));
         }
+    }
+
+    [Theory]
+    [InlineData("T4", "evidence")]
+    [InlineData("T4", "watermark")]
+    [InlineData("T4", "hook")]
+    [InlineData("T4", "cancelled")]
+    [InlineData("T4-replica", "watermark")]
+    [InlineData("T4-replica", "hook")]
+    [InlineData("T4-replica", "cancelled")]
+    public async Task TheEndsQueryStoreReadsRunWhateverFailedBeforeThem(string target, string failure)
+    {
+        // The evidence's own end failed (its last episode's row, its last watermark, or the lane's hook threw), or the host's
+        // stop cancelled the end (its 30-s limit). Query Store's end reads still run, after the evidence's end time was
+        // taken, and the failure follows them; a cancelled end cuts them short, as their coverage says.
+        var clock = new ManualTime(RcaSimulation.T4From);
+        var to = RcaSimulation.T4To;
+        var sidecar = new MemorySidecar();
+        var span = new MarkLog(new MemorySink())
+        {
+            FailWritesFrom = failure == "evidence" ? to : null,
+            FailWatermarksFrom = failure == "watermark" ? to : null,
+        };
+        TimedT4 connection;
+        TimedStore? azure = null;
+        TargetObserver observer;
+        if (target == "T4")
+        {
+            var store = new T4QueryStore(T4Statistics(), T4Waits());
+            store.Follow(clock);
+            var timings = new PgSidecarOptions { Clock = new TickClock(clock) };
+            connection = new TimedT4(clock, RcaSimulation.T4Primary(clock), block => block == "RCA-PG-17"
+                ? [HolderRow(clock.Now, ApplicationNames.Program + "/svc-intake/20261120170000-t4-0a0b0c", Runner, "idle", 40, 0, 12.5, 60)]
+                : store.ObserverAnswer(block))
+            {
+                // A connection episode still open at the end, so the evidence's end writes its close.
+                Surge = (to.AddMinutes(-2), to.AddMinutes(1)),
+            };
+            azure = new TimedStore(clock, store.Connector, timings.OpenTimeout);
+            var source = new PgQueryStoreSource(azure, new QueryWatermark(Path.Combine(root, Guid.NewGuid().ToString("N")), "T4"), new MemorySpans { CurrentSpan = SpanA });
+            observer = new PgPrimaryObserver(connection, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar, source, timings);
+        }
+        else
+        {
+            connection = new TimedT4(clock, RcaSimulation.T4Replica(clock), b => b == "RCA-PG-13" ? Settings(clock.Now, inRecovery: true) : null);
+            observer = new PgReplicaObserver(connection, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar, null, new PgSidecarOptions { Clock = new TickClock(clock) });
+        }
+
+        await RunUntilAsync(observer, span, clock, RcaSimulation.T4From, to);
+        using var stop = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        if (failure == "cancelled")
+        {
+            await stop.CancelAsync();
+        }
+
+        DateTimeOffset? ended = null;
+        Task End() => observer.EndAsync(
+            to,
+            stop.Token,
+            at =>
+            {
+                ended = at;
+                if (failure == "hook")
+                {
+                    throw new InvalidOperationException("The lane's hook failed (a test's).");
+                }
+            },
+            clock);
+        if (failure == "cancelled")
+        {
+            await End();
+        }
+        else
+        {
+            var thrown = await Assert.ThrowsAnyAsync<Exception>(End);
+            Assert.IsType(failure == "hook" ? typeof(InvalidOperationException) : typeof(IOException), thrown);
+        }
+
+        Assert.Equal(to, ended);
+        var gaps = (string?)sidecar.Table(RcaContract.QueryCoverage)[^1].Get("gaps") ?? string.Empty;
+        if (failure == "cancelled")
+        {
+            Assert.Contains(target == "T4" ? "The end's Query Store reads on T4 were cut short with the observer's end." : "RCA-PG-13 couldn't be read on T4-replica at 17:20 UTC: the end's read was cut short with the observer's end.", gaps, StringComparison.Ordinal);
+            return;
+        }
+
+        // Every end read ran: Query Store's settings, and on T4 its statistics too, none cut short.
+        Assert.Contains(connection.Calls, c => c.At >= to && c.BlockId == "RCA-PG-13");
+        Assert.True(azure is null || azure.Calls.Any(c => c.At >= to && c.BlockId == "RCA-PG-14"));
+        Assert.DoesNotContain("cut short", gaps, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("T4")]
+    [InlineData("T4-replica")]
+    public async Task AnEndCancelledInTheEvidencesOwnEndStillWritesQueryStoresCoverageWithItsGap(string target)
+    {
+        // The host stop's limit cancels the end while the evidence's own end writes its last watermark. T4's evidence end
+        // waits on nothing, so it completes, with and without a sink alike, and its evidence is the same.
+        async Task<(List<string> Rows, List<string> Notes, List<DateTimeOffset> Marks, DateTimeOffset Ended, MemorySidecar? Sidecar)> RunAsync(bool sink)
+        {
+            using var stop = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+            void CancelAtTheEnd(MarkLog span) => span.OnWatermark = at =>
+            {
+                if (at >= RcaSimulation.T4To)
+                {
+                    stop.Cancel();
+                }
+            };
+
+            if (target == "T4")
+            {
+                var run = await RunT4Async(sink, spanSetUp: CancelAtTheEnd, end: stop.Token);
+                return (run.Rows, run.Notes, run.Marks, run.Ended, run.Sidecar);
+            }
+
+            var clock = new ManualTime(RcaSimulation.T4From);
+            var replica = new TimedT4(clock, RcaSimulation.T4Replica(clock), b => b == "RCA-PG-13" ? Settings(clock.Now, inRecovery: true) : null);
+            var sidecar = sink ? new MemorySidecar() : null;
+            var span = new MarkLog(new MemorySink());
+            CancelAtTheEnd(span);
+            var ended = await LaneAsync(new PgReplicaObserver(replica, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar, null, new PgSidecarOptions { Clock = new TickClock(clock) }), span, clock, RcaSimulation.T4From, RcaSimulation.T4To, stop.Token);
+            return (Lines(span.Inner), [.. span.Inner.Notes.Select(Note)], Distinct(span.Marks), ended, sidecar);
+        }
+
+        var without = await RunAsync(sink: false);
+        var with = await RunAsync(sink: true);
+        Assert.Equal(without.Rows, with.Rows);
+        Assert.Equal(without.Notes, with.Notes);
+        Assert.Equal(without.Marks, with.Marks);
+        Assert.Equal(RcaSimulation.T4To, with.Marks[^1]);
+        Assert.Equal((RcaSimulation.T4To, RcaSimulation.T4To), (without.Ended, with.Ended));
+
+        // Query Store's end reads still ran, cancelled too, and wrote the sidecar's last coverage row with the gap that says so.
+        var gaps = ((string?)with.Sidecar!.Table(RcaContract.QueryCoverage)[^1].Get("gaps") ?? string.Empty).Split('\n');
+        Assert.Contains(target == "T4" ? "The end's Query Store reads on T4 were cut short with the observer's end." : "RCA-PG-13 couldn't be read on T4-replica at 17:20 UTC: the end's read was cut short with the observer's end.", gaps);
     }
 
     [Fact]
@@ -1509,7 +1745,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     /// clock the test's blocks move: the evidence as the store writes it,
     /// its notes, its watermarks, and the connectors. With a sink, Query Store is read too, and the surge's holders.
     /// </summary>
-    private async Task<T4Run> RunT4Async(bool sink, Action<TimedT4, TimedStore>? setUp = null)
+    private async Task<T4Run> RunT4Async(bool sink, Action<TimedT4, TimedStore>? setUp = null, Action<MarkLog>? spanSetUp = null, CancellationToken? end = null)
     {
         var clock = new ManualTime(RcaSimulation.T4From);
         var store = new T4QueryStore(T4Statistics(), T4Waits());
@@ -1524,24 +1760,23 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         var azure = new TimedStore(clock, store.Connector, timings.OpenTimeout);
         setUp?.Invoke(observer, azure);
         var span = new MarkLog(new MemorySink());
+        spanSetUp?.Invoke(span);
         var sidecar = sink ? new MemorySidecar() : null;
         var source = new PgQueryStoreSource(azure, new QueryWatermark(Path.Combine(root, Guid.NewGuid().ToString("N")), "T4"), new MemorySpans { CurrentSpan = SpanA });
         var primary = sidecar is null
             ? new PgPrimaryObserver(observer, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink())
             : new PgPrimaryObserver(observer, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar, source, timings);
 
-        var ended = await LaneAsync(primary, span, clock, RcaSimulation.T4From, RcaSimulation.T4To);
+        var ended = await LaneAsync(primary, span, clock, RcaSimulation.T4From, RcaSimulation.T4To, end);
 
         return new T4Run(Lines(span.Inner), [.. span.Inner.Notes.Select(Note)], Distinct(span.Marks), span.Inner.Watermarks["T4"], ended, span.Inner.Membership, observer, azure, sidecar);
     }
 
     /// <summary>
-    /// Drives one observer as ObserverLane does, by a clock a slow block moves: begins it at <paramref name="from"/>, ticks it
-    /// when it says, 50 ms to 1 s after its last tick ended, and ends it at <paramref name="to"/>, with its clock. The span's
-    /// end is the time EndAsync's hook gets: the clock's when the evidence's own end was done, as the lane takes it. Returns
-    /// that time.
+    /// Drives one observer as ObserverLane does, by a clock a slow block moves: begins it at <paramref name="from"/>, and ticks
+    /// it when it says, 50 ms to 1 s after its last tick ended, until <paramref name="to"/>.
     /// </summary>
-    private static async Task<DateTimeOffset> LaneAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to)
+    private static async Task RunUntilAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to)
     {
         var token = TestContext.Current.CancellationToken;
         clock.Set(from);
@@ -1555,9 +1790,18 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             delay = delay < TimeSpan.FromMilliseconds(50) ? TimeSpan.FromMilliseconds(50) : delay > TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : delay;
             clock.Set(after + delay);
         }
+    }
 
+    /// <summary>
+    /// <see cref="RunUntilAsync"/>, then ends the observer at <paramref name="to"/>, with its clock, as the lane does, and
+    /// <paramref name="end"/> as the token when given. The span's end is the time EndAsync's hook gets: the clock's when the
+    /// evidence's own end was done, as the lane takes it. Returns that time.
+    /// </summary>
+    private static async Task<DateTimeOffset> LaneAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to, CancellationToken? end = null)
+    {
+        await RunUntilAsync(observer, span, clock, from, to);
         DateTimeOffset? ended = null;
-        await observer.EndAsync(to, token, end => ended = end, clock);
+        await observer.EndAsync(to, end ?? TestContext.Current.CancellationToken, at => ended = at, clock);
         Assert.NotNull(ended);
         span.Ended(observer.Target, ended.Value);
         return ended.Value;
@@ -1727,19 +1971,50 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         public override long GetTimestamp() => time.GetUtcNow().UtcTicks;
     }
 
-    /// <summary>A span that keeps what a <see cref="MemorySink"/> keeps, and every watermark in order.</summary>
+    /// <summary>A span that keeps what a <see cref="MemorySink"/> keeps, and every watermark in order; its writes can fail from a moment on.</summary>
     private sealed class MarkLog(MemorySink inner) : ICaptureSpan
     {
         public MemorySink Inner => inner;
 
         public List<DateTimeOffset> Marks { get; } = [];
 
-        public void Write(CaptureRow row) => inner.Write(row);
+        /// <summary>When set, a row or note at or after it throws, as an evidence store that failed would.</summary>
+        public DateTimeOffset? FailWritesFrom { get; set; }
 
-        public void Note(CaptureNote note) => inner.Note(note);
+        /// <summary>When set, a watermark at or after it throws.</summary>
+        public DateTimeOffset? FailWatermarksFrom { get; set; }
+
+        /// <summary>Runs as each watermark is written, before it's kept: a test's moment in the evidence's own end.</summary>
+        public Action<DateTimeOffset>? OnWatermark { get; set; }
+
+        public void Write(CaptureRow row)
+        {
+            if (row.At >= FailWritesFrom)
+            {
+                throw new IOException("The evidence store failed (a test's).");
+            }
+
+            inner.Write(row);
+        }
+
+        public void Note(CaptureNote note)
+        {
+            if (note.At >= FailWritesFrom)
+            {
+                throw new IOException("The evidence store failed (a test's).");
+            }
+
+            inner.Note(note);
+        }
 
         public void Watermark(string target, DateTimeOffset complete)
         {
+            OnWatermark?.Invoke(complete);
+            if (complete >= FailWatermarksFrom)
+            {
+                throw new IOException("The watermark couldn't be written (a test's).");
+            }
+
             Marks.Add(complete);
             inner.Watermark(target, complete);
         }
@@ -1806,6 +2081,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             {
                 var at = owner.Clock.Now;
                 owner.Calls.Add((at, blockId, timeout));
+                cancellationToken.ThrowIfCancellationRequested();
                 var quiet = Quiet.Contains(blockId);
                 if (owner.BreakAt is { } moment && opened <= moment && (at > moment || (at == moment && quiet)))
                 {
@@ -1874,6 +2150,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
         public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken)
         {
+            cancellationToken.ThrowIfCancellationRequested();
             var at = clock.Now;
             var cost = OpenCostAt?.Invoke(at) ?? OpenCost;
             clock.Advance(cost > openTimeout ? openTimeout : cost);
@@ -1901,6 +2178,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             {
                 var at = owner.Time.Now;
                 owner.Calls.Add((at, blockId, timeout));
+                cancellationToken.ThrowIfCancellationRequested();
                 var cost = owner.Cost(blockId);
                 owner.Time.Advance(cost > timeout ? timeout : cost);
                 if (cost > timeout)
@@ -1999,9 +2277,10 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     /// <summary>
     /// A PostgreSQL server that listens (protocol 3: https://www.postgresql.org/docs/18/protocol-flow.html). It refuses TLS
     /// and GSS encryption, lets the client in without a password, records the startup packet's parameters and every query
-    /// the client sends, and closes the connection once the client has been quiet for half a second. Without an answer it
-    /// answers no query, so a client that sends one before its open completes fails to open; with one, it answers the
-    /// extended protocol's statements at each Sync with the answer's columns and one row of their binary values, or none.
+    /// the client sends, and closes the connection when the client terminates it or has been quiet a while: 2 seconds, or
+    /// 10 when it answers, so a busy machine's pause isn't taken for the end. Without an answer it answers no query, so a
+    /// client that sends one before its open completes fails to open; with one, it answers the extended protocol's
+    /// statements at each Sync with the answer's columns and one row of their binary values, or none.
     /// </summary>
     private sealed class ListeningPostgres(Func<string, (string Name, uint Oid, byte[]? Value)[]?>? answer = null) : IDisposable
     {
@@ -2063,7 +2342,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
                 byte[] head;
                 using (var quiet = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
                 {
-                    quiet.CancelAfter(TimeSpan.FromMilliseconds(500));
+                    quiet.CancelAfter(answer is null ? TimeSpan.FromSeconds(2) : TimeSpan.FromSeconds(10));
                     try
                     {
                         head = await ReadAsync(stream, 5, quiet.Token);

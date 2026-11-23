@@ -135,23 +135,44 @@ internal sealed class PgPrimaryObserver(ICaptureConnector connector, ObserverOpt
 
     protected override async Task StopAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
-        Close(lockWaits, now);
-        Close(connections, now);
         holdersDue = false;
-
-        // The evidence's own end is done: its last watermark, and the lane's end time, before the sidecar's end reads.
-        EvidenceEnded(now);
-        if (queryStoreCapture is { } queryStoreReads)
+        try
         {
-            // After the evidence capture's end, so its last reads come first; bounded by the reads' own budget.
+            Close(lockWaits, now);
+            Close(connections, now);
+        }
+        finally
+        {
+            // The evidence's own end is done, or failed: its end time is taken now, for its last watermark and the lane, so
+            // the sidecar's end reads don't move the span's end. They run even when the evidence's end, its watermark, or
+            // the lane's hook failed, whose failure then follows them, and when the host's stop cancelled the end, which
+            // cuts them short, as their coverage says.
             try
             {
-                await queryStoreReads.EndAsync(now, cancellationToken).ConfigureAwait(false);
+                EvidenceEnded(now);
             }
-            catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+            finally
             {
-                SidecarFailed(ex);
+                await EndQueryStoreAsync(now, cancellationToken).ConfigureAwait(false);
             }
+        }
+    }
+
+    /// <summary>Query Store's end reads, after the evidence capture's end, bounded by their own budget; a failure is the sidecar's.</summary>
+    private async Task EndQueryStoreAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        if (queryStoreCapture is not { } queryStoreReads)
+        {
+            return;
+        }
+
+        try
+        {
+            await queryStoreReads.EndAsync(now, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+        {
+            SidecarFailed(ex);
         }
     }
 
@@ -500,7 +521,7 @@ internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOpt
             }
 
             nextQueryStore = queryStoreSchedule.NextRead(now);
-            await QueryStoreAsync(now, timings.LightTimeout, cancellationToken).ConfigureAwait(false);
+            await QueryStoreAsync(now, timings.LightTimeout, end: false, cancellationToken).ConfigureAwait(false);
         }
 
         return Earliest(evidenceDue, nextQueryStore);
@@ -522,27 +543,50 @@ internal sealed class PgReplicaObserver(ICaptureConnector connector, ObserverOpt
 
     protected override async Task StopAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
-        Close(stall, now);
-        link.StalledSince = null;
-
-        // The evidence's own end is done: its last watermark, and the lane's end time, before the sidecar's end read.
-        EvidenceEnded(now);
-        if (sidecarSink is not null)
+        try
         {
-            await QueryStoreAsync(now, timings.LightTimeout < timings.EndBudget ? timings.LightTimeout : timings.EndBudget, cancellationToken).ConfigureAwait(false);
+            Close(stall, now);
+        }
+        finally
+        {
+            link.StalledSince = null;
+
+            // As the primary's: the evidence's end time first, then the sidecar's end read, whatever failed before it.
+            try
+            {
+                EvidenceEnded(now);
+            }
+            finally
+            {
+                if (sidecarSink is not null)
+                {
+                    await QueryStoreAsync(now, timings.LightTimeout < timings.EndBudget ? timings.LightTimeout : timings.EndBudget, end: true, cancellationToken).ConfigureAwait(false);
+                }
+            }
         }
     }
 
     /// <summary>
     /// RCA-PG-13 on the replica, quietly: its RCA Query Coverage row, which says a replica records nothing in Query Store,
-    /// or why the block failed. A row the sidecar's store can't keep is logged; neither reaches the evidence.
+    /// or why the block failed, the end's read cut short by the host's stop included. A row the sidecar's store can't keep
+    /// is logged; neither reaches the evidence.
     /// </summary>
-    private async Task QueryStoreAsync(DateTimeOffset now, TimeSpan timeout, CancellationToken cancellationToken)
+    private async Task QueryStoreAsync(DateTimeOffset now, TimeSpan timeout, bool end, CancellationToken cancellationToken)
     {
         try
         {
-            var result = await SidecarAccess.RunAsync(PgQueryStoreRows.Settings, now, CaptureParameters.None, timeout, cancellationToken).ConfigureAwait(false);
-            sidecarSink!.Write(PgQueryStoreRows.ReplicaCoverage(Target, lastQueryStore, now, result.Rows, result.Rows is null ? PgQueryStoreRows.Why(Target, PgQueryStoreRows.Settings, result) : null));
+            CaptureRow coverage;
+            try
+            {
+                var result = await SidecarAccess.RunAsync(PgQueryStoreRows.Settings, now, CaptureParameters.None, timeout, cancellationToken).ConfigureAwait(false);
+                coverage = PgQueryStoreRows.ReplicaCoverage(Target, lastQueryStore, now, result.Rows, result.Rows is null ? PgQueryStoreRows.Why(Target, PgQueryStoreRows.Settings, result) : null);
+            }
+            catch (OperationCanceledException) when (end && cancellationToken.IsCancellationRequested)
+            {
+                coverage = PgQueryStoreRows.ReplicaCoverage(Target, lastQueryStore, now, null, "the end's read was cut short with the observer's end.");
+            }
+
+            sidecarSink!.Write(coverage);
         }
         catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
         {
