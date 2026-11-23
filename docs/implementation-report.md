@@ -5011,6 +5011,26 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The estimate's job minutes, measured:** a 90-minute session's jobs took 23.8 minutes. That's 9.09 for the start, 3.25 and 3.95 for the re-checks, and 7.53 for the stop, against "at most about 60". A start that fetches an earlier session's evidence added about 1.4 minutes.
 - **The history's size, measured:** 371,740 bytes of Delta for a 90-minute session's save, against the estimate's 1 to 2 MB. A's three scripts' saves came to 598,582 bytes together.
 
+### The stacked branch, for the owner's review (2026-11-22)
+
+**What it is.** `marcbushong-microsoft-rca-postmortem-cause`: local commits stacked on the Incident RCA branch, rebased whenever that branch's head moves, not pushed, and deployed nowhere. They change the Insights app, its tests, the docs, and one line of `stop-demo.ps1`'s output. No runbook, notebook, capture, history table, semantic model, Azure resource, role, or setting changes, so `./scripts/deploy.ps1` updates an environment to it, as it does for any app change.
+
+**What it adds.** The entries below give each change in full.
+
+- **The postmortem's Cause from the blind investigation** ([ADR 0031, section 9](adr/0031-incident-rca.md#9-the-postmortems-cause); [its entry](#the-postmortems-cause-from-the-blind-investigation-2026-11-22)). With the RCA tables, **Write the postmortem** on a session investigates the session's own minutes, as the session control recorded them, and explains up to six incidents there from the signals alone, in the Root cause view's order. What the demo injected follows as the answer key, on every target, with other plans' faults in those minutes labeled as theirs. A lone incident request gets no investigation, since its minutes are its fault's own: its Cause points to the Root cause view.
+- **The evaluation set's Phase 1 cases** ([its entry](#the-evaluation-sets-phase-1-cases-2026-11-22)): 12 blind questions on the contract's fixtures and B's and A's recorded rows, graded offline against their answer keys by the scoreboard's own rule, with what they miss reported. It's test-only: the scoreboard exports three of its functions for it, with its output unchanged.
+- **Final tests' findings** ([F4 to F6](#final-tests-should-fix-items-f4-to-f6-2026-11-22), [O1 to O4](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)). In the RCA's answers: the minutes that T5's throttled counts cover, in the statement and the errors table (F6); a replica's slow replay named only from the stall's own samples, with WAL behind, and an interval cut short worded by its own minutes (F4); one instant written as one, not as a range (F5); and the clients waiting on a lock as some of the active ones (O2). On `stop-demo.ps1`'s handoff of a Run all session's stop, `STOP.CONTROL.AUTOSTOP` names the control's job (O3).
+- **The reviews' fixes,** in each entry. Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says nothing was injected, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
+
+**What still needs live proof.** All of it but the evaluation set, which reads recorded rows. Each change is unit-tested, and the RCA's answers are checked on B's and A's recorded rows, but none has run on a live environment. Its live check waits for the owner: dbhubrc stays at dbee7d53 for the owner's testing on Monday, 2026-11-23. On an environment deployed or updated from this branch, after a Run all session:
+
+- **The postmortem** of that session: its Cause against the Root cause view's first six incidents, how long the investigation takes within Execute Queries' 120 queries a minute, **Download Markdown**, and the answer key with the page's filter on fewer targets.
+- **The RCA's answers,** where the session has such incidents: a T5 storm with intervals under 100 % among those at 100 %, a replica's lag rising after the stop, an interval cut short, an incident of one instant, and a T4 surge with clients waiting on a lock at its peak. Final tests' headless harness can also check these on a live history, with no deploy.
+- **The scoreboard's** T4 and T5 rows marked Not supported, and their signal.
+- **`./scripts/stop-demo.ps1` during a Run all session,** from this checkout: its `STOP.CONTROL.AUTOSTOP` line.
+
+**For the owner's decision.** O1, the capture's tail after the control's stop, is assessed but not built ([its entry](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)): the full fix, about 2 to 3 days and its own live proof, or naming the tail only, about half a day.
+
 ### The postmortem's Cause from the blind investigation (2026-11-22)
 
 **Why.** [ADR 0031, section 9](adr/0031-incident-rca.md#9-the-postmortems-cause): in Phase 1, the postmortem's Cause comes from the blind RCA, and what was injected moves to a section of its own, labeled as the answer key. The coordinator asked for it on a local branch stacked on the Incident RCA's, `marcbushong-microsoft-rca-postmortem-cause`, so that the Incident RCA branch's head stays the live round's final SHA. The owner gets it reviewed and unit-tested, with its live check still to come.
