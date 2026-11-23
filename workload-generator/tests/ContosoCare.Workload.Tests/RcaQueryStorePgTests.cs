@@ -1458,7 +1458,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
-    public async Task OnlyTheObserversConnectionsCarryTheMarkerAndTheirLimitsInTheirStartupPacket()
+    public async Task MarkedConnectionsCarryTheMarkerAndTheirLimitsInTheirStartupPacketAndAPlainOneNone()
     {
         using var server = new ListeningPostgres();
         var endpoint = Postgres.PgEndpoint.Create("127.0.0.1:" + server.Port.ToString(CultureInfo.InvariantCulture), null, passwordFromEnvironment: true, managedIdentityClientId: null);
@@ -1482,9 +1482,18 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
                 SplitOptions(startup["options"]));
         }
 
-        // Any other connection the runner opens carries no options and loads types: Npgsql's type loading comes first.
+        // The harness's T4 control connections open the same way, with the control limits (the scan below checks each).
+        var control = server.AcceptAsync(TestContext.Current.CancellationToken);
+        await (await new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(Sql.SessionNames.ForControl("status"), TestContext.Current.CancellationToken, retry: false, silent: PgCaptureConnector.Startup)).DisposeAsync();
+        var (marked, controlSent) = await control;
+        Assert.Empty(controlSent);
+        Assert.Equal(
+            ["-c", "search_path=\"$user\", public, dbhubdemo_rca_observer", "-c", string.Create(CultureInfo.InvariantCulture, $"statement_timeout={Postgres.PgSessionLimits.Control.StatementTimeoutMs}")],
+            SplitOptions(marked["options"]).Take(4));
+
+        // A plain open, as the workload's sessions use, carries no options and loads types: Npgsql's type loading comes first.
         var other = server.AcceptAsync(TestContext.Current.CancellationToken);
-        await Assert.ThrowsAnyAsync<Exception>(() => new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(ApplicationNames.Program + "/control/status", TestContext.Current.CancellationToken, retry: false));
+        await Assert.ThrowsAnyAsync<Exception>(() => new Postgres.PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(ApplicationNames.Program + "/svc-intake/20261120170000-t4-0a0b0c", TestContext.Current.CancellationToken, retry: false));
         var (plain, sent) = await other;
         Assert.False(plain.ContainsKey("options"));
         Assert.DoesNotContain(PgCaptureConnector.ObserverSchema, plain.GetValueOrDefault("search_path") ?? string.Empty, StringComparison.Ordinal);
@@ -1591,20 +1600,30 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [Fact]
     public void EveryPostgreSqlTextTheRunnerSendsIsTheObserversTheWorkloadsOrAKnownPendingOne()
     {
-        // Every PostgreSQL text in the runner's code, outside the workload's own functions (database/postgresql): its SQL
-        // literals, and the command texts it sets from an expression. Each must be the observer's (sent on a connection that
-        // opens with PgCaptureConnector.Startup, whose marker RCA-PG-14 leaves out on any role), the workload's (a call of
-        // the workload database's own functions, whose harness ones RCA-PG-14 leaves out once they're marked, or a workload
-        // session's own statement), sent only to the read replica (which records nothing in Query Store), or one of the
-        // known pending ones, whose leave-out the coordinator decides. Any other fails, with where it is.
-        var sites = PostgreSqlTexts(RepositoryPaths.Combine("workload-generator", "src", "ContosoCare.Workload"));
+        // Every connection the runner opens to T4, and every PostgreSQL text in its code outside the workload's own functions
+        // (database/postgresql): its SQL literals, and the command texts it sets from an expression. A connection is marked
+        // (it opens with PgCaptureConnector.Startup, whose marker RCA-PG-14 leaves out on any role: the observer's, and the
+        // harness's control connections), a workload session (never marked), the read replica's (which records nothing in
+        // Query Store), or a known pending one. A text is sent only on marked connections, is the workload's (a call of the
+        // workload database's own functions, or a workload session's own statement), is sent only to the replica, or is a
+        // known pending one. Any other fails, with where it is.
+        var root = RepositoryPaths.Combine("workload-generator", "src", "ContosoCare.Workload");
+        var opens = PostgreSqlOpens(root);
+        var sites = PostgreSqlTexts(root);
+        var databaseMarked = DemoDatabaseMarked(root, opens);
+        Assert.True(opens.Count >= 15, $"The scan found only {opens.Count} connections to T4: it no longer reads the runner's code.");
         Assert.True(sites.Count >= 40, $"The scan found only {sites.Count} PostgreSQL texts: it no longer reads the runner's code.");
 
-        var unclassified = sites.Where(s => Classify(s) is null).Select(s => $"{s.File}:{s.Line} ({s.Member}): {s.Text}").ToList();
-        Assert.True(unclassified.Count == 0, "PostgreSQL text the runner sends that's neither the observer's nor the workload's:" + Environment.NewLine + string.Join(Environment.NewLine, unclassified));
-        Assert.Equal(PendingSites, new SortedSet<string>(sites.Where(s => Classify(s) == "pending").Select(s => s.File + " " + s.Member), StringComparer.Ordinal));
-        Assert.Contains(sites, s => s.File == "Rca/AnswerKey/AnswerKeyRecorder.cs" && s.Member == "ReadPgAsync" && Classify(s) == "observer");
-        Assert.Contains(sites, s => s.File == "Rca/Observer/PgCapture.cs" && Classify(s) == "observer");
+        var unclassified = opens.Where(o => ClassifyOpen(o) is null).Select(o => $"{o.File}:{o.Line} ({o.Member}): OpenAsync({o.Arguments})")
+            .Concat(sites.Where(s => Classify(s, opens, databaseMarked) is null).Select(s => $"{s.File}:{s.Line} ({s.Member}): {s.Text}"))
+            .ToList();
+        Assert.True(unclassified.Count == 0, "A connection to T4, or a PostgreSQL text, that's neither marked, the workload's, nor the replica's:" + Environment.NewLine + string.Join(Environment.NewLine, unclassified));
+        Assert.Equal(MarkedOpens, new SortedSet<string>(opens.Where(o => ClassifyOpen(o) == "marked").Select(o => o.File + " " + o.Member), StringComparer.Ordinal));
+        Assert.Equal(
+            PendingSites,
+            new SortedSet<string>(opens.Where(o => ClassifyOpen(o) == "pending").Select(o => o.File + " " + o.Member).Concat(sites.Where(s => Classify(s, opens, databaseMarked) == "pending").Select(s => s.File + " " + s.Member)), StringComparer.Ordinal));
+        Assert.True(databaseMarked, "A PgDemoDatabase is built on a connection that doesn't open with the observer's marker.");
+        Assert.All(sites.Where(s => s.File is "Postgres/PgDemoDatabase.cs" or "Rca/Observer/PgCapture.cs" || s.Member is "ReadPgAsync" or "WarmupT4Async"), s => Assert.Equal("marked", Classify(s, opens, databaseMarked)));
     }
 
     // ---- Helpers -----------------------------------------------------------------------------------------------------
@@ -1618,24 +1637,31 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     private static readonly string[] OtherTable = ["patients"];
 
     /// <summary>
-    /// The runner's PostgreSQL texts whose leave-out the coordinator decides (2026-11-23). They're sent on ordinary
-    /// connections and aren't calls of the workload database's functions:
-    /// <list type="bullet">
-    /// <item>the harness's reads and writes of its own tables, and of the statistics views, which stay evidence until H
-    /// marks the functions that write those tables, or the connection opens as the observer's;</item>
-    /// <item>the warmup's read before a session;</item>
-    /// <item>T4's setup, as the Microsoft Entra administrator, at a deploy.</item>
-    /// </list>
+    /// The runner's connections to T4 that open with the observer's marker (the coordinator's decision, 2026-11-23): the
+    /// observer's, the answer key's read, and the harness's control connections (a run's control connection and reset's,
+    /// status's, warmup's, and stop's).
+    /// </summary>
+    private static readonly SortedSet<string> MarkedOpens = new(StringComparer.Ordinal)
+    {
+        "Cli/CommandLine.Postgres.cs StatusT4Async",
+        "Cli/CommandLine.Postgres.cs WarmupT4Async",
+        "Cli/CommandLine.cs StopCommand",
+        "Postgres/PgScenarioRunner.cs ResetAsync",
+        "Postgres/PgScenarioRunner.cs RunAsync",
+        "Rca/AnswerKey/AnswerKeyRecorder.cs ReadPgAsync",
+        "Rca/Observer/PgCapture.cs OpenAsync",
+    };
+
+    /// <summary>
+    /// The runner's PostgreSQL work whose leave-out stays pending (the coordinator's decision, 2026-11-23): T4's setup, as
+    /// the Microsoft Entra administrator at a deploy, on connections of its own, and the statements only it sends; the
+    /// harness-table rule and the live probes cover it. ProfileHost (O1's) has nothing here: it opens no connection to T4,
+    /// since T4's activity profile is a file on T1, and its T4 runs and resets go through PgScenarioRunner's marked
+    /// connections.
     /// </summary>
     private static readonly SortedSet<string> PendingSites = new(StringComparer.Ordinal)
     {
-        "Cli/CommandLine.Postgres.cs WarmupT4Async",
-        "Postgres/PgDemoDatabase.cs GetConnectionLimitsAsync",
-        "Postgres/PgDemoDatabase.cs GetRunsAsync",
-        "Postgres/PgDemoDatabase.cs GetSeedScaleAsync",
-        "Postgres/PgDemoDatabase.cs GetServerViewAsync",
-        "Postgres/PgDemoDatabase.cs GetStopFlagsAsync",
-        "Postgres/PgDemoDatabase.cs ResetAsync",
+        "Cli/CommandLine.Postgres.cs SetupT4Async",
         "Postgres/PgScripts.cs ApplyAsync",
         "Postgres/PgScripts.cs EnsureEntraRoleAsync",
         "Postgres/PgScripts.cs GrantRunnerAsync",
@@ -1643,8 +1669,11 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         "Postgres/PgScripts.cs VerifyScenarioFunctionsAsync",
     };
 
-    /// <summary>A PostgreSQL text in the runner's code: where it is, its member's text, and its file's.</summary>
-    private sealed record SqlText(string File, int Line, string Member, string Text, bool Literal, string MemberText, string Source);
+    /// <summary>A PostgreSQL text in the runner's code: where it is, and whether it's a literal (else the expression a command text is set from).</summary>
+    private sealed record SqlText(string File, int Line, string Member, string Text, bool Literal);
+
+    /// <summary>A connection the runner opens to T4: where, its opener ("new" when inline, else its variable), and its arguments.</summary>
+    private sealed record PgOpen(string File, int Line, string Member, string Opener, string Arguments);
 
     /// <summary>A class member: where its declaration starts, its name, and its text up to the next member's.</summary>
     private sealed record SourceMember(int Start, string Name, string Text);
@@ -1657,20 +1686,13 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     private static List<SqlText> PostgreSqlTexts(string root)
     {
         var texts = new List<SqlText>();
-        foreach (var path in Directory.GetFiles(root, "*.cs", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
+        foreach (var (file, source) in RunnerSources(root))
         {
-            var file = Path.GetRelativePath(root, path).Replace('\\', '/');
-            if (file.StartsWith("obj/", StringComparison.Ordinal) || file.StartsWith("bin/", StringComparison.Ordinal))
-            {
-                continue;
-            }
-
-            var source = File.ReadAllText(path);
             var members = SourceMembers(source);
             var whole = file.StartsWith("Postgres/", StringComparison.Ordinal) || file is "Cli/CommandLine.Postgres.cs" or "Rca/Observer/PgCapture.cs";
             SourceMember? PostgreSql(int offset)
             {
-                var member = members.LastOrDefault(m => m.Start <= offset) ?? new SourceMember(0, "(file)", source);
+                var member = Member(members, offset, source);
                 return whole || PostgreSqlTypes().IsMatch(CommentLine().Replace(member.Text, string.Empty)) ? member : null;
             }
 
@@ -1679,7 +1701,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
                 var statement = WhiteSpace().Replace(text, " ").Trim();
                 if (SqlStart().IsMatch(statement) && PostgreSql(offset) is { } member)
                 {
-                    texts.Add(new SqlText(file, LineOf(source, offset), member.Name, statement, Literal: true, member.Text, source));
+                    texts.Add(new SqlText(file, LineOf(source, offset), member.Name, statement, Literal: true));
                 }
             }
 
@@ -1689,7 +1711,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
                 var sql = StringLiterals(expression).Any(l => SqlStart().IsMatch(WhiteSpace().Replace(l.Text, " ").Trim()));
                 if (!sql && PostgreSql(command.Index) is { } member)
                 {
-                    texts.Add(new SqlText(file, LineOf(source, command.Index), member.Name, expression, Literal: false, member.Text, source));
+                    texts.Add(new SqlText(file, LineOf(source, command.Index), member.Name, expression, Literal: false));
                 }
             }
         }
@@ -1698,32 +1720,148 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     /// <summary>
-    /// What a PostgreSQL text of the runner's is: the observer's, the workload's, the replica's, a helper's (it sends what
-    /// its callers pass, whose literals are classified where they are), pending (<see cref="PendingSites"/>), or null.
+    /// Every connection the runner opens to T4 or its replica: each OpenAsync on a PgConnectionOpener, inline, or through a
+    /// variable its member or its file declares as one, with its member, its opener, and its arguments as written.
     /// </summary>
-    private static string? Classify(SqlText site)
+    private static List<PgOpen> PostgreSqlOpens(string root)
     {
-        // The observer's: its connections, and the answer key's read on T4, open with the marker (PgCaptureConnector.Startup).
-        if (site.File == "Rca/Observer/PgCapture.cs")
+        var opens = new List<PgOpen>();
+        foreach (var (file, source) in RunnerSources(root))
         {
-            return site.Source.Contains("retry: false, Startup)", StringComparison.Ordinal) ? "observer" : null;
+            var code = CodeOnly(source);
+            var members = SourceMembers(source);
+            foreach (Match call in OpenCall().Matches(code))
+            {
+                var member = Member(members, call.Index, source);
+                var opener = "new";
+                if (call.Groups["receiver"].Success)
+                {
+                    opener = call.Groups["receiver"].Value;
+                    if ((DeclaredOpener(code.Substring(member.Start, member.Text.Length), opener) ?? DeclaredOpener(code, opener)) != "Pg")
+                    {
+                        continue;
+                    }
+                }
+
+                // The arguments, to the parenthesis that closes them, counted in the code alone.
+                var start = call.Index + call.Length;
+                var end = start;
+                var depth = 1;
+                while (end < code.Length)
+                {
+                    depth += code[end] switch { '(' => 1, ')' => -1, _ => 0 };
+                    if (depth == 0)
+                    {
+                        break;
+                    }
+
+                    end++;
+                }
+
+                opens.Add(new PgOpen(file, LineOf(source, call.Index), member.Name, opener, WhiteSpace().Replace(source[start..end], " ").Trim()));
+            }
         }
 
-        if (site.File == "Rca/AnswerKey/AnswerKeyRecorder.cs" && site.Member == "ReadPgAsync")
+        return opens;
+    }
+
+    /// <summary>"Pg" or "Sql" when <paramref name="code"/> declares <paramref name="name"/> as that runner's opener ("Pg" when both); null when it doesn't.</summary>
+    private static string? DeclaredOpener(string code, string name)
+    {
+        string Declared(string type) => $@"\b{type}ConnectionOpener\??\s+{Regex.Escape(name)}\b|\b{Regex.Escape(name)}\s*=\s*new\s+{type}ConnectionOpener\b";
+        return Regex.IsMatch(code, Declared("Pg")) ? "Pg" : Regex.IsMatch(code, Declared("Sql")) ? "Sql" : null;
+    }
+
+    /// <summary>
+    /// What a connection to T4 is: marked (it opens with the observer's marker), a workload session (one of a run's tagged
+    /// sessions, which must never carry the marker), the replica's, pending (<see cref="PendingSites"/>), or null.
+    /// </summary>
+    private static string? ClassifyOpen(PgOpen open)
+    {
+        var marked = open.Arguments.Contains("silent: PgCaptureConnector.Startup", StringComparison.Ordinal)
+            || (open.File == "Rca/Observer/PgCapture.cs" && open.Arguments.EndsWith(", Startup", StringComparison.Ordinal));
+        var workload = open.Arguments.StartsWith("context.ApplicationName,", StringComparison.Ordinal);
+        if (workload && marked)
         {
-            return site.MemberText.Contains("silent: PgCaptureConnector.Startup", StringComparison.Ordinal) ? "observer" : null;
+            return null;
+        }
+
+        return open.Opener == "replica" ? "replica"
+            : workload ? "workload"
+            : marked ? "marked"
+            : PendingSites.Contains(open.File + " " + open.Member) ? "pending" : null;
+    }
+
+    /// <summary>Whether every PgDemoDatabase the runner builds is built in a member whose connections to T4 are all marked, as the one it's built on is.</summary>
+    private static bool DemoDatabaseMarked(string root, List<PgOpen> opens)
+    {
+        var builds = new List<(string File, string Member)>();
+        foreach (var (file, source) in RunnerSources(root))
+        {
+            var members = SourceMembers(source);
+            builds.AddRange(DemoDatabaseBuild().Matches(CodeOnly(source)).Select(b => (file, Member(members, b.Index, source).Name)));
+        }
+
+        return builds.Count > 0
+            && builds.All(b => opens.Where(o => o.File == b.File && o.Member == b.Member).ToList() is { Count: > 0 } own && own.All(o => ClassifyOpen(o) == "marked"));
+    }
+
+    /// <summary>The runner's C# files under <paramref name="root"/>, by their path from it, in order, with their text.</summary>
+    private static List<(string File, string Source)> RunnerSources(string root)
+    {
+        var sources = new List<(string File, string Source)>();
+        foreach (var path in Directory.GetFiles(root, "*.cs", SearchOption.AllDirectories).Order(StringComparer.Ordinal))
+        {
+            var file = Path.GetRelativePath(root, path).Replace('\\', '/');
+            if (!file.StartsWith("obj/", StringComparison.Ordinal) && !file.StartsWith("bin/", StringComparison.Ordinal))
+            {
+                sources.Add((file, File.ReadAllText(path)));
+            }
+        }
+
+        return sources;
+    }
+
+    private static SourceMember Member(List<SourceMember> members, int offset, string source) =>
+        members.LastOrDefault(m => m.Start <= offset) ?? new SourceMember(0, "(file)", source);
+
+    /// <summary>
+    /// What a PostgreSQL text of the runner's is: marked (sent only on connections that open with the observer's marker),
+    /// the workload's, the replica's, a helper's (it sends what its callers pass, whose literals are classified where they
+    /// are), pending (<see cref="PendingSites"/>), or null.
+    /// </summary>
+    private static string? Classify(SqlText site, List<PgOpen> opens, bool databaseMarked)
+    {
+        List<PgOpen> Opens(string file, string? member = null) => [.. opens.Where(o => o.File == file && (member is null || o.Member == member))];
+
+        // The observer's: every block goes on its own connections.
+        if (site.File == "Rca/Observer/PgCapture.cs")
+        {
+            return Opens(site.File) is { Count: > 0 } capture && capture.All(o => ClassifyOpen(o) == "marked") ? "marked" : null;
         }
 
         // Sent only to T4's read replica, which records nothing in Query Store: every connection PgReplicaSessions opens is
         // the replica's, and replica-lag's report and checks run there.
         if (site.File == "Postgres/PgReplica.cs")
         {
-            return OpenedOn().Matches(site.Source).All(m => m.Groups["opener"].Value == "replica") ? "replica" : null;
+            return Opens(site.File) is { Count: > 0 } replica && replica.All(o => ClassifyOpen(o) == "replica") ? "replica" : null;
         }
 
         if (site.File == "Postgres/ReplicaLag.cs" && site.Member is "ReportSql" or "ReportHoldsSql" or "ReplicaStateSql")
         {
             return "replica";
+        }
+
+        // Sent on the connection its own member opens, marked: the answer key's read, and the warmup's.
+        if (Opens(site.File, site.Member) is { Count: > 0 } own && own.All(o => ClassifyOpen(o) == "marked"))
+        {
+            return "marked";
+        }
+
+        // PgDemoDatabase's statements, the harness's bookkeeping, go on the connection it's built on.
+        if (site.File == "Postgres/PgDemoDatabase.cs" && databaseMarked)
+        {
+            return "marked";
         }
 
         if (site.Literal)
@@ -1741,7 +1879,6 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         }
         else if ((site.File, site.Member, site.Text) switch
                  {
-                     ("Postgres/PgDemoDatabase.cs", "Command", "sql") => "helper",
                      ("Postgres/PgScenarioRunner.cs", "QueryRowAsync", "sql") => "helper",
                      ("Postgres/PgConnection.cs", "ApplyLimitsAsync", "LimitsCommand(limits)") => "workload",
                      _ => null,
@@ -1775,24 +1912,27 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     /// <summary>
-    /// C# string literals with their offsets: regular, verbatim, raw, and interpolated ones (their holes as written);
-    /// comments and character literals skipped.
+    /// The comments, character literals, and string literals in C# source: where each starts and ends, and a string's text
+    /// (regular, verbatim, raw, or interpolated, its holes as written); null for the others.
     /// </summary>
-    private static List<(int Offset, string Text)> StringLiterals(string source)
+    private static List<(int Start, int End, string? Text)> Tokens(string source)
     {
-        var literals = new List<(int Offset, string Text)>();
+        var tokens = new List<(int Start, int End, string? Text)>();
         var i = 0;
         while (i < source.Length)
         {
+            var start = i;
             if (string.CompareOrdinal(source, i, "//", 0, 2) == 0)
             {
                 var end = source.IndexOf('\n', i);
                 i = end < 0 ? source.Length : end;
+                tokens.Add((start, i, null));
             }
             else if (string.CompareOrdinal(source, i, "/*", 0, 2) == 0)
             {
                 var end = source.IndexOf("*/", i + 2, StringComparison.Ordinal);
                 i = end < 0 ? source.Length : end + 2;
+                tokens.Add((start, i, null));
             }
             else if (source[i] == '\'')
             {
@@ -1802,7 +1942,8 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
                     i += source[i] == '\\' ? 2 : 1;
                 }
 
-                i++;
+                i = Math.Min(i + 1, source.Length);
+                tokens.Add((start, i, null));
             }
             else if (source[i] is '"' or '$' or '@')
             {
@@ -1816,7 +1957,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
                 {
                     var prefix = source[i..quote];
                     var (end, text) = ReadLiteral(source, quote, prefix.Contains('@', StringComparison.Ordinal), prefix.Contains('$', StringComparison.Ordinal));
-                    literals.Add((i, text));
+                    tokens.Add((start, end, text));
                     i = end;
                 }
                 else
@@ -1830,7 +1971,29 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             }
         }
 
-        return literals;
+        return tokens;
+    }
+
+    /// <summary>C# string literals with their offsets; comments and character literals skipped.</summary>
+    private static List<(int Offset, string Text)> StringLiterals(string source) =>
+        [.. Tokens(source).Where(t => t.Text is not null).Select(t => (t.Start, t.Text!))];
+
+    /// <summary>The source with its comments and literals blanked, its lines kept, so a pattern or a parenthesis matches code only, at the same offset.</summary>
+    private static string CodeOnly(string source)
+    {
+        var code = source.ToCharArray();
+        foreach (var (start, end, _) in Tokens(source))
+        {
+            for (var i = start; i < end; i++)
+            {
+                if (code[i] is not ('\n' or '\r'))
+                {
+                    code[i] = ' ';
+                }
+            }
+        }
+
+        return new string(code);
     }
 
     /// <summary>The literal whose first quote is at <paramref name="quote"/>: where it ends, and its text.</summary>
@@ -2000,8 +2163,12 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [GeneratedRegex(@"^ {4}(?:(?:public|private|internal|protected|static|async|override|sealed|readonly|const|partial|new|virtual|abstract|required|unsafe|extern|file)\s+)+(?:(?:class|record|struct|interface|enum)\s+)?[^\r\n=;{]*?\b(?<name>[A-Za-z_]\w*)\s*(?:<[^>()\r\n]*>)?\s*(?:\(|=>|=(?!=)|\{|;|\r?$)", RegexOptions.Multiline)]
     private static partial Regex MemberDeclaration();
 
-    [GeneratedRegex(@"(?<opener>\w+)\.OpenAsync\(")]
-    private static partial Regex OpenedOn();
+    /// <summary>An OpenAsync call on a PgConnectionOpener built inline, or on a variable (its receiver), in code alone.</summary>
+    [GeneratedRegex(@"(?:\bnew\s+PgConnectionOpener\s*\([^()]*(?:\([^()]*\)[^()]*)*\)|\b(?<receiver>[A-Za-z_]\w*))!?\s*\.OpenAsync\s*\(")]
+    private static partial Regex OpenCall();
+
+    [GeneratedRegex(@"\bnew\s+PgDemoDatabase\s*\(")]
+    private static partial Regex DemoDatabaseBuild();
 
     [GeneratedRegex(@"^\s*//.*$", RegexOptions.Multiline)]
     private static partial Regex CommentLine();

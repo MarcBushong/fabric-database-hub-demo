@@ -5,11 +5,16 @@ using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Postgres;
 using ContosoCare.Workload.Profiles;
+using ContosoCare.Workload.Rca.Observer;
 using ContosoCare.Workload.Sql;
 
 namespace ContosoCare.Workload.Cli;
 
-/// <summary>T4's status, warmup, and setup (Phase 24, ADR 0019): the same commands and output shapes as T1 to T3, on PostgreSQL.</summary>
+/// <summary>
+/// T4's status, warmup, and setup (Phase 24, ADR 0019): the same commands and output shapes as T1 to T3, on PostgreSQL.
+/// Status and warmup open as the RCA observer's connections do (<see cref="PgCaptureConnector.Startup"/>), so T4's Query
+/// Store evidence leaves out their statements.
+/// </summary>
 internal static partial class CommandLine
 {
     /// <summary>
@@ -21,7 +26,7 @@ internal static partial class CommandLine
     /// </summary>
     private static async Task<int> StatusT4Async(ParseResult parseResult, PgEndpoint endpoint, PgEndpoint? replica, int runCount, string? profileFile, string? hostStateFile, bool json, RunnerLog log, CancellationToken cancellationToken)
     {
-        await using var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("status"), cancellationToken).ConfigureAwait(false);
+        await using var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("status"), cancellationToken, silent: PgCaptureConnector.Startup).ConfigureAwait(false);
         var database = new PgDemoDatabase(connection);
         var profile = await new FileProfileStore(profileFile ?? FileProfileStore.DefaultPathFor(DemoTarget.T4)).GetAsync(cancellationToken).ConfigureAwait(false);
         var runs = await database.GetRunsAsync(runCount, runningOnly: false, cancellationToken).ConfigureAwait(false);
@@ -102,7 +107,7 @@ internal static partial class CommandLine
     private static async Task<int> WarmupT4Async(ParseResult parseResult, PgEndpoint endpoint, bool json, RunnerLog log, CancellationToken cancellationToken)
     {
         var started = DateTimeOffset.UtcNow;
-        await using var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("warmup"), cancellationToken).ConfigureAwait(false);
+        await using var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("warmup"), cancellationToken, silent: PgCaptureConnector.Startup).ConfigureAwait(false);
         await using (var command = connection.CreateCommand())
         {
             command.CommandText = "SELECT count(*) FROM care.facilities; SELECT count(*) FROM demo.fn_scenario_catalog();";

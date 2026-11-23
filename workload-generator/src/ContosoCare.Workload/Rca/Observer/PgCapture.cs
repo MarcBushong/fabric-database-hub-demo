@@ -33,13 +33,15 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgS
     public const string ObserverSchema = "dbhubdemo_rca_observer";
 
     /// <summary>
-    /// The observer's search_path, a server option in its connections' startup packet, and only theirs (Npgsql's Options,
-    /// libpq's options): the server's default, <c>"$user", public</c>, with <see cref="ObserverSchema"/> last. A space in a
-    /// value is escaped with a backslash (https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-OPTIONS).
+    /// The observer's search_path, a server option in its connections' startup packet (Npgsql's Options, libpq's options):
+    /// the server's default, <c>"$user", public</c>, with <see cref="ObserverSchema"/> last. The runner's T4 control
+    /// connections open the same way (<see cref="Startup"/>), so RCA-PG-14 leaves out their statements too; its workload
+    /// sessions never do. A space in a value is escaped with a backslash
+    /// (https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-OPTIONS).
     /// </summary>
     internal const string SearchPathOption = """-c search_path="$user",\ public,\ """ + ObserverSchema;
 
-    /// <summary>How every observer connection opens: <see cref="SearchPathOption"/> and its limits in the startup packet, and no type loading.</summary>
+    /// <summary>How every observer connection, and the runner's T4 control connections, open: <see cref="SearchPathOption"/> and their limits in the startup packet, and no type loading.</summary>
     internal static readonly PgSilentStartup Startup = new(SearchPathOption);
 
     /// <summary>What every block runs after, in the same round trip, so no statistics view repeats an earlier snapshot.</summary>
