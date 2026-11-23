@@ -17,6 +17,7 @@ internal sealed class SpanWriter : ICaptureSpan
     private readonly Dictionary<string, TargetFile> files = new(StringComparer.Ordinal);
     private DateTimeOffset lastPersist = DateTimeOffset.MinValue;
     private bool closed;
+    private bool closeWritten;
 
     public SpanWriter(EvidenceStore store, string directory, SpanFile span)
     {
@@ -95,28 +96,35 @@ internal sealed class SpanWriter : ICaptureSpan
     {
         lock (gate)
         {
-            if (closed)
+            if (closeWritten)
             {
                 return;
             }
 
-            foreach (var state in span.Targets.Values)
+            if (!closed)
             {
-                if (state.Intervals.LastOrDefault() is { To: null } open)
+                foreach (var state in span.Targets.Values)
                 {
-                    open.To = at;
+                    if (state.Intervals.LastOrDefault() is { To: null } open)
+                    {
+                        open.To = at;
+                    }
                 }
+
+                span.ClosedUtc = at;
+                foreach (var file in files.Values)
+                {
+                    file.Stream.Dispose();
+                }
+
+                files.Clear();
+                closed = true;
             }
 
-            span.ClosedUtc = at;
-            foreach (var file in files.Values)
-            {
-                file.Stream.Dispose();
-            }
-
-            files.Clear();
-            closed = true;
+            // A close whose write of span.json failed writes it when called again (the re-check of 9440acf2): the observer
+            // lane tries a held span's close again each second.
             Persist(force: true);
+            closeWritten = true;
         }
 
         store.Closed(this);

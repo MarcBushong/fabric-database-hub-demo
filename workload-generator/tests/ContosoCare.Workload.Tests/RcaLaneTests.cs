@@ -205,6 +205,105 @@ public sealed class RcaLaneTests
     }
 
     [Fact]
+    public async Task AHeldSpansCloseThatFailsIsTriedAgainTheNextSecond()
+    {
+        // The re-check of 9440acf2: a failed write of span.json ended the loop that closes a held span, for good.
+        var (connector, gate, store, lane) = HoldingLane();
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            var (span, ended) = await HoldAtTheEndAsync(connector, gate, store);
+            span.CloseFailures = 2;
+            gate.Hold(DemoTarget.T1, false);
+            await Until(() => span.ClosedAt is not null);
+            Assert.Equal(ended, span.ClosedAt);
+            Assert.Equal(0, span.CloseFailures);
+            Assert.Single(store.Spans);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task ALaneStoppedDuringAHoldClosesTheSpanAtItsLastEndTryingAgainWhenItsWriteFails()
+    {
+        // The re-check of 9440acf2: the lane's stop closes a held span whatever the answer key does, and a failed write there
+        // was thrown out of the lane's stop.
+        var (connector, gate, store, lane) = HoldingLane();
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            var (span, ended) = await HoldAtTheEndAsync(connector, gate, store);
+            await Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+            Assert.Null(span.ClosedAt);
+            span.CloseFailures = 1;
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+            Assert.Equal(ended, span.ClosedAt);
+            Assert.Equal(0, span.CloseFailures);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task AProfileSetAfterTheEndDuringAHoldClosesTheHeldSpanAtItsLastEndAndOpensANewOne()
+    {
+        // The re-check of 9440acf2: a session that begins while the stopped session's span waits for the answer key gets a
+        // span of its own, and the stopped session's ends where its capture did.
+        var (connector, gate, store, lane) = HoldingLane();
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            var (span, ended) = await HoldAtTheEndAsync(connector, gate, store);
+            gate.Set(DemoTarget.T1, true, profileSetAt: DateTimeOffset.UtcNow);
+            await Until(() => store.Spans.Count == 2 && store.Spans[1].Membership.Any(m => m.Target == "T1" && m.Began));
+            Assert.Equal(ended, span.ClosedAt);
+            Assert.DoesNotContain(store.Spans[1].Membership, m => m.Target == "T5");
+            Assert.Null(store.Spans[1].ClosedAt);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task ANotedTargetsNewSessionDuringAHoldTriesTheHeldSpansCloseAgainWhenItFails()
+    {
+        // The re-check of 9440acf2: the note loop has no catch of its own, so a failed close of the held span when T5's next
+        // session began ended it, and T5 joined no span again.
+        var (connector, gate, store, lane) = HoldingLane();
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            var (span, ended) = await HoldAtTheEndAsync(connector, gate, store);
+            span.CloseFailures = 1;
+            gate.Set(DemoTarget.T5, true, profileSetAt: DateTimeOffset.UtcNow);
+            await Until(() => store.Spans.Count == 2 && store.Spans[1].Membership.Any(m => m.Target == "T5" && m.Began));
+            Assert.Equal(ended, span.ClosedAt);
+            Assert.Equal(0, span.CloseFailures);
+            Assert.DoesNotContain(store.Spans[1].Membership, m => m.Target == "T1");
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
     public async Task TheReplicaJoinsTheSpanOnlyOnceItAnswers()
     {
         var replica = new ScriptedConnector((_, _) => []) { OpenFailure = new CaptureException(CaptureFailureKind.Connection, "No such host is known.") };
@@ -241,6 +340,31 @@ public sealed class RcaLaneTests
         {
             return [.. connector.Calls.Select(c => c.BlockId)];
         }
+    }
+
+    /// <summary>A lane that observes T1 and notes T5, for the held span's tests.</summary>
+    private static (ScriptedConnector Connector, Gate Gate, Store Store, ObserverLane Lane) HoldingLane()
+    {
+        var connector = RcaSimulation.T1(new ManualTime(RcaSimulation.T1From));
+        var gate = new Gate();
+        var store = new Store();
+        return (connector, gate, store, new ObserverLane([new SqlTargetObserver("T1", DemoTarget.T1, connector, new ObserverOptions(), RunnerLog.Null)], [DemoTarget.T5], gate, store, RunnerLog.Null, TimeProvider.System));
+    }
+
+    /// <summary>
+    /// T1 and T5 in a session, then the capture's end while the answer key still has to record a T1 fault run that ended by
+    /// then: both captures end, and the span waits to close. Returns it, and when its last member ended.
+    /// </summary>
+    private static async Task<(MemorySink Span, DateTimeOffset Ended)> HoldAtTheEndAsync(ScriptedConnector connector, Gate gate, Store store)
+    {
+        gate.Set(DemoTarget.T1, true);
+        gate.Set(DemoTarget.T5, true);
+        await Until(() => Calls(connector).Contains("RCA-SQL-09") && store.Spans.Count == 1 && store.Spans[0].Membership.Any(m => m.Target == "T5" && m.Began));
+        var span = store.Spans[0];
+        gate.Hold(DemoTarget.T1, true);
+        store.EndedAt = DateTimeOffset.UtcNow;
+        await Until(() => span.Membership.Any(m => m.Target == "T1" && !m.Began) && span.Membership.Any(m => m.Target == "T5" && !m.Began));
+        return (span, span.Membership.Where(m => !m.Began).Max(m => m.At));
     }
 
     private static async Task Until(Func<bool> condition)

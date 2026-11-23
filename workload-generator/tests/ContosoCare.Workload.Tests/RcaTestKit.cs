@@ -50,6 +50,7 @@ internal sealed class MemorySink : ICaptureSpan
     private readonly List<CaptureNote> notes = [];
     private readonly List<(string Target, DateTimeOffset At, bool Began)> membership = [];
     private DateTimeOffset? closedAt;
+    private int closeFailures;
 
     public List<CaptureRow> Rows { get; } = [];
 
@@ -134,7 +135,33 @@ internal sealed class MemorySink : ICaptureSpan
     {
         lock (gate)
         {
+            if (closeFailures > 0)
+            {
+                closeFailures--;
+                throw new IOException("The process cannot access the file 'span.json' because it is being used by another process.");
+            }
+
             closedAt = at;
+        }
+    }
+
+    /// <summary>How many more times <see cref="Close"/> fails, as a write of span.json can, before it closes.</summary>
+    public int CloseFailures
+    {
+        get
+        {
+            lock (gate)
+            {
+                return closeFailures;
+            }
+        }
+
+        set
+        {
+            lock (gate)
+            {
+                closeFailures = value;
+            }
         }
     }
 

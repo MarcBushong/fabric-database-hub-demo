@@ -871,6 +871,25 @@ public sealed class RcaExportTests : IDisposable
     }
 
     [Fact]
+    public void ASpanWhoseCloseCouldntBeWrittenWritesItWhenClosedAgain()
+    {
+        // The re-check of 9440acf2: the observer lane tries a held span's close again each second, but the span took a close
+        // whose write of span.json failed for done, so span.json never said it closed while the runner ran.
+        var store = Store(T1From, out _);
+        var span = store.Open(T1From);
+        span.Began("T1", T1From);
+        var path = Path.Combine(span.Directory, "span.json");
+        var blocker = path + ".tmp";
+        Directory.CreateDirectory(blocker);
+        Assert.True(Record.Exception(() => span.Close(T1To)) is IOException or UnauthorizedAccessException);
+        Assert.Null(EvidenceStore.ReadJson(path, RcaStoreJsonContext.Default.SpanFile)!.ClosedUtc);
+
+        Directory.Delete(blocker);
+        span.Close(T1To);
+        Assert.Equal(T1To, EvidenceStore.ReadJson(path, RcaStoreJsonContext.Default.SpanFile)!.ClosedUtc);
+    }
+
+    [Fact]
     public async Task AfterTheCapturesEndOnlyTheRunsThatEndedByThenHoldTheAnswerKeyPending()
     {
         var store = Store(T1From, out _);

@@ -1685,6 +1685,8 @@ Describe 'Invoke-DemoGoldenControlPendingJob (2026-11-23)' {
         @{ Case = 'a job that failed'; Output = ''; Statuses = @('Running', 'Failed'); CreateFail = ''; Status = 'Failed'; Error = 'ended Failed: its job job-1, The sandbox ran out of memory' }
         @{ Case = 'a job Azure refused'; Output = ''; Statuses = @('Completed'); CreateFail = 'Forbidden'; Status = 'Failed'; Error = 'couldn''t be started: Forbidden' }
         @{ Case = 'a job with no result line'; Output = 'Request: pending by capture-t2-golden.ps1.'; Statuses = @('Completed'); CreateFail = ''; Status = 'NoResult'; Error = 'ended without a readable result: its job job-1' }
+        @{ Case = 'a Read without its lists (the review of 8ca2b39c)'; Output = 'DBHUB-CONTROL {"action":"pending","status":"Read","message":"x"}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
+        @{ Case = 'a Read whose lists aren''t an object (the review of 8ca2b39c)'; Output = 'DBHUB-CONTROL {"action":"pending","status":"Read","message":"x","pending":[]}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
     ) {
         $script:output = $Output
         $script:statuses = $Statuses
@@ -1697,12 +1699,12 @@ Describe 'Invoke-DemoGoldenControlPendingJob (2026-11-23)' {
         $job.Pending | Should -BeNullOrEmpty
     }
 
-    It 'stops waiting after -WaitSeconds, and leaves the read-only job to end by itself' {
+    It 'stops waiting after -WaitSeconds, and leaves the read-only job to end by itself, saying to wait for it before the capture again' {
         $script:statuses = @('Running')
         $job = Invoke-PendingJob -WaitSeconds 30
         $job.Ok | Should -BeFalse
         $job.Status | Should -Be 'TimedOut'
-        $job.Error | Should -Be 'didn''t end in 30 seconds: its job job-1 is Running'
+        $job.Error | Should -Be 'didn''t end in 30 seconds: its job job-1 is Running, and since it only reads, wait for it to end before you run the capture again'
         $script:statusReads | Should -Be 2
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -Times 0 -ParameterFilter { $Method -eq 'delete' }
     }
