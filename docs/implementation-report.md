@@ -5545,12 +5545,17 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
   - An `out-of-step` refusal is retried.
   - Two integration tests: the T-SQL upgrade, from earlier names to new ones with the run check following the module, and the refusal, which registers nothing.
 - **Pester:** under strict mode, with the Azure CLI guard, the eight suites that read the scripts or the catalog passed, with none failing: `Rca.Contract`, `Agent.PromptPack`, `Automation.Runbooks`, `DbHubDemo.Lifecycle`, `DbHubDemo.T3`, `DbHubDemo.T3Agent`, `DbHubDemo.T4`, and `DbHubDemo.Workload`, 1,341 in all.
+- **T4's upgrade on a real PostgreSQL 18.6,** a disposable local server in the session's own folder, with trust authentication on 127.0.0.1 only:
+  - The base commit's scripts, seed, and grants, then this branch's scripts and grants, as setup applies them: the 15 earlier functions are gone, the 15 new ones are in their schemas (`billing` 8, `frontdesk` 2, and one each in the others), and `demo.fn_seed_scale` stays. A second setup changes nothing.
+  - As `contosocare_runner`, each of the 13 steps ran under a run of its scenario, and the two helper functions through them. An earlier name failed with SQLSTATE 42883, and a stopped run's step with CC001.
+  - `PostgresTests.SetupRunAndResetAgainstALocalServer` passed: the runner's setup, a baseline run, and reset.
+  - The runner, against a database at the base commit, refused a cpu-pressure run with the out-of-step reason, and registered no run.
 - **The leak check** finds no identifier in what these commits add.
 - **Not run here:** this PC has no SQL Server, so the new T-SQL is checked by the parser (ScriptDom) and the static tests, not by an engine.
 
 **Risks.**
 
-- The T-SQL runs on an engine for the first time in its live check, or under the integration tests on a disposable SQL Server.
+- The T-SQL runs on an engine for the first time in its live check, or under the integration tests on a disposable SQL Server. The PostgreSQL ran on one here.
 - Run IDs keep their form until unit B lands.
 - What's still readable as a demo, though it names no scenario, is listed for a follow-up in the design: the scratch and mark tables, parameter names and values such as `@variant = 'problem'`, PostgreSQL result columns, run-event names, and the `demo.` control helpers inside the bodies.
 
