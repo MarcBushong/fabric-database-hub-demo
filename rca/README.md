@@ -74,11 +74,19 @@ Query Store records every statement a database runs, the capture's and the harne
 1. **The capture's own statements.**
    - **SQL Server and Azure SQL Database:** every catalog statement carries the marker `/* dbhubdemo:rca-observer */` inside its text, which Query Store keeps ("Comments and spaces inside text aren't ignored", [sys.query_store_query_text](https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-query-text-transact-sql)). RCA-SQL-10 and 14 leave out texts that carry it.
    - **PostgreSQL:** Query Store keeps one text per `query_id`, the first it saw, and `query_id` ignores comments, so a marker in the text isn't enough: T4 recorded the observer's statements before they carried one. So RCA-PG-14 has two rules:
-     - **the `search_path`:** the observer's T4 connections set `search_path` to `"$user", public, dbhubdemo_rca_observer`, a schema that doesn't exist, so names resolve as before. `query_store.qs_view` records `search_path` per row, and RCA-PG-14 leaves out the rows that name it, and the texts that carry the marker;
-     - **the catalog's own texts:** it also leaves out a row whose text equals one of the catalog's own PostgreSQL statements, today's or edd01c86's, once comments are stripped and white space is collapsed on both sides, prefix-matched where Query Store truncated the text (`pg_qs.max_query_text_length`). This covers the windows where an earlier runner's statements ran without the marker, which the first read after an update reaches. It also covers a `search_path` that Query Store kept from a query's first capture, which the live check L0c measures.
+     - **the `search_path`:** the observer's T4 connections, and only those, carry `search_path` `"$user", public, dbhubdemo_rca_observer` in their startup packet (`Options=-c search_path=...`); the schema doesn't exist, so names resolve as before. `query_store.qs_view` records `search_path` per row, and RCA-PG-14 leaves out the rows that name it, and the texts that carry the marker;
+     - **the catalog's own texts:** it also leaves out a row whose text equals one of the observer's own statements (RCA-PG-14's `$7`, `PgObserverStatements`):
+       - the catalog's PostgreSQL blocks, today's and edd01c86's;
+       - the observer's snapshot clear, and its limits' `SET` statements;
+       - Npgsql 10.0.3's type loading.
+
+       Both sides are compared with comments stripped, white space collapsed, and a final semicolon dropped. A row whose text Query Store didn't keep stays as evidence. The rule covers the windows where an earlier runner's statements ran without the marker, which the first read after an update reaches. It also covers a `search_path` that Query Store kept from a query's first capture, which the live check L0c measures.
 2. **The harness's bookkeeping and control modules,** which the demo marks where it defines them, so a rename carries the mark:
    - **SQL Server:** the extended property `dbhubdemo.role` = `harness` on every module `database/common/110-demo-control.sql` creates. RCA-SQL-10 and 14 leave out every statement whose `object_id` carries it.
-   - **PostgreSQL:** `COMMENT ON FUNCTION ... IS 'dbhubdemo:harness'` on its control functions. Query Store records a statement nested in a function without its function (`pg_qs.query_capture_mode` `all`), so RCA-PG-16 reads, at the observer's start, the marked functions and the tables only marked functions write; RCA-PG-14 leaves out a call of a marked function, and a statement whose tables are all ones only the harness writes. A scenario function's own read of a run table is then left out too: it's bookkeeping.
+   - **PostgreSQL:** `COMMENT ON ROUTINE ... IS 'dbhubdemo:harness'` on its control routines. Query Store records a statement nested in a function without its function (`pg_qs.query_capture_mode` `all`). So, at the observer's start, RCA-PG-16 reads the marked routines and the tables they write.
+     - **A table is the workload's** when any unmarked routine mentions it at all.
+     - **When the rule turns off:** a routine with `EXECUTE` (dynamic SQL), or with no source, makes RCA-PG-16 report it as unsure (`dynamic_sql`, `no_source`). It then names no harness table, and the sidecar's coverage says why.
+     - **What RCA-PG-14 leaves out:** a call of a marked routine, and a statement whose tables are all harness tables.
 
 Everything else is measured evidence, normalized as RCA Sessions' text is: the scenario modules' reads and writes, other applications' statements, and monitoring queries (Database Hub's among them). Modules keep their database names ([Names](#names)).
 
@@ -168,7 +176,7 @@ What the observer captures beyond the evidence document, in documents of their o
 
 - **What's read:** RCA-SQL-10, 11, 14, and 15 on T1 to T3, and RCA-AZ-03 and 04 for T3's automatic tuning; RCA-PG-13 to 16 on T4. T4's replica records nothing in Query Store ([Learn](https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store)), which its coverage says.
 - **When:**
-  - every 15 minutes, 2 minutes after a Query Store interval ends. The intervals are 15 minutes on every target: `database/*/030-configure.sql`, and T4's `pg_qs.interval_length_minutes` default;
+  - every 15 minutes, 2 minutes after a Query Store interval ends. The intervals are 15 minutes on every target: `database/*/030-configure.sql`, and T4's `pg_qs.interval_length_minutes` default. On T4, each read takes again the intervals that ended in the last 20 minutes, until they've settled, and writes a row again only when it changed;
   - at the observer's start, the 2 hours before it (8 intervals), so a rule has a baseline;
   - at its end, with SQL Server's open interval: Query Store unifies its in-memory and on-disk data when it's read;
   - RCA-SQL-15 every 60 s; RCA-PG-13 with each read.
