@@ -35,7 +35,9 @@ describe("the replica's lag (finding 1)", () => {
             "waited for AccessExclusiveLock on demo.replica_lag_marks from 16:16:21 UTC",
             "(AccessShareLock; session 5883, ContosoCare.Demo: SELECT r.marks_seen",
             "578598600 bytes received but not replayed",
-            "write and flush lag at most 7.132 s",
+            // The stall's own samples (the review of 921d3097): the 7.132 s once said here is the primary's at 16:19:47, 20 s
+            // after the recovery at 16:19:27, while the replica replayed its backlog.
+            "write and flush lag at most 0.043 s",
             "the query ended before that, so nothing was cancelled",
         ]) {
             expect(r.rootCause?.statement).toContain(fact);

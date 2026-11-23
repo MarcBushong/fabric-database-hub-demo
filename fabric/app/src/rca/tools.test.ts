@@ -11,7 +11,7 @@ import { emptyListNote } from "./view/facts";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { live, liveSources } from "./testdata/live-rb-2233e0ae";
 import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
-import { emptyEvidence, type EventRow, type Evidence, type InvestigationResult, type RcaTarget } from "./types";
+import { during, emptyEvidence, fromTo, openCountWords, type EventRow, type Evidence, type InvestigationResult, type RcaTarget } from "./types";
 
 const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
 const minute = (from: string, n: number) => new Date(at(from).getTime() + n * 60_000);
@@ -372,6 +372,94 @@ describe("every family the RCA explains", () => {
         };
         const marked = await ask("explain_incident", { episodeKey: episode.key }, tools({ evidence: rows, telemetry: { bins } }));
         expect(marked.notCaptured.filter((line) => line.startsWith("T1: no RCA"))).toEqual(["T1: no RCA evidence at 15:15:00 UTC"]);
+    });
+});
+
+// The review of 921d3097: F5 told one instant by its time of day alone, so a day's minutes read as one instant, "T2: no RCA
+// capture recorded at 17:00:00 UTC", in answers the chat is grounded on. One instant is the same second now, and a span
+// whose ends fall on two UTC days gives their dates, so it can't read "17:00:00-17:00:00" or run backwards across midnight.
+describe("a span across two UTC days", () => {
+    const bin = (when: Date, blocked: number) => ({ at: when, target: "T1" as const, cpu: 20, blocked, lockWaitS: null, bufferIoS: null, logRateS: null, waitS: null, ioMb: null, batch: null, sessions: null });
+    const day1 = (hms: string) => new Date(`2026-11-19T${hms}Z`);
+    const sameTime = /(\d\d:\d\d:\d\d)(-| to | and )\1 UTC/;
+
+    it("says a day's minutes with their dates, never as one instant: the review's find_incidents call, and nothing abnormal in them", async () => {
+        const deps = tools({ evidence: emptyEvidence() });
+        const day = { from: "2026-11-19T17:00:00Z", to: "2026-11-20T17:00:00Z" };
+        const found = await ask("find_incidents", { ...day, targets: ["T2"] }, deps);
+        expect(found.notCaptured).toEqual(["T2: no RCA capture recorded from 2026-11-19 17:00:00 to 2026-11-20 17:00:00 UTC; only the telemetry (Telemetry Snapshots) is known"]);
+        const nothing = await ask("explain_incident", { ...day, target: "T2" }, deps);
+        expect(nothing.notCaptured).toContain("Nothing abnormal on T2 from 2026-11-19 17:00:00 to 2026-11-20 17:00:00 UTC: the detector found no episode there.");
+        expect(JSON.stringify([found, nothing])).not.toMatch(sameTime);
+        expect(JSON.stringify([found, nothing])).not.toMatch(/at 17:00:00 UTC/);
+    });
+
+    it("says a coverage row a day long with its dates", async () => {
+        const evidence: Evidence = { ...emptyEvidence(), coverage: [{ target: "T1", from: day1("15:00:00"), to: at("15:00:00"), captured: false, sources: [], gaps: [] }] };
+        const r = await ask("explain_errors", { from: "2026-11-19T14:00:00Z", to: "2026-11-20T16:00:00Z", targets: ["T1"] }, tools({ evidence, telemetry: {} }));
+        expect(r.notCaptured).toContain("T1: no RCA evidence from 2026-11-19 15:00:00 to 2026-11-20 15:00:00 UTC");
+        expect(JSON.stringify(r)).not.toMatch(/at 15:00:00 UTC/);
+    });
+
+    it("says blocked processes a day apart, and a day's minutes with no chain, as spans with their dates", async () => {
+        // One bin of blocked processes at 15:15 on each day, each the telemetry's last before a break.
+        const bins = [...Array.from({ length: 11 }, (_, i) => bin(new Date(day1("15:05:00").getTime() + i * 60_000), i === 10 ? 3 : 0)), ...Array.from({ length: 11 }, (_, i) => bin(minute("15:05:00", i), i === 10 ? 3 : 0))];
+        const captured = (from: Date, to: Date): Evidence => ({ ...emptyEvidence(), coverage: [{ target: "T1", from, to, captured: true, sources: ["RCA-SQL-01", "RCA-SQL-09"], gaps: [] }] });
+        // The capture started after both: they're the telemetry's only.
+        const telemetryOnly = await ask("explain_locking", { from: "2026-11-19T15:00:00Z", to: "2026-11-20T15:30:00Z", targets: ["T1"] }, tools({ evidence: captured(at("15:20:00"), at("16:00:00")), telemetry: { bins } }));
+        expect(telemetryOnly.notCaptured).toContain(
+            "T1: the blocked processes from 2026-11-19 15:15:00 to 2026-11-20 15:15:00 UTC are in Database Hub's telemetry only: the capture wasn't running then, so it has no blocking chain for them, and neither the head blocker nor its statement is known.",
+        );
+        // The capture's sentinel saw blocked processes at 16:00, with no chain in its samples: asked about the day up to just
+        // after them, the note gives the day's minutes with their dates.
+        const sentinel: Evidence = {
+            ...emptyEvidence(),
+            events: [
+                { target: "T1", at: at("16:00:00"), kind: "capture", name: "escalated", code: "T1-20261120T160000Z", count: 1, detail: "processes_blocked 2 >= 1: blocking detail (RCA-SQL-01) every 10 s." },
+                { target: "T1", at: at("16:01:30"), kind: "capture", name: "relaxed", code: "T1-20261120T160000Z", count: 1, detail: "processes_blocked 0 for 60 s: back to the 30-s sentinel." },
+            ],
+            resource: [{ target: "T1", at: at("16:00:00"), source: "RCA-SQL-09", metric: "processes_blocked", value: 2 }],
+            coverage: [{ target: "T1", from: at("15:30:00"), to: at("16:30:00"), captured: true, sources: ["RCA-SQL-01", "RCA-SQL-09"], gaps: [] }],
+        };
+        const noChain = await ask("explain_locking", { from: "2026-11-19T16:01:00Z", to: "2026-11-20T16:01:00Z", targets: ["T1"] }, tools({ evidence: sentinel, telemetry: {} }));
+        expect(noChain.notCaptured.find((line) => line.startsWith("T1: the blocked processes"))).toMatch(/^T1: the blocked processes from 2026-11-19 16:01:00 to 2026-11-20 16:01:00 UTC left no blocking chain in the capture: /);
+        expect(JSON.stringify([telemetryOnly, noChain])).not.toMatch(sameTime);
+        expect(JSON.stringify([telemetryOnly, noChain])).not.toMatch(/at 15:15:00 UTC/);
+    });
+
+    it("says errors a day apart with their dates, in explain_errors and in triage, never backwards across the day", async () => {
+        const events = [day1("16:00:00"), at("15:00:00")].map((when) => ({ target: "T1" as const, at: when, kind: "error" as const, code: "1222", count: 1, program: "ContosoCare.Demo", detail: "Lock request time out period exceeded." }));
+        const deps = tools({ evidence: { ...emptyEvidence(), events }, telemetry: {} });
+        const day = { from: "2026-11-19T15:00:00Z", to: "2026-11-20T16:00:00Z", targets: ["T1"] };
+        const errors = await ask("explain_errors", day, deps);
+        expect(errors.findings[0].detail).toContain("2 lock timeouts on T1 between 2026-11-19 16:00:00 and 2026-11-20 15:00:00 UTC");
+        expect(errors.rootCause?.statement).toContain("(2, 2026-11-19 16:00:00 to 2026-11-20 15:00:00 UTC, mostly");
+        const triage = await ask("triage_window", day, deps);
+        expect(triage.findings.map((f) => f.title)).toContain("T1: 2 errors and cancels from 2026-11-19 16:00:00 to 2026-11-20 15:00:00 UTC.");
+        expect(JSON.stringify([errors, triage])).not.toMatch(/16:00:00 (and|to) 15:00:00/);
+        // Counts beside an interval whose length isn't known say their span the same way.
+        expect(openCountWords({ count: 30, from: at("15:00:00"), intervals: 1 }, { count: 5, first: day1("16:00:00"), last: at("14:00:00") })).toBe(
+            "30 in the interval from 15:00:00 UTC, whose length isn't known in these minutes, after the 5 counted from 2026-11-19 16:00:00 to 2026-11-20 14:00:00 UTC",
+        );
+    });
+
+    it("still says one instant 'at' it, and a span within one UTC day by its times", async () => {
+        expect([fromTo(at("15:15:00"), at("15:15:00")), during(at("15:15:00"), new Date(at("15:15:00").getTime() + 400))]).toEqual(["at 15:15:00", "at 15:15:00"]);
+        expect([fromTo(at("15:15:00"), at("15:20:00")), during(at("15:15:00"), at("15:20:00"))]).toEqual(["from 15:15:00 to 15:20:00", "between 15:15:00 and 15:20:00"]);
+        // Across midnight, its dates, though it lasts minutes.
+        expect(fromTo(day1("23:55:00"), at("00:05:00"))).toBe("from 2026-11-19 23:55:00 to 2026-11-20 00:05:00");
+    });
+
+    it("says an incident's no-capture note across midnight once, though its part reads wider minutes", async () => {
+        const bins = Array.from({ length: 21 }, (_, i) => bin(new Date(day1("23:50:00").getTime() + i * 60_000), i >= 5 && i <= 15 ? 3 : 0));
+        const deps = tools({ evidence: emptyEvidence(), telemetry: { bins } });
+        const [episode] = (await deps.episodes(day1("23:40:00"), at("00:20:00"), ["T1"])).filter((e) => e.family === "blocking");
+        const end = episode.end ?? episode.last;
+        expect([episode.start.toISOString(), end.toISOString().slice(0, 10)]).toEqual(["2026-11-19T23:55:00.000Z", "2026-11-20"]);
+        const incident = await ask("explain_incident", { episodeKey: episode.key }, deps);
+        expect(incident.notCaptured.filter((line) => line.startsWith("T1: no RCA"))).toEqual([
+            `T1: no RCA capture recorded from 2026-11-19 23:55:00 to ${end.toISOString().slice(0, 19).replace("T", " ")} UTC; only the telemetry (Telemetry Snapshots) is known`,
+        ]);
     });
 });
 

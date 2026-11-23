@@ -4,7 +4,7 @@
 // event session and Azure Monitor's counts (T4's failed connections, T5's 429s), never the workload's own account of them.
 
 import { recommend } from "./catalog";
-import { during, hhmmss, iso, openCountWords, openKnownCount, type EventRow, type EvidenceRef, type Finding, type InvestigationResult, type RcaTarget } from "./types";
+import { during, hhmmss, iso, openCountWords, openKnownCount, sameSecond, spanEnds, type EventRow, type EvidenceRef, type Finding, type InvestigationResult, type RcaTarget } from "./types";
 
 export interface ErrorClass {
     id: string;
@@ -120,7 +120,7 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
         target: c.targets[0],
         severity: c.count >= 100 ? "critical" : "warning",
         title: `${c.title}: ${stoppedAt ? "at least " : ""}${c.open && c.known ? `${c.open.count} in an interval of unknown length, ${c.known.count} counted` : c.count}`,
-        detail: `${stoppedAt ? `At least ${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} from ${hhmmss(c.first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped` : `${c.open ? openCountWords(c.open, c.known, `${c.title.toLowerCase()} on ${c.targets.join(", ")}`) : `${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} ${during(c.first, c.last)} UTC`}`}, mostly ${c.top}${c.intercepted ? ` (${c.intercepted} caught by the code's own TRY...CATCH)` : ""}. ${c.cause}`,
+        detail: `${stoppedAt ? `At least ${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} from ${spanEnds(c.first, stoppedAt).join(" UTC through ")} UTC, where the read stopped` : `${c.open ? openCountWords(c.open, c.known, `${c.title.toLowerCase()} on ${c.targets.join(", ")}`) : `${c.count} ${c.title.toLowerCase()} on ${c.targets.join(", ")} ${during(c.first, c.last)} UTC`}`}, mostly ${c.top}${c.intercepted ? ` (${c.intercepted} caught by the code's own TRY...CATCH)` : ""}. ${c.cause}`,
         evidence: c.evidence,
     }));
     return { classes, findings };
@@ -130,7 +130,8 @@ export function summarizeErrors(events: readonly EventRow[], stoppedAt?: Date): 
 export function analyzeErrorsResult(events: readonly EventRow[], stoppedAt?: Date): Pick<InvestigationResult, "findings" | "rootCause" | "recommendations" | "nextSteps" | "details"> {
     const { classes, findings } = summarizeErrors(events, stoppedAt);
     const top = classes[0];
-    const span = (c: ErrorSummary) => (stoppedAt ? `at least ${c.count}, ${hhmmss(c.first)} through ${hhmmss(stoppedAt)} UTC, where the read stopped` : c.open ? openCountWords(c.open, c.known) : `${c.count}, ${c.first.getTime() === c.last.getTime() ? `at ${hhmmss(c.first)}` : `${hhmmss(c.first)} to ${hhmmss(c.last)}`} UTC`);
+    // A span across two UTC days with its dates (the review of 921d3097), and one instant "at" it.
+    const span = (c: ErrorSummary) => (stoppedAt ? `at least ${c.count}, ${spanEnds(c.first, stoppedAt).join(" through ")} UTC, where the read stopped` : c.open ? openCountWords(c.open, c.known) : `${c.count}, ${sameSecond(c.first, c.last) ? `at ${hhmmss(c.first)}` : spanEnds(c.first, c.last).join(" to ")} UTC`);
     return {
         findings,
         rootCause: top

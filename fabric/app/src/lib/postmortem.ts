@@ -277,7 +277,8 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
         // A fault that isn't measured still has its injection, from Scenario Runs.
         ...unscored.map((r) => ({ event: { at: r.windowStart ?? plan.start, kind: "injected" as const }, row: [time(r.windowStart), r.target, EVENT_LABEL.injected, `${faultTitle(r)} on ${r.target} (not measured)`] })),
     ].sort((a, b) => comparePlanEvents(a.event, b.event));
-    if (timeline.length === 0) lines.push("No event in this window.");
+    // With the filter hiding all of the session's faults, it's the shown targets that have none (the review of 3c0f5aeb).
+    if (timeline.length === 0) lines.push(filtered ? `No event ${SHOWN}.` : "No event in this window.");
     else lines.push(...table(["Time", "Target", "Event", "Detail"], timeline.map((t) => t.row)));
     lines.push("");
 
@@ -357,7 +358,7 @@ export function buildPostmortem(input: PostmortemInput): Postmortem {
     const unanswered = scores.length - answered.length;
     if (unanswered > 0) lines.push(`- ${answered.length > 0 ? "The other" : "The"} ${unanswered} fault${unanswered === 1 ? "" : "s"} had no response step: each ended at its time limit.`);
     if (unscored.length > 0) lines.push(`- ${NOT_MEASURED}`);
-    else if (scores.length === 0) lines.push("- No response step in this window.");
+    else if (scores.length === 0) lines.push(filtered ? `- No response step ${SHOWN}.` : "- No response step in this window.");
     lines.push("");
 
     lines.push("## Times to signal and recover", "");

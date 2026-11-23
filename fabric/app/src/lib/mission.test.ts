@@ -759,18 +759,27 @@ describe("the postmortem", () => {
             // its Summary, Impact, and Follow-ups speak of the targets the filter shows, and the Summary points to the key (the
             // review of 96abcf65: they said "No fault was injected in this window" beside the key's list of its faults).
             const none = buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: all, rca: investigated, hidden: null }).markdown;
-            expect(none).not.toMatch(/injected nothing|No fault was injected|nothing was injected|Nothing was injected/);
+            // The review of 3c0f5aeb: the Timeline and the Response still said "No event in this window." and "No response step
+            // in this window.", though the hidden T3 plan regression was answered at 14:26.
+            const empty = /injected nothing|No fault was injected|nothing was injected|Nothing was injected|No event in this window|No response step in this window/;
+            expect(none).not.toMatch(empty);
             expect(sectionOf(none, "Summary")).toContain("- None of the session's faults is on the targets this page's filter shows: its 4 faults are on T1, T2, and T3, which the filter hides, and the answer key below lists them.\n");
+            expect(sectionOf(none, "Timeline (UTC)")).toContain("No event on the targets this page's filter shows.");
             expect(sectionOf(none, "Impact on ContosoCare")).toContain("No measured impact on the targets this page's filter shows: the session's faults are all on targets it hides.");
+            expect(sectionOf(none, "Response")).toContain("- No response step on the targets this page's filter shows.");
             expect(sectionOf(none, "Follow-ups")).toContain("- None from the data on the targets this page's filter shows: the session's faults are all on targets it hides.");
             expect(sectionOf(none, "What the demo injected (answer key)")).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.\n");
             // Without the RCA tables, the same, with no key to point to; the Cause, which lists what was injected then, too.
             const plain = buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: all }).markdown;
-            expect(plain).not.toMatch(/injected nothing|No fault was injected|nothing was injected|Nothing was injected|answer key/);
+            expect(plain).not.toMatch(new RegExp(`${empty.source}|answer key`));
             expect(sectionOf(plain, "Summary")).toContain("- None of the session's faults is on the targets this page's filter shows: its 4 faults are on T1, T2, and T3, which the filter hides.\n");
+            expect(sectionOf(plain, "Timeline (UTC)")).toContain("No event on the targets this page's filter shows.");
+            expect(sectionOf(plain, "Response")).toContain("- No response step on the targets this page's filter shows.");
             expect(sectionOf(plain, "Cause")).toContain("None of the session's faults is on the targets this page's filter shows.");
             // A window with no fault on any target still says so.
-            expect(sectionOf(buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: [{ ...shown, faults: [] }] }).markdown, "Summary")).toContain("- No fault was injected in this window: Scenario Runs has no incident request in it.");
+            const nothing = buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: [{ ...shown, faults: [] }] }).markdown;
+            expect(sectionOf(nothing, "Summary")).toContain("- No fault was injected in this window: Scenario Runs has no incident request in it.");
+            expect([sectionOf(nothing, "Timeline (UTC)"), sectionOf(nothing, "Response")].join("\n")).toMatch(/No event in this window\.[\s\S]*- No response step in this window\./);
             // Without the investigation, the answer key is the release's: what the filter shows.
             expect(buildPostmortem({ ...filtered, plans: all, hidden }).markdown).not.toMatch(/filter hides|Memory grant|Connection surge/);
         });

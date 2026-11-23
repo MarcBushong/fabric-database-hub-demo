@@ -4,7 +4,7 @@
 
 import { describeEpisode } from "./detector";
 import { AZURE_MONITOR, summarizeErrors } from "./errors";
-import { asWholeReadings, hhmmss, metricIn, openCountWords, plural, type Episode, type EventRow, type Evidence, type RcaTarget } from "./types";
+import { asWholeReadings, fromTo, metricIn, openCountWords, plural, spanEnds, type Episode, type EventRow, type Evidence, type RcaTarget } from "./types";
 
 export interface Hypothesis {
     target: RcaTarget;
@@ -99,17 +99,17 @@ export function triageWindow(input: { evidence: Evidence; episodes: readonly Epi
         const openFrom = opened.length ? new Date(Math.min(...opened.map((c) => c.open!.from.getTime()))) : null;
         const first = new Date(starts.length ? Math.min(...starts) : (openFrom ?? new Date(0)).getTime());
         const last = new Date(ends.length ? Math.max(...ends) : first.getTime());
-        const when = (a: Date, b: Date) => (a.getTime() === b.getTime() ? `at ${hhmmss(a)}` : `from ${hhmmss(a)} to ${hhmmss(b)}`);
+        // One instant "at" it, and a span across two UTC days with its dates (fromTo; the review of 921d3097).
         const errorsOrCancels = (count: number) => (count === 1 ? "error or cancel" : "errors and cancels");
         const where = counted.length > 0 ? ` (${AZURE_MONITOR} counts included)` : "";
         // A read that stopped short counted them only up to there (the review of d431edb4).
         const span = stoppedAt
-            ? `at least ${plural(n, "error or cancel", "errors and cancels")} from ${hhmmss(first)} UTC through ${hhmmss(stoppedAt)} UTC, where the read stopped`
+            ? `at least ${plural(n, "error or cancel", "errors and cancels")} from ${spanEnds(first, stoppedAt).join(" UTC through ")} UTC, where the read stopped`
             : opened.length === 0
-              ? `${plural(n, "error or cancel", "errors and cancels")} ${when(first, last)} UTC`
+              ? `${plural(n, "error or cancel", "errors and cancels")} ${fromTo(first, last)} UTC`
               : classes.length === 1
                 ? openCountWords(opened[0].open!, opened[0].known, errorsOrCancels(opened[0].open!.count))
-                : `${plural(n, "error or cancel", "errors and cancels")}: ${classes.map((c) => (c.open ? openCountWords(c.open, c.known, c.title.toLowerCase()) : `${c.count} ${c.title.toLowerCase()} ${when(c.first, c.last)} UTC`)).join("; ")}`;
+                : `${plural(n, "error or cancel", "errors and cancels")}: ${classes.map((c) => (c.open ? openCountWords(c.open, c.known, c.title.toLowerCase()) : `${c.count} ${c.title.toLowerCase()} ${fromTo(c.first, c.last)} UTC`)).join("; ")}`;
         hypotheses.push({ target, family: "errors", score: Math.round((4 + Math.min(4, Math.log10(n + 1))) * 10) / 10, summary: `${target}: ${span}${where}.`, nextTool: "explain_errors" });
     }
     hypotheses.sort((a, b) => b.score - a.score);

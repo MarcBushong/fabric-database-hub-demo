@@ -187,6 +187,10 @@ describe("the report's root cause, never blank", () => {
         const span = "T4-replica: no RCA capture recorded for 16:55:00-16:59:00 UTC; only the telemetry (Telemetry Snapshots) is known";
         expect(at([instant], [span])).toEqual([instant]);
         expect(at([span], [instant, "T4-replica: no RCA evidence at 16:59:00 UTC"])).toEqual([span]);
+        // The review of 921d3097: a span across two UTC days reads "from" one date and time "to" the other, a note all the same.
+        const days = "T4-replica: no RCA capture recorded from 2026-11-20 23:55:00 to 2026-11-21 00:05:00 UTC; only the telemetry (Telemetry Snapshots) is known";
+        expect(at([days], [span, "T4-replica: no RCA evidence from 2026-11-20 23:50:00 to 2026-11-21 00:10:00 UTC"])).toEqual([days]);
+        expect(at([span], [days])).toEqual([span]);
     });
 
     // The re-review of ab1d2d41: an incident across two coverage rows not captured has a line for each, and the view kept

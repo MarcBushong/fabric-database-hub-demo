@@ -315,17 +315,28 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
 
     const inWindow = input.samples.filter((s) => s.at.getTime() >= from && s.at.getTime() <= to);
     const replica = inWindow.filter((s) => s.side === "replica");
-    const primary = inWindow.filter((s) => s.side === "primary");
+    // The capture's samples say what replay did only when they're from the stall itself (the rise's own samples, from its
+    // last replay on). Final tests' check of ddebd4c3 (F4): Azure Monitor's 68 s from 18:54, after the capture's last sample
+    // at 18:53:23 (0.1 s since a replay), read as replay slower than WAL, "0 bytes behind", from that sample's minutes.
+    const sawStall = rise.lastReplay !== undefined;
+    // The figures a cause rests on, then, are the stall's own too: from replay's last advance to its recovery, not the
+    // recovery's sample, by which replay had resumed, or to its last point when it hadn't recovered (the review of 921d3097:
+    // a sample a minute before the stall, with 512 bytes in flight from a busy primary, read as slow replay "512 bytes
+    // behind, WAL about 0 bytes/s" for a stall whose own samples held 0 behind, from an idle primary).
+    const ofStall = (s: ReplicaSample) => s.at.getTime() >= rise.lastReplay!.getTime() && (rise.recovered ? s.at < rise.end : s.at <= rise.end);
+    const figures = sawStall ? inWindow.filter(ofStall) : inWindow;
+    const figuresReplica = figures.filter((s) => s.side === "replica");
+    const figuresPrimary = figures.filter((s) => s.side === "primary");
     // A conflict is this rise's only from when its replay stood still: the minute before it can hold the last stall's
     // (the review of ebd1c6c3).
     const stoodFrom = (rise.lastReplay ?? rise.stalledSince).getTime();
     const conflicts = replica.filter((s) => s.conflictRelation && s.conflictHolder !== undefined && s.at.getTime() >= stoodFrom);
     const conflict = conflicts[0];
     const waitStart = conflicts.find((s) => s.conflictWaitStart)?.conflictWaitStart;
-    const backlog = Math.max(0, ...replica.map((s) => s.receivedNotReplayedBytes ?? 0));
-    const maxWriteLag = Math.max(0, ...primary.map((s) => Math.max(s.writeLagS ?? 0, s.flushLagS ?? 0)));
-    const maxSendGap = Math.max(0, ...primary.map((s) => s.sendGapBytes ?? 0));
-    const walRate = primary.filter((s) => s.walBytesPerS !== undefined).map((s) => s.walBytesPerS as number);
+    const backlog = Math.max(0, ...figuresReplica.map((s) => s.receivedNotReplayedBytes ?? 0));
+    const maxWriteLag = Math.max(0, ...figuresPrimary.map((s) => Math.max(s.writeLagS ?? 0, s.flushLagS ?? 0)));
+    const maxSendGap = Math.max(0, ...figuresPrimary.map((s) => s.sendGapBytes ?? 0));
+    const walRate = figuresPrimary.filter((s) => s.walBytesPerS !== undefined).map((s) => s.walBytesPerS as number);
     // The median, so a short burst (the primary taking its lock) doesn't stand for the rate the replica received.
     const avgWal = walRate.length ? Math.round([...walRate].sort((a, b) => a - b)[Math.floor(walRate.length / 2)]) : null;
     const cancels = Math.max(0, ...replica.map((s) => s.conflictsCancelled ?? 0));
@@ -335,10 +346,6 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     const watchedRefs = watched.slice(0, 2).map((e) => ({ table: "RCA Events", at: iso(e.at), target: e.target, text: `capture ${e.name}: ${e.detail}` }));
 
     if (replica.length === 0) notCaptured.push("The replica's replay state (RCA Replica) wasn't captured for these minutes: the explanation rests on the metric's shape alone.");
-    // The capture's samples say what replay did only when they're from the stall itself (the rise's own samples, from its
-    // last replay on). Final tests' check of ddebd4c3 (F4): Azure Monitor's 68 s from 18:54, after the capture's last sample
-    // at 18:53:23 (0.1 s since a replay), read as replay slower than WAL, "0 bytes behind", from that sample's minutes.
-    const sawStall = rise.lastReplay !== undefined;
 
     let ruleId: string;
     let statement: string;
@@ -349,9 +356,15 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
         ruleId = "REPL-REPLAY-CONFLICT";
         const holder = `session ${conflict.conflictHolder}${conflict.conflictHolderProgram ? `, ${conflict.conflictHolderProgram}` : ""}${conflict.conflictHolderStatement ? `: ${conflict.conflictHolderStatement}` : ""}`;
         const since = waitStart ? ` from ${hhmmss(waitStart)} UTC` : "";
+        // How the primary shipped, only from its own samples in these figures' minutes: with none, "at most 0 s" would rest
+        // on no sample at all.
+        const shipped =
+            figuresPrimary.length > 0
+                ? `The primary shipped normally (write and flush lag at most ${maxWriteLag} s${avgWal !== null ? `, WAL about ${avgWal} bytes/s` : ""}), so neither the network nor the write volume caused it. `
+                : "The primary's side wasn't sampled during the stall, so whether it shipped normally isn't known. ";
         statement =
             `${shape}: replay stood still. The replica kept receiving WAL (${backlog} bytes received but not replayed) while its startup process waited for ${conflict.conflictWantedMode ?? "a lock"} on ${conflict.conflictRelation}${since}, which a query on the replica held (${conflict.conflictHolderMode ?? "a lock"}; ${holder}). ` +
-            `The primary shipped normally (write and flush lag at most ${maxWriteLag} s${avgWal !== null ? `, WAL about ${avgWal} bytes/s` : ""}), so neither the network nor the write volume caused it. ` +
+            shipped +
             `Replay may wait up to max_standby_streaming_delay${delay !== undefined ? ` (${delay} s)` : ""}; ${cancels > 0 ? `recovery cancelled ${plural(cancels, "replica query", "replica queries")} (SQLSTATE 40001)` : "the query ended before that, so nothing was cancelled"}, and replay caught up.`;
         confidence = conflicts.length >= 2 ? "high" : "medium";
         evidence = [...lagRefs, ...charted, ev("RCA Replica", conflict.at, `startup waits ${conflict.conflictWantedMode} on ${conflict.conflictRelation}, held ${conflict.conflictHolderMode} by session ${conflict.conflictHolder}`), ...watchedRefs];
@@ -366,7 +379,8 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
         statement = `${shape}: the WAL didn't reach the replica in time (send gap up to ${maxSendGap} bytes, write or flush lag up to ${maxWriteLag} s).`;
         confidence = "medium";
         ids = ["RPL-SHORT-REPORTS"];
-    } else if (sawStall && backlog === 0 && (avgWal ?? 0) < 50) {
+    } else if (sawStall && backlog === 0 && avgWal !== null && avgWal < 50) {
+        // Only from the primary's own samples in the stall: with none, what it committed then isn't known.
         ruleId = "REPL-IDLE-PRIMARY";
         statement = `${shape}, but the replica had nothing to replay: the primary committed nothing, and the metric counts the time since the last replayed transaction.`;
         confidence = "high";

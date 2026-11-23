@@ -195,6 +195,9 @@ describe("read replica lag (INV-15) on T4's replica", () => {
         expect(a.rootCause?.ruleIds).toEqual(["REPL-REPLAY-CONFLICT"]);
         expect(a.rootCause?.statement).toContain("from 16:01:21 UTC, which a query on the replica held (AccessShareLock; session 222)");
         expect(a.rootCause?.statement).not.toContain("session 111");
+        // The review of 921d3097: the primary's side has no sample here, so how it shipped isn't said ("at most 0 s").
+        expect(a.rootCause?.statement).toContain(". The primary's side wasn't sampled during the stall, so whether it shipped normally isn't known. Replay may wait");
+        expect(a.rootCause?.statement).not.toMatch(/shipped normally \(/);
     });
 
     // The review of ebd1c6c3: the rise was read from the first point at or after the asked time less a minute, so a time in
@@ -341,6 +344,46 @@ describe("read replica lag (INV-15) on T4's replica", () => {
             expect(a.rootCause).toMatchObject({ confidence: "medium", ruleIds: ["REPL-REPLAY-SLOW"] });
             expect(a.rootCause?.statement).toMatch(/: replay advanced slower than WAL arrived \(65536 bytes behind, WAL about 2797 bytes\/s\)\.$/);
             expect(a.recommendations.map((r) => r.id)).toEqual(["RPL-SHORT-REPORTS"]);
+        });
+
+        // The review of 921d3097: the stall was sampled, but the figures each rule read still came from the minute either side
+        // of it, so one sample there decided the cause.
+        it("reads the figures from the stall's own samples, not one a minute before it: the review's Stop now, sampled", () => {
+            const samples: ReplicaSample[] = [];
+            // The primary is busy until 16:00, with 512 bytes in flight on the replica at 15:59:30.
+            for (let t = at("15:59:00").getTime(); t < at("16:00:00").getTime(); t += 30_000) samples.push(replica(t, 0.3, t === at("15:59:30").getTime() ? 512 : 0), primary(t));
+            // Then it commits nothing: replay stands still with nothing behind, sampled every 5 s, and is back at 16:01:35.
+            for (let t = at("16:00:05").getTime(); t <= at("16:01:35").getTime(); t += 5_000) {
+                samples.push(t < at("16:01:35").getTime() ? replica(t, (t - at("16:00:00").getTime()) / 1000, 0) : replica(t, 0.2, 0), { ...primary(t), walBytesPerS: 0 });
+            }
+            const a = analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+            expect(a.rise?.lastReplay).toEqual(at("16:00:00"));
+            expect(a.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-IDLE-PRIMARY"] });
+            expect(a.rootCause?.statement).toMatch(/, but the replica had nothing to replay: the primary committed nothing, and the metric counts the time since the last replayed transaction\.$/);
+            expect(JSON.stringify(a)).not.toMatch(/512 bytes|slower than WAL/);
+            expect(a.recommendations).toEqual([]);
+        });
+
+        // Its recovery's sample is replay resumed, not the stall: WAL in flight there, as a busy primary's always is, isn't WAL
+        // the stall left behind.
+        it("reads the stall's samples up to its recovery, not the recovery's own", () => {
+            const samples: ReplicaSample[] = [];
+            for (let t = at("16:00:05").getTime(); t <= at("16:01:30").getTime(); t += 5_000) samples.push(replica(t, (t - at("16:00:00").getTime()) / 1000, 0), primary(t));
+            samples.push(replica(at("16:01:35").getTime(), 0.2, 4096), primary(at("16:01:35").getTime()));
+            const a = analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+            expect(a.rise?.recovered?.at).toEqual(at("16:01:35"));
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-REPLAY-STALLED"] });
+            expect(JSON.stringify(a)).not.toMatch(/4096 bytes|slower than WAL/);
+        });
+
+        it("says the primary committed nothing only from its own samples in the stall", () => {
+            // Replay stood still with nothing behind, and the primary was sampled idle only before it.
+            const samples: ReplicaSample[] = [primary(at("15:59:00").getTime()), primary(at("15:59:30").getTime())].map((s) => ({ ...s, walBytesPerS: 0 }));
+            for (let t = at("16:00:05").getTime(); t <= at("16:01:30").getTime(); t += 5_000) samples.push(replica(t, (t - at("16:00:00").getTime()) / 1000, 0));
+            samples.push(replica(at("16:01:35").getTime(), 0.2, 0));
+            const a = analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+            expect(a.rootCause).toMatchObject({ confidence: "low", ruleIds: ["REPL-REPLAY-STALLED"] });
+            expect(a.rootCause?.statement).toMatch(/Replay stood still, and nothing captured says why\.$/);
         });
     });
 });

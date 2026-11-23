@@ -15,7 +15,7 @@ import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
 import { bothTimes, resolveTime, windowAround } from "./time";
 import { triageWindow } from "./triage";
-import { asWholeReadings, emptyEvidence, fromTo, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, readStoppedAt, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample, type WholeReading } from "./types";
+import { asWholeReadings, dateTime, emptyEvidence, fromTo, hhmmss, iso, metricIn, NEWEST_MINUTES, plural, pointKey, RCA_TARGETS, readStoppedAt, sameSecond, sameUtcDay, spanEnds, type Confidence, type Episode, type EventRow, type Evidence, type InvestigationResult, type MetricPoint, type RcaTarget, type SessionSample, type WholeReading } from "./types";
 
 /** The relay's ToolSpec shape (ask-relay/src/protocol.ts). */
 export interface ToolSpec {
@@ -234,14 +234,15 @@ const episodeView = (e: Episode) => ({
  * The note for a target with no capture in a window, and whether a line is one: an incident says it once. A line is one in
  * either form: none recorded, or a coverage row marked not captured, as T5's are in B's model ("no RCA evidence for"), which
  * a part reading wider minutes said again for a span after the storm had ended (Final tests' check of ddebd4c3, F2). Each
- * says one instant "at" it, never as a range of it (F5: "no RCA capture recorded for 16:57:00-16:57:00 UTC").
+ * says one instant "at" it, never as a range of it (F5: "no RCA capture recorded for 16:57:00-16:57:00 UTC"), and a span
+ * across two UTC days with its dates, "from … to …" (the review of 921d3097: a day's minutes read "at 17:00:00 UTC").
  */
-const forSpan = (from: Date, to: Date) => (hhmmss(from) === hhmmss(to) ? `at ${hhmmss(from)}` : `for ${hhmmss(from)}-${hhmmss(to)}`);
+const forSpan = (from: Date, to: Date) => (sameSecond(from, to) ? `at ${hhmmss(from)}` : sameUtcDay(from, to) ? `for ${hhmmss(from)}-${hhmmss(to)}` : `from ${dateTime(from)} to ${dateTime(to)}`);
 const noCaptureNote = (t: RcaTarget, from: Date, to: Date) => `${t}: no RCA capture recorded ${forSpan(from, to)} UTC; only the telemetry (Telemetry Snapshots) is known`;
 const isNoCaptureNote = (t: RcaTarget, line: string) => {
     if (!line.startsWith(`${t}: `)) return false;
     const rest = line.slice(t.length + 2);
-    return /^no RCA capture recorded (?:for|at) .*; only the telemetry \(Telemetry Snapshots\) is known$/.test(rest) || /^no RCA evidence (?:for|at) /.test(rest);
+    return /^no RCA capture recorded (?:for|at|from) .*; only the telemetry \(Telemetry Snapshots\) is known$/.test(rest) || /^no RCA evidence (?:for|at|from) /.test(rest);
 };
 
 function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarget[], deps: InvestigationDeps, g: Gathered, at?: Date): InvestigationResult {
@@ -380,7 +381,7 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             if (seen.some((e) => e.source === SOURCES.capture || covered(t, e.start, e.end ?? e.last))) {
                 if (chainsTo <= w.from || !seen.some((e) => e.start <= chainsTo)) return [];
                 return [
-                    `${t}: the blocked processes from ${hhmmss(w.from)} to ${hhmmss(chainsTo)} UTC${stoppedNote} left no blocking chain in the capture: its 30-s sentinel saw ${pg(t) ? "a client waiting on a lock" : "a blocked process"}, and the capture samples the chain (${pg(t) ? "RCA-PG-01 and RCA-PG-02" : "RCA-SQL-01"}) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.`,
+                    `${t}: the blocked processes ${fromTo(w.from, chainsTo)} UTC${stoppedNote} left no blocking chain in the capture: its 30-s sentinel saw ${pg(t) ? "a client waiting on a lock" : "a blocked process"}, and the capture samples the chain (${pg(t) ? "RCA-PG-01 and RCA-PG-02" : "RCA-SQL-01"}) every 10 s from then on, so the blocking ended before its next chain sample, and neither the head blocker nor its statement is known.`,
                 ];
             }
             const from = new Date(Math.min(...seen.map((e) => e.start.getTime())));
@@ -595,8 +596,8 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             // Nothing abnormal only up to where a read stopped short (the review of d431edb4).
             const stop = readStoppedAt(g.evidence);
             const nothing = stop
-                ? `Nothing abnormal on ${targets.join(", ")} from ${hhmmss(from)} up to ${hhmmss(stop)} UTC, where the read stopped: the detector found no episode there, and what came after it wasn't read.`
-                : `Nothing abnormal on ${targets.join(", ")} from ${hhmmss(from)} to ${hhmmss(to)} UTC: the detector found no episode there.`;
+                ? `Nothing abnormal on ${targets.join(", ")} from ${spanEnds(from, stop).join(" up to ")} UTC, where the read stopped: the detector found no episode there, and what came after it wasn't read.`
+                : `Nothing abnormal on ${targets.join(", ")} ${fromTo(from, to)} UTC: the detector found no episode there.`;
             return { ...base, notCaptured: [...base.notCaptured, nothing], details: stop ? { nothingAbnormal: false, nothingAbnormalUpTo: iso(stop), readStoppedAt: iso(stop) } : { nothingAbnormal: true } };
         }
         const stopped = readStoppedAt(g.evidence);

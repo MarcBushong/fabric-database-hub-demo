@@ -162,7 +162,8 @@ describe("the investigations' sources", () => {
         expect(errors.notCaptured).toContain("No errors, cancels, failed connections, or 429s were recorded up to 11:16:00 UTC, where the read stopped; what came after it wasn't read.");
         expect(errors.notCaptured.join(" ")).not.toMatch(/recorded in the window/);
         const incident = (await late.investigate("explain_incident", { target: "T5", from: window.from, to: window.to })) as InvestigationResult;
-        expect(incident.notCaptured).toContain("Nothing abnormal on T5 from 00:00:00 up to 11:16:00 UTC, where the read stopped: the detector found no episode there, and what came after it wasn't read.");
+        // Across days with its dates (the review of 921d3097): it read "from 00:00:00 up to 11:16:00 UTC", three days apart.
+        expect(incident.notCaptured).toContain("Nothing abnormal on T5 from 2026-11-20 00:00:00 up to 2026-11-23 11:16:00 UTC, where the read stopped: the detector found no episode there, and what came after it wasn't read.");
         expect(incident.details).toMatchObject({ nothingAbnormal: false, nothingAbnormalUpTo: "2026-11-23T11:16:00Z" });
         // Counted up to where it stopped: at least, never as if it ended there.
         const counted = (await tools(4900).investigate("explain_errors", window)) as InvestigationResult;

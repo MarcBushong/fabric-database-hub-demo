@@ -329,10 +329,23 @@ export const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n ==
 
 export const iso = (d: Date) => d.toISOString().replace(/\.\d{3}Z$/, "Z");
 export const hhmmss = (d: Date) => d.toISOString().slice(11, 19);
-/** "between 16:52:10 and 17:00:40" for a range, "at 16:53:10" for one point in time (UTC; the caller adds "UTC"). */
-export const during = (first: Date, last: Date) => (first.getTime() === last.getTime() ? `at ${hhmmss(first)}` : `between ${hhmmss(first)} and ${hhmmss(last)}`);
-/** "from 16:52:10 to 17:00:40" for a range, "at 16:53:10" for one point in time (UTC; the caller adds "UTC"). Final tests' check of ddebd4c3 (F5): "from 19:30:00 to 19:30:00 UTC". */
-export const fromTo = (first: Date, last: Date) => (hhmmss(first) === hhmmss(last) ? `at ${hhmmss(first)}` : `from ${hhmmss(first)} to ${hhmmss(last)}`);
+/** "2026-11-19 17:00:00": a time with its UTC date, the form the chat's entry points date a window in (entry.ts), to the second. */
+export const dateTime = (d: Date) => d.toISOString().slice(0, 19).replace("T", " ");
+/**
+ * Whether two times are one instant as the answers give them, to the second (the review of 921d3097: compared by their time
+ * of day alone, a day's minutes read as one instant, "T2: no RCA capture recorded at 17:00:00 UTC").
+ */
+export const sameSecond = (a: Date, b: Date) => iso(a) === iso(b);
+export const sameUtcDay = (a: Date, b: Date) => a.toISOString().slice(0, 10) === b.toISOString().slice(0, 10);
+/**
+ * A span's two ends as the answers give them (UTC; the caller adds "UTC"): their times when they fall on one UTC day, and with
+ * their dates when they don't, so a day's minutes never read "17:00:00-17:00:00", nor a span across midnight backwards.
+ */
+export const spanEnds = (first: Date, last: Date): [string, string] => (sameUtcDay(first, last) ? [hhmmss(first), hhmmss(last)] : [dateTime(first), dateTime(last)]);
+/** "between 16:52:10 and 17:00:40" for a range, "at 16:53:10" for one instant (UTC; the caller adds "UTC"). */
+export const during = (first: Date, last: Date) => (sameSecond(first, last) ? `at ${hhmmss(first)}` : `between ${spanEnds(first, last).join(" and ")}`);
+/** "from 16:52:10 to 17:00:40" for a range, "at 16:53:10" for one instant (UTC; the caller adds "UTC"). Final tests' check of ddebd4c3 (F5): "from 19:30:00 to 19:30:00 UTC". */
+export const fromTo = (first: Date, last: Date) => (sameSecond(first, last) ? `at ${hhmmss(first)}` : `from ${spanEnds(first, last).join(" to ")}`);
 
 /** Whether the known counts all end by the time the interval whose length isn't known begins, so it can't hold them. */
 function knownBefore(open: { from: Date }, known: { count: number; last: Date } | null): boolean {
@@ -350,7 +363,7 @@ export function openCountWords(open: { count: number; from: Date; intervals: num
     const where = `${open.count}${what ? ` ${what}` : ""} ${open.intervals > 1 ? `in ${open.intervals} intervals` : "in the interval"} from ${hhmmss(open.from)} UTC, whose length isn't known in these minutes`;
     if (!known || known.count === 0) return where;
     // One instant reads as one (the re-review of 8b43102e: "the 5 counted from 15:20:00 to 15:20:00 UTC").
-    const span = known.first.getTime() === known.last.getTime() ? `at ${hhmmss(known.first)} UTC` : `from ${hhmmss(known.first)} to ${hhmmss(known.last)} UTC`;
+    const span = `${fromTo(known.first, known.last)} UTC`;
     if (knownBefore(open, known)) return `${where}, after the ${known.count} counted ${span}`;
     return `${where}, which may hold ${known.first < open.from ? "some of " : ""}the ${known.count} counted ${span}`;
 }

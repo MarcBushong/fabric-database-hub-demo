@@ -5019,13 +5019,13 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 
 - **The postmortem's Cause from the blind investigation** ([ADR 0031, section 9](adr/0031-incident-rca.md#9-the-postmortems-cause); [its entry](#the-postmortems-cause-from-the-blind-investigation-2026-11-22)). With the RCA tables, **Write the postmortem** on a session investigates the session's own minutes, as the session control recorded them, and explains up to six incidents there from the signals alone, in the Root cause view's order. What the demo injected follows as the answer key, on every target, with other plans' faults in those minutes labeled as theirs. A lone incident request gets no investigation, since its minutes are its fault's own: its Cause points to the Root cause view.
 - **The evaluation set's Phase 1 cases** ([its entry](#the-evaluation-sets-phase-1-cases-2026-11-22)): 12 blind questions on the contract's fixtures and B's and A's recorded rows, graded offline against their answer keys by the scoreboard's own rule, with what they miss reported. It's test-only: the scoreboard exports three of its functions for it, with its output unchanged.
-- **Final tests' findings** ([F4 to F6](#final-tests-should-fix-items-f4-to-f6-2026-11-22), [O1 to O4](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)). In the RCA's answers: the minutes that T5's throttled counts cover, in the statement and the errors table (F6); a replica's slow replay named only from the stall's own samples, with WAL behind, and an interval cut short worded by its own minutes (F4); one instant written as one, not as a range (F5); and the clients waiting on a lock as some of the active ones (O2). On `stop-demo.ps1`'s handoff of a Run all session's stop, `STOP.CONTROL.AUTOSTOP` names the control's job (O3).
-- **The reviews' fixes,** in each entry. Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says nothing was injected, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
+- **Final tests' findings** ([F4 to F6](#final-tests-should-fix-items-f4-to-f6-2026-11-22), [O1 to O4](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)). In the RCA's answers: the minutes that T5's throttled counts cover, in the statement and the errors table (F6); a replica's cause named only from the stall's own samples and their figures, slow replay only with WAL behind, and an interval cut short worded by its own minutes (F4); one instant written as one, not as a range, and a span across two UTC days with its dates (F5); and the clients waiting on a lock as some of the active ones (O2). On `stop-demo.ps1`'s handoff of a Run all session's stop, `STOP.CONTROL.AUTOSTOP` names the control's job (O3).
+- **The reviews' fixes,** in each entry ([the latest](#the-reviews-of-f4-to-f6-and-of-3c0f5aeb-2026-11-22)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
 
 **What still needs live proof.** All of it but the evaluation set, which reads recorded rows. Each change is unit-tested, and the RCA's answers are checked on B's and A's recorded rows, but none has run on a live environment. Its live check waits for the owner: dbhubrc stays at dbee7d53 for the owner's testing on Monday, 2026-11-23. On an environment deployed or updated from this branch, after a Run all session:
 
 - **The postmortem** of that session: its Cause against the Root cause view's first six incidents, how long the investigation takes within Execute Queries' 120 queries a minute, **Download Markdown**, and the answer key with the page's filter on fewer targets.
-- **The RCA's answers,** where the session has such incidents: a T5 storm with intervals under 100 % among those at 100 %, a replica's lag rising after the stop, an interval cut short, an incident of one instant, and a T4 surge with clients waiting on a lock at its peak. Final tests' headless harness can also check these on a live history, with no deploy.
+- **The RCA's answers,** where the session has such incidents: a T5 storm with intervals under 100 % among those at 100 %, a replica's lag rising after the stop, a replica stall the capture sampled, an interval cut short, an incident of one instant, a question over a day or across UTC midnight, and a T4 surge with clients waiting on a lock at its peak. Final tests' headless harness can also check these on a live history, with no deploy.
 - **The scoreboard's** T4 and T5 rows marked Not supported, and their signal.
 - **`./scripts/stop-demo.ps1` during a Run all session,** from this checkout: its `STOP.CONTROL.AUTOSTOP` line.
 
@@ -5240,3 +5240,70 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The doc and app suites:** under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Agent.PromptPack`, `Rca.Contract`, `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks. PSScriptAnalyzer found nothing in 393 files; markdownlint found no issue in 152 files.
 
 **What their live check needs.** O2, the app's next deploy, and a surge with clients waiting on a lock at its peak. O3, a `stop-demo.ps1` during a Run all session, from this checkout, whose `STOP.CONTROL.AUTOSTOP` reads the control's words; the runbooks don't change.
+
+### The reviews of F4 to F6 and of 3c0f5aeb (2026-11-22)
+
+**Why.** Two fresh reviewers read the stacked branch on Sunday evening. One read F4 to F6 (96abcf65..921d3097) and found 2 Mediums; the other read 3c0f5aeb and dd744ef8 and found 3 Lows. Blindness was clean in both, and 56b5b9cf's own review was clean. The coordinator decided each, in this order, and added a note. One commit, after dd744ef8.
+
+- **Medium 1 (921d3097, F5): a day's minutes read as one instant.** `fromTo` and `forSpan` told one instant by its time of day alone. So `find_incidents` over a day on T2, with no capture, said "T2: no RCA capture recorded at 17:00:00 UTC; only the telemetry (Telemetry Snapshots) is known", in answers the chat is grounded on. A coverage row a day long, and blocked processes in the telemetry a day apart, read the same way.
+  - **The rule** (`rca/types.ts`), which `during`, `fromTo`, and `forSpan` share:
+    - one instant is the same second (`sameSecond`), never the same time of day;
+    - a span within one UTC day reads by its times, as before;
+    - a span whose ends fall on two UTC days gives their dates (`spanEnds`), in the form the chat's entry points date a window in, to the second: "T2: no RCA capture recorded from 2026-11-19 17:00:00 to 2026-11-20 17:00:00 UTC".
+  - **Where a viewer's own window reaches, the same:**
+    - `explain_errors`'s and `triage_window`'s spans, such as "2 lock timeouts on T1 between 2026-11-19 16:00:00 and 2026-11-20 15:00:00 UTC", which read backwards across midnight before, and the counts beside an interval whose length isn't known;
+    - `explain_locking`'s notes, and `explain_incident`'s "Nothing abnormal".
+  - **Both dedupes,** the incident's and the view's, count the dated form, "from … to …", as a target's note.
+  - **Left as they are:** the rules' wordings of an incident's own minutes (T4's connections, T5's throughput, and the replica's rise); single times, such as where a read stopped; and the window's local times, beside its ISO times. Across two UTC days they give times alone, and the result's window gives the dates. None reads a range as one instant.
+  - **Tests:**
+    - the review's `find_incidents` call, and `explain_incident` over the same day;
+    - a coverage row a day long;
+    - blocked processes in the telemetry a day apart, and a day's minutes with no chain;
+    - errors a day apart, in `explain_errors` and `triage_window`, and `openCountWords`;
+    - one instant, and a span within a day, as before;
+    - an incident across midnight, with its note once;
+    - the view's dedupe of the dated form.
+
+    All 7 fail at dd744ef8. `sources.test.ts`'s four-day read, which said "from 00:00:00 up to 11:16:00 UTC" for minutes three days apart, now gives its dates.
+- **Medium 2 (f7507b11, F4): the stall was sampled, but the figures came from beside it.** `sawStall` gated slow replay, slow shipping, and an idle primary on the capture's samples of the stall. But `backlog`, `avgWal`, `maxWriteLag`, and `maxSendGap` still came from a minute either side of it. The review's Stop now, sampled, shows the result: a sample at 15:59:30 with 512 bytes in flight from a busy primary, then an idle primary and a stall with 0 behind, read as slow replay, "512 bytes behind, WAL about 0 bytes/s".
+  - **The rule:** with the stall sampled, the figures come from its own samples only, from replay's last advance (`lastReplay`) up to its recovery.
+  - **The boundary I chose:** the recovery's own sample is left out. Replay had resumed by then, and WAL in flight there, as a busy primary's always is, isn't WAL the stall left behind. With no recovery, the figures run to the rise's last point. The review suggested `<= rise.end`, which takes the recovery's sample in; a test pins the difference.
+  - **An idle primary** needs a WAL rate from the primary's own samples in the stall. The capture samples the primary every 30 s, and every 5 s only in a replay episode, which an idle primary alone doesn't start, so a stall's minutes can hold none of its samples. With none, `(avgWal ?? 0) < 50` said "the primary committed nothing" from no sample at all.
+  - **What the review's Stop now reads now:** `REPL-IDLE-PRIMARY`, high: "…, but the replica had nothing to replay: the primary committed nothing, …". The 64 KB slow replay still reads `REPL-REPLAY-SLOW`.
+  - **A replay conflict's figures** are the stall's own too. B's first stall said "The primary shipped normally (write and flush lag at most 7.132 s …)". That 7.132 s is the primary's at 16:19:47, 20 s after the stall's recovery at 16:19:27, while the replica replayed its 578 MB. The stall's own samples say at most 0.043 s.
+  - **Beyond the review, coupled to it:** with none of the primary's samples among the figures, a conflict said "The primary shipped normally (write and flush lag at most 0 s)", from no sample. The narrower minutes make that more likely, so it now says "The primary's side wasn't sampled during the stall, so whether it shipped normally isn't known." The live data doesn't reach it, since a conflict sample comes only in a replay episode, which samples the primary every 5 s. But `rules.test.ts`'s conflict with replica samples only did, at dd744ef8.
+  - **Tests:** the review's Stop now; a recovery's sample with 4096 bytes in flight; an idle primary sampled only before the stall; and the conflict with no primary sample. All 4 fail at dd744ef8, as does B's first stall's figure in `live-accuracy.test.ts`. The 64 KB case passes at both.
+- **Low 1 (3c0f5aeb): two more lines claimed an empty window.** With the page's filter hiding all of a session's faults, the Timeline said "No event in this window." and the Response "- No response step in this window.", though the hidden T3 plan regression was answered at 14:26.
+  - They say "No event on the targets this page's filter shows." and "- No response step on the targets this page's filter shows.". A window with no fault on any target keeps its words.
+  - The test's negative pattern holds both, with and without the RCA tables. It fails at dd744ef8.
+- **Low 2 (3c0f5aeb): a fault's own incident was left as a false alarm.** An incident still open from the fault before, such as a blocking chain's at a deadlock storm's start, takes the catch's time, as the scoreboard's first bin does. Only that incident went into `caught`, so the storm's own incident from 13:44 was unexplained.
+  - Now the earliest catch gives the time to detect, and every incident that catches a run is one it explains (`catchesOf`, `explainedBy`).
+  - The review's probe is a test: both incidents are explained, and the times, 13:31 and 13:41, are the scoreboard's. It fails when `explainedBy` takes the earliest catch only, as before.
+  - The datasets' grades are unchanged: none of them has such a pair.
+- **Low 3: three docs said nothing changes without the RCA tables.** The CHANGELOG, ADR 0031's compatibility table, and its "changes everywhere" now name the two that do: the postmortem's wording when the page's filter hides all of a session's faults, and the Signal cell of the scoreboard's T4 and T5 rows marked Not supported. ADR 0031's section 9 names the Timeline and the Response too.
+- **The note: a limit of the shared rule.** A catch by an incident already open before the fault doesn't show that the fault raised anything.
+  - On the sample session, faults 11 and 34, T3's log-rate faults, are caught by `T3-log_rate-…131500Z`, which opened at 13:15 and never ends (its last sample is at 15:30): the log rate rests at 0.05 s a minute, over the detector's level.
+  - So the set's catch there doesn't depend on the fault. It agrees with the scoreboard's, a minute later over its bound of 0.075, by coincidence.
+  - The scoreboard's own rule has the same limit wherever a signal is over its bound at a fault's start. ADR 0031's evaluation set says so.
+
+**The B/A sweep.** 5 of 1,134 answers differ from 56b5b9cf's, all in B's two replay-conflict stalls, with their rules unchanged (Medium 2's figures):
+
+- `explain_incident` for `T4-replica-replica_lag-20261121T161712Z`, and `explain_replica_lag` at 16:15: "write and flush lag at most 0.043 s, WAL about 559098 bytes/s", where they said 7.132 s and 551521 bytes/s;
+- `explain_incident` for `…162142Z`, and `explain_replica_lag` at 16:25 and 16:30: "WAL about 562512 bytes/s", the median of the stall's own primary samples, where they said 562162.
+
+Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
+
+**Changed files.** `fabric/app/src/`: `rca/types.ts`, `rca/tools.ts`, `rca/errors.ts`, `rca/triage.ts`, `rca/replica.ts`, `rca/view/RcaReport.tsx`, and `lib/postmortem.ts`; the tests `rca/tools.test.ts`, `rca/rules.test.ts`, `rca/live-accuracy.test.ts`, `rca/sources.test.ts`, `rca/eval.test.ts`, `rca/view/rca-view.test.tsx`, and `lib/mission.test.ts`. ADR 0031 (the replica's cause, the notes' times, the evaluation set, section 9, and the compatibility table), the CHANGELOG, and this report, whose summary of the stacked branch names them.
+
+**Validation.** On dd744ef8 with this commit:
+
+- **The app:** `npm run verify` passed: typecheck, lint, Vitest's 668 tests in 36 files, the license check (136 production packages), and the build, whose main chunk is 940.72 kB, as before. `ask-blind.test.tsx` passed in it, and `Rca.Contract`'s blind scan is clean.
+- **Each new test fails without its fix:**
+  - Medium 1's 7, and Low 1's, at dd744ef8;
+  - Medium 2's 4, and B's first stall's figure, at dd744ef8, while the 64 KB slow replay passes at both;
+  - Low 2's, with `explainedBy` taking the earliest catch only.
+- **Mutations:** each of 19 fails its own tests. Medium 1's 11 are the time of day, the dates, `during`'s milliseconds, `openCountWords`, `forSpan`, both dedupes, the no-chain note, "Nothing abnormal", and the errors' and triage's spans. Medium 2's 5 are the window's figures, the recovery's sample (the review's `<=`), a minute before the stall, an idle primary from no sample, and a conflict's shipping from no sample. The rest are the Timeline, the Response, and the earliest catch only.
+- **The B/A sweep:** 5 of 1,134 answers differ from 56b5b9cf's, above; the rest are byte-identical.
+- **The doc and app suites:** under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Agent.PromptPack`, `Rca.Contract`, `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks. markdownlint found no issue, and every link this commit adds resolves. No PowerShell file changed.
+
+**What their live check needs.** Nothing to deploy beyond the app. On the next environment's history: a question over a day, or across UTC midnight, to `find_incidents` and `explain_errors`; a replica stall the capture sampled; and a postmortem with the page's filter hiding all of a session's faults.

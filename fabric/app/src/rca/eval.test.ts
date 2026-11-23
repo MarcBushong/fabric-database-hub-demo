@@ -92,14 +92,14 @@ interface Listed {
 }
 
 /**
- * The episode that catches a fault by the scoreboard's rule, and when, or null: one of its families on its target at its
+ * The episodes that catch a fault by the scoreboard's rule, earliest first, and when: of its families on its target at its
  * level in the bin that holds the fault's start or later, before TELEMETRY_LAG_MINUTES after its end or the start of the
  * next fault on its target that raises the same signal, whichever comes first. One that starts in those minutes catches it
  * in the bin that holds its start; one still open at the fault's start, in the bin that holds that start, where the
  * scoreboard's first bin at its level is too (the review of 96abcf65: a deadlock storm right after a blocking chain, in one
  * episode with it, was missed). With no known end, an episode is open only as far as its last sample at its level.
  */
-function catchOf(fault: SessionRun, faults: readonly SessionRun[], episodes: readonly Listed[]): { episode: Listed; at: number } | null {
+function catchesOf(fault: SessionRun, faults: readonly SessionRun[], episodes: readonly Listed[]): Array<{ episode: Listed; at: number }> {
     const scenario = scenarioOf(fault);
     const target = T4_BEATS[scenario]?.target ?? fault.target;
     const from = (fault.windowStart as Date).getTime();
@@ -109,7 +109,19 @@ function catchOf(fault: SessionRun, faults: readonly SessionRun[], episodes: rea
         const to = searchEndOf(fault, family, faults, familiesOf);
         return episodes.filter((e) => e.target === target && e.family === family && (inSearch(binOf(e.start), BIN, from, to) || open(e))).map((episode) => ({ episode, at: Math.max(binOf(episode.start), fromBin) }));
     });
-    return hits.sort((a, b) => a.at - b.at || Date.parse(a.episode.start) - Date.parse(b.episode.start))[0] ?? null;
+    return hits.sort((a, b) => a.at - b.at || Date.parse(a.episode.start) - Date.parse(b.episode.start));
+}
+
+/** The earliest catch of a fault, which gives its time to detect, as the scoreboard's first bin at its level does; or null. */
+const catchOf = (fault: SessionRun, faults: readonly SessionRun[], episodes: readonly Listed[]) => catchesOf(fault, faults, episodes)[0] ?? null;
+
+/**
+ * The incidents the graded faults explain: every one that catches a fault, not only its earliest (the review of 3c0f5aeb:
+ * the chain's incident, still open at a deadlock storm's start, gave the storm its time, and the storm's own incident was
+ * then left unexplained, a false alarm). `faults` are all of them in the minutes, for each one's cap at the next.
+ */
+function explainedBy(graded: readonly SessionRun[], faults: readonly SessionRun[], episodes: readonly Listed[]): Set<string> {
+    return new Set(graded.flatMap((f) => catchesOf(f, faults, episodes).map((h) => h.episode.key)));
 }
 
 interface Graded {
@@ -138,13 +150,13 @@ async function grade(data: EvalData, key: Run[] = runsOf(data)): Promise<Graded>
     const inMinutes = key.filter(within);
     const faults = inMinutes.map(asFault);
     const notGradable = NOT_GRADABLE[data] ?? {};
-    const caught = new Set<string>();
+    // Each run's earliest catch gives its time to detect; every incident that catches a run is one it explains.
+    const caught = explainedBy(faults.filter((_, i) => !notGradable[inMinutes[i].scenario]), faults, listed);
     const runs = inMinutes.map((r, i) => {
         if (notGradable[r.scenario]) return `${name(r)}: not graded (${notGradable[r.scenario]})`;
         if (familiesOf(r.scenario).length === 0) return `${name(r)}: no rule`;
         const c = catchOf(faults[i], faults, listed);
         if (!c) return `${name(r)}: missed`;
-        caught.add(c.episode.key);
         return `${name(r)}: caught by ${c.episode.key} after ${Math.max(0, Date.parse(c.episode.start) - r.start.getTime()) / 1000} s`;
     });
     // The families the key grades: a fixture's key records every run, so all of them; a live key file, its runs' only.
@@ -327,6 +339,24 @@ describe("the evaluation set grades by the scoreboard's rule (ADR 0031)", () => 
         expect(catchOf(f, [f], [episode("blocking", at(-5), null, at(-1))])).toBeNull();
         // Locking and blocking raises blocked processes (the notebook's SCENARIO_SIGNALS): a deadlock alone doesn't catch it.
         expect(catchOf(f, [f], [episode("deadlock", at(2))])).toBeNull();
+    });
+
+    // The review of 3c0f5aeb: with the chain's incident still open at a deadlock storm's start, that incident gave the storm
+    // its time, as the scoreboard's first bin does, and the storm's own incident from 13:44 was left unexplained, so a key
+    // that grades T1's blocking would have called it a false alarm.
+    it("explains every incident that catches a fault, not only its earliest: a blocking chain, then a deadlock storm", () => {
+        const pair = [fault("00", "blocking-chain", 0, 10), fault("01", "deadlock-storm", 11, 21)];
+        // Blocked processes from 13:31 to 13:41, none at 13:42 and 13:43, then again from 13:44 to 13:50.
+        const listed = listedOf(blockedIn([...Array.from({ length: 11 }, (_, i) => i + 1), ...Array.from({ length: 7 }, (_, i) => i + 14)]));
+        expect(listed.map((e) => [e.key, e.end])).toEqual([
+            ["T1-blocking-20261117T133100Z", at(12).toISOString()],
+            ["T1-blocking-20261117T134400Z", at(21).toISOString()],
+        ]);
+        // The earliest catch of each, as the scoreboard times them: the storm's by the chain's incident, open at its start.
+        expect(evaluationOf(pair, listed)).toEqual({ "00": at(1), "01": at(11) });
+        expect(catchesOf(pair[1], pair, listed).map((h) => h.episode.key)).toEqual(["T1-blocking-20261117T133100Z", "T1-blocking-20261117T134400Z"]);
+        // And both incidents are explained: none is a false alarm.
+        expect([...explainedBy(pair, pair, listed)].sort()).toEqual(["T1-blocking-20261117T133100Z", "T1-blocking-20261117T134400Z"]);
     });
 
     // The review of 96abcf65: on the preview's sample session, 7 of its 35 faults graded otherwise than the scoreboard's
