@@ -7,8 +7,12 @@
 -- the runner's identity (SYSTEM, a sysadmin through BUILTIN\Administrators in the default JumpstartImage and T1 modes:
 -- vm/hyperv-guest/GuestWorkload.ps1, vm/bootstrap/Invoke-SqlVmBootstrap.ps1). T3: T1's managed identity, dbo through
 -- the P6 administrator group (database/azuresql/030-configure.sql). No new permission or role assignment.
--- Least privilege, if the owner wants a dedicated login later: VIEW SERVER PERFORMANCE STATE covers the DMVs below on
--- SQL Server 2022, and ALTER ANY EVENT SESSION the XE session; VIEW DATABASE PERFORMANCE STATE on Azure SQL Database.
+-- Least privilege, if the owner wants a dedicated login later (rca/capture/README.md lists each block's permission).
+-- SQL Server 2022: VIEW SERVER PERFORMANCE STATE covers the DMVs and Query Store's views below, and ALTER ANY EVENT
+-- SESSION the XE session. Azure SQL Database: VIEW DATABASE STATE in ContosoCare covers them, and CREATE ANY DATABASE
+-- EVENT SESSION the XE session; RCA-AZ-04 also needs VIEW SERVER PERFORMANCE STATE, which there comes only through the
+-- ##MS_ServerStateReader## server role, for a login in master with its own user in ContosoCare. Both: VIEW DEFINITION
+-- for the harness's mark (sys.extended_properties).
 --
 -- Blind (ADR 0031): the observer sees what a DBA's tools see. It never reads what the workload plans or injects, and
 -- its cadence follows what it sees: the sentinel (RCA-SQL-09, RCA-XE-02) runs every 30 s for the whole session, and a
