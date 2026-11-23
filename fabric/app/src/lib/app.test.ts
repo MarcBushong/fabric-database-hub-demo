@@ -176,6 +176,21 @@ describe("themes", () => {
         expect(contrastRatio(hc[stroke] ?? `no ${stroke}`, hc.colorNeutralBackground1), `the band's outline, ${stroke}`).toBeGreaterThanOrEqual(3);
         expect(band?.media, "the band's outline").toEqual([]);
     });
+
+    it("under Windows forced colors, gives a hovered filter item's target mark HighlightText, the system's pair for the Highlight Fluent paints the item in", () => {
+        // Fluent's hovered menu item takes the system's Highlight under forced-color-adjust: none, so a target's mark showed its
+        // theme color on it, as low as 1.01:1 on Night sky's Highlight (the review of cc1fe148).
+        const rules = cssRules(readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8"));
+        const selector = '.fui-MenuItemCheckbox:not([aria-disabled="true"]):hover .target-chip i';
+        const rule = rules.find((r) => r.selectors.includes(selector));
+        expect(rule?.media, selector).toEqual(["@media (forced-colors: active)"]);
+        // The mark's color is an inline background: only !important replaces it.
+        expect(rule?.body, selector).toMatch(/(?:^|[;\s])background:\s*HighlightText\s*!important\s*;/);
+        // Only there: a list option, and a disabled or focused item, have no Highlight under forced colors, and HighlightText
+        // on their Canvas would hide the mark as surely as Canvas does.
+        const marks = rules.filter((r) => r.media.includes("@media (forced-colors: active)") && r.selectors.some((s) => s.includes(".target-chip")));
+        expect(marks.flatMap((r) => r.selectors)).toEqual([selector]);
+    });
     it("keeps the chart's incident band label readable (4.5:1) with the band over each surface a chart sits on, the stage's included", () => {
         // The band is translucent: its label sits on the band blended over the surface, as the browser composites it.
         const over = (rgba: string, base: string) => {

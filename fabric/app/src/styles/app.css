@@ -1967,6 +1967,17 @@ button.kpi-main:hover {
     }
 }
 
+/* Under Windows forced colors, Fluent paints a hovered menu item in the system's Highlight under forced-color-adjust: none,
+   so a target's mark in the target filter's menu showed its theme color on it, as low as 1.01:1 on the Night sky theme's
+   Highlight. It takes HighlightText there, the system's own pair for Highlight, in any of the app's themes. A press with the
+   pointer keeps :hover. Nothing else: a disabled or keyboard-focused item, and a list option, which Fluent leaves without
+   a forced-colors fill, have no Highlight, and their marks are forced to Canvas, as every other mark is. */
+@media (forced-colors: active) {
+    .fui-MenuItemCheckbox:not([aria-disabled="true"]):hover .target-chip i {
+        background: HighlightText !important;
+    }
+}
+
 /* A bar chart's hovered category: the cyan band would sit under high contrast's bright bars, so it's a dashed outline,
    as a line chart's cursor is. Outside the group above, so it holds under Windows forced colors too, where the app's high
    contrast charts keep their colors and a cyan band would sit under T2's cyan bars. */
