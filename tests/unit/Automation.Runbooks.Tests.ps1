@@ -5370,6 +5370,10 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             [System.Text.Encoding]::UTF8.GetByteCount($json) | Should -BeLessOrEqual 300
             $pointer['message'].Length | Should -BeLessOrEqual 120
             Test-Json -Json $json -SchemaFile $script:transportSchema | Should -BeTrue
+            # A message the bytes would let through is cut to its 120 characters.
+            $cut = New-DbHubRcaSidecarPointer -Index ('a' * 32) -Documents 3 -Status 'Pass' -Message ('m' * 150)
+            $cut['message'] | Should -Be (('m' * 117) + '...')
+            Test-Json -Json (ConvertTo-Json -InputObject $cut -Compress) -SchemaFile $script:transportSchema | Should -BeTrue
             $rcaIndex = [ordered]@{ kind = 'ContosoCare.RcaBundleIndex'; version = 1; sessionId = $script:fixtureSession; bundles = @(); documents = @(); status = 'Pass'; message = '' }
             $null = Save-DbHubSessionMetric -Context (New-TestContext) -Tags $script:groupTags -SessionId $script:fixtureSession -Rca $rcaIndex
             $null = Save-DbHubSessionMetric -Context (New-TestContext) -Tags $script:groupTags -SessionId $script:fixtureSession -Rca $rcaIndex -RcaSidecars $pointer
@@ -5385,18 +5389,46 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             $script:bounds = @()
             $null = Save-DbHubSessionMetric -Context (New-TestContext) -Tags $script:groupTags -SessionId $script:fixtureSession -RcaSidecars $pointer
             $script:bounds[0].Bytes | Should -Be (24000 - [System.Text.Encoding]::UTF8.GetByteCount($json) - 16)
+            # Checked as written: a pointer over 300 bytes goes without its message.
+            $long = [ordered]@{ kind = 'ContosoCare.RcaSidecarPointer'; version = 1; index = ('a' * 32); documents = 3; status = 'Warning'; message = ('x' * 400) }
+            $null = Save-DbHubSessionMetric -Context (New-TestContext) -Tags $script:groupTags -SessionId $script:fixtureSession -RcaSidecars $long
+            $written = ($script:secrets['dbhub-session-metrics'][-1].Value | ConvertFrom-Json)
+            [System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject $written.rcaSidecars -Compress)) | Should -BeLessOrEqual 300
+            $written.rcaSidecars.message | Should -Be ''
+            $written.rcaSidecars.index | Should -Be ('a' * 32)
+            $written.rcaSidecars.documents | Should -Be 3
         }
 
-        It 'acknowledges the request''s sidecars on the VM each names, before anything else of the start''s goes out there, and records what it sent' {
+        It 'acknowledges the request''s sidecars on the VM each names once the start''s activity went out, one Run Command a VM, and records what it sent' {
             Set-TestSessionStart
             Set-SidecarRunner
             $script:rcaListOpen = $true
             $script:rcaDeleteDelay = @{ archost01 = 2 }
-            $ids = @('20261120T165000Z-sqlvm01-0001-sidecar', '20261120T170000Z-sqlvm01-0002-sidecar', '20261120T165500Z-arcsql01-0001-sidecar', '20261120T165000Z-otherhost-0001-sidecar')
+            # T2's guest's IDs go to the T2 host, which reaches its runner; the T2 host's own name and any other host are no
+            # runner's, so their IDs stay for the notebook (review of the contract, 2026-11-23).
+            $ids = @('20261120T165000Z-sqlvm01-0001-sidecar', '20261120T170000Z-sqlvm01-0002-sidecar', '20261120T165500Z-arcsql01-0001-sidecar', '20261120T165000Z-archost01-0001-sidecar', '20261120T165000Z-otherhost-0001-sidecar')
             $request = @{ action = 'session'; sessionId = $script:nextSession; requestedBy = 'presenter'; rcaAcks = [ordered]@{ kind = 'ContosoCare.RcaAckRequest'; version = 1; documents = $ids } }
             Test-Json -Json (ConvertTo-Json -InputObject $request.rcaAcks -Compress) -SchemaFile $script:transportSchema | Should -BeTrue
+            # Each status write, with how many acknowledgements had gone out then (T2c-2's review: the notebook reads the
+            # first rcaAcks it sees as final).
+            $script:statusWrites = [System.Collections.Generic.List[object]]::new()
+            $script:secretWriteHook = {
+                param($Name, $Body)
+                if ($Name -eq 'dbhub-session-status') {
+                    $written = [string]$Body.properties.value | ConvertFrom-Json
+                    $result = ''
+                    if ($null -ne $written.PSObject.Properties['rcaAcks']) {
+                        $result = ConvertTo-Json -InputObject $written.rcaAcks -Depth 4 -Compress
+                    }
+                    $script:statusWrites.Add([pscustomobject]@{ Result = $result; Acks = @(Get-SidecarCommand -Kind 'ack').Count })
+                }
+            }
             $started = Invoke-DbHubControl -WebhookData (New-Webhook $request) -Context (New-TestContext)
             $started.status | Should -BeIn 'Started', 'Partial'
+            $script:secretWriteHook = $null
+            @($script:statusWrites | Where-Object { $_.Result -and $_.Acks -lt 2 }) | Should -BeNullOrEmpty -Because 'no status carries rcaAcks before both VMs'' acknowledgements were attempted'
+            @($script:statusWrites | Where-Object { -not $_.Result -and $_.Acks -lt 2 }).Count | Should -BeGreaterThan 0 -Because 'the start writes its status before then'
+            @($script:statusWrites | Where-Object Result | ForEach-Object Result | Select-Object -Unique).Count | Should -Be 1 -Because 'it''s written once, and later writes keep it'
             $acks = @(Get-SidecarCommand -Kind 'ack')
             $acks.Count | Should -Be 2 -Because 'one Run Command a VM, with all its IDs'
             @(($acks | Where-Object Vm -EQ 'sqlvm01').Request.documentIds) | Should -Be $ids[0..1]
@@ -5404,47 +5436,129 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             foreach ($vm in 'sqlvm01', 'archost01') {
                 $ack = ($acks | Where-Object Vm -EQ $vm).Name
                 $sent = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match ('/runCommands/{0}$' -f $ack) }))[0])
-                $deleted = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match ('/runCommands/{0}$' -f $ack) }))[0])
                 $dispatch = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match ('/virtualMachines/{0}/runCommands/DbHubControl-{0}-\d{{14}}$' -f $vm) }))[0])
-                $sent | Should -BeLessThan $deleted
-                $deleted | Should -BeLessThan $dispatch -Because "$vm's acknowledgement ends before its activity goes out"
+                $dispatch | Should -BeGreaterThan -1
+                $sent | Should -BeGreaterThan $dispatch -Because "$vm's acknowledgement waits until the start's activity has gone out there"
             }
-            # On the T2 host the next Run Command goes only once Azure no longer lists the acknowledgement's.
+            # On the T2 host the acknowledgement's Run Command is gone, as Azure lists it, before the job goes on.
             $script:rcaMostOpen['archost01'] | Should -Be 1
             $hostAck = ($acks | Where-Object Vm -EQ 'archost01').Name
             $deletedAt = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match ('/runCommands/{0}$' -f $hostAck) }))[0])
-            $hostDispatch = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' }))[0])
-            @($script:calls[$deletedAt..$hostDispatch] | Where-Object { $_.Method -eq 'GET' -and $_.Path -match ('/runCommands/{0}$' -f $hostAck) }).Count | Should -BeGreaterOrEqual 2
+            @($script:calls | Select-Object -Skip ($deletedAt + 1) | Where-Object { $_.Method -eq 'GET' -and $_.Path -match ('/runCommands/{0}$' -f $hostAck) }).Count | Should -BeGreaterOrEqual 2
             $status = Get-SessionStatus
             Test-Json -Json (ConvertTo-Json -InputObject $status.rcaAcks -Depth 4 -Compress) -SchemaFile $script:transportSchema | Should -BeTrue
             @($status.rcaAcks.sent | Sort-Object) | Should -Be @($ids[0..2] | Sort-Object)
-            @($status.rcaAcks.left) | Should -Be @($ids[3])
+            @($status.rcaAcks.left) | Should -Be @($ids[3..4])
             @(@($status.rcaAcks.sent) + @($status.rcaAcks.left) | Sort-Object) | Should -Be @($ids | Sort-Object)
             $status.rcaAcks.status | Should -Be 'Warning'
-            $status.rcaAcks.message | Should -Match '^3 of 4 sidecar acknowledgement\(s\) sent before the start''s exports \(2 on sqlvm01, 1 on archost01\); the rest weren''t: 1 name a host this control doesn''t know\.$'
-            $step = @($status.steps | Where-Object step -EQ 'RCA.SIDECAR.ACK')
-            $step.Count | Should -Be 1
-            $step[0].state | Should -Be 'Warning'
-            $step[0].fix | Should -Match '^The control notebook keeps them, and the next Run all''s start sends them again'
+            $status.rcaAcks.message | Should -Match '^3 of 5 sidecar acknowledgement\(s\) sent before the start''s sidecar fetch \(2 on sqlvm01, 1 on archost01\); the rest weren''t: 2 name a host this control doesn''t know\.$'
+            @($status.steps | Where-Object step -EQ 'RCA.SIDECAR.ACK') | Should -BeNullOrEmpty -Because 'the control notebook prints RCA.SIDECAR.ACK from rcaAcks (T2c-2)'
             # The runner took them: no start fetches them again.
             $expected = @(('{0}@sqlvm01' -f $ids[0]), ('{0}@sqlvm01' -f $ids[1]), ('{0}@archost01' -f $ids[2])) | Sort-Object
             @($script:sidecarAcked | ForEach-Object { '{0}@{1}' -f $_.Id, $_.Vm } | Sort-Object) | Should -Be $expected
+            # A host segment is the VM's name as the runner writes it (Hosts.Normalize): lower case, each run of other
+            # characters one hyphen.
+            $odd = [pscustomobject]@{ sqlVmName = 'SQL_VM.01'; hostVmName = 'archost01'; t2GuestName = 'ArcSql01' }
+            Get-DbHubRcaSidecarVm -Settings $odd -DocumentId '20261120T165000Z-sql-vm-01-0001-sidecar' | Should -Be 'SQL_VM.01'
+            Get-DbHubRcaSidecarVm -Settings $odd -DocumentId '20261120T165000Z-arcsql01-0001-sidecar' | Should -Be 'archost01'
+            Get-DbHubRcaSidecarVm -Settings $odd -DocumentId '20261120T165000Z-archost01-0001-sidecar' | Should -Be ''
+            Get-DbHubRcaSidecarVm -Settings $odd -DocumentId '20261120T165000Z-sqlvm01-0001-sidecar' | Should -Be ''
+            # A VM that isn't running gets none, and its IDs wait for the next start.
+            Reset-TestAzure
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+            Set-SidecarRunner
+            $work = New-DbHubRcaAckWork -Settings $script:settings -Acks ([pscustomobject]@{ Present = $true; Ids = @($ids[0], $ids[2]); Problem = '' })
+            Invoke-DbHubRcaAck -Context (New-TestContext) -Work $work -DeadlineUtc $script:clock.AddMinutes(6)
+            @(Get-SidecarCommand -Kind 'ack' | ForEach-Object Vm) | Should -Be @('sqlvm01')
+            $alone = [ordered]@{}
+            Complete-DbHubRcaAck -Status $alone -Work $work
+            @($alone['rcaAcks'].left) | Should -Be @($ids[2])
+            $alone['rcaAcks'].message | Should -Match 'archost01 didn''t run during this start'
+            # A VM's older runner: the message the notebook prints names ./scripts/deploy.ps1.
+            Reset-TestAzure
+            $script:vm = @{ sqlvm01 = 'running'; archost01 = 'deallocated' }
+            Set-SidecarRunner -Old @{ sqlvm01 = 'OldRunner' }
+            $work = New-DbHubRcaAckWork -Settings $script:settings -Acks ([pscustomobject]@{ Present = $true; Ids = @($ids[0]); Problem = '' })
+            Invoke-DbHubRcaAck -Context (New-TestContext) -Work $work -DeadlineUtc $script:clock.AddMinutes(6)
+            $old = [ordered]@{}
+            Complete-DbHubRcaAck -Status $old -Work $work
+            $old['rcaAcks'].status | Should -Be 'Warning'
+            $old['rcaAcks'].message | Should -Be 'None of the 1 sidecar acknowledgement(s) was sent: sqlvm01''s workload runner predates the Query Store sidecar. Run ./scripts/deploy.ps1, which updates the runner, its bootstrap bundle, the runbooks, and the control notebook together.'
         }
 
-        It 'takes the acknowledgements'' time out of the start''s bound, which the earlier session''s evidence and the sidecars share' {
+        It 'sends the acknowledgements within the start''s bound, which the earlier session''s evidence and the sidecars share' {
+            # The session before it left sidecars on the VMs, so the start fetches them, after its acknowledgements.
+            $previous = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $true; finalRan = $true; status = 'Pass'; message = '' }; rcaSidecar = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); offered = 3; fetched = 0; left = 3; waiting = $true; status = 'Warning'; message = 'cut'; index = '' } }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
             Set-TestSessionStart
             # sqlvm01's acknowledgement takes 100 seconds.
             Set-SidecarRunner -AckSeconds 100
-            $script:earlier = $null
-            Mock Invoke-DbHubRcaEarlier { $script:earlier = [pscustomobject]@{ At = $script:clock; DeadlineUtc = $DeadlineUtc } }
+            $script:fetch = $null
+            Mock Invoke-DbHubRcaSidecarSession { $script:fetch = [pscustomobject]@{ At = $script:clock; DeadlineUtc = $DeadlineUtc }; return [pscustomobject]@{ State = (ConvertTo-DbHubRcaSidecarState -State $null -SessionId $SessionId); Lines = @() } }
             $request = @{ action = 'session'; sessionId = $script:nextSession; requestedBy = 'presenter'; rcaAcks = [ordered]@{ kind = 'ContosoCare.RcaAckRequest'; version = 1; documents = @('20261120T165000Z-sqlvm01-0001-sidecar') } }
             $started = Invoke-DbHubControl -WebhookData (New-Webhook $request) -Context (New-TestContext)
             $started.status | Should -BeIn 'Started', 'Partial'
             (Get-SessionStatus).rcaAcks.status | Should -Be 'Pass'
-            (Get-SessionStatus).rcaAcks.message | Should -Be '1 sidecar acknowledgement(s) sent before the start''s exports: 1 on sqlvm01.'
-            $left = ($script:earlier.DeadlineUtc - $script:earlier.At).TotalSeconds
+            (Get-SessionStatus).rcaAcks.message | Should -Be '1 sidecar acknowledgement(s) sent before the start''s sidecar fetch: 1 on sqlvm01.'
+            $ack = @(Get-SidecarCommand -Kind 'ack')[0]
+            ($script:fetch.DeadlineUtc - $ack.At).TotalSeconds | Should -BeLessOrEqual 360 -Because 'the bound began before the acknowledgement'
+            $left = ($script:fetch.DeadlineUtc - $script:fetch.At).TotalSeconds
             $left | Should -BeLessOrEqual 260 -Because 'the acknowledgement''s 100 seconds or more come out of the start''s 360'
-            $left | Should -BeGreaterOrEqual 180 -Because 'the acknowledgements take at most half the start''s bound'
+            $left | Should -BeGreaterOrEqual 240
+
+            # One that doesn't end is cut at the bound, where the fetch begins with no time left; the next VM's get none, and
+            # their IDs wait for the next start.
+            Reset-TestAzure
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
+            Set-TestSessionStart
+            Set-SidecarRunner -AckSeconds 1000
+            $script:fetch = $null
+            $request.rcaAcks.documents = @('20261120T165000Z-sqlvm01-0001-sidecar', '20261120T165500Z-arcsql01-0001-sidecar')
+            $null = Invoke-DbHubControl -WebhookData (New-Webhook $request) -Context (New-TestContext)
+            $status = Get-SessionStatus
+            @($status.rcaAcks.sent) | Should -BeNullOrEmpty
+            @($status.rcaAcks.left) | Should -Be @($request.rcaAcks.documents)
+            $status.rcaAcks.status | Should -Be 'Warning'
+            $status.rcaAcks.message | Should -Be 'None of the 2 sidecar acknowledgement(s) was sent: sqlvm01''s acknowledgements didn''t end in the time the start had for them; no time was left for archost01''s in the start''s bound.'
+            @(Get-SidecarCommand -Kind 'ack' -Vm 'archost01') | Should -BeNullOrEmpty
+            @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty -Because 'what still ran was deleted'
+            $over = ($script:fetch.At - $script:fetch.DeadlineUtc).TotalSeconds
+            $over | Should -BeGreaterOrEqual 0
+            $over | Should -BeLessOrEqual 10 -Because 'nothing runs past the bound but the poll that finds it'
+        }
+
+        It 'acknowledges at a start after the earlier session''s evidence on each VM and before the sidecar fetch, so the runner offers none the history holds' {
+            # The session before it ended without its final export, so the start exports it right before each VM's activity,
+            # and fetches its evidence and then the sidecars it left on sqlvm01, the first of which the history holds.
+            $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; steps = @(); rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $false; status = 'Pass'; message = '' } }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+            Set-TestSessionStart
+            Set-FixtureRunner
+            $sidecars = @(Get-FixtureSidecar)
+            Set-SidecarRunner -Offer @{ sqlvm01 = $sidecars }
+            $script:rcaListOpen = $true
+            $ids = @($sidecars[0].documentId, '20261101T100000Z-arcsql01-0009-sidecar')
+            $request = @{ action = 'session'; sessionId = $script:nextSession; requestedBy = 'presenter'; rcaAcks = [ordered]@{ kind = 'ContosoCare.RcaAckRequest'; version = 1; documents = $ids } }
+            $started = Invoke-DbHubControl -WebhookData (New-Webhook $request) -Context (New-TestContext)
+            $started.status | Should -BeIn 'Started', 'Partial'
+            foreach ($vm in 'sqlvm01', 'archost01') {
+                $evidence = @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match ('/virtualMachines/{0}/runCommands/DbHubControl-rca-{0}-(x|\d{{4}})-\d{{14}}$' -f $vm) })
+                $evidence.Count | Should -BeGreaterThan 0
+                $ackPut = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match ('/virtualMachines/{0}/runCommands/DbHubControl-rca-{0}-k01-\d{{14}}$' -f $vm) }))[0])
+                $ackPut | Should -BeGreaterThan $script:calls.IndexOf($evidence[-1]) -Because "the earlier session's evidence on $vm comes first"
+            }
+            $ackGone = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/runCommands/DbHubControl-rca-sqlvm01-k01-\d{14}$' }))[0])
+            $page = $script:calls.IndexOf((@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/runCommands/DbHubControl-rca-sqlvm01-i01-\d{14}$' }))[0])
+            $page | Should -BeGreaterThan $ackGone -Because 'the sidecar fetch follows the acknowledgements'
+            $status = Get-SessionStatus
+            @($status.rcaAcks.sent | Sort-Object) | Should -Be @($ids | Sort-Object)
+            @($status.rcaEarlier.documents.documentId) | Should -Be $script:fixtureIds -Because 'the evidence goes on as before'
+            # The runner no longer offers the sidecar the history holds: the start fetches only the others, under the new
+            # session.
+            @($status.rcaSidecar.documents.documentId) | Should -Be @($sidecars[1..2].documentId)
+            @(Get-SidecarCommand -Kind 'part' | Where-Object { $_.Request.documentId -eq $sidecars[0].documentId }) | Should -BeNullOrEmpty
+            $status.rcaSidecar.sessionId | Should -Be $script:nextSession
+            @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
         }
 
         It 'starts a session whose rcaAcks doesn''t follow the contract, sends none of it, and says why with the fix' {
@@ -5459,8 +5573,9 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             @($status.rcaAcks.sent) | Should -BeNullOrEmpty
             @($status.rcaAcks.left) | Should -Be $ids
             $status.rcaAcks.status | Should -Be 'Warning'
-            $status.rcaAcks.message | Should -Be 'None of the 2 sidecar acknowledgement(s) was sent: its rcaAcks is of a kind or version this runbook doesn''t know.'
-            (@($status.steps | Where-Object step -EQ 'RCA.SIDECAR.ACK'))[0].fix | Should -Match '^Run \./scripts/deploy\.ps1'
+            $status.rcaAcks.message | Should -Be 'None of the 2 sidecar acknowledgement(s) was sent: its rcaAcks is of a kind or version this runbook doesn''t know. Run ./scripts/deploy.ps1, which updates the runner, its bootstrap bundle, the runbooks, and the control notebook together.'
+            Test-Json -Json (ConvertTo-Json -InputObject $status.rcaAcks -Depth 4 -Compress) -SchemaFile $script:transportSchema | Should -BeTrue
+            @($status.steps | Where-Object step -EQ 'RCA.SIDECAR.ACK') | Should -BeNullOrEmpty
             # Only a session takes rcaAcks.
             (Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'stop'; rcaAcks = $request.rcaAcks }) -Settings $script:settings).Valid | Should -BeFalse
             $valid = Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:nextSession; rcaAcks = [ordered]@{ kind = 'ContosoCare.RcaAckRequest'; version = 1; documents = @($ids[0]) } }) -Settings $script:settings
@@ -5536,12 +5651,16 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             (Get-FinalMetric).rcaSidecars.documents | Should -Be 3
         }
 
-        It 'writes no sidecar bundle from a re-check once the session''s stop has begun, and sends no more Run Commands' {
+        It 'writes no sidecar bundle from a re-check once the session''s stop has begun, and sends no more Run Commands: <Case>' -ForEach @(
+            @{ Case = 'the stop begins during a part, with more to send'; Pad = 5000 }
+            @{ Case = 'the stop begins during the part that makes a sidecar whole'; Pad = 0 }
+        ) {
             $running = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $script:fixtureSession) }
             $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
-            # T2's guest's sidecar, whose parts the T2 host takes one at a time: the re-check has more to send after the first.
-            $a = New-TestSidecar -Id '20261027T140000Z-arcsql01-0001-sidecar' -Pad 5000
-            $a.parts | Should -BeGreaterThan 1
+            # T2's guest's sidecar, whose parts the T2 host takes one at a time: with Pad, the re-check has more to send after
+            # the first; without, its one part makes it whole, and only the bundle's write is left.
+            $a = New-TestSidecar -Id '20261027T140000Z-arcsql01-0001-sidecar' -Pad $Pad
+            ($a.parts -gt 1) | Should -Be ($Pad -gt 0)
             Set-SidecarRunner -Offer @{ archost01 = @($a) }
             # Stop now begins while the re-check's first sidecar part runs.
             $script:sidecarRunnerBefore = $script:rcaSidecarRunner
@@ -5560,6 +5679,10 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             $script:stopped.status | Should -Be 'Stopped'
             $versions = @($script:secrets['dbhub-session-metrics'])
             [string]$versions[-1].Tags['rca'] | Should -BeIn 'yes', 'no' -Because 'nothing goes after the stop''s final version of the metrics'
+            # The stop's own tail took the sidecar: every sidecar bundle is the stop's, which its index lists.
+            $index = @(Get-SidecarVersion -Tag 'sidecar-index')
+            $index.Count | Should -Be 1
+            @(($index[0].Value | ConvertFrom-Json).bundles) | Should -Be @(Get-SidecarVersion -Tag 'sidecar-bundle' | ForEach-Object Version)
             $recheckStamp = '-' + (Get-SidecarCommand -Kind 'page')[0].Name.Split('-')[-1]
             @(Get-SidecarCommand -Kind 'part' -Vm 'archost01' | Where-Object { $_.Name.EndsWith($recheckStamp) }).Count | Should -Be 1 -Because 'the re-check sends no more parts once the stop has begun'
             @($script:rcaCommands | Where-Object { $_.Name.EndsWith($recheckStamp) -and $_.At -gt $script:stopAt }) | Should -BeNullOrEmpty
@@ -5591,7 +5714,8 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
             Set-TestSessionStart
             Set-SidecarRunner -Offer @{ sqlvm01 = $sidecars }
-            $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:nextSession; requestedBy = 'presenter' }) -Context (New-TestContext)
+            $again = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:nextSession; requestedBy = 'presenter' }) -Context (New-TestContext)
+            $again.status | Should -BeIn 'Started', 'Partial'
             @($script:rcaCommands) | Should -BeNullOrEmpty
         }
 
@@ -5613,6 +5737,10 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
                     $out += ('{0}|{1}|{2}' -f $id, $expanded.Ok, $expanded.Document.documentId)
                 }
                 $out += (ConvertTo-Json -InputObject (New-DbHubRcaSidecarPointer -Index ('a' * 32) -Documents 3 -Status 'Pass' -Message ('A long message, ' * 20)) -Compress)
+                # Within 300 bytes as this engine writes it: 5.1 writes each ' as \u0027, 6 bytes, so it cuts this message.
+                $apostrophes = New-DbHubRcaSidecarPointer -Index ('a' * 32) -Documents 3 -Status 'Warning' -Message ("it's " * 24)
+                $out += [string]([System.Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json -InputObject $apostrophes -Depth 3 -Compress)) -le 300)
+                $out += (@((ConvertTo-DbHubRcaHostSegment -Name 'SQL_VM.01'), (ConvertTo-DbHubRcaHostSegment -Name '--Arc Sql 01--'), (ConvertTo-DbHubRcaHostSegment -Name ''), (ConvertTo-DbHubRcaHostSegment -Name (('a' * 39) + '-b'))) -join '|')
                 $acks = ConvertFrom-DbHubRcaAckRequest -Body ($Body | ConvertFrom-Json)
                 $out += ('{0}|{1}|{2}' -f $acks.Present, ($acks.Ids -join ','), $acks.Problem)
                 $out += (ConvertTo-Json -InputObject (ConvertTo-DbHubRcaSidecarState -State (ConvertTo-DbHubDictionary -InputObject ($State | ConvertFrom-Json)) -SessionId '5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21') -Depth 4 -Compress)
@@ -5634,6 +5762,8 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             $there | Should -Be $here
             $here[0] | Should -Match '^True\|1\|Pass\|\[\{"documentId":"20261120T165000Z-sqlvm01-0001-sidecar","sessionId":"5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21","parts":2,'
             $here[2] | Should -Be '20261120T165000Z-sqlvm01-0001-sidecar|True|20261120T165000Z-sqlvm01-0001-sidecar'
+            $here[-5] | Should -Be 'True'
+            $here[-4] | Should -Be ('sql-vm-01|arc-sql-01|host|{0}' -f ('a' * 39))
             $here[-3] | Should -Be 'True|20261120T165000Z-sqlvm01-0001-sidecar|'
             $here[-1] | Should -Be ('archost01|{0}|True' -f (Get-DbHubRcaSidecarSize -Reference ([ordered]@{ documentId = '20261120T165000Z-sqlvm01-0001-sidecar'; sessionId = $null; parts = 2; sha256 = ('0' * 64); state = 'new' })))
         }
@@ -5773,9 +5903,12 @@ Describe 'The published runbooks' {
             '{"action":"stop","sessionId":"0123456789abcdef0123456789abcdef"}'
             '{"action":"pending","requestedBy":"capture-t2-golden.ps1"}'
             '{"action":"pending","sessionId":"0123456789abcdef0123456789abcdef"}'
+            # A start's rcaAcks (2026-11-23, rca/transport.schema.json, ackRequest), which only a session takes.
+            '{"action":"session","sessionId":"0123456789abcdef0123456789abcdef","rcaAcks":{"kind":"ContosoCare.RcaAckRequest","version":1,"documents":["20261120T165000Z-sqlvm01-0001-sidecar","20261120T165500Z-arcsql01-0001-sidecar"]}}'
+            '{"action":"stop","rcaAcks":{"kind":"ContosoCare.RcaAckRequest","version":1,"documents":["20261120T165000Z-sqlvm01-0001-sidecar"]}}'
         )
         $expected = @($bodies | ForEach-Object { (Test-DbHubControlRequest -WebhookData (New-Webhook $_) -Settings $script:settings).Valid })
-        ($expected | ForEach-Object { $_.ToString() }) -join ',' | Should -Be 'True,False,True,True,False,False,False,True,True,False,True,True,True,False'
+        ($expected | ForEach-Object { $_.ToString() }) -join ',' | Should -Be 'True,False,True,True,False,False,False,True,True,False,True,True,True,False,True,False'
         $requestFile = Join-Path -Path $TestDrive -ChildPath 'requests.json'
         Set-Content -LiteralPath $requestFile -Value (ConvertTo-Json -InputObject @{ settings = $script:settingsJson; bodies = $bodies } -Depth 4) -Encoding utf8
         $common = Join-Path -Path $repoRoot -ChildPath 'automation/runbooks/DbHubControl.Common.ps1'
