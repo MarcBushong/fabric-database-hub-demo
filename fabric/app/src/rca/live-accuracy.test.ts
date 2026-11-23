@@ -53,6 +53,14 @@ describe("the replica's lag (finding 1)", () => {
         expect(r.recommendations.map((x) => x.id)).toEqual(["RPL-SHORT-REPORTS", "RPL-STANDBY-DELAY", "RPL-NO-EXCLUSIVE"]);
     });
 
+    // B's second stall, from a last replay at 16:20:51, cited the first stall's relax at 16:20:03 as its own episode's, beside
+    // its own escalation, while its own relax at 16:24:03 was left out.
+    it("cites each stall's own episode: the capture's escalation in it, and its relax after that stall's recovery", async () => {
+        const events = async (key: string) => ((await ask("explain_incident", { episodeKey: key })).rootCause?.evidence ?? []).filter((e) => e.table === "RCA Events").map((e) => `${e.at} ${e.text.split(":")[0]}`);
+        expect(await events(LIVE_KEYS.replicaFirst)).toEqual(["2026-11-21T16:17:12Z capture escalated", "2026-11-21T16:20:03Z capture relaxed"]);
+        expect(await events(LIVE_KEYS.replicaSecond)).toEqual(["2026-11-21T16:21:42Z capture escalated", "2026-11-21T16:24:03Z capture relaxed"]);
+    });
+
     it.each([
         ["the harness's live call", { at: "2026-11-21T16:17:12Z", minutesBefore: 5, minutesAfter: 15 }],
         ["the stall's escalation", { at: "2026-11-21T16:17:12Z" }],

@@ -323,14 +323,16 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     // recovery's sample, by which replay had resumed, or to its last point when it hadn't recovered (the review of 921d3097:
     // a sample a minute before the stall, with 512 bytes in flight from a busy primary, read as slow replay "512 bytes
     // behind, WAL about 0 bytes/s" for a stall whose own samples held 0 behind, from an idle primary).
-    const ofStall = (s: ReplicaSample) => s.at.getTime() >= rise.lastReplay!.getTime() && (rise.recovered ? s.at < rise.end : s.at <= rise.end);
+    const beforeEnd = (s: { at: Date }) => (rise.recovered ? s.at < rise.end : s.at <= rise.end);
+    const ofStall = (s: ReplicaSample) => s.at.getTime() >= rise.lastReplay!.getTime() && beforeEnd(s);
     const figures = sawStall ? inWindow.filter(ofStall) : inWindow;
     const figuresReplica = figures.filter((s) => s.side === "replica");
     const figuresPrimary = figures.filter((s) => s.side === "primary");
-    // A conflict is this rise's only from when its replay stood still: the minute before it can hold the last stall's
-    // (the review of ebd1c6c3).
+    // A conflict is this rise's only from when its replay stood still, since the minute before it can hold the last stall's
+    // (the review of ebd1c6c3), and only up to its end, as its figures are, since the minute after it can hold the next
+    // one's (the review of fb144473: a lock the replica took 16 s after this stall's recovery was named as its cause).
     const stoodFrom = (rise.lastReplay ?? rise.stalledSince).getTime();
-    const conflicts = replica.filter((s) => s.conflictRelation && s.conflictHolder !== undefined && s.at.getTime() >= stoodFrom);
+    const conflicts = replica.filter((s) => s.conflictRelation && s.conflictHolder !== undefined && s.at.getTime() >= stoodFrom && beforeEnd(s));
     const conflict = conflicts[0];
     const waitStart = conflicts.find((s) => s.conflictWaitStart)?.conflictWaitStart;
     const backlog = Math.max(0, ...figuresReplica.map((s) => s.receivedNotReplayedBytes ?? 0));
@@ -339,10 +341,29 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     const walRate = figuresPrimary.filter((s) => s.walBytesPerS !== undefined).map((s) => s.walBytesPerS as number);
     // The median, so a short burst (the primary taking its lock) doesn't stand for the rate the replica received.
     const avgWal = walRate.length ? Math.round([...walRate].sort((a, b) => a - b)[Math.floor(walRate.length / 2)]) : null;
-    const cancels = Math.max(0, ...replica.map((s) => s.conflictsCancelled ?? 0));
+    // The queries recovery cancelled: pg_stat_database_conflicts' deltas since the reading before, so they add up. A stall's
+    // cancel ends it, so the capture records it at or after the stall's recovery, and the next stall's only after it has
+    // read that one at its level. So this stall's are those recorded after its own first reading at its level, which is
+    // after its last replay too, through its recovery, up to the next rise's first point at its level, and within the
+    // minutes read: never an earlier stall's, nor the next one's (the review of fb144473: a cancel recorded 20 s before
+    // this stall's last replay read as this one's). From its last replay alone, B's blip at 16:19:37 would share the first
+    // stall's reading at 16:19:32.827, since its own last replay was at 16:19:32.69.
+    const nextRise = rise.recovered ? series.points.find((p) => p.at > rise.end && p.value >= 5) : undefined;
+    const cancelsTo = nextRise ? Math.min(nextRise.at.getTime(), to) : rise.recovered ? to : rise.end.getTime();
+    const cancelsAfter = Math.max(stoodFrom, rise.start.getTime());
+    const cancelReadings = replica.filter((s) => s.conflictsCancelled !== undefined && s.at.getTime() > cancelsAfter && s.at.getTime() <= cancelsTo);
+    const cancels = cancelReadings.reduce((n, s) => n + (s.conflictsCancelled ?? 0), 0);
+    // Whether recovery cancelled the query is known only from a reading at or after the recovery, where that cancel is recorded.
+    const cancelRead = !!rise.recovered && cancelReadings.some((s) => s.at >= rise.end);
     const delay = replica.find((s) => s.maxStandbyStreamingDelayS !== undefined)?.maxStandbyStreamingDelayS;
-    // The observer's own episode for the stall, as evidence of when it watched closely; it never names a cause.
-    const watched = input.events.filter((e) => e.kind === "capture" && e.target === "T4-replica" && e.at.getTime() >= from - 120_000 && e.at.getTime() <= to + 120_000);
+    // The capture's own episode for the stall, as evidence of when it watched closely; it never names a cause. Its own:
+    // from the stall's first reading at its level, since the capture escalates no earlier, to the episode's relax at or
+    // after its recovery (B's second stall, from 16:20:51, cited the first one's relax at 16:20:03).
+    const captureEvents = input.events
+        .filter((e) => e.kind === "capture" && e.target === "T4-replica" && e.at.getTime() >= from - 120_000 && e.at.getTime() <= to + 120_000)
+        .sort((a, b) => a.at.getTime() - b.at.getTime());
+    const relaxed = captureEvents.find((e) => e.name === "relaxed" && e.at >= rise.end);
+    const watched = captureEvents.filter((e) => e.at >= rise.start && (!relaxed || e.at <= relaxed.at));
     const watchedRefs = watched.slice(0, 2).map((e) => ({ table: "RCA Events", at: iso(e.at), target: e.target, text: `capture ${e.name}: ${e.detail}` }));
 
     if (replica.length === 0) notCaptured.push("The replica's replay state (RCA Replica) wasn't captured for these minutes: the explanation rests on the metric's shape alone.");
@@ -362,10 +383,22 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
             figuresPrimary.length > 0
                 ? `The primary shipped normally (write and flush lag at most ${maxWriteLag} s${avgWal !== null ? `, WAL about ${avgWal} bytes/s` : ""}), so neither the network nor the write volume caused it. `
                 : "The primary's side wasn't sampled during the stall, so whether it shipped normally isn't known. ";
+        // How it ended, only as far as the capture's readings show it: a stall that hadn't recovered may still have its
+        // query cancelled, and one the capture didn't read from its recovery on says nothing either way.
+        const cancelled = plural(cancels, "replica query", "replica queries");
+        const ended = !rise.recovered
+            ? cancels > 0
+                ? `recovery cancelled ${cancelled} (SQLSTATE 40001) during it, and replay hadn't caught up by the end of the minutes read`
+                : "replay hadn't caught up by the end of the minutes read, so whether the query ended or recovery cancelled it isn't known"
+            : !cancelRead
+              ? "the capture has no reading of the replica's cancels from its recovery on, so whether recovery cancelled the query isn't known, and replay caught up"
+              : cancels > 0
+                ? `recovery cancelled ${cancelled} (SQLSTATE 40001), and replay caught up`
+                : "the query ended before that, so nothing was cancelled, and replay caught up";
         statement =
             `${shape}: replay stood still. The replica kept receiving WAL (${backlog} bytes received but not replayed) while its startup process waited for ${conflict.conflictWantedMode ?? "a lock"} on ${conflict.conflictRelation}${since}, which a query on the replica held (${conflict.conflictHolderMode ?? "a lock"}; ${holder}). ` +
             shipped +
-            `Replay may wait up to max_standby_streaming_delay${delay !== undefined ? ` (${delay} s)` : ""}; ${cancels > 0 ? `recovery cancelled ${plural(cancels, "replica query", "replica queries")} (SQLSTATE 40001)` : "the query ended before that, so nothing was cancelled"}, and replay caught up.`;
+            `Replay may wait up to max_standby_streaming_delay${delay !== undefined ? ` (${delay} s)` : ""}; ${ended}.`;
         confidence = conflicts.length >= 2 ? "high" : "medium";
         evidence = [...lagRefs, ...charted, ev("RCA Replica", conflict.at, `startup waits ${conflict.conflictWantedMode} on ${conflict.conflictRelation}, held ${conflict.conflictHolderMode} by session ${conflict.conflictHolder}`), ...watchedRefs];
         ids = ["RPL-SHORT-REPORTS", "RPL-STANDBY-DELAY", "RPL-NO-EXCLUSIVE"];

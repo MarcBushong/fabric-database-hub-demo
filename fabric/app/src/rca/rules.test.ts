@@ -6,7 +6,7 @@ import { analyzeLocking, blockingEpisodes, chainsOf } from "./locking";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { analyzeThroughput } from "./throughput";
-import { pointKey, type MetricPoint, type RcaTarget, type ReplicaSample, type ResourcePoint, type SessionSample, type WholeReading } from "./types";
+import { pointKey, type EventRow, type MetricPoint, type RcaTarget, type ReplicaSample, type ResourcePoint, type SessionSample, type WholeReading } from "./types";
 
 const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
 
@@ -198,6 +198,147 @@ describe("read replica lag (INV-15) on T4's replica", () => {
         // The review of 921d3097: the primary's side has no sample here, so how it shipped isn't said ("at most 0 s").
         expect(a.rootCause?.statement).toContain(". The primary's side wasn't sampled during the stall, so whether it shipped normally isn't known. Replay may wait");
         expect(a.rootCause?.statement).not.toMatch(/shipped normally \(/);
+    });
+
+    // The review of fb144473: a conflict's lock was read with no upper bound and its cancels with no bound at all, so a later
+    // stall's lock, or an earlier stall's cancel, read as this one's, beside its own figures.
+    describe("reads a conflict's lock and the queries recovery cancelled from its own stall", () => {
+        /** Every 5 s from `from` to `to`, as the capture reads the replica while replay stands still. */
+        const every5 = (from: string, to: string) => {
+            const out: string[] = [];
+            for (let t = at(from).getTime(); t <= at(to).getTime(); t += 5_000) out.push(new Date(t).toISOString().slice(11, 23));
+            return out;
+        };
+        /** The replica's reading at `t`: since its last replay at `since` (null: replay current, 0.3 s), and what was read with it. */
+        const reading = (t: string, since: string | null, o: { behind?: number; holder?: number; waitStart?: string; cancelled?: number } = {}): ReplicaSample => ({
+            target: "T4-replica",
+            at: at(t),
+            side: "replica",
+            sinceLastReplayS: since === null ? 0.3 : (at(t).getTime() - at(since).getTime()) / 1000,
+            receivedNotReplayedBytes: o.behind ?? 0,
+            conflictsCancelled: o.cancelled ?? 0,
+            ...(o.holder ? { conflictRelation: "demo.replica_lag_marks", conflictWantedMode: "AccessExclusiveLock", conflictWaitStart: at(o.waitStart ?? since ?? t), conflictHolder: o.holder, conflictHolderMode: "AccessShareLock" } : {}),
+        });
+        const primary = (t: string, walBytesPerS: number): ReplicaSample => ({ target: "T4", at: at(t), side: "primary", walBytesPerS, writeLagS: 0.002, flushLagS: 0.002, sendGapBytes: 0 });
+        const statementAt = (samples: ReplicaSample[], t: string, metrics: MetricPoint[] = []) => analyzeReplicaLag({ at: at(t), metrics, samples, events: [] }).rootCause?.statement ?? "";
+
+        it("names no lock the replica took after the stall ended: the review's P2", () => {
+            const samples = [
+                // Replay stood still from 16:00:00 with nothing behind, the primary idle, and was back at 16:01:35.
+                ...every5("16:00:05", "16:01:30").flatMap((t) => [reading(t, "16:00:00"), primary(t, 0)]),
+                reading("16:01:35", null),
+                primary("16:01:35", 0),
+                reading("16:01:40", null),
+                reading("16:01:45", null),
+                // The next stall: its startup process waits for a lock from 16:01:51, sampled from 16:01:55, back at 16:02:45.
+                ...every5("16:01:55", "16:02:40").flatMap((t) => [reading(t, "16:01:50", { behind: 40_960, holder: 333, waitStart: "16:01:51" }), primary(t, 2797)]),
+                reading("16:02:45", null),
+            ];
+            const first = analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples, events: [] });
+            expect(first.rise?.recovered?.at).toEqual(at("16:01:35"));
+            expect(first.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-IDLE-PRIMARY"] });
+            expect(JSON.stringify(first)).not.toMatch(/session 333|16:01:51|40960/);
+            // The next stall's lock is its own, with its own figures.
+            const second = analyzeReplicaLag({ at: at("16:02:20"), metrics: [], samples, events: [] });
+            expect(second.rootCause).toMatchObject({ confidence: "high", ruleIds: ["REPL-REPLAY-CONFLICT"] });
+            expect(second.rootCause?.statement).toContain("(40960 bytes received but not replayed) while its startup process waited for AccessExclusiveLock on demo.replica_lag_marks from 16:01:51 UTC, which a query on the replica held (AccessShareLock; session 333). The primary shipped normally (write and flush lag at most 0.002 s, WAL about 2797 bytes/s)");
+        });
+
+        it("counts no earlier stall's cancel, and a stall's own, recorded at its recovery: the review's P5", () => {
+            const samples = [
+                // Replay stood still from 15:58:00 behind session 111, which recovery cancelled: recorded at 16:00:30.
+                ...every5("15:58:05", "16:00:25").map((t) => reading(t, "15:58:00", { behind: 4096, holder: 111 })),
+                reading("16:00:30", null, { cancelled: 1 }),
+                ...every5("16:00:35", "16:00:50").map((t) => reading(t, null)),
+                // From a last replay at 16:00:50, behind session 222, whose query ended on its own.
+                ...every5("16:00:55", "16:02:00").map((t) => reading(t, "16:00:50", { behind: 4096, holder: 222 })),
+                reading("16:02:05", null),
+            ];
+            expect(statementAt(samples, "16:01:30")).toMatch(/\(AccessShareLock; session 222\)\. .*; the query ended before that, so nothing was cancelled, and replay caught up\.$/);
+            expect(statementAt(samples, "15:59:30")).toMatch(/\(AccessShareLock; session 111\)\. .*; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+        });
+
+        // After the recovery the count goes on, since a cancel is recorded at or after it, up to the next rise's first point at
+        // its level: the next stall's cancel ends that one, so the capture records it only after reading it there.
+        it("counts no cancel of the next stall, though the capture recorded it in the minute after this one's recovery", () => {
+            const samples = [
+                ...every5("16:00:05", "16:00:40").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                reading("16:00:45", null),
+                reading("16:00:50", null),
+                // From 16:00:55, behind session 222, which recovery cancelled: recorded at its recovery, 16:01:35.
+                ...every5("16:01:00", "16:01:30").map((t) => reading(t, "16:00:55", { behind: 4096, holder: 222 })),
+                reading("16:01:35", null, { cancelled: 1 }),
+            ];
+            expect(statementAt(samples, "16:00:20")).toMatch(/\(AccessShareLock; session 111\)\. .*; the query ended before that, so nothing was cancelled, and replay caught up\.$/);
+            expect(statementAt(samples, "16:01:15")).toMatch(/\(AccessShareLock; session 222\)\. .*; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+        });
+
+        // As in B's data: its first stall recovered at 16:19:27.763, and the blip after it stood still from 16:19:32.69, 0.13 s
+        // before the first stall's next reading. Counted from each one's last replay, that reading would be both stalls'.
+        it("counts a reading after a recovery once, for the stall it follows, though the next one's last replay came just before it", () => {
+            const samples = [
+                ...every5("16:00:05", "16:00:25").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                reading("16:00:30", null),
+                // The first stall's cancel, recorded a reading after its recovery, 0.13 s after the next one's last replay.
+                reading("16:00:35", "16:00:34.870", { cancelled: 1 }),
+                ...every5("16:00:40", "16:01:00").map((t) => reading(t, "16:00:34.870", { behind: 4096, holder: 222 })),
+                reading("16:01:05", null),
+            ];
+            expect(statementAt(samples, "16:00:15")).toMatch(/session 111\)\. .*; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+            expect(statementAt(samples, "16:00:50")).toMatch(/session 222\)\. .*; the query ended before that, so nothing was cancelled, and replay caught up\.$/);
+            // Recorded at the next stall's first reading at its level, it's still the first one's: the next was standing still.
+            const atNext = samples.map((s) => (s.at.getTime() === at("16:00:35").getTime() ? { ...s, conflictsCancelled: 0 } : s.at.getTime() === at("16:00:40").getTime() ? { ...s, conflictsCancelled: 1 } : s));
+            expect(statementAt(atNext, "16:00:15")).toMatch(/; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+            expect(statementAt(atNext, "16:00:50")).toMatch(/; the query ended before that, so nothing was cancelled, and replay caught up\.$/);
+        });
+
+        it("says whether the query was cancelled isn't known when the stall hadn't recovered by the end of the minutes read", () => {
+            const open = every5("16:00:05", "16:01:30").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 }));
+            expect(analyzeReplicaLag({ at: at("16:01:00"), metrics: [], samples: open, events: [] }).rise?.recovered).toBeUndefined();
+            const statement = statementAt(open, "16:01:00");
+            expect(statement).toMatch(/; replay hadn't caught up by the end of the minutes read, so whether the query ended or recovery cancelled it isn't known\.$/);
+            expect(statement).not.toMatch(/nothing was cancelled|, and replay caught up/);
+            // A cancel the capture recorded during it is said as one.
+            const cancelled = open.map((s) => (s.at.getTime() === at("16:00:45").getTime() ? { ...s, conflictsCancelled: 1 } : s));
+            expect(statementAt(cancelled, "16:01:00")).toMatch(/; recovery cancelled 1 replica query \(SQLSTATE 40001\) during it, and replay hadn't caught up by the end of the minutes read\.$/);
+        });
+
+        it("says whether the query was cancelled isn't known when the capture didn't read the replica from the stall's recovery on", () => {
+            // The capture's readings end in the stall, and Azure Monitor's lag is back under 5 s from 16:05.
+            const samples = every5("16:00:05", "16:01:30").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 }));
+            const metrics: MetricPoint[] = [{ target: "T4-replica", at: at("16:05:00"), metric: LAG_METRIC, value: 0.5, intervalMs: 60_000, grainMs: 60_000 }];
+            expect(analyzeReplicaLag({ at: at("16:01:00"), metrics, samples, events: [] }).rise?.recovered).toMatchObject({ source: "Telemetry Snapshots", value: 0.5 });
+            expect(statementAt(samples, "16:01:00", metrics)).toMatch(/; the capture has no reading of the replica's cancels from its recovery on, so whether recovery cancelled the query isn't known, and replay caught up\.$/);
+        });
+
+        // Each reading's count is the cancels since the reading before (pg_stat_database_conflicts' deltas), so they add up.
+        it("adds the cancels each reading recorded since the one before", () => {
+            const samples = [
+                ...every5("16:00:05", "16:00:40").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                reading("16:00:45", null, { cancelled: 1 }),
+                reading("16:00:50", null, { cancelled: 1 }),
+            ];
+            expect(statementAt(samples, "16:00:20")).toMatch(/; recovery cancelled 2 replica queries \(SQLSTATE 40001\), and replay caught up\.$/);
+        });
+
+        // The capture's episode events cited beside a conflict are the stall's own: from its first reading at its level to the
+        // episode's relax after its recovery. A stall that began while the episode for the one before it still ran (B's blip
+        // at 16:19:37) has no escalation of its own, and a later episode's escalation isn't its.
+        it("cites the capture's episode events in the stall's own minutes, up to the relax after its recovery", () => {
+            const samples = [
+                ...every5("16:00:05", "16:00:40").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                reading("16:00:45", null),
+                reading("16:00:50", null),
+                // The next stall, in the episode the first one began, which relaxes after it.
+                ...every5("16:00:56", "16:01:10").map((t) => reading(t, "16:00:51", { behind: 4096, holder: 222 })),
+                ...every5("16:01:15", "16:01:25").map((t) => reading(t, null)),
+            ];
+            const event = (t: string, name: string): EventRow => ({ target: "T4-replica", at: at(t), kind: "capture", name, code: "T4-replica-episode", count: 1, detail: `${name} at ${t}` });
+            const events = [event("16:00:30", "escalated"), event("16:01:25", "relaxed"), event("16:02:30", "escalated"), event("16:03:00", "relaxed")];
+            const cited = (t: string) => (analyzeReplicaLag({ at: at(t), metrics: [], samples, events }).rootCause?.evidence ?? []).filter((e) => e.table === "RCA Events").map((e) => e.text);
+            expect(cited("16:00:20")).toEqual(["capture escalated: escalated at 16:00:30", "capture relaxed: relaxed at 16:01:25"]);
+            expect(cited("16:01:05")).toEqual(["capture relaxed: relaxed at 16:01:25"]);
+        });
     });
 
     // The review of ebd1c6c3: the rise was read from the first point at or after the asked time less a minute, so a time in
