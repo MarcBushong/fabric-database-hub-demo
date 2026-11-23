@@ -924,6 +924,13 @@ button.kpi-main:hover {
     cursor: pointer;
 }
 
+/* A plain link in a table or a definition list (DataGrid's Open, the Links page's Open in Fabric) takes the theme's link
+   color, not the browser's blue. */
+.grid-table a,
+.kv a {
+    color: var(--colorBrandForegroundLink);
+}
+
 .grid-empty,
 .grid-note {
     margin: 0;
