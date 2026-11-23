@@ -363,9 +363,12 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
                 Where-Object { $_.Name -notmatch '\.test\.tsx?$' -and $_.FullName -notmatch '[\\/]testdata[\\/]' } |
                 ForEach-Object { $files.Add($_) }
         }
-        $observerRoot = Join-Path -Path $repoRoot -ChildPath 'workload-generator/src/ContosoCare.Workload/Rca/Observer'
-        if (Test-Path -LiteralPath $observerRoot) {
-            Get-ChildItem -LiteralPath $observerRoot -Recurse -File -Filter '*.cs' | ForEach-Object { $files.Add($_) }
+        # The observer's code and the sidecar's readers (blind-detection.json, detectionCode.runner).
+        foreach ($folder in 'Observer', 'QueryStore') {
+            $observerRoot = Join-Path -Path $repoRoot -ChildPath "workload-generator/src/ContosoCare.Workload/Rca/$folder"
+            if (Test-Path -LiteralPath $observerRoot) {
+                Get-ChildItem -LiteralPath $observerRoot -Recurse -File -Filter '*.cs' | ForEach-Object { $files.Add($_) }
+            }
         }
         $violations = foreach ($file in $files) {
             $relative = $file.FullName.Substring($repoRoot.Length + 1).Replace('\', '/')
