@@ -161,6 +161,20 @@ BeforeAll {
                 return (New-AzResult -StdOut '{}')
             }
             '/userAssignedIdentities/' {
+                # Resource Manager checks access before it looks for the resource (the review of 842a3e5c): a role without
+                # the action gets 403 whether the identity is there or not.
+                if ($Method -in $script:identityRefuses) {
+                    $action = if ($Method -eq 'get') { 'read' } else { $Method }
+                    return (New-AzResult -ExitCode 1 -StdErr ("ERROR: (AuthorizationFailed) The client has no access to perform action 'Microsoft.ManagedIdentity/userAssignedIdentities/{0}'." -f $action))
+                }
+                # Another run deletes the control's group after this identity's read, just before its delete.
+                if ($Method -eq 'delete' -and $script:groupGoesAtDelete -and $script:identityExists) {
+                    $script:controlGroupGone = $true
+                    $script:identityExists = $false
+                    $script:vaultExists = $false
+                    $script:accountExists = $false
+                    return (New-AzResult -ExitCode 3 -StdErr "ERROR: (ResourceGroupNotFound) Resource group 'rg-dbhub-control' could not be found.")
+                }
                 if (-not $script:identityExists) {
                     # Resource Manager answers a delete of a resource that doesn't exist with 204 No Content.
                     if ($Method -eq 'delete') {
@@ -384,6 +398,8 @@ BeforeAll {
         $script:writerExists = $true
         $script:writerRoleId = 'eeeeeeee-0000-0000-0000-000000000006'
         $script:identityExists = $true
+        $script:identityRefuses = @()
+        $script:groupGoesAtDelete = $false
         $script:demoGroupExists = $true
         $script:secretExists = $true
         $script:accountExists = $true
@@ -1845,6 +1861,64 @@ Describe 'Removing the control (setup-activity-control.ps1 -Remove)' {
         # The resources themselves, not the role assignments on the vault's secrets, which the roles' removal deletes.
         $deletes = @($script:ops | Where-Object { $_ -match '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$' } | ForEach-Object { $_ -replace '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$', '$1' })
         ($deletes -join ', ') | Should -Be ($Deleted -join ', ') -Because 'a resource that''s already gone gets no delete'
+    }
+
+    # The review of 842a3e5c probed these three (2026-11-22); destroy.ps1 runs the same code for DESTROY.CONTROL.RESOURCES.
+    It 'sends the delete when Azure refuses the read, and never calls the resource already gone: <Case>' -ForEach @(
+        @{ Case = 'the delete allowed'; Refuses = @('get'); Status = 'Pass'; Deleted = @('userAssignedIdentities', 'vaults', 'automationAccounts') }
+        @{ Case = 'the delete refused too'; Refuses = @('get', 'delete'); Status = 'Fail'; Deleted = @('userAssignedIdentities', 'vaults') }
+    ) {
+        $script:identityRefuses = $Refuses
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
+
+        $vault = (Get-ControlName (New-ControlConfig)).KeyVault
+        $resources = $results | Where-Object checkId -EQ 'CONTROL.REMOVE.RESOURCES'
+        $resources.status | Should -Be $Status
+        $resources.message | Should -Not -Match 'Already gone' -Because 'a refused read doesn''t say whether the identity is there'
+        if ($Status -eq 'Pass') {
+            $resources.message | Should -BeExactly ('Deleted: id-dbhub-automation, {0}, the vault purge, aa-dbhub-control. rg-dbhub-control was empty and is being deleted.' -f $vault)
+        }
+        else {
+            $resources.message | Should -BeLike ('Deleted: {0}, the vault purge. Failed: id-dbhub-automation: ERROR: (AuthorizationFailed) *userAssignedIdentities/delete*; aa-dbhub-control: kept until the rest is deleted.*' -f $vault)
+        }
+        $deletes = @($script:ops | Where-Object { $_ -match '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$' } | ForEach-Object { $_ -replace '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$', '$1' })
+        ($deletes -join ', ') | Should -Be ($Deleted -join ', ') -Because 'the identity''s delete is still sent'
+    }
+
+    It 'calls a resource that goes between its read and its delete already gone' {
+        # Another run deletes the control's group after the identity's read, so Resource Manager answers the identity's
+        # delete with 404, and every later read in the group too. The vault went with the group, soft-deleted, so its purge
+        # still runs.
+        $script:groupGoesAtDelete = $true
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
+
+        $resources = $results | Where-Object checkId -EQ 'CONTROL.REMOVE.RESOURCES'
+        $resources.status | Should -Be 'Pass'
+        $resources.message | Should -BeExactly ('Deleted: the vault purge. Already gone: id-dbhub-automation, {0}, aa-dbhub-control. rg-dbhub-control is already gone.' -f (Get-ControlName (New-ControlConfig)).KeyVault)
+        $deletes = @($script:ops | Where-Object { $_ -match '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$' } | ForEach-Object { $_ -replace '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$', '$1' })
+        ($deletes -join ', ') | Should -Be 'userAssignedIdentities' -Because 'the identity was there when it was read'
+    }
+
+    It 'purges a vault that''s deleted but not purged yet, and calls it already gone: <Case>' -ForEach @(
+        @{ Case = 'the rest still there'; Rest = $true; GroupGone = $false; Deleted = @('userAssignedIdentities', 'automationAccounts'); Expected = 'Deleted: id-dbhub-automation, the vault purge, aa-dbhub-control. Already gone: {vault}. rg-dbhub-control was empty and is being deleted.' }
+        @{ Case = 'the rest gone with the group'; Rest = $false; GroupGone = $true; Deleted = @(); Expected = 'Deleted: the vault purge. Already gone: id-dbhub-automation, {vault}, aa-dbhub-control. rg-dbhub-control is already gone.' }
+    ) {
+        # A deleted vault stays, soft-deleted, until it's purged: a read of it is 404, and its purge works
+        # (https://learn.microsoft.com/azure/key-vault/general/soft-delete-overview).
+        $script:vaultExists = $false
+        $script:vaultPurgeable = $true
+        $script:secretExists = $false
+        $script:identityExists = $Rest
+        $script:accountExists = $Rest
+        $script:controlGroupGone = $GroupGone
+        $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig) -Remove -Force -SkipFabric)
+
+        $resources = $results | Where-Object checkId -EQ 'CONTROL.REMOVE.RESOURCES'
+        $resources.status | Should -Be 'Pass'
+        $resources.message | Should -BeExactly ($Expected -replace '\{vault\}', (Get-ControlName (New-ControlConfig)).KeyVault)
+        @($script:rest | Where-Object { $_.Method -eq 'post' -and $_.Url -match '/deletedVaults/.+/purge' }).Count | Should -Be 1
+        $deletes = @($script:ops | Where-Object { $_ -match '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$' } | ForEach-Object { $_ -replace '^arm delete .*/(userAssignedIdentities|vaults|automationAccounts)/[^/]+$', '$1' })
+        ($deletes -join ', ') | Should -Be ($Deleted -join ', ') -Because 'a vault that''s deleted gets its purge, not a delete'
     }
 }
 

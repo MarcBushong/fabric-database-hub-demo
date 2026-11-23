@@ -5714,7 +5714,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
   - One that's there is deleted as before. "Deleted" lists the deletes that succeeded, and one that Azure answers isn't there, deleted meanwhile, goes under "Already gone" too.
   - A read that fails for another reason, access for example, leaves the delete to say what happened, as before.
 - **The message:** "Deleted: ..." and "Already gone: ...", each only when it has something, or "Nothing was deleted." when neither has; then "Failed: ...", and the group's note. When the group itself is gone, the note says it's already gone, where it said nothing.
-- **Unchanged:** the order (the Automation account last), the purge (still only "the vault purge" when one was done), the group's deletion when nothing else is in it, and the statuses.
+- **Unchanged:** the order (the Automation account last), the purge (still only "the vault purge" when one was done), the group's deletion when nothing else is in it, and the statuses, except that a resource that's already gone no longer fails on a refused delete. Resource Manager checks access before it looks for a resource, so a role without the delete permission got 403 for one that was gone: a **Fail**, with the Automation account kept. Now the read's 404 lists it as already gone, the result is a **Pass**, and the account is deleted ([the review of 842a3e5c](#the-review-of-842a3e5c-the-statuses-and-three-cases-pinned-2026-11-22)).
 - **Docs:** the CHANGELOG, and this report.
 
 **Changed files.** `scripts/modules/DbHubDemo/Private/ActivityControlHelpers.ps1`; `tests/unit/DbHubDemo.ActivityControl.Tests.ps1` (its fake answers a delete of what doesn't exist with 204, as Resource Manager does, and a group that's gone with 404 for everything in it); the CHANGELOG, and this report.
@@ -5798,3 +5798,32 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - vitest: the file's 18 tests, and the app's whole suite, 390 of 390 in 21 files. typecheck and eslint: clean. markdownlint: clean.
 
 **Risks.** None: two tests, comments, and this report.
+
+### The review of 842a3e5c: the statuses, and three cases pinned (2026-11-22)
+
+**Why.** The review of 7b1110a6, 527c386c, and 842a3e5c found no bugs or regressions: ship it. Its one Low was in the docs: [842a3e5c's section](#the-session-controls-removal-says-what-was-already-gone-2026-11-22) said the statuses are unchanged, and one changed, for the better.
+
+- **Before,** a resource that was already gone still got a delete. Resource Manager checks access before it looks for the resource, so for a role without the delete permission that was a 403: `CONTROL.REMOVE.RESOURCES` was a **Fail**, the Automation account was kept, and in `destroy.ps1`, `DESTROY.CONTROL` was a **Warning**.
+- **Now,** the read's 404 lists it as already gone, the result is a **Pass**, and the account is deleted.
+- **The reviewer also checked three cases by probe only,** which no test covered. `destroy.ps1` runs this code, so the coordinator asked to pin them in `DbHubDemo.ActivityControl`.
+
+**Work summary.**
+
+- **The docs:** 842a3e5c's section, and the CHANGELOG's entry, say what changed in the statuses.
+- **Three tests,** through `Invoke-DemoActivityControlSetup -Remove -Force -SkipFabric`:
+  - **a refused read** (403) still sends the delete, and the message never calls the identity already gone. With the delete allowed, it's a **Pass** that lists the identity as deleted; with the delete refused too, a **Fail** that names it, with the Automation account kept;
+  - **a resource that goes between its read and its delete** is already gone: another run deletes the control's group after the identity's read, so the identity's delete gets 404, and so does every later read in the group;
+  - **a vault that's deleted but not purged yet** gets its purge, and no delete: with the rest still there, and with the rest gone with the group.
+- **The fake** can refuse an identity's read or delete with 403 before it looks for the identity, as Resource Manager does, and can delete the control's group at the identity's delete.
+
+**Changed files.** `tests/unit/DbHubDemo.ActivityControl.Tests.ps1`, the CHANGELOG, and this report.
+
+**Validation.**
+
+- **The new cases catch what they pin:**
+  - on 527c386c's code, before 842a3e5c, the resource that goes meanwhile and the vault's two cases fail, as 842a3e5c's own three do; the refused read's two pass, since that code sent every delete;
+  - with a refused read counted as gone, both refused-read cases fail; with a delete's 404 counted as deleted, the meanwhile case fails; with the purge only for a vault the run deleted itself, the meanwhile case and the vault's two fail.
+- Pester with StrictMode: DbHubDemo.ActivityControl, DbHubDemo.Destroy, DbHubDemo.Teardown, and DbHubDemo.SafetyStop, 369 passed, 5 more than 842a3e5c's, and 1 failed that fails the same way with the previous code, Teardown's "stay out of the static run", as in 842a3e5c's section.
+- PSScriptAnalyzer 1.25.0 with the tests' settings: no findings in the test file. markdownlint: clean. The changed files are ASCII, with LF line endings.
+
+**Risks.** None: tests and docs.
