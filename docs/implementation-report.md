@@ -8961,6 +8961,10 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
   - F35's docs for the Livy steps' design A (243ba79b);
   - [zod 4.6.7 in the functions](#zod-in-the-functions-lock-dependabot-alert-14-2026-11-23) (c0d61282).
 - **The CHANGELOG:** every piece's entries are under `[Unreleased]`, and the RCA release's section reads as 66cc5326 has it. Two merges had put theirs there: stop-tail's Fixed and Security entries, and High contrast's Fixed entries with an edit of the RCA's earth tones entry, which ships as it is.
+- **#69's head, 963c802f** (92bd73fa), merged ahead of main, as the review of 1582e482..c63b155b asked (SHIP WITH FIXES, one Low). #69 dates each heading at its merge, so a later merge of main would have put this release's entries under a second Incident RCA heading, without `[Unreleased]`.
+  - **The CHANGELOG** is this branch's, with #69's date for the Ignite updates, 2026-11-23. From the Incident RCA's heading on, it's #69's byte for byte.
+  - **What else it brings:** #69's secret-scan fix (`.gitleaksignore`'s fingerprints, and `episodeKeyOf` in the RCA's incident tests, beside Query Store's tests), and its service stubs for CI on Linux.
+  - **Main:** main at 4c2c1850 already merges into it without a change.
 
 **Conflicts, and how they were resolved,** besides this report (each merge's message says more):
 
@@ -8976,6 +8980,7 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - The Livy steps: Pester on HistoryKeptValue, Tracks, Lifecycle, FabricItem, FirstRun, and FabricTrack, 721 passed.
 - The typecheck: `npm run typecheck` clean, and `snapshot-value.test.ts` 23 passed.
 - High contrast: `src/lib/app.test.ts` and `src/visuals/ChartView.test.tsx`, 61 passed.
+- #69's head: `Repo.Gitleaks` with the pinned gitleaks on PATH, 11 passed, none skipped; `Vm.SqlVmPlan`, 24 passed; vitest on `tools.test.ts` and `live-accuracy.test.ts`, 78 passed; `npm run typecheck` clean.
 - gitleaks 8.30.1, as CI pins it, checksum checked: the range's 69 commits, and its net diff, found no leak.
 - markdownlint is clean on every commit.
 
