@@ -184,9 +184,10 @@ SUMMARIZECOLUMNS(
 8. **H's marks, deployed twice** (review-h): on T1, T2's guest, and T3:
    - after the net-new deployment, and again after `./scripts/deploy.ps1` runs a second time over it, `sys.extended_properties` (`class` 1, `name` `dbhubdemo.role`, value `harness`) lists exactly the 21 modules `database/common/110-demo-control.sql` creates, and nothing else;
    - the second run's setup reports no error;
-   - the observer reads the marks as it runs: through `contosocare_runner`'s schema grant on T1 and T2, and as `dbo` on T3. RCA-SQL-10's `harness` CTE returns the 21 there.
+   - the observer reads the marks as it runs, and the probe reports through which principal. On T1 and in a `JumpstartImage` guest the runner runs as SYSTEM, a sysadmin, so `dbo` in ContosoCare; on T3, `dbo` through the P6 administrator group. Only a `PaygWizard` guest reads them through `contosocare_runner`'s grant on the `demo` schema (`GuestWorkload.ps1`), so the default deployment doesn't exercise that path. RCA-SQL-10's `harness` CTE returns the 21 there.
 9. **The engine's own tests,** against a disposable SQL Server (`CONTOSOCARE_TEST_SQL_SERVER`, never a demo target):
    - `SqlIntegrationTests.SetupMarksExactlyTheHarnessModulesAsTheRcaReadsThem`, H's first run on a real SQL Server;
+   - `RcaIntegrationTests`' SQL Server test, at the integration's head: with A1 merged, the observer runs the Query Store blocks (RCA-SQL-10, 11, 14, and 15, and 16 once A1 builds item 3) on an engine for the first time, so the report gives each read's time from the runner's log;
    - A1's real-engine test for the runner's own statements, once it's built (item 3): every statement Query Store records from DemoDatabase's methods matches the list.
 
 ## T4's live checks (S11)
