@@ -890,6 +890,29 @@ public sealed class RcaExportTests : IDisposable
     }
 
     [Fact]
+    public void ABeginThatCouldntBeWrittenIsTakenBackSoItsNextTryBeginsTheTargetOnce()
+    {
+        // The re-check of 60aacd7b: the lane tries a failed begin again at its next tick. An interval left open by the first
+        // try would never end, since a target's end closes only its last one.
+        var store = Store(T1From, out _);
+        var span = store.Open(T1From);
+        span.Began("T5", T1From);
+        var path = Path.Combine(span.Directory, "span.json");
+        var blocker = path + ".tmp";
+        Directory.CreateDirectory(blocker);
+        Assert.True(Record.Exception(() => span.Began("T1", T1From.AddSeconds(1))) is IOException or UnauthorizedAccessException);
+
+        Directory.Delete(blocker);
+        span.Began("T1", T1From.AddSeconds(2));
+        span.Ended("T1", T1From.AddMinutes(1));
+        var targets = EvidenceStore.ReadJson(path, RcaStoreJsonContext.Default.SpanFile)!.Targets;
+        var interval = Assert.Single(targets["T1"].Intervals);
+        Assert.Equal(T1From.AddSeconds(2), interval.From);
+        Assert.Equal(T1From.AddMinutes(1), interval.To);
+        Assert.Single(targets["T5"].Intervals);
+    }
+
+    [Fact]
     public async Task AfterTheCapturesEndOnlyTheRunsThatEndedByThenHoldTheAnswerKeyPending()
     {
         var store = Store(T1From, out _);
