@@ -51,9 +51,15 @@ describe("themes", () => {
             for (const name of ["colorNeutralForeground1", "colorNeutralForeground2", "colorNeutralForeground3", "colorBrandForeground1", "colorBrandForegroundLink", "colorBrandForegroundLinkHover"]) {
                 for (const surface of all) expect(contrastRatio(token(id, name), surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(4.5);
             }
-            // A pressed or selected link sits on a card, the navigation, or the page: the app's rows hold no links.
-            for (const name of ["colorBrandForegroundLinkPressed", "colorBrandForegroundLinkSelected"]) {
+            // A Fluent Link's pressed or selected color sits on a card, the navigation, or the page: no Fluent Link sits in a row
+            // (DataGrid's Open is a plain link in the link color, below). A transparent button's hovered, pressed, or checked
+            // text takes Fluent's brand foreground 2 on the same surfaces, since its fill stays transparent.
+            for (const name of ["colorBrandForegroundLinkPressed", "colorBrandForegroundLinkSelected", "colorNeutralForeground2BrandHover", "colorNeutralForeground2BrandPressed", "colorNeutralForeground2BrandSelected"]) {
                 for (const surface of rest) expect(contrastRatio(token(id, name), surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(4.5);
+            }
+            // A subtle button's icon takes the same color on its hovered, pressed, or checked fill: a mark, so 3:1.
+            for (const name of ["colorNeutralForeground2BrandHover", "colorNeutralForeground2BrandPressed", "colorNeutralForeground2BrandSelected"]) {
+                for (const surface of APP_TOKENS[id].states) expect(contrastRatio(token(id, name), surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(3);
             }
             // Hints and placeholders sit on cards, the navigation, and the page.
             for (const surface of rest.slice(0, 3)) expect(contrastRatio(token(id, "colorNeutralForeground4"), surface), `${id} foreground 4 on ${surface}`).toBeGreaterThanOrEqual(4.5);
@@ -62,6 +68,22 @@ describe("themes", () => {
             }
             for (const fill of ["colorBrandBackground", "colorBrandBackgroundHover", "colorBrandBackgroundPressed", "colorBrandBackgroundSelected"]) {
                 expect(contrastRatio(token(id, "colorNeutralForegroundOnBrand"), token(id, fill)), `${id} button text on ${fill}`).toBeGreaterThanOrEqual(4.5);
+            }
+        }
+    });
+
+    it("gives a plain link in a table or on the Links page the theme's link color, readable at rest and in a hovered or pressed row", () => {
+        // DataGrid's Open (a URL column, the Readiness page's Docs) and the Links page's Open in Fabric are plain anchors:
+        // without a rule, the browser's own blue, outside the theme.
+        const css = readFileSync(join(process.cwd(), "src", "styles", "app.css"), "utf8")
+            .replace(/\/\*[\s\S]*?\*\//g, "")
+            .replace(/@media \(forced-colors: active\) \{[\s\S]*?\n\}/g, "");
+        const ruleFor = (selector: string) => [...css.matchAll(/([^{}]+)\{([^{}]*)\}/g)].find((m) => m[1].split(",").map((s) => s.trim()).includes(selector))?.[2] ?? "";
+        for (const selector of [".grid-table a", ".kv a"]) {
+            const name = ruleFor(selector).match(/(?:^|[;\s])color:\s*var\(--(\w+)\)/)?.[1] ?? "missing";
+            expect(name, selector).toBe("colorBrandForegroundLink");
+            for (const id of ["light", "dark"] as const) {
+                for (const surface of [...SURFACES[id], ...APP_TOKENS[id].states]) expect(contrastRatio(token(id, name), surface), `${id} ${selector} on ${surface}`).toBeGreaterThanOrEqual(4.5);
             }
         }
     });

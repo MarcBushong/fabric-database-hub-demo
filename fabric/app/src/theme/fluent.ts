@@ -102,8 +102,9 @@ const light: Theme = {
 };
 const darkBase: Theme = {
     ...createDarkTheme(APP_BRAND),
-    // Brand text a step lighter than Fluent's, so it keeps 4.5:1 on a hovered row or button too; a pressed link one step
-    // darker than at rest (Fluent's own was 3.1:1 on a card), and a selected one as at rest (the review of 2b0e46b0).
+    // Brand text a step lighter than Fluent's, so it keeps 4.5:1 on a hovered row or button too; a pressed link, and a
+    // transparent button's pressed text and a subtle button's pressed icon, one step darker than at rest (Fluent's own were
+    // 3.1:1 on a card), and a selected link as at rest (the review of 2b0e46b0 and its re-check).
     colorBrandForeground1: APP_BRAND[120],
     colorBrandForeground2: APP_BRAND[120],
     colorBrandForegroundLink: APP_BRAND[120],
@@ -113,6 +114,7 @@ const darkBase: Theme = {
     colorCompoundBrandForeground1: APP_BRAND[110],
     colorCompoundBrandStroke: APP_BRAND[110],
     colorNeutralForeground2BrandHover: APP_BRAND[110],
+    colorNeutralForeground2BrandPressed: APP_BRAND[110],
     colorNeutralForeground2BrandSelected: APP_BRAND[110],
     colorSubtleBackgroundSelected: "#383838",
 };
