@@ -1,0 +1,100 @@
+/// One wait category (SQL Server) or wait event (PostgreSQL) of one Query Store plan (on PostgreSQL, one role's query) over one interval, as one read saw it: each plan's or query's three largest in the interval. Readers keep the latest read, as for RCA Query Stats. The Incident RCA's sidecar (ADR 0031): Query Store's evidence, which the observer beside the workload read and NB_DatabaseHub_LiveActivity writes from its sidecar documents, each under its own session's run (rca/history-tables.json).
+table 'RCA Query Waits'
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables. A sidecar's rows take their own session's, session-<sessionId>, whichever run wrote them (rca/README.md, The sidecar).
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The document the row came from (documentId): an evidence document's, or a sidecar's.
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// When the observer read the interval (UTC).
+    column 'Captured At UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: captured_at_utc
+
+    /// T1, T2, T3, or T4.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// Start of the Query Store interval.
+    column 'Interval Start UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: interval_start_utc
+
+    /// End of the interval.
+    column 'Interval End UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: interval_end_utc
+
+    /// Query Store's query_id, as in RCA Query Stats.
+    column 'Query ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: query_id
+
+    /// Query Store's plan_id on SQL Server; 0 on PostgreSQL, whose wait sampling records waits per query, not per plan.
+    column 'Plan ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: plan_id
+
+    /// As in RCA Query Stats: PostgreSQL's role, the workload's own only; null on SQL Server.
+    column Login
+        dataType: string
+        sourceColumn: login_name
+
+    /// SQL Server's wait_category_desc (Lock, CPU, Buffer IO, Memory, Parallelism, Tran Log IO, Network IO, ...); PostgreSQL's wait_event_type (Lock, LWLock, IO, Client, IPC, ...).
+    column 'Wait Category'
+        dataType: string
+        sourceColumn: wait_category
+
+    /// PostgreSQL's wait_event (transactionid, relation, DataFileRead, ...); null on SQL Server, whose Query Store keeps categories only.
+    column 'Wait Event'
+        dataType: string
+        sourceColumn: wait_event
+
+    /// Time waited, in milliseconds: SQL Server's total_query_wait_time_ms; on PostgreSQL the samples times pgms_wait_sampling.history_period (100 ms by default), an estimate.
+    column 'Wait (ms)'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: wait_ms
+
+    /// The longest single wait, in milliseconds (SQL Server's max_query_wait_time_ms); null on PostgreSQL.
+    column 'Max Wait (ms)'
+        dataType: double
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: max_wait_ms
+
+    /// How many times PostgreSQL's wait sampling found the query waiting on it (calls); null on SQL Server.
+    column Samples
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: samples
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Query Waits' = entity
+        mode: directLake
+        source
+            entityName: rca_query_waits
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

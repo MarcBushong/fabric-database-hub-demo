@@ -94,6 +94,46 @@ relationship 'RCA Queries to Date'
     fromColumn: 'RCA Queries'.'Report Date UTC'
     toColumn: Date.Date
 
+relationship 'RCA Query Stats to Target'
+    fromColumn: 'RCA Query Stats'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Query Stats to Date'
+    fromColumn: 'RCA Query Stats'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Query Waits to Target'
+    fromColumn: 'RCA Query Waits'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Query Waits to Date'
+    fromColumn: 'RCA Query Waits'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Query Plans to Target'
+    fromColumn: 'RCA Query Plans'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Query Plans to Date'
+    fromColumn: 'RCA Query Plans'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Query Events to Target'
+    fromColumn: 'RCA Query Events'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Query Events to Date'
+    fromColumn: 'RCA Query Events'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Query Coverage to Target'
+    fromColumn: 'RCA Query Coverage'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Query Coverage to Date'
+    fromColumn: 'RCA Query Coverage'.'Report Date UTC'
+    toColumn: Date.Date
+
 relationship 'RCA Resource to Target'
     fromColumn: 'RCA Resource'.'Target Key'
     toColumn: Target.'Target Key'
@@ -108,6 +148,14 @@ relationship 'RCA Replica to Target'
 
 relationship 'RCA Replica to Date'
     fromColumn: 'RCA Replica'.'Report Date UTC'
+    toColumn: Date.Date
+
+relationship 'RCA Connections to Target'
+    fromColumn: 'RCA Connections'.'Target Key'
+    toColumn: Target.'Target Key'
+
+relationship 'RCA Connections to Date'
+    fromColumn: 'RCA Connections'.'Report Date UTC'
     toColumn: Date.Date
 
 relationship 'RCA Coverage to Target'
