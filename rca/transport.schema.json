@@ -2,12 +2,15 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/rca/transport.schema.json",
   "title": "Incident RCA transport, version 1 (ADR 0031)",
-  "description": "How evidence documents travel from the VMs into the history: the part lines the runner prints, the bundles the control's runbook writes as earlier versions of dbhub-session-metrics, the rca member of that secret's final version, and the RCA_EVIDENCE document NB_DatabaseHub_LiveActivity reads, inline or from the lakehouse file RCA_EVIDENCE_FILE names. rca/README.md, Transport, gives the encoding and the size limits.",
+  "description": "How evidence documents travel from the VMs into the history: the part lines the runner prints, the bundles the control's runbook writes as earlier versions of dbhub-session-metrics, the rca member of that secret's final version, and the RCA_EVIDENCE document NB_DatabaseHub_LiveActivity reads, inline or from the lakehouse file RCA_EVIDENCE_FILE names. Beside them, the sidecar's own kinds, which a consumer that knows only the evidence document never meets: its index (rca sidecar-export), its part lines (DBHUBDEMO-RCAS), the RCA_SIDECAR_FILE document, and the notebook's acknowledgement by document ID. rca/README.md, Transport and The sidecar, give the encoding and the size limits.",
   "oneOf": [
     { "$ref": "#/$defs/bundle" },
     { "$ref": "#/$defs/bundleIndex" },
     { "$ref": "#/$defs/parameter" },
-    { "$ref": "#/$defs/exportIndex" }
+    { "$ref": "#/$defs/exportIndex" },
+    { "$ref": "#/$defs/sidecarIndex" },
+    { "$ref": "#/$defs/sidecarParameter" },
+    { "$ref": "#/$defs/ack" }
   ],
   "$defs": {
     "sessionId": { "type": ["string", "null"], "pattern": "^[0-9a-f]{32}$" },
@@ -86,6 +89,90 @@
       "type": "string",
       "pattern": "^Files/rca/inbox/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\.json$",
       "description": "RCA_EVIDENCE_FILE, NB_DatabaseHub_LiveActivity's other parameter: a path in the demo's lakehouse to a file holding exactly one RCA_EVIDENCE document (#/$defs/parameter). The notebook reads it with notebookutils.fs.head and max_bytes 262144, and deletes it once the tables are written."
+    },
+    "sidecarId": {
+      "type": "string",
+      "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar$",
+      "description": "A sidecar's documentId: an evidence document's form with -sidecar after it, so the two kinds' IDs never meet."
+    },
+    "sidecarPartLine": {
+      "type": "string",
+      "maxLength": 3400,
+      "pattern": "^DBHUBDEMO-RCAS 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}$",
+      "description": "A sidecar's part line: DBHUBDEMO-RCAS, then the fields of #/$defs/partLine. The marker differs, so a consumer that reads only DBHUBDEMO-RCA part lines never takes one."
+    },
+    "sidecarRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["documentId", "sessionId", "parts", "sha256", "state"],
+      "properties": {
+        "documentId": { "$ref": "#/$defs/sidecarId" },
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "parts": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "state": { "enum": ["new", "pending"], "description": "new: made by this call; pending: made earlier and not acknowledged yet, offered again." }
+      }
+    },
+    "sidecarIndex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "page", "pages", "documents", "status", "message"],
+      "description": "What rca sidecar-export prints after DBHUBDEMO-RCAS-INDEX, at most 3,400 characters: one page of the sidecars to fetch, new and pending. --page n prints page n of the same list.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaSidecarIndex" },
+        "version": { "const": 1 },
+        "page": { "type": "integer", "minimum": 1 },
+        "pages": { "type": "integer", "minimum": 0 },
+        "documents": { "type": "array", "maxItems": 8, "items": { "$ref": "#/$defs/sidecarRef" } },
+        "status": { "$ref": "#/$defs/status" },
+        "message": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "sidecarParameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "sessionId", "parts"],
+      "description": "The document in the file RCA_SIDECAR_FILE names: every part line of the sidecars a save fetched, in any order.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaSidecarParts" },
+        "version": { "const": 1 },
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "parts": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "$ref": "#/$defs/sidecarPartLine" } },
+        "status": { "$ref": "#/$defs/status" },
+        "message": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "sidecarFile": {
+      "type": "string",
+      "pattern": "^Files/rca/inbox/sidecar-[0-9]{8}T[0-9]{6}Z(-[A-Za-z0-9][A-Za-z0-9._-]{0,63})?\\.json$",
+      "description": "RCA_SIDECAR_FILE, NB_DatabaseHub_LiveActivity's parameter for sidecars: a path in the demo's lakehouse, Files/rca/inbox/sidecar-<yyyyMMddTHHmmssZ>[-<name>].json, to a file holding exactly one #/$defs/sidecarParameter document, read as RCA_EVIDENCE_FILE is. The sweep of evidence files staged more than a day ago never matches the name. The notebook deletes it only when its acknowledgement says every document in it is written or already written."
+    },
+    "ack": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "payload", "runId", "documents"],
+      "description": "The notebook's acknowledgement of one payload file, Files/rca/acks/<the payload's name without .json>.ack.json, written once every document in the payload is committed: what it did with each, by ID. None when the run doesn't save its results or can't read the payload. The scripts read it, never the payload's disappearance, and acknowledge to the runner only the documents it says are written or already written; one naming another payload or other documents counts as missing.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaAck" },
+        "version": { "const": 1 },
+        "payload": { "$ref": "#/$defs/sidecarFile" },
+        "runId": { "type": "string", "minLength": 1, "maxLength": 200 },
+        "documents": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["documentId", "kind", "status"],
+            "properties": {
+              "documentId": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}(-sidecar)?$" },
+              "kind": { "enum": ["ContosoCare.RcaEvidence", "ContosoCare.RcaSidecar"] },
+              "status": { "enum": ["written", "already", "skipped"], "description": "written: by this run; already: an earlier run wrote it; skipped: not written, with the reason." },
+              "reason": { "type": "string", "maxLength": 500 }
+            }
+          }
+        }
+      }
     }
   }
 }
