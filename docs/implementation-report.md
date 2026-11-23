@@ -8542,6 +8542,82 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - **Two changes still to come,** each merged when it's reviewed: the Livy steps' first deployment, whose end step deploys the kept form itself instead of warning, and the notebook session's report-only commit with its validation.
 - **Not proven live,** as ADR 0014's amendment lists: a net-new deployment and an update at the release's final SHA, and the deployed model's kept form against its reference, in Tuesday's timing run.
 
+### A ready-to-run Query Store query in the RCA's next step (2026-11-23, for the release after the RCA's)
+
+**Why.** The coordinator, for Wednesday's release: the capture's Query Store evidence (unit 2) can't ship before about December 1, so meanwhile the chat's next step should be query-level, a ready-to-run, read-only query for the target and those minutes, built only from the incident's measured target and times, never from the answer key, with a copy button in the app.
+
+- **The query** (`rca/query-store.ts`, `queryStoreQuery`), for each `TELEMETRY-ONLY` episode while its target's Query Store keeps its minutes (the retention rule of [the review of 319b3ae1](#the-review-of-319b3ae1-and-a2f776db-2026-11-23)):
+  - **T1 to T3,** T-SQL in ContosoCare: `sys.query_store_runtime_stats` with `sys.query_store_runtime_stats_interval`, the plan, query, and text, for the intervals that overlap the incident's minutes (`end_time > @from AND start_time <= @to`, with `datetimeoffset` literals in UTC; `<` where the episode has an end, since [the review of 0b922f37](#the-review-of-0b922f37-2026-11-23)), the top 20 plans by CPU, then duration, with their query and plan IDs, executions, module, and the first 300 characters of their text. For a wait class, the top 20 plans by their wait time in its category (`sys.query_store_wait_stats`, `wait_category_desc`, the names the detector's wait families map to).
+  - **T4,** PostgreSQL in `azure_sys`: `query_store.qs_view` for ContosoCare's database and no system queries, the top 20 queries by total time, with calls, the longest run, blocks read, and their text; then `query_store.pgms_wait_sampling_view`'s samples by query and event. Never `query_parameters`, which can hold a parameter's values. Its comment says the times are the server's, UTC unless its TimeZone was changed, and that an interval shows once it has ended, as Learn says.
+  - **None** for T4's read replica, whose queries Query Store doesn't record, for T5, or past the retention.
+- **Where it goes:** `explain_incident`'s `details.queryStoreQueries` (the target, language, database, the minutes in UTC, and the text), and the playbook's step 3 tells the chat to give it as is, in a code block, naming its target, database, and minutes. **The Root cause view's copy button** waits for the reorganized page, which owns `rca/view/**` today.
+- **Tests:** the times and targets come out exactly, to the second, for T1's CPU, T2's buffer latch waits, and T4; across UTC midnight with both dates; one instant from the interval that starts at it; none for the replica or past the retention; read-only (no statement that writes or changes a setting); and no scenario's name, in any case.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts`, `rca/tools.ts`, `rca/playbook.ts`, and `rca/tools.test.ts`; ADR 0031, `CHANGELOG.md`, and this report.
+
+**Validation.** `npm run verify`'s steps, one at a time on a PC at 100 % CPU: the typecheck, lint, license check, and build pass, and the tests (vitest with two workers) 686 of 687; the one failure is a `waitFor` timeout in `pages/mission.test.tsx`'s Session replay, which this change doesn't touch, and it passes run alone (3 of 3). `rca/tools.test.ts` alone, after blank lines between its tests: 42 of 42; ESLint on the four files: clean. markdownlint: no issues. Pester in strict mode with the Azure CLI guard: `Repo.Conventions.Tests.ps1`, with the documents' links and their fragments, 123 of 123; `Repo.NeutralWording.Tests.ps1` and `Repo.Gitleaks.Tests.ps1`, 10 passed, and the 3 that need gitleaks installed skipped. The leak check prints nothing.
+
+**What its live check needs.** The query, copied from a CPU incident's next step on T1 and on T4 in a live history, runs in SQL Server Management Studio on ContosoCare and in `azure_sys` (from T1, as the runner signs in), and lists those minutes' queries.
+
+### The ready-to-run query's Copy button in the Root cause view (2026-11-23, for the release after the RCA's)
+
+**Why.** The coordinator's item for Wednesday's release: the app shows the next step's ready-to-run query with a copy button. It builds on the Root cause page's reorganization and its review fix (62e5a18f), merged into this branch (cfd529b6), as the coordinator asked.
+
+- **The view** (`rca/view/QueryStoreQueries.tsx`, under the next steps in `RcaReport.tsx`): each of `explain_incident`'s `details.queryStoreQueries` as the tools built it, in a code block, under a line that names the target's Query Store, its database, and the minutes in the viewer's time and UTC (`bothTimes`, as the rest of the report gives them), with **Copy**. Copy uses the app's `copyText`, says "Query copied: run it in ContosoCare on T1", and reads **Copied** for two seconds; when the Fabric portal's frame blocks the clipboard, it asks the viewer to select the query and press Ctrl+C, as the Database Agent prompts do. The view adds no fact of its own: it shows only entries with the tools' fields (a target, T-SQL or PostgreSQL, a database, two times that parse, and a text), and nothing in place of anything else.
+- **A result cut to fit the chat's answer keeps them:** `bounded` (62e5a18f) keeps `details.queryStoreQueries` among the details it keeps however it cuts (`KEPT_DETAILS`), since the playbook's step 3 tells the chat to give them as they are.
+- **Its CSS** is layout only, at the end of `rca.css` (`.rca-query`, `.rca-query-head`): no color, so the theme's tokens stay the theme's.
+- **Tests** (`rca/view/next-step-query.test.tsx`, and one in `rca/tools.test.ts`):
+  - the queries shown exactly as built, in their order, each with its target, database, and times in the viewer's zone and UTC, and one instant "at" it;
+  - Copy writes exactly that query, says so, and reads **Copied**, while the other still reads **Copy**;
+  - a blocked clipboard asks for a copy by hand;
+  - entries that aren't the tools' queries show nothing, and the next steps stay;
+  - no scenario's name in the section;
+  - a result cut to fit keeps the queries, which fails without `KEPT_DETAILS`' entry.
+
+**Changed files.** `fabric/app/src/rca/view/QueryStoreQueries.tsx` (new), `rca/view/RcaReport.tsx`, `rca/view/rca.css`, `rca/view/next-step-query.test.tsx` (new), `rca/tools.ts` (`KEPT_DETAILS` and `bounded`'s comment), and `rca/tools.test.ts`; ADR 0031, `CHANGELOG.md`, `fabric/app/README.md`, and this report.
+
+**Validation.** On a PC at 100 % CPU, where Wednesday's work runs targeted tests until 2 PM: the typecheck passes; ESLint on the five changed files: clean; the tests under `src/rca` (vitest with two workers): 264 of 264, the new file's 4 among them; the bounded test fails with `KEPT_DETAILS`' entry taken out. markdownlint: no issues. Pester in strict mode with the Azure CLI guard: `Repo.Conventions.Tests.ps1`, with the documents' links and their fragments, 123 of 123. The leak check prints nothing.
+
+**What its live check needs.** In the Root cause view on a live history, a CPU incident's next steps on T1 and on T4 show their queries, and **Copy** puts each on the clipboard inside the Fabric portal's frame, or says to copy it by hand.
+
+### The review of 0b922f37 (2026-11-23)
+
+**Why.** The independent review of 0b922f37, the ready-to-run query's tools side, said **SHIP WITH FIXES**. It found that the queries only read, take no unsafe input, and use nothing the demo planned. Its fixes are in one commit after the merge of 62e5a18f (cfd529b6), as the coordinator asked.
+
+- **The window's end (Medium).**
+  - **The problem:** an episode's `end` is its first sample back under the level (`rca/types.ts`), so `start_time <= @to` also read the interval that starts there. That's one interval too many whenever the end falls on an interval's start: about 1 in 15 incidents on 1-minute bins, and every one on 15-minute points.
+  - **The fix:** with an end, the queries read `start_time < @to`. `<=` stays where the minutes end at the last sample at the level, or at `readEnd`, where the minutes read ended with the incident still on (the detector sets `readEnd` only when there's no end): the interval that starts there holds some of the incident.
+- **Kept when cut, and capped (Medium).**
+  - **Kept:** 7462a151 already added `queryStoreQueries` to what `bounded` keeps however it cuts (`KEPT_DETAILS`).
+  - **Capped:** the list now holds at most three (`QUERY_STORE_QUERIES_MAX`, in `rca/query-store.ts`), in the order the causes read, the root cause's first. `details.queryStoreQueriesLeftOut` counts the others, and `bounded` keeps it too.
+  - **Step 3** of the playbook says so, says that `explain_incident` with each one's key gives its query, and says that without a query the chat gives the next step alone and never writes a query itself.
+  - **The Root cause view** says how many more aren't shown, the rare time there are any; it asks for one incident at a time.
+- **The wait query's words (Low):** it's the top 20 plans by their wait time in the category, which is the better query. Its comment, ADR 0031, the CHANGELOG, and this report's entry now say that, not "the same plans' waits".
+- **Ties (Low):** `p.plan_id` last in both T-SQL queries' order, `q.query_id` in `qs_view`'s, and `w.query_id`, `w.event_type`, `w.event` in the wait sampling's.
+- **An empty result (Low):** it read as "no query ran". Each query now starts with a read-only line:
+  - on T1 to T3, `actual_state_desc` and `readonly_reason` from [`sys.database_query_store_options`](https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-database-query-store-options-transact-sql), with a comment that `READ_WRITE` records and `READ_ONLY` doesn't;
+  - on T4, `pg_qs.query_capture_mode` and `pgms_wait_sampling.query_capture_mode` through [`current_setting` with `missing_ok`](https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SET), which gives null rather than an error for a setting the server doesn't know.
+  - T4's header now says "at every size but Burstable", as its next step does.
+- **Tests,** each failing without its fix:
+  - `rca/tools.test.ts`:
+    - the intervals a query reads, from its own window and operator, around an end at 15:45 on T1 and T4: 15:30's interval and not 15:45's, but 15:45's too for a last sample or a `readEnd` at 15:45;
+    - T1's, T2's, and T4's queries with `<`, the wait query's words, the tie-breakers, and their first statements;
+    - T1, T2, and T3 with a query at exactly 14 days, and none a second later;
+    - a blocking episode with no query, and the CPU beside it in one window with one;
+    - five episodes no rule explains on T2 with three queries, matched to the root cause's signal and then to "Also in these minutes", the other two counted, all kept by `bounded`, and step 3's words.
+  - `rca/view/next-step-query.test.tsx`: the count of the others, one and two, and nothing for anything but a whole count.
+  - Mutations, one at a time: `<=` at every end; no cap; the count left out of `KEPT_DETAILS`; and queries for every episode. Each fails its test.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts`, `rca/tools.ts`, `rca/playbook.ts`, `rca/view/QueryStoreQueries.tsx`, `rca/view/rca.css`, `rca/tools.test.ts`, and `rca/view/next-step-query.test.tsx`; ADR 0031, `CHANGELOG.md`, and this report.
+
+**Validation.** On a PC at 100 % CPU, before 2 PM, when Wednesday's work runs targeted tests: the typecheck passes; ESLint on the six changed source and test files: clean; the tests under `src/rca` (vitest with two workers): 269 of 269; the four mutations each fail their test. markdownlint: no issues. Pester in strict mode with the Azure CLI guard: `Repo.Conventions.Tests.ps1`, with the documents' links and their fragments, and `Repo.NeutralWording.Tests.ps1`: 126 of 126. The leak check prints nothing. The full `npm run verify` runs after 2 PM.
+
+**What its live check needs** (on Tuesday's list):
+
+- each query, copied from a live incident's next step, runs on T1 and T2 in SQL Server Management Studio, on T3, and on T4 in `azure_sys`;
+- each query's first result is Query Store's state, or T4's capture modes;
+- T4's `qs_view` times are UTC.
+
 ### The next release's integration: the review of its merges (2026-11-23)
 
 **Why.** An independent review of the next release's integration merges (66cc5326..07dc860c) said **SHIP WITH FIXES**: a High that comes from the integration itself, a Low, and an optional fix for a test that fails under load. The coordinator asked for each as a fix-up commit on the release branch, with a test that fails without it.

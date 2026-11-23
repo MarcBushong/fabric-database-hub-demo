@@ -12,7 +12,7 @@ import { RCA_CATEGORY_IDS, RCA_SEVERITY_IDS, type RcaCategory, type RcaSeverity 
 import { categoryOf, facetArgs, FAR_PERCENT, FAR_TIMES, LONG_MINUTES, matches, severityOf } from "./facets";
 import { isPagedTable, MONITOR_PAGES, MONITOR_ROW_LIMIT, RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
-import { queryStoreNextStep, queryStoreNote, unexplainedByQuery } from "./query-store";
+import { QUERY_STORE_QUERIES_MAX, queryStoreNextStep, queryStoreNote, queryStoreQuery, unexplainedByQuery, type QueryStoreQuery } from "./query-store";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
@@ -307,8 +307,8 @@ function envelope(tool: string, from: Date, to: Date, targets: readonly RcaTarge
     };
 }
 
-/** What a result's details keep however it's cut: the verdicts, where a read stopped, the servers, and the filters with what they left out. */
-const KEPT_DETAILS = ["nothingAbnormal", "nothingAbnormalUpTo", "quiet", "quietUpTo", "readStoppedAt", "servers", "filters", "leftOut"] as const;
+/** What a result's details keep however it's cut: the verdicts, where a read stopped, the servers, the filters with what they left out, and the next steps' Query Store queries with how many more there are. */
+const KEPT_DETAILS = ["nothingAbnormal", "nothingAbnormalUpTo", "quiet", "quietUpTo", "readStoppedAt", "servers", "filters", "leftOut", "queryStoreQueries", "queryStoreQueriesLeftOut"] as const;
 
 const SEVERITY_ORDER: Readonly<Record<string, number>> = { high: 0, medium: 1, low: 2 };
 
@@ -326,9 +326,9 @@ function withoutReasons(list: unknown): unknown {
 /**
  * A result as the text Copilot reads: within `limit` characters, and always JSON that parses (the review of 90e9d914: a
  * 24-hour list ended " [cut]", invalid, with notCaptured and nextSteps gone, yet answered ok). Past the limit it leaves out,
- * in turn: each episode's severityReason; the details but the verdicts, the servers, and the filters with what they left
- * out (KEPT_DETAILS) and triage's hypotheses; then the least severe episodes, and the last findings and hypotheses, saying
- * how many more there were. notCaptured, nextSteps, and the root cause are always kept.
+ * in turn: each episode's severityReason; the details but the verdicts, the servers, the filters with what they left out,
+ * and the next steps' Query Store queries (KEPT_DETAILS) and triage's hypotheses; then the least severe episodes, and the
+ * last findings and hypotheses, saying how many more there were. notCaptured, nextSteps, and the root cause are always kept.
  */
 export function bounded(result: InvestigationResult, limit = RESULT_CHARS): string {
     const fit = (r: unknown) => {
@@ -746,15 +746,16 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         // it isn't in this history, which is the capture's limit, never the target's (query-store.ts): live, the chat read
         // "isn't captured yet" as "T1 doesn't have Query Store" (the owner, 2026-11-23).
         const telemetryOnly = chosen.filter((e) => !EXPLAINED_FAMILIES.includes(e.family));
-        const causes = [
-            ...parts.filter((p) => p.rootCause).map((p) => p.rootCause!),
-            ...telemetryOnly.map((e) => ({
+        const unexplained = telemetryOnly.map((e) => ({
+            episode: e,
+            cause: {
                 statement: `${describeEpisode(e)} ${unexplainedByQuery(e)}`,
                 confidence: "low" as Confidence,
                 ruleIds: ["TELEMETRY-ONLY"],
                 evidence: [{ table: e.source === "the RCA capture" ? "RCA Resource" : "Telemetry Snapshots", at: iso(e.peakAt), target: e.target, text: `${e.signal} ${Math.round(e.peak * 10) / 10} ${e.unit} (peak)` }],
-            })),
-        ].sort((a, b) => RANK[b.confidence] - RANK[a.confidence]);
+            },
+        }));
+        const causes = [...parts.filter((p) => p.rootCause).map((p) => p.rootCause!), ...unexplained.map((u) => u.cause)].sort((a, b) => RANK[b.confidence] - RANK[a.confidence]);
         const [rootCause, ...others] = causes;
         // Each part reads its own minutes, a little wider than the incident's, so its envelope said the incident's "no RCA
         // capture" note again with other times: two such lines for one T5 storm (the coordinator's note on 803f2b1a). The
@@ -762,6 +763,11 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         const partNotes = parts.flatMap((p) => p.notCaptured).filter((line) => !RCA_TARGETS.some((t) => isNoCaptureNote(t, line) && base.notCaptured.some((b) => isNoCaptureNote(t, b))));
         // Whether the target's Query Store still keeps those minutes is judged now, by the viewer's clock (the review of 319b3ae1).
         const now = (deps.now ?? (() => new Date()))();
+        // The queries in the order the causes read, the root cause's first, at most QUERY_STORE_QUERIES_MAX of them, with the
+        // others counted: a window can hold many such episodes, and a result cut to fit keeps these (the review of 0b922f37).
+        const ordered = causes.flatMap((c) => unexplained.filter((u) => u.cause === c).map((u) => queryStoreQuery(u.episode, now))).filter((q): q is QueryStoreQuery => q !== null);
+        const queryStoreQueries = ordered.slice(0, QUERY_STORE_QUERIES_MAX);
+        const queryStoreQueriesLeftOut = ordered.length - queryStoreQueries.length;
         const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => queryStoreNote(e, now))])];
         // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
         if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded ${fromTo(e.start, e.end ?? e.last)} UTC explains the ${e.signal}.`));
@@ -775,6 +781,10 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             details: {
                 episodes: chosen.map((e) => ({ ...episodeView(e), text: describeEpisode(e) })),
                 ...(readAs.length ? { readAs: { key, as: readAs.map((e) => e.key) } } : {}),
+                // Each next step's ready-to-run, read-only query of the target's own Query Store for those minutes, while it keeps
+                // them (query-store.ts): built from the episode's target, family, and times only.
+                ...(queryStoreQueries.length ? { queryStoreQueries } : {}),
+                ...(queryStoreQueriesLeftOut > 0 ? { queryStoreQueriesLeftOut } : {}),
                 alsoInTheseMinutes: others.map((c) => c.statement),
                 parts: parts.map((p) => ({ tool: p.tool, details: p.details })),
             },
