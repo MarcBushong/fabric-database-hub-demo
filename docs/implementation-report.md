@@ -7365,6 +7365,19 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **What its live check needs.** As the summary above lists: the facets and their counts on a live session's incidents, 6 and 24 hours, a shared address, the links landing filtered, T4's and T5's names, the severities, and the chat's filters.
 
+### The re-review of bbdcd05c and 8e2cb06b (2026-11-23)
+
+**Why.** The re-review said **SHIP** for both, with one Low: past a target's retention, the note gave the minutes' age rounded down, so for the whole day after the retention ran out it said Query Store "no longer keeps those minutes ... it keeps 7 days, and they're 7 days old". One commit, after 8e2cb06b.
+
+- **The fix** (`rca/query-store.ts`): past the retention, the note says "they're more than 7 days old" (14 on T1 to T3), which holds at any age past it.
+- **Test:** T4's incident at its last kept minute still has its next step, and 7 days and 18 hours after it, its note says "more than 7 days old" and never "7 days old"; T1's and T3's the same around 14 days, one minute apart. It fails at 8e2cb06b.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts` and `rca/tools.test.ts`; ADR 0031 and this report.
+
+**Validation.** On 8e2cb06b with this commit: the type check and lint passed, and so did `src/rca` and `src/copilot`'s 384 tests, one of which, `ask-blind.test.tsx`'s Overview, timed out on this loaded PC and passed when its file ran alone (32 of 32). markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+
+**What its live check needs.** Nothing beyond part 1's and the review's: a T4 incident more than 7 days old reads "more than 7 days old".
+
 ### The RCA release: the Incident RCA merged onto the release's follow-ups (2026-11-23)
 
 **Why.** The owner wants the releases after the Ignite release out as soon as possible: the release's follow-ups first (PR #67), then the Incident RCA. This branch is the RCA release: the RCA line merged onto the follow-ups, proven live by Final tests before it merges, right after the follow-ups.
