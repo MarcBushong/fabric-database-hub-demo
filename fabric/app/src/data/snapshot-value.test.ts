@@ -407,7 +407,7 @@ describe("the kept form of 'Snapshot Value' (keptFormValues)", () => {
         // T5's storm: the session's minutes are all of the day save's 15:15 and 15:30 intervals, so those two points keep
         // nothing, and every other row keeps its value. The whole history reads as the rule does.
         const covered = new Set(["2026-11-21T15:15:00", "2026-11-21T15:30:00"]);
-        const requests = T5_ROWS.filter((r) => r.Metric === "TotalRequests").map((r) => ({
+        const requests: Row[] = T5_ROWS.filter((r) => r.Metric === "TotalRequests").map((r) => ({
             ...r,
             KeptValue: r.CapturedAt === T5_DAY.CapturedAt && covered.has(String(r.Bucket)) ? null : r.Value,
             ResolvedAt: "2026-11-21T22:00:00",
