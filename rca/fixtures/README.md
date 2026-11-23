@@ -14,7 +14,7 @@ Two evidence documents from one control session of the 2026-11-20 Run all (times
 | [t3-plan-regression.sidecar.json](t3-plan-regression.sidecar.json) | sqlvm01's sidecar 1: T3's Query Store, 16:50 to 17:20. A lookup's plan regressed, and automatic plan correction forced its last good plan |
 | [t4-query-store.sidecar.json](t4-query-store.sidecar.json) | sqlvm01's sidecar 2: T4's Query Store, 17:00 to 17:20, beside t4-replica-lag's chain; 17:15 to 17:20 pending publication |
 | [t4-connection-surge.sidecar.json](t4-connection-surge.sidecar.json) | A save's sidecar outside a control session (no session ID), 2026-11-21 10:00 to 10:20: who held T4's connections during a surge |
-| `*.sidecar-parts.txt` | Each sidecar as the runner prints it: `DBHUBDEMO-RCAS` part lines of its gzip |
+| `*.sidecar-parts.txt` | Each sidecar in `DBHUBDEMO-RCAS` part lines of its gzip, the form the runner prints. The parts are illustrative: the runner's gzip level and number forms (`1980` where these have `1980.0`) give other bytes for the same document. So a test compares decoded documents, never parts' bytes, and the SHA-256s in sidecar-index.json and rca-sidecar.parameter.json are these parts' |
 | [sidecar-index.json](sidecar-index.json) | What `rca sidecar-export` printed after `DBHUBDEMO-RCAS-INDEX` at a save on 2026-11-21 10:25: the surge's sidecar new, the session's two pending |
 | [rca-sidecar.parameter.json](rca-sidecar.parameter.json) | The `RCA_SIDECAR_FILE` document that save staged: every part line of the three |
 | [rca-ack.json](rca-ack.json) | The notebook's acknowledgement of that file: the first sidecar already written by an earlier run, the other two written |
@@ -56,11 +56,13 @@ The sidecars name no scenario: their statements are the procedures' own, normali
   - **Plan 58:** a parallel Clustered Index Scan of `pk_appointments` at DOP 4, estimated cost 38.6, compiled at 17:03:11; its first execution ended at 17:03:12.6. It ran 524 times, to 17:09:40.2, at 176 ms of CPU each (92,224 ms), with 4,100 logical reads each and 31,440 ms of waits: CPU 18,900, Parallelism 11,620, and Buffer IO 920.
 - **The 17:00 interval is mixed:** plan 31 also ran 668 times in it (1,403 ms). Plan 58 used 96 % of the captured top queries' CPU in that interval (92,224 of 95,644 ms).
 - **The response, as measured:**
-  - automatic tuning's FORCE_LAST_GOOD_PLAN for query 412 was Executing at 17:09:30;
+  - automatic tuning's recommendation for query 412 appeared, Active, between 17:05:30 and 17:06:00: force plan 31 over plan 58, CPU time per execution 2.1 ms against 176 ms;
+  - FORCE_LAST_GOOD_PLAN was Executing at 17:09:30;
   - plan 31 was forced (AUTO) between 17:09:00 and 17:10:00; its last compile was 17:09:41;
   - the recommendation was Verifying at 17:10:30;
   - from 17:15 (the interval still open at the final read, 17:20:10), plan 31 ran alone, at 2.1 ms each.
-- **Other statements are evidence too:** query 377 (an ad hoc patient list), and query 902, another application's read of `sys.dm_exec_requests`.
+- **Other statements are evidence too:** query 377 (an ad hoc patient list), and query 902, another application's read of `sys.dm_exec_requests`, with its plan 40.
+- **Plans:** a plan's row is written when a read first returns it, and again when it changes. So plan 31 has a row at 16:50 and one at 17:17, forced; plans 58 and 40 one each, at 17:17; and the final read writes none.
 - **Coverage:** READ_WRITE, capture mode AUTO, 15-minute intervals, intervals read from 16:15 to 17:30.
 
 **T4 (t4-query-store):**

@@ -182,12 +182,17 @@ Describe 'The Incident RCA contract: schemas and tables (ADR 0031)' {
             }
         }
     }
-    It 'accepts a minimal sidecar, and refuses one with an evidence document''s ID, an evidence table, the answer key, or no coverage' {
+    It 'accepts a minimal sidecar, and refuses one with an evidence document''s ID, an evidence table, the answer key, no coverage, or a header time without milliseconds' {
         $evidence = Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures/t1-blocking-chain.evidence.json') -Raw
-        # A fresh copy of the evidence fixture's header each time, as a sidecar with one coverage row.
+        $headerTimes = 'exportedUtc', 'windowStartUtc', 'windowEndUtc', 'epochUtc'
+        # A fresh copy of the evidence fixture's header each time, as a sidecar with one coverage row. ConvertFrom-Json
+        # reads the header's times as dates, so they're written back as the runner writes them, with milliseconds.
         $sidecar = {
             $document = $evidence | ConvertFrom-Json -AsHashtable
             $document.Remove('answerKey')
+            foreach ($field in $headerTimes) {
+                $document[$field] = ([datetime]$document[$field]).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", [Globalization.CultureInfo]::InvariantCulture)
+            }
             $document['kind'] = 'ContosoCare.RcaSidecar'
             $document['documentId'] = $document['documentId'] + '-sidecar'
             $document['targets'] = @('T1')
@@ -209,9 +214,16 @@ Describe 'The Incident RCA contract: schemas and tables (ADR 0031)' {
         $noCoverage = & $sidecar
         $noCoverage['tables'] = [ordered]@{}
         & $valid $noCoverage | Should -BeFalse
+        foreach ($field in $headerTimes) {
+            $seconds = & $sidecar
+            $seconds[$field] = $seconds[$field] -replace '\.[0-9]{3}Z$', 'Z'
+            & $valid $seconds | Should -BeFalse -Because "$field without milliseconds: $($seconds[$field])"
+            $ticks = & $sidecar
+            $ticks[$field] = $ticks[$field] -replace 'Z$', '0000Z'
+            & $valid $ticks | Should -BeFalse -Because "$field with seven digits: $($ticks[$field])"
+        }
     }
 }
-
 Describe 'The Incident RCA contract: document fixtures (ADR 0031)' {
     It '<Name> validates against its kind''s schema' -ForEach $documentFixtures {
         $schemaErrors = $null
@@ -252,6 +264,39 @@ Describe 'The Incident RCA contract: document fixtures (ADR 0031)' {
         $document = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable
         $covered = @($document.tables[$documentKinds[$Kind].Coverage].columns.target | ForEach-Object { $document.strings[$_] } | Sort-Object)
         $covered | Should -Be @($document.targets | Sort-Object)
+    }
+
+    It '<Name> has a plan row for every plan its statistics name, and writes a plan again only when it changed' -ForEach @($documentFixtures | Where-Object { $_.Kind -eq 'sidecar' }) {
+        # rca/README.md, Query Store, Plans: RCA-SQL-14's @plans, and a plan's row again only when its forcing, compiles,
+        # or compile time change. T4 stores no plans: its statistics name plan 0.
+        $document = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable
+        $stats = $document.tables['rca_query_stats']
+        $plans = $document.tables['rca_query_plans']
+        $value = { param($Table, $Column, $Row) $values = $Table.columns[$Column]; if ($null -eq $values) { $null } else { $values[$Row] } }
+        $keys = [System.Collections.Generic.HashSet[string]]::new()
+        $rows = [System.Collections.Generic.List[object]]::new()
+        if ($null -ne $plans) {
+            for ($i = 0; $i -lt $plans.columns.plan_id.Count; $i++) {
+                $key = '{0}/{1}' -f $document.strings[$plans.columns.target[$i]], $plans.columns.plan_id[$i]
+                $null = $keys.Add($key)
+                $forcing = & $value $plans 'forcing_type' $i
+                $change = '{0}|{1}|{2}|{3}|{4}' -f (& $value $plans 'is_forced_plan' $i), $(if ($null -ne $forcing) { $document.strings[$forcing] }), (& $value $plans 'compiles' $i), (& $value $plans 'last_compiled_utc' $i), (& $value $plans 'force_failures' $i)
+                $rows.Add([pscustomobject]@{ Key = $key; At = [long]$plans.columns.captured_at_utc[$i]; Change = $change })
+            }
+        }
+        if ($null -ne $stats) {
+            for ($i = 0; $i -lt $stats.columns.plan_id.Count; $i++) {
+                if ([long]$stats.columns.plan_id[$i] -eq 0) { continue }
+                $key = '{0}/{1}' -f $document.strings[$stats.columns.target[$i]], $stats.columns.plan_id[$i]
+                $keys.Contains($key) | Should -BeTrue -Because ('the statistics name plan {0}, which has no plan row' -f $key)
+            }
+        }
+        foreach ($group in ($rows | Group-Object -Property Key)) {
+            $ordered = @($group.Group | Sort-Object -Property At)
+            for ($j = 1; $j -lt $ordered.Count; $j++) {
+                $ordered[$j].Change | Should -Not -Be $ordered[$j - 1].Change -Because ('plan {0} is written again unchanged' -f $group.Name)
+            }
+        }
     }
 
     It '<Name> keeps the detection tables blind: no scenario ID, run ID, or answer-key string, and program names without their segments' -ForEach $documentFixtures {
@@ -338,8 +383,15 @@ Describe 'The Incident RCA contract: transport fixtures (ADR 0031)' {
         }
         '20261120T165000Z-sqlvm01-0001-sidecar' | Should -Not -Match $defs.documentRef.properties.documentId.pattern
         '20261120T165000Z-sqlvm01-0001' | Should -Not -Match $defs.sidecarId.pattern
-        # A sidecar's file stays in the same inbox, with its own kind and parameter.
-        $defs.sidecarFile.pattern | Should -Be $defs.evidenceFile.pattern
+        # A sidecar's file stays in the same inbox, with its own name, kind, and parameter: sidecar-<UTC>, which the day-old
+        # sweep of evidence files never matches (the notebook's staging rule, acde5510).
+        foreach ($path in 'Files/rca/inbox/sidecar-20261121T102531Z.json', 'Files/rca/inbox/sidecar-20261121T102531Z-stop.json') {
+            $path | Should -MatchExactly $defs.sidecarFile.pattern
+            $path | Should -MatchExactly $defs.evidenceFile.pattern
+        }
+        foreach ($path in 'Files/rca/inbox/rca-20261121T102531Z.json', 'Files/rca/inbox/sidecar-latest.json', 'Files/rca/inbox/sidecar-20261121T102531Z.json.tmp', 'Files/rca/acks/sidecar-20261121T102531Z.json') {
+            $path | Should -Not -MatchExactly $defs.sidecarFile.pattern
+        }
         $defs.sidecarParameter.properties.kind.const | Should -Be 'ContosoCare.RcaSidecarParts'
     }
 
@@ -384,9 +436,10 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
                 Where-Object { $_.Name -notmatch '\.test\.tsx?$' -and $_.FullName -notmatch '[\\/]testdata[\\/]' } |
                 ForEach-Object { $files.Add($_) }
         }
-        # The observer's code and the sidecar's readers (blind-detection.json, detectionCode.runner).
-        foreach ($folder in 'Observer', 'QueryStore') {
-            $observerRoot = Join-Path -Path $repoRoot -ChildPath "workload-generator/src/ContosoCare.Workload/Rca/$folder"
+        # The observer's code and the sidecar's readers and store (blind-detection.json, detectionCode.runner); a folder a
+        # builder hasn't created yet has nothing to scan.
+        foreach ($pattern in @($blind.detectionCode.runner.include)) {
+            $observerRoot = Join-Path -Path $repoRoot -ChildPath ($pattern -split '/\*\*/')[0]
             if (Test-Path -LiteralPath $observerRoot) {
                 Get-ChildItem -LiteralPath $observerRoot -Recurse -File -Filter '*.cs' | ForEach-Object { $files.Add($_) }
             }
@@ -401,6 +454,39 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
             foreach ($hit in (Get-DetectionStringViolation -Text $text)) { '{0}: {1}' -f $relative, $hit }
         }
         @($violations) | Should -BeNullOrEmpty
+    }
+
+    It 'lets the list of the runner''s own statements name exactly the forbidden names those statements use (What the capture leaves out, 3)' {
+        $list = 'workload-generator/src/ContosoCare.Workload/Rca/QueryStore/HarnessStatements.cs'
+        $harnessCode = 'Sql/DemoDatabase.cs', 'Sql/SqlScripts.cs', 'Cli/CommandLine.cs'
+        # The SQL the runner's harness code sends as text: Text("...") and CommandText = "...", raw string literals included.
+        $literal = '(?:Text\(|CommandText\s*=)\s*(?:"""(?<raw>[\s\S]*?)"""|"(?<plain>(?:[^"\\]|\\.)*)")'
+        $statements = foreach ($file in $harnessCode) {
+            $source = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath ('workload-generator/src/ContosoCare.Workload/' + $file)))
+            foreach ($match in [regex]::Matches($source, $literal)) { $match.Groups['raw'].Value + $match.Groups['plain'].Value }
+        }
+        @($statements).Count | Should -BeGreaterThan 8
+        $named = @($blind.forbiddenInDetectionCode.identifiers | Where-Object { $identifier = $_; @($statements | Where-Object { $_.Contains($identifier) }).Count -gt 0 })
+        $excepted = @($blind.detectionCode.exceptions | Where-Object { $list -in $_.files } | ForEach-Object { $_.identifier })
+        @($excepted | Sort-Object) | Should -Be @($named | Sort-Object) -Because 'the list holds every such statement, and nothing else may name what blind-detection.json forbids'
+    }
+
+    It 'scans every folder of the runner''s RCA code for answer-key names, or says why one is exempt' {
+        # A new folder (the sidecar's store, 2026-11-23) must join blind-detection.json's runner include, or this list.
+        $exempt = @{
+            AnswerKey = 'it records the answer key, which only the evaluation reads'
+            Export    = 'it packs the answer key apart from the evidence; its Reducer.cs is scanned by name (RcaBlindTests)'
+            Store     = 'it keeps the answer key''s file beside the evidence, unread by detection'
+        }
+        $rcaCode = Join-Path -Path $repoRoot -ChildPath 'workload-generator/src/ContosoCare.Workload/Rca'
+        $scanned = @($blind.detectionCode.runner.include | ForEach-Object { ($_ -split '/\*\*/')[0] })
+        foreach ($folder in Get-ChildItem -LiteralPath $rcaCode -Directory) {
+            $relative = 'workload-generator/src/ContosoCare.Workload/Rca/' + $folder.Name
+            ($relative -in $scanned -or $exempt.ContainsKey($folder.Name)) | Should -BeTrue -Because ('{0} holds RCA code that the blind-detection guard neither scans nor exempts' -f $relative)
+        }
+        foreach ($pattern in $scanned) {
+            $pattern | Should -Match '^workload-generator/src/ContosoCare\.Workload/Rca/[A-Za-z]+$'
+        }
     }
 
     It 'keeps the capture catalog off the answer key: no scenario ID, and nothing the workload reports about itself' {
