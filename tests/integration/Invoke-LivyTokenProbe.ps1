@@ -3,7 +3,8 @@
 .SYNOPSIS
 F35's token probe (2026-11-23): does Fabric's Livy API take the Azure CLI's Fabric token? It starts a Livy session in
 the demo's lakehouse, runs SELECT 1, reads the history table's columns and row count, and deletes the session.
-Read-only.
+Read-only, except with -KeptValueModule, F35's smoke test, which writes only a scratch copy of the history table and
+drops it.
 
 .DESCRIPTION
 Learn documents the Livy API for a Microsoft Entra app or a service principal, with the scopes Lakehouse.Execute.All,
@@ -22,6 +23,16 @@ What it does, in order, with the configured subscription's Azure CLI account and
    telemetry_snapshots's columns and row count, and how the session sees the lakehouse. Nothing is written.
 5. Delete Livy Session, always, after a failure or Ctrl+C too. A session that isn't deleted ends after 20 minutes idle.
 
+With -KeptValueModule (F35's smoke test of fabric/history/kept_value.py, before the steps use it), in the same session
+after step 4, and only on a scratch copy, so telemetry_snapshots itself is never changed:
+a. CREATE TABLE telemetry_snapshots_f35smoke_<8 hex> AS SELECT * FROM telemetry_snapshots.
+b. The module's text, as is, as one statement (it only defines names), then kept_value_step(spark, table=<the copy>):
+   it adds the F35 columns to the copy and works out every row. Its JSON is the output's last line.
+c. A read-back of the copy, per analysis: rows, rows worked out, rows with a kept value, and the sums of value and
+   kept_value.
+d. kept_value_step again, which should find nothing left to work out (a rerun changes nothing).
+e. DROP TABLE of the copy, always, unless -KeepCopy.
+
 Results (ADR 0012), printed and written as JSON lines to -OutputPath:
 - PROBE.LIVY.SESSION: Pass when the session started; Fail when Fabric refused it (its status and error code are in the
   message); Manual action required when the workspace's capacity is paused.
@@ -30,6 +41,9 @@ Results (ADR 0012), printed and written as JSON lines to -OutputPath:
 - PROBE.LIVY.DELETE: Pass when the session was deleted.
 - PROBE.LIVY.TOKEN: the answer. Pass when the Azure CLI's token started a session, ran SQL, and read the lakehouse;
   Fail when Fabric refused it.
+- With -KeptValueModule: PROBE.KEPTVALUE.COPY, .LOAD, .STEP, .READBACK, .RERUN, and .DROP, one per step above, and
+  PROBE.KEPTVALUE.SMOKE, its answer: Pass when the step worked out every row of the copy with form Kept and no error,
+  the read-back found the three columns, and the rerun had nothing left.
 Exit code: 0 without a Fail, 1 with one.
 
 Sources (checked 2026-11-23):
@@ -52,8 +66,18 @@ Where the results go, as JSON lines (default: out/livy-token-probe.jsonl in -Rep
 .PARAMETER TimeoutMinutes
 How long to wait for the session to be idle, and for each statement.
 
+.PARAMETER KeptValueModule
+A kept_value.py to smoke-test on a scratch copy of the history table (the steps a. to e. above). Its first resolve
+of a whole history can take minutes: raise -TimeoutMinutes for a long one.
+
+.PARAMETER KeepCopy
+With -KeptValueModule: keep the scratch copy for inspection; the result says how to drop it.
+
 .EXAMPLE
 pwsh -NoProfile -File ./tests/integration/Invoke-LivyTokenProbe.ps1 -ConfigPath ./config/demo.config.json
+
+.EXAMPLE
+pwsh -NoProfile -File ./tests/integration/Invoke-LivyTokenProbe.ps1 -ConfigPath ./config/demo.config.json -KeptValueModule ./fabric/history/kept_value.py -TimeoutMinutes 20
 #>
 [CmdletBinding()]
 param(
@@ -64,7 +88,11 @@ param(
     [string] $OutputPath = '',
 
     [ValidateRange(1, 30)]
-    [int] $TimeoutMinutes = 10
+    [int] $TimeoutMinutes = 10,
+
+    [string] $KeptValueModule = '',
+
+    [switch] $KeepCopy
 )
 
 Set-StrictMode -Version Latest
@@ -149,9 +177,45 @@ $excerpt = {
     }
     return $clean
 }
+# The smoke test's results by check, for its answer (PROBE.KEPTVALUE.SMOKE).
+$smokeStatus = [ordered]@{}
+$smokeAdd = {
+    param([string] $CheckId, [string] $Status, [string] $Message, [System.Collections.IDictionary] $Evidence = @{}, [string] $Remediation = '')
+    $smokeStatus[$CheckId] = $Status
+    & $add $CheckId $Status $Message $Evidence $Remediation
+}
+# The JSON a statement's output ends with: its last line, or the last line that starts with -Prefix; $null without one.
+$lastJson = {
+    param([string] $Text, [string] $Prefix = '')
+    $lines = @(([string]$Text) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    if ($Prefix) {
+        $lines = @($lines | Where-Object { $_.StartsWith($Prefix, [System.StringComparison]::Ordinal) } | ForEach-Object { $_.Substring($Prefix.Length) })
+    }
+    if ($lines.Count -eq 0) {
+        return $null
+    }
+    try {
+        return ($lines[$lines.Count - 1] | ConvertFrom-Json -Depth 16)
+    }
+    catch {
+        return $null
+    }
+}
 
 if (-not (Test-Path -LiteralPath $ConfigPath)) {
     throw "Configuration file not found: $ConfigPath."
+}
+# F35's smoke test: the module is read before anything reaches Azure, so a wrong path costs nothing.
+$keptValueText = ''
+if ($KeptValueModule) {
+    $KeptValueModule = Resolve-DemoUserPath -Path $KeptValueModule
+    if (-not (Test-Path -LiteralPath $KeptValueModule -PathType Leaf)) {
+        throw "The module to smoke-test isn't there: $KeptValueModule."
+    }
+    $keptValueText = [System.IO.File]::ReadAllText($KeptValueModule)
+    if (-not $keptValueText.Contains('def kept_value_step(')) {
+        throw "The module to smoke-test has no kept_value_step function: $KeptValueModule."
+    }
 }
 $config = Get-DemoConfig -Path $ConfigPath
 try {
@@ -174,6 +238,10 @@ if ($workspaceId -notmatch $guidPattern -or $lakehouseId -notmatch $guidPattern)
 $sessionsUri = '{0}/workspaces/{1}/lakehouses/{2}/livyapi/versions/2023-12-01/sessions' -f 'https://api.fabric.microsoft.com/v1', $workspaceId, $lakehouseId
 $sessionUri = ''
 $sessionStarted = $false
+# The smoke test's scratch copy, a name of its own, so it never meets the history table or another run's copy.
+$copyName = 'telemetry_snapshots_f35smoke_{0}' -f [guid]::NewGuid().ToString('N').Substring(0, 8)
+$copyMade = $false
+$runStatement = $null
 $sqlOk = $false
 $readOk = $false
 $refused = $false
@@ -283,7 +351,8 @@ $deadline = { param([datetime] $Start) $Start.AddMinutes($TimeoutMinutes) }
             if ($outputStatus -ne 'ok') {
                 $plain = '{0}: {1}' -f (& $member $output 'ename'), (& $member $output 'evalue')
             }
-            [pscustomobject]@{ Ok = ($outputStatus -eq 'ok'); Status = 200; Text = (& $excerpt $plain); Seconds = [int]$watch.Elapsed.TotalSeconds; State = [string](& $member $statement 'state') }
+            # Full: the whole output, redacted, for the JSON lines it ends with; Text: an excerpt for the results.
+            [pscustomobject]@{ Ok = ($outputStatus -eq 'ok'); Status = 200; Text = (& $excerpt $plain); Full = (Protect-DemoText -Text ([string]$plain)); Seconds = [int]$watch.Elapsed.TotalSeconds; State = [string](& $member $statement 'state') }
         }
 
         # PySpark, the kind F35's steps send; spark.sql runs the SQL.
@@ -354,8 +423,149 @@ $deadline = { param([datetime] $Start) $Start.AddMinutes($TimeoutMinutes) }
             & $add 'PROBE.LIVY.READ' 'Fail' ('The session didn''t read telemetry_snapshots: {0}' -f $lakehouse.Text) $readEvidence
         }
         #endregion
+
+        #region F35's smoke test (-KeptValueModule): kept_value.py on a scratch copy of the history table, never on the table.
+        if ($KeptValueModule) {
+            if (-not $readOk) {
+                & $smokeAdd 'PROBE.KEPTVALUE.COPY' 'Not selected' 'The history table wasn''t read (PROBE.LIVY.READ says why), so the smoke test didn''t run.'
+                break probe
+            }
+            $copyCode = @(
+                'import json'
+                ('spark.sql("CREATE TABLE {0} AS SELECT * FROM telemetry_snapshots")' -f $copyName)
+                ('print("DBHUB_PROBE " + json.dumps({{"rows": spark.table("{0}").count()}}))' -f $copyName)
+            ) -join "`n"
+            # Set first: a statement that stopped after the CREATE still leaves a copy for the drop below.
+            $copyMade = $true
+            $copy = & $runStatement 'pyspark' $copyCode
+            $copied = & $lastJson $copy.Full 'DBHUB_PROBE '
+            $copyEvidence = [ordered]@{ table = $copyName; seconds = $copy.Seconds; output = $copy.Text }
+            if (-not $copy.Ok -or $null -eq $copied) {
+                & $smokeAdd 'PROBE.KEPTVALUE.COPY' 'Fail' ('The scratch copy of telemetry_snapshots wasn''t made: {0}' -f $copy.Text) $copyEvidence
+                break probe
+            }
+            $copyEvidence['rows'] = & $member $copied 'rows'
+            & $smokeAdd 'PROBE.KEPTVALUE.COPY' 'Pass' ('Copied telemetry_snapshots to the scratch table {0}: {1:N0} rows, in about {2} seconds.' -f $copyName, [long](& $member $copied 'rows'), $copy.Seconds) $copyEvidence
+
+            # The module's text as is, as one statement: it only defines names (the interface note).
+            $load = & $runStatement 'pyspark' $keptValueText
+            $loadEvidence = [ordered]@{ module = (Split-Path -Path $KeptValueModule -Leaf); characters = $keptValueText.Length; seconds = $load.Seconds; output = $load.Text }
+            if (-not $load.Ok) {
+                & $smokeAdd 'PROBE.KEPTVALUE.LOAD' 'Fail' ('The module didn''t load in the session: {0}' -f $load.Text) $loadEvidence
+                break probe
+            }
+            & $smokeAdd 'PROBE.KEPTVALUE.LOAD' 'Pass' ('The module loaded in the session as one statement, in about {0} seconds.' -f $load.Seconds) $loadEvidence
+
+            $stepCode = 'import json; print(json.dumps(kept_value_step(spark, table="{0}")))' -f $copyName
+            $keys = @('version', 'table', 'exists', 'missing', 'added', 'form', 'scope', 'read', 'resolved', 'pending', 'attempts', 'seconds', 'error')
+            $step = & $runStatement 'pyspark' $stepCode
+            $stepJson = & $lastJson $step.Full
+            $stepEvidence = [ordered]@{ seconds = $step.Seconds; output = $step.Text }
+            if (-not $step.Ok -or $null -eq $stepJson) {
+                & $smokeAdd 'PROBE.KEPTVALUE.STEP' 'Fail' ('kept_value_step didn''t print its JSON: {0}' -f $step.Text) $stepEvidence
+                break probe
+            }
+            $stepEvidence['result'] = $stepJson
+            $absent = @($keys | Where-Object { $null -eq $stepJson.PSObject.Properties[$_] })
+            $stepError = [string](& $member $stepJson 'error')
+            $pending = [long](& $member $stepJson 'pending')
+            if ($absent.Count -gt 0) {
+                & $smokeAdd 'PROBE.KEPTVALUE.STEP' 'Fail' ('kept_value_step''s JSON lacks {0}, which the interface says are always there.' -f ($absent -join ', ')) $stepEvidence
+            }
+            elseif ((& $member $stepJson 'exists') -ne $true -or [string](& $member $stepJson 'form') -ne 'Kept') {
+                & $smokeAdd 'PROBE.KEPTVALUE.STEP' 'Fail' ('kept_value_step left the copy without its columns: exists {0}, form {1}, error {2}.' -f (& $member $stepJson 'exists'), (& $member $stepJson 'form'), $(if ($stepError) { $stepError } else { 'none' })) $stepEvidence
+            }
+            elseif ($stepError -or $pending -gt 0) {
+                & $smokeAdd 'PROBE.KEPTVALUE.STEP' 'Warning' ('kept_value_step stopped with {0:N0} rows still to work out: {1}' -f $pending, $(if ($stepError) { $stepError } else { 'no error was given' })) $stepEvidence
+            }
+            else {
+                & $smokeAdd 'PROBE.KEPTVALUE.STEP' 'Pass' ('kept_value_step added {0} to the copy and worked out {1:N0} rows ({2:N0} read, {3} MERGE attempt(s)) in {4} seconds; none left.' -f $(if (@(& $member $stepJson 'added').Count -gt 0) { @(& $member $stepJson 'added') -join ', ' } else { 'no column' }), [long](& $member $stepJson 'resolved'), [long](& $member $stepJson 'read'), (& $member $stepJson 'attempts'), (& $member $stepJson 'seconds')) $stepEvidence
+            }
+
+            $readBackCode = @(
+                'import json'
+                'from pyspark.sql import functions as F'
+                ('frame = spark.table("{0}")' -f $copyName)
+                'names = set(frame.columns)'
+                'probe = {"columns": [c for c in ("grain_minutes", "kept_value", "resolved_at_utc") if c in names], "rows": frame.count()}'
+                'if {"kept_value", "resolved_at_utc"} <= names:'
+                '    grouped = frame.groupBy("analysis").agg(F.count(F.lit(1)).alias("rows"), F.count("resolved_at_utc").alias("resolved"), F.count("kept_value").alias("kept"), F.sum("value").alias("value"), F.sum("kept_value").alias("kept_sum"))'
+                '    probe["analyses"] = {str(row["analysis"]): {"rows": row["rows"], "resolved": row["resolved"], "kept": row["kept"], "value": row["value"], "kept_sum": row["kept_sum"]} for row in grouped.collect()}'
+                'print("DBHUB_PROBE " + json.dumps(probe, default=str))'
+            ) -join "`n"
+            $readBack = & $runStatement 'pyspark' $readBackCode
+            $readBackJson = & $lastJson $readBack.Full 'DBHUB_PROBE '
+            $readBackEvidence = [ordered]@{ seconds = $readBack.Seconds }
+            if (-not $readBack.Ok -or $null -eq $readBackJson) {
+                $readBackEvidence['output'] = $readBack.Text
+                & $smokeAdd 'PROBE.KEPTVALUE.READBACK' 'Fail' ('The copy wasn''t read back: {0}' -f $readBack.Text) $readBackEvidence
+            }
+            else {
+                $readBackEvidence['result'] = $readBackJson
+                $columns = @(& $member $readBackJson 'columns')
+                $analyses = & $member $readBackJson 'analyses'
+                $resolvedRows = [long]0
+                if ($null -ne $analyses) {
+                    foreach ($entry in $analyses.PSObject.Properties) {
+                        $resolvedRows += [long](& $member $entry.Value 'resolved')
+                    }
+                }
+                $readBackEvidence['resolvedRows'] = $resolvedRows
+                if ($columns.Count -ne 3) {
+                    & $smokeAdd 'PROBE.KEPTVALUE.READBACK' 'Fail' ('The copy has {0} of the three F35 columns ({1}).' -f $columns.Count, ($columns -join ', ')) $readBackEvidence
+                }
+                elseif ($null -ne $stepJson.PSObject.Properties['resolved'] -and $resolvedRows -ne [long](& $member $stepJson 'resolved')) {
+                    & $smokeAdd 'PROBE.KEPTVALUE.READBACK' 'Warning' ('The copy has {0:N0} rows worked out, where kept_value_step said it wrote {1:N0}.' -f $resolvedRows, [long](& $member $stepJson 'resolved')) $readBackEvidence
+                }
+                else {
+                    & $smokeAdd 'PROBE.KEPTVALUE.READBACK' 'Pass' ('The copy has the three F35 columns and {0:N0} of its {1:N0} rows worked out; the evidence has each analysis''s rows and its sums of value and kept_value.' -f $resolvedRows, [long](& $member $readBackJson 'rows')) $readBackEvidence
+                }
+            }
+
+            # A rerun works out only rows that aren't yet, so it should find none.
+            $rerun = & $runStatement 'pyspark' $stepCode
+            $rerunJson = & $lastJson $rerun.Full
+            $rerunEvidence = [ordered]@{ seconds = $rerun.Seconds; output = $rerun.Text }
+            if (-not $rerun.Ok -or $null -eq $rerunJson) {
+                & $smokeAdd 'PROBE.KEPTVALUE.RERUN' 'Fail' ('kept_value_step''s rerun didn''t print its JSON: {0}' -f $rerun.Text) $rerunEvidence
+            }
+            else {
+                $rerunEvidence['result'] = $rerunJson
+                $again = [long](& $member $rerunJson 'resolved')
+                $left = [long](& $member $rerunJson 'pending')
+                $rerunError = [string](& $member $rerunJson 'error')
+                if ($again -eq 0 -and $left -eq 0 -and -not $rerunError) {
+                    & $smokeAdd 'PROBE.KEPTVALUE.RERUN' 'Pass' ('kept_value_step''s rerun found nothing left to work out, in {0} seconds.' -f (& $member $rerunJson 'seconds')) $rerunEvidence
+                }
+                else {
+                    & $smokeAdd 'PROBE.KEPTVALUE.RERUN' 'Warning' ('kept_value_step''s rerun wrote {0:N0} rows and left {1:N0}{2}; a rerun should find nothing left.' -f $again, $left, $(if ($rerunError) { ' ({0})' -f $rerunError } else { '' })) $rerunEvidence
+                }
+            }
+        }
+        #endregion
     }
     finally {
+        #region The smoke test's scratch copy, dropped before the session goes (unless -KeepCopy).
+        if ($copyMade -and $sessionUri -and $null -ne $runStatement) {
+            if ($KeepCopy) {
+                & $smokeAdd 'PROBE.KEPTVALUE.DROP' 'Not selected' ('The scratch copy {0} was kept (-KeepCopy).' -f $copyName) ([ordered]@{ table = $copyName }) ('Drop it when you''re done, in a notebook cell in the workspace: spark.sql("DROP TABLE {0}").' -f $copyName)
+            }
+            else {
+                try {
+                    $drop = & $runStatement 'pyspark' ('spark.sql("DROP TABLE IF EXISTS {0}")' -f $copyName)
+                    if ($drop.Ok) {
+                        & $smokeAdd 'PROBE.KEPTVALUE.DROP' 'Pass' ('The scratch copy {0} was dropped.' -f $copyName) ([ordered]@{ table = $copyName })
+                    }
+                    else {
+                        & $smokeAdd 'PROBE.KEPTVALUE.DROP' 'Warning' ('The scratch copy {0} wasn''t dropped: {1}' -f $copyName, $drop.Text) ([ordered]@{ table = $copyName }) ('Drop it in a notebook cell in the workspace: spark.sql("DROP TABLE {0}").' -f $copyName)
+                    }
+                }
+                catch {
+                    & $smokeAdd 'PROBE.KEPTVALUE.DROP' 'Warning' ('The scratch copy {0} wasn''t dropped: {1}' -f $copyName, (& $excerpt $_.Exception.Message)) ([ordered]@{ table = $copyName }) ('Drop it in a notebook cell in the workspace: spark.sql("DROP TABLE {0}").' -f $copyName)
+                }
+            }
+        }
+        #endregion
         #region 3. Delete Livy Session, whatever happened above.
         if ($sessionUri) {
             try {
@@ -389,5 +599,18 @@ elseif ($sessionStarted -and $sqlOk) {
 }
 else {
     & $add 'PROBE.LIVY.TOKEN' 'Warning' 'The probe didn''t reach an answer (PROBE.LIVY.* says why); it isn''t a refusal of the token.' @{} 'Fix what PROBE.LIVY.* names, then run the probe again.'
+}
+if ($KeptValueModule) {
+    $needed = @('PROBE.KEPTVALUE.STEP', 'PROBE.KEPTVALUE.READBACK', 'PROBE.KEPTVALUE.RERUN')
+    $failed = @($smokeStatus.Keys | Where-Object { $smokeStatus[$_] -eq 'Fail' })
+    if ($failed.Count -gt 0) {
+        & $add 'PROBE.KEPTVALUE.SMOKE' 'Fail' ('The kept-value smoke test failed: {0}.' -f ($failed -join ', '))
+    }
+    elseif (@($needed | Where-Object { $smokeStatus[$_] -eq 'Pass' }).Count -eq $needed.Count) {
+        & $add 'PROBE.KEPTVALUE.SMOKE' 'Pass' 'kept_value.py ran through Livy on a scratch copy of the history: it added the columns, worked out every row, and a rerun found nothing left.'
+    }
+    else {
+        & $add 'PROBE.KEPTVALUE.SMOKE' 'Warning' 'The kept-value smoke test didn''t pass all its steps (PROBE.KEPTVALUE.* says why).'
+    }
 }
 & $finish
