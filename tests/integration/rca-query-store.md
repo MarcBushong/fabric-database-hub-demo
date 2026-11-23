@@ -200,6 +200,10 @@ SUMMARIZECOLUMNS(
 6. **A NULL `event_type`:** how often it appears, and the waits around it.
 7. **RCA-PG-16:** the routines it lists match H's 13; the harness tables are exactly `demo.scenario_control`, `demo.scenario_runs`, and `demo.scenario_run_events`; and there's **no `unsure` row** (`dynamic_sql`, `no_source`).
 8. **H's marks on T4, deployed twice** (review-h): setup runs as the P6 role. After the net-new deployment and after the second `./scripts/deploy.ps1`, `obj_description(p.oid, 'pg_proc') = 'dbhubdemo:harness'` holds for exactly the 13 control routines, every overload, and the second run reports no error.
+9. **The observer's connections, from A2's 83344ef0:** every PostgreSQL evidence block reads with Npgsql's `NoTypeLoading`, and the observer's connections to T4 and to the replica carry their limits in the startup packet's `options`, never as `SET` statements.
+   - **Pass:** the runner's log names each connection's `options`. After the update, Query Store's rows under the runner's role hold no type-loading query and no limits' `SET` from the observer.
+   - L0's probe reads with `NoTypeLoading` too, so its own type loading never lands in Query Store under the workload's role.
+10. **RCA-PG-14 on shared rows:** a text that both the observer and the workload sent under the same role stays as evidence, unless it's one of the observer's own specific statements: the catalog's blocks and its snapshot clear. The probe reports each such shared row's `query_id` and whether it was kept.
 
 ## The scripts' transport's live checks (S12)
 
