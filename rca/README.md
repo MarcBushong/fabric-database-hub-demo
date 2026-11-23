@@ -209,7 +209,7 @@ What the observer captures beyond the evidence document, in documents of their o
 
   Each is timed within its read's period (`time_from_utc` to `event_time_utc`).
 - **Coverage:** `rca_query_coverage` holds one row per target per sidecar: Query Store's state and capture mode as read, the intervals read, PostgreSQL's pending publication, and the gaps:
-  - Query Store off or read-only, a permission (the gap names the grant that fixes it: for example RCA-PG-17's `pg_read_all_stats`, which T4's read replica has once T4 does, since a replica copies its primary's roles; or RCA-AZ-04's server role), a timeout, an expired pending range, the sidecar's budget;
+  - Query Store off or read-only, a permission (the gap names the grant that fixes it: for example RCA-PG-17's `pg_read_all_stats` on T4's primary, the only server it reads; or RCA-AZ-04's server role), a timeout, an expired pending range, the sidecar's budget;
   - a session's sidecars past their budget when a span is bound to it, with nothing cut ([Limits](#limits));
   - on a Burstable T4: Query Store is off, as Learn advises there;
   - on T2's kept PaygWizard guest: not captured, because its runner identity has no `VIEW DATABASE STATE`, with `RCA.CAPTURE.T2`'s fix.
@@ -225,7 +225,7 @@ PostgreSQL shows an interval only once it ends and is persisted ("Data that the 
   - **before the start,** from the newest interval Query Store shows to the start or the range's end, whichever is first, it's "Lost when T4 stopped", never pending or not captured;
   - **from the start on,** T4's new lifetime recorded it, so it waits for publication as any pending range does.
 
-  If L0a shows that Query Store publishes a stopped window late, the backfill also waits an interval and the publication delay after the start before it calls any part lost. Like any rule on what Query Store lacks, it can't tell an interval in which nothing ran from a lost one. The live check L0a measures whether a stop keeps the window.
+  In every case, the backfill waits an interval and the publication delay after the start before it calls any part lost, so a window that a stop kept and Query Store publishes late still counts. The live check L0a measures whether a stop keeps the window, and tunes only that wait. Like any rule on what Query Store lacks, it can't tell an interval in which nothing ran from a lost one.
 
 ### Who holds T4's connections
 
