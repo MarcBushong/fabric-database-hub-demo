@@ -979,6 +979,9 @@ Describe 'Invoke-DemoDeployment' {
             $script:history.Add([pscustomobject]@{ Before = $script:order.ToArray(); DoneChecked = [bool]$PesterBoundParameters['DoneChecked']; SkipFabric = [bool]$PesterBoundParameters['SkipFabric']; WhatIfRun = [bool]$PesterBoundParameters['WhatIfRun'] })
             New-DemoResult -CheckId 'DEPLOY.FABRIC.HISTORY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'Saved the history report''s snapshots.' -Evidence @{ nonBlocking = 'historySnapshot' }
         }
+        # The history's kept values (F35, 2026-11-23) have their own tests (DbHubDemo.HistoryKeptValue.Tests.ps1); here the
+        # Fabric stage's step never reaches Fabric, and the end's finds no saved snapshot above, so it's Not selected.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -MockWith { New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'kept values' -Evidence @{ nonBlocking = 'keptValue' } }
         # T4's read replica at the run's end (2026-11-16) has its own tests (DbHubDemo.T4Replica.Tests.ps1); here it notes
         # what had run before it, and never reaches Azure.
         $script:replicaEnd = [System.Collections.Generic.List[object]]::new()
@@ -1487,6 +1490,9 @@ Describe 'Invoke-DemoDeployment' {
         $ids = @($results | ForEach-Object { [string]$_.checkId })
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeGreaterThan ([array]::IndexOf($ids, 'DEPLOY.INCIDENTS_T1'))
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
+        # Its kept values right after it, and the Fabric stage's before the history model's step (F35, 2026-11-23).
+        [array]::IndexOf($ids, 'DEPLOY.FABRIC.KEPTVALUE.END') | Should -Be ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') + 1)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'DEPLOY.FABRIC.KEPTVALUE' -and $ProgressId -eq 'Fabric.KeptValues' }
         # T4's read replica goes after the snapshot (2026-11-16): DONE's checks and the snapshot read it first.
         $script:replicaEnd.Count | Should -Be 1
         $script:replicaEnd[0].Snapshots | Should -Be 1
@@ -1524,7 +1530,10 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Be @('Preflight', 'Template')
         $script:history.Count | Should -Be 1
         $script:history[0].WhatIfRun | Should -BeTrue
-        $results[-1].checkId | Should -Be 'DEPLOY.FABRIC.HISTORY'
+        $results[-2].checkId | Should -Be 'DEPLOY.FABRIC.HISTORY'
+        # The snapshot's kept values (F35, 2026-11-23), Not selected too.
+        $results[-1].checkId | Should -Be 'DEPLOY.FABRIC.KEPTVALUE.END'
+        $results[-1].status | Should -Be 'Not selected'
         $script:replicaEnd.Count | Should -Be 0 -Because 'a what-if deletes nothing'
     }
 

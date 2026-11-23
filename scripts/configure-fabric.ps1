@@ -172,7 +172,9 @@ With -ImportDashboard, skip step 4.
 Also run step 5: NB_DatabaseHub_LiveActivity on demand with SAVE_RESULTS true (Invoke-DemoFabricNotebookRun), so
 the lakehouse tables the history report reads (incident windows, telemetry snapshots, validation results) are
 current. It runs analyze-only, scoped to the demo's resource group
-(RESOURCE_GROUP, rg-<prefix>-<environment>). It waits up to -TimeoutSeconds (at least 5 minutes) for the job. Step 5
+(RESOURCE_GROUP, rg-<prefix>-<environment>). It waits up to -TimeoutSeconds (at least 5 minutes) for the job. After a
+run that completed, the history's kept values are worked out through Fabric's Livy API with this checkout's
+fabric/history/kept_value.py (F35; FABRIC.KEPTVALUE, Invoke-DemoHistoryKeptValue, never a Fail). Step 5
 also runs once by itself when step 2 created the notebook, or bound it to a lakehouse that step 0 created, so a new
 lakehouse gets the tables; that first run waits up to -HistoryRunWaitMinutes, since a busy capacity can keep it queued
 for longer than 10 minutes (#68).
@@ -734,6 +736,11 @@ if ($RunLiveActivity -or $firstRun) {
             catch {
                 Write-DemoLog -Level Warning -Message ('The PostgreSQL metrics are in the history now, but {0} couldn''t be moved aside: {1}' -f $PostgresMetricsPath, $_.Exception.Message)
             }
+        }
+        # F35 (i, 2026-11-23): with -RunLiveActivity, the kept values of the rows the run saved, worked out through Livy with
+        # this checkout's code (Invoke-DemoHistoryKeptValue), only after a run that completed. Never a Fail.
+        if ($RunLiveActivity -and [string]$run.status -eq 'Pass') {
+            $results.Add((Invoke-DemoHistoryKeptValue -Config $config -Token $runToken -CheckId 'FABRIC.KEPTVALUE'))
         }
     }
 }

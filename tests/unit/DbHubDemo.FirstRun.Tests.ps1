@@ -1713,6 +1713,19 @@ Describe 'stop-demo.ps1 -SaveHistory (Save-DemoFabricHistory)' {
             ($results | Where-Object { $_.checkId -eq 'STOP.FABRIC.CAPACITY' }).status | Should -Be 'Warning'
         }
 
+        It 'works out the saved rows'' kept values after a run that completed, before the capacity is paused, and not under a run still going (F35, 2026-11-23)' {
+            Mock -ModuleName DbHubDemo -CommandName Save-DemoFabricHistory -MockWith { $script:order.Add('SaveHistory'); [pscustomobject]@{ Result = (New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status $(if ($script:still) { 'Warning' } else { 'Pass' }) -Message 'saved' -Evidence @{ jobStatus = $(if ($script:still) { 'InProgress' } else { 'Completed' }) }); StillRunning = $script:still } }
+            Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -MockWith { $script:order.Add('KeptValues'); New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'worked out' }
+            $results = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
+            $script:order | Should -Be @('Deallocate:archost01', 'Deallocate:sqlvm01', 'SaveHistory', 'KeptValues', 'Pause')
+            ($results | Where-Object { $_.checkId -eq 'STOP.FABRIC.KEPTVALUE' }).status | Should -Be 'Pass'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'STOP.FABRIC.KEPTVALUE' -and $TimeoutMinutes -eq 15 }
+            $script:order.Clear()
+            $script:still = $true
+            $null = Stop-DemoEnvironment -Config $script:stopConfig -SaveHistory -Confirm:$false
+            $script:order | Should -Not -Contain 'KeptValues'
+        }
+
         It 'saves nothing without -SaveHistory or saveHistoryOnStop, and touches neither with -ParkT2' {
             Stop-DemoEnvironment -Config $script:stopConfig -Confirm:$false | Out-Null
             $script:order | Should -Not -Contain 'SaveHistory'

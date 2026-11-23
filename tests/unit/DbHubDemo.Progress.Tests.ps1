@@ -77,8 +77,8 @@ Describe 'The progress model (Phase 28, brief item 11)' {
     It 'shows the history report''s snapshot after the validation, where it happens, as not blocking DONE, and leaves it out with -SkipFabric (2026-11-06)' {
         $model = New-TestModel
         # The busy marker's Nightly stop row (2026-11-14), then the session control's (ADR 0026), then the stop at the end of an
-        # update (2026-11-19), come last, with or without Fabric.
-        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History', 'NightlyStop', 'Control', 'EndStop')
+        # update (2026-11-19), come last, with or without Fabric. The snapshot's kept values (F35, 2026-11-23) follow it.
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History', 'Fabric.HistoryKept', 'NightlyStop', 'Control', 'EndStop')
         $history = Get-TestStep -Model $model -Id 'Fabric.History'
         $history['nonBlocking'] | Should -BeTrue
         $history['state'] | Should -Be 'Pending'

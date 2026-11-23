@@ -54,6 +54,9 @@ function Stop-DemoEnvironment {
       the capacity runs (STOP.T4.HISTORY.PENDING, Save-DemoPostgresHistoryPending). T5's Azure Monitor metrics
       (2026-11-18, ADR 0027) are read right before the run (STOP.T5.HISTORY, Get-DemoCosmosHistoryCapture) and sent as
       COSMOS_METRICS; its account stays, so a run that doesn't save them leaves them in Azure Monitor for a later one.
+      After a run that completed, the kept values of the rows it saved are worked out through Livy with this checkout's
+      code, before any pause (F35, 2026-11-23; STOP.FABRIC.KEPTVALUE, Invoke-DemoHistoryKeptValue): never a Fail, and
+      one that can't run leaves the history reading as before.
     Run Command needs a running VM: a password rotation on a deallocated host reports Manual action required
     with the steps, and a profile on a VM that isn't running is already inactive (Not selected).
 
@@ -402,6 +405,7 @@ function Stop-DemoEnvironment {
                 }
             }
             try {
+                $saved = $null
                 $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' })
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning
@@ -410,6 +414,12 @@ function Stop-DemoEnvironment {
             }
             catch {
                 $results.Add((New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The session''s history wasn''t saved: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'In Fabric, run NB_DatabaseHub_LiveActivity in the demo''s workspace (Run all).'))
+            }
+            # F35 (i, 2026-11-23): the kept values of the rows the save wrote, worked out through Livy with this checkout's code
+            # while the capacity still runs (Invoke-DemoHistoryKeptValue). Only after a run that completed: one still going
+            # writes after it. Never a Fail.
+            if ($null -ne $saved -and -not $historyRunning -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $saved.Result -Name 'evidence') -Name 'jobStatus') -eq 'Completed') {
+                $results.Add((Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'STOP.FABRIC.KEPTVALUE' -TimeoutMinutes 15))
             }
             # T4's read replica is deleted by now, and its metrics with it (ADR 0025): when the run that would have added them
             # to the history didn't (a paused capacity, for example), they're kept in out/history-pending, with the command

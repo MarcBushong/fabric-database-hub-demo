@@ -591,6 +591,11 @@ Describe 'Invoke-DemoDeploymentTrack' {
         Mock -ModuleName DbHubDemo -CommandName Enable-DemoSqlVmMonitoring -MockWith { $script:calls.Add('monitoring'); New-TestResult 'T1.SQLVM.MONITORING' }
         # Phase 28: the VM's extensions settle before its artifacts and its loader (brief item 14); its own tests are in DbHubDemo.OneCommand.Tests.ps1.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoVmSettle -MockWith { if ($VmName -eq 'sqlvm01' -and $ProgressId -eq 'T1.Bootstraps') { $script:calls.Add('settle ' + $VmName) }; [pscustomobject]@{ Settled = $true; Results = @() } }
+        # F35 (2026-11-23): the Fabric step's kept values through Livy have their own tests (DbHubDemo.HistoryKeptValue.Tests.ps1);
+        # here they note when they ran, and never reach Fabric.
+        $script:keptForm = 'Kept'
+        $script:keptStatus = 'Pass'
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -MockWith { $script:calls.Add('kept values'); New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status $script:keptStatus -Message ('kept values {0}' -f $script:keptStatus) -Evidence @{ nonBlocking = 'keptValue'; form = $script:keptForm } }
     }
 
     It 'says on the console and the status page why a resumed run sends a VM''s artifacts again (live finding, 2026-11-06)' {
@@ -1212,6 +1217,22 @@ Describe 'Invoke-DemoDeploymentTrack' {
         ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.APP' }).status | Should -Be 'Not selected'
         $script:powerBIStatus = 'Fail'
         (InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }).Status | Should -Be 'Fail'
+    }
+
+    It 'works out the history''s kept values between the notebooks and the history model, whose step gets the form they allow, and never fails the track for them (F35, 2026-11-23)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -MockWith { $script:calls.Add('fabric stage'); New-TestResult 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoPowerBIStage -MockWith { $script:calls.Add(('powerbi form={0}' -f $SnapshotValueForm)); New-TestResult 'FABRIC.SEMANTICMODEL.DATA' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricAppStage -MockWith { $script:calls.Add('fabric app'); New-TestResult 'DEPLOY.FABRIC.APP' 'Not selected' }
+        foreach ($case in @(@{ Form = 'Kept'; Status = 'Pass' }, @{ Form = ''; Status = 'Warning' })) {
+            $script:calls.Clear()
+            $script:keptForm = $case.Form
+            $script:keptStatus = $case.Status
+            $outcome = InModuleScope DbHubDemo -Parameters @{ Config = $config; Context = $script:context } { Invoke-DemoDeploymentTrack -Config $Config -Track 'Fabric' -Context $Context -Step @('Fabric') }
+            $outcome.Status | Should -Be 'Pass'
+            @($script:calls | Where-Object { $_ -in 'fabric stage', 'kept values', 'fabric app' -or $_ -like 'powerbi*' }) | Should -Be @('fabric stage', 'kept values', ('powerbi form={0}' -f $case.Form), 'fabric app')
+            ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.KEPTVALUE' }).status | Should -Be $case.Status
+        }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -Times 2 -Exactly -ParameterFilter { $CheckId -eq 'DEPLOY.FABRIC.KEPTVALUE' -and $ProgressId -eq 'Fabric.KeptValues' -and $RunAgain -eq './scripts/deploy.ps1 -FromStage Fabric' -and $TimeoutMinutes -eq 30 }
     }
 
     It 'ends a first deployment''s Fabric step without a Fail when a busy capacity kept the first history run queued past its wait: the model refreshes once it completes, before the Insights app (#68)' {
@@ -1998,6 +2019,12 @@ Describe 'Invoke-DemoParallelDeployment' {
             $script:calls.Add('replica end')
             New-DemoResult -CheckId 'DEPLOY.T4.REPLICA.END' -Area 'infra' -Target 'T4' -Status 'Pass' -Message 'replica end' -Evidence @{ outcome = 'Deleted' }
         }
+        # The snapshot's kept values (F35, 2026-11-23) have their own tests (DbHubDemo.HistoryKeptValue.Tests.ps1); here they
+        # note when they ran, and never reach Fabric.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoKeptValueEndStep -MockWith {
+            $script:calls.Add(('kept end whatIf={0}' -f [bool]$PesterBoundParameters['WhatIfRun']))
+            New-DemoResult -CheckId 'DEPLOY.FABRIC.KEPTVALUE.END' -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'kept end' -Evidence @{ nonBlocking = 'keptValue' }
+        }
         # The T2 host's missing-host check (2026-11-17) has its own tests (DbHubDemo.T2HostRebuild.Tests.ps1): here the host
         # exists unless a test says not.
         $script:hostMissing = $null
@@ -2506,6 +2533,9 @@ Describe 'Invoke-DemoParallelDeployment' {
         $calls = @($script:calls)
         $history = [array]::IndexOf($calls, 'history done=True skipFabric=False whatIf=False')
         $history | Should -BeGreaterThan ([array]::IndexOf($calls, 'fabric items')) -Because 'DONE''s checks come first'
+        # The snapshot's kept values right after it (F35, 2026-11-23), with the results that hold its record.
+        [array]::IndexOf($calls, 'kept end whatIf=False') | Should -Be ($history + 1)
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoKeptValueEndStep -Times 1 -Exactly -ParameterFilter { @($Result | Where-Object { [string]$_.checkId -eq 'DEPLOY.FABRIC.HISTORY' }).Count -eq 1 -and $ProgressPath -eq 'progress.json' }
         $history | Should -BeGreaterThan ([array]::IndexOf($calls, 'switch T1,T3,T4,T2=business-day wait=180')) -Because 'the notebook never touches the VMs, so their incidents don''t wait for Spark'
         [array]::IndexOf($calls, 'switch T1,T3,T4,T2=business-day wait=180') | Should -BeGreaterOrEqual 0
         $ids = @($results | ForEach-Object { [string]$_.checkId })
@@ -2560,7 +2590,10 @@ Describe 'Invoke-DemoParallelDeployment' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoDeploymentTrack -Times 0 -Exactly
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT4ReplicaDeployEnd -Times 0 -Exactly -Because 'a what-if deletes nothing'
         $ids = @($results | ForEach-Object { [string]$_.checkId })
-        $ids[-1] | Should -Be 'DEPLOY.FABRIC.HISTORY'
+        $ids[-2] | Should -Be 'DEPLOY.FABRIC.HISTORY'
+        # The snapshot's kept values (F35, 2026-11-23) are Not selected too, right after it.
+        $ids[-1] | Should -Be 'DEPLOY.FABRIC.KEPTVALUE.END'
+        $script:calls | Should -Contain 'kept end whatIf=True'
         [array]::IndexOf($ids, 'DEPLOY.STAGE.INFRASTRUCTURE') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY'))
     }
 
