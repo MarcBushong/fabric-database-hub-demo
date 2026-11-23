@@ -5,7 +5,7 @@
   "service": "supply-sync",
   "summary": "Pairs of sessions deadlock with each other round after round: in 'order' rounds side 1 locks inventory row A then B while side 2 locks B then A; in 'conversion' rounds both sides read row A with HOLDLOCK and then both update it. Side 2 runs at DEADLOCK_PRIORITY LOW, so it's the victim (error 1205). Every round rolls back, each victim is recorded as a deadlock-victim event, and each session stops after maxRounds rounds.",
   "orchestration": "pairs",
-  "procedure": "demo.usp_scenario_deadlock_storm",
+  "procedure": "supply.usp_reconcile_stock",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
   "concurrency": { "default": 2, "min": 1, "max": 8, "description": "Session pairs; each pair deadlocks with itself on its own two inventory rows (101 to 116), apart from locking-blocking's rows 1 and 2." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pause between rounds: about 10 seconds at 1, 1 second at 10." },

@@ -98,6 +98,9 @@ internal static partial class PgScripts
         return await exists.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is true;
     }
 
+    /// <summary>The application schemas that hold the workload's step functions (ADR 0031, decision 6; database/postgresql/120-scenario-functions.sql creates them).</summary>
+    public static readonly IReadOnlyList<string> ApplicationSchemas = ["billing", "frontdesk", "records", "reporting", "scheduling", "supply"];
+
     /// <summary>
     /// Grants the runner's role what the scenarios need in contosocare, and nothing at the server level except the
     /// optional pg_read_all_stats (the live view of other roles' sessions). Run it connected to contosocare.
@@ -110,6 +113,7 @@ internal static partial class PgScripts
         }
 
         var role = QuoteIdentifier(roleName);
+        var applications = string.Join(", ", ApplicationSchemas);
         var statements = new[]
         {
             $"GRANT CONNECT ON DATABASE {QuoteIdentifier(PgEndpoint.DatabaseName)} TO {role};",
@@ -117,6 +121,8 @@ internal static partial class PgScripts
             $"GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA care, demo TO {role};",
             $"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA care, demo TO {role};",
             $"GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA demo TO {role};",
+            $"GRANT USAGE ON SCHEMA {applications} TO {role};",
+            $"GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA {applications} TO {role};",
         };
         foreach (var statement in statements)
         {
@@ -127,7 +133,7 @@ internal static partial class PgScripts
             await grant.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         }
 
-        var checks = new List<CheckRecord> { new("runner-grants", "Pass", $"{roleName} can read and write the care and demo tables and run the demo functions in contosocare, and nothing else.") };
+        var checks = new List<CheckRecord> { new("runner-grants", "Pass", $"{roleName} can read and write the care and demo tables and run the demo and workload functions in contosocare, and nothing else.") };
         try
         {
             await using var stats = connection.CreateCommand();
@@ -145,16 +151,13 @@ internal static partial class PgScripts
         return checks;
     }
 
-    /// <summary>Checks that every T4 scenario in the catalog has its step function.</summary>
+    /// <summary>Checks that every T4 scenario in the catalog has its step function, in the schema its name gives.</summary>
     public static async Task<CheckRecord> VerifyScenarioFunctionsAsync(NpgsqlConnection connection, IEnumerable<ScenarioDefinition> scenarios, CancellationToken cancellationToken)
     {
         var missing = new List<string>();
         foreach (var scenario in scenarios.Where(s => s.AppliesTo(DemoTarget.T4)))
         {
-            await using var command = connection.CreateCommand();
-            command.CommandText = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = 'demo' AND p.proname = @name);";
-            command.Parameters.Add(new NpgsqlParameter<string>("name", NpgsqlDbType.Text) { TypedValue = scenario.Procedure["demo.".Length..] });
-            if (await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is not true)
+            if (!await FunctionExistsAsync(connection, scenario.Procedure, cancellationToken).ConfigureAwait(false))
             {
                 missing.Add(scenario.Procedure);
             }
@@ -163,6 +166,22 @@ internal static partial class PgScripts
         return missing.Count == 0
             ? new CheckRecord("scenario-functions", "Pass", "Every T4 scenario in the catalog has its step function.")
             : new CheckRecord("scenario-functions", "Fail", string.Create(CultureInfo.InvariantCulture, $"{missing.Count} scenario function(s) are missing: {string.Join(", ", missing)}."));
+    }
+
+    /// <summary>True when a function of that schema-qualified name exists, whatever its arguments.</summary>
+    public static async Task<bool> FunctionExistsAsync(NpgsqlConnection connection, string qualifiedName, CancellationToken cancellationToken)
+    {
+        var separator = qualifiedName.IndexOf('.', StringComparison.Ordinal);
+        if (separator <= 0 || separator == qualifiedName.Length - 1)
+        {
+            throw new ArgumentException("A function name must be schema-qualified.", nameof(qualifiedName));
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT EXISTS (SELECT 1 FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace WHERE n.nspname = @schema AND p.proname = @name);";
+        command.Parameters.Add(new NpgsqlParameter<string>("schema", NpgsqlDbType.Text) { TypedValue = qualifiedName[..separator] });
+        command.Parameters.Add(new NpgsqlParameter<string>("name", NpgsqlDbType.Text) { TypedValue = qualifiedName[(separator + 1)..] });
+        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is true;
     }
 
     internal static string QuoteIdentifier(string identifier) => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";

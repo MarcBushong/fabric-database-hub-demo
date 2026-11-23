@@ -5,7 +5,7 @@
   "service": "frontdesk-app",
   "summary": "A front-desk visit summary whose plan depends on the first range it's compiled for: a few patients seek (plan A); then the runner recompiles it for every patient, so the cached plan scans care.appointments (plan B), and the same narrow lookups go on far more slowly. With FORCE_LAST_GOOD_PLAN on, Azure SQL Database's default, automatic tuning forces plan A. In the Database Agent beat (2026-11-18) the run holds it off until Database Agents raises its issue, then forces the last good plan itself and puts it back. T3 (Azure SQL Database) only.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_plan_regression",
+  "procedure": "frontdesk.usp_refresh_visit_summaries",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
   "concurrency": { "default": 2, "min": 1, "max": 8, "description": "Sessions running the lookups; session 1 also unforces an earlier run's forced plan at the start and makes the switch, and in the Database Agent beat holds automatic correction and makes the response. Up to 8 so the beat's regressed lookups can load T3's two vCores (2026-11-18)." },
   "intensity": { "default": 6, "min": 1, "max": 10, "description": "Pace: a lookup about every 400 ms per session at 1, back to back at 10." },

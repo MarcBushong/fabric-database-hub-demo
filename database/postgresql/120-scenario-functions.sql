@@ -1,11 +1,31 @@
 -- Bounded scenario steps for T4 (Phase 24, ADR 0010, ADR 0019): the PostgreSQL counterpart of
 -- database/common/120-scenario-procedures.sql. Each function is one short unit of work that the runner calls in a
--- loop from its tagged sessions (ContosoCare.Demo/<scenario>/<run>), so no statement or transaction outlives the
+-- loop from its tagged sessions (ContosoCare.Demo/<service>/<run>), so no statement or transaction outlives the
 -- run: every step first calls demo.usp_run_assert_running, which raises SQLSTATE CC001 once the run is stopped or
 -- past its deadline. The runner sets statement_timeout, lock_timeout, and idle_in_transaction_session_timeout on
 -- every session it opens, and the server's idle_in_transaction_session_timeout is the backstop. Scenarios work only
 -- inside contosocare; changes to business data roll back, except the baseline's tagged audit rows and work-item
 -- touches, which reset removes. Idempotent. Batches are separated by lines that hold only '-- @batch'.
+--
+-- Realistic names (ADR 0031, decision 6, 2026-11-23): the steps live in the schemas a ContosoCare application would use,
+-- with the same names as their T-SQL counterparts, so Query Store and pg_stat_activity show an application, not the
+-- demo's script. rca/blind-detection.json (answerKey.workloadNames) maps each to its scenarios, for grading only.
+-- PostgreSQL stores only a function's body, so the comments here stay in the script; no body names a scenario. The
+-- old names are dropped at the end, once their replacements exist. demo keeps the control objects and fn_seed_scale.
+
+-- The application schemas. setup grants the runner's role USAGE on them and EXECUTE on their functions.
+CREATE SCHEMA IF NOT EXISTS billing;
+-- @batch
+CREATE SCHEMA IF NOT EXISTS frontdesk;
+-- @batch
+CREATE SCHEMA IF NOT EXISTS records;
+-- @batch
+CREATE SCHEMA IF NOT EXISTS reporting;
+-- @batch
+CREATE SCHEMA IF NOT EXISTS scheduling;
+-- @batch
+CREATE SCHEMA IF NOT EXISTS supply;
+-- @batch
 
 -- The seeded sizes, from demo.seed_state (the seed scales every table linearly).
 CREATE OR REPLACE FUNCTION demo.fn_seed_scale()
@@ -27,7 +47,7 @@ $$;
 
 -- healthy-baseline: the steady OLTP mix (front-desk lookup, a provider's day, a billing balance, work-queue triage,
 -- a work-item touch, and an audit row). Short, indexed statements with no blocking.
-CREATE OR REPLACE FUNCTION demo.usp_scenario_healthy_baseline(p_run_id varchar, p_worker integer, p_intensity integer)
+CREATE OR REPLACE FUNCTION frontdesk.usp_process_requests(p_run_id varchar, p_worker integer, p_intensity integer)
 RETURNS TABLE (statements integer, rows_read bigint, rows_written integer)
 LANGUAGE plpgsql
 AS $$
@@ -61,7 +81,7 @@ BEGIN
         LIMIT 20) AS q;
     v_read := v_read + v_count;
 
-    -- Touch a Scheduling item (never the Billing items locking-blocking contends for); reset clears the touch.
+    -- Touch a Scheduling item (never the prioritized Billing items); reset clears the touch.
     v_item := 1 + (demo.fn_rand(7, 'baseline-item', v_n, 3) % (2000 * v_scale));
     UPDATE care.work_queues AS w
     SET last_touched_at = clock_timestamp(), touched_by_run = p_run_id
@@ -81,7 +101,7 @@ $$;
 -- cpu-pressure: the double-booking audit report. problem: the overlap test wraps both start times in expressions
 -- and hashes every pair, so each call compares every pair of ten providers' appointments (CPU-bound, no IO).
 -- healthy: the same question as an indexed range join. One call runs one report over a slice of providers.
-CREATE OR REPLACE FUNCTION demo.usp_scenario_cpu_pressure(p_run_id varchar, p_worker integer, p_variant varchar)
+CREATE OR REPLACE FUNCTION scheduling.usp_find_double_bookings(p_run_id varchar, p_worker integer, p_variant varchar)
 RETURNS TABLE (executions integer, pairs_compared bigint, overlap_pairs bigint, elapsed_ms integer)
 LANGUAGE plpgsql
 AS $$
@@ -122,7 +142,7 @@ $$;
 -- @batch
 
 -- locking-blocking: the hot rows are the first Billing work items still Open.
-CREATE OR REPLACE FUNCTION demo.fn_locking_hot_rows(p_hot_rows integer)
+CREATE OR REPLACE FUNCTION billing.fn_priority_work_items(p_hot_rows integer)
 RETURNS SETOF bigint
 LANGUAGE sql
 STABLE
@@ -136,7 +156,7 @@ $$;
 -- @batch
 -- The head blocker: row locks on the hot rows, in the caller's open transaction (the runner then sits idle in that
 -- transaction and always rolls back).
-CREATE OR REPLACE FUNCTION demo.usp_scenario_locking_acquire(p_run_id varchar, p_hot_rows integer)
+CREATE OR REPLACE FUNCTION billing.usp_reprioritize_queue(p_run_id varchar, p_hot_rows integer)
 RETURNS TABLE (run_id varchar, locked_rows integer)
 LANGUAGE plpgsql
 AS $$
@@ -146,7 +166,7 @@ BEGIN
     PERFORM demo.usp_run_assert_running(p_run_id);
     UPDATE care.work_queues AS w
     SET priority = w.priority
-    WHERE w.work_item_id IN (SELECT h FROM demo.fn_locking_hot_rows(p_hot_rows) AS h);
+    WHERE w.work_item_id IN (SELECT h FROM billing.fn_priority_work_items(p_hot_rows) AS h);
     GET DIAGNOSTICS v_rows = ROW_COUNT;
     RETURN QUERY SELECT p_run_id, v_rows;
 END;
@@ -154,7 +174,7 @@ $$;
 -- @batch
 -- The head blocker as one active call: it locks the hot rows and waits (pg_sleep, one second at a time) for
 -- p_hold_seconds, never past the deadline or a stop request. The runner rolls back afterward.
-CREATE OR REPLACE FUNCTION demo.usp_scenario_locking_hold(p_run_id varchar, p_hot_rows integer, p_hold_seconds integer)
+CREATE OR REPLACE FUNCTION billing.usp_reprioritize_queue_batch(p_run_id varchar, p_hot_rows integer, p_hold_seconds integer)
 RETURNS TABLE (run_id varchar, locked_rows integer, held_ms integer)
 LANGUAGE plpgsql
 AS $$
@@ -166,7 +186,7 @@ DECLARE
 BEGIN
     UPDATE care.work_queues AS w
     SET priority = w.priority
-    WHERE w.work_item_id IN (SELECT h FROM demo.fn_locking_hot_rows(p_hot_rows) AS h);
+    WHERE w.work_item_id IN (SELECT h FROM billing.fn_priority_work_items(p_hot_rows) AS h);
     GET DIAGNOSTICS v_rows = ROW_COUNT;
     v_until := LEAST(v_started + make_interval(secs => GREATEST(LEAST(COALESCE(p_hold_seconds, 60), 900), 1)), v_deadline);
     WHILE clock_timestamp() < v_until AND NOT demo.fn_run_should_stop(p_run_id) LOOP
@@ -178,7 +198,7 @@ $$;
 -- @batch
 -- A billing clerk: updates one hot row, so it waits on the head blocker's row lock (wait event Lock/transactionid).
 -- The runner wraps each call in a transaction it rolls back, with lock_timeout set.
-CREATE OR REPLACE FUNCTION demo.usp_scenario_locking_contend(p_run_id varchar, p_worker integer, p_hot_rows integer)
+CREATE OR REPLACE FUNCTION billing.usp_claim_work_item(p_run_id varchar, p_worker integer, p_hot_rows integer)
 RETURNS TABLE (updates integer, waited_ms integer)
 LANGUAGE plpgsql
 AS $$
@@ -189,7 +209,7 @@ DECLARE
 BEGIN
     PERFORM demo.usp_run_assert_running(p_run_id);
     SELECT h INTO v_item
-    FROM demo.fn_locking_hot_rows(p_hot_rows) AS h
+    FROM billing.fn_priority_work_items(p_hot_rows) AS h
     OFFSET (GREATEST(p_worker, 1) - 1) % GREATEST(LEAST(COALESCE(p_hot_rows, 10), 50), 1)
     LIMIT 1;
     v_started := clock_timestamp();
@@ -201,7 +221,7 @@ $$;
 -- @batch
 -- The optional deadlock: side 1 locks inventory row 1 then 2, side 2 locks 2 then 1, each in a transaction the runner
 -- rolls back. PostgreSQL's deadlock detector (deadlock_timeout) cancels one side with SQLSTATE 40P01.
-CREATE OR REPLACE FUNCTION demo.usp_scenario_locking_deadlock(p_run_id varchar, p_side integer, p_step integer)
+CREATE OR REPLACE FUNCTION supply.usp_transfer_stock(p_run_id varchar, p_side integer, p_step integer)
 RETURNS TABLE (locked_inventory_id integer)
 LANGUAGE plpgsql
 AS $$
@@ -218,7 +238,7 @@ $$;
 
 -- io-pressure: grows demo.io_scratch to p_scratch_mb (one row per page), at most p_chunk_mb per call, and never past
 -- 8 GiB of database size (the 32 GiB server stays far from full; storage auto-grow is off).
-CREATE OR REPLACE FUNCTION demo.usp_scenario_io_pressure_grow(p_run_id varchar, p_scratch_mb integer, p_chunk_mb integer)
+CREATE OR REPLACE FUNCTION records.usp_load_archive_batch(p_run_id varchar, p_scratch_mb integer, p_chunk_mb integer)
 RETURNS TABLE (rows_added integer, scratch_mb integer)
 LANGUAGE plpgsql
 AS $$
@@ -232,7 +252,7 @@ BEGIN
     v_add := LEAST(v_target - v_have, LEAST(GREATEST(COALESCE(p_chunk_mb, 32), 1), 64)::bigint * 128);
     IF v_add > 0 THEN
         IF pg_database_size(current_database()) + v_add * 8192 > 8::bigint * 1024 * 1024 * 1024 THEN
-            RAISE EXCEPTION 'io-pressure won''t grow contosocare past 8 GiB.' USING ERRCODE = 'CC003';
+            RAISE EXCEPTION 'The archive won''t grow contosocare past 8 GiB.' USING ERRCODE = 'CC003';
         END IF;
         INSERT INTO demo.io_scratch (id, run_id, touched, filler)
         SELECT v_have + g, p_run_id, 0, md5(g::text)
@@ -246,7 +266,7 @@ $$;
 -- @batch
 -- One io-pressure cycle: a range read of up to 256 MB at a varying offset, then a 16 MB range of in-place (HOT)
 -- updates that checkpoints write back. The table's fillfactor leaves room in each page, so updates don't grow it.
-CREATE OR REPLACE FUNCTION demo.usp_scenario_io_pressure(p_run_id varchar, p_worker integer, p_scratch_mb integer)
+CREATE OR REPLACE FUNCTION records.usp_scan_archive(p_run_id varchar, p_worker integer, p_scratch_mb integer)
 RETURNS TABLE (pages_read bigint, pages_updated bigint, elapsed_ms integer)
 LANGUAGE plpgsql
 AS $$
@@ -277,7 +297,7 @@ $$;
 -- @batch
 
 -- connection-surge: each held connection pings now and then, so it shows as active for a moment and idle otherwise.
-CREATE OR REPLACE FUNCTION demo.usp_scenario_connection_surge(p_run_id varchar, p_worker integer)
+CREATE OR REPLACE FUNCTION frontdesk.usp_kiosk_heartbeat(p_run_id varchar, p_worker integer)
 RETURNS TABLE (facilities bigint)
 LANGUAGE plpgsql
 AS $$
@@ -292,7 +312,7 @@ $$;
 -- top-level parameterized statement on a column with no index (care.claims.payer_code, care.appointments.reason_code),
 -- so Query Store captures it for autonomous tuning. A statement inside this function would be nested, which
 -- pg_qs.query_capture_mode top doesn't capture.
-CREATE OR REPLACE FUNCTION demo.usp_scenario_missing_index(p_run_id varchar)
+CREATE OR REPLACE FUNCTION billing.usp_claims_aging_report(p_run_id varchar)
 RETURNS TABLE (checked integer)
 LANGUAGE plpgsql
 AS $$
@@ -304,7 +324,7 @@ $$;
 -- @batch
 -- idle-in-transaction: each idle session locks its own slice of Submitted claims, then the runner leaves it idle in
 -- that transaction; blocked writers update the same claims and wait (wait event Lock/transactionid).
-CREATE OR REPLACE FUNCTION demo.fn_idle_rows(p_worker integer, p_rows integer)
+CREATE OR REPLACE FUNCTION billing.fn_claims_review_batch(p_worker integer, p_rows integer)
 RETURNS SETOF bigint
 LANGUAGE sql
 STABLE
@@ -317,7 +337,7 @@ AS $$
     LIMIT GREATEST(LEAST(COALESCE(p_rows, 5), 50), 1);
 $$;
 -- @batch
-CREATE OR REPLACE FUNCTION demo.usp_scenario_idle_in_transaction(p_run_id varchar, p_worker integer, p_rows integer)
+CREATE OR REPLACE FUNCTION billing.usp_open_claims_review(p_run_id varchar, p_worker integer, p_rows integer)
 RETURNS TABLE (locked_rows integer)
 LANGUAGE plpgsql
 AS $$
@@ -327,13 +347,13 @@ BEGIN
     PERFORM demo.usp_run_assert_running(p_run_id);
     UPDATE care.claims AS c
     SET claim_status = c.claim_status
-    WHERE c.claim_id IN (SELECT r FROM demo.fn_idle_rows(p_worker, p_rows) AS r);
+    WHERE c.claim_id IN (SELECT r FROM billing.fn_claims_review_batch(p_worker, p_rows) AS r);
     GET DIAGNOSTICS v_rows = ROW_COUNT;
     RETURN QUERY SELECT v_rows;
 END;
 $$;
 -- @batch
-CREATE OR REPLACE FUNCTION demo.usp_scenario_idle_writer(p_run_id varchar, p_idle_worker integer, p_rows integer)
+CREATE OR REPLACE FUNCTION billing.usp_update_claim_status(p_run_id varchar, p_idle_worker integer, p_rows integer)
 RETURNS TABLE (updates integer, waited_ms integer)
 LANGUAGE plpgsql
 AS $$
@@ -343,7 +363,7 @@ DECLARE
     v_rows integer;
 BEGIN
     PERFORM demo.usp_run_assert_running(p_run_id);
-    SELECT r INTO v_claim FROM demo.fn_idle_rows(p_idle_worker, p_rows) AS r LIMIT 1;
+    SELECT r INTO v_claim FROM billing.fn_claims_review_batch(p_idle_worker, p_rows) AS r LIMIT 1;
     v_started := clock_timestamp();
     UPDATE care.claims AS c SET claim_status = c.claim_status WHERE c.claim_id = v_claim;
     GET DIAGNOSTICS v_rows = ROW_COUNT;
@@ -354,11 +374,11 @@ $$;
 
 -- replica-lag (ADR 0025): one mark a call, in the call's own transaction. With p_lock, the call first takes an ACCESS
 -- EXCLUSIVE lock on demo.replica_lag_marks, which T4 writes to the WAL: T4's read replica can't replay it while a
--- ContosoCare.Demo/replica-lag report there holds the table, so its replay waits, up to max_standby_streaming_delay,
+-- report there holds the table, so its replay waits, up to max_standby_streaming_delay,
 -- and the replica's lag grows (https://www.postgresql.org/docs/current/hot-standby.html#HOT-STANDBY-CONFLICT). T4
 -- holds the lock only until the call ends, and lock_timeout keeps any wait for it short. The runner's role may take
 -- it because it has UPDATE, DELETE, and TRUNCATE on the demo tables (https://www.postgresql.org/docs/current/sql-lock.html).
-CREATE OR REPLACE FUNCTION demo.usp_scenario_replica_lag(p_run_id varchar, p_lock boolean)
+CREATE OR REPLACE FUNCTION reporting.usp_publish_feed_checkpoint(p_run_id varchar, p_lock boolean)
 RETURNS TABLE (marks_written integer, locks_taken integer, last_mark_id bigint)
 LANGUAGE plpgsql
 SET lock_timeout = '5s'
@@ -372,5 +392,26 @@ BEGIN
     END IF;
     INSERT INTO demo.replica_lag_marks (run_id) VALUES (p_run_id) RETURNING mark_id INTO v_mark;
     RETURN QUERY SELECT 1, CASE WHEN COALESCE(p_lock, false) THEN 1 ELSE 0 END, v_mark;
+END;
+$$;
+-- @batch
+
+-- Retired names (ADR 0031, decision 6, 2026-11-23): the steps' earlier names in demo, which named the scenario a step
+-- belonged to, go once every replacement above exists, with every argument list they ever had. A runner from before the
+-- rename that calls one fails at once (SQLSTATE 42883) and its run ends Failed; the kill tools still end that runner's
+-- sessions, which they match by run.
+DO $$
+DECLARE
+    v_function regprocedure;
+BEGIN
+    FOR v_function IN
+        SELECT p.oid::regprocedure
+        FROM pg_catalog.pg_proc AS p
+        JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'demo'
+          AND p.proname IN ('usp_scenario_healthy_baseline', 'usp_scenario_cpu_pressure', 'fn_locking_hot_rows', 'usp_scenario_locking_acquire', 'usp_scenario_locking_hold', 'usp_scenario_locking_contend', 'usp_scenario_locking_deadlock', 'usp_scenario_io_pressure_grow', 'usp_scenario_io_pressure', 'usp_scenario_connection_surge', 'usp_scenario_missing_index', 'fn_idle_rows', 'usp_scenario_idle_in_transaction', 'usp_scenario_idle_writer', 'usp_scenario_replica_lag')
+    LOOP
+        EXECUTE format('DROP FUNCTION IF EXISTS %s', v_function);
+    END LOOP;
 END;
 $$;

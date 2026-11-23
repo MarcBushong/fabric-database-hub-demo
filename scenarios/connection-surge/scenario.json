@@ -5,7 +5,7 @@
   "service": "frontdesk-app",
   "summary": "A burst of application connections fills the server's connection slots: the runner opens a few connections a second until only headroom slots stay free below max_connections, fills that headroom for a few seconds at most so overshoot more attempts are past the limit, which the server refuses as too many connections, frees the headroom again, and holds the rest (each pings now and then, so most sit idle). It releases them all, pauses, and repeats until the run ends. PostgreSQL (T4) only.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_connection_surge",
+  "procedure": "frontdesk.usp_kiosk_heartbeat",
   "duration": { "defaultSeconds": 300, "maxSeconds": 900 },
   "concurrency": { "default": 5, "min": 1, "max": 16, "description": "Connections opened per second while a wave ramps up." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "How often each held connection pings: every 15 seconds at 1, every second at 10." },

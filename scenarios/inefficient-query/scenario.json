@@ -5,7 +5,7 @@
   "service": "frontdesk-app",
   "summary": "A frequent front-desk lookup by the numeric part of the MRN. The problem variant wraps the indexed column in RIGHT(), so uq_patients_mrn can't be seeked and every call scans care.patients: modest cost per call, high cost in total because it runs constantly. The healthy variant compares the full MRN and seeks, for a Query Store before-and-after comparison.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_inefficient_query",
+  "procedure": "frontdesk.usp_find_patient_visits",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
   "concurrency": { "default": 4, "min": 1, "max": 32, "description": "Front-desk sessions running the lookup." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace: about 2 lookups per second per session at 1, back to back at 10." },

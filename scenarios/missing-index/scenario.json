@@ -5,7 +5,7 @@
   "service": "reporting-jobs",
   "summary": "Repeatable lookups that no index covers: claims aging by payer and submission date, and visits by reason code. Each call scans its table, and the optimizer records a missing-index suggestion. The story is before, recommendation, action, after: the remediation (scenarios/missing-index/remediation.sql) is reviewed and applied by a person, never automatically.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_missing_index",
+  "procedure": "billing.usp_claims_aging_report",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
   "concurrency": { "default": 2, "min": 1, "max": 16, "description": "Sessions running the lookups." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace: a lookup about once a second per session at 1, about 50 per second at 10." },

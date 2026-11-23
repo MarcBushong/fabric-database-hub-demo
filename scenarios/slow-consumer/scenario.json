@@ -5,7 +5,7 @@
   "service": "records-archive",
   "summary": "A client that fetches a few rows and then pauses: each session runs a wide query (about 1 KB per row) and the runner reads its result set slowly on purpose, so the server fills the network buffers and waits for the client (ASYNC_NETWORK_IO). At the deadline or on a stop request the runner cancels the query, and while the run lasts it runs the query again. The procedure only reads.",
   "orchestration": "slow-consumer",
-  "procedure": "demo.usp_scenario_slow_consumer",
+  "procedure": "records.usp_export_visit_history",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
   "concurrency": { "default": 4, "min": 1, "max": 8, "description": "Sessions whose client reads slowly." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "How slowly the client reads: 25 rows, then a pause of about 100 ms at 1 up to 1 second at 10." },

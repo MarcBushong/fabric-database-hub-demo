@@ -193,11 +193,11 @@ public sealed class ReplicaLagTests
     public void TheStepTheRunnerCallsIsTheScenariosFunction()
     {
         var functions = PgScripts.Read("120-scenario-functions.sql");
-        var function = functions[functions.IndexOf("CREATE OR REPLACE FUNCTION demo.usp_scenario_replica_lag(", StringComparison.Ordinal)..];
+        var function = functions[functions.IndexOf("CREATE OR REPLACE FUNCTION reporting.usp_publish_feed_checkpoint(", StringComparison.Ordinal)..];
         function = function[..function.IndexOf("$$;", StringComparison.Ordinal)];
 
-        Assert.Equal("demo.usp_scenario_replica_lag", ScenarioCatalog.Default.Get(ReplicaLag.ScenarioId).Procedure);
-        Assert.Contains("demo.usp_scenario_replica_lag(@run_id, @take_lock)", ReplicaLag.StepSql, StringComparison.Ordinal);
+        Assert.Equal("reporting.usp_publish_feed_checkpoint", ScenarioCatalog.Default.Get(ReplicaLag.ScenarioId).Procedure);
+        Assert.Contains("reporting.usp_publish_feed_checkpoint(@run_id, @take_lock)", ReplicaLag.StepSql, StringComparison.Ordinal);
         Assert.Contains("(p_run_id varchar, p_lock boolean)", function, StringComparison.Ordinal);
         Assert.Contains("RETURNS TABLE (marks_written integer, locks_taken integer, last_mark_id bigint)", function, StringComparison.Ordinal);
         Assert.StartsWith("SELECT marks_written, locks_taken, last_mark_id FROM", ReplicaLag.StepSql, StringComparison.Ordinal);

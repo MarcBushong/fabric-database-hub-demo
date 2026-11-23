@@ -68,7 +68,7 @@ ALTER TABLE demo.io_scratch ALTER COLUMN filler SET STORAGE PLAIN;
 -- @batch
 -- replica-lag's marks (ADR 0025): the runner commits one small row every markIntervalMs, and once a cycle takes an
 -- ACCESS EXCLUSIVE lock on this table, which T4's read replica has to replay while a demo report there holds the table
--- (demo.usp_scenario_replica_lag). Only replica-lag reads or writes it; the auto-cleanup and reset delete its rows.
+-- (reporting.usp_publish_feed_checkpoint). Only replica-lag reads or writes it; the auto-cleanup and reset delete its rows.
 CREATE TABLE IF NOT EXISTS demo.replica_lag_marks
 (
     mark_id    bigint      GENERATED ALWAYS AS IDENTITY CONSTRAINT pk_replica_lag_marks PRIMARY KEY,

@@ -5,7 +5,7 @@
   "service": "billing-worker",
   "summary": "Write-heavy batches of 3,000-byte rows into demo.log_rate_scratch, each deleted right after it commits, so the table stays small while the log keeps working. The run asks for 2 MB of log per second per intensity level. On Azure SQL Database, more than the service objective's log rate shows up as log-rate governance; on SQL Server it shows up as WRITELOG waits and log flushes. Each run stops after maxLogMb of log, at its deadline, or on a stop request.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_log_rate_pressure",
+  "procedure": "billing.usp_import_remittances",
   "duration": { "defaultSeconds": 300, "maxSeconds": 900 },
   "concurrency": { "default": 2, "min": 1, "max": 8, "description": "Writer sessions; they share the run's log budget and requested rate." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "Requested log rate: 2 MB per second per level (10 MB/s at the default), unthrottled at 10." },

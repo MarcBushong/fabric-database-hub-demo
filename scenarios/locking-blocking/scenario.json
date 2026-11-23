@@ -5,7 +5,7 @@
   "service": "billing-worker",
   "summary": "A batch session updates the first Billing work items and then sits idle with its transaction open, like an application that forgot to commit. Billing clerks (the contender sessions) block on those rows, a normal workload keeps running beside them, and an optional bounded deadlock adds a deadlock victim. The holder always rolls back after holdSeconds (the watchdog rollback), then repeats after pauseSeconds until the run ends.",
   "orchestration": "locking",
-  "procedure": "demo.usp_scenario_locking_contend",
+  "procedure": "billing.usp_claim_work_item",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
   "concurrency": { "default": 3, "min": 1, "max": 16, "description": "Blocked sessions (billing clerks contending for the hot rows)." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace of the normal workload that runs next to the blocking." },

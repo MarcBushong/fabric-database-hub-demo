@@ -51,10 +51,53 @@ public sealed class SqlIntegrationTests
         var token = TestContext.Current.CancellationToken;
 
         var missing = await SqlScripts.FindMissingProceduresAsync(connection, SqlScripts.ExpectedProcedures(ScenarioCatalog.Default, DemoTarget.T2), token);
-        var unknown = await SqlScripts.FindMissingProceduresAsync(connection, ["demo.usp_scenario_chain_link", "demo.usp_scenario_no_such_scenario"], token);
+        var unknown = await SqlScripts.FindMissingProceduresAsync(connection, ["scheduling.usp_route_work_item", "scheduling.usp_no_such_module"], token);
 
         Assert.Empty(missing);
-        Assert.Equal(["demo.usp_scenario_no_such_scenario"], unknown);
+        Assert.Equal(["scheduling.usp_no_such_module"], unknown);
+    }
+
+    [Fact]
+    public async Task SetupRetiresTheEarlierNamesAndTheRunCheckFollowsTheModule()
+    {
+        // The one-click upgrade (ADR 0031, decision 6): a database from before the rename has the earlier names, and setup
+        // leaves none of them; the run check maps the calling module to its scenario, and the earlier form still works for
+        // a module setup hasn't replaced yet.
+        await PrepareAsync();
+        var token = TestContext.Current.CancellationToken;
+        await using var connection = await OpenAsync(SessionNames.ForControl("test"));
+        await using (var old = connection.CreateCommand())
+        {
+            old.CommandText = "CREATE OR ALTER PROCEDURE demo.usp_scenario_cpu_pressure @run_id varchar(64) AS BEGIN DECLARE @deadline datetime2(3); EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'cpu-pressure', @deadline_at = @deadline OUTPUT; END;";
+            await old.ExecuteNonQueryAsync(token);
+        }
+
+        var runId = "it-names-" + Suffix();
+        var database = new DemoDatabase(connection);
+        await database.BeginRunAsync(runId, "inefficient-query", DemoTarget.T2, 60, 1, 1, "{}", "test", "test", null, token);
+        try
+        {
+            await using (var earlier = connection.CreateCommand())
+            {
+                earlier.CommandText = "EXEC demo.usp_scenario_cpu_pressure @run_id = @run_id;";
+                earlier.Parameters.Add("@run_id", SqlDbType.VarChar, 64).Value = runId;
+                Assert.Equal(50111, (await Assert.ThrowsAsync<SqlException>(() => earlier.ExecuteNonQueryAsync(token))).Number);
+            }
+
+            await SqlScripts.ApplyAsync(connection, "120-scenario-procedures.sql", RunnerLog.Null, token);
+
+            Assert.Equal(["demo.usp_scenario_cpu_pressure"], await SqlScripts.FindMissingProceduresAsync(connection, ["demo.usp_scenario_cpu_pressure", "frontdesk.usp_find_patient_visits"], token));
+            await using var other = connection.CreateCommand();
+            other.CommandText = "EXEC scheduling.usp_find_double_bookings @run_id = @run_id;";
+            other.Parameters.Add("@run_id", SqlDbType.VarChar, 64).Value = runId;
+            var refused = await Assert.ThrowsAsync<SqlException>(() => other.ExecuteNonQueryAsync(token));
+            Assert.Equal(50111, refused.Number);
+            Assert.DoesNotContain("cpu-pressure", refused.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            await database.StopAsync("run", runId, null, "test", setProfileOff: false, token);
+        }
     }
 
     [Fact]
@@ -63,7 +106,7 @@ public sealed class SqlIntegrationTests
         await PrepareAsync();
         await using var connection = await OpenAsync(SessionNames.ForControl("test"));
         await using var command = connection.CreateCommand();
-        command.CommandText = "EXEC demo.usp_scenario_cpu_pressure @run_id = 'it-no-such-run';";
+        command.CommandText = "EXEC scheduling.usp_find_double_bookings @run_id = 'it-no-such-run';";
 
         var error = await Assert.ThrowsAsync<SqlException>(() => command.ExecuteNonQueryAsync(TestContext.Current.CancellationToken));
 
@@ -141,6 +184,29 @@ public sealed class SqlIntegrationTests
         Assert.Equal(1, result.Workers.Where(w => w.Role == "deadlock").Sum(w => Convert.ToInt32(w.Metrics["deadlock_victim"], System.Globalization.CultureInfo.InvariantCulture)));
         Assert.Contains(result.Checks, c => c.CheckId == "run-sessions-closed" && c.Status == "Pass");
         Assert.Equal(before, await ChecksumAsync(token));
+    }
+
+    [Fact]
+    public async Task ARunnerAheadOfItsDatabaseRefusesBeforeItRegistersAnything()
+    {
+        // ADR 0031, decision 6: deploy.ps1 installs the runner on T1 before it updates T3's and T4's modules. A run that
+        // meets a database without its entry module is refused, retryably, and leaves no run behind.
+        await PrepareAsync();
+        var token = TestContext.Current.CancellationToken;
+        var scenario = ScenarioCatalog.Default.Get("cpu-pressure") with { Procedure = "scheduling.usp_not_set_up_yet" };
+        var plan = RunBounds.Plan(scenario, new RunRequest { ScenarioId = scenario.Id, Target = DemoTarget.T2, Duration = TimeSpan.FromSeconds(60), Concurrency = 1, Intensity = 1 }, DateTimeOffset.UtcNow);
+
+        var result = await new ScenarioRunner(new SqlConnectionOpener(Endpoint, RunnerLog.Null), RunnerLog.Null, TimeProvider.System).RunAsync(plan, token);
+
+        Assert.Equal("Refused", result.Status);
+        Assert.Equal(OutOfStep.RefusalReason, result.RefusalReason);
+        Assert.True(result.CanRetryRefusal);
+        Assert.Contains("scheduling.usp_not_set_up_yet", result.Outcome, StringComparison.Ordinal);
+        await using var control = await OpenAsync(SessionNames.ForControl("test"));
+        await using var runs = control.CreateCommand();
+        runs.CommandText = "SELECT COUNT(*) FROM demo.scenario_runs WHERE run_id = @run_id;";
+        runs.Parameters.Add("@run_id", SqlDbType.VarChar, 64).Value = result.RunId;
+        Assert.Equal(0, (int)(await runs.ExecuteScalarAsync(token))!);
     }
 
     [Fact]

@@ -5,7 +5,7 @@
   "service": "reporting-jobs",
   "summary": "Every scheduler busy and the storage at its cap at the same time. CPU sessions run back-to-back CPU-heavy reports at MAXDOP 1, one scheduler each, more sessions than schedulers (on Azure SQL Database, CPU at the vCore limit). IO sessions scan and update a scratch set (shared with io-pressure) that the first one grows to scratchMb after a free-space check, so reads miss the buffer pool once it's bigger than memory. Business data is only read.",
   "orchestration": "capacity",
-  "procedure": "demo.usp_scenario_capacity_max",
+  "procedure": "reporting.usp_nightly_batch",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1200 },
   "concurrency": { "default": 8, "min": 2, "max": 16, "description": "CPU sessions; T1 and T2 have 2 vCPUs and T3 at most 2 vCores by default, so 8 keeps every scheduler busy with several runnable tasks each." },
   "intensity": { "default": 10, "min": 1, "max": 10, "description": "CPU work per report and the pause between units of work: about 1 second at 1, none at 10." },

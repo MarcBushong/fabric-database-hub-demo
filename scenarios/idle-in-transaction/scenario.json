@@ -5,7 +5,7 @@
   "service": "billing-worker",
   "summary": "Application sessions open a transaction, lock a few Submitted claims, and then go quiet without committing: they sit idle in transaction, block the billing writers that queue behind them, and hold back vacuum's cleanup horizon while the baseline keeps writing. Each idle session rolls back after holdSeconds (never past the deadline), pauses, and repeats. PostgreSQL (T4) only.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_idle_in_transaction",
+  "procedure": "billing.usp_open_claims_review",
   "duration": { "defaultSeconds": 600, "maxSeconds": 1800 },
   "concurrency": { "default": 3, "min": 1, "max": 8, "description": "Sessions left idle in an open transaction." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "Pace of the normal workload that runs beside them." },

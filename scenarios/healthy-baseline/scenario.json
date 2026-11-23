@@ -5,7 +5,7 @@
   "service": "careportal-api",
   "summary": "A steady Contoso Care OLTP mix: front-desk patient lookups, provider schedules, billing balances, check-ins, work-queue triage, supply updates, and audit events. Short, indexed statements with no blocking, used as the baseline activity profile and as the before picture for every incident. On T5 (Cosmos DB), the same steady pace as point reads, upserts, and single-partition queries on patient documents.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_healthy_baseline",
+  "procedure": "frontdesk.usp_process_requests",
   "duration": { "defaultSeconds": 1800, "maxSeconds": 14400 },
   "concurrency": { "default": 2, "min": 1, "max": 16, "description": "Sessions running the OLTP mix." },
   "intensity": { "default": 3, "min": 1, "max": 10, "description": "Pace: about 1 operation per second per session at 1, about 20 at 10." },
