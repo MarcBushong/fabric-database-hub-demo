@@ -459,8 +459,10 @@ function Get-DemoHealthWarningNote {
     stay while their cause does), and the summary view prints the first two (warnings, warningCount). Since 2026-11-22
     (F32: live on dbhubra, a new host's sign-in cleanup was its only cause), a one-off note that a new VM's bootstrap gives
     by design ($script:DemoHealthExpectedNote) is called expected, with why; when every warning is one, the fix is nothing.
-    Since 2026-11-23 a bundle gives those as notes instead (Get-DemoHealthNoteText), and a summary that has noteCount is
-    from such a bundle, so none of its warnings is called expected (the review of cb4bc479).
+    Since 2026-11-23 a bundle gives those as notes instead (Get-DemoHealthNoteText), so a warning with an expected note's
+    text from such a bundle is an established VM's, and isn't called expected (the review of cb4bc479). Such a bundle's
+    health.json always has notes, even empty: the full view prints it as it is, and the summary prints notes and noteCount
+    only then (the re-check of ea1ea20f).
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -493,11 +495,12 @@ function Get-DemoHealthWarningNote {
     $noun = if ($total -eq 1) { 'a warning' } else { '{0} warnings' -f $total }
     # Which of them a new VM's bootstrap gives by design, and why (F32, 2026-11-22: live on dbhubra, a new host's sign-in
     # cleanup was the Warning's only cause, and the result didn't say it was expected). Only for a bundle from before
-    # 2026-11-23: one since gives those as notes (noteCount, which its summary always has), so a warning with the same text
-    # is an established VM's, which isn't expected (the review of cb4bc479).
+    # 2026-11-23: one since gives those as notes, so a warning with the same text is an established VM's, which isn't
+    # expected (the review of cb4bc479). Such a bundle's health.json has notes, even empty, in the full view, and its
+    # summary has notes and noteCount; an older one's has neither, in either view (the re-check of ea1ea20f).
     $reasons = [System.Collections.Generic.List[string]]::new()
     $expected = 0
-    $givesNotes = $null -ne (Get-DemoMemberValue -InputObject $Health -Name 'noteCount')
+    $givesNotes = $null -ne (Get-DemoMemberValue -InputObject $Health -Name 'notes') -or $null -ne (Get-DemoMemberValue -InputObject $Health -Name 'noteCount')
     foreach ($warning in @($shown)) {
         $reason = if ($givesNotes) { '' } else { Get-DemoHealthExpectedReason -Text ([string]$warning) }
         if ($reason) {

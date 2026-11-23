@@ -1597,7 +1597,8 @@ Describe 'The health read''s live view of the T2 guest (T2.GUEST.STATE, 2026-11-
         $summary.notes[0] | Should -Be 'SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one.'
         $summary.notes[1].Length | Should -Be 240
         $text.Length | Should -BeLessThan 3500 -Because 'the summary fits the 4 KB a Run Command keeps'
-        # A health.json without warnings or notes, as an older bundle's has no notes, prints none.
+        # A health.json without warnings or notes, as an older bundle's has no notes, prints no notes and no noteCount, so
+        # the validator can tell it from a newer bundle's (the re-check of ea1ea20f).
         $health.Remove('warnings')
         $health.Remove('notes')
         $health['status'] = 'Pass'
@@ -1605,8 +1606,14 @@ Describe 'The health read''s live view of the T2 guest (T2.GUEST.STATE, 2026-11-
         $clean = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
         $clean.warningCount | Should -Be 0
         @($clean.warnings).Count | Should -Be 0
-        $clean.noteCount | Should -Be 0
-        @($clean.notes).Count | Should -Be 0
+        $clean.PSObject.Properties['noteCount'] | Should -BeNullOrEmpty
+        $clean.PSObject.Properties['notes'] | Should -BeNullOrEmpty
+        # A newer bundle's, whose notes are empty, prints noteCount 0.
+        $health['notes'] = @()
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), ($health | ConvertTo-Json -Depth 5))
+        $none = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $none.noteCount | Should -Be 0
+        @($none.notes).Count | Should -Be 0
     }
     It 'reports a source a golden capture left air-gapped, with its role and no ID, in both views' {
         $root = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = $hostVmId; released = $false })

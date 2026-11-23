@@ -488,9 +488,10 @@ function Get-DemoEvalArcStepPlan {
                 if (-not [bool]$sweep.pass) {
                     throw ('Sign-in data is left after the cleanup, so the build stops here (fail closed). {0}' -f $summary)
                 }
-                # A note after the onboarding or SQL Server setup that ran in this generation; otherwise a one-off warning
-                # (the review of cb4bc479, 2026-11-23).
-                Get-DemoSignInStepResult -Sweep @($sweep) -Label @('arcsql01') -VmName 'arcsql01' -Expected:(Test-DemoVmStepSetThisGeneration -Name 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'SqlUnattendedInstall', 'SqlSetupWizard') } }
+                # A note after the Arc onboarding that ran in this generation; otherwise a one-off warning (the review of
+                # cb4bc479). Not SQL Server's setup steps: their Tests fail while its service is stopped, so their Sets
+                # also run on an established VM (the re-check of ea1ea20f).
+                Get-DemoSignInStepResult -Sweep @($sweep) -Label @('arcsql01') -VmName 'arcsql01' -Expected:(Test-DemoVmStepSetThisGeneration -Name 'ArcOnboarding', 'ArcOnboardingBeforeWizard') } }
         @{ Name = 'SqlAdminAccess'; MaxAttempts = 2
             Test = { Test-DemoSqlVmSysadmin }
             Set = { param($Step) Grant-DemoSqlVmSysadmin -Context $Step.Context } }

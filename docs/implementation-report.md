@@ -5964,3 +5964,29 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - **Not run live:** a net-new deployment's first `validate.ps1` should show `INFRA.HEALTH.ARCHOST01` and `INFRA.HEALTH.SQLVM01` as **Pass**, naming the notes, and an update with no new setup none. That `deploy.ps1` keeps a notebook whose `GITHUB_REPOSITORY` someone changed needs the 2a live proof first, that Fabric's ipynb export gives the file's fingerprint.
 - **A state.json from before this commit** has no `setGeneration`, so the first bundle with this commit gives the cleanup's event as a warning, not a note, on a host whose onboarding ran before it: the safe side. A new host records it from its first Set.
 - **The Low stays open:** an edit that makes a notebook's code exactly a listed version's is still updated.
+
+### The re-check of ea1ea20f: the notes' bundle told apart by health.json, and the cleanup's gate narrowed (2026-11-23)
+
+**Why.** The re-check of ea1ea20f said ship with fixes: the bindings' Medium and the Low's docs are closed, and two findings remained in the expected notes' gate, both for tonight's release.
+
+**Work summary.**
+
+1. **Medium: `status.ps1 -Detail` still called an established VM's warnings expected.** `Get-DemoHealthWarningNote` told a bundle that gives the by-design notes as notes by the summary's `noteCount`, but that tells the view, not the bundle: `Get-DemoVmHealth` sends the repository's own `Get-DemoHealth.ps1`, whose summary had `noteCount` for an older health.json too, 0, and whose full view, which `status.ps1 -Detail` reads, never has it. So the full view said "That's expected" and "Nothing to do" for an established host's sign-in cleanup and a later T1 sysadmin recovery or restart, and the summary didn't say it for an older bundle's own expected warnings. The reviewer ran the real script over both formats in both views. Now:
+   - `Get-DemoHealth.ps1 -View Summary` prints `notes` and `noteCount` only when health.json has `notes`, which every bundle since cb4bc479 writes, even empty, and an older one never does. It runs from the repository on every read, so this holds for every VM at once.
+   - `Get-DemoHealthWarningNote` takes health.json's `notes`, in the full view, or the summary's `noteCount` as a bundle that records notes.
+2. **Low: the cleanup's gate counted `GuestVm`,** whose Test fails while the guest isn't running with automatic start, so its Set also starts a guest that was only off, on an established host, and a token cleared later in that pass became a note and a **Pass**. The reviewer ran the real runner through three generations. Now the host's gate is Arc onboarding (before or after the wizard), `GuestImage`, and `GuestVhdx`, whose Tests read only files and the Arc marker: their Sets run only on a new host or a rebuilt guest. Two more members had the same flaw, so they're out too: `SqlSetupWizard`, whose Set waits for a guest that's off, which matters on a host that kept a finished `PaygWizard` guest; and, on the evaluation-only Arc VM, `SqlUnattendedInstall` and `SqlSetupWizard`, whose Tests fail while SQL Server's service is stopped. That VM's gate is Arc onboarding alone, which leaves the sign-in data and runs on every new one before the cleanup.
+
+- **Docs:** [ADR 0012's amendment](adr/0012-validation-model.md#2026-11-23-a-new-vms-by-design-notes-are-information-so-a-ready-vm-is-a-pass) ("Only a new VM's"), `vm/health/README.md`, and this report.
+
+**Changed files.** `vm/health/Get-DemoHealth.ps1`, `scripts/modules/DbHubDemo/Private/ValidationHelpers.ps1`, `vm/bootstrap/HostSteps.ps1`, `vm/bootstrap/Invoke-EvalArcVmBootstrap.ps1`, `vm/hyperv-guest/GuestSql.ps1` (a comment); tests in `tests/unit/DbHubDemo.Validation.Tests.ps1`, `Vm.WorkloadSteps.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, and `Vm.EvalArcVm.Tests.ps1`; the docs above.
+
+**Validation.**
+
+- **New tests:** the real `Get-DemoHealth.ps1` over an older health.json and a newer one, in both views, through `Get-DemoHealthWarningNote`: the older bundle's T1 recovery is expected in both, and the newer one's in neither; the summary of an older health.json has no `notes` or `noteCount`, and a newer one's with no notes has `noteCount` 0; the host's cleanup is a warning when only `GuestVm` ran in the generation, and a note when `GuestImage` or `GuestVhdx` did; the evaluation VM's cleanup is a warning when only `SqlUnattendedInstall` ran in it, and a note after its Arc onboarding.
+- **On ea1ea20f's code with the new tests:** in the four test files, 4 fail and 232 pass: each new or changed test.
+- Pester with StrictMode, targeted: Vm.HostPlan, Vm.EvalArcVm, Vm.WorkloadSteps, and DbHubDemo.Validation, 236 passed, 0 failed, 0 az calls.
+- PSScriptAnalyzer 1.25.0 with the repository's settings: 0 findings on the 9 changed PowerShell files. markdownlint: clean. The PowerShell files are ASCII, every changed file has LF line endings, and the VM files keep to Windows PowerShell 5.1's syntax.
+
+**Risks.**
+
+- **Not run live,** as before: a net-new deployment's first `validate.ps1` and `status.ps1 -Detail` should show the notes in a **Pass**, and an established VM's later events as warnings that aren't called expected.
