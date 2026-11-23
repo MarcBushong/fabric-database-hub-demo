@@ -80,6 +80,17 @@ describe("Query Store's rules: T3's plan regression (t3-plan-regression)", () =>
         expect(t3(s).rootCause?.statement).toBe(t3().rootCause?.statement);
     });
 
+    it("counts a plan's waits in an interval read twice once, with its latest read", () => {
+        const parallelism: QueryIncident = { family: "parallelism", start: at("20T17:04:00"), end: at("20T17:10:00"), last: at("20T17:10:00") };
+        const waits = (sidecar: SidecarEvidence) => t3(sidecar, parallelism).findings.find((f) => f.ruleId === "QS-WAITS")?.detail;
+        // An earlier, partial read of every interval beside the settled one, as a sidecar can hold (rca/README.md, Limits).
+        const s = fixtureSidecar("t3");
+        s.waits = [...s.waits.map((w) => ({ ...w, capturedAt: new Date(w.capturedAt.getTime() - 60_000), waitMs: w.waitMs / 2 })), ...s.waits];
+        expect(waits(fixtureSidecar("t3"))).toContain("11,620 ms");
+        expect(waits(s)).toBe(waits(fixtureSidecar("t3")));
+        expect(t3(s).details.top[0].waits).toEqual(t3().details.top[0].waits);
+    });
+
     it("lists the top queries with their shares of the captured top lists, and what changed against the hour before", () => {
         const top = t3().details.top;
         expect(top.map((q) => [q.queryId, q.figures.executions, Math.round(q.share!.percent), q.change.kind])).toEqual([
