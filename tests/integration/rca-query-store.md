@@ -37,6 +37,9 @@ sorted AS (
                WHEN EXISTS (SELECT 1 FROM sys.extended_properties AS ep
                             WHERE ep.class = 1 AND ep.major_id = q.object_id AND ep.minor_id = 0
                               AND ep.name = N'dbhubdemo.role' AND CAST(ep.value AS nvarchar(100)) = N'harness') THEN 'harness'
+               -- The answer-key recorder's reads from before they carried the marker (rca/README.md, What the capture
+               -- leaves out, 1): item 3 matches them by hash. A marked read is in the observer set above.
+               WHEN q.object_id = 0 AND t.query_sql_text LIKE N'%scenario[_]run[_]events%' THEN 'recorder'
                -- The runner's own ad hoc statements (rca/README.md, What the capture leaves out, 3), by their names:
                -- the probe may know them; the capture matches their normalized texts instead.
                WHEN q.object_id = 0 AND (t.query_sql_text LIKE N'%fn[_]run[_]stop[_]requested%'
@@ -98,7 +101,7 @@ The probe's own text carries the marker, so it counts itself as `observer`. That
    GROUP BY 1;
    ```
 
-The `observer-catalog` heuristic covers Phase 1's statements, which ran without the marker. It's a cross-check, independent of the capture's catalog-text rule.
+The `observer-catalog` heuristic covers Phase 1's statements, which ran without the marker. It's a cross-check, independent of the capture's catalog-text rule. The answer-key recorder's reads fall in `observer` once they carry the observer's startup, and in `harness-table` from a runner before that.
 
 ### The history, through `Invoke-DemoDaxQuery`
 
@@ -111,9 +114,40 @@ CALCULATETABLE(
 )
 ```
 
+**No row names the run events' table,** after a session on fc or Y, in the whole history, the first read's look-back included:
+
+```dax
+DEFINE
+    VAR stats =
+        SELECTCOLUMNS(
+            FILTER('RCA Query Stats',
+                CONTAINSSTRING('RCA Query Stats'[Statement], "scenario_run_events")
+                    || CONTAINSSTRING('RCA Query Stats'[Module], "scenario_run_events")),
+            "Table", "RCA Query Stats", "Target", 'RCA Query Stats'[Target Key], "Query", 'RCA Query Stats'[Query ID])
+    VAR plans =
+        SELECTCOLUMNS(
+            FILTER('RCA Query Plans',
+                CONTAINSSTRING('RCA Query Plans'[Statement], "scenario_run_events")
+                    || CONTAINSSTRING('RCA Query Plans'[Module], "scenario_run_events")
+                    || CONTAINSSTRING('RCA Query Plans'[Plan Summary], "scenario_run_events")),
+            "Table", "RCA Query Plans", "Target", 'RCA Query Plans'[Target Key], "Query", 'RCA Query Plans'[Query ID])
+    VAR events =
+        SELECTCOLUMNS(
+            FILTER('RCA Query Events', CONTAINSSTRING('RCA Query Events'[Detail], "scenario_run_events")),
+            "Table", "RCA Query Events", "Target", 'RCA Query Events'[Target Key], "Query", 'RCA Query Events'[Query ID])
+    VAR coverage =
+        SELECTCOLUMNS(
+            FILTER('RCA Query Coverage', CONTAINSSTRING('RCA Query Coverage'[Gaps], "scenario_run_events")),
+            "Table", "RCA Query Coverage", "Target", 'RCA Query Coverage'[Target Key], "Query", BLANK())
+EVALUATE
+UNION(stats, plans, events, coverage)
+```
+
+**Pass:** it returns no row, for any target. The sidecar's other two tables hold no statement text.
+
 **Pass, per target:**
 
-- **Nothing left out leaks in:** no `observer`, `observer-catalog`, `harness`, `runner`, `harness-call`, or `harness-table` ID is retained. The `runner` set holds the polled stop check whenever a run ran in the window, so it's never "not exercised" on a target with runs.
+- **Nothing left out leaks in:** no `observer`, `observer-catalog`, `harness`, `recorder`, `runner`, `harness-call`, or `harness-table` ID is retained. The `runner` set holds the polled stop check whenever a run ran in the window, so it's never "not exercised" on a target with runs. The `recorder` set holds only reads from a runner before 2026-11-23, so the first read after the update exercises it, when a fault run ran in its look-back and AUTO capture recorded the read; otherwise it's "not exercised", with that reason.
 - **The scripts' batches:** an `adhoc-demo` ID that's retained is reported by count, target, and interval. One from the deploy's or the start's intervals is the residual item 3 names: a **Warning** naming the batch it came from. One from an interval in which runs ran is a **Fail**, and the list grows.
 - **The workload is kept:** each `workload` ID in the incident's top lists is retained, which the positive controls below check.
 - **The log-rate scenario's writes stay:** writes to `demo`'s scratch tables (`billing.usp_import_remittances`, by the names) are retained on the targets it ran on. That's review High 1's case.
