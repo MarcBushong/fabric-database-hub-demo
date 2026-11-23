@@ -12,8 +12,8 @@ import { expectedFamilies, inSearch, scenarioOf, scorePlan, searchEndOf, toPlans
 import { sampleRows } from "@/preview/sample-data";
 import { SESSION_KEY } from "@/preview/sample-session";
 import { episodesFromBins } from "./detector";
-import { answerKeyOf, fixtureEvidence, namesAScenario, scenarioIds } from "./testdata/contract";
-import { EVAL_SET, EVAL_WINDOWS, NO_KEY_ROW, NOT_GRADABLE, T4_BEATS, type EvalCase, type EvalData } from "./testdata/eval-set";
+import { answerKeyOf, fixtureEvidence, fixtureSidecar, namesAScenario, scenarioIds } from "./testdata/contract";
+import { EVAL_SET, EVAL_SIDECARS, EVAL_WINDOWS, NO_KEY_ROW, NOT_GRADABLE, T4_BEATS, type EvalCase, type EvalData } from "./testdata/eval-set";
 import { live, liveAnswerKey, liveSources } from "./testdata/live-rb-2233e0ae";
 import { createInvestigationTools, type InvestigationTools } from "./tools";
 import { emptyEvidence, type Evidence, type InvestigationResult, type RcaTarget } from "./types";
@@ -35,8 +35,18 @@ function window(e: Evidence, from: Date, to: Date, targets: readonly RcaTarget[]
 
 function toolsFor(data: EvalData): InvestigationTools {
     if (data === "rb" || data === "ra") return createInvestigationTools({ ...liveSources(data), timeZone: "UTC", latestDay: live("00:00:00"), latest: live("21:33:15") });
-    const evidence = fixtureEvidence(data);
-    return createInvestigationTools({ load: async (f, t, ts) => window(evidence, f, t, ts), telemetry: async () => ({}), timeZone: "UTC", latestDay: new Date("2026-11-20T00:00:00Z"), latest: new Date("2026-11-20T17:30:00Z") });
+    const evidence = data === "t3" ? emptyEvidence() : fixtureEvidence(data);
+    const sidecar = EVAL_SIDECARS[data];
+    const rows = sidecar ? fixtureSidecar(sidecar) : null;
+    return createInvestigationTools({
+        load: async (f, t, ts) => window(evidence, f, t, ts),
+        telemetry: async () => ({}),
+        // Query Store's evidence, whatever the minutes read (its rules keep each row's own), on a clock within its retention.
+        ...(rows ? { sidecar: async () => rows, now: () => new Date("2026-11-21T12:00:00Z") } : {}),
+        timeZone: "UTC",
+        latestDay: new Date("2026-11-20T00:00:00Z"),
+        latest: new Date("2026-11-20T17:30:00Z"),
+    });
 }
 
 interface Run {
@@ -46,8 +56,9 @@ interface Run {
     end: Date;
 }
 
-/** A dataset's answer key: the runs it records. The live files record the connection surges, each to its run-end. */
+/** A dataset's answer key: the runs it records. The live files record the connection surges, each to its run-end; the sidecar fixtures, none. */
 function runsOf(data: EvalData): Run[] {
+    if (data === "t3") return [];
     if (data === "t1" || data === "t4") return answerKeyOf(data).flatMap((k) => (k.kind === "run" && k.end ? [{ scenario: k.scenario, target: k.target, start: k.at, end: k.end }] : []));
     const rows = liveAnswerKey(data);
     return rows
