@@ -44,7 +44,7 @@ For {incidentWindow} on {target}, adapt sample query 9 to report Temp Tables Cre
 ### 3. Which pages, with the SQL diagnostics skill
 
 ```text
-Use the diagnose-resource-pressure skill on {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. Read sys.dm_os_waiting_tasks for sessions whose program_name starts with ContosoCare.Demo/, and group their PAGELATCH waits by resource_description. Database 2 is tempdb; say whether the pages are allocation pages (PFS, GAM, SGAM) or system catalog pages, or that the skill doesn't apply to {target}. Don't change anything: don't add tempdb files, enable trace flags, or change any setting.
+Use the diagnose-resource-pressure skill on {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. First read the run_id of the latest tempdb-contention row in demo.scenario_runs in ContosoCare; if you can't, say so instead of reading other sessions. Then read sys.dm_os_waiting_tasks for that run's sessions only, whose program_name starts with ContosoCare.Demo/ and ends with that run_id: other runs can be active at the same time. Group their PAGELATCH waits by resource_description. Database 2 is tempdb; say whether the pages are allocation pages (PFS, GAM, SGAM) or system catalog pages, or that the skill doesn't apply to {target}. Don't change anything: don't add tempdb files, enable trace flags, or change any setting.
 ```
 
 ### 4. Line it up with the scenario record
@@ -68,6 +68,7 @@ Read the latest tempdb-contention row from demo.scenario_runs in ContosoCare on 
 
 - Wait and counter values are deltas or rates over a UTC window that overlaps the scenario record.
 - It separates Buffer Latch from Buffer IO and from Lock waits.
+- The waits it groups are the run's: sessions whose names start with `ContosoCare.Demo/` and end with the `run_id` it read from `demo.scenario_runs`, never every `ContosoCare.Demo/` session.
 - When the skill declines on T1 or T2, it says so, and the answer rests on the telemetry.
 
 ## Safety

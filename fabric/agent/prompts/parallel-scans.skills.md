@@ -7,8 +7,8 @@ targets: [T1, T2, T3]
 defaultTarget: T2
 surface: skills
 hosts: [copilot-cli, vscode]
-dataSources: [telemetry-endpoint, sql-diagnostics-skills]
-capability: Measures Parallelism and CPU waits, CPU, and throughput on any target from the telemetry endpoint and compares them with the baseline, then, where a SQL connection is possible, reads the scenario statement's cached plan and the live degree of parallelism with the microsoft-sql plan skill.
+dataSources: [telemetry-endpoint, sql-diagnostics-skills, scenario-record]
+capability: Measures Parallelism and CPU waits, CPU, and throughput on any target from the telemetry endpoint and compares them with the baseline, then, where a SQL connection is possible, reads the cached plan and the live degree of parallelism of the scenario run's sessions with the microsoft-sql plan skill.
 permission: Telemetry prompts need the Azure CLI signed in as you, Reader or higher on the subscription, and Microsoft.Sql registered. T-SQL prompts need network line of sight to the target and a database identity with VIEW DATABASE STATE on T3 (Microsoft Entra only), or VIEW SERVER PERFORMANCE STATE on T1 and T2 (Windows authentication on the VM or guest).
 responseShape: A verdict, then a table of waits, CPU, and batch requests for the baseline and incident windows, then the plan's parallelism and the sessions' live degree of parallelism when a SQL connection exists, then gaps, then the KQL and T-SQL it ran.
 previewLimitation: The telemetry endpoint and schema are previews and have no plans. The plan skill is documented for Azure SQL Database, so on T1 and T2 it can decline, and on T3, whose maximum is 2 vCores since 2026-11-18, the plans can run at DOP 2 or serially.
@@ -44,7 +44,7 @@ Compare {baselineWindow} and {incidentWindow} on {target}: adapt sample query 9 
 ### 3. The plan, with the SQL diagnostics skill
 
 ```text
-Use the read-execution-plan skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. For sessions whose program_name starts with ContosoCare.Demo/, read the dop column of sys.dm_exec_requests, then get their statement's cached plan from sys.dm_exec_query_plan or Query Store, without running it. Report whether the plan is parallel, its parallelism operators, its memory grant, and any warnings. Don't change anything: don't run the query, don't use SET STATISTICS XML, and don't change MAXDOP or any setting.
+Use the read-execution-plan skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. First read the run_id of the latest parallel-scans row in demo.scenario_runs; if you can't, say so instead of reading other sessions. Then read the dop column of sys.dm_exec_requests for that run's sessions only, whose program_name starts with ContosoCare.Demo/ and ends with that run_id: other runs can be active at the same time. Get their statement's cached plan from sys.dm_exec_query_plan or Query Store, without running it. Report whether the plan is parallel, its parallelism operators, its memory grant, and any warnings. Don't change anything: don't run the query, don't use SET STATISTICS XML, and don't change MAXDOP or any setting.
 ```
 
 ## Signals to look for
@@ -61,6 +61,7 @@ Use the read-execution-plan skill on the ContosoCare database of {target}, conne
 
 - Waits are deltas over each window, and the baseline and incident windows have the same length.
 - It reads Parallelism waits with CPU and throughput, and doesn't treat `CXCONSUMER` alone as a problem.
+- The plan and the `dop` it reports are the run's: sessions whose names start with `ContosoCare.Demo/` and end with the `run_id` it read from `demo.scenario_runs`, never another run's that overlaps it.
 - When the plan skill declines on T1 or T2, it says so, and the answer rests on the telemetry.
 
 ## Safety

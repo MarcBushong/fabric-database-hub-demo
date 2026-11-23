@@ -5524,7 +5524,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **T4's read replica: a scenario stop matches by run, not by service.** The design proposed the service, with a by-run match as the alternative if the service could reach another run's session. It can: on T4, missing-index and replica-lag share `reporting-jobs`, so a stop of missing-index would end a replica-lag report on the replica. The coordinator accepted the by-run match.
   - **How:** with a replica, `stop --target T4 --scenario <id>` reads T4's Running runs before it stops them, then ends the replica's sessions of that scenario's runs among them (`ReplicaSessionScope.ForStop`; the statements take `@run_ids`, matched through `unnest`). A run's own last check, by its run, and reset, of all, are as before.
   - **What changes:** a scenario stop no longer ends a replica session of that scenario's run that had already ended. The run's own last check ends those, and reset ends them all. A run that begins between the read and the stop is stopped but isn't in the replica scope: its runner ends its sessions within seconds of the stop, and its last check ends any left.
-- **Readers:** the agent prompts that picked the workload's sessions by a scenario segment (`blocking-chain`, `locking-blocking`, `deadlock-storm`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`) pick them by the `ContosoCare.Demo/` prefix, and match a run by the `run_id` at the end of the name. The deployment notebook's Workload paragraph, the runner's root description, and `stop --run-id`'s example say the new form.
+- **Readers:** the agent prompts that picked the workload's sessions by a scenario segment (`blocking-chain`, `locking-blocking`, `deadlock-storm`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`) pick a run's sessions instead: they read its `run_id` from `demo.scenario_runs` and match the sessions whose names start with `ContosoCare.Demo/` and end with it (corrected by [the review of e21c3431](#realistic-names-unit-b-the-review-of-e21c3431-2026-11-23), below: at e21c3431, four of them read every `ContosoCare.Demo/` session). The deployment notebook's Workload paragraph, the runner's root description, and `stop --run-id`'s example say the new form.
 - **Left to the other units, as agreed with the coordinator:** the comments in `database/postgresql/120-scenario-functions.sql` that still say `ContosoCare.Demo/<scenario>/<run>` and `ContosoCare.Demo/replica-lag` (A); and the docs, scenario READMEs, and `scenario.json` prose that quote a tag (C). A's `SqlIntegrationTests` still pass a scenario ID as the service in two `ForRun` calls, which now stand for an older runner's names; the kill tools match them by run.
 
 **Changed files.**
@@ -5558,3 +5558,34 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - A Run all, with the runs' sessions in `sys.dm_exec_sessions` and `pg_stat_activity` as `ContosoCare.Demo/<service>/<16 hex characters>`, and T5's requests' User-Agent and documents' `source` the same.
 - A run's sessions ended at its deadline or stop on every target, including a run an older runner started before the update (the design's 5.2).
 - `stop --target T4 --scenario replica-lag` during a replica-lag run: `replica-sessions-ended` passes, with the report's sessions ended. And `stop --target T4 --scenario missing-index` during one leaves the report running.
+
+### Realistic names, unit B: the review of e21c3431 (2026-11-23)
+
+**Why.** A fresh reviewer said to ship e21c3431 with fixes: the bounds, the kill tools, the run IDs, the names' lengths, and the replica's scenario stop are sound, with one Medium, in the agent prompts. The coordinator asked for its fix in a follow-up commit.
+
+- **Medium: four incident prompts read every demo session, not their incident's run.** e21c3431 took the scenario out of their prompt 3's filter, a `program_name` that starts with `ContosoCare.Demo/` and the scenario, and put no run in its place: `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`.
+  - **The effect:** each also read the healthy baseline's sessions and those of any incident at the same time, and the showcase runs exactly these with another (`scenarios/activity-profiles.json`): memory-grant-pressure with cpu-pressure on T2, parallel-scans and tempdb-contention with io-pressure, and slow-consumer with locking-blocking on T3. An agent would have reported another run's plans, grants, or waits as the incident's, such as a blocking incident's `LCK_M_*` in the slow client's answer. And memory-grant-pressure's way to judge the answer asked for the run's `run_id`, which none of its prompts read.
+  - **The fix:** each prompt 3 first reads the `run_id` of the scenario's latest row in `demo.scenario_runs`, then reads only that run's sessions: those whose `program_name` starts with `ContosoCare.Demo/` and ends with that `run_id`, as blocking-chain's and locking-blocking's prompt 4 match them. It tells the agent why, since other runs can be active at the same time, and to say so when it can't read the row, instead of reading other sessions. memory-grant-pressure's prompt 4 reads that run's statement, and each file's way to judge the answer says the sessions are the run's.
+  - **slow-consumer by its run, not by its `session_ids`:** the reviewer offered the `session_ids` that its prompt 2 reads. But `demo.usp_run_end` writes them when the run ends, so they're empty while the incident runs, when prompt 3 reads its live sessions; and once the run's sessions close, another session can take one of their IDs.
+  - **Front matter:** memory-grant-pressure and parallel-scans now read the scenario record, so their `dataSources` add `scenario-record`, and their `capability` says they read the run's sessions. Their `permission` stays the other scenario-record prompts'. `reviewed` stays as it was, since it dates a check of the prompt's sources too, which this didn't redo.
+  - **A test,** in `Agent.PromptPack`: a prompt block that names `ContosoCare.Demo/` reads `demo.scenario_runs` and matches a session's name by its end, the run. It fails for exactly the four prompts as e21c3431 left them, and passes with the fix.
+- **The review's live checks,** which the coordinator gives to Final tests, beside the entry above's:
+  - the past-deadline kill, `EXEC demo.usp_kill_demo_sessions;` with its defaults, on T1 to T3, with a session of each name form and a run past its deadline, and no collation conflict (Msg 468) between `program_name` and `run_id`;
+  - T4's, `SELECT * FROM demo.usp_kill_demo_sessions(NULL, true, 'check')`;
+  - the replica's statements through Npgsql, with an empty, a null, and a one-element run list;
+  - an older runner's session, ended by the new runner's watchdog and by reset.
+
+**Changed files.** The four prompts above, `tests/unit/Agent.PromptPack.Tests.ps1`, and this report: the entry above's Readers, and this entry.
+
+**Validation.** On 7c8272ba with this commit:
+
+- **The sweep:** every prompt block that names `ContosoCare.Demo/` reads `demo.scenario_runs` and matches the run: blocking-chain's, locking-blocking's, and the four above.
+- **Pester,** under strict mode with the Azure CLI guard:
+  - `Agent.PromptPack`: 512 passed, none failed, the new test's 40 cases among them. With the four prompts as 7c8272ba has them and the new test copied in, 4 failed, the new test on each of the four prompts, and nothing else.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - The guard saw no Azure CLI call.
+- PSScriptAnalyzer, with the repo's settings for tests, found nothing in the changed test file, which is ASCII-only, and markdownlint found no issue.
+- No runner code or SQL changed, so the runner's tests stand as at e21c3431.
+- The leak check prints nothing.
+
+**What its live check needs.** A presenter's rehearsal, since an agent runs the prompts, not a script: during the showcase, prompt 3 of memory-grant-pressure on T2 while cpu-pressure runs there, and of slow-consumer on T3 while locking-blocking runs, each reading only its own run's sessions.

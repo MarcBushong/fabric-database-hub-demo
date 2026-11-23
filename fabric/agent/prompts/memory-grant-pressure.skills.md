@@ -7,8 +7,8 @@ targets: [T1, T2, T3]
 defaultTarget: T2
 surface: skills
 hosts: [copilot-cli, vscode]
-dataSources: [telemetry-endpoint, sql-diagnostics-skills]
-capability: Measures Memory-category waits, the grant clerk, granted workspace memory, and page life expectancy on any target from the telemetry endpoint, then, where a SQL connection is possible, lists granted and waiting grants with the microsoft-sql resource pressure skill and reads the cached plan's memory grant with the plan skill.
+dataSources: [telemetry-endpoint, sql-diagnostics-skills, scenario-record]
+capability: Measures Memory-category waits, the grant clerk, granted workspace memory, and page life expectancy on any target from the telemetry endpoint, then, where a SQL connection is possible, lists the scenario run's granted and waiting grants with the microsoft-sql resource pressure skill and reads the cached plan's memory grant with the plan skill.
 permission: Telemetry prompts need the Azure CLI signed in as you, Reader or higher on the subscription, and Microsoft.Sql registered. T-SQL prompts need network line of sight to the target and a database identity with VIEW DATABASE STATE on T3 (Microsoft Entra only), or VIEW SERVER PERFORMANCE STATE on T1 and T2 (Windows authentication on the VM or guest).
 responseShape: A verdict, then a table of memory waits, clerks, and counters over the UTC window, then the grants (requested, granted, used, waiting) and the plan's memory grant when a SQL connection exists, then gaps, then the KQL and T-SQL it ran.
 previewLimitation: The telemetry endpoint and schema are previews and have no query-level detail; Memory Grants Pending is in the detailed counters table only if the target lists it. The resource pressure and plan skills are documented for Azure SQL Database, so on T1 and T2 they can decline.
@@ -44,13 +44,13 @@ For {incidentWindow} on {target}, adapt sample query 8 to report Granted Workspa
 ### 3. Grants now, with the SQL diagnostics skill
 
 ```text
-Use the diagnose-resource-pressure skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. Read sys.dm_exec_query_memory_grants joined to sys.dm_exec_sessions for sessions whose program_name starts with ContosoCare.Demo/, and report requested, granted, and used memory, and how many are still waiting for a grant and for how long. Tell me whether memory grants or another limit is the constraint, or that the skill doesn't apply to {target}. Don't change anything: don't change memory settings, Resource Governor, or query hints.
+Use the diagnose-resource-pressure skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. First read the run_id of the latest memory-grant-pressure row in demo.scenario_runs; if you can't, say so instead of reading other sessions. Then read sys.dm_exec_query_memory_grants joined to sys.dm_exec_sessions for that run's sessions only, whose program_name starts with ContosoCare.Demo/ and ends with that run_id: other runs can be active at the same time. Report requested, granted, and used memory, and how many are still waiting for a grant and for how long. Tell me whether memory grants or another limit is the constraint, or that the skill doesn't apply to {target}. Don't change anything: don't change memory settings, Resource Governor, or query hints.
 ```
 
 ### 4. The plan's memory grant
 
 ```text
-Use the read-execution-plan skill on the ContosoCare database of {target}, with the same connection rules. Get the cached plan of the statement those sessions run from sys.dm_exec_query_plan or Query Store, without running it, and report its memory grant, its sort operator, and any warnings. Don't change anything: don't run the query, and don't use SET STATISTICS XML.
+Use the read-execution-plan skill on the ContosoCare database of {target}, with the same connection rules. Get the cached plan of the statement that run's sessions execute, from sys.dm_exec_query_plan or Query Store, without running it, and report its memory grant, its sort operator, and any warnings. Don't change anything: don't run the query, and don't use SET STATISTICS XML.
 ```
 
 ## Signals to look for
@@ -66,7 +66,7 @@ Use the read-execution-plan skill on the ContosoCare database of {target}, with 
 ## How to judge the answer
 
 - Waits and counters are deltas or gauges over a UTC window, never sums of cumulative values.
-- The grants it lists belong to sessions tagged `ContosoCare.Demo/`, whose names end with the scenario run's `run_id`.
+- The grants it lists belong to the run it read from `demo.scenario_runs`: sessions whose names start with `ContosoCare.Demo/` and end with that run's `run_id`, never every `ContosoCare.Demo/` session.
 - When a skill declines on T1 or T2, it says so, and the answer rests on the telemetry.
 
 ## Safety

@@ -43,7 +43,7 @@ Read the session_ids, started_at, and stopped_at of the latest slow-consumer row
 ### 3. No resource limit, with the SQL diagnostics skill
 
 ```text
-Use the diagnose-resource-pressure skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. Read sys.dm_exec_requests and sys.dm_exec_sessions for sessions whose program_name starts with ContosoCare.Demo/: their wait type, wait time, CPU time, and reads, and the client's host_name. Tell me whether any resource limit of the database is the constraint, or say that the skill doesn't apply to {target}. Don't change anything: don't KILL a session or change any setting.
+Use the diagnose-resource-pressure skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. First read the run_id of the latest slow-consumer row in demo.scenario_runs; if you can't, say so instead of reading other sessions. Then read sys.dm_exec_requests and sys.dm_exec_sessions for that run's sessions only, whose program_name starts with ContosoCare.Demo/ and ends with that run_id: other runs can be active at the same time. Report their wait type, wait time, CPU time, and reads, and the client's host_name. Tell me whether any resource limit of the database is the constraint, or say that the skill doesn't apply to {target}. Don't change anything: don't KILL a session or change any setting.
 ```
 
 ## Signals to look for
@@ -60,6 +60,7 @@ Use the diagnose-resource-pressure skill on the ContosoCare database of {target}
 
 - Every number has a metric, a UTC window, and a resource; waits and attentions are deltas or rates, not sums.
 - It concludes on the client side only with the evidence that the database's own resources stayed below their limits.
+- The sessions it reads are the run's: names that start with `ContosoCare.Demo/` and end with the `run_id` it read from `demo.scenario_runs`, so another run's waits at the same time, such as a blocking incident's `LCK_M_*`, aren't counted as the slow client's.
 - When the skill declines on T1 or T2, it says so, and the answer rests on the telemetry.
 
 ## Safety
