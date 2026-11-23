@@ -5020,7 +5020,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The postmortem's Cause from the blind investigation** ([ADR 0031, section 9](adr/0031-incident-rca.md#9-the-postmortems-cause); [its entry](#the-postmortems-cause-from-the-blind-investigation-2026-11-22)). With the RCA tables, **Write the postmortem** on a session investigates the session's own minutes, as the session control recorded them, and explains up to six incidents there from the signals alone, in the Root cause view's order. What the demo injected follows as the answer key, on every target, with other plans' faults in those minutes labeled as theirs. A lone incident request gets no investigation, since its minutes are its fault's own: its Cause points to the Root cause view.
 - **The evaluation set's Phase 1 cases** ([its entry](#the-evaluation-sets-phase-1-cases-2026-11-22)): 12 blind questions on the contract's fixtures and B's and A's recorded rows, graded offline against their answer keys by the scoreboard's own rule, with what they miss reported. It's test-only: the scoreboard exports three of its functions for it, with its output unchanged.
 - **Final tests' findings** ([F4 to F6](#final-tests-should-fix-items-f4-to-f6-2026-11-22), [O1 to O4](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)). In the RCA's answers: the minutes that T5's throttled counts cover, in the statement and the errors table (F6); a replica's cause named only from the stall's own samples and their figures, slow replay only with WAL behind, and a conflict's lock, its cancels, and the capture's episode it cites read from its own stall too, and an interval cut short worded by its own minutes (F4); one instant written as one, not as a range, and a span across two UTC days with its dates (F5); and the clients waiting on a lock as some of the active ones (O2). On `stop-demo.ps1`'s handoff of a Run all session's stop, `STOP.CONTROL.AUTOSTOP` names the control's job (O3).
-- **The reviews' fixes,** in each entry ([the latest](#the-review-of-6eaed9aa-2026-11-22)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
+- **The reviews' fixes,** in each entry ([the latest](#the-review-of-b29d733d-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
 
 **What still needs live proof.** All of it but the evaluation set, which reads recorded rows. Each change is unit-tested, and the RCA's answers are checked on B's and A's recorded rows, but none has run on a live environment. Its live check waits for the owner: dbhubrc stays at dbee7d53 for the owner's testing on Monday, 2026-11-23. On an environment deployed or updated from this branch, after a Run all session:
 
@@ -5029,7 +5029,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The scoreboard's** T4 and T5 rows marked Not supported, and their signal.
 - **`./scripts/stop-demo.ps1` during a Run all session,** from this checkout: its `STOP.CONTROL.AUTOSTOP` line.
 
-**For the owner's decision.** O1, the capture's tail after the control's stop, is assessed but not built ([its entry](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)): the full fix, about 2 to 3 days and its own live proof, or naming the tail only, about half a day.
+**For the owner's decision.** O1, the capture's tail after the control's stop, is assessed but not built ([its entry](#final-tests-live-round-at-d7df4f9f-observations-o1-to-o4-2026-11-22)): the full fix, about 2 to 3 days and its own live proof, or naming the tail only, about half a day. And ADR 0031's [Phase 2 candidates](adr/0031-incident-rca.md#phase-2-candidates), each a capture change: each cancel count's span, which a failed read of the counter can stretch across a stall's bound ([the review of b29d733d](#the-review-of-b29d733d-2026-11-23)), and who held T4's idle connections.
 
 ### The postmortem's Cause from the blind investigation (2026-11-22)
 
@@ -5375,7 +5375,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
     - the 6eaed9aa entry above carries the correction;
     - ADR 0031's "the first stall's second reading after its recovery" now names that reading, 16:19:32.827, the first after its recovery.
   - **Left as is:** with no cancel recorded, a stall whose readings stop during its catch-up still says whether recovery cancelled the query isn't known. A reading in the catch-up, taken after replay resumed, would hold a cancel that ended the wait, but telling such a reading apart rests on the lag's slope, so the rule keeps to a reading at or after the recovery.
-- **Tests:** the review's probe, in `rca/rules.test.ts`. It fails at 6eaed9aa, and the case with no cancel recorded still says not known. Each of 2 mutations fails it: the old order, and no reading needed after the recovery.
+- **Tests:** the review's probe, in `rca/rules.test.ts`. It fails at 6eaed9aa, and the case with no cancel recorded still says not known. Each of 2 mutations fails a test: the old order fails the probe's; no reading needed after the recovery fails the existing test that a stall the capture didn't read from its recovery on says whether its query was cancelled isn't known, and the probe's passes under it (corrected by the review of b29d733d, below: this said each fails the probe's).
 - **The B/A sweep:** byte-identical to 6eaed9aa's answers. B and A have no cancels, and each of their conflict stalls has a reading after its recovery.
 
 **Changed files.** `fabric/app/src/rca/replica.ts`, with its test in `rca/rules.test.ts`; ADR 0031 (the replica's cause); and this report, whose summary of the stacked branch links this entry.
@@ -5388,3 +5388,34 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The doc and app suites:** under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Agent.PromptPack`, `Rca.Contract`, `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks. markdownlint found no issue, and every link this commit adds resolves. No PowerShell file changed.
 
 **What its live check needs.** Nothing to deploy beyond the app. On the next environment's history, a replica stall whose query recovery cancels, if the history has one.
+
+### The review of b29d733d (2026-11-23)
+
+**Why.** A fresh reviewer found b29d733d clean: the reorder is right in every case, its test fails at 6eaed9aa for the right reason, and the comments, ADR 0031, and this report match the code and B's rows. It named a gap that predates 6eaed9aa, and a claim of this report's that holds for the suite but not for the test it names. The coordinator decided: no code change now; name the gap as a known limit, here and in ADR 0031, and make its fix a Phase 2 candidate; and correct the claim here. Docs only, one commit, after b29d733d.
+
+- **A known limit: a cancel can be counted across a stall's bound when the capture's read of the counter failed there.**
+  - **How:** each reading's `conflicts_cancelled` is the increase since the last reading whose read of the counter (RCA-PG-07) answered, which needn't be the reading before it. A read that fails records no count, and the total the next count is measured from stays as it was: the replica observer calls `CounterDeltas` (in the runner's `Triggers.cs`) only when RCA-PG-07 answers (`PgTargetObserver.cs`). So the next count that's read covers the whole gap.
+  - **The effect:** when the reads failed from a cancel through a reading that bounds a stall's cancels, the cancel is counted on the other side of it. The review's case is an earlier stall's cancel counted as this stall's, when the read at this stall's first reading at its level failed. This stall's cancel can go into the next one's count the same way. The stall it was for counts it out, and, with no other cancel recorded, says whether its query was cancelled isn't known, since none of its readings from its recovery on has a count.
+  - **How rare:** it takes failed reads from the cancel through exactly the reading that bounds the window. B's 133 replica readings each have a count, all 0, so no read of the counter failed at a reading the capture recorded, and none recorded a cancel; A has no replica rows.
+  - **Why the app can't tell it today:** the history keeps no record of which reading a count is measured from. A reading's capture IDs reach only its window's coverage (`rca_coverage.sources`, in the runner's `Reducer.cs`), so a reading whose RCA-PG-07 read failed looks like one whose count is null for another reason, its first or one after a reset.
+  - **The Phase 2 candidate:** the capture stamps each count with the time of the reading it's measured from. That's a new column in the contract's `rca_replica`, which the runner writes, the notebook and the model carry, and the app reads. Then the app can tell when a count reaches back before a stall, and say so rather than count it as the stall's.
+  - **Where it's written:** ADR 0031's replica cause, beside the cancel window. Its opening now says each count is the delta since the reading before that read the counter, and its "never an earlier stall's, nor the next one's" holds as long as the capture read the counter at the readings that bound it. And ADR 0031's new [Phase 2 candidates](adr/0031-incident-rca.md#phase-2-candidates), with who held T4's idle connections, the candidate [the Phase 1 entry](#the-incident-rca-phase-1-2026-11-20) named. The stacked branch's summary points to both, for the owner's decision.
+  - **Left as is:** two texts that leave the limit out. This commit changes no code, contract, or model, so both go with the Phase 2 change:
+    - the comment in `rca/replica.ts`, which says "deltas since the reading before" and "never an earlier stall's, nor the next one's";
+    - the contract's description of `conflicts_cancelled` in `rca/history-tables.json`, "since the previous sample", which the history model's column description and the chat's model guide repeat.
+- **A claim corrected:** the review of 6eaed9aa's entry said each of its 2 mutations fails the probe's test.
+  - The first, the old order, does.
+  - The second, no reading needed after the recovery, fails the existing test that a stall the capture didn't read from its recovery on says whether its query was cancelled isn't known. The probe's test passes under it. I ran both tests by name with the mutation applied.
+  - The entry says so now. b29d733d's commit message makes the same claim, and isn't rewritten.
+
+**Changed files.** ADR 0031 (the replica's cause, and Phase 2 candidates) and this report: this entry, the correction above, and the stacked branch's summary.
+
+**Validation.** Docs only, on b29d733d:
+
+- markdownlint found no issue in 152 files.
+- Every link this commit adds resolves to one heading, including the anchors across this report and ADR 0031.
+- Under strict mode, with the Azure CLI guard, the `Repo` suites, `Docs.Walkthrough`, `Agent.PromptPack`, `Rca.Contract`, `DbHubDemo.FabricApp`, and `DbHubDemo.FabricAppSignIn` passed: 979 passed, none failed, and 3 were skipped because this PC lacks gitleaks. After the last wording edits, the suites that read the docs (`Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`) passed again: 231, with the same 3 skipped.
+- The leak check finds no identifier in what this commit adds.
+- No code changed, so the app's checks and the B/A sweep stand as they were at b29d733d.
+
+**What its live check needs.** Nothing: it changes no code.
