@@ -1,0 +1,101 @@
+/// What the capture read of Query Store for one target over one sidecar's window, and what it couldn't, with why: Query Store's state and settings, the intervals it read, and on PostgreSQL the intervals still pending publication. The Incident RCA's sidecar (ADR 0031): Query Store's evidence, which the observer beside the workload read and NB_DatabaseHub_LiveActivity writes from its sidecar documents, each under its own session's run (rca/history-tables.json).
+table 'RCA Query Coverage'
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables. A sidecar's rows take their own session's, session-<sessionId>, whichever run wrote them (rca/README.md, The sidecar).
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The document the row came from (documentId): an evidence document's, or a sidecar's.
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// T1, T2, T3, or T4.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// Start of the sidecar's window for the target.
+    column 'Window Start UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: window_start_utc
+
+    /// End of the window.
+    column 'Window End UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: window_end_utc
+
+    /// Query Store's actual state as last read: READ_WRITE, READ_ONLY, OFF, or ERROR on SQL Server; the capture mode on PostgreSQL (top, all, or none); null when it couldn't be read (gaps says why).
+    column 'Query Store State'
+        dataType: string
+        sourceColumn: state
+
+    /// Query Store's capture mode (SQL Server's query_capture_mode_desc; PostgreSQL's pg_qs.query_capture_mode) and, on PostgreSQL, wait sampling's (pgms_wait_sampling.query_capture_mode), as last read.
+    column 'Capture Mode'
+        dataType: string
+        sourceColumn: capture_mode
+
+    /// Query Store's interval length in minutes, as last read.
+    column 'Interval (min)'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: interval_minutes
+
+    /// The start of the first interval the window's reads returned.
+    column 'Read From UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: read_from_utc
+
+    /// The end of the last interval the window's reads returned.
+    column 'Read To UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: read_to_utc
+
+    /// PostgreSQL only: the start of the time Query Store hadn't published yet when the window ended (an interval shows once it ends); null when nothing is pending.
+    column 'Pending From UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: pending_from_utc
+
+    /// PostgreSQL only: the end of that time.
+    column 'Pending To UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn
+        sourceColumn: pending_to_utc
+
+    /// True when the sidecar holds intervals read after the session, which Query Store published later (rca/README.md, Pending publication).
+    column Backfill
+        dataType: boolean
+        sourceColumn: backfill
+
+    /// Comma-separated capture IDs that returned rows for the target in the window.
+    column Sources
+        dataType: string
+        sourceColumn: sources
+
+    /// One gap per line: what wasn't read and why (Query Store off or read-only, a permission, a timeout, pending publication that expired, the sidecar's budget).
+    column Gaps
+        dataType: string
+        sourceColumn: gaps
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Query Coverage' = entity
+        mode: directLake
+        source
+            entityName: rca_query_coverage
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

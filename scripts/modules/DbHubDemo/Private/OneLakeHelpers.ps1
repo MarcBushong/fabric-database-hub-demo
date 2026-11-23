@@ -292,26 +292,26 @@ function Remove-DemoOneLakeFile {
 function Get-DemoRcaHistoryTable {
     <#
     .SYNOPSIS
-    The Incident RCA's history tables of one document (rca/history-tables.json): Name (the lakehouse's) and Model (the
-    history model's), in the contract's order. The evidence document's eight by default; -Document sidecar for the
-    sidecar's, which the history model gets with the sidecar's notebook (rca/README.md, The sidecar). Pure (reads the
-    repository's file). Internal.
+    The Incident RCA's history tables (rca/history-tables.json): Name (the lakehouse's), Model (the history model's), Role,
+    and Document (the document that carries it), in the contract's order. All fourteen by default, the evidence document's
+    eight and the sidecar's six, which the history model reads since the sidecar's notebook (2026-11-23, rca/README.md, The
+    sidecar); -Document evidence or sidecar for one document's. Pure (reads the repository's file). Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
         [string] $Path = (Join-Path -Path $script:RepoRoot -ChildPath 'rca/history-tables.json'),
 
-        [ValidateSet('evidence', 'sidecar')]
-        [string] $Document = 'evidence'
+        [ValidateSet('all', 'evidence', 'sidecar')]
+        [string] $Document = 'all'
     )
 
     $contract = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 16
     foreach ($table in @($contract.tables)) {
         # A contract from before the sidecar names no document: every table is the evidence document's.
         $carrier = if ($table.PSObject.Properties['document']) { [string]$table.document } else { 'evidence' }
-        if ($carrier -eq $Document) {
-            [pscustomobject]@{ Name = [string]$table.name; Model = [string]$table.model; Role = [string]$table.role }
+        if ($Document -eq 'all' -or $carrier -eq $Document) {
+            [pscustomobject]@{ Name = [string]$table.name; Model = [string]$table.model; Role = [string]$table.role; Document = $carrier }
         }
     }
 }

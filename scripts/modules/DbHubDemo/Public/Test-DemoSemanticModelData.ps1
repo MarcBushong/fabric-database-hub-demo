@@ -40,7 +40,7 @@ function Test-DemoSemanticModelData {
     blank for at least one of their values. The defaults are the axes the report's visuals put in context.
 
     .PARAMETER OptionalTable
-    Tables, by their model names, that the deployed model may not have: by default the Incident RCA's eight, which
+    Tables, by their model names, that the deployed model may not have: by default the Incident RCA's, which
     configure-powerbi.ps1 leaves out while the lakehouse lacks them (Get-DemoRcaModelTablePlan; ADR 0031). They're counted
     first, in one query; one the model can't count isn't in it, so its rows and measures aren't checked, and the summary
     says so.

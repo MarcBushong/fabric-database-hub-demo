@@ -1,0 +1,148 @@
+/// One Query Store plan as one read saw it: when it was compiled and last ran, whether it was forced and how, its forcing failures, and its shape. A read lists the plans of the queries in its RCA Query Stats rows and every forced plan. The Incident RCA's sidecar (ADR 0031): Query Store's evidence, which the observer beside the workload read and NB_DatabaseHub_LiveActivity writes from its sidecar documents, each under its own session's run (rca/history-tables.json).
+table 'RCA Query Plans'
+
+    /// Plans forced in context as their latest read saw them, by sys.sp_query_store_force_plan or automatic plan correction.
+    measure 'Forced Plans (captured)' = COUNTROWS ( FILTER ( SUMMARIZE ( 'RCA Query Plans', 'RCA Query Plans'[Target Key], 'RCA Query Plans'[Plan ID] ), VAR latest = CALCULATE ( MAX ( 'RCA Query Plans'[Captured At UTC] ) ) RETURN CALCULATE ( COUNTROWS ( 'RCA Query Plans' ), 'RCA Query Plans'[Captured At UTC] = latest, 'RCA Query Plans'[Is Forced Plan] = TRUE () ) > 0 ) )
+        formatString: #,0
+        displayFolder: RCA
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables. A sidecar's rows take their own session's, session-<sessionId>, whichever run wrote them (rca/README.md, The sidecar).
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The document the row came from (documentId): an evidence document's, or a sidecar's.
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// When the observer read the plan (UTC).
+    column 'Captured At UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: captured_at_utc
+
+    /// T1, T2, or T3.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// Query Store's query_id.
+    column 'Query ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: query_id
+
+    /// Query Store's plan_id.
+    column 'Plan ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: plan_id
+
+    /// The query's query_hash, as in RCA Query Stats.
+    column 'Query Hash'
+        dataType: string
+        sourceColumn: query_hash
+
+    /// The plan's query_plan_hash, as in RCA Query Stats.
+    column 'Plan Hash'
+        dataType: string
+        sourceColumn: plan_hash
+
+    /// The module the query belongs to, as in RCA Query Stats.
+    column Module
+        dataType: string
+        sourceColumn: module_name
+
+    /// The query's statement, normalized, as in RCA Query Stats.
+    column Statement
+        dataType: string
+        sourceColumn: statement_text
+
+    /// When the plan was first compiled (initial_compile_start_time).
+    column 'Compiled UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: compiled_utc
+
+    /// When it was last compiled (last_compile_start_time).
+    column 'Last Compiled UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: last_compiled_utc
+
+    /// When it last ran (last_execution_time).
+    column 'Last Execution UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: last_execution_utc
+
+    /// How many times it was compiled (count_compiles).
+    column Compiles
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: compiles
+
+    /// True when the plan is forced, by sys.sp_query_store_force_plan or by automatic plan correction.
+    column 'Is Forced Plan'
+        dataType: boolean
+        sourceColumn: is_forced_plan
+
+    /// MANUAL, AUTO, or NONE (plan_forcing_type_desc).
+    column 'Forcing Type'
+        dataType: string
+        sourceColumn: forcing_type
+
+    /// How many times forcing it failed (force_failure_count).
+    column 'Force Failures'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: force_failures
+
+    /// Why forcing it last failed (last_force_failure_reason_desc); null when it never failed.
+    column 'Last Force Failure'
+        dataType: string
+        sourceColumn: last_force_failure
+
+    /// How many plans the query has in Query Store.
+    column 'Plans For Query'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: plans_for_query
+
+    /// The plan's estimated cost (its showplan's StatementSubTreeCost).
+    column 'Estimated Cost'
+        dataType: double
+        formatString: #,0.###
+        summarizeBy: none
+        sourceColumn: estimated_cost
+
+    /// True when the plan is parallel (is_parallel_plan).
+    column 'Is Parallel'
+        dataType: boolean
+        sourceColumn: is_parallel
+
+    /// The plan's shape in words, from its showplan: its costliest operators with their objects and indexes, its warnings, and a missing index it suggests; never a parameter's value (rca/README.md, Query Store). At most 1,000 characters.
+    column 'Plan Summary'
+        dataType: string
+        sourceColumn: plan_summary
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Query Plans' = entity
+        mode: directLake
+        source
+            entityName: rca_query_plans
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

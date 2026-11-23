@@ -1,0 +1,99 @@
+/// One group of T4's client connections in one sample of a connection episode: those of one program, login, and state, counted, idle ones included; never the observer's own connection. The Incident RCA's sidecar (ADR 0031): who held T4's connections in a connection episode, which the observer beside the workload counted and NB_DatabaseHub_LiveActivity writes from its sidecar documents, each under its own session's run (rca/history-tables.json).
+table 'RCA Connections'
+
+    /// The most client connections one sample of a connection episode found on T4 in context, every program and state together.
+    measure 'Connections Held (captured)' = MAXX ( VALUES ( 'RCA Connections'[Captured At UTC] ), CALCULATE ( SUM ( 'RCA Connections'[Connections] ) ) )
+        formatString: #,0
+        displayFolder: RCA
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables. A sidecar's rows take their own session's, session-<sessionId>, whichever run wrote them (rca/README.md, The sidecar).
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The document the row came from (documentId): an evidence document's, or a sidecar's.
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// When the observer took the sample (UTC).
+    column 'Captured At UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: captured_at_utc
+
+    /// T4.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// As in RCA Sessions: the application name without the workload's internal segments, for the workload's own connections; null for any other application's, whose name stays out (rca/README.md, Names).
+    column Program
+        dataType: string
+        sourceColumn: program_name
+
+    /// As in RCA Sessions.
+    column 'Run Token'
+        dataType: string
+        isHidden
+        sourceColumn: run_token
+
+    /// The role. The workload's own connections only.
+    column Login
+        dataType: string
+        sourceColumn: login_name
+
+    /// pg_stat_activity.state: active, idle, idle in transaction, or idle in transaction (aborted); unknown when the server reports none.
+    column State
+        dataType: string
+        sourceColumn: state
+
+    /// How many client connections the group held in the sample.
+    column Connections
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: connections
+
+    /// How many of them waited on a lock (wait_event_type Lock).
+    column 'Waiting On A Lock'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: waiting_lock
+
+    /// How long the group's longest-standing connection had been in its state, in seconds (state_change).
+    column 'Oldest State (s)'
+        dataType: double
+        formatString: #,0.0
+        summarizeBy: none
+        sourceColumn: oldest_state_s
+
+    /// How long the group's oldest connection had been open, in seconds (backend_start).
+    column 'Oldest Connection (s)'
+        dataType: double
+        formatString: #,0.0
+        summarizeBy: none
+        sourceColumn: oldest_connection_s
+
+    /// As in RCA Sessions: true for the demo workload's own connections, which keep their program and login.
+    column 'Is Workload Session'
+        dataType: boolean
+        sourceColumn: is_demo
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Connections' = entity
+        mode: directLake
+        source
+            entityName: rca_connections
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

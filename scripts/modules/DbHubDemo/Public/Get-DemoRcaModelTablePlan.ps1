@@ -9,9 +9,11 @@ function Get-DemoRcaModelTablePlan {
     only once this release's NB_DatabaseHub_LiveActivity has run (configure-fabric.ps1 runs it once when it updated the
     notebook and the lakehouse lacked a table the model reads; deploy.ps1's history snapshot runs it at the end). Until
     then configure-powerbi.ps1 leaves the missing ones out (Get-DemoFabricSemanticModelDefinition -ExcludeTable), and the
-    rest of the model works as before:
-    - Pass: the lakehouse has all eight.
-    - Warning: some are missing, with the fix; or the lakehouse's tables couldn't be listed, and all eight are left out,
+    rest of the model works as before. The RCA tables are the evidence document's eight and, since 2026-11-23, the
+    sidecar's six (Get-DemoRcaHistoryTable; rca/README.md, The sidecar), so an environment from the release before gets
+    the sidecar's the same way:
+    - Pass: the lakehouse has all of them.
+    - Warning: some are missing, with the fix; or the lakehouse's tables couldn't be listed, and all of them are left out,
       so the refresh can't fail on one that isn't there.
     The RCA tables relate only to Target and Date, and the report reads none of them, so leaving them out changes nothing
     else. Read-only: OneLake's Path - List (Get-DemoLakehouseTable) with a Storage token, from -Token, or from the Azure
@@ -21,7 +23,7 @@ function Get-DemoRcaModelTablePlan {
     - OneLake APIs: https://learn.microsoft.com/fabric/onelake/onelake-access-api
 
     .PARAMETER Config
-    The demo configuration, for the Storage token's subscription. Without it and -Token, the plan leaves all eight out.
+    The demo configuration, for the Storage token's subscription. Without it and -Token, the plan leaves all of them out.
 
     .PARAMETER WorkspaceId
     The workspace that holds the lakehouse.
