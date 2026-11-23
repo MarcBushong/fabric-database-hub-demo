@@ -8964,6 +8964,7 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - **#69's head, 963c802f** (92bd73fa), merged ahead of main, as the review of 1582e482..c63b155b asked (SHIP WITH FIXES, one Low). #69 dates each heading at its merge, so a later merge of main would have put this release's entries under a second Incident RCA heading, without `[Unreleased]`.
   - **The CHANGELOG** is this branch's, with #69's date for the Ignite updates, 2026-11-23. From the Incident RCA's heading on, it's #69's byte for byte.
   - **What else it brings:** #69's secret-scan fix (`.gitleaksignore`'s fingerprints, and `episodeKeyOf` in the RCA's incident tests, beside Query Store's tests), and its service stubs for CI on Linux.
+  - **#69's RCA-XE-00 fix, f16b9cb9** (12156f1c), reviewed SHIP, came later: RCA-XE-00 reads `sys.dm_xe_object_columns` alone, since its join took about 8 s of CPU at each observer start on SQL Server 2022 and timed out on a fresh T1. `Rca.Contract`: 32 passed.
   - **Main:** main at 4c2c1850 already merges into it without a change.
 
 **Conflicts, and how they were resolved,** besides this report (each merge's message says more):
