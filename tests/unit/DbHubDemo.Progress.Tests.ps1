@@ -114,12 +114,17 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         $history = Get-TestStep -Model $model -Id 'Fabric.History'
         $history['state'] | Should -Be 'Pending'
         $history['message'] | Should -BeNullOrEmpty
+        # The kept values (F35, 2026-11-23): the Fabric track's step with its track, and the snapshot's with the snapshot.
+        (Get-TestStep -Model $model -Id 'Fabric.KeptValues')['message'] | Should -Be 'Finished in an earlier run.'
+        (Get-TestStep -Model $model -Id 'Fabric.HistoryKept')['state'] | Should -Be 'Pending'
 
         $path = New-TestModelFile
         InModuleScope DbHubDemo -Parameters @{ Path = $path } { Set-DemoProgressPlan -Path $Path -Plan (Resolve-DemoTrackPlan -StopAfter 'Infrastructure') }
-        $history = Get-TestStep -Model (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20) -Id 'Fabric.History'
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $history = Get-TestStep -Model $model -Id 'Fabric.History'
         $history['state'] | Should -Be 'Skipped'
         $history['message'] | Should -Be 'Not part of this run.'
+        (Get-TestStep -Model $model -Id 'Fabric.HistoryKept')['message'] | Should -Be 'Not part of this run.'
     }
 
     It 'maps each ADR 0012 status onto one friendly state, and keeps the status underneath' -ForEach @(
