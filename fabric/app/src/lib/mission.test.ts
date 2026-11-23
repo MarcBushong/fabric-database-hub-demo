@@ -166,17 +166,18 @@ describe("the business lens", () => {
 
 describe("the scoreboard", () => {
     // The review of 96abcf65: T4's connection surge read "Buffer IO (PAGEIOLATCH) waits" in the Signal column, the first
-    // family a keyword in its name gives ("connect-io-n"), as the notebook's own fallback does; T5's storm read its raw ID.
-    it("names T4's and T5's beats, which it doesn't measure, by their title in the Signal column", () => {
+    // family a keyword in its name gave ("connect-io-n"), as the notebook's own fallback did; T5's storm read its raw ID.
+    // Since the release's follow-ups (F34), the surge is graded by T4's connections, which name its signal.
+    it("names T4's and T5's beats, which it doesn't measure, by their title in the Signal column, and T4's connection surge by its connections (F34)", () => {
         const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T4", "incident:connection-surge", 10, 18), run(`${SESSION}:01`, "T5", "incident:ru-storm", 30, 40)];
         const scores = scorePlan(toPlans(runs)[0], { bins: [], beats: [], runs });
         expect(scores.map((s) => [s.status, s.signal])).toEqual([
-            ["Not supported", "Connection surge (capacity maxed)"],
+            ["Not supported", "active connections"],
             ["Not supported", scenarioTitle("ru-storm")],
         ]);
         expect(scenarioTitle("ru-storm")).not.toBe("ru-storm");
-        // The keyword fallback stays as the notebook has it: it scores nothing on T4, whose faults aren't measured.
-        expect(expectedFamilies("connection-surge")).toEqual(["io"]);
+        // The keyword fallback matches a keyword only at a word's start, as the notebook does since F34.
+        expect(expectedFamilies("connection-surge")).toEqual(["connections"]);
     });
 
     it("groups the faults under their session, newest first, and leaves out the baseline and failed requests", () => {
@@ -575,9 +576,9 @@ describe("T4's connection surge (F34)", () => {
         expect(expectedFamilies("session-locking")).toEqual(["blocking"]);
         expect(expectedFamilies("io-pressure")).toEqual(["io"]);
         expect(expectedFamilies("index-io-mix")).toEqual(["cpu", "io"]);
-        // T4's other beats stay unmeasured here, under their own name, never under Buffer IO waits.
+        // T4's other beats stay unmeasured here, under their title (the RCA's Signal column), never under Buffer IO waits.
         const idle = score(capture([13, 39, 37, 28, 26, 18, 14]))[1];
-        expect(idle).toMatchObject({ status: "Not supported", signal: "idle-in-transaction" });
+        expect(idle).toMatchObject({ status: "Not supported", signal: scenarioTitle("idle-in-transaction") });
     });
 
     it("shows T4's connections at their peak on its card, against the slots clients can use, never its failed connections", () => {
