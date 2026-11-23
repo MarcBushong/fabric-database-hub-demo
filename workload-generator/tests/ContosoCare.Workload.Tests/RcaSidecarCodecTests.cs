@@ -190,6 +190,34 @@ public sealed class RcaSidecarCodecTests
     }
 
     [Fact]
+    public void TheFirstCutCountsEachIntervalOnceAtItsLatestRead()
+    {
+        // T4 reads an interval again until it settles, and the latest read wins (rca/README.md, Query Store): interval 0's
+        // Lock/tuple was read at 200 ms first, and at 8 ms settled. Counted once, Lock/tuple is the fourth event (768 ms)
+        // and goes; counted at both reads, it would be the first (968 ms), and IO/WALSync (792 ms) would go instead.
+        var t4 = new List<(string Category, string? Event, Func<int, double> Waited)>
+        {
+            ("Lock", "transactionid", _ => 10), ("LWLock", "LockManager", _ => 9.5), ("IO", "WALSync", _ => 8.25), ("Lock", "tuple", _ => 8),
+        };
+        var draft = Waiting(96, ("T4", t4));
+        var settled = draft.Tables[RcaContract.QueryWaits].First(w => (string?)w.Get("wait_event") == "tuple");
+        var first = new CaptureRow(settled.Table, settled.Target, settled.At.AddMinutes(-1), "test");
+        foreach (var (column, value) in settled.Values)
+        {
+            first.Set(column, value);
+        }
+
+        draft.Tables[RcaContract.QueryWaits].Add(first.Set("captured_at_utc", settled.At.AddMinutes(-1)).Set("wait_ms", 200.0));
+
+        var reduced = new SidecarReducer().Reduce(draft, Gzip(draft).Length - 1);
+
+        Assert.StartsWith("T4: " + SidecarReducer.GapPrefix + "wait events past each plan's three largest", Assert.Single(reduced.Cuts), StringComparison.Ordinal);
+        Assert.Equal(
+            ["T4 IO WALSync 96", "T4 LWLock LockManager 96", "T4 Lock transactionid 96"],
+            new SidecarView(reduced.Json).Table(RcaContract.QueryWaits).GroupBy(w => $"{w["target"]} {w["wait_category"]} {w["wait_event"]}").Select(g => g.Key + " " + g.Count().ToString(CultureInfo.InvariantCulture)).Order(StringComparer.Ordinal));
+    }
+
+    [Fact]
     public void AForcedPlanThatEventsNameKeepsItsSummaryLongest()
     {
         // T3's fixture: plan 31 is the last good plan, forced, and every tuning event names it. At every budget, from one

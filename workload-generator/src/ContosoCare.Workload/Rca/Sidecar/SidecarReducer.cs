@@ -11,7 +11,7 @@ namespace ContosoCare.Workload.Rca.Sidecar;
 /// it cuts in the contract's order, each step only as far as the document needs:
 /// <list type="number">
 /// <item>waits: each plan's wait categories past its three largest (on T4, its events), by time waited summed across the
-/// sidecar's intervals, every interval's rows of those three kept;</item>
+/// sidecar's intervals at each one's latest read, every interval's rows of those three kept;</item>
 /// <item>plan summaries, set to null plan by plan, the lowest-ranked queries' plans first; a forced plan, or one an event
 /// names, keeps its summary until every other plan's is cut;</item>
 /// <item>the lowest-ranked queries: all of a query's rows in its interval, and its plans' rows once it has none left,
@@ -234,7 +234,8 @@ internal sealed class SidecarReducer : ISidecarReducer
 
     /// <summary>
     /// 1. Each plan's wait categories past its three largest (on T4, its wait events), by time waited summed across the
-    /// sidecar's rows, per target, login, query, and plan. Every interval's rows of those three stay, so a plan's baseline
+    /// sidecar's intervals, each interval once, at its latest read (a later read of an interval holds its counts or more,
+    /// and wins), per target, login, query, and plan. Every interval's rows of those three stay, so a plan's baseline
     /// intervals keep the waits the rules compare against; ties go to the category that sorts first.
     /// </summary>
     private static Step WaitsPastTheFirstThree(Dictionary<string, List<CaptureRow>> tables)
@@ -243,7 +244,9 @@ internal sealed class SidecarReducer : ISidecarReducer
         var drop = new HashSet<int>();
         foreach (var plan in waits.Select((Row, Index) => (Row, Index)).GroupBy(w => (Target: TargetOf(w.Row), Login: Login(w.Row), Query: Id(w.Row, "query_id"), Plan: Id(w.Row, "plan_id"))))
         {
-            var largest = plan.GroupBy(w => WaitKey(w.Row))
+            var latest = plan.GroupBy(w => (Start: Time(w.Row, "interval_start_utc"), End: Time(w.Row, "interval_end_utc"), Key: WaitKey(w.Row)))
+                .Select(read => read.OrderBy(w => Time(w.Row, "captured_at_utc")).ThenBy(w => w.Index).Last());
+            var largest = latest.GroupBy(w => WaitKey(w.Row))
                 .Select(c => (c.Key, Waited: c.Sum(w => Number(w.Row, "wait_ms"))))
                 .OrderByDescending(c => c.Waited)
                 .ThenBy(c => c.Key.Category, StringComparer.Ordinal)
