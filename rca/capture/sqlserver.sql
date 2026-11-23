@@ -300,7 +300,10 @@ WHERE pc.counter_name IN (N'Processes blocked', N'Table Lock Escalations/sec', N
 -- statements, which carry the marker dbhubdemo:rca-observer in their text, as this one does; and every statement of a
 -- module the demo marks as its harness (the extended property dbhubdemo.role = harness, which database/common's control
 -- script sets on its own modules). Everything else is measured evidence: the scenario modules' reads and writes, other
--- applications' statements, and monitoring queries alike.
+-- applications' statements, and monitoring queries alike. The top lists are ranked after those leave-outs, a plan is in
+-- one only when it used what the list ranks (CPU, time, reads, or waits above 0), and ties go to the lower plan_id, so
+-- two reads of an interval rank it alike. At most 600 rows, the oldest intervals first: the runner reads again from the
+-- last whole interval it got.
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 1000;
@@ -376,10 +379,10 @@ kept AS (
         q.query_hash,
         q.object_id,
         qt.query_sql_text,
-        cpu_rank      = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY pl.cpu_ms DESC),
-        duration_rank = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY pl.duration_ms DESC),
-        reads_rank    = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY pl.logical_reads DESC),
-        wait_rank     = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY ISNULL(w.wait_ms, 0) DESC)
+        cpu_rank      = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY pl.cpu_ms DESC, pl.plan_id),
+        duration_rank = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY pl.duration_ms DESC, pl.plan_id),
+        reads_rank    = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY pl.logical_reads DESC, pl.plan_id),
+        wait_rank     = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY ISNULL(w.wait_ms, 0) DESC, pl.plan_id)
     FROM plans AS pl
     JOIN sys.query_store_query AS q ON q.query_id = pl.query_id
     JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
@@ -390,7 +393,10 @@ kept AS (
 chosen AS (
     SELECT DISTINCT k.runtime_stats_interval_id, k.query_id
     FROM kept AS k
-    WHERE k.cpu_rank <= 10 OR k.duration_rank <= 5 OR k.reads_rank <= 5 OR (k.wait_rank <= 5 AND k.wait_ms > 0)
+    WHERE (k.cpu_rank <= 10 AND k.cpu_ms > 0)
+       OR (k.duration_rank <= 5 AND k.duration_ms > 0)
+       OR (k.reads_rank <= 5 AND k.logical_reads > 0)
+       OR (k.wait_rank <= 5 AND k.wait_ms > 0)
 )
 SELECT TOP (600)
     captured_at_utc    = SYSUTCDATETIME(),
@@ -420,7 +426,7 @@ SELECT TOP (600)
 FROM kept AS k
 JOIN chosen AS c ON c.runtime_stats_interval_id = k.runtime_stats_interval_id AND c.query_id = k.query_id
 JOIN sys.query_store_plan AS p ON p.plan_id = k.plan_id
-ORDER BY k.start_time, k.cpu_ms DESC;
+ORDER BY k.start_time, k.cpu_ms DESC, k.plan_id;
 
 -- name: RCA-SQL-11
 -- Query Store's waits by category (Lock, CPU, Buffer IO, Memory, Parallelism, Tran Log IO, Network IO, ...) for the plans
@@ -456,7 +462,7 @@ ranked AS (
         w.wait_category_desc,
         w.wait_ms,
         w.max_wait_ms,
-        wait_rank = ROW_NUMBER() OVER (PARTITION BY w.start_time, w.plan_id ORDER BY w.wait_ms DESC)
+        wait_rank = ROW_NUMBER() OVER (PARTITION BY w.start_time, w.plan_id ORDER BY w.wait_ms DESC, w.wait_category_desc)
     FROM waits AS w
 )
 SELECT
@@ -471,7 +477,7 @@ SELECT
 FROM ranked AS r
 WHERE r.wait_rank <= 3
   AND r.wait_ms > 0
-ORDER BY r.start_time, r.plan_id, r.wait_ms DESC;
+ORDER BY r.start_time, r.plan_id, r.wait_ms DESC, r.wait_category_desc;
 
 -- name: RCA-SQL-12
 -- Deadlock graphs from the always-on system_health session, when the ContosoCare_RCA session isn't there (an older
@@ -511,12 +517,14 @@ ORDER BY s.avg_total_user_cost * s.avg_user_impact * (s.user_seeks + s.user_scan
 
 -- name: RCA-SQL-14
 -- Query Store's plans (the sidecar): the plans of the queries RCA-SQL-10 returned, at most the 5 of each query that ran
--- last, and every forced plan: when each was compiled and last ran, whether it's forced and how, and its forcing
--- failures; and, for the plans named in @with_plan only, its showplan XML, which the observer reduces to the plan's shape
--- (its costliest operators with their objects and indexes, its warnings, a missing index) and never keeps a parameter's
--- value from. Read with RCA-SQL-10. Parameters: @queries nvarchar(max), RCA-SQL-10's query_ids, comma-separated;
--- @with_plan nvarchar(max), the plan_ids whose XML the observer hasn't reduced yet. It leaves out what RCA-SQL-10 leaves
--- out, by the same two rules. T1, T2, T3.
+-- last, every plan RCA-SQL-10 returned (so each of its rows has its plan), and every forced plan: when each was compiled
+-- and last ran, whether it's forced and how, and its forcing failures; and, for the plans named in @with_plan only, its
+-- showplan XML, which the observer reduces to the plan's shape (its costliest operators with their objects and indexes,
+-- its warnings, a missing index) and never keeps a parameter's value from. A showplan over 16,777,216 bytes (8,388,608
+-- characters, the most the observer reduces) isn't returned: query_plan_bytes says its size, so the coverage says why
+-- the plan has no summary. Read with RCA-SQL-10. Parameters: @queries nvarchar(max), RCA-SQL-10's query_ids,
+-- comma-separated; @plans nvarchar(max), its plan_ids; @with_plan nvarchar(max), the plan_ids whose XML the observer
+-- hasn't reduced yet. It leaves out what RCA-SQL-10 leaves out, by the same two rules. T1, T2, T3.
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 1000;
@@ -529,12 +537,14 @@ WITH /* dbhubdemo:rca-observer */ harness AS (
       AND CAST(ep.value AS nvarchar(100)) = N'harness'
 ),
 recent AS (
-    SELECT p.plan_id, last_rank = ROW_NUMBER() OVER (PARTITION BY p.query_id ORDER BY p.last_execution_time DESC)
+    SELECT p.plan_id, last_rank = ROW_NUMBER() OVER (PARTITION BY p.query_id ORDER BY p.last_execution_time DESC, p.plan_id DESC)
     FROM sys.query_store_plan AS p
     WHERE p.query_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@queries, N',') AS v)
 ),
 chosen AS (
     SELECT r.plan_id FROM recent AS r WHERE r.last_rank <= 5
+    UNION
+    SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@plans, N',') AS v
     UNION
     SELECT p.plan_id FROM sys.query_store_plan AS p WHERE p.is_forced_plan = 1
 )
@@ -556,7 +566,9 @@ SELECT
     last_force_failure = CASE WHEN p.force_failure_count > 0 THEN p.last_force_failure_reason_desc END,
     plans_for_query    = (SELECT COUNT(*) FROM sys.query_store_plan AS p2 WHERE p2.query_id = p.query_id),
     is_parallel        = p.is_parallel_plan,
-    query_plan         = CASE WHEN p.plan_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@with_plan, N',') AS v) THEN p.query_plan END
+    query_plan         = CASE WHEN p.plan_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@with_plan, N',') AS v)
+                               AND DATALENGTH(p.query_plan) <= 16777216 THEN p.query_plan END,
+    query_plan_bytes   = CASE WHEN p.plan_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@with_plan, N',') AS v) THEN DATALENGTH(p.query_plan) END
 FROM chosen AS c
 JOIN sys.query_store_plan AS p ON p.plan_id = c.plan_id
 JOIN sys.query_store_query AS q ON q.query_id = p.query_id
@@ -625,7 +637,7 @@ WHERE ws.waiting_tasks_count > 0;
 
 -- name: RCA-AZ-03
 -- T3 only: automatic plan correction: the option's desired and actual state and why, as a DBA would check it. Every
--- 30 s with the sentinel; a change of state is recorded as a tuning event (RCA Events).
+-- 30 s with the sentinel; a change of state is an RCA Query Events row of kind tuning (the sidecar).
 SET NOCOUNT ON;
 SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
@@ -637,7 +649,15 @@ FROM sys.database_automatic_tuning_options AS o;
 
 -- name: RCA-AZ-04
 -- T3 only: the tuning recommendations with their state and plan IDs: the regressed and the recommended plan of each
--- query, when the recommendation was valid, and who forced it (system or user).
+-- query, when the recommendation was valid, and who forced it (system or user). A recommendation that appears, or whose
+-- state changes, is an RCA Query Events row of kind tuning (the sidecar). The plans' CPU averages are Learn's
+-- microseconds (regressedPlanCpuTimeAverage, recommendedPlanCpuTimeAverage), as the recommendation measured them when
+-- it detected the regression; the observer writes them in milliseconds. Learn lists VIEW SERVER PERFORMANCE STATE for
+-- this view on SQL Server 2022 and Azure SQL Database: a server permission, which a contained database user can't
+-- hold. On Azure SQL Database, a login in master holds it through the ##MS_ServerStateReader## server role, in each
+-- database where the login has a user, and the server's Microsoft Entra administrator holds every permission (Learn:
+-- Server roles; Authorize server and database access). A refusal is a gap in the sidecar's coverage that names the
+-- permission and that fix; the other reads go on.
 SET NOCOUNT ON;
 SELECT /* dbhubdemo:rca-observer */
     captured_at_utc            = SYSUTCDATETIME(),
@@ -657,9 +677,8 @@ SELECT /* dbhubdemo:rca-observer */
     query_id                   = JSON_VALUE(tr.details, N'$.planForceDetails.queryId'),
     regressed_plan_id          = JSON_VALUE(tr.details, N'$.planForceDetails.regressedPlanId'),
     recommended_plan_id        = JSON_VALUE(tr.details, N'$.planForceDetails.recommendedPlanId'),
-    regressed_plan_cpu_ms      = JSON_VALUE(tr.details, N'$.planForceDetails.regressedPlanCpuTimeAverage'),
-    recommended_plan_cpu_ms    = JSON_VALUE(tr.details, N'$.planForceDetails.recommendedPlanCpuTimeAverage'),
-    estimated_gain             = JSON_VALUE(tr.details, N'$.estimatedGain')
+    regressed_plan_cpu_us      = JSON_VALUE(tr.details, N'$.planForceDetails.regressedPlanCpuTimeAverage'),
+    recommended_plan_cpu_us    = JSON_VALUE(tr.details, N'$.planForceDetails.recommendedPlanCpuTimeAverage')
 FROM sys.dm_db_tuning_recommendations AS tr;
 
 -- name: RCA-AZ-05

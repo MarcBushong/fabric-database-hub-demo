@@ -3,6 +3,7 @@ using System.Text.RegularExpressions;
 using System.Xml.Linq;
 using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
+using ContosoCare.Workload.Rca.QueryStore;
 
 namespace ContosoCare.Workload.Rca.Observer;
 
@@ -13,9 +14,12 @@ namespace ContosoCare.Workload.Rca.Observer;
 /// deadlock count that rose with no graph reads system_health (RCA-SQL-12, T1 and T2). On T3, RCA-AZ-01 every 30
 /// minutes and at the end. The event session ContosoCare_RCA is created at the start (after dropping one left behind)
 /// and dropped at the end (ADR 0010's amendment). On T3 it's database-scoped
-/// (https://learn.microsoft.com/azure/azure-sql/database/xevent-db-diff-from-svr).
+/// (https://learn.microsoft.com/azure/azure-sql/database/xevent-db-diff-from-svr). With a sidecar sink, Query Store's
+/// reads too (<see cref="SqlQueryStoreReader"/>), last in each tick, quietly on the observer's connection, and only when
+/// they fit before the evidence's next work; their last read follows the event session's drop. The default sink keeps
+/// nothing, so then Query Store isn't read at all.
 /// </summary>
-internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, ICaptureConnector connector, ObserverOptions options, RunnerLog log)
+internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, ICaptureConnector connector, ObserverOptions options, RunnerLog log, ISidecarSink? sidecar = null, SqlQueryStoreOptions? queryStoreOptions = null)
     : TargetObserver(target, gate, connector, options, log, FixFor(gate))
 {
     private const string DatabaseName = "ContosoCare";
@@ -33,6 +37,7 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
     };
 
     private readonly bool databaseScoped = gate == DemoTarget.T3;
+    private readonly ISidecarSink sidecarSink = sidecar ?? NullSidecarSink.Instance;
     private readonly CounterDeltas deltas = new();
     private readonly Dictionary<long, string> objects = [];
     private readonly SeenEvents bufferEvents = new();
@@ -55,6 +60,7 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
     private DateTimeOffset deadlockSeen;
     private DateTimeOffset lastSentinel;
     private bool pendingErrorSample;
+    private SqlQueryStoreReader? queryStore;
     private readonly List<(CaptureRow Row, long? ObjectId, string? Named, string? Cause, long? Count, string? Mode)> pendingEscalations = [];
 
     // Who ran each of the workload's sessions a blocking sample showed, by session and run token: lock_escalation's
@@ -64,6 +70,7 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
     public override async Task<DateTimeOffset> TickAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
         var tickStarted = now;
+        var queryStoreStarted = queryStore?.Timestamp() ?? 0;
         if (now >= nextSentinel)
         {
             await SentinelAsync(now, cancellationToken).ConfigureAwait(false);
@@ -85,7 +92,8 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         FlushEscalations();
 
         Sink.Watermark(Target, Earliest(tickStarted - Options.ClockSkew, eventSession ? lastEventRead - Options.EventLatency : null, databaseScoped ? resourceStatsRead - Options.EventLatency - TimeSpan.FromSeconds(15) : null));
-        return Earliest(nextSentinel, blocking.Current is not null && !Cadence.DetailStopped ? nextDetail : null, databaseScoped ? nextResourceStats : null);
+        var evidenceDue = Earliest(nextSentinel, blocking.Current is not null && !Cadence.DetailStopped ? nextDetail : null, databaseScoped ? nextResourceStats : null);
+        return queryStore is null ? evidenceDue : Earliest(evidenceDue, await QueryStoreAsync(now, queryStoreStarted, evidenceDue, cancellationToken).ConfigureAwait(false));
     }
 
     protected override async Task StartAsync(DateTimeOffset now, CancellationToken cancellationToken)
@@ -108,6 +116,12 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         deadlockSince = null;
         eventsDropped = 0;
         await CreateEventSessionAsync(now, cancellationToken).ConfigureAwait(false);
+        if (sidecarSink is not NullSidecarSink)
+        {
+            // Query Store's first read waits for the first tick, so the sentinel samples first.
+            queryStore ??= new SqlQueryStoreReader(SidecarAccess, databaseScoped, sidecarSink, queryStoreOptions);
+            queryStore.Begin(now);
+        }
     }
 
     protected override async Task StopAsync(DateTimeOffset now, CancellationToken cancellationToken)
@@ -126,6 +140,45 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         Close(blocking, now);
         Close(errors, now);
         await DropEventSessionAsync(now, cancellationToken).ConfigureAwait(false);
+
+        // The evidence's own end is done: the lane takes its time now, so Query Store's end reads don't move the span's end.
+        EvidenceEnded(now);
+        if (queryStore is not null)
+        {
+            // Bounded by the reader's own budget.
+            try
+            {
+                await queryStore.EndAsync(now, cancellationToken).ConfigureAwait(false);
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+            {
+                QueryStoreFailed(ex);
+            }
+        }
+    }
+
+    /// <summary>
+    /// Query Store's reads, last in the tick, after the evidence's rows, their flush, and the watermark: the reads that are
+    /// due and fit before the evidence capture's next work (<see cref="SqlQueryStoreReader"/>). A failure is logged and
+    /// reaches neither the evidence nor the lane; the reader has already set when it reads again.
+    /// </summary>
+    private async Task<DateTimeOffset> QueryStoreAsync(DateTimeOffset now, long started, DateTimeOffset evidenceDue, CancellationToken cancellationToken)
+    {
+        try
+        {
+            return await queryStore!.TickAsync(now, started, evidenceDue, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+        {
+            QueryStoreFailed(ex);
+            return evidenceDue;
+        }
+    }
+
+    private void QueryStoreFailed(Exception ex)
+    {
+        Log.Warn("rca.querystore-failed", "Query Store's read failed on this target; the evidence capture goes on, and the read is tried again later.", ("target", Target), ("error", Redactor.Redact(ex.GetType().Name + ": " + ex.Message)));
+        Log.Debug("rca.querystore-failed-detail", ex.ToString(), ("target", Target));
     }
 
     private static string FixFor(DemoTarget target) => target switch
