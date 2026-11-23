@@ -8035,6 +8035,10 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 
 **Risks.** A SQL save of a dense analysis whose target ran only in scattered bins would now fail the proof, though its declared grain is right; none of the notebook's saves does that while the targets run.
 
+### F35 design (i): the filtered-saves test's rows typed as rows (2026-11-23)
+
+**792e9a19,** test-only, on 464b542d: 4f44e7ce's filtered-saves test in `fabric/app/src/data/snapshot-value.test.ts` spread T5's rows into objects with `KeptValue` and `ResolvedAt`, which TypeScript typed without the rows' own columns, so `tsc` failed where the test reads `r.CapturedAt` (TS2339), while vitest, which doesn't type-check, passed; the map now returns a `Row`, `tsc --noEmit` is clean, and the file's 23 tests pass (in the next release as 5eebcfa0, in place of the integration's own fix of the same line, 2a356245).
+
 ### F35 design (i): the Livy steps (2026-11-23)
 
 **Why.** An existing demo's workspace keeps its old `NB_DatabaseHub_LiveActivity` unless `fabric.importNotebooks`, `-ImportNotebooks`, or `configure-fabric.ps1` updates it, so a fix that lives only in the notebook misses those demos until the owner opts in. The approved design (i) has the PC's scripts work out the history's kept values themselves, through Fabric's Livy API, sending this checkout's `fabric/history/kept_value.py` each time. Learn documents the Livy API for a Microsoft Entra app or a service principal with the `Lakehouse.*` and `Code.*` scopes ([authentication](https://learn.microsoft.com/fabric/data-engineering/get-started-api-livy)), and the Azure CLI's token carries only `user_impersonation`, so a probe checked it first.
