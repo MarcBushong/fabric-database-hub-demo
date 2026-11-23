@@ -402,4 +402,27 @@ describe("the kept form of 'Snapshot Value' (keptFormValues)", () => {
         const values = keptFormValues([worked(SESSION, "cpu", "MaxCPU", null)(["15:30", 30]), worked(DAY, "cpu", "MaxCPU", null)(["15:30", 25])]);
         expect(values.has(key("T1", "cpu", "MaxCPU", "15:30"))).toBe(false);
     });
+
+    it("reads the rows that a query's filter on the saves leaves, as Ask's latest T5 run, by the release's rule (the review of f2298b18)", () => {
+        // T5's storm: the session's minutes are all of the day save's 15:15 and 15:30 intervals, so those two points keep
+        // nothing, and every other row keeps its value. The whole history reads as the rule does.
+        const covered = new Set(["2026-11-21T15:15:00", "2026-11-21T15:30:00"]);
+        const requests = T5_ROWS.filter((r) => r.Metric === "TotalRequests").map((r) => ({
+            ...r,
+            KeptValue: r.CapturedAt === T5_DAY.CapturedAt && covered.has(String(r.Bucket)) ? null : r.Value,
+            ResolvedAt: "2026-11-21T22:00:00",
+        }));
+        expect(keptFormValues(requests)).toEqual(snapshotValues(requests));
+        const total = (values: Map<string, number>) => [...values.values()].reduce((a, b) => a + b, 0);
+        // Ask's T5 rule reads the latest run, the day save, alone: its kept values leave out the minutes the session holds.
+        const latestRun = requests.filter((r) => r.CapturedAt === T5_DAY.CapturedAt);
+        const shares = keptFormValues(latestRun);
+        expect(shares.has(key("T5", "cosmosdb", "TotalRequests", "15:15"))).toBe(false);
+        expect(shares.has(key("T5", "cosmosdb", "TotalRequests", "15:30"))).toBe(false);
+        expect(total(shares)).toBe(50428);
+        // With the filter on its saves, the run reads as it saved them.
+        const run = keptFormValues(latestRun, { savesFiltered: true });
+        expect(run.get(key("T5", "cosmosdb", "TotalRequests", "15:30"))).toBe(27630);
+        expect(total(run)).toBe(78161);
+    });
 });

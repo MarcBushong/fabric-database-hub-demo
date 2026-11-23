@@ -253,11 +253,15 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
  * with the kept values that fabric/history/kept_value.py wrote (KeptValue, and ResolvedAt, when it worked the row out):
  * - a bin with a row not worked out yet, a row without a bin, and an analysis off the bin grid: the release's rule, the
  *   newest capture's sum;
+ * - every bin, with savesFiltered: the release's rule among the rows given. A query sets it by filtering a column that
+ *   tells a bin's saves apart (Run ID, Source Notebook, Captured At UTC, Window Start UTC, Window End UTC, Value, Kept
+ *   Value, or Resolved At UTC), as Ask reads T5's latest run: a kept value is a row's share against every save, so the
+ *   rows of some saves alone read as those saves wrote them (the review of f2298b18);
  * - otherwise a total's kept values summed, and for a maximum or an average the highest of each capture's sum.
  * A bin whose kept values are all null isn't there. It's the DAX measure's reference
  * (fabric/powerbi/kept-value/Snapshot Value.tmdl), and F35's live proof compares it with snapshotValues on the same rows.
  */
-export function keptFormValues(rows: readonly Row[]): Map<string, number> {
+export function keptFormValues(rows: readonly Row[], options: { savesFiltered?: boolean } = {}): Map<string, number> {
     const groups = new Map<string, Row[]>();
     for (const r of rows) {
         const at = time(r.Bucket);
@@ -271,7 +275,7 @@ export function keptFormValues(rows: readonly Row[]): Map<string, number> {
     for (const [key, group] of groups) {
         const [, analysis, metric, binText] = key.split("|");
         const sums = new Map<number | null, number | null>();
-        const kept = binText !== "" && !OFF_GRID_ANALYSES.has(analysis) && group.every((r) => time(r.ResolvedAt) !== null);
+        const kept = !options.savesFiltered && binText !== "" && !OFF_GRID_ANALYSES.has(analysis) && group.every((r) => time(r.ResolvedAt) !== null);
         for (const r of group) {
             const captured = time(r.CapturedAt);
             const value = numberOf(kept ? r.KeptValue : r.Value);

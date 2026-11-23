@@ -241,6 +241,22 @@ Describe 'Snapshot Value''s kept form (F35, design (i))' {
         ($script:keptMeasure -split "`n")[-4..-2] | Should -Be @('        formatString: #,0.##', '        isHidden', '        displayFolder: Base')
     }
 
+    It 'reads every bin by the release''s rule while a query filters a column that tells a bin''s saves apart, as Ask''s latest T5 run does (the review of f2298b18)' {
+        # A kept value is a row's share against every save, so a filter that leaves some of a bin's saves out would leave out
+        # what the others hold: Ask's T5 rule reads TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] ).
+        $filtered = @([regex]::Matches($script:keptMeasure, "NOT ISFILTERED \( 'Telemetry Snapshots'\[([^\]]+)\] \)") | ForEach-Object { $_.Groups[1].Value })
+        $filtered | Should -Be @('Run ID', 'Source Notebook', 'Captured At UTC', 'Window Start UTC', 'Window End UTC', 'Value', 'Kept Value', 'Resolved At UTC')
+        $script:keptMeasure | Should -Match ([regex]::Escape("VAR WorkedOut =`n                    OnGrid`n                        && EverySave`n                        && ISEMPTY ( CALCULATETABLE ("))
+        # Every column of the table is in that list, or holds the same value in every save's rows of a bin: the bin's keys,
+        # the row's resource, and its report date, which is the bin's. A new column has to be put on one side.
+        $release = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Telemetry Snapshots.tmdl'))
+        $columns = @([regex]::Matches($release + "`n" + $script:kept, "(?m)^    column ('(?:[^']|'')+'|\S+)$") | ForEach-Object { $_.Groups[1].Value.Trim("'").Replace("''", "'") })
+        $columns.Count | Should -Be 18
+        $sameInEverySave = @('Target Key', 'Analysis Key', 'Metric', 'Bucket UTC', 'Resource Type', 'Resource Name', 'Instance Name', 'Database Name', 'Unit', 'Report Date UTC')
+        @($columns | Where-Object { $_ -notin $filtered -and $_ -notin $sameInEverySave }) | Should -BeNullOrEmpty
+        @($filtered + $sameInEverySave | Where-Object { $_ -notin $columns }) | Should -BeNullOrEmpty
+    }
+
     It 'reads its two columns from the columns the notebooks write, hidden' {
         $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
         $code = (@($notebook['cells'] | Where-Object { $_['cell_type'] -eq 'code' } | ForEach-Object { @($_['source']) -join '' })) -join "`n"

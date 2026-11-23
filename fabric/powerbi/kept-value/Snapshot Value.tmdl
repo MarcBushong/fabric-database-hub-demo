@@ -1,7 +1,7 @@
-/// One value per notebook run, analysis, target, resource, instance, database, metric, and bin, from dbo.telemetry_snapshots. Overlapping notebook runs store the same bin more than once, at different intervals; every measure reads each row's kept value, so a minute that overlapping saves hold counts once, and a bin's most recent capture where its kept values aren't all worked out yet (Snapshot Value, F35).
+/// One value per notebook run, analysis, target, resource, instance, database, metric, and bin, from dbo.telemetry_snapshots. Overlapping notebook runs store the same bin more than once, at different intervals; every measure reads each row's kept value, so a minute that overlapping saves hold counts once, and a bin's most recent capture where its kept values aren't all worked out yet, or while a query filters which saves it reads (Snapshot Value, F35).
 table 'Telemetry Snapshots'
 
-    /// Base measure. Per target, analysis, metric, and bin: where every row has its kept value (F35, design (i): kept_value and resolved_at_utc, which the live-activity notebook and the operator's history steps work out when history is saved), a total's kept values summed, and a maximum's or an average's highest capture sum, so a minute that saves at different intervals hold counts once. A bin with a row not worked out yet, a row without a bin, and an analysis off the bin grid keep the most recent capture, summed across instances and files, as before. Every telemetry measure builds on it.
+    /// Base measure. Per target, analysis, metric, and bin: where every row has its kept value (F35, design (i): kept_value and resolved_at_utc, which the live-activity notebook and the operator's history steps work out when history is saved), a total's kept values summed, and a maximum's or an average's highest capture sum, so a minute that saves at different intervals hold counts once. A bin with a row not worked out yet, a row without a bin, and an analysis off the bin grid keep the most recent capture, summed across instances and files, as before; so does every bin while a query filters a column that tells a bin's saves apart (a run, a notebook, a capture, a window, or a value), as Ask's latest T5 run does, because a kept value is a row's share against every save. Every telemetry measure builds on it.
     measure 'Snapshot Value' =
             SUMX (
                 SUMMARIZE (
@@ -14,8 +14,18 @@ table 'Telemetry Snapshots'
                 VAR OnGrid =
                     NOT ISBLANK ( 'Telemetry Snapshots'[Bucket UTC] )
                         && NOT ( 'Telemetry Snapshots'[Analysis Key] IN { "database_growth", "estate_pulse", "memory_clerks", "telemetry_coverage", "wait_profile" } )
+                VAR EverySave =
+                    NOT ISFILTERED ( 'Telemetry Snapshots'[Run ID] )
+                        && NOT ISFILTERED ( 'Telemetry Snapshots'[Source Notebook] )
+                        && NOT ISFILTERED ( 'Telemetry Snapshots'[Captured At UTC] )
+                        && NOT ISFILTERED ( 'Telemetry Snapshots'[Window Start UTC] )
+                        && NOT ISFILTERED ( 'Telemetry Snapshots'[Window End UTC] )
+                        && NOT ISFILTERED ( 'Telemetry Snapshots'[Value] )
+                        && NOT ISFILTERED ( 'Telemetry Snapshots'[Kept Value] )
+                        && NOT ISFILTERED ( 'Telemetry Snapshots'[Resolved At UTC] )
                 VAR WorkedOut =
                     OnGrid
+                        && EverySave
                         && ISEMPTY ( CALCULATETABLE ( 'Telemetry Snapshots', ISBLANK ( 'Telemetry Snapshots'[Resolved At UTC] ) ) )
                 VAR Adds =
                     'Telemetry Snapshots'[Analysis Key] IN { "counter_deltas", "storage_io", "wait_deltas" }
