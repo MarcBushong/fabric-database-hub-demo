@@ -170,6 +170,16 @@ Describe 'T1 associated services (Analysis Services and Integration Services)' {
         $script:agentRestarts | Should -Be 0
     }
 
+    It 'notes the restart setup asks for, by design, as information, so a new T1 stays a Pass (2026-11-23)' {
+        $script:uninstallExit = 3010
+        $context = New-TestSqlVmContext
+        $step = @(Get-DemoSqlVmStepPlan -Context $context | Where-Object Name -eq 'AssociatedServices')
+        Invoke-DemoVmStateMachine -Step $step -Generation 'g1' | Should -Be 'Ready'
+
+        @((Get-DemoVmState)['warnings'] | Where-Object { $_ }).Count | Should -Be 0 -Because 'a restart that setup asks for is expected'
+        @((Get-DemoVmState)['notes']) | Should -Be @('AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.')
+    }
+
     It 'warns without trying to uninstall when the image has no setup media' {
         Mock -CommandName Test-Path -ParameterFilter { $LiteralPath -eq 'C:\SQLServerFull\setup.exe' } -MockWith { $false }
         $result = Disable-DemoSqlVmAssociatedService -Context (New-TestSqlVmContext)

@@ -11,7 +11,8 @@ With -View Summary (Phase 7), only the fields the orchestrator gates on are prin
 the first 500 characters of message, currentStep, generation, updatedUtc, and from details the install mode,
 Arc onboarding, the guest's state, and its SQL Server edition. Since 2026-11-20 (F24) it also prints the first two
 warnings, each cut to 240 characters and naming the step it came from, and how many there are (warningCount): a Ready VM
-with warnings reports Warning, and the validator says which step warned. Since 2026-11-09 it also prints the configured install
+with warnings reports Warning, and the validator says which step warned. Since 2026-11-23 it prints the notes the same way
+(notes, noteCount): what a new VM's bootstrap gives by design, as information, which leaves a Ready VM a Pass. Since 2026-11-09 it also prints the configured install
 mode, whether the configuration names it (modeSource), whether the host kept an existing guest's mode (modeAdopted), the
 guest's own mode (guestMode) and whether a pass saw SQL Server set up in it (guestSetUp), and the last rebuild of an
 unfinished guest, read from guest-rebuild.json itself (guestRebuild: Removing, Removed, or Done once the new guest
@@ -367,6 +368,9 @@ if ($View -eq 'Summary') {
     # cut to 240 characters, with how many there are, so the summary still fits.
     $allWarnings = @(& $read $health @('warnings') | Where-Object { $_ } | ForEach-Object { [string]$_ })
     $shownWarnings = @($allWarnings | Select-Object -First 2 | ForEach-Object { if ($_.Length -gt 240) { $_.Substring(0, 237) + '...' } else { $_ } })
+    # The notes a new VM's bootstrap gives by design, as information (2026-11-23): the first two, as the warnings are.
+    $allNotes = @(& $read $health @('notes') | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $shownNotes = @($allNotes | Select-Object -First 2 | ForEach-Object { if ($_.Length -gt 240) { $_.Substring(0, 237) + '...' } else { $_ } })
     $summary = [ordered]@{
         schemaVersion  = 1
         role           = & $read $health @('role')
@@ -408,6 +412,8 @@ if ($View -eq 'Summary') {
         signInNote     = & $read $health @('details', 'signIn', 'note')
         warningCount   = $allWarnings.Count
         warnings       = $shownWarnings
+        noteCount      = $allNotes.Count
+        notes          = $shownNotes
     }
     if ($null -ne $guestFacts) {
         $summary['t2Guest'] = $guestFacts

@@ -606,7 +606,8 @@ Describe 'GuestSignInCleanup step' {
         Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestSweep -Pass $true -Cleaned $true -Cleared @('Windows PowerShell') }
         $warned = Clear-DemoHostGuestSignIn -Context $context
         $warned.Outcome | Should -Be 'Done'
-        $warned.TransientWarningMessage[0] | Should -Match 'Windows PowerShell on archost01.*endpoint protection may report' -Because 'what the cleanup did is a one-off note (the F24 review)'
+        $warned.NoteMessage[0] | Should -Match 'Windows PowerShell on archost01.*endpoint protection may report' -Because 'what the cleanup did after Arc onboarding is a one-off note, by design, recorded as information (2026-11-23)'
+        @($warned.TransientWarningMessage).Count | Should -Be 0 -Because 'it isn''t a warning'
 
         Mock -CommandName Invoke-DemoSignInSweep -MockWith { New-TestSweep -Pass $true -Cleaned $true -Security 2 }
         $manual = Clear-DemoHostGuestSignIn -Context $context

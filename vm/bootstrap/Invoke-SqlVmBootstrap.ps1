@@ -179,8 +179,9 @@ function Grant-DemoSqlVmSysadmin {
         Start-Service -Name $sql.ServiceName
         Start-Service -Name $sql.AgentService -ErrorAction SilentlyContinue
     }
-    # A one-off recovery: the next bootstrap generation clears its note (the F24 review, 2026-11-20).
-    return (New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage ('SYSTEM was not a sysadmin, so {0} was made one with the documented lockout-recovery procedure.' -f $sql.AdminLogin))
+    # A one-off recovery that a new T1 needs by design: a note, as information, which the next bootstrap generation clears
+    # (the F24 review, 2026-11-20; the expected-notes decision, 2026-11-23).
+    return (New-DemoVmStepResult -Outcome 'Done' -NoteMessage ('SYSTEM was not a sysadmin, so {0} was made one with the documented lockout-recovery procedure.' -f $sql.AdminLogin))
 }
 
 function Get-DemoSqlVmDatabaseStatus {
@@ -578,13 +579,14 @@ function Disable-DemoSqlVmAssociatedService {
         return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage (@('Uninstalling {0} didn''t pass (exit code {1}, final result "{2}", {3} service(s) left; see {4}). {5}' -f $settings.Features, $exitCode, $final, $left.Count, $settings.SummaryPath, $keep) + $warnings))
     }
     Write-DemoVmLog -Message ('Uninstalled {0} with SQL Server setup (exit code {1}, final result {2}).' -f $settings.Features, $exitCode, $final)
-    # The restart setup asked for is a one-off note, which the next bootstrap generation clears (the F24 review, 2026-11-20).
+    # The restart setup asks for, by design, when it removes them from a new T1: a note, as information, which the next
+    # bootstrap generation clears (the F24 review, 2026-11-20; the expected-notes decision, 2026-11-23).
     $notes = @()
     if ($exitCode -eq 3010) {
         $notes = @('SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.')
     }
     if ($warnings.Count -gt 0 -or $notes.Count -gt 0) {
-        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $warnings -TransientWarningMessage $notes)
+        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage $warnings -NoteMessage $notes)
     }
 }
 

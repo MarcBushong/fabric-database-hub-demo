@@ -430,7 +430,8 @@ function Get-DemoValidationQuietReason {
 # The one-off notes a new VM's bootstrap gives by design, and why (F32, 2026-11-22): on a new deployment, health.json's
 # Warning can have no other cause, so validate.ps1 and status.ps1 say these are expected. They're vm/bootstrap/lib/State.ps1's
 # legacy one-off notes, less two that aren't by design: a download without a pinned SHA-256, the repository's to fix, and
-# automatic sign-in left armed, which nothing in the demo does.
+# automatic sign-in left armed, which nothing in the demo does. Since 2026-11-23 a bundle records these as information,
+# in health.json's notes, which leave a Ready VM a Pass (Get-DemoHealthNoteText); an older bundle's are still warnings.
 $script:DemoHealthExpectedNote = [ordered]@{
     '^The sign-in cleanup cleared '                                                             = 'a sign-in cleanup that clears an event log follows T2''s Arc onboarding, on a new host or a rebuilt guest (ADR 0009)'
     '^SQL Server setup asked for a restart'                                                     = 'SQL Server setup asks for a restart when it removes Analysis Services and Integration Services from a new T1'
@@ -490,16 +491,11 @@ function Get-DemoHealthWarningNote {
     $reasons = [System.Collections.Generic.List[string]]::new()
     $expected = 0
     foreach ($warning in @($shown)) {
-        # A warning names its step first ("<Step>: ...", F24); one from an older bundle doesn't.
-        $body = ([string]$warning).Trim() -replace '^[A-Za-z0-9]+: ', ''
-        foreach ($pattern in $script:DemoHealthExpectedNote.Keys) {
-            if ($body -match $pattern) {
-                $expected++
-                $reason = [string]$script:DemoHealthExpectedNote[$pattern]
-                if (-not $reasons.Contains($reason)) {
-                    $reasons.Add($reason)
-                }
-                break
+        $reason = Get-DemoHealthExpectedReason -Text ([string]$warning)
+        if ($reason) {
+            $expected++
+            if (-not $reasons.Contains($reason)) {
+                $reasons.Add($reason)
             }
         }
     }
@@ -517,6 +513,75 @@ function Get-DemoHealthWarningNote {
         Expected    = $allExpected
         Text        = ('Its bootstrap has {0}: {1}{2}.{3}' -f $noun, $list, $more, $expectedText)
         Remediation = $remediation
+    }
+}
+
+function Get-DemoHealthExpectedReason {
+    <#
+    .SYNOPSIS
+    Why a new VM's bootstrap gives a note by design ($script:DemoHealthExpectedNote, F32), for one warning or note of
+    health.json, with or without its step's name ("<Step>: ..."); '' when it isn't one of them. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $Text = ''
+    )
+
+    # A warning or a note names its step first ("<Step>: ...", F24); one from an older bundle doesn't.
+    $body = $Text.Trim() -replace '^[A-Za-z0-9]+: ', ''
+    foreach ($pattern in $script:DemoHealthExpectedNote.Keys) {
+        if ($body -match $pattern) {
+            return [string]$script:DemoHealthExpectedNote[$pattern]
+        }
+    }
+    return ''
+}
+
+function Get-DemoHealthNoteText {
+    <#
+    .SYNOPSIS
+    What a Ready VM's health summary says about its notes (the expected-notes decision, 2026-11-23): Count and Text, a
+    sentence that names the notes shown, each with its step, and why each is expected. $null when the bootstrap isn't
+    Ready or has no notes, as with a bundle from before then, whose by-design notes are still warnings
+    (Get-DemoHealthWarningNote). Pure. Internal.
+
+    .DESCRIPTION
+    Since 2026-11-23, a VM's bootstrap records the notes it gives by design as information, in health.json's notes
+    (Add-DemoVmNote): a sign-in cleanup that cleared an event log, the restart SQL Server setup asked for, T1's sysadmin
+    recovery, and Jumpstart's image checked by its pinned SHA-256. They leave a Ready VM's status a Pass, so health.json,
+    validate.ps1's INFRA.HEALTH.<vm>, status.ps1's STATUS.VM_<vm>, and the status page agree; the message still names them.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $Health
+    )
+
+    if ($null -eq $Health -or [string](Get-DemoMemberValue -InputObject $Health -Name 'state') -ne 'Ready') {
+        return $null
+    }
+    $shown = Get-DemoMemberList -InputObject $Health -Name 'notes'
+    $count = Get-DemoMemberValue -InputObject $Health -Name 'noteCount'
+    $total = if ($null -ne $count) { [int]$count } else { $shown.Count }
+    if ($total -le 0 -or $shown.Count -eq 0) {
+        return $null
+    }
+    $list = (@($shown | ForEach-Object { ([string]$_).Trim().TrimEnd('.') }) -join '; ')
+    $more = if ($total -gt $shown.Count) { ' ({0} more)' -f ($total - $shown.Count) } else { '' }
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    foreach ($note in @($shown)) {
+        $reason = Get-DemoHealthExpectedReason -Text ([string]$note)
+        if ($reason -and -not $reasons.Contains($reason)) {
+            $reasons.Add($reason)
+        }
+    }
+    $why = if ($reasons.Count -gt 0) { ' {0} expected: {1}.' -f $(if ($total -eq 1) { 'That''s' } else { 'Those are' }), ($reasons -join '; ') } else { '' }
+    return [pscustomobject]@{
+        Count = $total
+        Text  = ('Its bootstrap noted, as information: {0}{1}.{2}' -f $list, $more, $why)
     }
 }
 function Test-DemoValidationWorkloadBound {

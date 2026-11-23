@@ -2813,6 +2813,15 @@ Describe 'Get-DemoEnvironmentStatus' {
         $vm.message | Should -Be 'sqlvm01 is running; bootstrap Ready: Every step is in the desired state. Its bootstrap has a warning: AssociatedServices: SQL Server setup asked for a restart; the next start completes it. That''s expected: SQL Server setup asks for a restart when it removes Analysis Services and Integration Services from a new T1.'
         $vm.evidence.warningCount | Should -Be 1
     }
+
+    It 'passes STATUS.VM_SQLVM01 for a Ready VM whose bootstrap recorded its by-design notes as information, and names them (2026-11-23)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'sqlvm01') { 'PowerState/running' } else { 'PowerState/deallocated' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ status = 'Pass'; state = 'Ready'; message = 'Every step is in the desired state.'; warningCount = 0; warnings = @(); noteCount = 1; notes = @('SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.') } }
+        $vm = Get-DemoEnvironmentStatus -Config $config | Where-Object { $_.checkId -eq 'STATUS.VM_SQLVM01' }
+        $vm.status | Should -Be 'Pass'
+        $vm.message | Should -Be 'sqlvm01 is running; bootstrap Ready: Every step is in the desired state. Its bootstrap noted, as information: SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure. That''s expected: a new T1 needs the sysadmin recovery, because its image''s SQL IaaS Agent least-privilege mode doesn''t make SYSTEM a sysadmin.'
+        $vm.evidence.noteCount | Should -Be 1
+    }
     It 'flags T2''s guest that a golden capture left air-gapped while archost01 runs, from the same health read (live, 2026-11-03)' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'archost01') { 'PowerState/running' } else { 'PowerState/deallocated' } }
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith {

@@ -180,6 +180,12 @@ function Invoke-DemoVmStateMachine {
                     Add-DemoVmWarning -State $state -Message $warning -Step $name -Transient
                 }
             }
+            # Notes a new VM's bootstrap gives by design, as information: a Ready VM stays a Pass (2026-11-23).
+            if ($result.PSObject.Properties['NoteMessage']) {
+                foreach ($note in @($result.NoteMessage)) {
+                    Add-DemoVmNote -State $state -Message $note -Step $name
+                }
+            }
 
             if ($result.Outcome -eq 'Done') {
                 if (-not (Invoke-DemoVmStepTest -Block $definition['Test'] -Definition $definition)) {

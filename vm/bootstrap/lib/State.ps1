@@ -22,6 +22,7 @@ function Get-DemoVmState {
         instructions       = @()
         warnings           = @()
         transientWarnings  = @()
+        notes              = @()
         pendingReboot      = $false
         rebootRequestedUtc = $null
         rebootCount        = 0
@@ -41,6 +42,7 @@ function Get-DemoVmState {
     $state['instructions'] = @($state['instructions'] | Where-Object { $_ })
     $state['warnings'] = @($state['warnings'] | Where-Object { $_ })
     $state['transientWarnings'] = @($state['transientWarnings'] | Where-Object { $_ })
+    $state['notes'] = @($state['notes'] | Where-Object { $_ })
     return $state
 }
 
@@ -116,6 +118,33 @@ function Add-DemoVmWarning {
     }
 }
 
+function Add-DemoVmNote {
+    # Adds a note that a new VM's bootstrap gives by design to health.json's notes, once, naming its step ("<Step>: ..."),
+    # as information: unlike a warning, it leaves a Ready VM's status a Pass (the expected-notes decision, 2026-11-23: a
+    # sign-in cleanup that cleared an event log, the restart SQL Server setup asked for, T1's sysadmin recovery, and
+    # Jumpstart's image checked by its pinned SHA-256). It's a one-off note: the next bootstrap generation clears it
+    # (Clear-DemoVmTransientWarning), and its step's Set drops it when it runs again (Remove-DemoVmStepWarning).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $State,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string] $Message,
+
+        [AllowEmptyString()]
+        [string] $Step = ''
+    )
+
+    if ($Message -and $Step -and -not $Message.StartsWith(('{0}: ' -f $Step), [System.StringComparison]::Ordinal)) {
+        $Message = '{0}: {1}' -f $Step, $Message
+    }
+    if ($Message -and @($State['notes']) -notcontains $Message) {
+        $State['notes'] = @(@($State['notes']) + $Message)
+    }
+}
+
 function Remove-DemoVmStepWarning {
     # A step's own warnings ("<Step>: ..."), dropped once its Set has run to its end, Done or NotSelected, which says again
     # what still holds (the F24 reviews, 2026-11-20). A Set that throws, or stops early (InProgress, Waiting, a restart),
@@ -133,6 +162,7 @@ function Remove-DemoVmStepWarning {
     $prefix = '{0}: ' -f $Step
     $State['warnings'] = @(@($State['warnings']) | Where-Object { $_ -and -not ([string]$_).StartsWith($prefix, [System.StringComparison]::Ordinal) })
     $State['transientWarnings'] = @(@($State['transientWarnings']) | Where-Object { $_ -and -not ([string]$_).StartsWith($prefix, [System.StringComparison]::Ordinal) })
+    $State['notes'] = @(@($State['notes']) | Where-Object { $_ -and -not ([string]$_).StartsWith($prefix, [System.StringComparison]::Ordinal) })
 }
 
 # The one-off notes of bundles from before 2026-11-20, which named no step and weren't marked transient: the restart that
@@ -217,6 +247,8 @@ function Clear-DemoVmTransientWarning {
     }
     $State['warnings'] = @($kept.ToArray())
     $State['transientWarnings'] = @()
+    # The notes a new VM's bootstrap gives by design are one-off too (Add-DemoVmNote, 2026-11-23).
+    $State['notes'] = @()
 }
 
 function Enter-DemoVmLock {
@@ -293,7 +325,11 @@ function New-DemoVmStepResult {
 
         # One-off notes, which the next bootstrap generation clears (Add-DemoVmWarning -Transient; the F24 review,
         # 2026-11-20); WarningMessage stays until the step's Set runs again.
-        [string[]] $TransientWarningMessage = @()
+        [string[]] $TransientWarningMessage = @(),
+
+        # Notes a new VM's bootstrap gives by design, recorded as information, which leave a Ready VM a Pass
+        # (Add-DemoVmNote; the expected-notes decision, 2026-11-23). One-off, as TransientWarningMessage is.
+        [string[]] $NoteMessage = @()
     )
 
     [pscustomobject]@{
@@ -304,6 +340,7 @@ function New-DemoVmStepResult {
         Instruction             = @($Instruction)
         WarningMessage          = @($WarningMessage)
         TransientWarningMessage = @($TransientWarningMessage)
+        NoteMessage             = @($NoteMessage)
     }
 }
 
@@ -314,7 +351,8 @@ function Write-DemoVmHealth {
 
     .DESCRIPTION
     status maps the machine state to the ADR 0012 statuses: Ready is Pass (Warning with warnings), Failed
-    is Fail, ManualActionRequired is "Manual action required", and every in-flight state is Warning.
+    is Fail, ManualActionRequired is "Manual action required", and every in-flight state is Warning. notes, the
+    information a new VM's bootstrap gives by design (Add-DemoVmNote, 2026-11-23), don't change it.
     #>
     [CmdletBinding()]
     param(
@@ -357,6 +395,7 @@ function Write-DemoVmHealth {
         generation    = [string]$State['generation']
         instructions  = @($State['instructions'] | Where-Object { $_ })
         warnings      = $warnings
+        notes         = @($State['notes'] | Where-Object { $_ })
         rebootCount   = [int]$State['rebootCount']
         startedUtc    = $State['startedUtc']
         updatedUtc    = Get-DemoVmUtcNow

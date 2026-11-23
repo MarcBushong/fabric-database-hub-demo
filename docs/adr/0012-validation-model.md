@@ -324,6 +324,16 @@ The handler's skip comes from reusing a name whose last delete never reached it 
 
 A test pins each call's kind, so a new caller has to choose. Unit-tested in `tests/unit/DbHubDemo.Arc.Tests.ps1`, `DbHubDemo.Bundle.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`. **Not run live: it needs a live proof before it ships.**
 
+### 2026-11-23: a new VM's by-design notes are information, so a Ready VM is a Pass
+
+Since F32 (2026-11-22), `INFRA.HEALTH.<vm>` and `STATUS.VM_<vm>` said that a new VM's one-off notes are expected, and why, but stayed a **Warning**, health.json's own status, so a clean first deployment ended with yellow rows. The owner chose to make them a **Pass** everywhere, by having the VM record them as information rather than warnings, so health.json, `validate.ps1`, `status.ps1`, and the status page agree.
+
+- **On the VM:** a step's Set returns them as `NoteMessage` (`New-DemoVmStepResult`), which goes to health.json's new `notes`, each naming its step (`Add-DemoVmNote`), not to `warnings`. The status rule doesn't change: `Ready` is a **Pass** unless `warnings` has something. They're the four notes F32 calls expected: a sign-in cleanup that cleared an event log after T2's Arc onboarding (`GuestSql.ps1`), the restart SQL Server setup asks for when it removes Analysis Services and Integration Services from a new T1, T1's sysadmin recovery (`Invoke-SqlVmBootstrap.ps1`), and Jumpstart's image checked by its pinned SHA-256 (`GuestJumpstart.ps1`). Everything else stays a warning, including a download without a pinned SHA-256 and automatic sign-in left armed. Notes are one-off: the next bootstrap generation clears them, and so does their step's Set when it runs again.
+- **The checks:** `Get-DemoHealth.ps1 -View Summary` prints the first two notes with `noteCount`, and `INFRA.HEALTH.<vm>` and `STATUS.VM_<vm>` take health.json's status, as they did, and add "Its bootstrap noted, as information: ..." with why each is expected (`Get-DemoHealthNoteText`). The status page shows those results.
+- **An older bundle's** notes are still warnings, so its health.json, and the checks, still say **Warning**, with F32's "That's expected"; the next `./scripts/deploy.ps1` sends the new bundle, whose first generation clears them.
+
+Unit-tested in `tests/unit/Vm.StateMachine.Tests.ps1`, `Vm.SqlVmPlan.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, `Vm.JumpstartImage.Tests.ps1`, `Vm.WorkloadSteps.Tests.ps1`, `DbHubDemo.Validation.Tests.ps1`, and `DbHubDemo.Lifecycle.Tests.ps1`. Not run live: a net-new deployment's first `validate.ps1` and `status.ps1` show it.
+
 ## Consequences
 
 - **Positive:** a presenter can trust a green result. Every manual step is explicit and actionable. Results are machine-readable for the notebooks and CI.
