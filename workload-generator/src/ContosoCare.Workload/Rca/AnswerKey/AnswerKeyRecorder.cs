@@ -21,7 +21,8 @@ internal interface IAnswerKeySink
 
     /// <summary>
     /// True while a run of the target that ended by <paramref name="endedBy"/> is still being recorded: after the capture's
-    /// end (rca export --end-capture), the span stays open for those runs only, not for runs that end later.
+    /// end (rca export --end-capture), the stop's span waits to close for those runs only, not for runs that end later. A
+    /// run counts only by the end its runner gave it.
     /// </summary>
     bool IsPending(DemoTarget target, DateTimeOffset endedBy);
 }
@@ -39,19 +40,25 @@ internal sealed class AnswerKeyRecorder(EvidenceStore store, IReadOnlyDictionary
 
     private static readonly TimeSpan EventReadLimit = TimeSpan.FromSeconds(60);
 
-    // Each run being recorded, with its target and when it ended.
-    private readonly ConcurrentDictionary<long, (DemoTarget Target, DateTimeOffset EndedAt)> pending = new();
+    // Each run being recorded, with its target and the end its runner gave it.
+    private readonly ConcurrentDictionary<long, (DemoTarget Target, DateTimeOffset? EndedAt)> pending = new();
     private long recordings;
+
+    /// <summary>
+    /// Whether the answer key records a run: one that started. A refused run never did, so it has neither a start nor an
+    /// end, and nothing of it is recorded. The profile host holds the stop's span for these runs only (ProfileHost.HoldsAfter).
+    /// </summary>
+    internal static bool Records(RunResult result) => result.StartedAt is not null && result.Status != "Refused";
 
     public void RunEnded(DemoTarget target, RunResult result)
     {
-        if (result.StartedAt is null || result.Status == "Refused")
+        if (!Records(result))
         {
             return;
         }
 
         var key = Interlocked.Increment(ref recordings);
-        pending[key] = (target, result.EndedAt ?? DateTimeOffset.UtcNow);
+        pending[key] = (target, result.EndedAt);
         _ = Task.Run(async () =>
         {
             try
@@ -71,7 +78,7 @@ internal sealed class AnswerKeyRecorder(EvidenceStore store, IReadOnlyDictionary
 
     public bool IsPending(DemoTarget target) => pending.Values.Any(p => p.Target == target);
 
-    public bool IsPending(DemoTarget target, DateTimeOffset endedBy) => pending.Values.Any(p => p.Target == target && p.EndedAt <= endedBy);
+    public bool IsPending(DemoTarget target, DateTimeOffset endedBy) => pending.Values.Any(p => p.Target == target && p.EndedAt is { } ended && ended <= endedBy);
 
     /// <summary>The run's answer-key rows: the run, then the events it reported (demo.scenario_run_events), its start event left out.</summary>
     internal static List<CaptureRow> Rows(DemoTarget target, RunResult result, IReadOnlyList<RunEvent> runEvents)

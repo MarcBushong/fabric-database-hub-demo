@@ -3710,7 +3710,7 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             }
         }
 
-        It 'asks each runner to end the capture in the stop''s own export, and a re-check''s or a start''s export never does' {
+        It 'asks each runner to end the capture in the stop''s own export, and in no other Run Command' {
             Set-FixtureRunner
             $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:fixtureSession }) -Context (New-TestContext)
             $result.status | Should -Be 'Stopped'
@@ -3718,20 +3718,37 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             @($exports | ForEach-Object Vm | Sort-Object) | Should -Be @('archost01', 'sqlvm01')
             @($exports | ForEach-Object { '{0}:{1}:{2}' -f $_.Vm, $_.Request.final, $_.Request.endCapture } | Sort-Object) | Should -Be @('archost01:True:True', 'sqlvm01:True:True')
             @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' }).Count | Should -Be 2 -Because 'the end rides in the export''s own Run Command: the stop sends no other'
+            @($script:rcaCommands | Where-Object { $_.Request.command -ne 'export' -and $null -ne $_.Request.PSObject.Properties['endCapture'] }) | Should -BeNullOrEmpty
             $status = Get-SessionStatus
             @($status.rca.leftVms) | Should -BeNullOrEmpty
             $status.rca.final | Should -BeTrue
             @($status.rcaLines | Where-Object step -EQ 'RCA.PENDING') | Should -BeNullOrEmpty
+        }
 
-            # A re-check's export, and an earlier session's at a start (final, with that session's ID), leave the capture on.
-            $script:rcaCommands.Clear()
+        It 'never asks for the end in a re-check''s export, or in the export of an earlier session''s capture that a start sends first (the review of 1ca916a9)' {
+            # Only the stop's own export ends the capture. DbHub-Monitor's re-check runs while the session does, and a start
+            # exports what an earlier session left on a VM right before its own activity goes out there.
+            $session = $script:fixtureSession
+            $running = [ordered]@{ schemaVersion = 1; sessionId = $session; phase = 'running'; acceptedUtc = '2026-10-27T15:00:00Z'; updatedUtc = '2026-10-27T15:00:00Z'; runEndUtc = '2026-10-27T16:30:00Z'; steps = @(); rca = (ConvertTo-DbHubRcaState -State $null -SessionId $session) }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $running -Depth 8 -Compress
+            $script:clock = [datetime]::new(2026, 10, 27, 15, 30, 0, [System.DateTimeKind]::Utc)
             $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
             Set-FixtureRunner
-            $null = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Minutes 30
-            $null = Invoke-DbHubRcaSessionExport -Context (New-TestContext) -SessionId $script:fixtureSession -Final -Minutes 30
-            $later = @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' })
-            $later.Count | Should -Be 4
-            @($later | Where-Object { $null -ne $_.Request.PSObject.Properties['endCapture'] }) | Should -BeNullOrEmpty
+            $null = Update-DbHubSessionRca -Context (New-TestContext -NowUtc $script:clock) -Tags @{ DbHubSessionId = $session }
+            $recheck = @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' })
+            @($recheck | ForEach-Object Vm | Sort-Object) | Should -Be @('archost01', 'sqlvm01')
+            @($script:rcaCommands | Where-Object { $null -ne $_.Request.PSObject.Properties['endCapture'] }) | Should -BeNullOrEmpty
+
+            # The nightly stop ends the session after that re-check, so its own final export never runs: the next start
+            # exports what it left on each VM first, final and with its ID, and still leaves the capture on.
+            $script:rcaCommands.Clear()
+            Set-TestSessionStart
+            Set-FixtureRunner
+            $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = ('b' * 32); requestedBy = 'presenter' }) -Context (New-TestContext -NowUtc $script:clock)
+            $started.status | Should -BeIn 'Started', 'Partial'
+            $earlier = @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' -and $_.Request.sessionId -eq $session })
+            @($earlier | ForEach-Object { '{0}:{1}' -f $_.Vm, $_.Request.final } | Sort-Object) | Should -Be @('archost01:True', 'sqlvm01:True')
+            @($script:rcaCommands | Where-Object { $null -ne $_.Request.PSObject.Properties['endCapture'] }) | Should -BeNullOrEmpty
         }
 
         It 'names a VM whose observer still captured when the stop''s export ended: its leftVms, RCA.PENDING, and RCA.EXPORT''s Warning say so' {

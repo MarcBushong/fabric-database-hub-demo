@@ -296,15 +296,22 @@ internal sealed class ProfileHost(
         || answerKey?.IsPending(target) == true;
 
     /// <summary>
-    /// The gate after the capture's end that a session's stop recorded (rca export --end-capture): a profile set after it
-    /// starts a new session, which <see cref="IsActive"/> then follows; before that, only the fault runs that ended by then
-    /// keep the target in its session until the answer key has them: a run its lane hasn't handed over yet (it does at its
-    /// next poll), or one being recorded. The runs still going at the end don't: the workload runs on until the VM stops.
+    /// The gate after the capture's end that a session's stop recorded (rca export --end-capture): only a session that began
+    /// after it, whose profile was set after it, which <see cref="IsActive"/> then follows. The stopped session's runs go on
+    /// until the VM stops, uncaptured: the review of 1ca916a9 ended every target's capture at the end, and only the span's
+    /// close waits for the answer key (<see cref="HoldsAfter"/>).
     /// </summary>
     public bool IsActiveAfter(DemoTarget target, DateTimeOffset end) =>
-        (profileSetAt.TryGetValue(target, out var set) && set > end && IsActive(target))
-        || EndedUnrecorded(target, end)
-        || answerKey?.IsPending(target, end) == true;
+        profileSetAt.TryGetValue(target, out var set) && set > end && IsActive(target);
+
+    /// <summary>
+    /// Whether the span that the stop's export takes waits to close, capturing nothing, for a fault run of the target that
+    /// ended by the capture's end and that the answer key records (<see cref="AnswerKeyRecorder.Records"/>): one its lane
+    /// hasn't handed over yet (it does at its next poll), or one being recorded. A refused start never counts, so a fault
+    /// the plan still tries after the stop can't hold the span (the review of 1ca916a9).
+    /// </summary>
+    public bool HoldsAfter(DemoTarget target, DateTimeOffset end) =>
+        EndedUnrecorded(target, end) || answerKey?.IsPending(target, end) == true;
 
     public async Task RunAsync(IReadOnlyList<ProfileTarget> targets, DateTimeOffset? notAfter, CancellationToken cancellationToken)
     {
@@ -362,8 +369,10 @@ internal sealed class ProfileHost(
     }
 
     /// <summary>
-    /// A fault run of the target that ended by <paramref name="end"/> and that its lane hasn't handed to the answer key yet:
-    /// the lane does at its next poll (Reap). Baseline chunks never go to the answer key.
+    /// A fault run of the target that ended by <paramref name="end"/>, that the answer key records, and that its lane hasn't
+    /// handed over yet: the lane does at its next poll (Reap). Baseline chunks never go to the answer key, and neither does a
+    /// refused start, which has no end of its own (the review of 1ca916a9: one counted as ended by any end, and a start
+    /// refused after the stop opened capture again).
     /// </summary>
     private bool EndedUnrecorded(DemoTarget target, DateTimeOffset end)
     {
@@ -381,7 +390,7 @@ internal sealed class ProfileHost(
 
             lock (lane.Gate)
             {
-                if (lane.Running.Values.Any(r => !r.IsBaseline && r.Task.IsCompletedSuccessfully && (r.Task.Result.EndedAt ?? DateTimeOffset.MinValue) <= end))
+                if (lane.Running.Values.Any(r => !r.IsBaseline && r.Task.IsCompletedSuccessfully && AnswerKeyRecorder.Records(r.Task.Result) && r.Task.Result.EndedAt is { } ended && ended <= end))
                 {
                     return true;
                 }

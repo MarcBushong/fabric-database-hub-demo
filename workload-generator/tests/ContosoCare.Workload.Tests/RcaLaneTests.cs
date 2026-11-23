@@ -98,12 +98,16 @@ public sealed class RcaLaneTests
     }
 
     [Fact]
-    public async Task AnEndLaterThanTheLanesClockAllowsIsIgnoredAndCaptureGoesOn()
+    public async Task AnEndAheadOfTheLanesClockWhenFirstReadStaysIgnoredWhenTheClockCatchesUp()
     {
+        // The review of 1ca916a9: an end more than a minute ahead was ignored only until the lane's clock caught up, so a
+        // clock that went back postponed the end rather than leaving the capture as it was. Kept for that end now; a new
+        // stop's end is decided afresh.
+        var clock = new OffsetTime();
         var connector = RcaSimulation.T1(new ManualTime(RcaSimulation.T1From));
         var gate = new Gate();
         var store = new Store { EndedAt = DateTimeOffset.UtcNow + ObserverLane.FutureEndLimit + TimeSpan.FromMinutes(5) };
-        var lane = new ObserverLane([new SqlTargetObserver("T1", DemoTarget.T1, connector, new ObserverOptions(), RunnerLog.Null)], [], gate, store, RunnerLog.Null, TimeProvider.System);
+        var lane = new ObserverLane([new SqlTargetObserver("T1", DemoTarget.T1, connector, new ObserverOptions(), RunnerLog.Null)], [], gate, store, RunnerLog.Null, clock);
         using var stop = new CancellationTokenSource();
         var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
         try
@@ -111,7 +115,87 @@ public sealed class RcaLaneTests
             gate.Set(DemoTarget.T1, true);
             await Until(() => Calls(connector).Contains("RCA-SQL-09"));
             await Task.Delay(TimeSpan.FromSeconds(1.5), TestContext.Current.CancellationToken);
-            Assert.Null(Assert.Single(store.Spans).ClosedAt);
+            var span = Assert.Single(store.Spans);
+            Assert.Null(span.ClosedAt);
+
+            clock.Offset = TimeSpan.FromMinutes(10);
+            await Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+            Assert.Null(span.ClosedAt);
+            Assert.Single(store.Spans);
+
+            store.EndedAt = clock.GetUtcNow();
+            await Until(() => span.ClosedAt is not null);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task AnEndAppliedWhenFirstReadStaysAppliedWhenTheClockGoesBack()
+    {
+        // The other way: once in force, an end that a clock gone back would put ahead mustn't open capture again.
+        var clock = new OffsetTime();
+        var connector = RcaSimulation.T1(new ManualTime(RcaSimulation.T1From));
+        var gate = new Gate();
+        var store = new Store();
+        var lane = new ObserverLane([new SqlTargetObserver("T1", DemoTarget.T1, connector, new ObserverOptions(), RunnerLog.Null)], [], gate, store, RunnerLog.Null, clock);
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            gate.Set(DemoTarget.T1, true);
+            await Until(() => Calls(connector).Contains("RCA-SQL-09"));
+            store.EndedAt = clock.GetUtcNow();
+            await Until(() => store.Spans.Count == 1 && store.Spans[0].ClosedAt is not null);
+
+            clock.Offset = -TimeSpan.FromMinutes(10);
+            await Task.Delay(TimeSpan.FromSeconds(2.5), TestContext.Current.CancellationToken);
+            Assert.Single(store.Spans);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public async Task AtTheEndEveryTargetsCaptureEndsAndOnlyTheSpansCloseWaitsForTheAnswerKey()
+    {
+        // The review of 1ca916a9: the answer key of a fault run that ended by the end held its target's capture open, a
+        // coverage tail that only the fault explained. Now every target's capture ends at the end, and the span stays open,
+        // capturing nothing, until the answer key has the run, so the stop's export still takes it.
+        var connector = RcaSimulation.T1(new ManualTime(RcaSimulation.T1From));
+        var gate = new Gate();
+        var store = new Store();
+        var lane = new ObserverLane([new SqlTargetObserver("T1", DemoTarget.T1, connector, new ObserverOptions(), RunnerLog.Null)], [DemoTarget.T5], gate, store, RunnerLog.Null, TimeProvider.System);
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            gate.Set(DemoTarget.T1, true);
+            gate.Set(DemoTarget.T5, true);
+            await Until(() => Calls(connector).Contains("RCA-SQL-09") && store.Spans.Count == 1 && store.Spans[0].Membership.Any(m => m.Target == "T5" && m.Began));
+            var span = store.Spans[0];
+
+            gate.Hold(DemoTarget.T1, true);
+            store.EndedAt = DateTimeOffset.UtcNow;
+            await Until(() => span.Membership.Any(m => m.Target == "T1" && !m.Began) && span.Membership.Any(m => m.Target == "T5" && !m.Began));
+            Assert.Equal("RCA-XE-05", Calls(connector)[^1]);
+            var ended = span.Membership.Where(m => !m.Began).Max(m => m.At);
+            var calls = Calls(connector).Count;
+            await Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+            Assert.Null(span.ClosedAt);
+            Assert.Equal(calls, Calls(connector).Count);
+
+            gate.Hold(DemoTarget.T1, false);
+            await Until(() => span.ClosedAt is not null);
+            Assert.Equal(ended, span.ClosedAt);
+            Assert.Equal(calls, Calls(connector).Count);
+            Assert.Single(store.Spans);
         }
         finally
         {
@@ -172,6 +256,7 @@ public sealed class RcaLaneTests
     private sealed class Gate : IObservationGate
     {
         private readonly HashSet<DemoTarget> active = [];
+        private readonly HashSet<DemoTarget> held = [];
         private readonly Dictionary<DemoTarget, DateTimeOffset> setAt = [];
         private readonly Lock sync = new();
 
@@ -207,6 +292,44 @@ public sealed class RcaLaneTests
                 return active.Contains(target) && setAt[target] > end;
             }
         }
+
+        /// <summary>Whether the answer key still has to record a fault run of the target that ended by the end.</summary>
+        public void Hold(DemoTarget target, bool on)
+        {
+            lock (sync)
+            {
+                if (on)
+                {
+                    held.Add(target);
+                }
+                else
+                {
+                    held.Remove(target);
+                }
+            }
+        }
+
+        public bool HoldsAfter(DemoTarget target, DateTimeOffset end)
+        {
+            lock (sync)
+            {
+                return held.Contains(target);
+            }
+        }
+    }
+
+    /// <summary>The system's clock, set ahead or back by <see cref="Offset"/>; its timers are the system's.</summary>
+    private sealed class OffsetTime : TimeProvider
+    {
+        private long offsetTicks;
+
+        public TimeSpan Offset
+        {
+            get => TimeSpan.FromTicks(Interlocked.Read(ref offsetTicks));
+            set => Interlocked.Exchange(ref offsetTicks, value.Ticks);
+        }
+
+        public override DateTimeOffset GetUtcNow() => base.GetUtcNow() + Offset;
     }
 
     private sealed class Store : ICaptureStore

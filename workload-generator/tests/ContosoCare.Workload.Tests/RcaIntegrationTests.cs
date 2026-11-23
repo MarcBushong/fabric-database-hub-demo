@@ -267,5 +267,7 @@ public sealed class RcaIntegrationTests : IDisposable
         public bool IsActive(DemoTarget asked) => asked == target && active;
 
         public bool IsActiveAfter(DemoTarget asked, DateTimeOffset end) => false;
+
+        public bool HoldsAfter(DemoTarget asked, DateTimeOffset end) => false;
     }
 }

@@ -282,13 +282,20 @@ internal sealed class EvidenceStore : ICaptureStore
 
     /// <summary>
     /// Records the capture's end (rca export --end-capture, a session's stop): the observer lane of 'profile run' reads it
-    /// at its next tick and ends its capture, as a profile's end does, while the workload runs on. Call under the export's
-    /// lock.
+    /// at its next tick and ends its capture, as a profile's end does, while the workload runs on. A second stop of the same
+    /// session keeps the end its first recorded, untouched, so the fault runs that ended between the two never hold the span
+    /// again (the review of 1ca916a9). Returns the end in effect. Call under the export's lock.
     /// </summary>
-    public void EndCapture(DateTimeOffset at, string? sessionId)
+    public DateTimeOffset EndCapture(DateTimeOffset at, string? sessionId)
     {
         EnsureRoot();
+        if (sessionId is not null && ReadJson(CaptureEndPath, RcaStoreJsonContext.Default.CaptureEndFile) is { SessionId: { } recorded } existing && string.Equals(recorded, sessionId, StringComparison.Ordinal))
+        {
+            return existing.EndedUtc;
+        }
+
         WriteJson(CaptureEndPath, new CaptureEndFile { EndedUtc = at, SessionId = sessionId }, RcaStoreJsonContext.Default.CaptureEndFile);
+        return at;
     }
 
     /// <summary>
