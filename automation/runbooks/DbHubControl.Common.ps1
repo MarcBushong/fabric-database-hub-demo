@@ -4993,7 +4993,8 @@ function Send-DbHubT4ReplicaCreate {
     Asks Azure for T4's read replica at SkuName (Servers - Create, createMode Replica), as infra/replica/pgreplica01.bicep
     makes it: T4's location, delegated subnet, private DNS zone, and storage, General Purpose, no public network access,
     and storage auto-grow off, with the demo's tags and component t4-replica. Returns once Azure answered: Accepted,
-    StatusCode, Code (SkuNotAvailable, SourceNotReady, AlreadyExists, NotGranted, or Other), and Error.
+    StatusCode, Code (SkuNotAvailable, SourceNotReady, AlreadyExists, NotGranted, or Other), Error, and Refused (the action
+    Azure says the caller doesn't have, or '').
     https://learn.microsoft.com/rest/api/postgresql/flexibleserver/servers/create
     https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica
     #>
@@ -5047,7 +5048,7 @@ function Send-DbHubT4ReplicaCreate {
     $version = Get-DbHubApiVersion -Settings $Context.Settings -Type 'Microsoft.DBforPostgreSQL/flexibleServers'
     $put = Invoke-DbHubArm -Context $Context -Method PUT -Path ('{0}/providers/Microsoft.DBforPostgreSQL/flexibleServers/{1}' -f (Get-DbHubDemoPath -Settings $Context.Settings), $Name) -ApiVersion $version -Body $body
     if ($put.StatusCode -in 200, 201, 202) {
-        return [pscustomobject]@{ Accepted = $true; StatusCode = $put.StatusCode; Code = ''; Error = '' }
+        return [pscustomobject]@{ Accepted = $true; StatusCode = $put.StatusCode; Code = ''; Error = ''; Refused = '' }
     }
     # The error's code and message, from Invoke-DbHubArm's text and the response body both.
     $detail = Get-DbHubMember -InputObject $put.Body -Name 'error'
@@ -5067,7 +5068,11 @@ function Send-DbHubT4ReplicaCreate {
     elseif ($text -match 'ReadReplicaAlreadyExistWithGivenName') {
         $code = 'AlreadyExists'
     }
-    return [pscustomobject]@{ Accepted = $false; StatusCode = $put.StatusCode; Code = $code; Error = (ConvertTo-DbHubSafeText -Text $text) }
+    # The action the caller "does not have", read before the error is cut to 400 characters: a 403
+    # LinkedAuthorizationFailed first names the write that it has, then, after the client's IDs and the scope, the join it
+    # lacks (the review of 061db648).
+    $refused = ([regex]::Match($text, 'does not have (?:permission|authorization) to perform action(?:\(s\))? ''?([A-Za-z.]+/[A-Za-z0-9./]+)').Groups[1].Value).TrimEnd('.')
+    return [pscustomobject]@{ Accepted = $false; StatusCode = $put.StatusCode; Code = $code; Error = (ConvertTo-DbHubSafeText -Text $text); Refused = $refused }
 }
 
 function Set-DbHubT4ReplicaParameter {
@@ -5440,10 +5445,9 @@ function Send-DbHubSessionReplicaAttempt {
             return $Work
         }
         if ($sent.Code -eq 'NotGranted') {
-            # Azure names the action it refused: the PostgreSQL write of a role from before 2026-11-14, or the join of T4's
-            # subnet of one from before 2026-11-23 where Azure checks it (ADR 0026).
-            $refused = [regex]::Match([string]$sent.Error, 'perform action ''?([A-Za-z.]+/[A-Za-z0-9./]+)').Groups[1].Value
-            $lacks = if ($refused) { 'its role doesn''t allow {0}, which Azure checks for the create' -f $refused.TrimEnd('.') } else { 'its role doesn''t have the actions the create needs' }
+            # Azure names the action it refused (Refused): the PostgreSQL write of a role from before 2026-11-14, or the join
+            # of T4's subnet of one from before 2026-11-23 where Azure checks it (ADR 0026).
+            $lacks = if ($sent.Refused) { 'its role doesn''t allow {0}, which Azure checks for the create' -f $sent.Refused } else { 'its role doesn''t have the actions the create needs' }
             return (& $finish 'NotGranted' ('The control identity can''t create T4''s read replica yet: {0}, so this session has none, and Database Hub''s Read replica lag stays empty.' -f $lacks) 'An Owner runs ./scripts/grant-safety-stop.ps1 once, which gives the role its approved actions; the next Run all creates the replica.')
         }
         if ($sent.Code -eq 'SourceNotReady') {

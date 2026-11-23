@@ -158,27 +158,36 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
         while (!cancellationToken.IsCancellationRequested)
         {
             var now = time.GetUtcNow();
-            var end = CaptureEnd(now);
-            foreach (var target in noted)
+            try
             {
-                var wanted = IsActive(target, end);
-                if (wanted && !active.Contains(target) && Acquire(target.ToString(), now) is { } sink)
+                var end = CaptureEnd(now);
+                foreach (var target in noted)
                 {
-                    active.Add(target);
-                    sink.Note(new CaptureNote(NoteKind.Gap, target.ToString(), now, $"{target} has no observer: its evidence is Azure Monitor's metrics (its 429s and normalized request units), which the history saves."));
-                    sink.Watermark(target.ToString(), now);
-                }
-                else if (!wanted && active.Remove(target))
-                {
-                    Release(target.ToString(), now, end);
-                }
-                else if (active.Contains(target))
-                {
-                    lock (spanGate)
+                    var wanted = IsActive(target, end);
+                    if (wanted && !active.Contains(target) && Acquire(target.ToString(), now) is { } sink)
                     {
-                        span?.Watermark(target.ToString(), now);
+                        active.Add(target);
+                        sink.Note(new CaptureNote(NoteKind.Gap, target.ToString(), now, $"{target} has no observer: its evidence is Azure Monitor's metrics (its 429s and normalized request units), which the history saves."));
+                        sink.Watermark(target.ToString(), now);
+                    }
+                    else if (!wanted && active.Remove(target))
+                    {
+                        Release(target.ToString(), now, end);
+                    }
+                    else if (active.Contains(target))
+                    {
+                        lock (spanGate)
+                        {
+                            span?.Watermark(target.ToString(), now);
+                        }
                     }
                 }
+            }
+            catch (Exception ex) when (ex is not OutOfMemoryException)
+            {
+                // A failure of one pass never ends the lane, as in ObserveAsync: the next pass tries again (the re-check of
+                // 60aacd7b: a failed write of the span's begin ended this loop).
+                log.Warn("rca.tick-failed", "The RCA observer's tick failed; it carries on.", ("target", "noted"), ("error", Redactor.Redact(ex.GetType().Name + ": " + ex.Message)));
             }
 
             try
@@ -392,8 +401,10 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                 }
             }
 
-            members++;
+            // Counted only once its begin is written (the re-check of 60aacd7b): a failed write, which the caller's next tick tries
+            // again, never leaves a member that the span waits for and no loop will release.
             span.Began(target, at);
+            members++;
             return span;
         }
     }
@@ -415,7 +426,17 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                 return;
             }
 
-            span.Ended(target, at);
+            try
+            {
+                span.Ended(target, at);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // The end stays in memory, and the span's next write has it (the re-check of 60aacd7b): the member has left
+                // either way, since its loop never releases it again, so the count settles and the span still closes.
+                log.Warn("rca.write-failed", "The RCA observer couldn't write a target's end to its span; the span's next write has it.", ("target", target), ("error", Redactor.Redact(ex.Message)));
+            }
+
             lastEnded = lastEnded is { } known && known > at ? known : at;
             if (--members <= 0)
             {

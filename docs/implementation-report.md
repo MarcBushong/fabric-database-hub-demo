@@ -5025,7 +5025,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **O1: the capture ends at a session's stop** ([its entry](#o1-the-capture-ends-at-a-sessions-stop-2026-11-23)): the control's stop stops nothing on the VMs before they deallocate, so the observer captured on past the stop's export, and the session's last minutes stayed on the VMs, listed nowhere. The stop's export now ends the capture first, in its own Run Command, and takes it whole; a VM where it didn't end is named.
 - **The golden capture reads an encrypted status through the control's job** ([its entry](#the-golden-capture-reads-an-encrypted-status-through-the-controls-job-2026-11-23)): when Azure Resource Manager can't give the status's value, `capture-t2-golden.ps1` starts `DbHub-Control`'s new read-only `pending` action as a job, which reads it with `Get-AutomationVariable`, so the capture no longer needs the variable deleted to check it.
 - **The session control's role joins T4's network again** ([its entry](#the-session-controls-role-joins-t4s-network-again-2026-11-23)): in West Central US, Azure refused Run all's create of T4's read replica because the role didn't have the join of T4's subnet. The role gets both join actions back, an update by someone who isn't an Owner says what waits for the Owner's grant, and a session's status names the action Azure refused.
-- **The reviews' fixes,** in each entry ([the latest](#the-re-check-of-d06899f6-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
+- **The reviews' fixes,** in each entry ([the latest](#the-re-check-of-60aacd7b-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
 
 **What still needs live proof.** All of it but the evaluation set, which reads recorded rows. Each change is unit-tested, and the RCA's answers are checked on B's and A's recorded rows, but none has run on a live environment. Its live check waits for the owner: dbhubrc stays at dbee7d53 for the owner's testing on Monday, 2026-11-23. On an environment deployed or updated from this branch, after a Run all session:
 
@@ -5777,3 +5777,44 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - PSScriptAnalyzer, with the repo's settings, found nothing in the two PowerShell files this commit changes, which are ASCII-only; markdownlint found no issue; every link this commit adds resolves, each relative one to one heading; and the leak check finds no identifier in it.
 
 **What its live check needs.** Nothing more than O1's and the golden job's: these paths take a failed write of the store, or a runbook that doesn't write its lists.
+
+### The review of 061db648 (2026-11-23)
+
+**Why.** A fresh reviewer read [the role fix](#the-session-controls-role-joins-t4s-network-again-2026-11-23) and said **SHIP**, rating the residual risk Low: the only write of the identity's that joins a network is `flexibleServers/write`, into `snet-pg` and T4's zone. The coordinator asked for two small optional fixes in one commit.
+
+- **A test had lost its exact message.** The role fix's edit of `DbHubDemo.ActivityControl.Tests.ps1` dropped the exact-message assertion of the role from before 2026-11-19, the only test of the wording for T5's container actions alone, which now follows the new `elseif`. It's back, unchanged, and passes.
+- **The replica's note could name the wrong action.** It took the first "perform action '…'" in Azure's error. A 403 `LinkedAuthorizationFailed` names first the write that the caller has (`flexibleServers/write`), then the join it lacks. Now `Send-DbHubT4ReplicaCreate` reads the action after "does not have permission" or "does not have authorization" (`Refused`), and it reads it before the error is cut to 400 characters, since that format puts the client's IDs and the scope first. A second case of the runbook's test has that format, and names the subnet's join.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`, with `tests/unit/Automation.Runbooks.Tests.ps1` and `tests/unit/DbHubDemo.ActivityControl.Tests.ps1`; and this report: this entry and the stacked branch's summary. They're in one commit with [the re-check of 60aacd7b](#the-re-check-of-60aacd7b-2026-11-23)'s fix.
+
+**Validation.** On 60aacd7b with this commit:
+
+- **The runbook:** under strict mode, with the Azure CLI guard, `Automation.Runbooks` passed: 338 passed, none failed, and the guard saw no unmocked Azure CLI call. With 60aacd7b's runbook, the new case fails, and the first passes.
+- **The role's suite:** `DbHubDemo.ActivityControl` passed: 140 passed, none failed.
+- **The runner, on 60aacd7b, after 2 PM:** `dotnet test`, all of it: 829 tests, 808 passed, none failed, and 21 skipped, the integration tests that need a disposable SQL Server or PostgreSQL.
+- PSScriptAnalyzer, with the repo's settings (Windows PowerShell 5.1's for the runbook), found nothing in the three PowerShell files this commit changes, which are ASCII-only; markdownlint found no issue; every link this commit adds resolves, each relative one to one heading; and the leak check finds no identifier in it.
+
+**What its live check needs.** The role fix's.
+
+### The re-check of 60aacd7b (2026-11-23)
+
+**Why.** The re-check of [the re-check of d06899f6](#the-re-check-of-d06899f6-2026-11-23)'s commit, 60aacd7b, said **SHIP**: all three Lows closed. It found one older Low, from before O1, which the coordinator asked for in the same commit as [the review of 061db648](#the-review-of-061db648-2026-11-23)'s.
+
+- **A target's begin and end write `span.json` too,** before the lane's count of the span's members settled, so the same failed write could still:
+  - end the note loop, which had no catch of its own;
+  - or leave the count off by one: a begin that failed was counted although the target never joined, and an end that failed left the target counted, so the span never closed while the runner ran, and the stop then named the VM.
+- **Now:**
+  - `Acquire` counts a member only once its begin is written, and a failed begin is taken back in the span (`SpanWriter.Began`), so the lane's next try begins the target once: an interval left open would never end, since only a target's last one does.
+  - `Release` keeps an end whose write failed in memory, for the span's next write (`rca.write-failed`), and settles the count anyway, since that target's loop never releases it again.
+  - `NoteAsync` has the per-loop catch that `ObserveAsync` has (`rca.tick-failed`).
+- **Tests:** a lane test has a begin fail once in the note loop and an end fail once; the lane runs on, the count stays right, and the span closes at the last end. A store test has a begin's write fail once, then the target's next begin and its end make one interval.
+
+**Changed files.** In `workload-generator/`: `src/ContosoCare.Workload/Rca/Observer/ObserverLane.cs` and `Rca/Store/SpanWriter.cs`, with `tests/ContosoCare.Workload.Tests/RcaLaneTests.cs`, `RcaExportTests.cs`, and `RcaTestKit.cs`, whose span's begin and end fail on demand; and this report.
+
+**Validation.** On 60aacd7b with this commit:
+
+- **The runner:** `dotnet build` with warnings as errors, then the lane's and the export's test classes: 47 passed, none failed.
+- **The runner's mutations,** each alone, built, with those two classes, then restored, and the runner built again: E1, `Acquire` that counts before the begin is written, E2, `Release` without the catch of a failed end, and E3, the note loop without its catch, each fail the lane test; and E4, a failed begin kept in the span, fails the store test.
+- **The runner, all of it:** `dotnet test`: 831 tests, 810 passed, none failed, and 21 skipped, the integration tests that need a disposable SQL Server or PostgreSQL.
+
+**What its live check needs.** Nothing more than O1's: these paths take a failed write of the store.

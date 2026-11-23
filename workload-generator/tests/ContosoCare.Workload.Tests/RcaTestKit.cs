@@ -51,6 +51,8 @@ internal sealed class MemorySink : ICaptureSpan
     private readonly List<(string Target, DateTimeOffset At, bool Began)> membership = [];
     private DateTimeOffset? closedAt;
     private int closeFailures;
+    private int beganFailures;
+    private int endedFailures;
 
     public List<CaptureRow> Rows { get; } = [];
 
@@ -119,6 +121,13 @@ internal sealed class MemorySink : ICaptureSpan
     {
         lock (gate)
         {
+            // As SpanWriter does: a begin whose write failed isn't kept.
+            if (beganFailures > 0)
+            {
+                beganFailures--;
+                throw new IOException("The process cannot access the file 'span.json' because it is being used by another process.");
+            }
+
             membership.Add((target, at, true));
         }
     }
@@ -127,7 +136,53 @@ internal sealed class MemorySink : ICaptureSpan
     {
         lock (gate)
         {
+            // As SpanWriter does: an end whose write failed stays in memory, for the span's next write.
             membership.Add((target, at, false));
+            if (endedFailures > 0)
+            {
+                endedFailures--;
+                throw new IOException("The process cannot access the file 'span.json' because it is being used by another process.");
+            }
+        }
+    }
+
+    /// <summary>How many more times <see cref="Began"/> fails, as a write of span.json can.</summary>
+    public int BeganFailures
+    {
+        get
+        {
+            lock (gate)
+            {
+                return beganFailures;
+            }
+        }
+
+        set
+        {
+            lock (gate)
+            {
+                beganFailures = value;
+            }
+        }
+    }
+
+    /// <summary>How many more times <see cref="Ended"/> fails, as a write of span.json can.</summary>
+    public int EndedFailures
+    {
+        get
+        {
+            lock (gate)
+            {
+                return endedFailures;
+            }
+        }
+
+        set
+        {
+            lock (gate)
+            {
+                endedFailures = value;
+            }
         }
     }
 

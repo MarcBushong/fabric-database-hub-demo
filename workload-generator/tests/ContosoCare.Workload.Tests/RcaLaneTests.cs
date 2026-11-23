@@ -368,6 +368,47 @@ public sealed class RcaLaneTests
     }
 
     [Fact]
+    public async Task AWriteOfTheSpanThatFailsInABeginOrAnEndKeepsTheLaneGoingTheCountRightAndTheCloseAtTheLastEnd()
+    {
+        // The re-check of 60aacd7b: a target's begin and end write span.json too. A failed begin was counted although the
+        // target never joined, a failed end left the target counted, so the span never closed, and in the note loop, which
+        // had no catch of its own, either one ended the loop.
+        var (connector, gate, store, lane) = HoldingLane();
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            store.BeganFailures = 1;
+            gate.Set(DemoTarget.T5, true);
+            await Until(() => store.Spans.Count == 1 && store.Spans[0].Membership.Any(m => m.Target == "T5" && m.Began));
+            var span = store.Spans[0];
+            Assert.Equal(0, span.BeganFailures);
+            gate.Set(DemoTarget.T1, true);
+            await Until(() => Calls(connector).Contains("RCA-SQL-09") && span.Membership.Any(m => m.Target == "T1" && m.Began));
+
+            span.EndedFailures = 1;
+            gate.Set(DemoTarget.T5, false);
+            await Until(() => span.Membership.Any(m => m.Target == "T5" && !m.Began));
+            Assert.Equal(0, span.EndedFailures);
+            await Task.Delay(TimeSpan.FromSeconds(2), TestContext.Current.CancellationToken);
+            Assert.Null(span.ClosedAt);
+
+            gate.Set(DemoTarget.T1, false);
+            await Until(() => span.ClosedAt is not null);
+            var last = span.Membership[^1];
+            Assert.Equal(("T1", false), (last.Target, last.Began));
+            Assert.Equal(last.At, span.ClosedAt);
+            Assert.Equal(4, span.Membership.Count);
+            Assert.Single(store.Spans);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(Wait, TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
     public async Task TheReplicaJoinsTheSpanOnlyOnceItAnswers()
     {
         var replica = new ScriptedConnector((_, _) => []) { OpenFailure = new CaptureException(CaptureFailureKind.Connection, "No such host is known.") };
@@ -552,11 +593,16 @@ public sealed class RcaLaneTests
             var span = new MemorySink();
             lock (Spans)
             {
+                span.BeganFailures = BeganFailures;
+                BeganFailures = 0;
                 Spans.Add(span);
             }
 
             return span;
         }
+
+        /// <summary>How many times the next span's first begins fail, as a write of span.json can.</summary>
+        public int BeganFailures { get; set; }
 
         public DateTimeOffset? CaptureEndedAt() => EndedAt;
     }

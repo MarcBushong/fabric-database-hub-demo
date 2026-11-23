@@ -1851,6 +1851,7 @@ Describe 'Validation and status (Test-DemoActivityControl, STATUS.CONTROL)' {
         $results = @(Test-DemoActivityControl -Config (New-ControlConfig) -ConfigPath './config/demo.config.json' -NowUtc $script:now)
         $definition = $results | Where-Object checkId -EQ 'CONTROL.ROLE.DEFINITION'
         $definition.status | Should -Be 'Warning'
+        $definition.message | Should -Be 'The custom role "DbHub Demo Activity Operator" lacks 3 of its approved actions (Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/read, Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/write, Microsoft.DocumentDB/databaseAccounts/sqlDatabases/containers/delete), so T5''s container can''t exist only during a session: it stays between sessions, and its throughput keeps billing.'
         $definition.remediation | Should -Match 'grant-safety-stop\.ps1'
     }
 
