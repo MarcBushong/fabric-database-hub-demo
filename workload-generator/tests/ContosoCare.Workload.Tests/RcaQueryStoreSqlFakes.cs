@@ -1,4 +1,5 @@
 using System.Globalization;
+using System.Text.Json;
 using System.Text.Json.Nodes;
 using ContosoCare.Workload.Rca;
 using ContosoCare.Workload.Rca.Observer;
@@ -151,9 +152,10 @@ internal sealed class T3QueryStore
         var stamp = Stamps.Where(s => s.Key <= now && now < s.Key.AddMinutes(1)).Select(s => (DateTimeOffset?)s.Value).FirstOrDefault() ?? now;
         return block switch
         {
-            "RCA-SQL-10" => [.. Intervals(stats, parameters, now).Select(s => StatsRow(s, stamp))],
+            "RCA-SQL-10" => [.. Intervals(stats, parameters, now).Where(s => !LeftOut(parameters).Contains((long)s["query_id"]!)).Select(s => StatsRow(s, stamp))],
             "RCA-SQL-11" => [.. Intervals(waits, parameters, now).Where(w => Ids(parameters, "@plans").Contains((long)w["plan_id"]!)).Select(w => WaitRow(w, stamp))],
             "RCA-SQL-14" => PlanRows(parameters, stamp),
+            "RCA-SQL-16" => AdHoc(parameters, now),
             "RCA-SQL-15" => [Row(("captured_at_utc", now.UtcDateTime), ("actual_state", "READ_WRITE"), ("desired_state", "READ_WRITE"), ("readonly_reason", 0), ("query_capture_mode", "AUTO"), ("interval_length_minutes", 15L), ("current_storage_size_mb", 118L), ("max_storage_size_mb", 1000L), ("forced_plans", now >= Forced ? "412:31:AUTO" : null))],
             "RCA-AZ-03" => [Row(("captured_at_utc", now.UtcDateTime), ("name", "FORCE_LAST_GOOD_PLAN"), ("desired_state_desc", "ON"), ("actual_state_desc", "ON"), ("reason_desc", null))],
             "RCA-AZ-04" => Recommendation(now),
@@ -171,6 +173,20 @@ internal sealed class T3QueryStore
 
     private static HashSet<long> Ids(CaptureParameters parameters, string name) =>
         [.. ((string?)parameters.Value(name) ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries).Select(id => long.Parse(id, CultureInfo.InvariantCulture))];
+
+    /// <summary>@left_out, RCA-SQL-10's and 14's JSON array of the runner's own statements' query_ids.</summary>
+    public static HashSet<long> LeftOut(CaptureParameters parameters) =>
+        parameters.Value("@left_out") is string json ? [.. JsonSerializer.Deserialize<long[]>(json) ?? []] : [];
+
+    /// <summary>RCA-SQL-16: the fixture's statements outside any module that ran in the read's intervals, none of them the runner's.</summary>
+    private List<CaptureValues> AdHoc(CaptureParameters parameters, DateTimeOffset now) =>
+    [
+        .. Intervals(stats, parameters, now)
+            .Where(s => s["module_name"] is null)
+            .GroupBy(s => (long)s["query_id"]!)
+            .OrderBy(g => g.Key)
+            .Select(g => Row(("query_id", g.Key), ("query_sql_text", Raw((string?)g.First()["statement_text"])))),
+    ];
 
     private static CaptureValues StatsRow(Dictionary<string, object?> s, DateTimeOffset stamp) => Row(
         ("captured_at_utc", stamp.UtcDateTime),
@@ -214,12 +230,13 @@ internal sealed class T3QueryStore
         var queries = Ids(parameters, "@queries");
         var asked = Ids(parameters, "@plans");
         var withPlan = Ids(parameters, "@with_plan");
+        var leftOut = LeftOut(parameters);
         var rows = new List<CaptureValues>();
         foreach (var plan in plans.Select(p => (long)p["plan_id"]!).Distinct().Order())
         {
             // A plan as the latest of the fixture's reads up to this one saw it.
             var seen = plans.Where(p => (long)p["plan_id"]! == plan && (DateTimeOffset)p["captured_at_utc"]! <= stamp).MaxBy(p => (DateTimeOffset)p["captured_at_utc"]!);
-            if (seen is null || !(queries.Contains((long)seen["query_id"]!) || asked.Contains(plan) || (bool)seen["is_forced_plan"]!))
+            if (seen is null || leftOut.Contains((long)seen["query_id"]!) || !(queries.Contains((long)seen["query_id"]!) || asked.Contains(plan) || (bool)seen["is_forced_plan"]!))
             {
                 continue;
             }
@@ -393,7 +410,7 @@ internal sealed class TimedConnector(ManualTime clock, ICaptureConnector evidenc
 {
     public const string TransportError = "SQL error 10054: A transport-level error has occurred when receiving results from the server.";
 
-    public static readonly HashSet<string> QueryStoreBlocks = new(StringComparer.Ordinal) { "RCA-SQL-10", "RCA-SQL-11", "RCA-SQL-14", "RCA-SQL-15", "RCA-AZ-03", "RCA-AZ-04" };
+    public static readonly HashSet<string> QueryStoreBlocks = new(StringComparer.Ordinal) { "RCA-SQL-10", "RCA-SQL-11", "RCA-SQL-14", "RCA-SQL-15", "RCA-SQL-16", "RCA-AZ-03", "RCA-AZ-04" };
 
     public List<(DateTimeOffset At, string BlockId, TimeSpan Timeout, CaptureParameters? Parameters)> Calls { get; } = [];
 

@@ -629,13 +629,13 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         $captureReadme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'capture/README.md'))
     }
 
-    It 'names 43 blocks, each once: RCA-SQL-01 to 15, RCA-AZ-01 to 05, RCA-XE-00 to 05, RCA-PG-01 to 17' {
-        $expected = @(1..15 | ForEach-Object { 'RCA-SQL-{0:d2}' -f $_ }) + @(1..5 | ForEach-Object { 'RCA-AZ-{0:d2}' -f $_ }) + @(0..5 | ForEach-Object { 'RCA-XE-{0:d2}' -f $_ }) + @(1..17 | ForEach-Object { 'RCA-PG-{0:d2}' -f $_ })
+    It 'names 44 blocks, each once: RCA-SQL-01 to 16, RCA-AZ-01 to 05, RCA-XE-00 to 05, RCA-PG-01 to 17' {
+        $expected = @(1..16 | ForEach-Object { 'RCA-SQL-{0:d2}' -f $_ }) + @(1..5 | ForEach-Object { 'RCA-AZ-{0:d2}' -f $_ }) + @(0..5 | ForEach-Object { 'RCA-XE-{0:d2}' -f $_ }) + @(1..17 | ForEach-Object { 'RCA-PG-{0:d2}' -f $_ })
         @($blocks | Sort-Object) | Should -Be @($expected | Sort-Object)
     }
 
     It 'lists every block in capture/README.md, each row with its documentation' {
-        $blocks.Count | Should -Be 43
+        $blocks.Count | Should -Be 44
         $rows = @($captureReadme -split "`n" | Where-Object { $_ -match '^\| RCA-' })
         foreach ($block in $blocks) {
             $family, $number = $block -replace '^RCA-', '' -split '-'

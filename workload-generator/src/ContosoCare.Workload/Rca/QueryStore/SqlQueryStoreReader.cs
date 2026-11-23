@@ -69,8 +69,13 @@ internal sealed record SqlQueryStoreOptions
 /// self-throttling's factor, and while the observer is slowed or has stopped its detail capture, no interval read starts
 /// or goes on (Query Store keeps the intervals, and the next read takes them); the end's reads come after the evidence's
 /// own end (which the observer reports to the lane first) and together take at most <see cref="SqlQueryStoreOptions.EndBudget"/>.
-/// The capture leaves out its own statements and the harness's by the blocks' two fixed rules (rca/README.md, What the
-/// capture leaves out), and nothing else; the reader takes no list from anywhere to leave something out.
+/// The capture leaves out its own statements, the harness's modules, and the runner's own statements outside any module,
+/// by the README's three fixed rules (rca/README.md, What the capture leaves out), and nothing else: RCA-SQL-16 returns
+/// the ad hoc texts of a read's intervals, the reader matches them with <see cref="HarnessStatements"/>, the one list it
+/// has, and RCA-SQL-10 and 14 leave out the matching query_ids before they rank, as RCA-SQL-15's and RCA-AZ-04's events
+/// name none. One that RCA-SQL-16 didn't return, in an interval that ended between the two reads or past its bound, is
+/// matched by the text RCA-SQL-10 and 14 return: its rows are dropped, and RCA-SQL-10's page is read again with it left
+/// out, so the top lists still rank without it.
 /// </summary>
 internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticTuning, ISidecarSink sink, SqlQueryStoreOptions? options = null)
 {
@@ -102,6 +107,13 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
     private readonly HashSet<string> sources = new(StringComparer.Ordinal);
     private readonly List<string> gaps = [];
     private readonly Dictionary<string, DateTimeOffset> noted = new(StringComparer.Ordinal);
+
+    // RCA-SQL-16's ad hoc query_ids: a fingerprint of the text each had, and whether that text is the runner's own.
+    private readonly Dictionary<long, (ulong Text, bool Runners)> adHoc = [];
+
+    // Events of RCA-SQL-15 and RCA-AZ-04 about a query not matched yet, which wait for the observation's first RCA-SQL-16.
+    private readonly List<CaptureRow> waiting = [];
+    private bool matched;
     private QueryStoreSchedule schedule = QueryStoreSchedule.Default;
     private SqlQueryStoreState? state;
     private IntervalRead? read;
@@ -117,6 +129,7 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
 
     private enum Phase
     {
+        AdHoc,
         Stats,
         Waits,
         Plans,
@@ -143,6 +156,9 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         sources.Clear();
         gaps.Clear();
         noted.Clear();
+        adHoc.Clear();
+        waiting.Clear();
+        matched = false;
         since = schedule.FirstSince(now);
         nextState = now;
         nextTuning = now;
@@ -279,6 +295,11 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
                 Finish(final, now);
             }
         }
+        finally
+        {
+            // Events that waited for a match no RCA-SQL-16 made are written as they are.
+            Matched();
+        }
     }
 
     private static DateTimeOffset Earliest(DateTimeOffset first, DateTimeOffset second) => first <= second ? first : second;
@@ -329,7 +350,7 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         {
             foreach (var change in current.Changes(previous, target))
             {
-                sink.Write(change);
+                WriteEvent(change);
             }
         }
 
@@ -385,7 +406,10 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         if (recommendations.Rows is { } rows)
         {
             Returned(SqlAutomaticTuning.RecommendationsBlock, rows);
-            tuning.Recommendations(rows, now).ForEach(sink.Write);
+            foreach (var change in tuning.Recommendations(rows, now))
+            {
+                WriteEvent(change);
+            }
         }
         else
         {
@@ -394,9 +418,9 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
     }
 
     /// <summary>
-    /// Runs the interval read's blocks in order, RCA-SQL-10 and 11 page by page, then RCA-SQL-14, then its coverage row:
-    /// one block at most with <paramref name="oneBlock"/>, and none once <paramref name="timeout"/> has no time left. A step
-    /// with no block to run, such as RCA-SQL-14 with nothing to ask, doesn't count.
+    /// Runs the interval read's blocks in order, RCA-SQL-16, 10, and 11 page by page, then RCA-SQL-14, then its coverage
+    /// row: one block at most with <paramref name="oneBlock"/>, and none once <paramref name="timeout"/> has no time left. A
+    /// step with no block to run, such as RCA-SQL-14 with nothing to ask, doesn't count.
     /// </summary>
     private async Task AdvanceAsync(IntervalRead current, DateTimeOffset now, Func<TimeSpan?> timeout, bool oneBlock, CancellationToken cancellationToken)
     {
@@ -417,6 +441,9 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
             blocks++;
             switch (current.Phase)
             {
+                case Phase.AdHoc:
+                    await AdHocAsync(current, now, limit, cancellationToken).ConfigureAwait(false);
+                    break;
                 case Phase.Stats:
                     await StatsAsync(current, now, limit, cancellationToken).ConfigureAwait(false);
                     break;
@@ -431,12 +458,68 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         }
     }
 
-    /// <summary>One page of RCA-SQL-10: the intervals that ended after <see cref="since"/>, the oldest first.</summary>
+    /// <summary>
+    /// RCA-SQL-16 before each page of RCA-SQL-10: the ad hoc statements that ran in the intervals it's about to read, each
+    /// query_id matched once per text (<see cref="HarnessStatements"/>), and again when its text changes, since Query Store
+    /// reuses a query_id once it's cleared. RCA-SQL-10 and 14 then leave out the runner's own (<see cref="LeftOut"/>). A
+    /// read whose statements couldn't be told apart doesn't read the statistics: it's tried again, as a failed RCA-SQL-10 is.
+    /// </summary>
+    private async Task AdHocAsync(IntervalRead current, DateTimeOffset now, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        var result = await access.RunAsync(SqlQueryStoreRows.AdHocBlock, now, CaptureParameters.Named(("@since", since), ("@final", current.Final)), timeout, cancellationToken).ConfigureAwait(false);
+        if (result.Rows is not { } rows)
+        {
+            current.Complete = false;
+            current.Phase = Phase.Plans;
+            GapOnce(now, "ad-hoc", $"Query Store's statistics (RCA-SQL-10) weren't read on {target}: the runner's own statements among them couldn't be told apart (RCA-SQL-16): {Why(SqlQueryStoreRows.AdHocBlock, result)} {Then(current.Final, since)}");
+            return;
+        }
+
+        foreach (var row in rows)
+        {
+            if (row.Long("query_id") is not { } query || row.Text("query_sql_text") is not { } text)
+            {
+                continue;
+            }
+
+            var fingerprint = Fingerprint(text);
+            if (!adHoc.TryGetValue(query, out var known) || known.Text != fingerprint)
+            {
+                adHoc[query] = (fingerprint, HarnessStatements.IsRunners(text));
+            }
+        }
+
+        if (rows.Count >= SqlQueryStoreRows.AdHocCap)
+        {
+            GapOnce(now, "ad-hoc-bound", string.Create(CultureInfo.InvariantCulture, $"RCA-SQL-16: {SqlQueryStoreRows.AdHocCap:N0} ad hoc statements read, the most executed first. On {target}, a statement of the runner's past them is matched by the text RCA-SQL-10 and 14 return instead."));
+        }
+
+        Matched();
+        current.Phase = Phase.Stats;
+    }
+
+    /// <summary>The observation's queries are matched from now on: the events that waited for it are written, but the runner's own.</summary>
+    private void Matched()
+    {
+        matched = true;
+        var held = waiting.ToList();
+        waiting.Clear();
+        foreach (var row in held)
+        {
+            WriteEvent(row);
+        }
+    }
+
+    /// <summary>
+    /// One page of RCA-SQL-10: the intervals that ended after <see cref="since"/>, the oldest first. A page with one of the
+    /// runner's own statements that wasn't recorded yet (<see cref="IsRunnersRow"/>) is read again, as the read's next
+    /// block, with it in @left_out, so the top lists rank without it; one already recorded is dropped.
+    /// </summary>
     private async Task StatsAsync(IntervalRead current, DateTimeOffset now, TimeSpan timeout, CancellationToken cancellationToken)
     {
         current.From = since;
         current.Pages++;
-        var result = await access.RunAsync(SqlQueryStoreRows.StatsBlock, now, CaptureParameters.Named(("@since", current.From), ("@final", current.Final)), timeout, cancellationToken).ConfigureAwait(false);
+        var result = await access.RunAsync(SqlQueryStoreRows.StatsBlock, now, CaptureParameters.Named(("@since", current.From), ("@final", current.Final), ("@left_out", LeftOut())), timeout, cancellationToken).ConfigureAwait(false);
         if (result.Rows is not { } rows)
         {
             current.Complete = false;
@@ -445,8 +528,27 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
             return;
         }
 
-        Returned(SqlQueryStoreRows.StatsBlock, rows);
-        var kept = rows.Select(r => SqlQueryStoreRows.Stats(target, r, now)).OfType<CaptureRow>().ToList();
+        var mine = new List<CaptureValues>(rows.Count);
+        var recorded = false;
+        foreach (var row in rows)
+        {
+            if (IsRunnersRow(row, out var isNew))
+            {
+                recorded |= isNew;
+                continue;
+            }
+
+            mine.Add(row);
+        }
+
+        if (recorded)
+        {
+            current.Pages--;
+            return;
+        }
+
+        Returned(SqlQueryStoreRows.StatsBlock, mine);
+        var kept = mine.Select(r => SqlQueryStoreRows.Stats(target, r, now)).OfType<CaptureRow>().ToList();
         var intervals = kept.Select(SqlQueryStoreRows.Interval).Distinct().OrderBy(i => i.Start).ToList();
         current.Capped = rows.Count >= settings.RowCap;
         if (current.Capped && intervals.Count > 1)
@@ -520,20 +622,22 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         }
         else
         {
-            current.Phase = Phase.Stats;
+            current.Phase = Phase.AdHoc;
         }
     }
 
     private bool HasPlansToRead(IntervalRead current) =>
         current.Queries.Count > 0 || current.Plans.Count > 0 || ForcedPlans().Any(p => !sent.TryGetValue(p, out var s) || s.Forced != true);
 
-    private HashSet<long> ForcedPlans() => state?.Forced.Keys.Select(k => k.Plan).ToHashSet() ?? [];
+    /// <summary>RCA-SQL-15's forced plans, but those of the runner's own statements, which RCA-SQL-14 leaves out.</summary>
+    private HashSet<long> ForcedPlans() => state?.Forced.Keys.Where(k => !IsRunners(k.Query)).Select(k => k.Plan).ToHashSet() ?? [];
 
     /// <summary>
     /// RCA-SQL-14 for the read's queries and plans: a plan's row when it wasn't written in this observation, or when its
     /// forcing, its forcing failures, or its last compile changed, or its summary is new. A plan's showplan is fetched
     /// once per observation, at most <see cref="SqlQueryStoreOptions.PlansWithXml"/> a read, and only up to
-    /// <see cref="PlanSummary.MaximumXmlBytes"/>; one past that is a gap that says its size.
+    /// <see cref="PlanSummary.MaximumXmlBytes"/>; one past that is a gap that says its size. A plan of one of the runner's
+    /// own statements (a forced plan's, of one no RCA-SQL-16 returned) is dropped, and its query isn't asked for again.
     /// </summary>
     private async Task PlansAsync(IntervalRead current, DateTimeOffset now, TimeSpan timeout, CancellationToken cancellationToken)
     {
@@ -545,7 +649,7 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
             .ThenBy(p => p)
             .Take(settings.PlansWithXml)
             .ToHashSet();
-        var parameters = CaptureParameters.Named(("@queries", SqlQueryStoreRows.Ids(current.Queries)), ("@plans", SqlQueryStoreRows.Ids(current.Plans)), ("@with_plan", SqlQueryStoreRows.Ids(withPlan)));
+        var parameters = CaptureParameters.Named(("@queries", SqlQueryStoreRows.Ids(current.Queries)), ("@plans", SqlQueryStoreRows.Ids(current.Plans)), ("@with_plan", SqlQueryStoreRows.Ids(withPlan)), ("@left_out", LeftOut()));
         var result = await access.RunAsync(SqlQueryStoreRows.PlansBlock, now, parameters, timeout, cancellationToken).ConfigureAwait(false);
         if (result.Rows is not { } rows)
         {
@@ -555,10 +659,11 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
             return;
         }
 
-        Returned(SqlQueryStoreRows.PlansBlock, rows);
+        var mine = rows.Where(r => !IsRunnersRow(r, out _)).ToList();
+        Returned(SqlQueryStoreRows.PlansBlock, mine);
         carriedQueries.Clear();
         carriedPlans.Clear();
-        foreach (var row in rows)
+        foreach (var row in mine)
         {
             if (row.Long("plan_id") is not { } plan)
             {
@@ -704,6 +809,68 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         }
     }
 
+    /// <summary>Whether RCA-SQL-16's text for a query_id was the runner's own statement.</summary>
+    private bool IsRunners(long query) => adHoc.TryGetValue(query, out var known) && known.Runners;
+
+    /// <summary>
+    /// The list's backstop on a row RCA-SQL-10 or 14 returned: whether it's one of the runner's own statements, a statement
+    /// outside any module (no module_name, as RCA-SQL-16's object_id 0) whose text is on the list
+    /// (<see cref="HarnessStatements"/>), which RCA-SQL-16 didn't return when its interval ended between the two reads or
+    /// it was past the bound. Its query_id is recorded as the runner's, for @left_out and the events, and
+    /// <paramref name="recorded"/> says it wasn't already.
+    /// </summary>
+    private bool IsRunnersRow(CaptureValues row, out bool recorded)
+    {
+        recorded = false;
+        if (row.Text("module_name") is not null || row.Text("query_sql_text") is not { Length: <= SqlQueryStoreRows.AdHocTextLength } text || !HarnessStatements.IsRunners(text))
+        {
+            return false;
+        }
+
+        if (row.Long("query_id") is { } query && !IsRunners(query))
+        {
+            adHoc[query] = (Fingerprint(text), true);
+            recorded = true;
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// An event of RCA-SQL-15 or RCA-AZ-04, written unless it names one of the runner's own statements. Until the
+    /// observation's first RCA-SQL-16 has matched its queries, an event about a query it hasn't seen waits for it.
+    /// </summary>
+    private void WriteEvent(CaptureRow row)
+    {
+        if (row.Get("query_id") is not long query || (!adHoc.ContainsKey(query) && matched))
+        {
+            sink.Write(row);
+        }
+        else if (!adHoc.ContainsKey(query))
+        {
+            waiting.Add(row);
+        }
+        else if (!IsRunners(query))
+        {
+            sink.Write(row);
+        }
+    }
+
+    /// <summary>@left_out: the runner's own statements' query_ids, a JSON array, every one matched in this observation.</summary>
+    private string LeftOut() => "[" + string.Join(',', adHoc.Where(k => k.Value.Runners).Select(k => k.Key).Order().Select(id => id.ToString(CultureInfo.InvariantCulture))) + "]";
+
+    /// <summary>A text's 64-bit FNV-1a fingerprint: a query_id whose text changed is matched again.</summary>
+    private static ulong Fingerprint(string text)
+    {
+        var hash = 14695981039346656037UL;
+        foreach (var c in text)
+        {
+            hash = (hash ^ c) * 1099511628211UL;
+        }
+
+        return hash;
+    }
+
     private void Gap(DateTimeOffset at, string text) =>
         gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{at:HH:mm:ss} UTC: {TextNormalizer.Detail(text) ?? "A gap the observer couldn't describe."}"));
 
@@ -749,12 +916,12 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
     /// <summary>What a plan's last written row said: a change to any of it writes the plan again.</summary>
     private sealed record SentPlan(bool? Forced, string? ForcingType, long? Failures, DateTimeOffset? LastCompiled, bool Summarized);
 
-    /// <summary>One interval read: RCA-SQL-10 and 11 page by page, then RCA-SQL-14, then its coverage row.</summary>
+    /// <summary>One interval read: RCA-SQL-16, 10, and 11 page by page, then RCA-SQL-14, then its coverage row.</summary>
     private sealed class IntervalRead(bool final, IEnumerable<long> queries, IEnumerable<long> plans)
     {
         public bool Final { get; } = final;
 
-        public Phase Phase { get; set; } = Phase.Stats;
+        public Phase Phase { get; set; } = Phase.AdHoc;
 
         public int Pages { get; set; }
 
