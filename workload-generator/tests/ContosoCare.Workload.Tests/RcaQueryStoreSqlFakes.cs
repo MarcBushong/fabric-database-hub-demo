@@ -513,7 +513,9 @@ internal static class LaneDriver
 {
     /// <summary>
     /// Begins the observer at <paramref name="from"/>; ticks it when it says, 50 ms to 1 s after the last tick ended, as
-    /// ObserverLane does; and ends it at <paramref name="to"/>.
+    /// ObserverLane does; ends it at <paramref name="to"/>; and releases it, as the lane does with the end hook wired: at
+    /// the clock's time when the evidence's own end is done (EndAsync's hook), or the clock's time once EndAsync returns.
+    /// The target is the span's only member, so its release closes the span.
     /// </summary>
     public static async Task RunAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to, CancellationToken cancellationToken)
     {
@@ -534,7 +536,10 @@ internal static class LaneDriver
             clock.Set(to);
         }
 
-        await observer.EndAsync(to, cancellationToken);
-        span.Ended(observer.Target, to);
+        DateTimeOffset? evidenceEnded = null;
+        await observer.EndAsync(to, cancellationToken, () => evidenceEnded = clock.Now);
+        var released = evidenceEnded ?? clock.Now;
+        span.Ended(observer.Target, released);
+        span.Close(released);
     }
 }

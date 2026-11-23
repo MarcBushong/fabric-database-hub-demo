@@ -63,10 +63,12 @@ internal sealed record SqlQueryStoreOptions
 /// first interval read and the last, every source, and every gap in time order.</item>
 /// </list>
 /// The reads leave the evidence document as it would be without them (<see cref="ISidecarAccess"/>): a failure is a
-/// sidecar gap; they run last in a tick, a block only when its timeout ends before the evidence capture's next work, and
-/// at most one block of an interval read a tick; the state's and tuning's cadence is multiplied by the self-throttling's
-/// factor, and while the observer is slowed or has stopped its detail capture, no interval read starts (Query Store keeps
-/// the intervals, and the next read takes them); the end's reads together take at most <see cref="SqlQueryStoreOptions.EndBudget"/>.
+/// sidecar gap (a refusal's names the permission its block needs, and the fix: RCA-AZ-04's its own), and the rest of the
+/// reads go on; they run last in a tick, a block only when its own timeout ends before the evidence capture's next work,
+/// and at most one block of an interval read a tick; the state's and tuning's cadence is multiplied by the
+/// self-throttling's factor, and while the observer is slowed or has stopped its detail capture, no interval read starts
+/// or goes on (Query Store keeps the intervals, and the next read takes them); the end's reads come after the evidence's
+/// own end (which the observer reports to the lane first) and together take at most <see cref="SqlQueryStoreOptions.EndBudget"/>.
 /// The capture leaves out its own statements and the harness's by the blocks' two fixed rules (rca/README.md, What the
 /// capture leaves out), and nothing else; the reader takes no list from anywhere to leave something out.
 /// </summary>
@@ -77,6 +79,18 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         SqlQueryStoreRows.StatsBlock, SqlQueryStoreRows.WaitsBlock, SqlQueryStoreRows.PlansBlock, SqlQueryStoreRows.StateBlock,
         SqlAutomaticTuning.OptionsBlock, SqlAutomaticTuning.RecommendationsBlock,
     ];
+
+    /// <summary>
+    /// RCA-AZ-04's fix. Azure SQL Database grants no permission at the server level: its fixed server roles hold them, and
+    /// their members are logins in master, never contained database users; ##MS_ServerStateReader## holds VIEW SERVER
+    /// PERFORMANCE STATE, and a login's role reaches a database through the login's user there
+    /// (https://learn.microsoft.com/azure/azure-sql/database/security-server-roles). A managed identity's login is a
+    /// Microsoft Entra server principal (https://learn.microsoft.com/azure/azure-sql/database/authentication-azure-ad-logins).
+    /// T1's identity has the permission through T3's administrator group, the server's Microsoft Entra administrator, which
+    /// ./scripts/deploy.ps1 adds it to (database/azuresql/README.md, Users; Add-DemoT1ToT3AdminGroup).
+    /// </summary>
+    private const string ServerPermissionFix =
+        "The fix: a contained database user can't hold a server permission. T1's managed identity needs a login in master, in the ##MS_ServerStateReader## server role (which holds VIEW SERVER PERFORMANCE STATE on Azure SQL Database), and its user in ContosoCare made from that login; or ./scripts/deploy.ps1, which adds T1's managed identity to T3's administrator group again, the server's Microsoft Entra administrator.";
 
     private readonly string target = access.Target;
     private readonly SqlQueryStoreOptions settings = options ?? new SqlQueryStoreOptions();
@@ -94,7 +108,9 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
     private DateTimeOffset since;
     private DateTimeOffset nextState;
     private DateTimeOffset nextTuning;
+    private bool recommendationsDue;
     private DateTimeOffset nextRead;
+    private DateTimeOffset readResume;
     private DateTimeOffset coverageFrom;
     private DateTimeOffset? readFrom;
     private DateTimeOffset? readTo;
@@ -130,7 +146,9 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         since = schedule.FirstSince(now);
         nextState = now;
         nextTuning = now;
+        recommendationsDue = false;
         nextRead = now;
+        readResume = now;
         coverageFrom = now;
         readFrom = null;
         readTo = null;
@@ -138,40 +156,59 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
 
     /// <summary>
     /// The reads that are due and fit before <paramref name="evidenceDue"/>, the evidence capture's next work, counting
-    /// from <paramref name="tickStarted"/> (<see cref="Timestamp"/>): the state, T3's tuning, and one block of the interval
-    /// read. Each read's next time is set before it runs, so one that fails or throws waits its turn. Returns when the
-    /// reader next has work it could do.
+    /// from <paramref name="tickStarted"/> (<see cref="Timestamp"/>): the state, T3's tuning (each of its two blocks when
+    /// its own timeout fits, so a blocking episode's 10-s detail doesn't stop them), and one block of the interval read.
+    /// While the observer is slowed or has stopped its detail capture, no interval read starts or goes on: one under way
+    /// keeps its place and its since, and is looked at again after <see cref="SqlQueryStoreOptions.Retry"/>. Each read's
+    /// next time is set before it runs, so one that fails or throws waits its turn. Returns when the reader next has work
+    /// it could do.
     /// </summary>
     public async Task<DateTimeOffset> TickAsync(DateTimeOffset now, long tickStarted, DateTimeOffset evidenceDue, CancellationToken cancellationToken)
     {
         var room = evidenceDue - now;
+        var light = settings.LightTimeout;
         bool Fits(TimeSpan timeout) => room - settings.Clock.GetElapsedTime(tickStarted) >= timeout + settings.Margin;
 
-        if (now >= nextState && Fits(settings.LightTimeout))
+        if (now >= nextState && Fits(light))
         {
             nextState = now + Scaled(settings.StateEvery);
-            await ReadStateAsync(now, () => settings.LightTimeout, cancellationToken).ConfigureAwait(false);
+            await ReadStateAsync(now, () => light, cancellationToken).ConfigureAwait(false);
         }
 
-        if (automaticTuning && now >= nextTuning && Fits(settings.LightTimeout + settings.LightTimeout))
+        if (automaticTuning && now >= nextTuning && Fits(light))
         {
             nextTuning = now + Scaled(settings.TuningEvery);
-            await ReadTuningAsync(now, () => settings.LightTimeout, cancellationToken).ConfigureAwait(false);
+            recommendationsDue = true;
+            await ReadOptionsAsync(now, () => light, cancellationToken).ConfigureAwait(false);
         }
 
+        if (recommendationsDue && Fits(light))
+        {
+            recommendationsDue = false;
+            await ReadRecommendationsAsync(now, () => light, cancellationToken).ConfigureAwait(false);
+        }
+
+        var throttled = access.Factor > 1 || access.DetailStopped;
         if (read is null && now >= nextRead)
         {
-            if (Held(now))
+            if (throttled)
             {
+                Held(now);
                 nextRead = now + settings.Retry;
             }
             else if (Fits(settings.ReadTimeout))
             {
                 read = new IntervalRead(final: false, carriedQueries, carriedPlans);
+                readResume = now;
             }
         }
+        else if (read is not null && throttled && now >= readResume)
+        {
+            Held(now);
+            readResume = now + settings.Retry;
+        }
 
-        if (read is { } current && Fits(settings.ReadTimeout))
+        if (read is { } current && !throttled && now >= readResume && Fits(settings.ReadTimeout))
         {
             try
             {
@@ -188,13 +225,13 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
 
         // A read that's due but doesn't fit runs once the evidence capture's next work is done.
         DateTimeOffset When(DateTimeOffset due, TimeSpan timeout) => due > now ? due : Fits(timeout) ? now : evidenceDue;
-        var wake = When(nextState, settings.LightTimeout);
+        var wake = When(nextState, light);
         if (automaticTuning)
         {
-            wake = Earliest(wake, When(nextTuning, settings.LightTimeout + settings.LightTimeout));
+            wake = Earliest(wake, When(recommendationsDue ? now : nextTuning, light));
         }
 
-        return Earliest(wake, When(read is null ? nextRead : now, settings.ReadTimeout));
+        return Earliest(wake, When(read is null ? nextRead : readResume, settings.ReadTimeout));
     }
 
     /// <summary>
@@ -222,7 +259,9 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
             await ReadStateAsync(now, () => Left(settings.LightTimeout), cancellationToken).ConfigureAwait(false);
             if (automaticTuning)
             {
-                await ReadTuningAsync(now, () => Left(settings.LightTimeout), cancellationToken).ConfigureAwait(false);
+                recommendationsDue = false;
+                await ReadOptionsAsync(now, () => Left(settings.LightTimeout), cancellationToken).ConfigureAwait(false);
+                await ReadRecommendationsAsync(now, () => Left(settings.LightTimeout), cancellationToken).ConfigureAwait(false);
             }
 
             await AdvanceAsync(final, now, () => Left(settings.ReadTimeout), oneBlock: false, cancellationToken).ConfigureAwait(false);
@@ -252,19 +291,13 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         _ => string.Create(CultureInfo.InvariantCulture, $"the intervals that ended after {since:HH:mm} UTC"),
     };
 
-    /// <summary>While the observer is slowed or has stopped its detail capture, no interval read starts: Query Store keeps the intervals.</summary>
-    private bool Held(DateTimeOffset now)
+    /// <summary>The gap that says no interval read starts or goes on while the observer is slowed or has stopped its detail capture: Query Store keeps the intervals.</summary>
+    private void Held(DateTimeOffset now)
     {
-        if (access.Factor <= 1 && !access.DetailStopped)
-        {
-            return false;
-        }
-
         var why = access.DetailStopped
             ? "the observer stopped its detail capture for the rest of the session, so the end's read takes them"
             : string.Create(CultureInfo.InvariantCulture, $"the observer's samples are slow (its cadence is {access.Factor} times longer), so a read takes them once they're quick again, or the end's read");
         GapOnce(now, "held", string.Create(CultureInfo.InvariantCulture, $"Query Store's interval reads on {target} wait from {now:HH:mm:ss} UTC: {why}. Query Store keeps the intervals that ended after {since:HH:mm} UTC."));
-        return true;
     }
 
     private TimeSpan Scaled(TimeSpan every) => every * Math.Max(1, access.Factor);
@@ -280,7 +313,7 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         var result = await access.RunAsync(SqlQueryStoreRows.StateBlock, now, CaptureParameters.None, limit, cancellationToken).ConfigureAwait(false);
         if (result.Rows is not { } rows)
         {
-            GapOnce(now, "state", $"Query Store's state (RCA-SQL-15) wasn't read on {target}: {result.Message}");
+            GapOnce(now, "state", $"Query Store's state (RCA-SQL-15) wasn't read on {target}: {Why(SqlQueryStoreRows.StateBlock, result)}");
             return;
         }
 
@@ -318,40 +351,45 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         state = current;
     }
 
-    private async Task ReadTuningAsync(DateTimeOffset now, Func<TimeSpan?> timeout, CancellationToken cancellationToken)
+    /// <summary>RCA-AZ-03: automatic tuning's options, and an option whose state changed (RCA Query Events).</summary>
+    private async Task ReadOptionsAsync(DateTimeOffset now, Func<TimeSpan?> timeout, CancellationToken cancellationToken)
     {
-        if (timeout() is not { } first)
+        if (timeout() is not { } limit)
         {
-            Gap(now, $"Automatic tuning (RCA-AZ-03, 04) wasn't read on {target} at the end: the end's reads had no time left.");
+            Gap(now, $"Automatic tuning's options (RCA-AZ-03) weren't read on {target} at the end: the end's reads had no time left.");
             return;
         }
 
-        var options = await access.RunAsync(SqlAutomaticTuning.OptionsBlock, now, CaptureParameters.None, first, cancellationToken).ConfigureAwait(false);
-        if (options.Rows is { } optionRows)
+        var options = await access.RunAsync(SqlAutomaticTuning.OptionsBlock, now, CaptureParameters.None, limit, cancellationToken).ConfigureAwait(false);
+        if (options.Rows is { } rows)
         {
-            Returned(SqlAutomaticTuning.OptionsBlock, optionRows);
-            tuning.Options(optionRows, now).ForEach(sink.Write);
+            Returned(SqlAutomaticTuning.OptionsBlock, rows);
+            tuning.Options(rows, now).ForEach(sink.Write);
         }
         else
         {
-            GapOnce(now, "tuning-options", $"Automatic tuning's options (RCA-AZ-03) weren't read on {target}: {options.Message}");
+            GapOnce(now, "tuning-options", $"Automatic tuning's options (RCA-AZ-03) weren't read on {target}: {Why(SqlAutomaticTuning.OptionsBlock, options)}");
         }
+    }
 
-        if (timeout() is not { } second)
+    /// <summary>RCA-AZ-04: the tuning recommendations, and one that appeared or whose state changed (RCA Query Events).</summary>
+    private async Task ReadRecommendationsAsync(DateTimeOffset now, Func<TimeSpan?> timeout, CancellationToken cancellationToken)
+    {
+        if (timeout() is not { } limit)
         {
             Gap(now, $"Automatic tuning's recommendations (RCA-AZ-04) weren't read on {target} at the end: the end's reads had no time left.");
             return;
         }
 
-        var recommendations = await access.RunAsync(SqlAutomaticTuning.RecommendationsBlock, now, CaptureParameters.None, second, cancellationToken).ConfigureAwait(false);
-        if (recommendations.Rows is { } recommendationRows)
+        var recommendations = await access.RunAsync(SqlAutomaticTuning.RecommendationsBlock, now, CaptureParameters.None, limit, cancellationToken).ConfigureAwait(false);
+        if (recommendations.Rows is { } rows)
         {
-            Returned(SqlAutomaticTuning.RecommendationsBlock, recommendationRows);
-            tuning.Recommendations(recommendationRows, now).ForEach(sink.Write);
+            Returned(SqlAutomaticTuning.RecommendationsBlock, rows);
+            tuning.Recommendations(rows, now).ForEach(sink.Write);
         }
         else
         {
-            GapOnce(now, "tuning-recommendations", $"Automatic tuning's recommendations (RCA-AZ-04) weren't read on {target}: {recommendations.Message}");
+            GapOnce(now, "tuning-recommendations", $"Automatic tuning's recommendations (RCA-AZ-04) weren't read on {target}: {Why(SqlAutomaticTuning.RecommendationsBlock, recommendations)}");
         }
     }
 
@@ -403,7 +441,7 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         {
             current.Complete = false;
             current.Phase = Phase.Plans;
-            GapOnce(now, "stats", $"Query Store's statistics (RCA-SQL-10) weren't read on {target}: {result.Message} {Then(current.Final, current.From)}");
+            GapOnce(now, "stats", $"Query Store's statistics (RCA-SQL-10) weren't read on {target}: {Why(SqlQueryStoreRows.StatsBlock, result)} {Then(current.Final, current.From)}");
             return;
         }
 
@@ -465,7 +503,7 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         }
         else
         {
-            GapOnce(now, "waits", $"Query Store's waits (RCA-SQL-11) weren't read on {target}: {result.Message} The statistics' wait_ms holds each plan's total.");
+            GapOnce(now, "waits", $"Query Store's waits (RCA-SQL-11) weren't read on {target}: {Why(SqlQueryStoreRows.WaitsBlock, result)} The statistics' wait_ms holds each plan's total.");
         }
 
         var newest = kept.Max(r => SqlQueryStoreRows.Interval(r).End);
@@ -513,7 +551,7 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         {
             Carry(carriedQueries, current.Queries);
             Carry(carriedPlans, current.Plans);
-            GapOnce(now, "plans", $"Query Store's plans (RCA-SQL-14) weren't read on {target}: {result.Message} The next read asks for them again.");
+            GapOnce(now, "plans", $"Query Store's plans (RCA-SQL-14) weren't read on {target}: {Why(SqlQueryStoreRows.PlansBlock, result)} The next read asks for them again.");
             return;
         }
 
@@ -600,6 +638,36 @@ internal sealed class SqlQueryStoreReader(ISidecarAccess access, bool automaticT
         Carry(carriedPlans, current.Plans);
         read = null;
     }
+
+    /// <summary>
+    /// Why a block returned nothing, for its gap. A refusal names the permission the block needs, whatever the server's
+    /// message says, then the server's message and the fix: the observer's for the target (<see cref="ISidecarAccess"/>),
+    /// or RCA-AZ-04's own, since the target's general fix doesn't give a server permission.
+    /// </summary>
+    private string Why(string block, QuietResult result)
+    {
+        if (result.Failure != CaptureFailureKind.Permission)
+        {
+            return result.Message ?? "the read returned no rows and no error.";
+        }
+
+        return block == SqlAutomaticTuning.RecommendationsBlock
+            ? $"it needs {Permission(block)}, and {target} refused it: {result.Error ?? result.Message} {ServerPermissionFix}"
+            : $"it needs {Permission(block)}, and {target} refused it: {result.Message}";
+    }
+
+    /// <summary>
+    /// The permission a block needs, as Learn gives it for its view (rca/capture/README.md): Query Store's catalog views
+    /// (https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-runtime-stats-transact-sql#permissions),
+    /// sys.database_automatic_tuning_options, and sys.dm_db_tuning_recommendations
+    /// (https://learn.microsoft.com/sql/relational-databases/system-dynamic-management-views/sys-dm-db-tuning-recommendations-transact-sql#permissions).
+    /// </summary>
+    private static string Permission(string block) => block switch
+    {
+        SqlAutomaticTuning.OptionsBlock => "VIEW DATABASE STATE",
+        SqlAutomaticTuning.RecommendationsBlock => "VIEW SERVER PERFORMANCE STATE, a server permission",
+        _ => "VIEW DATABASE PERFORMANCE STATE, or VIEW DATABASE STATE, which includes it",
+    };
 
     /// <summary>What happens to the intervals a failed read didn't take.</summary>
     private static string Then(bool final, DateTimeOffset from) => final

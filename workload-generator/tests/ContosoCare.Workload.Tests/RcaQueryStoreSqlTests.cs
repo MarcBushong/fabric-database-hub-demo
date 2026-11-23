@@ -22,22 +22,6 @@ public sealed class RcaQueryStoreSqlTests
 
     private static readonly string[] SourceOrder = ["RCA-SQL-10", "RCA-SQL-11", "RCA-SQL-14", "RCA-SQL-15", "RCA-AZ-03", "RCA-AZ-04"];
 
-    // The reader's words where the aligned fixture (27c14daa) still has the first, hand-written ones: its plan summaries
-    // for plans 31, 58, and 12, and the details of the recommendation's Executing and Verifying events. The contract's
-    // author takes these into the fixture; then they change nothing here, and go.
-    private static readonly Dictionary<long, string> ReaderSummaries = new()
-    {
-        [31] = "Index Seek on [care].[appointments].[ix_appointments_patient] seeking patient_id (71 % of the cost); Key Lookup on [care].[appointments].[pk_appointments] for status and duration_minutes (27 %); Nested Loops (Inner Join) (2 %).",
-        [58] = "Clustered Index Scan on [care].[appointments].[pk_appointments] filtering on patient_id and status (88 % of the cost); Parallelism (Gather Streams) (12 %).",
-        [12] = "Index Scan on [care].[patients].[ix_patients_facility] (62 % of the cost); Sort (TopN Sort) by last_name and first_name (35 %); Top (3 %).",
-    };
-
-    private static readonly Dictionary<string, string> ReaderDetails = new(StringComparer.Ordinal)
-    {
-        ["Executing"] = "FORCE_LAST_GOOD_PLAN for query 412: plan 31 over plan 58, CPU time per execution 2.1 ms against 176 ms; Executing, applied by System at 17:09:15 UTC.",
-        ["Verifying"] = "FORCE_LAST_GOOD_PLAN for query 412: plan 31 over plan 58, CPU time per execution 2.1 ms against 176 ms; Verifying, applied by System at 17:09:15 UTC.",
-    };
-
     [Theory]
     [InlineData("RCA-SQL-10", "@final,@since")]
     [InlineData("RCA-SQL-11", "@final,@plans,@since")]
@@ -138,7 +122,7 @@ public sealed class RcaQueryStoreSqlTests
         // Every table, row by row and column by column; the coverage as the sidecar's export makes it one row.
         foreach (var table in new[] { RcaContract.QueryStats, RcaContract.QueryWaits, RcaContract.QueryPlans, RcaContract.QueryEvents })
         {
-            Assert.Equal(Canonical(WithReaderWords(table, fixture.Table(table))), Canonical(sidecar.Table(table)));
+            Assert.Equal(Canonical(fixture.Table(table)), Canonical(sidecar.Table(table)));
         }
 
         Assert.Equal(Canonical(fixture.Table(RcaContract.QueryCoverage)), Canonical([Coalesce(sidecar.Table(RcaContract.QueryCoverage))]));
@@ -414,8 +398,7 @@ public sealed class RcaQueryStoreSqlTests
         var with = await RunT1Async(sidecar);
 
         Assert.DoesNotContain(without.Connector.Calls, c => TimedConnector.QueryStoreBlocks.Contains(c.BlockId));
-        Assert.Equal(without.Evidence, with.Evidence);
-        Assert.Equal(without.Watermarks, with.Watermarks);
+        AssertSameEvidence(without, with);
 
         // Query Store's first read follows the first tick's sentinel, and its last read follows the event session's drop.
         var calls = with.Connector.Calls.Select(c => c.BlockId).ToList();
@@ -444,8 +427,7 @@ public sealed class RcaQueryStoreSqlTests
             _ => new InvalidOperationException("The connection threw (a test's failure)."),
         });
 
-        Assert.Equal(without.Evidence, with.Evidence);
-        Assert.Equal(without.Watermarks, with.Watermarks);
+        AssertSameEvidence(without, with);
         Assert.True(with.Watermarks.Count > 25, $"The watermark advanced {with.Watermarks.Count} times.");
         Assert.Contains(with.Connector.Failures, f => f.BlockId == "RCA-SQL-15");
         Assert.Contains("Query Store's state (RCA-SQL-15) wasn't read on T1: ", Gaps(sidecar), StringComparison.Ordinal);
@@ -462,8 +444,7 @@ public sealed class RcaQueryStoreSqlTests
         // Without a sink, the next detail sample finds the connection lost; with one, Query Store's state read did, first.
         Assert.Equal((RcaSimulation.At(16, 55, 10), "RCA-SQL-01"), without.Connector.Failures[0]);
         Assert.Equal((lost, "RCA-SQL-15"), with.Connector.Failures[0]);
-        Assert.Equal(without.Evidence, with.Evidence);
-        Assert.Equal(without.Watermarks, with.Watermarks);
+        AssertSameEvidence(without, with);
         Assert.Equal((2, 2), (without.Connector.Opens, with.Connector.Opens));
         Assert.Contains(with.Evidence, e => e.Contains($"16:55:10|T1 didn't answer RCA-SQL-01: {TimedConnector.TransportError}", StringComparison.Ordinal));
     }
@@ -475,8 +456,7 @@ public sealed class RcaQueryStoreSqlTests
         var sink = new ThrowingSidecarSink();
         var with = await RunT1Async(sink);
 
-        Assert.Equal(without.Evidence, with.Evidence);
-        Assert.Equal(without.Watermarks, with.Watermarks);
+        AssertSameEvidence(without, with);
 
         // Each interval read threw writing its coverage row: tried again 2 minutes later, never at every tick.
         var reads = with.Connector.Calls.Where(c => c.BlockId == "RCA-SQL-10" && c.At < RcaSimulation.T1To).Select(c => c.At).ToList();
@@ -499,8 +479,7 @@ public sealed class RcaQueryStoreSqlTests
             connector.QueryStore = (block, parameters) => block == "RCA-SQL-10" ? [StatRow(RcaSimulation.At(16, 30, 0), 7, cpu: 50)] : query(block, parameters);
         });
 
-        Assert.Equal(without.Evidence, with.Evidence);
-        Assert.Equal(without.Watermarks, with.Watermarks);
+        AssertSameEvidence(without, with);
 
         // The clock moved with Query Store's blocks; no interval read ran while the blocking episode's detail came every 10 s.
         var blocks = with.Connector.Calls.Where(c => TimedConnector.QueryStoreBlocks.Contains(c.BlockId)).ToList();
@@ -517,7 +496,92 @@ public sealed class RcaQueryStoreSqlTests
         Assert.All(blocks.Where(c => c.At < RcaSimulation.T1To), c => Assert.Equal(c.BlockId == "RCA-SQL-15" ? TimeSpan.FromSeconds(5) : TimeSpan.FromSeconds(15), c.Timeout));
     }
 
-    /// <summary>The 10 s before each tick's next evidence work: ticks the reader every second for <paramref name="span"/>.</summary>
+    [Fact]
+    public async Task ARefusedRcaAz04IsAGapWithItsPermissionAndItsOwnFixWhileTheRestMatchesTheFixture()
+    {
+        var without = await RunT3FixtureAsync(sidecar: null, refused: "RCA-AZ-04");
+        var sidecar = new MemorySidecarSink();
+        var with = await RunT3FixtureAsync(sidecar, refused: "RCA-AZ-04");
+
+        // The evidence document doesn't know: the same evidence, watermarks, and span as without a sink.
+        AssertSameEvidence(without.Run, with.Run);
+        Assert.Empty(without.Attempts);
+
+        // One attempt every 10 minutes (the observer's wait after a refusal), the end's included.
+        Assert.Equal([RcaSimulation.At(16, 50, 0), RcaSimulation.At(17, 0, 0), RcaSimulation.At(17, 10, 0), RcaSimulation.At(17, 20, 0)], with.Attempts);
+
+        // Each is a sidecar gap that names the permission and RCA-AZ-04's own fix, not T3's general one.
+        const string Gap = "Automatic tuning's recommendations (RCA-AZ-04) weren't read on T3: it needs VIEW SERVER PERFORMANCE STATE, a server permission, and T3 refused it: SQL error 297: The user does not have permission to perform this action. " +
+            "The fix: a contained database user can't hold a server permission. T1's managed identity needs a login in master, in the ##MS_ServerStateReader## server role (which holds VIEW SERVER PERFORMANCE STATE on Azure SQL Database), and its user in ContosoCare made from that login; " +
+            "or ./scripts/deploy.ps1, which adds T1's managed identity to T3's administrator group again, the server's Microsoft Entra administrator.";
+        Assert.Equal(with.Attempts.Select(a => string.Create(CultureInfo.InvariantCulture, $"{a:HH:mm:ss} UTC: {Gap}")), Gaps(sidecar).Split('\n'));
+
+        // The rest is the fixture's: RCA-SQL-10, 11, and 14 row for row, RCA-SQL-15's forcing, and RCA-AZ-03 as a source.
+        var fixture = with.Fixture;
+        foreach (var table in new[] { RcaContract.QueryStats, RcaContract.QueryWaits, RcaContract.QueryPlans })
+        {
+            Assert.Equal(Canonical(fixture.Table(table)), Canonical(sidecar.Table(table)));
+        }
+
+        var events = fixture.Table(RcaContract.QueryEvents);
+        var recommendations = events.Where(e => (string?)e["kind"] == "tuning" && e["query_id"] is not null).ToList();
+        Assert.Equal(3, recommendations.Count);
+        Assert.Equal(Canonical(events.Except(recommendations)), Canonical(sidecar.Table(RcaContract.QueryEvents)));
+        var coverage = Coalesce(sidecar.Table(RcaContract.QueryCoverage));
+        var expected = Assert.Single(fixture.Table(RcaContract.QueryCoverage));
+        expected["sources"] = "RCA-SQL-10,RCA-SQL-11,RCA-SQL-14,RCA-SQL-15,RCA-AZ-03";
+        expected["gaps"] = string.Join('\n', with.Attempts.Select(a => string.Create(CultureInfo.InvariantCulture, $"{a:HH:mm:ss} UTC: {Gap}")));
+        Assert.Equal(Canonical([expected]), Canonical([coverage]));
+    }
+
+    [Fact]
+    public async Task T3sTuningReadsGoOnEvery30SecondsThroughABlockingEpisode()
+    {
+        var without = await RunT3BlockingAsync(sidecar: null);
+        var with = await RunT3BlockingAsync(new MemorySidecarSink());
+
+        AssertSameEvidence(without, with);
+
+        // The chain's detail came every 10 s from 16:52:30 to 17:01:40: each tuning block fits its own 5 s between samples.
+        Assert.Contains(with.Connector.Calls, c => c.BlockId == "RCA-SQL-01" && c.At == RcaSimulation.At(16, 52, 30));
+        Assert.Contains(with.Connector.Calls, c => c.BlockId == "RCA-SQL-01" && c.At == RcaSimulation.At(17, 1, 30));
+        var expected = Enumerable.Range(0, 30).Select(i => RcaSimulation.T1From.AddSeconds(30 * i)).Append(RcaSimulation.T1To).ToList();
+        foreach (var block in new[] { "RCA-AZ-03", "RCA-AZ-04" })
+        {
+            Assert.Equal(expected, with.Connector.Calls.Where(c => c.BlockId == block).Select(c => c.At));
+        }
+    }
+
+    [Fact]
+    public async Task AnIntervalReadUnderWayHoldsWhileTheObserverIsSlowedAndKeepsItsPlaceAndSince()
+    {
+        var start = RcaSimulation.At(16, 50, 0);
+        var access = new FakeSidecarAccess("T1", (block, _) => block switch
+        {
+            "RCA-SQL-10" => [StatRow(RcaSimulation.At(16, 30, 0), 7, cpu: 50)],
+            "RCA-SQL-15" => [StateRow(start, "READ_WRITE", 0, null)],
+            _ => [],
+        });
+        var sink = new MemorySidecarSink();
+        var reader = new SqlQueryStoreReader(access, automaticTuning: false, sink);
+        reader.Begin(start);
+
+        // The read reads its statistics; the observer is slowed before its waits, then quick again from 16:51:30.
+        await TickAsync(reader, start, TimeSpan.FromSeconds(1));
+        access.Factor = 2;
+        await TickAsync(reader, start.AddSeconds(1), TimeSpan.FromSeconds(89));
+        Assert.Equal(start.AddHours(-2), reader.Since);
+        access.Factor = 1;
+        await TickAsync(reader, start.AddSeconds(90), TimeSpan.FromMinutes(1));
+
+        // It went on where it stood, 2 minutes after it was held: no read again of its statistics, and its since moved only then.
+        var reads = access.Calls.Where(c => c.BlockId is "RCA-SQL-10" or "RCA-SQL-11" or "RCA-SQL-14").Select(c => (c.BlockId, c.At)).ToList();
+        Assert.Equal([("RCA-SQL-10", start), ("RCA-SQL-11", start.AddSeconds(121)), ("RCA-SQL-14", start.AddSeconds(122))], reads);
+        Assert.Equal(RcaSimulation.At(16, 45, 0), reader.Since);
+        Assert.Contains("16:50:01 UTC: Query Store's interval reads on T1 wait from 16:50:01 UTC: the observer's samples are slow (its cadence is 2 times longer)", Gaps(sink), StringComparison.Ordinal);
+    }
+
+    /// <summary>Ticks the reader every second for <paramref name="span"/>, each tick with 30 s before the evidence's next work.</summary>
     private static async Task TickAsync(SqlQueryStoreReader reader, DateTimeOffset from, TimeSpan span, ManualTime? clock = null)
     {
         for (var now = from; now < from + span; now = now.AddSeconds(1))
@@ -529,10 +593,9 @@ public sealed class RcaQueryStoreSqlTests
 
     /// <summary>
     /// T1's simulated session (RcaSimulation's blocking chain), 16:50 to 17:05, driven as the lane drives it, through a
-    /// TimedConnector whose Query Store blocks the test sets up: the evidence (rows and notes), the watermark's values in
-    /// order, and the connector.
+    /// TimedConnector whose Query Store blocks the test sets up: the evidence, its watermarks, its span, and the connector.
     /// </summary>
-    private static async Task<T1Run> RunT1Async(ISidecarSink? sidecar, Action<TimedConnector>? setUp = null)
+    private static async Task<SessionRun> RunT1Async(ISidecarSink? sidecar, Action<TimedConnector>? setUp = null)
     {
         var clock = new ManualTime(RcaSimulation.T1From);
         var connector = new TimedConnector(clock, RcaSimulation.T1(clock)) { QueryStore = (block, _) => block == "RCA-SQL-15" ? [StateRow(clock.Now, "READ_WRITE", 0, null)] : [] };
@@ -542,11 +605,66 @@ public sealed class RcaQueryStoreSqlTests
 
         await LaneDriver.RunAsync(observer, span, clock, RcaSimulation.T1From, RcaSimulation.T1To, TestContext.Current.CancellationToken);
 
-        var evidence = span.Inner.Rows.Select(r => string.Join('|', new[] { r.Table, r.Target, Norm(r.At), r.Source, r.Sentinel ? "sentinel" : string.Empty }.Concat(r.Values.OrderBy(v => v.Key, StringComparer.Ordinal).Select(v => $"{v.Key}={Norm(v.Value)}"))))
-            .Concat(span.Inner.Notes.Select(n => string.Create(CultureInfo.InvariantCulture, $"note|{n.Kind}|{n.Target}|{n.At:HH:mm:ss}|{n.Text}")))
-            .ToList();
-        var watermarks = span.Marks.Where((m, i) => i == 0 || m != span.Marks[i - 1]).ToList();
-        return new T1Run(evidence, watermarks, connector);
+        return SessionRun.Of(span, connector);
+    }
+
+    /// <summary>T3 with T1's blocking chain (RcaSimulation.T1AsT3), 16:50 to 17:05, driven as the lane drives it; Query Store answers as a quiet T3's would.</summary>
+    private static async Task<SessionRun> RunT3BlockingAsync(ISidecarSink? sidecar)
+    {
+        var clock = new ManualTime(RcaSimulation.T1From);
+        var connector = new TimedConnector(clock, RcaSimulation.T1AsT3(clock))
+        {
+            QueryStore = (block, _) => block switch
+            {
+                "RCA-SQL-15" => [StateRow(clock.Now, "READ_WRITE", 0, null)],
+                "RCA-AZ-03" => [Row(("captured_at_utc", clock.Now.UtcDateTime), ("name", "FORCE_LAST_GOOD_PLAN"), ("desired_state_desc", "ON"), ("actual_state_desc", "ON"), ("reason_desc", null))],
+                _ => [],
+            },
+        };
+        var span = new WatermarkLog(new MemorySink());
+        var observer = new SqlTargetObserver("T3", DemoTarget.T3, connector, RcaSimulation.Options(), RunnerLog.Null, sidecar, new SqlQueryStoreOptions { Clock = new SteppedClock(clock) });
+
+        await LaneDriver.RunAsync(observer, span, clock, RcaSimulation.T1From, RcaSimulation.T1To, TestContext.Current.CancellationToken);
+
+        return SessionRun.Of(span, connector);
+    }
+
+    /// <summary>
+    /// T3's plan regression on the fixture's connector (T3QueryStore), 16:50 to 17:20, as the round trip drives it, with
+    /// <paramref name="refused"/> refused for a permission whenever it runs: the evidence, its watermarks, its span, and the
+    /// refused block's attempts.
+    /// </summary>
+    private static async Task<(SessionRun Run, List<DateTimeOffset> Attempts, SidecarView Fixture)> RunT3FixtureAsync(ISidecarSink? sidecar, string refused)
+    {
+        var clock = new ManualTime(T3QueryStore.From);
+        var store = new T3QueryStore(clock);
+        var connector = store.Connector();
+        var attempts = new List<DateTimeOffset>();
+        connector.Failure = block =>
+        {
+            if (block != refused)
+            {
+                return null;
+            }
+
+            attempts.Add(clock.Now);
+            return new CaptureException(CaptureFailureKind.Permission, "SQL error 297: The user does not have permission to perform this action.");
+        };
+        var span = new WatermarkLog(new MemorySink());
+        var observer = new SqlTargetObserver("T3", DemoTarget.T3, connector, RcaSimulation.Options(), RunnerLog.Null, sidecar, T3QueryStore.Options);
+
+        await RcaSimulation.DriveAsync([observer], span, clock, T3QueryStore.From, T3QueryStore.To, TestContext.Current.CancellationToken);
+        span.Close(T3QueryStore.To);
+
+        return (SessionRun.Of(span, null), attempts, store.Fixture);
+    }
+
+    /// <summary>The evidence, its watermarks, and its span are the same with a sidecar sink as without one.</summary>
+    private static void AssertSameEvidence(SessionRun without, SessionRun with)
+    {
+        Assert.Equal(without.Evidence, with.Evidence);
+        Assert.Equal(without.Watermarks, with.Watermarks);
+        Assert.Equal(without.Span, with.Span);
     }
 
     private static List<(DateTimeOffset Since, bool Final)> Reads(TimedConnector connector) =>
@@ -574,24 +692,6 @@ public sealed class RcaQueryStoreSqlTests
         ("current_storage_size_mb", 1000L),
         ("max_storage_size_mb", 1000L),
         ("forced_plans", forced));
-
-    /// <summary>The fixture's rows with the reader's words where the fixture still has its first ones (<see cref="ReaderSummaries"/>).</summary>
-    private static List<Dictionary<string, object?>> WithReaderWords(string table, List<Dictionary<string, object?>> rows)
-    {
-        foreach (var row in rows)
-        {
-            if (table == RcaContract.QueryPlans && ReaderSummaries.TryGetValue((long)row["plan_id"]!, out var summary))
-            {
-                row["plan_summary"] = summary;
-            }
-            else if (table == RcaContract.QueryEvents && (string?)row["kind"] == "tuning" && ReaderDetails.TryGetValue((string)row["state"]!, out var detail))
-            {
-                row["detail"] = detail;
-            }
-        }
-
-        return rows;
-    }
 
     /// <summary>The coverage rows of a sidecar made one, as its export makes them (SqlQueryStoreReader's remarks).</summary>
     private static Dictionary<string, object?> Coalesce(List<CaptureRow> rows)
@@ -684,8 +784,24 @@ public sealed class RcaQueryStoreSqlTests
         _ => [expression],
     };
 
-    /// <summary>One simulated session: its evidence, its watermark's values in order, and its connector.</summary>
-    private sealed record T1Run(List<string> Evidence, List<DateTimeOffset> Watermarks, TimedConnector Connector);
+    /// <summary>
+    /// One simulated session: its evidence (rows and notes), its watermark's values in order, its span's intervals (each
+    /// target's start and end, and the span's close), and its connector, when the test drove a TimedConnector.
+    /// </summary>
+    private sealed record SessionRun(List<string> Evidence, List<DateTimeOffset> Watermarks, List<string> Span, TimedConnector Connector)
+    {
+        public static SessionRun Of(WatermarkLog span, TimedConnector? connector)
+        {
+            var evidence = span.Inner.Rows.Select(r => string.Join('|', new[] { r.Table, r.Target, Norm(r.At), r.Source, r.Sentinel ? "sentinel" : string.Empty }.Concat(r.Values.OrderBy(v => v.Key, StringComparer.Ordinal).Select(v => $"{v.Key}={Norm(v.Value)}"))))
+                .Concat(span.Inner.Notes.Select(n => string.Create(CultureInfo.InvariantCulture, $"note|{n.Kind}|{n.Target}|{n.At:HH:mm:ss}|{n.Text}")))
+                .ToList();
+            var watermarks = span.Marks.Where((m, i) => i == 0 || m != span.Marks[i - 1]).ToList();
+            var intervals = span.Inner.Membership.Select(m => string.Create(CultureInfo.InvariantCulture, $"{(m.Began ? "began" : "ended")}|{m.Target}|{m.At:HH:mm:ss.fff}"))
+                .Append(string.Create(CultureInfo.InvariantCulture, $"closed|{span.Inner.ClosedAt:HH:mm:ss.fff}"))
+                .ToList();
+            return new SessionRun(evidence, watermarks, intervals, connector!);
+        }
+    }
 
     /// <summary>The variables a block uses: the parameters the reader binds.</summary>
     private sealed class VariableVisitor : TSqlFragmentVisitor

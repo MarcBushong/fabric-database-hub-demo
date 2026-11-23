@@ -140,9 +140,12 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
         Close(blocking, now);
         Close(errors, now);
         await DropEventSessionAsync(now, cancellationToken).ConfigureAwait(false);
+
+        // The evidence's own end is done: the lane takes its time now, so Query Store's end reads don't move the span's end.
+        EvidenceEnded(now);
         if (queryStore is not null)
         {
-            // After the evidence capture's end, so its last reads come first; bounded by the reader's own budget.
+            // Bounded by the reader's own budget.
             try
             {
                 await queryStore.EndAsync(now, cancellationToken).ConfigureAwait(false);

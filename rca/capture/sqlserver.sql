@@ -649,7 +649,11 @@ FROM sys.database_automatic_tuning_options AS o;
 -- state changes, is an RCA Query Events row of kind tuning (the sidecar). The plans' CPU averages are Learn's
 -- microseconds (regressedPlanCpuTimeAverage, recommendedPlanCpuTimeAverage), as the recommendation measured them when
 -- it detected the regression; the observer writes them in milliseconds. Learn lists VIEW SERVER PERFORMANCE STATE for
--- this view on SQL Server 2022 and Azure SQL Database.
+-- this view on SQL Server 2022 and Azure SQL Database: a server permission, which a contained database user can't
+-- hold. On Azure SQL Database, a login in master holds it through the ##MS_ServerStateReader## server role, in each
+-- database where the login has a user, and the server's Microsoft Entra administrator holds every permission (Learn:
+-- Server roles; Authorize server and database access). A refusal is a gap in the sidecar's coverage that names the
+-- permission and that fix; the other reads go on.
 SET NOCOUNT ON;
 SELECT /* dbhubdemo:rca-observer */
     captured_at_utc            = SYSUTCDATETIME(),
