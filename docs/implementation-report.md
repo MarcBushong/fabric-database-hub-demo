@@ -6032,3 +6032,239 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - **And:** vitest, the cases file's 11 tests and the app's whole suite, 401 of 401 in 22 files; typecheck and eslint clean; markdownlint clean; the changed files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames, with the follow-ups' two commits under it: 135 passed, 3 skipped.
 
 **Risks.** None: nothing runs this code yet, and no rule changes.
+
+### F35 design (i): the declared grain, and a straddling row's split in both rules (2026-11-23)
+
+**Why.** The owner approved design (i) on 2026-11-23, for Wednesday's release: a kept value beside each row of `telemetry_snapshots`, worked out when history is saved, so the model's reads stay as fast as today's, and a bin not worked out yet reads as today's. Two sessions build it at once. This one builds the module's Spark step, the notebook, the save's declared grain, both rules' straddling split, and the model; "F35 Livy steps" builds the Livy client and the column and resolve steps of `deploy.ps1`, `stop-demo.ps1`, and `configure-fabric.ps1`, which send this module to Spark as it is. The groundwork left [two known differences](#f35-design-i-groundwork-two-known-differences-pinned-2026-11-22) for the build: a save whose step the rule reads from its window and `finestPerInterval` from its bins (`random 11`), and a finer row that a coarser point's window cuts through (D and A).
+
+**Work summary.**
+
+- **The declared grain** (`GrainMinutes`, the column `grain_minutes`): each save writes its step with its rows, a whole number of minutes from 1 to 1,440. `finestPerInterval` (`declaredGrain`, new), `snapshotValues`, and `kept_value.py` (`declared_grain`) take it as the save's step, with T5's hourly metrics still at least an hour. A save written before F35 declares none and keeps today's reading, so a step difference like `random 11`'s can only come from those saves.
+- **A straddling row's split,** in `snapshotValues` and `kept_value.py`, as `finestPerInterval` does it: a coarser point's finer rows, finest and then newest first, each keep the stretches that the earlier ones leave uncovered, with a total's remainder split across them by length (in whole numbers when it's one); the coarser point then takes only the stretches that overlap the part its window keeps. `finestPerInterval`'s stretch helpers (`overlapping`, `insert`, `gapsIn`, and `shares`) are exported for `snapshotValues`, and `kept_value.py` has the same four.
+- **The shared cases,** written again from the TypeScript rule: D's 15:15 bin is 31, where the groundwork pinned 28, and 15:15 to 15:30 totals 89, `finestPerInterval`'s split by length, where the data hold 86; A's is 44, where it was 40, and totals 72, the data's. Two new cases declare grains: a hand-set 5-minute bin, which the window alone reads as 1, and a save whose bins don't show its step. That's 50 cases and 1,742 bins, where there were 48 and 1,733.
+- **Parity with `finestPerInterval`** pins one known difference, `random 11`'s hour, an older save's step; with every save given its declared grain (`withDeclaredGrains`), it has none.
+
+**Changed files.** `fabric/app/src/data/finest-per-interval.ts`, `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, `fabric/app/src/data/kept-value-cases.test.ts`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/history/kept_value.py`, `tests/unit/Fabric.History.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **Both rules:** vitest, the cases file's 13 tests and `snapshot-value.test.ts`' 22, among them the declared grain's; `Fabric.History` passes on Python 3.11.9 and 3.10.11, so `kept_value.py` gives every bin of the 50 cases within 1e-9 of `snapshotValues`.
+- **On many histories,** with a scratch script that isn't committed: 1,000 random histories of every kind and 200 days of the three producers with the review's timing (488,921 rows).
+  - `kept_value.py`'s bins equal `snapshotValues`' in all 355,850.
+  - `snapshotValues`' hourly totals and peaks equal `finestPerInterval`'s in 29,830 of 29,843 hours. The 13 others are all in random Azure Monitor histories, in saves that declare no grain, where the rule reads the step from the window and `finestPerInterval` from the bins, as in `random 11`.
+  - With every save declaring its grain, none of 29,842 hours differs, and no bin. The producers' days differ in none either way.
+
+**Risks.**
+
+- A save written before F35 keeps today's reading of its step, so where its bins don't show the step, the kept values and `finestPerInterval` can differ in that save's hours, as in `random 11`. On `dbhubfn`'s real history, no save does ([below](#f35-design-i-the-kept-values-against-the-apps-rule-on-a-real-history-2026-11-23)).
+- Where a finer row straddles a window's cut, `finestPerInterval`'s split by length is an estimate, and both rules now follow it: D totals 89 where the data hold 86.
+
+### F35 design (i): the resolve step, and the notebook's kept values at save time (2026-11-23)
+
+**Why.** The kept values have to be in `telemetry_snapshots` before the model reads them, whichever save wrote the rows: a Run all session (the live-activity notebook), `stop-demo.ps1 -SaveHistory`, or `deploy.ps1`. So the resolve is one Python module, which the notebook runs as a helper cell and "F35 Livy steps" sends to Spark as one Livy statement.
+
+**Work summary.**
+
+- **`kept_value_step(spark, table="telemetry_snapshots", add_columns=True, run_id=None, everything=False)`,** the Spark part of `fabric/history/kept_value.py`. The file has no `__future__` import, so one Livy statement runs it as it is.
+  - It runs `DESCRIBE TABLE`, then adds F35's missing columns with one `ALTER TABLE ... ADD COLUMNS`: `grain_minutes INT`, `kept_value DOUBLE`, and `resolved_at_utc TIMESTAMP`.
+  - **The rows it works out:** those not worked out yet, by default; one run's (`run_id`); or every row (`everything`). Per target and analysis, it reads their bins' days and the day either side, in chunks of at most 7 days and batches of about 400,000 rows, each with every save that has a row there, whole, so each save's extent and step are its own.
+  - **One `MERGE` per batch** writes `kept_value` and `resolved_at_utc` into the rows whose kept value changed, matched on the row's identity (run, capture, target, analysis, metric, bin, resource, instance, database, and value) and pruned to the batch's bins. `resolved_at_utc` is the time just before the batch's read, and the MERGE doesn't overwrite a row that a later step worked out.
+  - **After Delta's concurrent-commit exceptions** (`ConcurrentAppendException` and the others on Fabric's [concurrency control for Delta tables](https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control)), a batch reads and MERGEs again, up to 5 times, with a growing pause.
+  - **Its result,** ready for JSON: `version`, `table`, `exists`, `missing`, `added`, `form` (`Kept` when the three columns are there, which `configure-powerbi.ps1 -SnapshotValueForm` takes, and otherwise `Release`), `scope`, `read`, `resolved`, `pending`, `attempts`, `seconds`, and `error`. It never raises: rows it couldn't work out stay unresolved and read as today's.
+  - **Rows the rule doesn't work out** keep both columns null, and the model reads them by the release's rule: the analyses off the bin grid, rows without a bin, a capture time, or a window, and a `NaN` value.
+- **The notebook** (`NB_DatabaseHub_LiveActivity`):
+  - **Helpers, part 4** is `kept_value.py`, word for word. The module's first line is the cell's header, and a test keeps the two equal and checks that none of the module's names is another cell's.
+  - **Every telemetry row declares its save's step** in `grain_minutes`: the run's bin for the grid's analyses (none off the grid), the capture document's `intervalMinutes` for T4's rows, and each series' for T5's (an hour for its hourly metrics). The PowerShell history helpers already write those intervals (`PostgresHistoryHelpers.ps1` and `CosmosHistoryHelpers.ps1`), so they don't change.
+  - **`telemetry_snapshots`** gains the three columns, before `report_date_utc`, in both notebooks that create it (`NB_DatabaseHub_Deployment` too). An older table gains them with the save's `mergeSchema`, or with the step's `ALTER TABLE`.
+  - **The persist cell's last step,** after the session's `scenario_runs` rows, is `save_kept_values`: `kept_value_step` with this run's ID, so this run's rows and their neighbors are worked out. One line says what it did, and it never stops the run.
+- **For ADR 0014's amendment:** Fabric's Delta tables are Serializable, their only level, and `telemetry_snapshots` has no partitions. So a save appended while a step's MERGE runs makes the MERGE fail, not the append, and the step reads its batch again and MERGEs again. 1786a139's comment had this wrong, and so did what this session first passed to the docs author: they followed Azure Databricks' page, whose default level lets a blind append pass a MERGE, a level Fabric doesn't have. [A later section](#f35-design-i-fabrics-delta-tables-are-serializable-and-the-save-tries-a-concurrent-commit-again-2026-11-23) corrects the code.
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb`, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, `tests/unit/Fabric.History.Tests.ps1`, `tests/unit/Fabric.Notebooks.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **`Fabric.History`'s step tests,** on an in-memory table and through a fake Spark: the columns added, a retry after `ConcurrentAppendException`, chunks, a late save's neighborhood only, a later step's guard, rows off the grid left alone, the release's form, and errors without raising.
+- **`Fabric.Notebooks`:** part 4's text and names, the grains on SQL, T4, and T5 rows, the persist order, and `save_kept_values`' lines and call. 118 of 118 pass on Python 3.10.11 with pandas 2.3.3, and on 3.11.9 with pandas 3.1.1.
+- **Live, on a copy of `dbhubfn`'s history** (Final tests, with "F35 Livy steps"' probe, 2026-11-23, 10:11 to 10:14 ET):
+  - the step added the three columns and worked out 32,402 rows in 21.5 s with one MERGE, leaving none pending, with the form `Kept`;
+  - a second step read and resolved none, in 2.1 s;
+  - the 713 rows off the grid stayed null, the copy was dropped, and `telemetry_snapshots` wasn't touched;
+  - per analysis, the kept values sum to 33 to 75 % of the values: for example, wait_deltas 107.7M of 307.9M, counter_deltas 69.6B of 191.9B, and cosmosdb 2.61M of 7.33M. [The next section but one](#f35-design-i-the-kept-values-against-the-apps-rule-on-a-real-history-2026-11-23) checks them against the app's rule.
+
+**Risks.**
+
+- A save appended while a step runs makes the step's MERGE run again. The save's rows outside the step's batch stay unresolved until its own run's step, or the next, and its bins read as today's until then.
+- Part 4 is a copy of the module: a change to one without the other fails `Fabric.Notebooks`.
+- When Delta still reports a concurrent commit after 5 tries, the step reports its error and leaves those rows to the next step; they read as today's meanwhile.
+
+### F35 design (i): Snapshot Value's kept form, and `configure-powerbi.ps1 -SnapshotValueForm` (2026-11-23)
+
+**Why.** The model's `Snapshot Value` has to read the kept values, and fall back to the release's rule where they aren't worked out yet. A Direct Lake model that reads a column its table lacks can't be framed, so a lakehouse without F35's columns needs the release's form, and `configure-powerbi.ps1` has to deploy the form the lakehouse can take.
+
+**Work summary.**
+
+- **The kept form** (`fabric/powerbi/kept-value/Snapshot Value.tmdl`, new), per target, analysis, metric, and bin:
+  - where every row is worked out (none has a blank `Resolved At UTC`), a total's kept values summed, and a maximum's or an average's highest capture sum of them;
+  - a bin with a row not worked out yet, a row with no bin, and an analysis off the bin grid read by the release's measure, word for word (and every bin while a query filters which saves it sees, since [the review's fixes](#f35-design-i-the-reviews-fixes-a-filter-on-the-saves-and-declared-grains-checked-2026-11-23));
+  - two hidden columns, `Kept Value` and `Resolved At UTC` (`kept_value` and `resolved_at_utc`), and the table's description. Its lists of analyses and metrics are the shared rule's, and a test keeps them so.
+- **`keptFormValues`** (`snapshot-value.ts`): the kept form's reading in TypeScript, the DAX measure's reference for the tests and the live proof.
+- **`Get-DemoFabricSemanticModelDefinition -SnapshotValueForm Kept`** splices the fragment into the table's TMDL, each piece found exactly once or it throws. `Release`, the default, sends the committed TMDL unchanged, so Ask's model guide and the report's fields don't change.
+- **`configure-powerbi.ps1 -SnapshotValueForm`** (`Release` by default) builds and deploys that form, and `FABRIC.SEMANTICMODEL.FORM` says which, once the model's import passes:
+  - **Pass** for the kept form;
+  - a **Warning** for the release's, because the columns weren't there or the step couldn't tell, with `./scripts/deploy.ps1` as the fix;
+  - **Not selected** under `-WhatIf`;
+  - no result with `-SkipModel` or `-CheckModelData`, or when the import fails.
+
+  "F35 Livy steps" passes the form from `DEPLOY.FABRIC.KEPTVALUE`'s `evidence.form`.
+
+**Changed files.** `fabric/powerbi/kept-value/Snapshot Value.tmdl` (new), `scripts/modules/DbHubDemo/Public/Get-DemoFabricSemanticModelDefinition.ps1`, `scripts/configure-powerbi.ps1`, `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, `tests/unit/Fabric.PowerBI.Tests.ps1`, `tests/unit/DbHubDemo.PowerBI.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **Pester:** the kept form's lists equal the shared rule's, its fallback is the release's measure word for word, its columns read the notebooks' `kept_value` and `resolved_at_utc`, and its VAR names pass the names test; both forms deploy end to end with mocks, with their `FABRIC.SEMANTICMODEL.FORM`; and a table or a fragment that doesn't fit is refused.
+- **vitest:** `keptFormValues`' 3 tests: a total's kept values, a peak's highest capture, and a bin not worked out read by the release's rule.
+
+**Risks.**
+
+- **The kept form's DAX hasn't run on an engine yet.** This PC was at full CPU, so the coordinator moved the timing to Final tests, on a real Fabric model: the kept form against the release's, on the 7-day Performance query over a month of synthetic history, before Wednesday's proof. The plan proposes a pass at 1.5 times the release's median or less, with the owner deciding. The same run can check the measure against its reference ([below](#f35-design-i-the-deployed-models-kept-form-against-its-reference-2026-11-23)).
+- The release's form stays the default: a lakehouse that doesn't get the columns keeps today's totals, with the Warning.
+
+### F35 design (i): the kept values against the app's rule on a real history (2026-11-23)
+
+**Why.** On `dbhubfn`'s copy, the kept values brought wait_deltas and counter_deltas down by about 2.8 times, which means three or more overlapping saves in places. The coordinator asked for proof that they match the app's rule on the same rows, not only that they shrink: whole-hour totals of `kept_value` against `finestPerInterval` on the raw rows, as the design's live proof does.
+
+**Work summary.**
+
+- **`fabric/app/scripts/f35-proof.ts`** reads an export of a resolved `telemetry_snapshots`, one JSON object a line (target, analysis, metric, bucket_utc, captured_at_utc, window_start_utc, window_end_utc, value, grain_minutes, kept_value, and resolved_at_utc), and checks three things:
+  - **bins:** every worked-out bin, read from the written kept values as the kept form reads them (`keptFormValues`), against `snapshotValues` on the raw rows;
+  - **hours:** each series' total or peak in each whole hour, from those bins and from `finestPerInterval`'s kept points on the raw rows, with the release's newest-per-bin totals beside them;
+  - **steps:** each save's step in both rules.
+
+  It prints a JSON summary, and exits 1 when a bin or an hour differs.
+- **Final tests' export** (2026-11-23, 10:46 to 10:51 ET): probe bc730bd9 ran the step with `kept_value.py` at 1786a139 on a fresh copy of `dbhubfn`'s history, then paged the copy's 33,115 rows out. The step matched the 10:11 run: 32,402 resolved, none pending, with the same sums.
+
+**Validation.** `npx tsx scripts/f35-proof.ts` on the export exits 0, in 27 s:
+
+- **Bins:** 20,779 compared, all equal, and none left unresolved.
+- **Hours:** 1,551 series-hours, all equal to `finestPerInterval`'s. `finestPerInterval` gives the kept totals to the unit; storage_io differs only in the order of its float sums, at about 1e-16.
+- **Steps:** 151 saves, none declaring a grain (all saved before F35), and both rules read every one's step the same way, so this history has no save like `random 11`'s.
+- **What the release counted twice,** its newest-per-bin totals against the kept ones in the same hours: on T1, wait_deltas 103.8M against 43.3M (2.4 times), counter_deltas 19.98B against 8.01B (2.5 times), and storage_io 4.17M against 1.66M (2.5 times); on T2, 2.3 to 2.4 times; on T3, 2.1 times for wait_deltas, 1.7 for counter_deltas, and 1.0 for storage_io; and T5's cosmosdb totals, 6.05M against 2.59M (2.3 times).
+
+**Still to do,** by Final tests, before Wednesday's proof: the kept form's timing on a real Fabric model, against the release's form on the same model, on the 7-day Performance query over a month of synthetic history (Final tests' method: the real rows copied 30 times, each a day earlier than the last, with the copies' kept values cleared and then worked out by the step), and the same proof on that month's export.
+
+**Risks.** The proof covers one environment's real history, about two days of bins (2026-11-18 20:45 to 2026-11-21 01:23 UTC), with no save declaring its grain yet; the shared cases and the scratch histories above cover the declared grains.
+
+### F35 design (i): the deployed model's kept form against its reference (2026-11-23)
+
+**Why.** No engine has run the kept form's DAX yet. The proof above checks the written kept values through `keptFormValues`, the measure's TypeScript reference, not the measure itself, and the timing on a real model is Final tests'. This lets that run prove the DAX too.
+
+**Work summary.**
+
+- **`fabric/powerbi/kept-value/model-bins.dax`** (new): the deployed model's `Snapshot Value` per target, analysis, metric, and bin, from `BinsFrom` to `BinsTo`, for the Power BI REST API's [Execute Queries](https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group). A response holds at most 100,000 rows, about four days of a demo's history.
+- **`f35-proof.ts --model <response.json>`,** with `--from` and `--to`: each of those bins against `keptFormValues` on the export's rows, worked out or not, so it checks the kept branch and the release's fallback. A value that differs, a bin the model lacks, and one it has extra each fail it. It reads Execute Queries' response as saved, a JSON array of its rows, or JSON lines, and matches a bin time finer than a millisecond to within one.
+- **The same table:** the export and the model must read the same version of it, with nothing written between the export and the model's refresh. `keptFormValues` reads each bin's own rows, so this check needs only the compared bins' rows.
+
+**Changed files.** `fabric/powerbi/kept-value/model-bins.dax` (new), `fabric/app/scripts/f35-proof.ts`, and this report.
+
+**Validation.** With a scratch model built from `keptFormValues` on a synthetic 20-day export, over 4 days:
+
+- 2,556 bins equal (exit 0);
+- one value changed, one bin dropped, and one added are each found (exit 1);
+- the same rows as JSON lines read the same;
+- `--model` without `--from` and `--to` exits 2.
+
+The script type-checks with the app's strict settings and lints clean, and `Fabric.PowerBI`'s names and line-ending tests cover the new query.
+
+**Risks.** It checks the model only when Final tests run the query on a deployed kept form; until then, Pester checks the DAX's text only.
+
+### F35 design (i): the review's fixes: a filter on the saves, and declared grains checked (2026-11-23)
+
+**Why.** The review of the five units above confirmed parity in fuzzing: 0 of about 141,000 bins differ against `snapshotValues`, and 0 of 22,500 hours against `finestPerInterval`. It said ship with two fixes:
+
+- **High: the kept form undercounted where a query filters which saves it sees.** A row's kept value is its share against every save, but `WorkedOut` saw only the rows in the filter context. Ask's T5 rule reads `TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )`, and the latest cosmosdb capture is usually the coarse save, so its storm totals went blank or shrank.
+- **Medium: `f35-proof.ts`' step check couldn't fail for a save that declares its grain,** since both sides read the declared grain. The app's T4 and T5 views (`postgresSeriesQuery` and `cosmosSeriesQuery`) select no `grain_minutes`, so they read the step from the bins. A wrongly declared grain would make the pages and the model differ, unseen.
+
+**Work summary.**
+
+- **The kept form** reads every bin by the release's rule while a query filters a column that tells a bin's saves apart (`VAR EverySave`), so a run's own rows read as that run saved them, as before F35:
+  - the review's five: Run ID, Source Notebook, Captured At UTC, Window Start UTC, and Window End UTC;
+  - and Value, Kept Value, and Resolved At UTC, which also differ between a bin's saves.
+
+  Nothing filters those columns from outside: no relationship reaches them, a Date filter selects whole bins (`report_date_utc` is the bin's date), and the report's Run ID and Captured At visuals are Validation Results' and Analysis Findings'. The table's other columns hold the same value in every save's rows of a bin: the bin's keys, the row's resource and unit, and its report date.
+- **`keptFormValues(rows, { savesFiltered })`** is its reference.
+- **`f35-proof.ts`:**
+  - **filtered,** reported and never failing: each target and analysis's newest capture alone, or the rows captured from `--captured-from` to `--captured-to`, read by the release's rule (`run`) and by their kept values (`shares`), with the bins the latter leaves blank;
+  - **modelCaptured,** with `--model-captured`: the deployed model's bins under `model-bins-captured.dax` (new), which filters one range of captures, against the release's rule on those rows;
+  - **steps:** a declared grain against the save's bins. T4's and T5's must be the same. A SQL save's bins must be on its grid; sparser ones were counted per analysis (`declaredSparse`), which [the re-check](#f35-design-i-the-re-checks-two-items-a-declared-grain-finer-than-a-sql-saves-bins-and-the-saves-pauses-2026-11-23) narrows to the analyses that save bins with activity alone. A difference fails the proof. A save with one bin, whose step its bins can't show, is counted (`declaredOneBin`).
+- **Not done, the review's option** of `grain_minutes` in the model and the T4 and T5 queries. The release's form can't have the column, since Direct Lake can't frame a column its table lacks, so the app's queries can't name it while a model may be on that form. The step check catches the difference that leaves.
+
+**Changed files.** `fabric/powerbi/kept-value/Snapshot Value.tmdl`, `fabric/powerbi/kept-value/model-bins-captured.dax` (new), `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, `fabric/app/scripts/f35-proof.ts`, `tests/unit/Fabric.PowerBI.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **The finding, reproduced:**
+  - vitest, on T5's storm: the latest run alone totals 50,428 by its kept values, with 15:15 and 15:30 blank, and 78,161, the run's own, by the release's rule;
+  - on `dbhubfn`'s export (`filtered`): T5's newest capture would have read 228,046 by its kept values, with 202 of its 444 bins blank, where it saved 1,302,342; and T1's wait_deltas 2.35M, where it saved 22.06M.
+- **The pin:** `Fabric.PowerBI` checks the list, that it gates `WorkedOut`, and that every other column of the table is on the same-in-every-save side, so a new column has to be put on one side. Without the fix, the list is empty, and the test fails.
+- **The checks catch what they're for,** on the synthetic export:
+  - a T5 save declaring 5 minutes over 15-minute bins, and a T1 save declaring 15 over 5-minute bins, each fail;
+  - a T1 save declaring 5 over 15-minute bins is counted as sparser;
+  - a model built as the fixed measure reads passes `--model-captured` (291 bins), and one built as the unfixed measure fails it (9 bins differ, and 90 are missing).
+- **And:** on `dbhubfn`'s export, the proof still exits 0 (20,779 bins, 1,551 hours, and 151 saves, none declared); vitest `snapshot-value`, 23 tests; `Fabric.PowerBI` and `DbHubDemo.PowerBI`, 47 passed and 1 skipped, as before; and the script type-checks strict and lints clean.
+
+**Risks.**
+
+- A query that filters several overlapping saves at once, two runs for example, reads the release's rule among them, so it counts their shared minutes twice, as before F35.
+- The app's T4 and T5 views still read a save's step from its bins: the proof catches a difference from its declared grain, and the app doesn't.
+
+### F35 design (i): Fabric's Delta tables are Serializable, and the save tries a concurrent commit again (2026-11-23)
+
+**Why.** The follow-ups session checked Fabric's [concurrency control for Delta tables](https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control): every Fabric Delta table is Serializable, its only level, where even a blind append can conflict with a MERGE that reads the same partition. The resolve step's comment cited Azure Databricks' page instead, and its WriteSerializable default, where a blind append doesn't conflict. And F35 brings a concurrent writer to `telemetry_snapshots`, while the notebooks' save had no retry.
+
+**Work summary.**
+
+- **The step's comment,** in `kept_value.py` and Helpers, part 4, cites Fabric's page. It says that `telemetry_snapshots` has no partitions, so a save appended while a step's MERGE runs makes the MERGE fail (`ConcurrentAppendException`), not the append. The step reads its batch again, with the save's rows where they're in its days, and MERGEs again; the save's other rows stay for its own run's step, or the next.
+- **`ConcurrentWriteException`,** which Fabric's page lists as a generic conflict, joins the step's list.
+- **The save** (`write_delta`), in both notebooks, since both write `telemetry_snapshots`. The step's MERGE can fail a save's DELETE, and its ALTER TABLE a save's append (`MetadataChangedException`).
+  - The delete and the append now run again together after one of Delta's concurrency exceptions (`DELTA_CONFLICTS`, the step's list): at most 5 tries, after pauses of 1, 2, 4, then 8 seconds, each times 0.5 to 1.5 at random, so 0.5 to 12 seconds.
+  - A failed Delta transaction writes nothing, so they're safe to repeat.
+  - Any other error, and the last try's, stops the cell as before. The save's line says on which try it saved, when it wasn't the first.
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb`, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, `tests/unit/Fabric.Notebooks.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **The save's test,** per notebook (`Fabric.Notebooks`):
+  - a delete that meets the MERGE, an append that meets the ALTER TABLE, and an error that names the conflict only in its class each save once, on try 2;
+  - a conflict on every try stops after 5, and any other error stops at once;
+  - the save's list is the step's.
+
+  Against HEAD's notebook, the first conflict stops the save.
+- **And:** `Fabric.Notebooks` 120 of 120 and `Fabric.History` 8 of 8, on Python 3.11.9 and 3.10.11; every code cell of both notebooks compiles; and PSScriptAnalyzer finds nothing in the test file.
+
+**Risks.**
+
+- A save that meets a conflict on all 5 tries stops the cell, as any save error did before.
+- Part 4's new text changes the notebook's fingerprint; the integration writes the versions again.
+
+### F35 design (i): the re-check's two items: a declared grain finer than a SQL save's bins, and the save's pauses (2026-11-23)
+
+**Why.** The re-check of 7dfe34f6, 4f44e7ce, and def8f09b said ship: the kept form reads the release's rule for every filter on the saves that the app, the report, and Ask use, and the save's retry can't lose or duplicate rows. It found two small items:
+
+- **Low:** a SQL save that declares a grain finer than its bins still passed the proof. A 15-minute day save that declares 5 minutes counts the other 10 minutes of each bin twice where another save holds them, and the bins and hours checks still agree, because both rules read the declared grain.
+- **Wording:** `_delta_retrying` said its pauses are 1 to 8 seconds, but with the jitter each is 0.5 to 12 seconds.
+
+**Work summary.**
+
+- **`f35-proof.ts`' step check** fails a SQL save whose bins are farther apart than its declared grain, unless its analysis saves bins with activity alone: `sessions`, which keeps the demo database's sessions, and `wait_deltas`, which keeps the bins with waits (`WaitMs > 0`). The notebook's other SQL queries (CPU, gauges, counter rates, and storage IO) read every sample in the window. `declaredSparse` counts only those two.
+- **`_delta_retrying`'s docstring,** in both notebooks: pauses of 1, 2, 4, then 8 seconds, each times 0.5 to 1.5 at random, so 0.5 to 12 seconds.
+- **This report:** the resolve step's section says plainly where this session had Delta's isolation wrong, the save's section gives its pauses, and the review's section says what 4f44e7ce's step check counted.
+
+**Changed files.** `fabric/app/scripts/f35-proof.ts`, `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb`, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, and this report.
+
+**Validation.**
+
+- **The negative,** on the synthetic export: a T1 save of 15-minute bins that declares 5 minutes, its kept values worked out again with that grain, so the bins (12,851) and hours (1,443) all agree. def8f09b's script passes it (exit 0), counting `cpu` as sparser; this one fails it (exit 1): "T1|cpu: declares 5 minutes, where its bins are 15 minutes apart". The same save's `wait_deltas` is counted, not failed.
+- **And:** the unchanged synthetic export still passes (86 declared saves); the script type-checks strict and lints clean; every code cell of both notebooks compiles.
+
+**Risks.** A SQL save of a dense analysis whose target ran only in scattered bins would now fail the proof, though its declared grain is right; none of the notebook's saves does that while the targets run.
