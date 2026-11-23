@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "log-flush-waits",
   "title": "Log flush waits",
+  "service": "checkin-kiosk",
   "summary": "Commit-heavy singleton inserts: every session inserts one small row per transaction into demo.commit_scratch, so every commit waits for its log flush (WRITELOG). Each session deletes its rows every 1,000 inserts, so the table stays small, and stops after maxRows commits, at the deadline, or on a stop request. Business data is never touched.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_commit_flood",

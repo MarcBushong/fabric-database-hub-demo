@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "missing-index",
   "title": "Missing index",
+  "service": "reporting-jobs",
   "summary": "Repeatable lookups that no index covers: claims aging by payer and submission date, and visits by reason code. Each call scans its table, and the optimizer records a missing-index suggestion. The story is before, recommendation, action, after: the remediation (scenarios/missing-index/remediation.sql) is reviewed and applied by a person, never automatically.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_missing_index",

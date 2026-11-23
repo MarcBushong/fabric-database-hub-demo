@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "blocking-chain",
   "title": "Deep blocking chain and lock escalation",
+  "service": "scheduling-service",
   "summary": "A head blocker sits idle with its transaction open on one Scheduling work item. Under it, chains of sessions each lock their own work item and then wait for their parent's, so the sessions below wait for them in turn: head <- level 2 <- level 3 and deeper (depth 3 to 6). Beside the chain, an escalator updates thousands of appointments in one statement until SQL Server escalates to a table lock that blocks everyone else on care.appointments. Every change rolls back.",
   "orchestration": "chain",
   "procedure": "demo.usp_scenario_chain_link",

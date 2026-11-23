@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "capacity-max",
   "title": "Capacity maxed out",
+  "service": "reporting-jobs",
   "summary": "Every scheduler busy and the storage at its cap at the same time. CPU sessions run back-to-back CPU-heavy reports at MAXDOP 1, one scheduler each, more sessions than schedulers (on Azure SQL Database, CPU at the vCore limit). IO sessions scan and update a scratch set (shared with io-pressure) that the first one grows to scratchMb after a free-space check, so reads miss the buffer pool once it's bigger than memory. Business data is only read.",
   "orchestration": "capacity",
   "procedure": "demo.usp_scenario_capacity_max",

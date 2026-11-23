@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "locking-blocking",
   "title": "Locking and blocking",
+  "service": "billing-worker",
   "summary": "A batch session updates the first Billing work items and then sits idle with its transaction open, like an application that forgot to commit. Billing clerks (the contender sessions) block on those rows, a normal workload keeps running beside them, and an optional bounded deadlock adds a deadlock victim. The holder always rolls back after holdSeconds (the watchdog rollback), then repeats after pauseSeconds until the run ends.",
   "orchestration": "locking",
   "procedure": "demo.usp_scenario_locking_contend",

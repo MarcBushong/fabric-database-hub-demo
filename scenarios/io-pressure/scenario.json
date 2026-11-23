@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "io-pressure",
   "title": "IO pressure",
+  "service": "records-archive",
   "summary": "Bounded reads and writes over a scratch data set. The first session grows demo.io_scratch to scratchMb (one 7,000-byte row per page) after a free-space check; then every session alternates range scans of up to 256 MB with 16 MB range updates that checkpoints write back. Growth stops at scratchMb, below the file caps, and the scratch set is reused by later runs.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_io_pressure",

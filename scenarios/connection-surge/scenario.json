@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "connection-surge",
   "title": "Connection surge (capacity maxed)",
+  "service": "frontdesk-app",
   "summary": "A burst of application connections fills the server's connection slots: the runner opens a few connections a second until only headroom slots stay free below max_connections, fills that headroom for a few seconds at most so overshoot more attempts are past the limit, which the server refuses as too many connections, frees the headroom again, and holds the rest (each pings now and then, so most sit idle). It releases them all, pauses, and repeats until the run ends. PostgreSQL (T4) only.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_connection_surge",

@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "idle-in-transaction",
   "title": "Idle in transaction",
+  "service": "billing-worker",
   "summary": "Application sessions open a transaction, lock a few Submitted claims, and then go quiet without committing: they sit idle in transaction, block the billing writers that queue behind them, and hold back vacuum's cleanup horizon while the baseline keeps writing. Each idle session rolls back after holdSeconds (never past the deadline), pauses, and repeats. PostgreSQL (T4) only.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_idle_in_transaction",

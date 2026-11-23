@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "inefficient-query",
   "title": "Inefficient query",
+  "service": "frontdesk-app",
   "summary": "A frequent front-desk lookup by the numeric part of the MRN. The problem variant wraps the indexed column in RIGHT(), so uq_patients_mrn can't be seeked and every call scans care.patients: modest cost per call, high cost in total because it runs constantly. The healthy variant compares the full MRN and seeks, for a Query Store before-and-after comparison.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_inefficient_query",

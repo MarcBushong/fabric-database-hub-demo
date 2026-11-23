@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "resource-governance",
   "title": "Resource governance (CPU cap)",
+  "service": "reporting-jobs",
   "summary": "Sustained, well-planned reporting at more concurrency than the target has vCores: a full utilization rollup with a per-row scoring hash, parallelism allowed. On Azure SQL Database it drives CPU to the service objective's limit, so the database is throttled rather than slowed by a bad plan; on SQL Server it's plain CPU saturation. The fix is capacity or scheduling, not a rewrite, which contrasts with cpu-pressure.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_resource_governance",

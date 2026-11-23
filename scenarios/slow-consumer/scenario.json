@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "slow-consumer",
   "title": "Slow consumer",
+  "service": "records-archive",
   "summary": "A client that fetches a few rows and then pauses: each session runs a wide query (about 1 KB per row) and the runner reads its result set slowly on purpose, so the server fills the network buffers and waits for the client (ASYNC_NETWORK_IO). At the deadline or on a stop request the runner cancels the query, and while the run lasts it runs the query again. The procedure only reads.",
   "orchestration": "slow-consumer",
   "procedure": "demo.usp_scenario_slow_consumer",

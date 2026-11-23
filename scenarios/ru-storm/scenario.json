@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "ru-storm",
   "title": "RU storm (request rate too large)",
+  "service": "patient-events-ingest",
   "summary": "A bedside-monitor integration stuck in a retry loop floods one patient's partition: waves of writes to one hot logical partition from every writer, as fast as the pacing allows, use up the container's 400 RU/s, so normalized RU consumption reaches 100% and Cosmos DB answers 429 (request rate too large). Then a calm with no storm writes, so normalized RU falls back and the throttling stops. It repeats until the run ends, then deletes its storm documents. Azure Cosmos DB for NoSQL (T5) only.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_ru_storm",

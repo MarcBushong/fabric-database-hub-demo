@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "tempdb-contention",
   "title": "tempdb allocation contention",
+  "service": "frontdesk-app",
   "summary": "Many sessions create, fill, index, and drop temporary tables back to back. The index added after CREATE TABLE stops SQL Server from caching the tables, so every iteration allocates pages and system catalog rows in tempdb, and the sessions queue on tempdb's allocation and catalog pages (PAGELATCH waits). The #tables belong to the scenario's own sessions and are dropped every iteration; tempdb is the only place outside ContosoCare it touches, as any #table does.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_tempdb_contention",

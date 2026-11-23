@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "log-rate-pressure",
   "title": "Log-rate pressure",
+  "service": "billing-worker",
   "summary": "Write-heavy batches of 3,000-byte rows into demo.log_rate_scratch, each deleted right after it commits, so the table stays small while the log keeps working. The run asks for 2 MB of log per second per intensity level. On Azure SQL Database, more than the service objective's log rate shows up as log-rate governance; on SQL Server it shows up as WRITELOG waits and log flushes. Each run stops after maxLogMb of log, at its deadline, or on a stop request.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_log_rate_pressure",

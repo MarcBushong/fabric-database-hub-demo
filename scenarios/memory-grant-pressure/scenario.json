@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "memory-grant-pressure",
   "title": "Memory grant pressure",
+  "service": "reporting-jobs",
   "summary": "Concurrent large sorts, each reserving a big memory grant up front: the documented MIN_GRANT_PERCENT hint asks for grantPercent of the most one query may get (25% of the workspace memory in the default workload group). Only a few fit at once, so the rest wait in the RESOURCE_SEMAPHORE queue while the buffer pool gives memory up. The sorts read appointments times a multiplier from the intensity; nothing is written.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_memory_grants",

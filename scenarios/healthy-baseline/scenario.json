@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "healthy-baseline",
   "title": "Healthy baseline",
+  "service": "careportal-api",
   "summary": "A steady Contoso Care OLTP mix: front-desk patient lookups, provider schedules, billing balances, check-ins, work-queue triage, supply updates, and audit events. Short, indexed statements with no blocking, used as the baseline activity profile and as the before picture for every incident. On T5 (Cosmos DB), the same steady pace as point reads, upserts, and single-partition queries on patient documents.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_healthy_baseline",

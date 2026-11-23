@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "cpu-pressure",
   "title": "CPU pressure",
+  "service": "scheduling-service",
   "summary": "A double-booking audit report with a bounded plan problem: the overlap test wraps both date columns in DATEDIFF, so each execution compares every pair of a provider's appointments instead of seeking ix_appointments_provider. Concurrent sessions run it back to back. The healthy variant asks the same question with a range on scheduled_start and seeks the index, for a before-and-after comparison.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_cpu_pressure",

@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "deadlock-storm",
   "title": "Deadlock storm",
+  "service": "supply-sync",
   "summary": "Pairs of sessions deadlock with each other round after round: in 'order' rounds side 1 locks inventory row A then B while side 2 locks B then A; in 'conversion' rounds both sides read row A with HOLDLOCK and then both update it. Side 2 runs at DEADLOCK_PRIORITY LOW, so it's the victim (error 1205). Every round rolls back, each victim is recorded as a deadlock-victim event, and each session stops after maxRounds rounds.",
   "orchestration": "pairs",
   "procedure": "demo.usp_scenario_deadlock_storm",

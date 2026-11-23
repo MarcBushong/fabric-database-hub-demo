@@ -2,6 +2,7 @@
   "$schema": "../scenario.schema.json",
   "id": "plan-regression",
   "title": "Plan regression (automatic plan correction)",
+  "service": "frontdesk-app",
   "summary": "A front-desk visit summary whose plan depends on the first range it's compiled for: a few patients seek (plan A); then the runner recompiles it for every patient, so the cached plan scans care.appointments (plan B), and the same narrow lookups go on far more slowly. With FORCE_LAST_GOOD_PLAN on, Azure SQL Database's default, automatic tuning forces plan A. In the Database Agent beat (2026-11-18) the run holds it off until Database Agents raises its issue, then forces the last good plan itself and puts it back. T3 (Azure SQL Database) only.",
   "orchestration": "workers",
   "procedure": "demo.usp_scenario_plan_regression",
