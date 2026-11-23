@@ -76,11 +76,12 @@ export function monitorGrain(from: number, to: number, bins: Iterable<number>): 
  * (bin in epoch milliseconds, or "" for a row without one). Per bin, each save's point there, as finestPerInterval keeps it:
  * - No finer save's rows reach its interval: it stays whole. A finer save is a finer grain, or the same grain and newer.
  * - One finer save has a row in every one of its intervals across it: it's covered, and left out.
- * - Otherwise, from the finer saves' rows in its interval, ranked by save (the finest first, then the newest), each row
- *   keeps what the shared function keeps (all of it with nothing earlier under it, nothing when earlier rows cover it, or
- *   else what's left of it), against every earlier save's rows, as finestPerInterval takes each point against every one
- *   it kept before. Then a point that those rows cover is left out; a total stays as what's left of it, and a maximum or
- *   an average only when it's higher than every one of them that wasn't covered itself.
+ * - Otherwise, from the finer saves whose rows reach any part of its interval, the part its window cuts off too, ranked
+ *   by save (the finest first, then the newest), each of their rows in its interval keeps what the shared function keeps
+ *   (all of it with nothing earlier under it, nothing when earlier rows cover it, or else what's left of it), against
+ *   every earlier save's rows, as finestPerInterval takes each point against every one it kept before. Then a point that
+ *   those rows cover where its window keeps it is left out; a total stays as what's left of it, and a maximum or an
+ *   average only when it's higher than every one of them that wasn't covered itself.
  * Totals add, and maxima and averages take the highest; a remainder shows at its own bin's start. Off the bin grid, the
  * newest capture. A row with no bin is a save only, a marker with its rows' extent in First, Last, and Count.
  */
@@ -175,7 +176,10 @@ export function snapshotValues(rows: readonly Row[]): Map<string, number> {
             let start = Math.max(bin, save.from);
             let end = Math.min(bin + length, save.to);
             if (start >= end) [start, end] = [bin, bin + length];
-            const finer = [...saves.values()].filter((s) => finerThan(s, save) && s.rowFrom < end && s.rowTo > start);
+            // The finer saves whose rows reach any part of its interval, the part its window cuts off too: a finer row
+            // that straddles the cut is taken against every one of them, as finestPerInterval takes it (the review of
+            // 4944e22d). The cover check and the point's own remainder stay on the part its window keeps.
+            const finer = [...saves.values()].filter((s) => finerThan(s, save) && s.rowFrom < bin + length && s.rowTo > bin);
             if (finer.length === 0) return value;
             if (finer.some((s) => s.dense && s.rowFrom <= start + EPSILON && s.rowTo >= end - EPSILON)) return null;
             // The finer saves' rows in its interval, each ranked by its save: the finest first, then the newest.

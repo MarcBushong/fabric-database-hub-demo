@@ -280,4 +280,22 @@ describe("F35's per-bin rule in TypeScript, the reference for a fix of the histo
         expect(model).toBeCloseTo(0.9, 9);
         expect(finest).toBeCloseTo(0.9, 9);
     });
+
+    // The review of 4944e22d: a finer save whose rows fall only in the part of a coarser interval that the coarser save's
+    // window cuts off wasn't ranked there, so a finer point that straddles the cut kept all it held, and the coarser
+    // remainder lost the minutes they share twice. Background load is 4 a minute, and a session from 15:16 to 15:22 has 10
+    // a minute, saved every minute; stop-demo.ps1 -SaveHistory at 15:24 cuts its 15:20 bin to 15:20 to 15:24, 28; and the
+    // next day's update at 15:22 cuts its day save's 15:15 bin to 15:22 to 15:30, 32. The data hold 96 from 15:15 to 15:30.
+    it("ranks a finer save whose rows fall only where a coarser save's window cuts its interval off, as finestPerInterval does", () => {
+        const batch = (s: Record<string, string>) => row(s, "T1", "counter_deltas", "Batch Requests/sec");
+        const rows = [
+            ...minutes("15:16", [10, 10, 10, 10, 10, 10]).map(batch(save("2026-11-21T15:23:00", "2026-11-21T15:16:00", "2026-11-21T15:22:00"))),
+            ...every("15:15", 5, [44, 28]).map(batch(save("2026-11-21T15:24:30", "2026-11-21T03:24:00", "2026-11-21T15:24:00"))),
+            ...every("15:15", 15, [32, 60]).map(batch(save("2026-11-22T15:33:00", "2026-11-21T15:22:00", "2026-11-22T15:22:00"))),
+        ];
+        // The stop save's 15:20 keeps 8 beside the session's minutes, so the day's 15:15 keeps 24 for 15:24 to 15:30: with
+        // the stop save's 15:15, 4, its bin is 28. Without the session's save ranked there, they were 4, and 8.
+        expect(snapshotValues(rows).get(key("T1", "counter_deltas", "Batch Requests/sec", "15:15"))).toBe(28);
+        expect(f35Check(rows, at("15:15"), at("15:30")).measures.T1.Batch).toEqual({ model: 96, finest: 96 });
+    });
 });

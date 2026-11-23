@@ -5641,7 +5641,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 
 **Work summary.**
 
-- **`snapshotValues`** takes each finer save's rows in a coarser point's interval against every earlier save's rows there, in the same order as before (the finest first, then the newest), as `finestPerInterval` does. Its notes say so.
+- **`snapshotValues`** takes each finer save's rows in a coarser point's interval against every earlier save's rows there, in the same order as before (the finest first, then the newest), as `finestPerInterval` does, for the finer saves whose rows reach the part of the interval that the coarser save's window keeps. [A later section](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) ranks those whose rows reach only the part it cuts off too. Its notes say so.
 - **A test:** the named case's saves, in the test file's own terms. The day's 15:15 bin is 780, its 900 less the minutes' 130 beside the newest save's minute, where it was 728; and `f35Check`'s model equals finest from 15:15 to 15:30, 0.9 s.
 - **What doesn't change:** the app's views, which don't call `snapshotValues` (only its tests do, and the shared cases' test on the groundwork branch); the model; and every doc a user reads. So there's no CHANGELOG entry.
 
@@ -5730,3 +5730,40 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - **Three more reads per removal,** one per resource; each is one Resource Manager GET.
 - **A read Azure refuses** goes to the delete as before, so a resource that was gone then reads as deleted, as before the change.
 - **Not run live:** the next `-Remove` after a `destroy.ps1`, or on a control that's there, shows it.
+
+### The review of 4944e22d: a finer save where a window cuts the interval off (2026-11-22)
+
+**Why.** The review of 4944e22d, and of the groundwork's change of the same rule, found taking each rank against every earlier one correct, with two Lows. The first is in both rules, and older than that change; the second is the groundwork's, on its own branch.
+
+- **The problem:** `snapshotValues` ranked only the finer saves whose rows reach the part of a coarser point's interval that the coarser save's window keeps. A finer save whose rows fall only in the part the window cuts off wasn't ranked there. So a finer point that straddles the cut kept all it held, and the coarser remainder lost the minutes they share twice. `finestPerInterval` takes such a point against every point it kept before, so `f35Check` disagreed.
+- **The reviewer's case,** the three real producers, with values that agree across saves:
+  - background load of 4 a minute, and a session from 15:16 to 15:22 at 10 a minute, saved every minute;
+  - `stop-demo.ps1 -SaveHistory` at 15:24, whose 15:20 bin is cut to 15:20 to 15:24 and holds 28;
+  - the next day's update at 15:22, whose day save's 15:15 bin is cut to 15:22 to 15:30 and holds 32.
+
+  From 15:15 to 15:30, `snapshotValues` gave 76, and `finestPerInterval` 96, which the data hold. The session's rows end at 15:22, where the day save's window begins, so the day's point left the session's save out; the stop save's 15:20 then kept its 28 where 8 is its own, and the day's point kept 4 where 24 is.
+- **When:** an update that runs, a day later, at a time of day between a session's end and its stop save's. The review's simulation of the three producers found it in 32 of 9,390 hourly totals when forcing that timing after each session, and in none of 7,195 hours otherwise.
+- **The coordinator's decision:** fix it in both rules as the reviewer suggests, and correct the claims that the rules match `finestPerInterval` without that limit.
+
+**Work summary.**
+
+- **`snapshotValues`** chooses a coarser point's finer saves by its whole interval, the part its window cuts off too. The check that one finer save covers it, and its own remainder, stay on the part its window keeps. Its notes say so. The groundwork branch makes the same change in `kept_value.py`.
+- **A test:** the reviewer's case. The day's 15:15 bin is 28, the stop save's 4 beside the day's 24, and `f35Check`'s model equals finest from 15:15 to 15:30: 96.
+- **What doesn't change:** the app's views, which don't call `snapshotValues`; the model; and every doc a user reads. So there's no CHANGELOG entry.
+- **This report:** 4944e22d's section no longer says the rule takes every finer save as `finestPerInterval` does without that limit.
+
+**Changed files.** `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, and this report.
+
+**Validation.**
+
+- **The test** fails with the previous rule ("expected 8 to be 28": the bin was the stop save's 4 and the day's 4), and passes with this one.
+- **The reviewer's checks, again, with generators of my own** in a scratch test, not committed:
+  - the case: 76 with the previous rule, 96 with this one and with `finestPerInterval`;
+  - 4,000 random histories in the shared cases' style, every kind of window cut among them (274,607 rows, 11,166 hours of totals and peaks): no hour changes. The 7 hours where both rules differ from `finestPerInterval` are saves whose bins don't show their step, the groundwork's pinned kind;
+  - the three producers over four days, 30 histories with the review's timing (97,438 rows, 6,552 hours): the previous rule differs from `finestPerInterval` in 36 hourly totals, in 22 histories, by up to 50. This one changes exactly those 36, each to `finestPerInterval`'s, and no hour moves further from it. Peaks agree in both. 30 histories without that timing differ in no hour, with either rule.
+- vitest: the app's whole suite, 388 of 388 in 21 files. typecheck and eslint: clean. markdownlint: clean.
+
+**Risks.**
+
+- None for deployments: neither the app nor the model runs the reference.
+- More finer saves are ranked in an interval that a window cuts: those whose rows reach its cut-off part. An answer changes only where one of their rows straddles the cut.
