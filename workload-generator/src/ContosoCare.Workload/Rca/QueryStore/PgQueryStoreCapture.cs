@@ -6,7 +6,7 @@ using ContosoCare.Workload.Rca.Observer;
 namespace ContosoCare.Workload.Rca.QueryStore;
 
 /// <summary>Where T4's Query Store is read from, and where its unread time is kept: the observer's wiring.</summary>
-/// <param name="QueryStore">Connections to T4's azure_sys (<see cref="PgCaptureConnector.QueryStore"/>), one per read.</param>
+/// <param name="QueryStore">Connections to T4's azure_sys (<see cref="PgCaptureConnector.QueryStore"/>), one per block.</param>
 /// <param name="Watermark">The unread-interval watermark, in the evidence store's folder.</param>
 /// <param name="Spans">The span store's side of a backfill; without it, nothing is recorded as pending or backfilled.</param>
 /// <param name="Schedule">When to read; the interval Query Store reports replaces its interval.</param>
@@ -14,10 +14,51 @@ namespace ContosoCare.Workload.Rca.QueryStore;
 internal sealed record PgQueryStoreSource(ICaptureConnector QueryStore, QueryWatermark Watermark, ISidecarSpans? Spans = null, QueryStoreSchedule? Schedule = null, string Database = PgEndpoint.DatabaseName);
 
 /// <summary>
-/// T4's Query Store in the sidecar (rca/README.md, Query Store and Pending publication), for the PostgreSQL observer. Each
-/// read takes Query Store's settings (RCA-PG-13) and the harness (RCA-PG-16) on the observer's own connection, then, on a
-/// connection to azure_sys of its own, earlier spans' unsettled time (the backfill) and this observation's intervals
-/// (RCA-PG-14 and 15): the 2 hours before the observer's start first, then every 15 minutes, and at its end.
+/// T4's sidecar reads' timings and bounds (rca/README.md, The sidecar): Query Store's (RCA-PG-13 to 16) and who holds the
+/// connections (RCA-PG-17). A block runs in the observer's tick only when its timeout ends before the evidence capture's
+/// next work. Tests shorten or measure them.
+/// </summary>
+internal sealed record PgSidecarOptions
+{
+    /// <summary>RCA-PG-13, 16, and 17, which read a few rows on the observer's own connection.</summary>
+    public TimeSpan LightTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>Opening a connection to azure_sys, which each RCA-PG-14 page and RCA-PG-15 opens for itself and closes after it.</summary>
+    public TimeSpan OpenTimeout { get; init; } = TimeSpan.FromSeconds(5);
+
+    /// <summary>One RCA-PG-14 page, or RCA-PG-15.</summary>
+    public TimeSpan ReadTimeout { get; init; } = TimeSpan.FromSeconds(15);
+
+    /// <summary>A block runs in a tick only when its timeout would end at least this long before the evidence capture's next work.</summary>
+    public TimeSpan Margin { get; init; } = TimeSpan.FromSeconds(1);
+
+    /// <summary>The observer's end: its Query Store reads together, each block's timeout cut to what's left of this.</summary>
+    public TimeSpan EndBudget { get; init; } = TimeSpan.FromSeconds(10);
+
+    /// <summary>How soon a read that threw, or waited for a slowed observer, is tried again.</summary>
+    public TimeSpan Retry { get; init; } = TimeSpan.FromMinutes(2);
+
+    /// <summary>Measures how long a tick's work and the end's reads took: durations only, never the time of day.</summary>
+    public TimeProvider Clock { get; init; } = TimeProvider.System;
+
+    /// <summary>A block on azure_sys: its connection's open, and the block.</summary>
+    public TimeSpan StoreBlock => OpenTimeout + ReadTimeout;
+}
+
+/// <summary>
+/// T4's Query Store in the sidecar (rca/README.md, Query Store and Pending publication), for the PostgreSQL observer. A
+/// read takes Query Store's settings (RCA-PG-13) and the harness (RCA-PG-16) quietly on the observer's own connection
+/// (<see cref="ISidecarAccess"/>), then, on connections to azure_sys of its own, earlier spans' unsettled time (the
+/// backfill) and this observation's intervals (RCA-PG-14 and 15): the 2 hours before the observer's start first, then
+/// 2 minutes after each interval ends, and at its end.
+/// <para>
+/// None of it changes the evidence document. A read runs last in the observer's tick, one block a tick, and a block only
+/// when its timeout ends before the evidence capture's next work; each block on azure_sys opens its connection and closes
+/// it, so none is open when the evidence counts T4's connections. A read under way asks for no tick of its own: it takes
+/// the ticks the lane makes anyway. While the observer is slowed or has stopped its detail capture, no read starts (Query
+/// Store keeps the intervals), and the end's read takes at most <see cref="PgSidecarOptions.EndBudget"/>. Every failure
+/// is a gap in RCA Query Coverage, never one in RCA Coverage.
+/// </para>
 /// <para>
 /// An interval is settled once a read took it at least <see cref="PublishedAfter"/> after it ended, when Query Store has
 /// surely published all of it. Until then each read takes it again, and writes its rows again only when they changed, so
@@ -25,10 +66,9 @@ internal sealed record PgQueryStoreSource(ICaptureConnector QueryStore, QueryWat
 /// still unsettled at the observer's end is kept in the watermark for this span, and the coverage says what Query Store
 /// hadn't published yet, never that it wasn't captured.
 /// </para>
-/// Without the harness's list, nothing is read: its bookkeeping would be in it. Every failure is a gap in RCA Query
-/// Coverage; none reaches the evidence document or the observer's own connection.
+/// Without the harness's list, nothing is read: its bookkeeping would be in it.
 /// </summary>
-internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource source, ISidecarSink sidecar, ObserverOptions options, RunnerLog log)
+internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSource source, ISidecarSink sidecar, PgSidecarOptions options, RunnerLog log)
 {
     /// <summary>
     /// How long after an interval ends Query Store has surely published it: Learn allows "up to 20 minutes for the first
@@ -46,6 +86,10 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
     // What was written of each unsettled interval, by sink (this observation's, or an earlier range's): a row is written
     // again only when a later read found it changed.
     private readonly Dictionary<string, Dictionary<string, Written>> written = new(StringComparer.Ordinal);
+
+    // What another sidecar read of T4 (RCA-PG-17), a read that waited, or one that didn't finish leaves for the next row.
+    private readonly SortedSet<string> carriedSources = new(StringComparer.Ordinal);
+    private readonly List<string> carriedGaps = [];
     private QueryStoreSchedule schedule = source.Schedule ?? QueryStoreSchedule.Default;
     private DateTimeOffset observingSince;
     private DateTimeOffset lastRead;
@@ -53,9 +97,17 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
     private DateTimeOffset? settled;
     private PgQueryStoreSettings? settings;
     private PgHarness? harness;
+    private Cycle? cycle;
+    private bool held;
 
-    /// <summary>Runs a catalog block on the observer's own connection, untimed; null when it failed (the observer noted why).</summary>
-    public delegate Task<IReadOnlyList<CaptureValues>?> BlockRunner(string blockId, CancellationToken cancellationToken);
+    private enum Phase
+    {
+        Settings,
+        Harness,
+        Backfill,
+        Current,
+        Done,
+    }
 
     /// <summary>When the next read is due: at the observer's start, then 2 minutes after each interval ends.</summary>
     public DateTimeOffset NextRead { get; private set; } = DateTimeOffset.MaxValue;
@@ -66,6 +118,14 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
     /// <summary>Every interval that ends by this time is settled: a read took it once Query Store had surely published it.</summary>
     public DateTimeOffset? Settled => settled;
 
+    /// <summary>True while a read is under way: it runs a block a tick until it's done.</summary>
+    public bool Reading => cycle is not null;
+
+    private string Target => access.Target;
+
+    /// <summary>A timestamp of the reads' clock, which the observer takes at its tick's start, so the tick's evidence work counts against the reads' room.</summary>
+    public long Timestamp() => options.Clock.GetTimestamp();
+
     public void Begin(DateTimeOffset now)
     {
         schedule = source.Schedule ?? QueryStoreSchedule.Default;
@@ -75,15 +135,110 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
         settled = null;
         settings = null;
         harness = null;
+        cycle = null;
+        held = false;
         written.Clear();
+        carriedSources.Clear();
+        carriedGaps.Clear();
         NextRead = now;
     }
 
-    /// <summary>A read on the schedule: earlier spans' unsettled time first, then this observation's.</summary>
-    public Task ReadAsync(DateTimeOffset now, BlockRunner run, CancellationToken cancellationToken) => ReadCoreAsync(now, run, final: false, cancellationToken);
+    /// <summary>What another sidecar read of T4 leaves for the next RCA Query Coverage row: a block that returned rows, or a gap.</summary>
+    public void Note(string? returned, string? gap)
+    {
+        if (returned is not null)
+        {
+            carriedSources.Add(returned);
+        }
 
-    /// <summary>The last read, at the observer's end: what's published, and the rest kept as unsettled for a later read.</summary>
-    public Task EndAsync(DateTimeOffset now, BlockRunner run, CancellationToken cancellationToken) => ReadCoreAsync(now, run, final: true, cancellationToken);
+        if (gap is not null)
+        {
+            carriedGaps.Add(gap);
+        }
+    }
+
+    /// <summary>
+    /// The read's next block, when one is due and fits before <paramref name="evidenceDue"/>, the evidence capture's next
+    /// work, counting from <paramref name="tickStarted"/> (<see cref="Timestamp"/>). A read that throws is dropped and tried
+    /// again <see cref="PgSidecarOptions.Retry"/> later. Returns when the reads next have work.
+    /// </summary>
+    public async Task<DateTimeOffset> TickAsync(DateTimeOffset now, long tickStarted, DateTimeOffset evidenceDue, CancellationToken cancellationToken)
+    {
+        bool Fits(TimeSpan timeout) => evidenceDue - now - options.Clock.GetElapsedTime(tickStarted) >= timeout + options.Margin;
+
+        if (cycle is null && now >= NextRead)
+        {
+            if (Held(now))
+            {
+                NextRead = now + options.Retry;
+            }
+            else
+            {
+                NextRead = schedule.NextRead(now);
+                cycle = new Cycle(now, final: false, lastRead);
+            }
+        }
+
+        if (cycle is { } current)
+        {
+            try
+            {
+                if (Prepare(current, now) is { } need && Fits(need))
+                {
+                    await StepAsync(current, now, own => own, cancellationToken).ConfigureAwait(false);
+                    Prepare(current, now);
+                }
+            }
+            catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
+            {
+                Abandon(current);
+                NextRead = Earlier(NextRead, now + options.Retry);
+                throw;
+            }
+        }
+
+        // A read under way takes its next block at the lane's next tick, which comes within a second anyway: it asks for no
+        // tick of its own, so the evidence's ticks, and its watermark, stay as they'd be without it.
+        return cycle is null ? NextRead : evidenceDue;
+    }
+
+    /// <summary>
+    /// The last read, at the observer's end, after the evidence capture's own: what's published, within
+    /// <see cref="PgSidecarOptions.EndBudget"/>, and the rest kept as unsettled for a later read. A read cut short, by its
+    /// bound or the observer's cancellation, says so in its coverage.
+    /// </summary>
+    public async Task EndAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        var started = options.Clock.GetTimestamp();
+        TimeSpan? Left(TimeSpan own)
+        {
+            var left = options.EndBudget - options.Clock.GetElapsedTime(started);
+            return left < TimeSpan.FromSeconds(1) ? null : left < own ? left : own;
+        }
+
+        if (cycle is { } open)
+        {
+            Abandon(open);
+        }
+
+        NextRead = DateTimeOffset.MaxValue;
+        var final = cycle = new Cycle(now, final: true, lastRead);
+        try
+        {
+            while (Prepare(final, now) is not null)
+            {
+                if (!await StepAsync(final, now, Left, cancellationToken).ConfigureAwait(false))
+                {
+                    Cut(final, now, string.Create(CultureInfo.InvariantCulture, $"The end's Query Store reads on {Target} stopped at their bound of {options.EndBudget.TotalSeconds:0} s."));
+                    break;
+                }
+            }
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            Cut(final, now, $"The end's Query Store reads on {Target} were cut short with the observer's end.");
+        }
+    }
 
     private static DateTimeOffset Earlier(DateTimeOffset a, DateTimeOffset b) => a <= b ? a : b;
 
@@ -95,46 +250,202 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
     private static string Signature(CaptureRow row, string[] columns) =>
         string.Join('|', columns.Select(c => row.Get(c) is { } value ? "v" + Convert.ToString(value, CultureInfo.InvariantCulture) : "n"));
 
-    private async Task ReadCoreAsync(DateTimeOffset now, BlockRunner run, bool final, CancellationToken cancellationToken)
+    /// <summary>While the observer is slowed or has stopped its detail capture, no read starts: Query Store keeps the intervals.</summary>
+    private bool Held(DateTimeOffset now)
     {
-        ArgumentNullException.ThrowIfNull(run);
-
-        // Due again on the schedule whatever happens below, so a read that fails isn't repeated at every tick.
-        NextRead = final ? DateTimeOffset.MaxValue : schedule.NextRead(now);
-        var coverage = new QueryCoverage(lastRead, now);
-        var settingsRows = await run(PgQueryStoreRows.Settings, cancellationToken).ConfigureAwait(false);
-        if (settingsRows is null)
+        if (access.Factor <= 1 && !access.DetailStopped)
         {
-            coverage.Gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{PgQueryStoreRows.Settings} couldn't be read on {target} at {now:HH:mm} UTC, so Query Store's settings are as last read; RCA Coverage's gaps say why."));
-        }
-        else
-        {
-            var current = PgQueryStoreSettings.Parse(settingsRows, now);
-            if (settingsRows.Count > 0)
-            {
-                coverage.Sources.Add(PgQueryStoreRows.Settings);
-            }
-
-            if (settings is { } previous && PgQueryStoreRows.StateChange(target, previous, current) is { } change)
-            {
-                sidecar.Write(change);
-            }
-
-            settings = current;
-            coverage.Gaps.AddRange(current.Gaps(target));
-            if (current.Interval is { } interval && interval != schedule.Interval)
-            {
-                schedule = schedule.WithInterval(interval);
-                NextRead = final ? DateTimeOffset.MaxValue : schedule.NextRead(now);
-            }
+            held = false;
+            return false;
         }
 
-        coverage.Settings = settings;
-        var harnessRows = await run(PgQueryStoreRows.Harness, cancellationToken).ConfigureAwait(false);
-        if (harnessRows is not null)
+        if (!held)
         {
-            harness = PgHarness.Parse(harnessRows);
-            if (harnessRows.Count > 0)
+            held = true;
+            var why = access.DetailStopped
+                ? "the observer stopped its detail capture for the rest of the session, so the end's read takes them"
+                : string.Create(CultureInfo.InvariantCulture, $"the observer's samples are slow (its cadence is {access.Factor} times longer), so a read takes them once they're quick again, or the end's read");
+            carriedGaps.Add(string.Create(CultureInfo.InvariantCulture, $"Query Store's reads on {Target} wait from {now:HH:mm:ss} UTC: {why}. Query Store keeps the intervals that ended after {settled ?? schedule.FirstSince(observingSince):HH:mm} UTC."));
+        }
+
+        return true;
+    }
+
+    /// <summary>
+    /// Moves a read past what takes no block (a range read that's done, an earlier range that can't or needn't be read, the
+    /// read's end), and returns the time its next block needs, or null once the read is finished.
+    /// </summary>
+    private TimeSpan? Prepare(Cycle current, DateTimeOffset now)
+    {
+        while (!current.Finished)
+        {
+            switch (current.Phase)
+            {
+                case Phase.Settings:
+                case Phase.Harness:
+                    return options.LightTimeout;
+                case Phase.Backfill:
+                    if (current.Reader is { } reading)
+                    {
+                        if (!reading.Done)
+                        {
+                            return options.StoreBlock;
+                        }
+
+                        if (!FinishBackfill(current, now))
+                        {
+                            current.Ranges!.Clear();
+                        }
+
+                        current.Reader = null;
+                        continue;
+                    }
+
+                    current.Ranges ??= PendingRanges(current);
+                    if (current.Ranges.Count > 0)
+                    {
+                        StartBackfill(current, current.Ranges.Dequeue(), now);
+                        continue;
+                    }
+
+                    current.Phase = Phase.Current;
+                    continue;
+                case Phase.Current:
+                    current.Reader ??= new PgQueryStoreReader(source.Database, settled ?? schedule.FirstSince(observingSince), current.At, harness!);
+                    if (!current.Reader.Done)
+                    {
+                        return options.StoreBlock;
+                    }
+
+                    FinishCurrent(current, now);
+                    current.Reader = null;
+                    current.Phase = Phase.Done;
+                    continue;
+                default:
+                    FinishCycle(current);
+                    break;
+            }
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// Runs a read's next block, its timeouts as <paramref name="limit"/> allows them (null: no time left, and the block
+    /// doesn't run). Returns false when it didn't run.
+    /// </summary>
+    private async Task<bool> StepAsync(Cycle current, DateTimeOffset now, Func<TimeSpan, TimeSpan?> limit, CancellationToken cancellationToken)
+    {
+        switch (current.Phase)
+        {
+            case Phase.Settings:
+            {
+                if (limit(options.LightTimeout) is not { } timeout)
+                {
+                    return false;
+                }
+
+                TakeSettings(current, await access.RunAsync(PgQueryStoreRows.Settings, now, CaptureParameters.None, timeout, cancellationToken).ConfigureAwait(false), now);
+                current.Phase = Phase.Harness;
+                return true;
+            }
+
+            case Phase.Harness:
+            {
+                if (limit(options.LightTimeout) is not { } timeout)
+                {
+                    return false;
+                }
+
+                TakeHarness(current, await access.RunAsync(PgQueryStoreRows.Harness, now, CaptureParameters.None, timeout, cancellationToken).ConfigureAwait(false));
+                current.Phase = harness is null || settings?.InRecovery == true ? Phase.Done : !current.Final && source.Spans is not null ? Phase.Backfill : Phase.Current;
+                return true;
+            }
+
+            default:
+                return current.Reader is not { Done: false } reader || await StoreBlockAsync(reader, limit, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>One block of a range's read, on a connection to azure_sys opened for it and closed after it.</summary>
+    private async Task<bool> StoreBlockAsync(PgQueryStoreReader reader, Func<TimeSpan, TimeSpan?> limit, CancellationToken cancellationToken)
+    {
+        if (limit(options.OpenTimeout) is not { } openTimeout)
+        {
+            return false;
+        }
+
+        ICaptureConnection connection;
+        using (var bounded = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken))
+        {
+            bounded.CancelAfter(openTimeout);
+            try
+            {
+                connection = await source.QueryStore.OpenAsync(bounded.Token).ConfigureAwait(false);
+            }
+            catch (CaptureException ex)
+            {
+                reader.Fail(ex);
+                return true;
+            }
+            catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+            {
+                reader.Fail(new CaptureException(CaptureFailureKind.Timeout, string.Create(CultureInfo.InvariantCulture, $"a connection to azure_sys didn't open within {openTimeout.TotalSeconds:0.#} s.")));
+                return true;
+            }
+        }
+
+        await using (connection.ConfigureAwait(false))
+        {
+            if (limit(options.ReadTimeout) is not { } readTimeout)
+            {
+                return false;
+            }
+
+            await reader.StepAsync(connection, readTimeout, cancellationToken).ConfigureAwait(false);
+            return true;
+        }
+    }
+
+    private void TakeSettings(Cycle current, QuietResult result, DateTimeOffset now)
+    {
+        var coverage = current.Coverage;
+        if (result.Rows is not { } rows)
+        {
+            coverage.Gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{PgQueryStoreRows.Settings} couldn't be read on {Target} at {now:HH:mm} UTC, so Query Store's settings are as last read: {result.Message}"));
+            return;
+        }
+
+        var read = PgQueryStoreSettings.Parse(rows, now);
+        if (rows.Count > 0)
+        {
+            coverage.Sources.Add(PgQueryStoreRows.Settings);
+        }
+
+        if (settings is { } previous && PgQueryStoreRows.StateChange(Target, previous, read) is { } change)
+        {
+            sidecar.Write(change);
+        }
+
+        settings = read;
+        coverage.Gaps.AddRange(read.Gaps(Target));
+        if (read.Interval is { } interval && interval != schedule.Interval)
+        {
+            schedule = schedule.WithInterval(interval);
+            if (!current.Final)
+            {
+                NextRead = schedule.NextRead(current.At);
+            }
+        }
+    }
+
+    private void TakeHarness(Cycle current, QuietResult result)
+    {
+        var coverage = current.Coverage;
+        if (result.Rows is { } rows)
+        {
+            harness = PgHarness.Parse(rows);
+            if (rows.Count > 0)
             {
                 coverage.Sources.Add(PgQueryStoreRows.Harness);
             }
@@ -151,163 +462,206 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
         }
         else if (harness is null)
         {
-            coverage.Gaps.Add($"{PgQueryStoreRows.Harness} couldn't be read on {target}, so Query Store's statements weren't read: without the harness's functions, its bookkeeping would be among them. The next read tries again.");
+            coverage.Gaps.Add($"{PgQueryStoreRows.Harness} couldn't be read on {Target}, so Query Store's statements weren't read: without the harness's functions, its bookkeeping would be among them. The next read tries again: {result.Message}");
+        }
+    }
+
+    /// <summary>This observation's intervals, as read: written, and settled as far as the read surely took them.</summary>
+    private void FinishCurrent(Cycle current, DateTimeOffset now)
+    {
+        var reader = current.Reader!;
+        var read = reader.Result;
+        Take(read, string.Empty, sidecar, current.Coverage, now);
+        if (read.Failure is { } failure)
+        {
+            // Nothing settles: the next read takes the same intervals again.
+            Failed(current.Coverage, read.FailedBlock ?? PgQueryStoreRows.Statistics, failure);
+            return;
         }
 
-        if (harness is { } leaveOut && settings?.InRecovery != true)
+        if (read.Through is { } newest && (through is null || newest > through))
         {
-            await ReadStoreAsync(now, final, leaveOut, coverage, cancellationToken).ConfigureAwait(false);
+            through = newest;
         }
+
+        // Every interval that ended PublishedAfter before this read was published, and this read took it.
+        var surely = current.At - PublishedAfter;
+        var reached = read.Complete ? surely : Earlier(surely, read.Through ?? reader.From);
+        if (settled is null || reached > settled)
+        {
+            settled = reached;
+            Forget(string.Empty, reached);
+        }
+    }
+
+    /// <summary>A read's end: what's pending at the observer's end, the watermark, and the read's coverage row.</summary>
+    private void FinishCycle(Cycle current)
+    {
+        current.Finished = true;
+        if (cycle == current)
+        {
+            cycle = null;
+        }
+
+        var coverage = current.Coverage;
+        coverage.Settings = settings;
+        coverage.Sources.UnionWith(carriedSources);
+        coverage.Gaps.AddRange(carriedGaps);
+        carriedSources.Clear();
+        carriedGaps.Clear();
 
         // Query Store off, or a server in recovery, publishes nothing later: nothing is pending then.
         var recording = settings is null || (settings.InRecovery != true && !string.Equals(settings.CaptureMode, "none", StringComparison.Ordinal));
         var unsettled = settled ?? schedule.FirstSince(observingSince);
-        if (final && recording)
+        if (current.Final && recording)
         {
             // What Query Store hadn't published: after the newest interval it showed, or what's unsettled if that's later.
             var pending = through is { } shown && shown > unsettled ? shown : unsettled;
-            if (pending < now)
+            if (pending < current.At)
             {
-                coverage.Pending = (pending, now);
-                coverage.Gaps.Add(PgQueryStoreRows.PendingGap(target, pending, now));
+                coverage.Pending = (pending, current.At);
+                coverage.Gaps.Add(PgQueryStoreRows.PendingGap(Target, pending, current.At));
             }
         }
 
-        Record(now, unsettled, final, recording, coverage);
-        sidecar.Write(PgQueryStoreRows.Coverage(target, coverage));
-        lastRead = now;
+        Record(current.At, unsettled, current.Final, recording, coverage);
+        sidecar.Write(PgQueryStoreRows.Coverage(Target, coverage));
+        lastRead = current.At;
     }
 
-    /// <summary>The reads on azure_sys: the backfill (except at the end), then this observation's own intervals.</summary>
-    private async Task ReadStoreAsync(DateTimeOffset now, bool final, PgHarness leaveOut, QueryCoverage coverage, CancellationToken cancellationToken)
+    /// <summary>Drops a read that didn't finish: what it had read waits for a later read, and its gaps for the next coverage row.</summary>
+    private void Abandon(Cycle current)
     {
-        ICaptureConnection connection;
-        try
+        current.Finished = true;
+        if (cycle == current)
         {
-            connection = await source.QueryStore.OpenAsync(cancellationToken).ConfigureAwait(false);
+            cycle = null;
         }
-        catch (CaptureException ex)
+
+        carriedSources.UnionWith(current.Coverage.Sources);
+        carriedGaps.AddRange(current.Coverage.Gaps);
+    }
+
+    /// <summary>Ends the end's read where it is: the range under way keeps what it read, and the rest is a gap.</summary>
+    private void Cut(Cycle current, DateTimeOffset now, string why)
+    {
+        if (current.Finished)
         {
-            Failed(coverage, PgQueryStoreRows.Statistics, ex);
             return;
         }
 
-        await using (connection.ConfigureAwait(false))
+        if (current.Phase == Phase.Current && current.Reader is { } reader)
         {
-            if (!final && source.Spans is { } spans)
+            if (!reader.Done)
             {
-                await BackfillAsync(connection, spans, now, leaveOut, coverage, cancellationToken).ConfigureAwait(false);
+                reader.Fail(new CaptureException(CaptureFailureKind.Timeout, why));
             }
 
-            var since = settled ?? schedule.FirstSince(observingSince);
-            var read = await PgQueryStoreReader.ReadAsync(connection, source.Database, since, now, leaveOut, options.LongStatementTimeout, cancellationToken).ConfigureAwait(false);
-            Take(read, string.Empty, sidecar, coverage, now);
-            if (read.Failure is { } failure)
-            {
-                // Nothing settles: the next read takes the same intervals again.
-                Failed(coverage, read.FailedBlock ?? PgQueryStoreRows.Statistics, failure);
-                return;
-            }
+            FinishCurrent(current, now);
+            current.Reader = null;
+        }
+        else
+        {
+            current.Coverage.Gaps.Add(why);
+        }
 
-            if (read.Through is { } newest && (through is null || newest > through))
-            {
-                through = newest;
-            }
+        current.Phase = Phase.Done;
+        FinishCycle(current);
+    }
 
-            // Every interval that ended PublishedAfter before this read was published, and this read took it.
-            var surely = now - PublishedAfter;
-            var reached = read.Complete ? surely : Earlier(surely, read.Through ?? since);
-            if (settled is null || reached > settled)
-            {
-                settled = reached;
-                Forget(string.Empty, reached);
-            }
+    /// <summary>Earlier observations' unsettled time, oldest first, at most <see cref="BackfillsPerRead"/> ranges.</summary>
+    private Queue<PendingRange> PendingRanges(Cycle current)
+    {
+        var currentSpan = source.Spans?.CurrentSpan;
+        try
+        {
+            return new Queue<PendingRange>(source.Watermark.Read().Pending
+                .Where(p => !(string.Equals(p.SpanId, currentSpan, StringComparison.Ordinal) && p.ObservedFromUtc == observingSince))
+                .OrderBy(p => p.FromUtc)
+                .Take(BackfillsPerRead));
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            current.Coverage.Gaps.Add($"The Query Store watermark couldn't be read on this host, so no earlier session's pending time was read: {Redactor.Redact(ex.Message)}");
+            return new Queue<PendingRange>();
         }
     }
 
     /// <summary>
-    /// Earlier observations' unsettled time, oldest first: read again into the sidecar of the span it belongs to (backfill
-    /// true), until the interval that holds its end has surely been published and a read took it then. A range older than
-    /// Query Store's retention expires as a gap that says so.
+    /// Starts reading an earlier range again into the sidecar of the span it belongs to (backfill true), until the interval
+    /// that holds its end has surely been published and a read took it then; a range older than Query Store's retention
+    /// expires as a gap that says so, and one whose span the store no longer has is dropped.
     /// </summary>
-    private async Task BackfillAsync(ICaptureConnection connection, ISidecarSpans spans, DateTimeOffset now, PgHarness leaveOut, QueryCoverage current, CancellationToken cancellationToken)
+    private void StartBackfill(Cycle current, PendingRange range, DateTimeOffset now)
     {
-        var currentSpan = spans.CurrentSpan;
-        List<PendingRange> ranges;
-        try
+        var key = range.SpanId + "|" + range.ObservedFromUtc.UtcTicks.ToString(CultureInfo.InvariantCulture);
+        if (source.Spans!.ForSpan(range.SpanId) is not { } sink)
         {
-            ranges = [.. source.Watermark.Read().Pending
-                .Where(p => !(string.Equals(p.SpanId, currentSpan, StringComparison.Ordinal) && p.ObservedFromUtc == observingSince))
-                .OrderBy(p => p.FromUtc)
-                .Take(BackfillsPerRead)];
-        }
-        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
-        {
-            current.Gaps.Add($"The Query Store watermark couldn't be read on this host, so no earlier session's pending time was read: {Redactor.Redact(ex.Message)}");
+            log.Info("rca.querystore-forgotten", "An earlier span's pending Query Store time can't be backfilled: the store no longer has the span.", ("target", Target), ("span", range.SpanId));
+            Remove(range, key);
             return;
         }
 
+        // A range whose observer never ended (its process is gone) ends one interval after it was last recorded.
+        var to = range.ToUtc ?? Earlier(now, range.RecordedUtc + schedule.Interval);
+        var coverage = new QueryCoverage(range.FromUtc, to) { Settings = settings, Backfill = true };
+        coverage.Sources.UnionWith(current.Coverage.Sources);
         var retention = settings?.Retention ?? PgQueryStoreSettings.DefaultRetention;
         var kept = now - retention;
-        foreach (var range in ranges)
+        if (to <= kept)
         {
-            var key = range.SpanId + "|" + range.ObservedFromUtc.UtcTicks.ToString(CultureInfo.InvariantCulture);
-            var sink = spans.ForSpan(range.SpanId);
-            if (sink is null)
-            {
-                log.Info("rca.querystore-forgotten", "An earlier span's pending Query Store time can't be backfilled: the store no longer has the span.", ("target", target), ("span", range.SpanId));
-                Remove(range, key);
-                continue;
-            }
-
-            // A range whose observer never ended (its process is gone) ends one interval after it was last recorded.
-            var to = range.ToUtc ?? Earlier(now, range.RecordedUtc + schedule.Interval);
-            var coverage = new QueryCoverage(range.FromUtc, to) { Settings = settings, Backfill = true };
-            coverage.Sources.UnionWith(current.Sources);
-            if (to <= kept)
-            {
-                coverage.Gaps.Add(Expired(range.FromUtc, to, retention));
-                sink.Write(PgQueryStoreRows.Coverage(target, coverage));
-                Remove(range, key);
-                continue;
-            }
-
-            var from = range.FromUtc;
-            if (from < kept)
-            {
-                coverage.Gaps.Add(Expired(from, kept, retention));
-                from = kept;
-            }
-
-            var read = await PgQueryStoreReader.ReadAsync(connection, source.Database, from, to, leaveOut, options.LongStatementTimeout, cancellationToken).ConfigureAwait(false);
-            if (read.Failure is { } failure && read.Statistics.Count == 0)
-            {
-                current.Gaps.Add($"Reading an earlier session's pending time failed on {target}'s azure_sys; the next read tries again: {failure.Message}");
-                return;
-            }
-
-            Take(read, key, sink, coverage, now);
-            if (read.Failure is { } partial)
-            {
-                Failed(coverage, read.FailedBlock ?? PgQueryStoreRows.Statistics, partial);
-            }
-
-            var done = read.Failure is null && read.Complete && now >= to + schedule.Interval + PublishedAfter;
-            var shown = read.Through is { } reached && reached > from ? reached : from;
-            if (!done && shown < to)
-            {
-                coverage.Pending = (shown, to);
-                coverage.Gaps.Add(PgQueryStoreRows.PendingGap(target, shown, to));
-            }
-
-            sink.Write(PgQueryStoreRows.Coverage(target, coverage));
-            if (done)
-            {
-                Remove(range, key);
-            }
+            coverage.Gaps.Add(Expired(range.FromUtc, to, retention));
+            sink.Write(PgQueryStoreRows.Coverage(Target, coverage));
+            Remove(range, key);
+            return;
         }
+
+        var from = range.FromUtc;
+        if (from < kept)
+        {
+            coverage.Gaps.Add(Expired(from, kept, retention));
+            from = kept;
+        }
+
+        current.Backfill = new BackfillRead(range, key, sink, coverage, to);
+        current.Reader = new PgQueryStoreReader(source.Database, from, to, harness!);
     }
 
+    /// <summary>An earlier range's read, into its span's sidecar; false when it failed with nothing read, which ends this read's backfill.</summary>
+    private bool FinishBackfill(Cycle current, DateTimeOffset now)
+    {
+        var (range, key, sink, coverage, to) = current.Backfill!;
+        var reader = current.Reader!;
+        var read = reader.Result;
+        current.Backfill = null;
+        if (read.Failure is { } failure && read.Statistics.Count == 0)
+        {
+            current.Coverage.Gaps.Add($"Reading an earlier session's pending time failed on {Target}'s azure_sys; the next read tries again: {failure.Message}");
+            return false;
+        }
+
+        Take(read, key, sink, coverage, now);
+        if (read.Failure is { } partial)
+        {
+            Failed(coverage, read.FailedBlock ?? PgQueryStoreRows.Statistics, partial);
+        }
+
+        var done = read.Failure is null && read.Complete && now >= to + schedule.Interval + PublishedAfter;
+        var shown = read.Through is { } reached && reached > reader.From ? reached : reader.From;
+        if (!done && shown < to)
+        {
+            coverage.Pending = (shown, to);
+            coverage.Gaps.Add(PgQueryStoreRows.PendingGap(Target, shown, to));
+        }
+
+        sink.Write(PgQueryStoreRows.Coverage(Target, coverage));
+        if (done)
+        {
+            Remove(range, key);
+        }
+
+        return true;
+    }
     /// <summary>
     /// Writes a read's statistics and waits to <paramref name="sink"/>: a row it wrote before for the same interval only
     /// when it changed, since a later read of an interval holds the same counts or more. The coverage takes every row read.
@@ -322,7 +676,7 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
         var period = settings?.HistoryPeriod;
         foreach (var row in read.Statistics)
         {
-            if (PgQueryStoreRows.Stats(target, row, now, period) is not { } stats)
+            if (PgQueryStoreRows.Stats(Target, row, now, period) is not { } stats)
             {
                 continue;
             }
@@ -339,7 +693,7 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
             }
         }
 
-        var waits = read.Waits.Select(w => PgQueryStoreRows.Wait(target, w, now, period)).OfType<CaptureRow>().ToList();
+        var waits = read.Waits.Select(w => PgQueryStoreRows.Wait(Target, w, now, period)).OfType<CaptureRow>().ToList();
         foreach (var group in waits.GroupBy(w => Key("w", w, plan: false), StringComparer.Ordinal))
         {
             coverage.Sources.Add(PgQueryStoreRows.Waits);
@@ -412,7 +766,7 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
             coverage.Gaps.Add($"The Query Store watermark couldn't be written on this host, so the time still pending isn't kept for a later read: {Redactor.Redact(ex.Message)}");
-            log.Warn("rca.querystore-watermark", "The Query Store watermark couldn't be written.", ("target", target), ("error", Redactor.Redact(ex.Message)));
+            log.Warn("rca.querystore-watermark", "The Query Store watermark couldn't be written.", ("target", Target), ("error", Redactor.Redact(ex.Message)));
         }
     }
 
@@ -426,7 +780,7 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            log.Warn("rca.querystore-watermark", "The Query Store watermark couldn't be written.", ("target", target), ("error", Redactor.Redact(ex.Message)));
+            log.Warn("rca.querystore-watermark", "The Query Store watermark couldn't be written.", ("target", Target), ("error", Redactor.Redact(ex.Message)));
         }
     }
 
@@ -434,18 +788,41 @@ internal sealed class PgQueryStoreCapture(string target, PgQueryStoreSource sour
     {
         var text = failure.Kind switch
         {
-            CaptureFailureKind.Permission => $"{block} was refused a permission on {target}'s azure_sys, so Query Store's statements weren't read: {failure.Message} The public role reads query_store's views (Learn); ./scripts/deploy.ps1 sets T4's runner role up again.",
-            CaptureFailureKind.Connection => $"{target}'s azure_sys didn't answer {block}, so the next read takes its intervals: {failure.Message}",
-            CaptureFailureKind.Timeout => $"{block} timed out on {target}'s azure_sys, so the next read takes its intervals: {failure.Message}",
-            _ => $"{block} failed on {target}'s azure_sys: {failure.Message}",
+            CaptureFailureKind.Permission => $"{block} was refused a permission on {Target}'s azure_sys, so Query Store's statements weren't read: {failure.Message} The public role reads query_store's views (Learn); ./scripts/deploy.ps1 sets T4's runner role up again.",
+            CaptureFailureKind.Connection => $"{Target}'s azure_sys didn't answer {block}, so the next read takes its intervals: {failure.Message}",
+            CaptureFailureKind.Timeout => $"{block} timed out on {Target}'s azure_sys, so the next read takes its intervals: {failure.Message}",
+            _ => $"{block} failed on {Target}'s azure_sys: {failure.Message}",
         };
         coverage.Gaps.Add(text);
-        log.Warn("rca.querystore", text, ("target", target));
+        log.Warn("rca.querystore", text, ("target", Target));
     }
 
     private string Expired(DateTimeOffset from, DateTimeOffset to, TimeSpan retention) =>
-        string.Create(CultureInfo.InvariantCulture, $"Pending publication expired: {target}'s Query Store keeps {retention.TotalDays:0} days, so {from:yyyy-MM-dd HH:mm} to {to:yyyy-MM-dd HH:mm} UTC can't be read any more.");
+        string.Create(CultureInfo.InvariantCulture, $"Pending publication expired: {Target}'s Query Store keeps {retention.TotalDays:0} days, so {from:yyyy-MM-dd HH:mm} to {to:yyyy-MM-dd HH:mm} UTC can't be read any more.");
 
     /// <summary>What was written of one row or wait group: its interval's end, and its values.</summary>
     private sealed record Written(DateTimeOffset End, string Signature);
+
+    /// <summary>An earlier range under way: where its rows and coverage go, and where it ends.</summary>
+    private sealed record BackfillRead(PendingRange Range, string Key, ISidecarSink Sink, QueryCoverage Coverage, DateTimeOffset To);
+
+    /// <summary>One read: its time (its intervals end by it), how far it got, and its coverage row.</summary>
+    private sealed class Cycle(DateTimeOffset at, bool final, DateTimeOffset windowStart)
+    {
+        public DateTimeOffset At { get; } = at;
+
+        public bool Final { get; } = final;
+
+        public QueryCoverage Coverage { get; } = new(windowStart, at);
+
+        public Phase Phase { get; set; } = Phase.Settings;
+
+        public Queue<PendingRange>? Ranges { get; set; }
+
+        public BackfillRead? Backfill { get; set; }
+
+        public PgQueryStoreReader? Reader { get; set; }
+
+        public bool Finished { get; set; }
+    }
 }

@@ -439,9 +439,9 @@ ORDER BY r.start_time, r.query_id, r.samples DESC, r.event_type, r.event;
 -- runs dynamic SQL (EXECUTE) or keeps no source in pg_proc (a BEGIN ATOMIC body), since either could write any table; a
 -- row of kind unsure then says which (dynamic_sql, no_source). A statement the workload's client sends itself is in no
 -- function: the runner's tests check that only the harness's own code sends one that writes a table only the harness
--- writes. At the observer's start, and again with each RCA-PG-14 read until it has been read once, in contosocare, on
--- T4. It reads the database's own catalog and nothing the workload plans; with no function marked, it names no harness,
--- and RCA-PG-14 leaves out nothing as the harness's.
+-- writes. With each read of Query Store (the observer's start, 2 minutes after each interval ends, and its end), on the
+-- observer's own connection to contosocare, on T4. It reads the database's own catalog and nothing the workload plans;
+-- with no function marked, it names no harness, and RCA-PG-14 leaves out nothing as the harness's.
 SELECT /* dbhubdemo:rca-observer */ clock_timestamp() AS captured_at,
        x.kind,
        x.name

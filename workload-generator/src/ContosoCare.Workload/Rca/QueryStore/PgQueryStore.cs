@@ -314,15 +314,15 @@ internal static class PgQueryStoreRows
     public static string ReplicaGap(string target) => $"{target} is a read replica, which records nothing in Query Store.";
 
     /// <summary>
-    /// T4's read replica's RCA Query Coverage row from RCA-PG-13 (null when it failed): a server in recovery records nothing
-    /// in Query Store, and the observer reads Query Store on T4 alone.
+    /// T4's read replica's RCA Query Coverage row from RCA-PG-13 (null when it failed, and <paramref name="failure"/> says
+    /// why): a server in recovery records nothing in Query Store, and the observer reads Query Store on T4 alone.
     /// </summary>
-    public static CaptureRow ReplicaCoverage(string target, DateTimeOffset windowStart, DateTimeOffset now, IReadOnlyList<CaptureValues>? rows)
+    public static CaptureRow ReplicaCoverage(string target, DateTimeOffset windowStart, DateTimeOffset now, IReadOnlyList<CaptureValues>? rows, string? failure = null)
     {
         var coverage = new QueryCoverage(windowStart, now);
         if (rows is null)
         {
-            coverage.Gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{Settings} couldn't be read on {target} at {now:HH:mm} UTC; RCA Coverage's gaps say why."));
+            coverage.Gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{Settings} couldn't be read on {target} at {now:HH:mm} UTC: {failure ?? "the block failed."}"));
             return Coverage(target, coverage);
         }
 

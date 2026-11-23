@@ -11,6 +11,7 @@ using ContosoCare.Workload.Rca.QueryStore;
 using ContosoCare.Workload.Rca.Store;
 using Xunit;
 using static ContosoCare.Workload.Tests.RcaTestKit;
+using static ContosoCare.Workload.Tests.T4Fixtures;
 
 namespace ContosoCare.Workload.Tests;
 
@@ -23,20 +24,6 @@ namespace ContosoCare.Workload.Tests;
 /// </summary>
 public sealed partial class RcaQueryStorePgTests : IDisposable
 {
-    private const string Runner = "contosocare_runner";
-
-    private const string SpanA = "20261120T170000Z";
-
-    private const string SpanB = "20261120T180000Z";
-
-    private static readonly long Update = -6412873301142229951;
-
-    private static readonly long Claim = 2871345566190021453;
-
-    private static readonly long Marks = 8164251097732651127;
-
-    private static readonly long SizeCheck = -1129384756610293847;
-
     private readonly string root = Path.Combine(Path.GetTempPath(), "rca-querystore-" + Guid.NewGuid().ToString("N"));
 
     public void Dispose()
@@ -53,13 +40,13 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     public async Task T4sQueryStoreReadsRoundTripTheFixture()
     {
         var fixture = new SidecarFixture("t4-query-store.sidecar.json");
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits());
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
         var (capture, sidecar, _) = Capture(store, SpanA);
 
-        await ReadAtAsync(capture, store, At(17, 2, 5610), Observer(store));
-        await ReadAtAsync(capture, store, At(17, 17, 5700), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 2, 5610));
+        await ReadAtAsync(capture, store, At(17, 17, 5700));
         store.Clock = At(17, 20);
-        await capture.EndAsync(store.Clock, Observer(store), TestContext.Current.CancellationToken);
+        await capture.EndAsync(store.Clock, TestContext.Current.CancellationToken);
 
         AssertSameRows(fixture.Table(RcaContract.QueryStats), sidecar.Table(RcaContract.QueryStats), "interval_start_utc", "query_id", "login_name");
         AssertSameRows(fixture.Table(RcaContract.QueryWaits), sidecar.Table(RcaContract.QueryWaits), "interval_start_utc", "query_id", "wait_category", "wait_event");
@@ -79,17 +66,18 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [Fact]
     public async Task EachReadTakesTheUnsettledIntervalsOnAzureSysWithTheHarnessAndTheObserversStatements()
     {
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits());
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
         var (capture, _, _) = Capture(store, SpanA);
-        var observerCalls = new List<string>();
 
-        await ReadAtAsync(capture, store, At(17, 2, 5610), Observer(store, observerCalls));
-        await ReadAtAsync(capture, store, At(17, 17, 5700), Observer(store, observerCalls));
+        await ReadAtAsync(capture, store, At(17, 2, 5610));
+        await ReadAtAsync(capture, store, At(17, 17, 5700));
 
-        // RCA-PG-13 and 16 on the observer's own connection; RCA-PG-14 and 15 on azure_sys, with every parameter.
-        Assert.Equal(["RCA-PG-13", "RCA-PG-16", "RCA-PG-13", "RCA-PG-16"], observerCalls);
+        // RCA-PG-13 and 16 quietly on the observer's own connection; RCA-PG-14 and 15 on azure_sys, with every parameter,
+        // each on a connection of its own, opened and closed in its tick.
+        Assert.Equal(["RCA-PG-13", "RCA-PG-16", "RCA-PG-13", "RCA-PG-16"], store.Access.Calls.Select(c => c.BlockId));
+        Assert.All(store.Access.Calls, c => Assert.Equal(TimeSpan.FromSeconds(5), c.Timeout));
         Assert.Equal(["RCA-PG-14", "RCA-PG-15", "RCA-PG-14", "RCA-PG-15"], store.Connector.ParameterCalls.Select(c => c.BlockId));
-        Assert.Equal(2, store.Connector.Opens);
+        Assert.Equal(4, store.Connector.Opens);
         Assert.All(store.Connector.Calls, c => Assert.Equal(CaptureCatalog.Get(c.BlockId), c.Text));
         var first = store.Connector.ParameterCalls[0].Parameters;
         Assert.Equal(7, first.Count);
@@ -118,13 +106,13 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     {
         // Query Store shows each interval's statistics as soon as it ends, and its waits only 10 minutes later.
         var fixture = new SidecarFixture("t4-query-store.sidecar.json");
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits()) { WaitsPublishedAfter = TimeSpan.FromMinutes(10) };
+        var store = new T4QueryStore(T4Statistics(), T4Waits()) { WaitsPublishedAfter = TimeSpan.FromMinutes(10) };
         var (capture, sidecar, _) = Capture(store, SpanA);
 
-        await ReadAtAsync(capture, store, At(17, 2, 5610), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 2, 5610));
         Assert.Empty(sidecar.Table(RcaContract.QueryWaits));
-        await ReadAtAsync(capture, store, At(17, 17, 5700), Observer(store));
-        await ReadAtAsync(capture, store, At(17, 32), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 17, 5700));
+        await ReadAtAsync(capture, store, At(17, 32));
 
         // Every wait reached the sidecar, and each interval's latest statistics hold them, as the fixture's do.
         AssertSameRows(fixture.Table(RcaContract.QueryWaits), sidecar.Table(RcaContract.QueryWaits), ["captured_at_utc"], "interval_start_utc", "query_id", "wait_category", "wait_event");
@@ -144,10 +132,10 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [Fact]
     public async Task WithNoFunctionMarkedTheReadLeavesOutNothingAsTheHarnessAndSaysSo()
     {
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits()) { Harness = [Row(("kind", "table"), ("name", "work_queues"))] };
+        var store = new T4QueryStore(T4Statistics(), T4Waits()) { Harness = [Row(("kind", "table"), ("name", "work_queues"))] };
         var (capture, sidecar, _) = Capture(store, SpanA);
 
-        await ReadAtAsync(capture, store, At(17, 17, 5700), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 17, 5700));
 
         var parameters = store.Connector.ParameterCalls[0].Parameters;
         Assert.Empty((string[])parameters[2].Value!);
@@ -159,16 +147,16 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [Fact]
     public async Task WithoutTheHarnessListNothingIsReadAndTheTimeStaysPending()
     {
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits()) { HarnessFails = true };
+        var store = new T4QueryStore(T4Statistics(), T4Waits()) { HarnessFails = true };
         var (capture, sidecar, watermark) = Capture(store, SpanA);
 
-        await ReadAtAsync(capture, store, At(17, 2, 5610), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 2, 5610));
         store.Clock = At(17, 20);
-        await capture.EndAsync(store.Clock, Observer(store), TestContext.Current.CancellationToken);
+        await capture.EndAsync(store.Clock, TestContext.Current.CancellationToken);
 
         Assert.Empty(store.Connector.Calls);
         Assert.Empty(sidecar.Table(RcaContract.QueryStats));
-        Assert.Contains("RCA-PG-16 couldn't be read on T4, so Query Store's statements weren't read: without the harness's functions, its bookkeeping would be among them. The next read tries again.", Gaps(sidecar));
+        Assert.Contains("RCA-PG-16 couldn't be read on T4, so Query Store's statements weren't read: without the harness's functions, its bookkeeping would be among them. The next read tries again: PostgreSQL error XX000: RCA-PG-16 failed (a test's failure).", Gaps(sidecar));
         var pending = Assert.Single(watermark.Read().Pending);
         Assert.Equal((SpanA, At(17, 2, 5610).AddHours(-2), At(17, 20)), (pending.SpanId, pending.FromUtc, pending.ToUtc!.Value));
     }
@@ -176,16 +164,16 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [Fact]
     public async Task WaitsThatFailKeepTheNextReadOnTheSameIntervals()
     {
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits());
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
         store.Connector.Failure = block => block == "RCA-PG-15" ? new CaptureException(CaptureFailureKind.Timeout, "PostgreSQL error 57014: canceling statement due to statement timeout") : null;
         var (capture, sidecar, _) = Capture(store, SpanA);
 
-        await ReadAtAsync(capture, store, At(17, 17, 5700), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 17, 5700));
 
         Assert.Null(capture.Through);
         Assert.Contains("RCA-PG-15 timed out on T4's azure_sys, so the next read takes its intervals: PostgreSQL error 57014: canceling statement due to statement timeout", Gaps(sidecar));
         store.Connector.Failure = null;
-        await ReadAtAsync(capture, store, At(17, 32), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 32));
         Assert.Equal(At(17, 17, 5700).AddHours(-2), store.Connector.ParameterCalls[^2].Parameters[1].Value);
         Assert.Equal(At(17, 15), capture.Through);
     }
@@ -222,14 +210,14 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [Fact]
     public async Task ACaptureModeThatChangesBetweenReadsIsAQueryEventAndOffIsAGap()
     {
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits());
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
         var (capture, sidecar, watermark) = Capture(store, SpanA);
 
-        await ReadAtAsync(capture, store, At(17, 2, 5610), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 2, 5610));
         store.CaptureMode = "none";
-        await ReadAtAsync(capture, store, At(17, 17, 5700), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 17, 5700));
         store.Clock = At(17, 20);
-        await capture.EndAsync(store.Clock, Observer(store), TestContext.Current.CancellationToken);
+        await capture.EndAsync(store.Clock, TestContext.Current.CancellationToken);
 
         var change = Assert.Single(sidecar.Table(RcaContract.QueryEvents));
         Assert.Equal("state", change.Get("kind"));
@@ -250,12 +238,12 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [Fact]
     public async Task TheNextStartBackfillsTheLastWindowIntoTheSpanItBelongsTo()
     {
-        var store = new ScriptedQueryStore([.. T4Statistics(), .. Later()], T4Waits());
+        var store = new T4QueryStore([.. T4Statistics(), .. Later()], T4Waits());
         var (first, sessionA, watermark) = Capture(store, SpanA);
-        await ReadAtAsync(first, store, At(17, 2, 5610), Observer(store));
-        await ReadAtAsync(first, store, At(17, 17, 5700), Observer(store));
+        await ReadAtAsync(first, store, At(17, 2, 5610));
+        await ReadAtAsync(first, store, At(17, 17, 5700));
         store.Clock = At(17, 20);
-        await first.EndAsync(store.Clock, Observer(store), TestContext.Current.CancellationToken);
+        await first.EndAsync(store.Clock, TestContext.Current.CancellationToken);
 
         // What's unsettled at the end is kept: from 17:00, where the reads found every interval surely published.
         var pending = Assert.Single(watermark.Read().Pending);
@@ -265,8 +253,8 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         var spans = new MemorySpans { CurrentSpan = SpanB };
         var backfilled = spans.Add(SpanA);
         var sessionB = new MemorySidecar();
-        var second = new PgQueryStoreCapture("T4", new PgQueryStoreSource(store.Connector, watermark, spans), sessionB, RcaSimulation.Options(), RunnerLog.Null);
-        await ReadAtAsync(second, store, At(18, 0), Observer(store));
+        var second = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), sessionB, new PgSidecarOptions(), RunnerLog.Null);
+        await ReadAtAsync(second, store, At(18, 0));
 
         var rows = backfilled.Table(RcaContract.QueryStats);
         Assert.Equal([At(17, 0), At(17, 0), At(17, 0), At(17, 0), At(17, 15), At(17, 15)], rows.Select(r => (DateTimeOffset)r.Get("interval_start_utc")!).Order());
@@ -290,15 +278,15 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [Fact]
     public async Task ARangeStaysPendingUntilItsIntervalIsSurelyPublished()
     {
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits()) { PublishedAfter = TimeSpan.FromHours(4) };
+        var store = new T4QueryStore(T4Statistics(), T4Waits()) { PublishedAfter = TimeSpan.FromHours(4) };
         var watermark = Watermark();
         watermark.Update(s => s.Pending.Add(new PendingRange { SpanId = SpanA, ObservedFromUtc = At(17, 0), FromUtc = At(17, 15), ToUtc = At(17, 20), RecordedUtc = At(17, 20) }));
         var spans = new MemorySpans { CurrentSpan = SpanB };
         var backfilled = spans.Add(SpanA);
-        var capture = new PgQueryStoreCapture("T4", new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), RcaSimulation.Options(), RunnerLog.Null);
+        var capture = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
 
         // 17:47: nothing published for 17:15 yet, so it stays pending, and says so.
-        await ReadAtAsync(capture, store, At(17, 47), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 47));
         var waiting = Assert.Single(backfilled.Table(RcaContract.QueryCoverage));
         Assert.Equal(At(17, 15), waiting.Get("pending_from_utc"));
         Assert.Equal(At(17, 20), waiting.Get("pending_to_utc"));
@@ -306,7 +294,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.Equal(At(17, 15), Assert.Single(watermark.Read().Pending, p => p.SpanId == SpanA).FromUtc);
 
         // 17:55 on, the interval that holds 17:20 has surely been published: an empty read settles it.
-        await ReadAtAsync(capture, store, At(18, 2), Observer(store));
+        await ReadAtAsync(capture, store, At(18, 2));
         Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
         Assert.Null(backfilled.Table(RcaContract.QueryCoverage)[^1].Get("pending_from_utc"));
     }
@@ -315,16 +303,16 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     public async Task ARangeOlderThanQueryStoresRetentionExpiresAsAGapInTheSpanItBelongsTo()
     {
         // The span store still knows the span (T1's ledger keeps it past the span's folder): the range expires as a row.
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits());
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
         var watermark = Watermark();
         watermark.Update(s => s.Pending.Add(new PendingRange { SpanId = SpanA, ObservedFromUtc = At(17, 0).AddDays(-8), FromUtc = At(17, 15).AddDays(-8), ToUtc = At(17, 20).AddDays(-8), RecordedUtc = At(17, 20).AddDays(-8) }));
         var spans = new MemorySpans { CurrentSpan = SpanB };
         var expired = spans.Add(SpanA);
         using var logText = new StringWriter(CultureInfo.InvariantCulture);
         using var log = new RunnerLog(logText);
-        var capture = new PgQueryStoreCapture("T4", new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), RcaSimulation.Options(), log);
+        var capture = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), log);
 
-        await ReadAtAsync(capture, store, At(17, 47), Observer(store));
+        await ReadAtAsync(capture, store, At(17, 47));
 
         var coverage = Assert.Single(expired.Table(RcaContract.QueryCoverage));
         Assert.True(coverage.Get("backfill") is true);
@@ -336,7 +324,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
         // A span the store no longer knows at all can't take a row: its range is dropped with a log line instead.
         watermark.Update(s => s.Pending.Add(new PendingRange { SpanId = "20261101T090000Z", ObservedFromUtc = At(9, 0).AddDays(-19), FromUtc = At(9, 15).AddDays(-19), ToUtc = At(9, 20).AddDays(-19), RecordedUtc = At(9, 20).AddDays(-19) }));
-        await ReadAtAsync(capture, store, At(18, 2), Observer(store));
+        await ReadAtAsync(capture, store, At(18, 2));
         Assert.Contains("rca.querystore-forgotten", logText.ToString(), StringComparison.Ordinal);
         Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == "20261101T090000Z");
         Assert.Single(expired.Table(RcaContract.QueryCoverage));
@@ -345,14 +333,14 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [Fact]
     public async Task ARangeWhoseObserverNeverEndedIsReadToOneIntervalAfterItWasRecorded()
     {
-        var store = new ScriptedQueryStore([.. T4Statistics(), .. Later()], T4Waits());
+        var store = new T4QueryStore([.. T4Statistics(), .. Later()], T4Waits());
         var watermark = Watermark();
         watermark.Update(s => s.Pending.Add(new PendingRange { SpanId = SpanA, ObservedFromUtc = At(16, 50), FromUtc = At(17, 15), RecordedUtc = At(17, 17, 5700) }));
         var spans = new MemorySpans { CurrentSpan = SpanB };
         var backfilled = spans.Add(SpanA);
-        var capture = new PgQueryStoreCapture("T4", new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), RcaSimulation.Options(), RunnerLog.Null);
+        var capture = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
 
-        await ReadAtAsync(capture, store, At(18, 10), Observer(store));
+        await ReadAtAsync(capture, store, At(18, 10));
 
         var backfill = store.Connector.ParameterCalls[0].Parameters;
         Assert.Equal(At(17, 15), backfill[1].Value);
@@ -547,7 +535,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             "RCA-PG-17" => [HolderRow(clock.Now, "psql", "monitoring_reader", "idle", 40, 0, 1, 1)],
             _ => [],
         };
-        var store = new ScriptedQueryStore(T4Statistics(), T4Waits());
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
         store.Follow(clock);
         var source = new PgQueryStoreSource(store.Connector, Watermark(), new MemorySpans { CurrentSpan = SpanA });
 
@@ -572,7 +560,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             var link = new ReplicaLink();
             var sink = new MemorySink();
             var sidecar = new MemorySidecar();
-            var store = new ScriptedQueryStore(T4Statistics(), T4Waits());
+            var store = new T4QueryStore(T4Statistics(), T4Waits());
             var primary = RcaSimulation.T4Primary(clock);
             var spans = new MemorySpans { CurrentSpan = SpanA };
             var source = new PgQueryStoreSource(store.Connector, new QueryWatermark(Path.Combine(root, sidecarOn ? "on" : "off"), "T4"), spans);
@@ -593,6 +581,258 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.Contains(on.Primary.Calls, c => c.BlockId == "RCA-PG-13");
         Assert.DoesNotContain(on.Primary.Calls, c => c.BlockId is "RCA-PG-14" or "RCA-PG-15");
         Assert.Equal(off.Primary.Calls.Count, on.Primary.Calls.Count(c => c.BlockId is not ("RCA-PG-13" or "RCA-PG-16")));
+    }
+
+    // ---- The evidence stays as it would be without a sink --------------------------------------------------------------
+
+    [Theory]
+    [InlineData("RCA-PG-13", "timeout")]
+    [InlineData("RCA-PG-13", "refused")]
+    [InlineData("RCA-PG-13", "error")]
+    [InlineData("RCA-PG-13", "throws")]
+    [InlineData("RCA-PG-16", "timeout")]
+    [InlineData("RCA-PG-16", "refused")]
+    [InlineData("RCA-PG-16", "error")]
+    [InlineData("RCA-PG-16", "throws")]
+    [InlineData("RCA-PG-17", "timeout")]
+    [InlineData("RCA-PG-17", "refused")]
+    [InlineData("RCA-PG-17", "error")]
+    [InlineData("RCA-PG-17", "throws")]
+    [InlineData("RCA-PG-14", "timeout")]
+    [InlineData("RCA-PG-14", "refused")]
+    [InlineData("RCA-PG-14", "error")]
+    [InlineData("RCA-PG-14", "throws")]
+    [InlineData("RCA-PG-15", "timeout")]
+    [InlineData("RCA-PG-15", "refused")]
+    [InlineData("RCA-PG-15", "error")]
+    [InlineData("RCA-PG-15", "throws")]
+    [InlineData("open", "refused")]
+    [InlineData("open", "error")]
+    [InlineData("open", "throws")]
+    public async Task ASidecarBlockThatFailsLeavesTheEvidenceAndItsWatermarksAsWithoutASink(string block, string failure)
+    {
+        Exception Failure() => failure switch
+        {
+            "timeout" => new CaptureException(CaptureFailureKind.Timeout, "PostgreSQL error 57014: canceling statement due to statement timeout"),
+            "refused" => new CaptureException(CaptureFailureKind.Permission, "PostgreSQL error 42501: permission denied for view qs_view"),
+            "error" => new CaptureException(CaptureFailureKind.Other, "PostgreSQL error XX000: the block failed (a test's failure)"),
+            _ => new InvalidOperationException("The connection threw (a test's failure)."),
+        };
+        var without = await RunT4Async(sink: false);
+        var with = await RunT4Async(sink: true, (observer, azure) =>
+        {
+            observer.Failure = b => b == block ? Failure() : null;
+            azure.Failure = b => b == block ? Failure() : null;
+            azure.OpenFailure = block == "open" ? Failure() : null;
+        });
+
+        Assert.Equal(without.Rows, with.Rows);
+        Assert.Equal(without.Notes, with.Notes);
+        Assert.Equal(without.Marks, with.Marks);
+        Assert.Equal(without.Final, with.Final);
+        Assert.Contains(with.Observer.Failures.Concat(with.Store.Failures), f => f.BlockId == block);
+        Assert.DoesNotContain(with.Notes, n => SidecarBlocks.Any(b => n.Contains(b, StringComparison.Ordinal)));
+        if (block == "RCA-PG-17")
+        {
+            Assert.Empty(with.Sidecar!.Table(RcaContract.Connections));
+            Assert.Contains(Gaps(with.Sidecar), g => g.StartsWith("Who holds T4's connections (RCA-PG-17) wasn't read during a connection episode: ", StringComparison.Ordinal));
+        }
+        else if (failure != "throws" || block is "RCA-PG-13" or "RCA-PG-16")
+        {
+            Assert.Contains(Gaps(with.Sidecar!), g => g.Contains(block == "open" ? "RCA-PG-14" : block, StringComparison.Ordinal));
+        }
+    }
+
+    [Theory]
+    [InlineData("RCA-PG-13", 4)]
+    [InlineData("RCA-PG-13", 9)]
+    [InlineData("RCA-PG-16", 4)]
+    [InlineData("RCA-PG-16", 9)]
+    [InlineData("RCA-PG-17", 4)]
+    [InlineData("RCA-PG-17", 9)]
+    [InlineData("RCA-PG-14", 12)]
+    [InlineData("RCA-PG-14", 40)]
+    [InlineData("RCA-PG-15", 12)]
+    [InlineData("RCA-PG-15", 40)]
+    [InlineData("open", 4)]
+    [InlineData("open", 9)]
+    public async Task ASlowSidecarBlockNeverMovesAnEvidenceSample(string block, int seconds)
+    {
+        // Up to its timeout (5 s for RCA-PG-13, 16, 17, and an open; 15 s for RCA-PG-14 and 15), or past it: the clock moves.
+        var without = await RunT4Async(sink: false);
+        var with = await RunT4Async(sink: true, (observer, azure) =>
+        {
+            observer.Cost = b => b == block ? TimeSpan.FromSeconds(seconds) : TimeSpan.Zero;
+            azure.Cost = b => b == block ? TimeSpan.FromSeconds(seconds) : TimeSpan.Zero;
+            azure.OpenCost = block == "open" ? TimeSpan.FromSeconds(seconds) : TimeSpan.Zero;
+        });
+
+        // Every sample at its time, with the same rows and notes, and the same watermark at the end. T4's watermark is the
+        // tick's time, so the ticks a slow block took have no mark of their own.
+        Assert.Equal(without.Rows, with.Rows);
+        Assert.Equal(without.Notes, with.Notes);
+        Assert.Equal(without.Final, with.Final);
+
+        // Within its timeout it ran and returned; past it, it failed. The end's reads cut every timeout to their 10 s.
+        var past = seconds > (block is "RCA-PG-14" or "RCA-PG-15" ? 15 : 5);
+        Assert.Equal(past, with.Observer.Failures.Concat(with.Store.Failures).Any(f => f.BlockId == block && f.At < RcaSimulation.T4To));
+        if (!past)
+        {
+            Assert.Contains(with.Observer.Calls.Select(c => c.BlockId).Concat(with.Store.Calls.Select(c => c.BlockId)), b => b == (block == "open" ? "RCA-PG-14" : block));
+        }
+    }
+
+    [Fact]
+    public async Task AConnectionAQuietBlockFindsLostIsNotedByTheEvidenceAsItWouldHaveBeen()
+    {
+        // RCA-PG-13 runs first at 17:00:00, after the sentinel's blocks: with a sink it finds the connection lost; without
+        // one, the next sentinel does. Either way the sentinel notes the loss at 17:00:30 and reconnects a minute later.
+        var lost = RcaSimulation.T4From;
+        var without = await RunT4Async(sink: false, (observer, _) => observer.BreakAt = lost);
+        var with = await RunT4Async(sink: true, (observer, _) => observer.BreakAt = lost);
+
+        Assert.Equal((lost, "RCA-PG-13"), with.Observer.Failures[0]);
+        Assert.Equal((lost.AddSeconds(30), "RCA-PG-10"), without.Observer.Failures[0]);
+        Assert.Equal(without.Rows, with.Rows);
+        Assert.Equal(without.Notes, with.Notes);
+        Assert.Equal(without.Marks, with.Marks);
+        Assert.Equal((2, 2), (without.Observer.Opens, with.Observer.Opens));
+        Assert.Contains(with.Notes, n => n.Contains($"T4 didn't answer RCA-PG-10: {TimedT4.TransportError}", StringComparison.Ordinal));
+    }
+
+    [Theory]
+    [InlineData("timeout", 0)]
+    [InlineData("refused", 0)]
+    [InlineData(null, 4)]
+    [InlineData(null, 9)]
+    public async Task TheReplicasQueryStoreBlockLeavesItsEvidenceAsWithoutASink(string? failure, int seconds)
+    {
+        async Task<(List<string> Rows, List<string> Notes, List<DateTimeOffset> Marks, TimedT4 Replica, MemorySidecar? Sidecar)> RunAsync(bool sink)
+        {
+            var clock = new ManualTime(RcaSimulation.T4From);
+            var replica = new TimedT4(clock, RcaSimulation.T4Replica(clock), b => b == "RCA-PG-13" ? Settings(clock.Now, inRecovery: true) : null)
+            {
+                Cost = b => b == "RCA-PG-13" ? TimeSpan.FromSeconds(seconds) : TimeSpan.Zero,
+                Failure = b => b != "RCA-PG-13" ? null : failure switch
+                {
+                    "timeout" => new CaptureException(CaptureFailureKind.Timeout, "PostgreSQL error 57014: canceling statement due to statement timeout"),
+                    "refused" => new CaptureException(CaptureFailureKind.Permission, "PostgreSQL error 42501: permission denied for function pg_is_in_recovery"),
+                    _ => null,
+                },
+            };
+            var sidecar = sink ? new MemorySidecar() : null;
+            var span = new MarkLog(new MemorySink());
+            await LaneAsync(new PgReplicaObserver(replica, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar, null, new PgSidecarOptions { Clock = new TickClock(clock) }), span, clock, RcaSimulation.T4From, RcaSimulation.T4To);
+            return (Lines(span.Inner), [.. span.Inner.Notes.Select(Note)], Distinct(span.Marks), replica, sidecar);
+        }
+
+        var without = await RunAsync(sink: false);
+        var with = await RunAsync(sink: true);
+
+        Assert.Equal(without.Rows, with.Rows);
+        Assert.Equal(without.Notes, with.Notes);
+        if (seconds == 0)
+        {
+            Assert.Equal(without.Marks, with.Marks);
+        }
+
+        Assert.Equal(without.Marks[^1], with.Marks[^1]);
+        Assert.Contains(with.Replica.Calls, c => c.BlockId == "RCA-PG-13");
+        Assert.DoesNotContain(without.Replica.Calls, c => c.BlockId == "RCA-PG-13");
+        var rows = with.Sidecar!.Table(RcaContract.QueryCoverage);
+        Assert.NotEmpty(rows);
+        if (failure is not null || seconds > 5)
+        {
+            Assert.All(rows, r => Assert.StartsWith("RCA-PG-13 couldn't be read on T4-replica at ", (string?)r.Get("gaps"), StringComparison.Ordinal));
+        }
+    }
+
+    [Fact]
+    public async Task NoReadStartsWhileTheObserverIsSlowedAndTheEndsReadStillRuns()
+    {
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
+        var (capture, sidecar, _) = Capture(store, SpanA);
+        var token = TestContext.Current.CancellationToken;
+        capture.Begin(At(17, 2, 5610));
+        store.Clock = At(17, 2, 5610);
+
+        // Slowed: the read waits 2 minutes, then runs once the observer is quick again, and its coverage says it waited.
+        store.Access.Factor = 2;
+        await capture.TickAsync(At(17, 2, 5610), capture.Timestamp(), At(17, 3), token);
+        Assert.False(capture.Reading);
+        Assert.Empty(store.Access.Calls);
+        Assert.Equal(At(17, 4, 5610), capture.NextRead);
+        store.Access.Factor = 1;
+        await ReadAtAsync(capture, store, At(17, 4, 5610));
+        Assert.Contains("Query Store's reads on T4 wait from 17:02:05 UTC: the observer's samples are slow (its cadence is 2 times longer), so a read takes them once they're quick again, or the end's read. Query Store keeps the intervals that ended after 15:02 UTC.", Gaps(sidecar));
+        Assert.Single(store.Connector.ParameterCalls, c => c.BlockId == "RCA-PG-14");
+
+        // Its detail stopped: no read starts for the rest of the observation, but the end's.
+        store.Access.DetailStopped = true;
+        store.Clock = At(17, 17, 5700);
+        await capture.TickAsync(At(17, 17, 5700), capture.Timestamp(), At(17, 18), token);
+        Assert.False(capture.Reading);
+        Assert.Single(store.Connector.ParameterCalls, c => c.BlockId == "RCA-PG-14");
+        store.Clock = At(17, 20);
+        await capture.EndAsync(At(17, 20), token);
+        Assert.Equal(2, store.Connector.ParameterCalls.Count(c => c.BlockId == "RCA-PG-14"));
+        Assert.Contains("Query Store's reads on T4 wait from 17:17:05 UTC: the observer stopped its detail capture for the rest of the session, so the end's read takes them. Query Store keeps the intervals that ended after 16:44 UTC.", Gaps(sidecar));
+    }
+
+    [Fact]
+    public async Task AReadsBlockRunsOnlyWhenItFitsBeforeTheEvidencesNextWork()
+    {
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
+        var (capture, sidecar, _) = Capture(store, SpanA);
+        var token = TestContext.Current.CancellationToken;
+        var at = At(17, 2, 5610);
+        capture.Begin(at);
+        store.Clock = at;
+
+        // 10 s to the evidence's next work: RCA-PG-13 and 16 fit (5 s and 1 s of margin), a block on azure_sys doesn't
+        // (5 s to open and 15 s to read), and the read asks for no tick before that work.
+        for (var tick = 0; tick < 4; tick++)
+        {
+            Assert.Equal(at.AddSeconds(10), await capture.TickAsync(at, capture.Timestamp(), at.AddSeconds(10), token));
+        }
+
+        Assert.Equal(["RCA-PG-13", "RCA-PG-16"], store.Access.Calls.Select(c => c.BlockId));
+        Assert.Empty(store.Connector.Calls);
+        Assert.True(capture.Reading);
+
+        // 22 s: a block a tick, each on a connection of its own.
+        await capture.TickAsync(at, capture.Timestamp(), at.AddSeconds(22), token);
+        Assert.Equal(["RCA-PG-14"], store.Connector.Calls.Select(c => c.BlockId));
+        Assert.Equal(1, store.Connector.Opens);
+        Assert.Equal(At(17, 17), await capture.TickAsync(at, capture.Timestamp(), at.AddSeconds(22), token));
+        Assert.Equal(["RCA-PG-14", "RCA-PG-15"], store.Connector.Calls.Select(c => c.BlockId));
+        Assert.Equal(2, store.Connector.Opens);
+        Assert.False(capture.Reading);
+        Assert.Single(sidecar.Table(RcaContract.QueryCoverage));
+    }
+
+    [Fact]
+    public async Task TheEndsReadsStayWithinTheirBudget()
+    {
+        var clock = new ManualTime(At(17, 20));
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
+        store.Follow(clock);
+        var timings = new PgSidecarOptions { Clock = new TickClock(clock) };
+        var azure = new TimedStore(clock, store.Connector, timings.OpenTimeout) { Cost = b => b == "RCA-PG-14" ? TimeSpan.FromSeconds(9.5) : TimeSpan.Zero };
+        var sidecar = new MemorySidecar();
+        var capture = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(azure, Watermark(), new MemorySpans { CurrentSpan = SpanA }), sidecar, timings, RunnerLog.Null);
+        capture.Begin(At(17, 2, 5610));
+
+        await capture.EndAsync(At(17, 20), TestContext.Current.CancellationToken);
+
+        // The page took 9.5 s of the 10: the waits didn't start, and the page's rows are kept unsettled for a later read.
+        Assert.Equal(["RCA-PG-14"], azure.Calls.Select(c => c.BlockId));
+        Assert.Equal(TimeSpan.FromSeconds(10), azure.Calls[0].Timeout);
+        Assert.Equal(At(17, 20).AddSeconds(9.5), clock.Now);
+        Assert.Contains("RCA-PG-15 timed out on T4's azure_sys, so the next read takes its intervals: The end's Query Store reads on T4 stopped at their bound of 10 s.", Gaps(sidecar));
+        Assert.Equal(7, sidecar.Table(RcaContract.QueryStats).Count);
+        Assert.Empty(sidecar.Table(RcaContract.QueryWaits));
+        Assert.Null(capture.Settled);
     }
 
     // ---- The blocks' text --------------------------------------------------------------------------------------------
@@ -930,22 +1170,21 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [GeneratedRegex(@"\s+")]
     private static partial Regex WhiteSpace();
 
-    private static DateTimeOffset At(int hour, int minute, int milliseconds = 0) => new DateTimeOffset(2026, 11, 20, hour, minute, 0, TimeSpan.Zero).AddMilliseconds(milliseconds);
-
-    private static PgHarness Harness() => PgHarness.Parse([Row(("kind", "function"), ("name", "fn_harness_event"))]);
-
     private QueryWatermark Watermark() => new(root, "T4");
 
-    private (PgQueryStoreCapture Capture, MemorySidecar Sidecar, QueryWatermark Watermark) Capture(ScriptedQueryStore store, string span)
+    private (PgQueryStoreCapture Capture, MemorySidecar Sidecar, QueryWatermark Watermark) Capture(T4QueryStore store, string span)
     {
         var sidecar = new MemorySidecar();
         var watermark = Watermark();
-        var capture = new PgQueryStoreCapture("T4", new PgQueryStoreSource(store.Connector, watermark, new MemorySpans { CurrentSpan = span }), sidecar, RcaSimulation.Options(), RunnerLog.Null);
+        var capture = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, new MemorySpans { CurrentSpan = span }), sidecar, new PgSidecarOptions(), RunnerLog.Null);
         return (capture, sidecar, watermark);
     }
 
-    /// <summary>Begins the capture at its first read, and reads at <paramref name="at"/>.</summary>
-    private static async Task ReadAtAsync(PgQueryStoreCapture capture, ScriptedQueryStore store, DateTimeOffset at, PgQueryStoreCapture.BlockRunner observer)
+    /// <summary>
+    /// Begins the capture at its first read, and reads at <paramref name="at"/>, as the observer's ticks do: a block a tick,
+    /// with the evidence's next work 30 s away, until the read is done.
+    /// </summary>
+    private static async Task ReadAtAsync(PgQueryStoreCapture capture, T4QueryStore store, DateTimeOffset at)
     {
         if (capture.NextRead == DateTimeOffset.MaxValue)
         {
@@ -953,102 +1192,13 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         }
 
         store.Clock = at;
-        await capture.ReadAsync(at, observer, TestContext.Current.CancellationToken);
-    }
-
-    /// <summary>The observer's own connection: RCA-PG-13 and RCA-PG-16, as the scripted server answers them.</summary>
-    private static PgQueryStoreCapture.BlockRunner Observer(ScriptedQueryStore store, List<string>? calls = null) => (block, _) =>
-    {
-        calls?.Add(block);
-        IReadOnlyList<CaptureValues>? rows = block switch
+        Assert.True(at >= capture.NextRead, $"No read is due at {at:HH:mm:ss.fff}; the next is at {capture.NextRead:HH:mm:ss.fff}.");
+        do
         {
-            "RCA-PG-13" => Settings(store.Clock, inRecovery: false, store.CaptureMode),
-            "RCA-PG-16" => store.HarnessFails ? null : store.Harness,
-            _ => null,
-        };
-        return Task.FromResult(rows);
-    };
-
-    private static List<CaptureValues> Settings(DateTimeOffset now, bool inRecovery, string captureMode = "all") =>
-    [
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pg_qs.interval_length_minutes"), ("setting", "15"), ("unit", "min")),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pg_qs.query_capture_mode"), ("setting", captureMode), ("unit", null)),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pg_qs.retention_period_in_days"), ("setting", "7"), ("unit", null)),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pg_qs.store_query_plans"), ("setting", "off"), ("unit", null)),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pgms_wait_sampling.history_period"), ("setting", "100"), ("unit", "ms")),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pgms_wait_sampling.query_capture_mode"), ("setting", "all"), ("unit", null)),
-    ];
-
-    /// <summary>RCA-PG-14's rows behind the T4 fixture: what qs_view returns for 16:45 and 17:00, the leave-outs applied.</summary>
-    private static List<CaptureValues> T4Statistics() =>
-    [
-        StatsRow(At(16, 45), Update, Runner, "UPDATE care.work_queues SET status = $1, claimed_at = now() WHERE queue_id = $2", 220, 61.6, 1.4, 1760, 0, 220, 0, 0),
-        StatsRow(At(16, 45), Marks, Runner, "INSERT INTO demo.replica_lag_marks (marked_at, payload) VALUES (now(), $1) -- one mark", 1800, 1980, 9.7, 5400, 12, 1800, 0, 12),
-        StatsRow(At(16, 45), SizeCheck, null, "SELECT d.datname, pg_database_size(d.oid) FROM pg_database AS d", 15, 141, 12.2, 90, 0, 75, 0, 0),
-        StatsRow(At(17, 0), Update, Runner, "UPDATE care.work_queues SET status = $1, claimed_at = now() WHERE queue_id = $2", 214, 251300, 20050, 2140, 0, 214, 0, 2486),
-        StatsRow(At(17, 0), Claim, Runner, "SELECT q.queue_id FROM care.work_queues AS q WHERE q.status = $1 ORDER BY q.priority, q.queue_id LIMIT $2 FOR UPDATE", 30, 45, 3.1, 600, 0, 30, 0, 0),
-        StatsRow(At(17, 0), Marks, Runner, "INSERT INTO demo.replica_lag_marks (marked_at, payload) VALUES (now(), $1)", 1792, 2102, 11.3, 5376, 9, 1792, 0, 14),
-        StatsRow(At(17, 0), SizeCheck, null, "SELECT d.datname, pg_database_size(d.oid) FROM pg_database AS d", 15, 139, 11.8, 90, 0, 75, 0, 0),
-    ];
-
-    /// <summary>RCA-PG-15's rows: the fixture's, plus one of a query the statistics don't hold and one with no event.</summary>
-    private static List<CaptureValues> T4Waits() =>
-    [
-        WaitRow(At(16, 45), Marks, Runner, "IO", "WALSync", 12),
-        WaitRow(At(16, 45), Marks, null, "Lock", "relation", 3),
-        WaitRow(At(17, 0), Update, Runner, "Lock", "transactionid", 2480),
-        WaitRow(At(17, 0), Update, Runner, "LWLock", "LockManager", 6),
-        WaitRow(At(17, 0), Update, Runner, null, null, 900),
-        WaitRow(At(17, 0), Marks, Runner, "IO", "WALSync", 14),
-    ];
-
-    /// <summary>The 17:15 interval, published after the first session ended.</summary>
-    private static List<CaptureValues> Later() =>
-    [
-        StatsRow(At(17, 15), Update, Runner, "UPDATE care.work_queues SET status = $1, claimed_at = now() WHERE queue_id = $2", 31, 9.1, 0.6, 310, 0, 31, 0, 0),
-        StatsRow(At(17, 15), Marks, Runner, "INSERT INTO demo.replica_lag_marks (marked_at, payload) VALUES (now(), $1)", 420, 470, 8.8, 1260, 2, 420, 0, 0),
-    ];
-
-    private static CaptureValues StatsRow(DateTimeOffset start, long query, string? login, string text, long calls, double total, double max, decimal blocks, decimal read, decimal rows, decimal tempKb, long samples) =>
-        Row(
-            ("captured_at", null),
-            ("interval_start_utc", start.UtcDateTime),
-            ("interval_end_utc", start.AddMinutes(15).UtcDateTime),
-            ("login_name", login),
-            ("query_id", query),
-            ("plan_id", 0L),
-            ("query_sql_text", text),
-            ("executions", calls),
-            ("duration_ms", total),
-            ("max_duration_ms", max),
-            ("logical_reads", blocks),
-            ("physical_reads", read),
-            ("row_count", rows),
-            ("tempdb_kb", tempKb),
-            ("wait_samples", samples));
-
-    private static CaptureValues WaitRow(DateTimeOffset start, long query, string? login, string? category, string? waitEvent, long samples) =>
-        Row(
-            ("captured_at", null),
-            ("interval_start_utc", start.UtcDateTime),
-            ("interval_end_utc", start.AddMinutes(15).UtcDateTime),
-            ("login_name", login),
-            ("query_id", query),
-            ("plan_id", 0L),
-            ("wait_category", category),
-            ("wait_event", waitEvent),
-            ("samples", samples));
-
-    private static CaptureValues HolderRow(DateTimeOffset at, string application, string role, string state, long connections, long waitingLock, double oldestState, double oldestConnection) =>
-        Row(
-            ("captured_at", at.UtcDateTime),
-            ("application_name", application),
-            ("usename", role),
-            ("state", state),
-            ("connections", connections),
-            ("waiting_lock", waitingLock),
-            ("oldest_state_s", (decimal)oldestState),
-            ("oldest_connection_s", (decimal)oldestConnection));
+            await capture.TickAsync(at, capture.Timestamp(), at.AddSeconds(30), TestContext.Current.CancellationToken);
+        }
+        while (capture.Reading);
+    }
 
     /// <summary>The gaps of every coverage row, one per line.</summary>
     private static List<string> Gaps(MemorySidecar sidecar) =>
@@ -1109,6 +1259,76 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
     /// <summary>The evidence rows as the store writes them, byte for byte.</summary>
     private static List<string> Lines(MemorySink sink) => [.. sink.Rows.Select(r => System.Text.Encoding.UTF8.GetString(StoredLines.Row(r)))];
+
+    /// <summary>The sidecar's blocks: none may reach the evidence document.</summary>
+    private static readonly string[] SidecarBlocks = ["RCA-PG-13", "RCA-PG-14", "RCA-PG-15", "RCA-PG-16", "RCA-PG-17"];
+
+    private static string Note(CaptureNote note) => string.Create(CultureInfo.InvariantCulture, $"{note.Kind}|{note.Target}|{note.At:O}|{note.Text}");
+
+    /// <summary>The watermarks in order, each once while it stays the same.</summary>
+    private static List<DateTimeOffset> Distinct(List<DateTimeOffset> marks) => [.. marks.Where((m, i) => i == 0 || m != marks[i - 1])];
+
+    /// <summary>
+    /// T4's simulated session (RcaSimulation's chain under an idle transaction, 17:00 to 17:20, with a connection surge from
+    /// 17:16 to 17:17, whose episode holds the 17:17 read back until it ends at 17:18), driven as the lane drives it, by a
+    /// clock the test's blocks move: the evidence as the store writes it,
+    /// its notes, its watermarks, and the connectors. With a sink, Query Store is read too, and the surge's holders.
+    /// </summary>
+    private async Task<T4Run> RunT4Async(bool sink, Action<TimedT4, TimedStore>? setUp = null)
+    {
+        var clock = new ManualTime(RcaSimulation.T4From);
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
+        store.Follow(clock);
+        var timings = new PgSidecarOptions { Clock = new TickClock(clock) };
+        var observer = new TimedT4(clock, RcaSimulation.T4Primary(clock), block => block == "RCA-PG-17"
+            ? [HolderRow(clock.Now, ApplicationNames.Program + "/svc-intake/20261120170000-t4-0a0b0c", Runner, "idle", 40, 0, 12.5, 60)]
+            : store.ObserverAnswer(block))
+        {
+            Surge = (At(17, 16), At(17, 17)),
+        };
+        var azure = new TimedStore(clock, store.Connector, timings.OpenTimeout);
+        setUp?.Invoke(observer, azure);
+        var span = new MarkLog(new MemorySink());
+        var sidecar = sink ? new MemorySidecar() : null;
+        var source = new PgQueryStoreSource(azure, new QueryWatermark(Path.Combine(root, Guid.NewGuid().ToString("N")), "T4"), new MemorySpans { CurrentSpan = SpanA });
+        var primary = sidecar is null
+            ? new PgPrimaryObserver(observer, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink())
+            : new PgPrimaryObserver(observer, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar, source, timings);
+
+        await LaneAsync(primary, span, clock, RcaSimulation.T4From, RcaSimulation.T4To);
+
+        return new T4Run(Lines(span.Inner), [.. span.Inner.Notes.Select(Note)], Distinct(span.Marks), span.Inner.Watermarks["T4"], observer, azure, sidecar);
+    }
+
+    /// <summary>
+    /// Drives one observer as ObserverLane does, by a clock a slow block moves: begins it at <paramref name="from"/>, ticks it
+    /// when it says, 50 ms to 1 s after its last tick ended, and ends it at <paramref name="to"/>.
+    /// </summary>
+    private static async Task LaneAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to)
+    {
+        var token = TestContext.Current.CancellationToken;
+        clock.Set(from);
+        span.Began(observer.Target, from);
+        await observer.BeginAsync(span, from, token);
+        while (clock.Now < to)
+        {
+            var next = await observer.TickAsync(clock.Now, token);
+            var after = clock.Now;
+            var delay = next - after;
+            delay = delay < TimeSpan.FromMilliseconds(50) ? TimeSpan.FromMilliseconds(50) : delay > TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : delay;
+            clock.Set(after + delay);
+        }
+
+        await observer.EndAsync(to, token);
+        span.Ended(observer.Target, to);
+    }
+
+    private static CaptureValues With(CaptureValues row, string column, object? value)
+    {
+        var values = row.Raw.ToDictionary(v => v.Key, v => v.Value, StringComparer.OrdinalIgnoreCase);
+        values[column] = value;
+        return new CaptureValues(values);
+    }
 
     /// <summary>
     /// PostgreSQL's regular expressions in .NET's: \m starts a word and \M ends one; [:alnum:] is a letter or a digit
@@ -1229,105 +1449,207 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         private static partial Regex UnsureRule();
     }
 
-    /// <summary>
-    /// T4's Query Store on azure_sys, scripted: RCA-PG-14 and 15 answer from the rows of the intervals published by the
-    /// clock (an interval's statistics show <see cref="PublishedAfter"/> after it ends, its waits
-    /// <see cref="WaitsPublishedAfter"/> after), within the block's bounds, as the blocks' SQL would: RCA-PG-14's
-    /// wait_samples counts the waits shown, events only. The observer's own connection answers RCA-PG-13 and 16.
-    /// </summary>
-    private sealed class ScriptedQueryStore
+    /// <summary>One identity run: the evidence as the store writes it, its notes and watermarks, the connectors, and the sidecar.</summary>
+    private sealed record T4Run(List<string> Rows, List<string> Notes, List<DateTimeOffset> Marks, DateTimeOffset Final, TimedT4 Observer, TimedStore Store, MemorySidecar? Sidecar);
+
+    /// <summary>A clock whose timestamps follow a <see cref="ManualTime"/>, so the sidecar's room and budget measure what the test's blocks cost.</summary>
+    private sealed class TickClock(ManualTime time) : TimeProvider
     {
-        private readonly List<CaptureValues> statistics;
-        private readonly List<CaptureValues> waits;
-        private ManualTime? following;
-        private DateTimeOffset clock;
+        public override long TimestampFrequency => TimeSpan.TicksPerSecond;
 
-        public ScriptedQueryStore(List<CaptureValues> statistics, List<CaptureValues> waits)
-        {
-            this.statistics = statistics;
-            this.waits = waits;
-            Connector = new ScriptedConnector((_, _) => []) { ParameterAnswer = Answer };
-        }
+        public override DateTimeOffset GetUtcNow() => time.GetUtcNow();
 
-        public ScriptedConnector Connector { get; }
-
-        public DateTimeOffset Clock
-        {
-            get => following?.Now ?? clock;
-            set => clock = value;
-        }
-
-        public TimeSpan PublishedAfter { get; set; }
-
-        /// <summary>When an interval's waits show; as its statistics when null.</summary>
-        public TimeSpan? WaitsPublishedAfter { get; set; }
-
-        public string CaptureMode { get; set; } = "all";
-
-        public bool HarnessFails { get; set; }
-
-        public List<CaptureValues> Harness { get; set; } =
-        [
-            Row(("captured_at", null), ("kind", "function"), ("name", "fn$harness_begin")),
-            Row(("captured_at", null), ("kind", "function"), ("name", "fn_harness_event")),
-            Row(("captured_at", null), ("kind", "harness_table"), ("name", "harness_runs")),
-            Row(("captured_at", null), ("kind", "table"), ("name", "work_queues")),
-            Row(("captured_at", null), ("kind", "table"), ("name", "patients")),
-        ];
-
-        /// <summary>Answers by the simulation's clock instead of <see cref="Clock"/>.</summary>
-        public void Follow(ManualTime time) => following = time;
-
-        private static CaptureValues With(CaptureValues row, string column, object? value)
-        {
-            var values = row.Raw.ToDictionary(v => v.Key, v => v.Value, StringComparer.OrdinalIgnoreCase);
-            values[column] = value;
-            return new CaptureValues(values);
-        }
-
-        private static bool Same(CaptureValues a, CaptureValues b) =>
-            a.Time("interval_start_utc") == b.Time("interval_start_utc") && a.Long("query_id") == b.Long("query_id") && string.Equals(a.Text("login_name"), b.Text("login_name"), StringComparison.Ordinal);
-
-        private List<CaptureValues> Answer(string block, CaptureParameters parameters)
-        {
-            var since = (DateTimeOffset)parameters[1].Value!;
-            var until = (DateTimeOffset)parameters[block == "RCA-PG-14" ? 5 : 3].Value!;
-            var now = Clock;
-            bool Shown(CaptureValues row, TimeSpan after) => row.Time("interval_end_utc") > since && row.Time("interval_start_utc") < until && now >= row.Time("interval_end_utc") + after;
-            var shownWaits = waits.Where(w => Shown(w, WaitsPublishedAfter ?? PublishedAfter)).ToList();
-            var rows = block switch
-            {
-                "RCA-PG-14" => statistics.Where(s => Shown(s, PublishedAfter)).Select(s => With(s, "wait_samples", shownWaits.Where(w => Same(w, s) && w.Text("wait_category") is not null).Sum(w => w.Long("samples") ?? 0))),
-                "RCA-PG-15" => shownWaits.Where(w => ((long[])parameters[2].Value!).Contains(w.Long("query_id")!.Value)),
-                _ => Enumerable.Empty<CaptureValues>(),
-            };
-
-            // captured_at is clock_timestamp() at the read.
-            return [.. rows.Select(r => With(r, "captured_at", now.UtcDateTime))];
-        }
+        public override long GetTimestamp() => time.GetUtcNow().UtcTicks;
     }
 
-    /// <summary>A sidecar sink that keeps what it gets, refusing an evidence table's row as the default sink does.</summary>
-    private sealed class MemorySidecar : ISidecarSink
+    /// <summary>A span that keeps what a <see cref="MemorySink"/> keeps, and every watermark in order.</summary>
+    private sealed class MarkLog(MemorySink inner) : ICaptureSpan
     {
-        private readonly List<CaptureRow> rows = [];
+        public MemorySink Inner => inner;
 
-        public void Write(CaptureRow row)
+        public List<DateTimeOffset> Marks { get; } = [];
+
+        public void Write(CaptureRow row) => inner.Write(row);
+
+        public void Note(CaptureNote note) => inner.Note(note);
+
+        public void Watermark(string target, DateTimeOffset complete)
         {
-            NullSidecarSink.Instance.Write(row);
-            lock (rows)
+            Marks.Add(complete);
+            inner.Watermark(target, complete);
+        }
+
+        public void Began(string target, DateTimeOffset at) => inner.Began(target, at);
+
+        public void Ended(string target, DateTimeOffset at) => inner.Ended(target, at);
+
+        public void Close(DateTimeOffset at) => inner.Close(at);
+    }
+
+    /// <summary>
+    /// T4's observer connection, or its replica's, for the identity runs: the evidence blocks as <c>evidence</c>'s connection
+    /// answers them, with a connection surge on RCA-PG-10 when set; the sidecar's blocks (RCA-PG-13, 16, 17) as
+    /// <c>sidecar</c> answers them. A sidecar block can cost time (the clock moves by it; past its timeout, by the timeout,
+    /// and it fails as a statement timeout does), fail, or throw. The connection can break at a moment: a sidecar block at
+    /// it, or any block after it, fails on the connection that was open then, as does every later block on it.
+    /// </summary>
+    private sealed class TimedT4(ManualTime clock, ICaptureConnector evidence, Func<string, IReadOnlyList<CaptureValues>?> sidecar) : ICaptureConnector
+    {
+        public const string TransportError = "Exception while reading from stream (a test's broken connection).";
+
+        private static readonly HashSet<string> Quiet = new(StringComparer.Ordinal) { "RCA-PG-13", "RCA-PG-16", "RCA-PG-17" };
+
+        public List<(DateTimeOffset At, string BlockId, TimeSpan Timeout)> Calls { get; } = [];
+
+        public List<(DateTimeOffset At, string BlockId)> Failures { get; } = [];
+
+        public int Opens { get; private set; }
+
+        public Func<string, TimeSpan> Cost { get; set; } = _ => TimeSpan.Zero;
+
+        public Func<string, Exception?> Failure { get; set; } = _ => null;
+
+        public DateTimeOffset? BreakAt { get; set; }
+
+        public (DateTimeOffset From, DateTimeOffset To)? Surge { get; set; }
+
+        public string Description => "timed";
+
+        public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken)
+        {
+            var inner = await evidence.OpenAsync(cancellationToken);
+            Opens++;
+            return new Connection(this, clock.Now, inner);
+        }
+
+        private sealed class Connection(TimedT4 owner, DateTimeOffset opened, ICaptureConnection inner) : ICaptureConnection
+        {
+            private bool broken;
+
+            public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken) =>
+                RunAsync(blockId, text, parameter, null, timeout, cancellationToken);
+
+            public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken) =>
+                RunAsync(blockId, text, null, parameters, timeout, cancellationToken);
+
+            public ValueTask DisposeAsync() => inner.DisposeAsync();
+
+            private async Task<IReadOnlyList<CaptureValues>> RunAsync(string blockId, string text, int[]? parameter, CaptureParameters? parameters, TimeSpan timeout, CancellationToken cancellationToken)
             {
-                rows.Add(row);
+                var at = owner.Clock.Now;
+                owner.Calls.Add((at, blockId, timeout));
+                var quiet = Quiet.Contains(blockId);
+                if (owner.BreakAt is { } moment && opened <= moment && (at > moment || (at == moment && quiet)))
+                {
+                    broken = true;
+                }
+
+                if (broken)
+                {
+                    owner.Failures.Add((at, blockId));
+                    throw new CaptureException(CaptureFailureKind.Connection, TransportError);
+                }
+
+                if (!quiet)
+                {
+                    var rows = parameters is null
+                        ? await inner.QueryAsync(blockId, text, parameter, timeout, cancellationToken)
+                        : await inner.QueryAsync(blockId, text, parameters, timeout, cancellationToken);
+                    return blockId == "RCA-PG-10" && owner.Surge is { } surge && at >= surge.From && at < surge.To ? [.. rows.Select(r => With(r, "client_connections", 45L))] : rows;
+                }
+
+                var cost = owner.Cost(blockId);
+                owner.Clock.Advance(cost > timeout ? timeout : cost);
+                if (cost > timeout)
+                {
+                    owner.Failures.Add((at, blockId));
+                    throw new CaptureException(CaptureFailureKind.Timeout, "PostgreSQL error 57014: canceling statement due to statement timeout");
+                }
+
+                if (owner.Failure(blockId) is { } failure)
+                {
+                    owner.Failures.Add((at, blockId));
+                    throw failure;
+                }
+
+                return owner.Answer(blockId) ?? [];
             }
         }
 
-        public List<CaptureRow> Table(string name)
+        private ManualTime Clock => clock;
+
+        private IReadOnlyList<CaptureValues>? Answer(string blockId) => sidecar(blockId);
+    }
+
+    /// <summary>
+    /// Connections to azure_sys whose opens and blocks (RCA-PG-14, 15) can cost time (past the timeout, the clock moves by
+    /// the timeout and it fails as a timeout does), fail, or throw; otherwise <c>inner</c>'s connections answer.
+    /// </summary>
+    private sealed class TimedStore(ManualTime clock, ICaptureConnector inner, TimeSpan openTimeout) : ICaptureConnector
+    {
+        public List<(DateTimeOffset At, string BlockId, TimeSpan Timeout)> Calls { get; } = [];
+
+        public List<(DateTimeOffset At, string BlockId)> Failures { get; } = [];
+
+        public Func<string, TimeSpan> Cost { get; set; } = _ => TimeSpan.Zero;
+
+        public Func<string, Exception?> Failure { get; set; } = _ => null;
+
+        public TimeSpan OpenCost { get; set; }
+
+        public Exception? OpenFailure { get; set; }
+
+        public string Description => "timed azure_sys";
+
+        public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken)
         {
-            lock (rows)
+            var at = clock.Now;
+            clock.Advance(OpenCost > openTimeout ? openTimeout : OpenCost);
+            if (OpenCost > openTimeout)
             {
-                return [.. rows.Where(r => r.Table == name)];
+                Failures.Add((at, "open"));
+                throw new OperationCanceledException("The open's own bound ran out (a test's).");
             }
+
+            if (OpenFailure is { } failure)
+            {
+                Failures.Add((at, "open"));
+                throw failure;
+            }
+
+            return new Connection(this, await inner.OpenAsync(cancellationToken));
         }
+
+        private sealed class Connection(TimedStore owner, ICaptureConnection connection) : ICaptureConnection
+        {
+            public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken) =>
+                connection.QueryAsync(blockId, text, parameter, timeout, cancellationToken);
+
+            public async Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken)
+            {
+                var at = owner.Time.Now;
+                owner.Calls.Add((at, blockId, timeout));
+                var cost = owner.Cost(blockId);
+                owner.Time.Advance(cost > timeout ? timeout : cost);
+                if (cost > timeout)
+                {
+                    owner.Failures.Add((at, blockId));
+                    throw new CaptureException(CaptureFailureKind.Timeout, "PostgreSQL error 57014: canceling statement due to statement timeout");
+                }
+
+                if (owner.Failure(blockId) is { } failure)
+                {
+                    owner.Failures.Add((at, blockId));
+                    throw failure;
+                }
+
+                return await connection.QueryAsync(blockId, text, parameters, timeout, cancellationToken);
+            }
+
+            public ValueTask DisposeAsync() => connection.DisposeAsync();
+        }
+
+        private ManualTime Time => clock;
     }
 
     /// <summary>A sidecar sink whose store can't keep anything: every write fails as a full disk would.</summary>
@@ -1525,61 +1847,5 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         }
     }
 
-    /// <summary>The span store's side of a backfill: a sink per span that the test adds.</summary>
-    private sealed class MemorySpans : ISidecarSpans
-    {
-        private readonly Dictionary<string, MemorySidecar> sinks = new(StringComparer.Ordinal);
 
-        public string? CurrentSpan { get; set; }
-
-        public MemorySidecar Add(string span) => sinks[span] = new MemorySidecar();
-
-        public ISidecarSink? ForSpan(string spanId) => sinks.GetValueOrDefault(spanId);
-    }
-
-    /// <summary>A sidecar fixture decoded for assertions: each table's rows with strings resolved and times as UTC.</summary>
-    private sealed class SidecarFixture
-    {
-        private readonly JsonObject root;
-        private readonly DateTimeOffset epoch;
-        private readonly List<string> strings;
-
-        public SidecarFixture(string name)
-        {
-            root = JsonNode.Parse(File.ReadAllText(RepositoryPaths.Combine("rca", "fixtures", name)))!.AsObject();
-            Assert.Equal(RcaContract.SidecarKind, root["kind"]!.GetValue<string>());
-            epoch = DateTimeOffset.Parse(root["epochUtc"]!.GetValue<string>(), CultureInfo.InvariantCulture, DateTimeStyles.AssumeUniversal);
-            strings = [.. root["strings"]!.AsArray().Select(s => s!.GetValue<string>())];
-        }
-
-        public List<Dictionary<string, object?>> Table(string name)
-        {
-            if (root["tables"]![name]?.AsObject() is not { } table)
-            {
-                return [];
-            }
-
-            var types = RcaContract.Table(name).Columns.ToDictionary(c => c.Name, c => c.Type);
-            var count = table["rows"]!.GetValue<int>();
-            var rows = Enumerable.Range(0, count).Select(_ => new Dictionary<string, object?>(StringComparer.Ordinal)).ToList();
-            foreach (var (column, values) in table["columns"]!.AsObject())
-            {
-                var array = values!.AsArray();
-                for (var i = 0; i < count; i++)
-                {
-                    rows[i][column] = array[i] is not { } value ? null : types[column] switch
-                    {
-                        "string" => strings[value.GetValue<int>()],
-                        "timestamp" => epoch.AddMilliseconds(value.GetValue<long>()),
-                        "long" or "integer" => value.GetValue<long>(),
-                        "double" => value.GetValue<double>(),
-                        "boolean" => value.GetValue<bool>(),
-                        _ => value.ToJsonString(),
-                    };
-                }
-            }
-
-            return rows;
-        }
-    }
 }
