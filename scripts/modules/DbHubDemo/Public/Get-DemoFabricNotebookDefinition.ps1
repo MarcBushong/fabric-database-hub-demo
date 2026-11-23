@@ -19,6 +19,10 @@ function Get-DemoFabricNotebookDefinition {
     2026-11-14 only NB_DatabaseHub_Deployment has one (GITHUB_REPOSITORY): NB_DatabaseHub_LiveActivity has no GitHub
     path (ADR 0026), so its copy is unchanged by them.
 
+    BoundKeys lists the parameters this call sets: WORKSPACE_ID, LAKEHOUSE_ID, and LAKEHOUSE_NAME with a lakehouse, and
+    GITHUB_REPOSITORY and GITHUB_ENVIRONMENT when they're given. Any other parameter keeps the file's value, so deploy.ps1
+    counts a workspace copy whose value differs as edited (Get-DemoFabricNotebookState; the review of 42acec35).
+
     Notebook definition: https://learn.microsoft.com/rest/api/fabric/articles/item-management/definitions/notebook-definition
     ipynb example (part path notebook-content.ipynb): https://learn.microsoft.com/rest/api/fabric/notebook/items/create-notebook
     Default lakehouse in a notebook's metadata: https://learn.microsoft.com/fabric/data-engineering/notebook-source-control-deployment
@@ -159,6 +163,7 @@ function Get-DemoFabricNotebookDefinition {
         SizeBytes        = $bytes.Length
         Sha256           = $sha256
         LakehouseRebound = $rebound
+        BoundKeys        = [string[]]@($values.Keys | ForEach-Object { [string]$_ })
         Definition       = [ordered]@{
             format = 'ipynb'
             parts  = @(

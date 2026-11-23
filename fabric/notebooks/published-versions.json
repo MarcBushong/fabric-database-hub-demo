@@ -1,148 +1,341 @@
 {
-  "about": "Every version of the demo's notebooks in this repository's history, oldest first, by fingerprint: each cell's type and code, without outputs, metadata, line endings, trailing spaces, or the workspace, lakehouse, and GitHub values the import sets (Get-DemoNotebookFingerprint). deploy.ps1 brings a workspace's copy that matches one of them up to date, since nobody edited it, and keeps one that matches none, while fabric.importNotebooks is false. Written by tests/unit/Fabric.Notebooks.Tests.ps1 with DBHUB_WRITE_NOTEBOOK_VERSIONS=1; don't edit.",
+  "about": "Every version of the demo's notebooks in this repository's history, oldest first, by fingerprint: each cell's type and code, without outputs, metadata, line endings, trailing spaces, or the workspace, lakehouse, and GitHub values the import sets (Get-DemoNotebookFingerprint), with the values its file has there (parameters). deploy.ps1 brings a workspace's copy that matches one of them up to date, since nobody edited it, and keeps one that matches none, or that has another value in a parameter the import doesn't set, while fabric.importNotebooks is false. Written by tests/unit/Fabric.Notebooks.Tests.ps1 with DBHUB_WRITE_NOTEBOOK_VERSIONS=1; don't edit.",
   "notebooks": {
     "NB_DatabaseHub_Deployment": [
       {
         "sha256": "1a75717529e94678b3069949130ed9344e27889fbf22c9f056a23393c6889508",
-        "since": "2026-10-27"
+        "since": "2026-10-27",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       },
       {
         "sha256": "84f7db0d94970df9f090cbbc56fd3a50f021bc35bfd74b1dd5727e8eca6d107a",
-        "since": "2026-11-03"
+        "since": "2026-11-03",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       },
       {
         "sha256": "14f92eed81785e2f3fe4f2230db103af40b630097ff658d60eeaa3dd68833386",
-        "since": "2026-11-05"
+        "since": "2026-11-05",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       },
       {
         "sha256": "79e0b58056cc3a738ee39c16b58c1331e311fe6586a132d80e3ef724b417b17c",
-        "since": "2026-11-06"
+        "since": "2026-11-06",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       },
       {
         "sha256": "88c7a9b6d5438bf297c0de54c3080805ff610fef3ed9a69d7926c9ef2b1e546b",
-        "since": "2026-11-17"
+        "since": "2026-11-17",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       },
       {
         "sha256": "83a967421c118f081ab5bfc31b29cf898ac5048d0ddfd3d30ce149f3d4042424",
-        "since": "2026-11-18"
+        "since": "2026-11-18",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       },
       {
         "sha256": "74e4c8b85a07335d14fbe71701473f6757d5ce9a3d42801460ae444793f6629e",
-        "since": "2026-11-19"
+        "since": "2026-11-19",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       },
       {
         "sha256": "a27209fab4c9b6243859465ff34e288f47219632e3390793c20ce8fceca9bbd8",
-        "since": "2026-11-19"
+        "since": "2026-11-19",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       },
       {
         "sha256": "f28048c39b0fc4a6ac8aa72e1aa4fcbe457d26ebb9bdfde43a6cce6eb88a0fb2",
-        "since": "2026-11-20"
+        "since": "2026-11-20",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       },
       {
         "sha256": "f7e28b9d0f2c32ff355bf39a1f470ec3980f27d8fce9f9d5483c0bee599bbe27",
-        "since": "2026-11-20"
+        "since": "2026-11-20",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       }
     ],
     "NB_DatabaseHub_LiveActivity": [
       {
         "sha256": "17c5a4978d5f8345e4ed4d8b4cddbcecc8abd6bd58c8bdf3bb3c4bd429d3bc83",
-        "since": "2026-10-27"
+        "since": "2026-10-27",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo",
+          "GITHUB_ENVIRONMENT": "demo"
+        }
       },
       {
         "sha256": "4efa329f5aca997528cfd4f6599b3cd29e00bffa9aa8b530bfc1dfb024ab72a7",
-        "since": "2026-11-03"
+        "since": "2026-11-03",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo",
+          "GITHUB_ENVIRONMENT": "demo"
+        }
       },
       {
         "sha256": "d16835381a28213d0453ce6f7504813c49567079c012b5baf71c7069d0fc3d04",
-        "since": "2026-11-04"
+        "since": "2026-11-04",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo",
+          "GITHUB_ENVIRONMENT": "demo"
+        }
       },
       {
         "sha256": "cf88cc272e5948ab76476cba09899c0feaf91aa06c9cb3e6b52c46c1d6c3185c",
-        "since": "2026-11-13"
+        "since": "2026-11-13",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo",
+          "GITHUB_ENVIRONMENT": "demo"
+        }
       },
       {
         "sha256": "e7262dddeb04254ddb4b0ad2f83d21f3d122dcf78fc897c9b3b0c1a66a66d226",
-        "since": "2026-11-14"
+        "since": "2026-11-14",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "eaf7c857ef93ef68c18341100cf0415edd20bc7a348ac5f9dd31ef0aed301494",
-        "since": "2026-11-14"
+        "since": "2026-11-14",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "032fa6084502780cd1602d2d6eb508bf7ecc86dd55f841b2f3c2010f9e2b4370",
-        "since": "2026-11-16"
+        "since": "2026-11-16",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "57b5b544ae2041bea1fd0a8b198ec45aab2be044ad26866bdf049aceaf00c21c",
-        "since": "2026-11-16"
+        "since": "2026-11-16",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "5134ed8a87d135dd5d6d2d4aa40a87790cac698489225fc3ee53eb44582469dc",
-        "since": "2026-11-18"
+        "since": "2026-11-18",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "68614206810e19d9c005d9f61171a731d5205348e1b775003394b4b4c44ea840",
-        "since": "2026-11-18"
+        "since": "2026-11-18",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "89821fe17fd1d1eee9d121b5d511fa11ed4891721af3a6092343292a8dd23886",
-        "since": "2026-11-18"
+        "since": "2026-11-18",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "1aa862fc1730d8700d51c9b7a7942d1bdd9c5103bfc839e8d4e39a58f28d2753",
-        "since": "2026-11-19"
+        "since": "2026-11-19",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "84a8cce09c62e2683e54d4defa834c22b222176d6e016e7e0d37939279f5b02d",
-        "since": "2026-11-19"
+        "since": "2026-11-19",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "9e7268bce035424ba8e64d309c637b301c1564f664be55b329286dddce7ea5d5",
-        "since": "2026-11-19"
+        "since": "2026-11-19",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "b4c6018da6d1443e04b168870b2c3e5703a3beb8dde3238a1d149374cfc46798",
-        "since": "2026-11-19"
+        "since": "2026-11-19",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "c847da5ab054674dfbcdec32bbb8cc76b8df6fc74e8852d816df772dcd0a1e41",
-        "since": "2026-11-19"
+        "since": "2026-11-19",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "7438352becdc6212934cffb1596e42184700b7d73f65f86ff94c0bd821c2992d",
-        "since": "2026-11-20"
+        "since": "2026-11-20",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "7cb4e1a05422876bc3ce01ce6bfa06ce229f00a13232bb03745a3e5923c01c21",
-        "since": "2026-11-20"
+        "since": "2026-11-20",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "8e1af98d382d0840a611435cd3a944aa34449817bbf3eca07b192925ebfefbb7",
-        "since": "2026-11-20"
+        "since": "2026-11-20",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "ae89c966f6c80f16c8af53ba23394baede2591d81bb1a7ad12e2b6ff6e85bf62",
-        "since": "2026-11-20"
+        "since": "2026-11-20",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "df86b2e5d0dac00d0f42d25167f09988024bb076964c2276687fbcc63bd791e8",
-        "since": "2026-11-20"
+        "since": "2026-11-20",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "58317fc41c1d8967f7d08775a0a4b8e19832822f665eb387fcff46bfe2ea1873",
-        "since": "2026-11-21"
+        "since": "2026-11-21",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "5841a3d388293d840f2eeec4b8433d7bab0a99a726486d9efe87bc4d9aa27edd",
-        "since": "2026-11-21"
+        "since": "2026-11-21",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "0880740b6f5b32737cfbd54d13cba174fba3dbf972c581619cdee544e92f4770",
-        "since": "2026-11-22"
+        "since": "2026-11-22",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       },
       {
         "sha256": "36d394b7dc921070baae0261f458e612e57068755cca5185527ce45434cd0e69",
-        "since": "2026-11-23"
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
       }
     ]
   }

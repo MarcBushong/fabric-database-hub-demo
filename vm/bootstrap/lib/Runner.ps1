@@ -166,6 +166,10 @@ function Invoke-DemoVmStateMachine {
                 Write-DemoVmLog -Step $name -Level 'Warning' -Message ('Could not write the in-progress health.json: {0}' -f $_.Exception.Message)
             }
             Write-DemoVmLog -Step $name -Message 'Converging.'
+            # The generation in which this step's Set last ran (the review of cb4bc479, 2026-11-23): a step that has to
+            # change something in this generation is a new VM's setup, or a rebuilt guest's, where an established VM's
+            # step passes its Test (Test-DemoVmStepSetThisGeneration). The generation's reset keeps it.
+            $record['setGeneration'] = [string]$state['generation']
             $result = Get-DemoVmStepOutcome -Output @(& $definition['Set'] $definition)
             # A Set that ran to its end says again what still holds, so the step's earlier warnings go then (the F24
             # reviews, 2026-11-20); one that threw, or stopped early, leaves them.

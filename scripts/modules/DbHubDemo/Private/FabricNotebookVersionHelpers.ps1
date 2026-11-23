@@ -80,8 +80,9 @@ function Get-DemoNotebookPublishedVersion {
     .SYNOPSIS
     The fingerprints of every version of one of the demo's notebooks in this repository's history, oldest first, each
     with the day it first appeared (fabric/notebooks/published-versions.json, which a unit test keeps current). Returns
-    Sha256 and Since for each; nothing for a notebook the file doesn't list, or when the file can't be read, so a copy
-    then counts as edited and is kept. Internal.
+    Sha256, Since, and Parameters (the values the version's file has in its parameters cell, which the fingerprint leaves
+    out; $null when the list doesn't hold them) for each; nothing for a notebook the file doesn't list, or when the file
+    can't be read, so a copy then counts as edited and is kept. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject[]])]
@@ -108,9 +109,11 @@ function Get-DemoNotebookPublishedVersion {
     return @(foreach ($entry in @($notebooks[$Name])) {
             if ($entry -is [System.Collections.IDictionary] -and [string]$entry['sha256'] -match '^[0-9a-f]{64}$') {
                 $since = $entry['since']
+                $parameters = $entry['parameters']
                 [pscustomobject]@{
-                    Sha256 = [string]$entry['sha256']
-                    Since  = $(if ($since -is [datetime]) { $since.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) } else { [string]$since })
+                    Sha256     = [string]$entry['sha256']
+                    Since      = $(if ($since -is [datetime]) { $since.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture) } else { [string]$since })
+                    Parameters = $(if ($parameters -is [System.Collections.IDictionary]) { $parameters } else { $null })
                 }
             }
         })
@@ -215,15 +218,21 @@ function Get-DemoFabricNotebookState {
     Whether the workspace's copy of one of the demo's notebooks is a version the demo published, which nobody edited
     (follow-ups decision 2a, 2026-11-23). Reads it as ipynb (Read-DemoFabricItemDefinition), and compares its fingerprint
     (Get-DemoNotebookFingerprint) with the one -Notebook uploads, and with every version in this repository's history
-    (Get-DemoNotebookPublishedVersion). Returns State, ItemId, Since, and Error. Never throws. Internal.
+    (Get-DemoNotebookPublishedVersion). Returns State, ItemId, Since, Error, CapacityInactive, and EditedKeys. Never throws.
+    Internal.
 
     .DESCRIPTION
     - Missing: the workspace has no notebook by the name. Duplicate: it has more than one. ListFailed: its notebooks
       couldn't be listed (Error).
     - Current: this version, with the values -Notebook sets for the workspace, the lakehouse, and the GitHub path.
-    - Rebind: this version, with other values: it's bound to another lakehouse, for example.
+    - Rebind: this version, with other values in the parameters -Notebook sets (its BoundKeys): it's bound to another
+      lakehouse, for example.
     - Older: an earlier version of the demo's (Since: the day that version first appeared), so nobody edited it.
-    - Edited: none of them: someone edited it, or another copy of the scripts published it (a newer one, or a fork).
+    - Edited: none of them: someone edited it, or another copy of the scripts published it (a newer one, or a fork). Also
+      a copy whose code is this version or an earlier one, but which has another value in a parameter that -Notebook
+      doesn't set than the version's own (EditedKeys): with github.repository the example configuration's placeholder,
+      the import leaves GITHUB_REPOSITORY as the file has it, so a different one is an edit, not a binding (the review of
+      42acec35).
     - Unread: its definition couldn't be read (Error; CapacityInactive when the workspace's capacity is paused), or isn't
       a notebook the check reads.
     #>
@@ -246,8 +255,8 @@ function Get-DemoFabricNotebookState {
     )
 
     $answer = {
-        param([string] $State, [string] $ItemId = '', [string] $Why = '', [string] $Since = '', [bool] $CapacityInactive = $false)
-        [pscustomobject]@{ State = $State; ItemId = $ItemId; Error = $Why; Since = $Since; CapacityInactive = $CapacityInactive }
+        param([string] $State, [string] $ItemId = '', [string] $Why = '', [string] $Since = '', [bool] $CapacityInactive = $false, [string[]] $EditedKeys = @())
+        [pscustomobject]@{ State = $State; ItemId = $ItemId; Error = $Why; Since = $Since; CapacityInactive = $CapacityInactive; EditedKeys = @($EditedKeys) }
     }
     try {
         $found = Find-DemoFabricItem -WorkspaceId $WorkspaceId -DisplayName $Notebook.DisplayName -Type 'Notebook' -Token $Token
@@ -283,18 +292,55 @@ function Get-DemoFabricNotebookState {
         return (& $answer 'Unread' $itemId 'its definition isn''t an nbformat notebook')
     }
     $code = Get-DemoNotebookFingerprint -Text $utf8.GetString([System.Convert]::FromBase64String([string]@($Notebook.Definition['parts'])[0]['payload']))
-    if ($null -ne $code -and $there.Sha256 -eq $code.Sha256) {
-        $same = $true
-        foreach ($key in @($code.Bindings.Keys) + @($there.Bindings.Keys)) {
-            if (-not [string]::Equals([string]$code.Bindings[$key], [string]$there.Bindings[$key], [System.StringComparison]::OrdinalIgnoreCase)) {
-                $same = $false
+    # The parameters this run's import sets (Get-DemoFabricNotebookDefinition's BoundKeys): another value there is a
+    # binding. Any other parameter keeps the file's value, so another value there is an edit (the review of 42acec35).
+    $bound = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::Ordinal)
+    $boundProperty = $Notebook.PSObject.Properties['BoundKeys']
+    if ($null -ne $boundProperty) {
+        foreach ($key in @($boundProperty.Value)) {
+            if ($key) {
+                $null = $bound.Add([string]$key)
             }
         }
-        return (& $answer $(if ($same) { 'Current' } else { 'Rebind' }) $itemId)
+    }
+    $differs = { param($First, $Second) -not [string]::Equals([string]$First, [string]$Second, [System.StringComparison]::OrdinalIgnoreCase) }
+    if ($null -ne $code -and $there.Sha256 -eq $code.Sha256) {
+        $rebind = $false
+        $edited = [System.Collections.Generic.List[string]]::new()
+        foreach ($key in @(@($code.Bindings.Keys) + @($there.Bindings.Keys) | Select-Object -Unique)) {
+            if (-not (& $differs $code.Bindings[$key] $there.Bindings[$key])) {
+                continue
+            }
+            if ($bound.Contains([string]$key)) {
+                $rebind = $true
+            }
+            else {
+                $edited.Add([string]$key)
+            }
+        }
+        if ($edited.Count -gt 0) {
+            return (& $answer 'Edited' $itemId '' '' $false $edited.ToArray())
+        }
+        return (& $answer $(if ($rebind) { 'Rebind' } else { 'Current' }) $itemId)
     }
     $name = if ([string]$Notebook.Path) { [System.IO.Path]::GetFileNameWithoutExtension([string]$Notebook.Path) } else { [string]$Notebook.DisplayName }
     $known = @(Get-DemoNotebookPublishedVersion -Name $name | Where-Object { $_.Sha256 -eq $there.Sha256 }) | Select-Object -First 1
     if ($null -ne $known) {
+        # A parameter this run doesn't set has that version's own value (its file's, which the list records), or someone
+        # edited it. A list without that version's values can't tell, so the copy counts as edited and is kept.
+        $edited = [System.Collections.Generic.List[string]]::new()
+        $parameters = $known.Parameters
+        foreach ($key in @($there.Bindings.Keys)) {
+            if ($bound.Contains([string]$key)) {
+                continue
+            }
+            if ($null -eq $parameters -or -not $parameters.Contains([string]$key) -or (& $differs $parameters[[string]$key] $there.Bindings[$key])) {
+                $edited.Add([string]$key)
+            }
+        }
+        if ($edited.Count -gt 0) {
+            return (& $answer 'Edited' $itemId '' '' $false $edited.ToArray())
+        }
         return (& $answer 'Older' $itemId '' ([string]$known.Since))
     }
     return (& $answer 'Edited' $itemId)

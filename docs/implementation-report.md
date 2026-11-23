@@ -7091,7 +7091,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 **Risks.**
 
 - **Not run live:** that Fabric's ipynb export of an imported notebook gives the repository file's fingerprint. A normalization this doesn't cover makes every copy count as edited, so `deploy.ps1` keeps it, as before this change: safe, but the update then doesn't happen. The live round on an update should see `FABRIC.IMPORT.*` **Pass** "It was the demo's version of ..." for a workspace an earlier version imported, **Pass** "is this version already" on the next run, and **Not selected** after an edit in Fabric.
-- **An edit only to what the fingerprint leaves out,** a cell's metadata or outputs for example, is replaced by an update. An edit to the code is always kept.
+- **An edit only to what the fingerprint leaves out,** a cell's metadata or outputs for example, is replaced by an update. An edit to the code is kept, unless it makes the code exactly a listed version's, a hand edit that undoes a change for example: that copy counts as that version and is updated ([the review's Low](#the-review-of-42acec35-and-cb4bc479-two-mediums-fixed-one-low-narrowed-2026-11-23)).
 - **A notebook changed without the writer** makes copies of its version count as edited; the unit test fails first.
 - **One Get Item Definition per notebook per run,** a long-running operation when Fabric answers 202, bounded by the import's timeout.
 
@@ -7471,6 +7471,83 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 - markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
 
 **What its live check needs.** The deployed app in dark: press **All findings** on the Overview page and an icon-only button such as a table's Copy; and the Readiness page's **Open** and the Links page's **Open in Fabric** in light and dark.
+
+### The re-check of 62e5a18f: a shared link's incident (2026-11-23)
+
+**Why.** The re-check said SHIP, with one Low older than 62e5a18f: a shared `#/rca` link without an incident still opened on the recipient's saved incident, because `openView` reset only the filters from the address. A saved older window key, `T1.<from>.<to>`, also became the recipient's filters, since the Root cause page reads such a key's target and minutes as filters when the address has none.
+
+- **The fix:** when the address names the Root cause page, `openView` takes its incident from the address too, and none when it has none. Other pages keep the saved incident under the address, as before.
+- **The test,** in `lib/app.test.ts`: a link with no incident opens with none and the page's default filters; one with filters keeps them and still opens with no incident; an incident in the path or in `i=` is the one it opens; a saved older window key goes too; the Incidents page keeps the saved incident.
+
+**Changed files.** `fabric/app/src/lib/view-state.ts` (`openView`), the test `lib/app.test.ts`, ADR 0031, and this report.
+
+**Validation.** Targeted: `lib/app.test.ts` and the Root cause view's three suites (`app-rca`, `rca-retry`, `rca-view`) passed, 57 tests, and the new test fails with 96bf9ff7's `openView`. The typecheck and eslint are clean, markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+
+### The review of 42acec35 and cb4bc479: two Mediums fixed, one Low narrowed (2026-11-23)
+
+**Why.** The review of 42acec35 (decision 2a) and cb4bc479 (the expected notes) said ship with fixes: one Medium in each commit, and one Low. The coordinator put both Mediums in today's release, as one commit ahead of the F35 work, and the Low's docs with them.
+
+**Work summary.**
+
+1. **Medium (2a): a hand edit of `GITHUB_REPOSITORY` was replaced as a rebind.** `configure-fabric.ps1` sets the GitHub values only when `github.repository` isn't the example configuration's placeholder, so with the placeholder, an edit of that line alone read as Rebind and was replaced, and the Older path never compared the values. That broke 2a's promise that an edited notebook is kept. Now:
+   - `Get-DemoFabricNotebookDefinition` returns `BoundKeys`, the parameters it set.
+   - `Get-DemoFabricNotebookState`: another value in a key the run sets is still a rebind, which an update makes. Another value in a key it doesn't set is Edited, with `EditedKeys`, in both paths. An earlier version's values are compared with that version's own, which `fabric/notebooks/published-versions.json` now records (`parameters`, written by the same writer; the 26 versions and their days are unchanged), since the live-activity notebook dropped its GitHub values on 2026-11-14. A version without them counts as edited.
+   - `FABRIC.IMPORT.<notebook>` **Not selected** says "Kept notebook ... as it is: its `GITHUB_REPOSITORY` isn't the value the demo publishes there, and this run doesn't set it, so it counts as an edit", with the fix any edit has, and its evidence names the keys (`editedParameters`).
+2. **Medium (expected notes): the notes weren't limited to a new VM.** Every generation runs every step's Test again, so a token that reached an established host's logs after its setup, or a sysadmin recovery on a T1 that already had access, became a note and a **Pass**, labeled as a new VM's by-design event; before cb4bc479, they were warnings. Now:
+   - The runner records the generation on a step's record before its Set runs (`setGeneration`). `Test-DemoVmStepSetThisGeneration` says whether any named step's Set ran in this generation, and `Test-DemoVmStepFirstSetup` whether a step never completed before. Both read state.json and say false when they can't tell, so a doubt gives a warning.
+   - The sign-in cleanup gives a note only after a setup in this generation (`Get-DemoSignInStepResult -Expected`): on T2's host, Arc onboarding (before or after the wizard), the guest's build, or its setup wizard; on the evaluation-only Arc VM, Arc onboarding or SQL Server's setup. T1's sysadmin recovery and the restart setup asks for give a note only on their step's first setup. Otherwise each is a one-off warning, as before cb4bc479.
+   - The image check needs no condition: its note is about the download its own Set just made.
+   - `Get-DemoHealthWarningNote` doesn't call a warning expected when the summary has `noteCount`: a bundle that records notes gives these events as warnings only on an established VM, where they aren't expected. An older bundle's warnings keep F32's text.
+3. **Low (2a): an edit that reproduces a published version counts as that version and is updated,** a hand edit that undoes one of the live-activity notebook's one-cell changes for example. A later release whose notebook goes back to a listed version would also let an older checkout replace it. That contradicted ADR 0021's "No downgrade" and this report's "An edit to the code is always kept". For today, both state the limit, with the way to keep such an edit (change anything else in the code); the Fabric guide, troubleshooting, and the CHANGELOG say it too. The full fix, recording the version each environment last uploaded, is left for a decision.
+
+- **Docs:** [ADR 0021's amendment](adr/0021-fabric-resources-by-name.md#amendment-2026-11-23-an-update-brings-the-notebooks-that-nobody-edited-up-to-date-follow-ups-decision-2a) (the values, the outcome, and "No downgrade, with one limit"), [ADR 0012's amendment](adr/0012-validation-model.md#2026-11-23-a-new-vms-by-design-notes-are-information-so-a-ready-vm-is-a-pass) ("Only a new VM's"), the [Fabric guide](../fabric/README.md#import-or-update-the-notebooks), `vm/health/README.md`, three troubleshooting rows, both CHANGELOG entries, decision 2a's risk above, and this report.
+
+**Changed files.** `scripts/modules/DbHubDemo/Public/Get-DemoFabricNotebookDefinition.ps1`, `Private/FabricNotebookVersionHelpers.ps1`, `Public/Import-DemoFabricNotebook.ps1`, `fabric/notebooks/published-versions.json`, `Private/ValidationHelpers.ps1`; `vm/bootstrap/lib/Runner.ps1`, `vm/bootstrap/lib/State.ps1`, `vm/bootstrap/DbHubDemo.Vm.psm1` and `.psd1`, `vm/bootstrap/HostSteps.ps1`, `vm/bootstrap/Invoke-EvalArcVmBootstrap.ps1`, `vm/bootstrap/Invoke-SqlVmBootstrap.ps1`, `vm/hyperv-guest/GuestSql.ps1`; tests in `tests/unit/DbHubDemo.Fabric.Tests.ps1`, `Fabric.Notebooks.Tests.ps1`, `Vm.StateMachine.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, `Vm.SqlVmPlan.Tests.ps1`, and `DbHubDemo.Validation.Tests.ps1`; the docs above.
+
+**Validation.**
+
+- **New tests:**
+  - `DbHubDemo.Fabric.Tests.ps1`: a `GITHUB_REPOSITORY` changed by hand while the run doesn't set it is kept, in this version and in an earlier one, naming the key; the same value is bound again when the run sets it; and, with the list read as `deploy.ps1` reads it, a version from before 2026-11-14 with its own GitHub values is updated, and the same version with `GITHUB_REPOSITORY` changed is kept.
+  - `Fabric.Notebooks.Tests.ps1`: each listed version has its file's values, and the current one's are the file's.
+  - `Vm.StateMachine.Tests.ps1`: the runner records `setGeneration` for the steps whose Set ran, generation by generation.
+  - `Vm.HostPlan.Tests.ps1`: the host's sign-in cleanup is a note after Arc onboarding or the guest's build in this generation, and a one-off warning when the onboarding ran in an earlier one.
+  - `Vm.SqlVmPlan.Tests.ps1`: the sysadmin recovery is a note on T1's first setup and a one-off warning when the step completed before; the restart is a one-off warning on an established T1.
+  - `DbHubDemo.Validation.Tests.ps1`: a warning with the cleanup's text from a bundle that records notes isn't called expected.
+- **On cb4bc479's code with the new tests:** in the six test files, 10 fail and 321 pass. The 10 are each new or changed test: the four `GITHUB_REPOSITORY` tests, the list's values, the runner's `setGeneration`, the host's sign-in cleanup, T1's restart and its sysadmin recovery, and the warning that isn't called expected.
+- Pester with StrictMode, one run at a time: every `Vm.*.Tests.ps1` with DbHubDemo.Validation, 669 passed, 0 failed; DbHubDemo.Fabric, FabricItem, FabricTrack, FirstRun, HistorySnapshot, Lifecycle, OneCommand, Tracks, and JumpstartStatus with Fabric.Notebooks and Fabric.ControlNotebook, 1,036 passed, 0 failed, 69 skipped; and Repo.Conventions, FunctionNames, LifecycleScripts, NeutralWording, and TestAzGuard, 200 passed, 0 failed; 0 az calls.
+- PSScriptAnalyzer 1.25.0 with the repository's settings: 0 findings on the 18 changed PowerShell files. markdownlint: clean. The PowerShell files are ASCII, every changed file has LF line endings, and the VM files keep to Windows PowerShell 5.1's syntax (`Repo.Conventions`).
+
+**Risks.**
+
+- **Not run live:** a net-new deployment's first `validate.ps1` should show `INFRA.HEALTH.ARCHOST01` and `INFRA.HEALTH.SQLVM01` as **Pass**, naming the notes, and an update with no new setup none. That `deploy.ps1` keeps a notebook whose `GITHUB_REPOSITORY` someone changed needs the 2a live proof first, that Fabric's ipynb export gives the file's fingerprint.
+- **A state.json from before this commit** has no `setGeneration`, so the first bundle with this commit gives the cleanup's event as a warning, not a note, on a host whose onboarding ran before it: the safe side. A new host records it from its first Set.
+- **The Low stays open:** an edit that makes a notebook's code exactly a listed version's is still updated.
+
+### The re-check of ea1ea20f: the notes' bundle told apart by health.json, and the cleanup's gate narrowed (2026-11-23)
+
+**Why.** The re-check of ea1ea20f said ship with fixes: the bindings' Medium and the Low's docs are closed, and two findings remained in the expected notes' gate, both for tonight's release.
+
+**Work summary.**
+
+1. **Medium: `status.ps1 -Detail` still called an established VM's warnings expected.** `Get-DemoHealthWarningNote` told a bundle that gives the by-design notes as notes by the summary's `noteCount`, but that tells the view, not the bundle: `Get-DemoVmHealth` sends the repository's own `Get-DemoHealth.ps1`, whose summary had `noteCount` for an older health.json too, 0, and whose full view, which `status.ps1 -Detail` reads, never has it. So the full view said "That's expected" and "Nothing to do" for an established host's sign-in cleanup and a later T1 sysadmin recovery or restart, and the summary didn't say it for an older bundle's own expected warnings. The reviewer ran the real script over both formats in both views. Now:
+   - `Get-DemoHealth.ps1 -View Summary` prints `notes` and `noteCount` only when health.json has `notes`, which every bundle since cb4bc479 writes, even empty, and an older one never does. It runs from the repository on every read, so this holds for every VM at once.
+   - `Get-DemoHealthWarningNote` takes health.json's `notes`, in the full view, or the summary's `noteCount` as a bundle that records notes.
+2. **Low: the cleanup's gate counted `GuestVm`,** whose Test fails while the guest isn't running with automatic start, so its Set also starts a guest that was only off, on an established host, and a token cleared later in that pass became a note and a **Pass**. The reviewer ran the real runner through three generations. Now the host's gate is Arc onboarding (before or after the wizard), `GuestImage`, and `GuestVhdx`, whose Tests read only files and the Arc marker: their Sets run only on a new host or a rebuilt guest. Two more members had the same flaw, so they're out too: `SqlSetupWizard`, whose Set waits for a guest that's off, which matters on a host that kept a finished `PaygWizard` guest; and, on the evaluation-only Arc VM, `SqlUnattendedInstall` and `SqlSetupWizard`, whose Tests fail while SQL Server's service is stopped. That VM's gate is Arc onboarding alone, which leaves the sign-in data and runs on every new one before the cleanup.
+
+- **Docs:** [ADR 0012's amendment](adr/0012-validation-model.md#2026-11-23-a-new-vms-by-design-notes-are-information-so-a-ready-vm-is-a-pass) ("Only a new VM's"), `vm/health/README.md`, and this report.
+
+**Changed files.** `vm/health/Get-DemoHealth.ps1`, `scripts/modules/DbHubDemo/Private/ValidationHelpers.ps1`, `vm/bootstrap/HostSteps.ps1`, `vm/bootstrap/Invoke-EvalArcVmBootstrap.ps1`, `vm/hyperv-guest/GuestSql.ps1` (a comment); tests in `tests/unit/DbHubDemo.Validation.Tests.ps1`, `Vm.WorkloadSteps.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, and `Vm.EvalArcVm.Tests.ps1`; the docs above.
+
+**Validation.**
+
+- **New tests:** the real `Get-DemoHealth.ps1` over an older health.json and a newer one, in both views, through `Get-DemoHealthWarningNote`: the older bundle's T1 recovery is expected in both, and the newer one's in neither; the summary of an older health.json has no `notes` or `noteCount`, and a newer one's with no notes has `noteCount` 0; the host's cleanup is a warning when only `GuestVm` ran in the generation, and a note when `GuestImage` or `GuestVhdx` did; the evaluation VM's cleanup is a warning when only `SqlUnattendedInstall` ran in it, and a note after its Arc onboarding.
+- **On ea1ea20f's code with the new tests:** in the four test files, 4 fail and 232 pass: each new or changed test.
+- Pester with StrictMode, targeted: Vm.HostPlan, Vm.EvalArcVm, Vm.WorkloadSteps, and DbHubDemo.Validation, 236 passed, 0 failed, 0 az calls.
+- PSScriptAnalyzer 1.25.0 with the repository's settings: 0 findings on the 9 changed PowerShell files. markdownlint: clean. The PowerShell files are ASCII, every changed file has LF line endings, and the VM files keep to Windows PowerShell 5.1's syntax.
+
+**Risks.**
+
+- **Not run live,** as before: a net-new deployment's first `validate.ps1` and `status.ps1 -Detail` should show the notes in a **Pass**, and an established VM's later events as warnings that aren't called expected.
 
 ### The RCA release: the Incident RCA merged onto the release's follow-ups (2026-11-23)
 
