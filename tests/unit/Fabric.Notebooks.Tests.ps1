@@ -2007,14 +2007,16 @@ print(json.dumps(report, default=str))
         }
     }
 
-    It 'mirrors rca/history-tables.json: the eight tables, their columns and types in order, the required ones, the primary times, and the notebook''s columns' {
+    It 'mirrors rca/history-tables.json: the evidence document''s eight tables, their columns and types in order, the required ones, the primary times, and the notebook''s columns' {
         if ($rcaSkip) {
             Set-ItResult -Skipped -Because $rcaSkip
             return
         }
+        # The sidecar's tables come with the sidecar's decoder (rca/README.md, The sidecar); the evidence document's are the eight.
+        $evidenceTables = @($contract['tables'] | Where-Object { $_['document'] -eq 'evidence' })
         $tables = $rcaReport['contract']['tables']
-        @($tables.Keys) | Should -Be @($contract['tables'] | ForEach-Object { $_['name'] })
-        foreach ($table in $contract['tables']) {
+        @($tables.Keys) | Should -Be @($evidenceTables | ForEach-Object { $_['name'] })
+        foreach ($table in $evidenceTables) {
             $name = $table['name']
             $mine = $tables[$name]
             $mine['role'] | Should -Be ($(if ($table['role'] -eq 'answerKey') { 'answerKey' } else { 'detection' })) -Because $name
@@ -2025,7 +2027,7 @@ print(json.dumps(report, default=str))
             @($rcaReport['contract']['tableColumns'][$name] | ForEach-Object { $_ -join ':' }) | Should -Be @($notebookColumns[0..1] + @($table['columns'] | ForEach-Object { '{0}:{1}' -f $_['name'], $_['type'] }) + $notebookColumns[2]) -Because $name
             @($rcaReport['contract']['dateSources'][$name]) | Should -Be @($table['primaryTime']) -Because $name
         }
-        @($contract['purge']) | Should -Be @($tables.Keys)
+        @($contract['purge'] | Where-Object { $_ -in @($tables.Keys) }) | Should -Be @($tables.Keys)
     }
 
     It 'decodes the fixtures'' parts into the fixture documents, and writes their rows once to the right tables, the answer key only to rca_answer_key' {
@@ -2357,12 +2359,12 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
         }
     }
 
-    It 'drops incident_windows and the Incident RCA''s eight tables in the deployment notebook''s cleanup and says the semantic model needs the tables back' {
+    It 'drops incident_windows and every Incident RCA table in the deployment notebook''s cleanup, with the staged evidence and the acknowledgements, and says the semantic model needs the tables back' {
         $cleanup = @($deployment.Code | Where-Object { $_.Source -match '^# RESOURCE-CHANGING CELL: drops' })[0].Source
         $tables = @([regex]::Matches([regex]::Match($cleanup, '(?s)DEMO_TABLES = \((.*?)\)\n').Groups[1].Value, '"(\w+)"') | ForEach-Object { $_.Groups[1].Value })
         $purge = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).purge
         $tables | Should -Be (@('validation_results', 'scenario_runs', 'telemetry_snapshots', 'analysis_findings', 'incident_windows') + @($purge))
-        $cleanup | Should -Match ('DEMO_FOLDERS = \("{0}",\)' -f [regex]::Escape(@((Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).purgeFiles)[0]))
+        $cleanup | Should -Match ('DEMO_FOLDERS = \({0}\)' -f [regex]::Escape((@((Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).purgeFiles) | ForEach-Object { '"{0}"' -f $_ }) -join ', '))
         $cleanup | Should -Match 'SM_DatabaseHub_History'
         $cleanup | Should -Match 'NB_DatabaseHub_LiveActivity runs with SAVE_RESULTS = True and recreates the tables'
     }

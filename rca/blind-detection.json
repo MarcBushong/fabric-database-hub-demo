@@ -2,7 +2,7 @@
   "$comment": "Blind detection (ADR 0031): what the Incident RCA's detection may read, and what it must never reference. The product (the rules, the investigation tools, the RCA view, and the chat) is blind, like a real DBA's tools; the answer key exists only for the tests and the evaluation set, and for the scoreboard. Each component's tests read this file: the app's (fabric/app), the runner's observer (workload-generator), and the contract's (tests/unit/Rca.Contract.Tests.ps1).",
   "version": 1,
   "detectionMayRead": {
-    "modelTables": ["RCA Sessions", "RCA Waits", "RCA Events", "RCA Queries", "RCA Resource", "RCA Replica", "RCA Coverage", "Telemetry Snapshots", "Target", "Date", "Analysis"],
+    "modelTables": ["RCA Sessions", "RCA Waits", "RCA Events", "RCA Queries", "RCA Query Stats", "RCA Query Waits", "RCA Query Plans", "RCA Query Events", "RCA Query Coverage", "RCA Resource", "RCA Replica", "RCA Connections", "RCA Coverage", "Telemetry Snapshots", "Target", "Date", "Analysis"],
     "telemetryAnalyses": ["estate_pulse", "cpu", "gauges", "sessions", "counter_deltas", "wait_deltas", "wait_profile", "storage_io", "memory_clerks", "database_growth", "telemetry_coverage", "consumption", "postgresql", "cosmosdb"],
     "liveSources": ["the target's DMVs and catalog views (rca/capture)", "PostgreSQL's statistics views and functions (rca/capture)", "Extended Events the observer's own session records (RCA-XE)", "Azure Monitor platform metrics", "Database Hub's telemetry (ArcSqlTelemetry)"]
   },

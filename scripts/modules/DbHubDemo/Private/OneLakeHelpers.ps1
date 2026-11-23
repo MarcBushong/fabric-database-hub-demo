@@ -292,17 +292,26 @@ function Remove-DemoOneLakeFile {
 function Get-DemoRcaHistoryTable {
     <#
     .SYNOPSIS
-    The Incident RCA's eight history tables (rca/history-tables.json, version 1): Name (the lakehouse's) and Model (the
-    history model's), in the contract's order. Pure (reads the repository's file). Internal.
+    The Incident RCA's history tables of one document (rca/history-tables.json): Name (the lakehouse's) and Model (the
+    history model's), in the contract's order. The evidence document's eight by default; -Document sidecar for the
+    sidecar's, which the history model gets with the sidecar's notebook (rca/README.md, The sidecar). Pure (reads the
+    repository's file). Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [string] $Path = (Join-Path -Path $script:RepoRoot -ChildPath 'rca/history-tables.json')
+        [string] $Path = (Join-Path -Path $script:RepoRoot -ChildPath 'rca/history-tables.json'),
+
+        [ValidateSet('evidence', 'sidecar')]
+        [string] $Document = 'evidence'
     )
 
     $contract = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 16
     foreach ($table in @($contract.tables)) {
-        [pscustomobject]@{ Name = [string]$table.name; Model = [string]$table.model; Role = [string]$table.role }
+        # A contract from before the sidecar names no document: every table is the evidence document's.
+        $carrier = if ($table.PSObject.Properties['document']) { [string]$table.document } else { 'evidence' }
+        if ($carrier -eq $Document) {
+            [pscustomobject]@{ Name = [string]$table.name; Model = [string]$table.model; Role = [string]$table.role }
+        }
     }
 }
