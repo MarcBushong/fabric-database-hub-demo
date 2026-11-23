@@ -381,9 +381,10 @@ For the owner's decision: neither is in Phase 2's scope above until it's decided
 A first design put Query Store's tables into a version 2 of the evidence document. An independent review answered RETHINK, and the coordinator decided (decisions 1 to 7 of 2026-11-23):
 
 1. **The capture never reads the answer key.** It leaves out exactly three things, by fixed rules in the demo's own code, and nothing by schema:
-   - **its own statements:**
+   - **its own statements, and the runner's other RCA reads:**
      - on SQL Server, a marker in each catalog statement's text;
      - on T4, its connections' `search_path`, which Query Store records per row, and, for its own role only, its own specific statements: the catalog's blocks, today's and edd01c86's, and its snapshot clear. Query Store keeps the first text it saw per query, and the first update's look-back reaches the windows where the earlier runner's statements ran without a marker;
+     - the answer-key recorder's reads of the harness's run events carry the same markers (added after the review of the runner's harness statements): on SQL Server the marker in the text, on T4 the observer's startup. Its reads from before then are left out on T4 by the harness-table rule below, and on T1 to T3 by the SHA-256 of their normalized text, so no detection code names their table;
    - **the harness's bookkeeping and control modules:** marked where `110-demo-control.sql` defines them, with an extended property on SQL Server and a comment on PostgreSQL. On T4, which records statements nested in functions without their function, it also leaves out a statement that touches only tables that nothing but the harness writes;
    - **the runner's own statements outside any module,** on T1 to T3: the ad hoc statements of its harness code, such as the stop check it polls during every run, which no module's mark reaches. They're matched by their normalized text against a list in the runner's code, kept complete by a test (added after review-h).
 
@@ -395,7 +396,7 @@ A first design put Query Store's tables into a version 2 of the evidence documen
    - **What's kept:** the runner keeps a sidecar until it's acknowledged, or for 30 days, and a payload with a skipped document is never deleted.
    - **The evidence document** keeps its live-proven transport; acknowledging it is a later change.
 4. **T4's last window:** PostgreSQL shows an interval only once it ends.
-   - **The backfill:** a persisted watermark brings the session's last 0 to 15 minutes into the original session's history at the next run with T4 up. Until then, the analysis says "pending publication", never "not captured". A sidecar's rows always go under their own session's run.
+   - **The backfill:** a persisted watermark brings the session's last 0 to 15 minutes into the original session's history at the observer's next start with T4 up, the next session's. Until then, the analysis says "pending publication", never "not captured". A sidecar's rows always go under their own session's run.
    - **A stop in the window:** Learn doesn't say whether stopping a server keeps the window it still holds in memory, and the demo's stops stop T4 mid-window. A live check (L0) measures it. A window lost that way is worded so, from T4's restart time.
 5. **Precision:** execution-weighted interval totals; a 2-hour first read and a 60-minute baseline; claims qualified at Query Store's 15-minute granularity; the latest read of an interval counts once, in the notebook and in the model's measures. On T4: `all`, the source keys kept, and the identity's `azure_sys` access and UTC proven live.
 6. **Ownership:** parallel builders by file. The runner's and the VM control script's wiring waits for the stop tail's changes; the app and its report wait for the Root cause page's facets.
