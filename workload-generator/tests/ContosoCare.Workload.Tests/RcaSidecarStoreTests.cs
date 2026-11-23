@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Security.Principal;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Rca;
@@ -241,11 +242,90 @@ public sealed class RcaSidecarStoreTests : IDisposable
     }
 
     [Fact]
+    public void AnUnreadableLedgersRebuildIsSavedAtOnceSoAnAcknowledgementOfNothingKeepsIt()
+    {
+        // Review, Medium 2: an rca ack of IDs the store doesn't hold writes nothing itself; the ledger rebuilt for it must
+        // already be on disk, or the next read finds none and every pending sidecar is orphaned.
+        var rig = new SidecarRig(root, T0);
+        var sealedSidecar = rig.Seal(rig.Observe(T0, T0.AddMinutes(30), SidecarRig.Session, "T1"));
+        File.WriteAllText(Path.Combine(root, "sidecars", "ledger.json"), "{ not a ledger", new UTF8Encoding(false));
+
+        var acknowledgement = rig.Store.Acknowledge(["20261120T165000Z-sqlvm01-0099-sidecar"]);
+
+        Assert.Equal(["20261120T165000Z-sqlvm01-0099-sidecar"], acknowledgement.Unknown);
+        var saved = ReadLedger();
+        Assert.Equal(sealedSidecar.DocumentId, Assert.Single(saved.Sidecars).DocumentId);
+        Assert.Equal(sealedSidecar.Sequence + 1, saved.NextSequence);
+        Assert.Equal(sealedSidecar.DocumentId, Assert.Single(rig.Store.Offerable()).DocumentId);
+    }
+
+    [Fact]
+    public void AMissingLedgerIsRebuiltFromTheSealedSidecarsWithTheirBudget()
+    {
+        // Review, Medium 2: a ledger that's gone while sealed sidecars remain is rebuilt from them, not started empty.
+        var rig = new SidecarRig(root, T0);
+        var sealedSidecar = rig.Seal(rig.Observe(T0, T0.AddMinutes(30), SidecarRig.Session, "T1"));
+        File.Delete(Path.Combine(root, "sidecars", "ledger.json"));
+
+        var offered = Assert.Single(rig.Store.Offerable());
+
+        Assert.Equal((sealedSidecar.DocumentId, sealedSidecar.Sha256, (string?)SidecarRig.Session), (offered.DocumentId, offered.Sha256, offered.SessionId));
+        Assert.Equal((long)rig.Store.ReadGzip(offered.DocumentId)!.Length, ReadLedger().Budgets[SidecarRig.Session].Bytes);
+    }
+
+    [Fact]
+    public void TheFirstSealingWritesTheLedgerBeforeItsFirstSidecar()
+    {
+        // A missing ledger is rebuilt from the documents, so a sealing cut short after its document and before its ledger
+        // must leave a ledger beside it: a rebuild would otherwise offer that document beside the same rows sealed again.
+        var rig = new SidecarRig(root, T0);
+        var span = rig.Open(T0, "T1");
+        File.WriteAllBytes(SidecarSealer.FileFor(span.Directory, "T1"), StoredLines.Row(SidecarRig.Coverage("T1", T0, T0.AddMinutes(15))));
+        span.Close(T0.AddMinutes(15));
+        var ledgerPath = Path.Combine(root, "sidecars", "ledger.json");
+        Assert.False(File.Exists(ledgerPath));
+        var existed = false;
+        rig.Sealer.Rotated = _ => existed = File.Exists(ledgerPath);
+
+        rig.Seal(rig.Span(span.Id));
+
+        Assert.True(existed);
+    }
+
+    [Fact]
+    public void AnOrphanSidecarIsNeverOfferedGoes30DaysAfterItsWritingAndNothingElseIsSwept()
+    {
+        // Review, Medium 3 and Low 5: a document with no entry (a sealing cut short before its ledger was written) is never
+        // offered, and the sweep deletes it 30 days after it was written; a file not named as a sidecar is never deleted.
+        var rig = new SidecarRig(root, T0);
+        rig.Store.EnsureFolder();
+        rig.Store.WriteLedger(new SidecarLedger());
+        var orphan = Path.Combine(root, "sidecars", "20261120T165000Z-sqlvm01-0042-sidecar.json.gz");
+        var evidenceNamed = Path.Combine(root, "sidecars", "20261120T165000Z-sqlvm01-0042.json.gz");
+        var other = Path.Combine(root, "sidecars", "notes.json.gz");
+        foreach (var file in new[] { orphan, evidenceNamed, other })
+        {
+            File.WriteAllBytes(file, PartCodec.Gzip("{}"u8.ToArray()));
+            File.SetLastWriteTimeUtc(file, T0.UtcDateTime);
+        }
+
+        rig.Clock.Set(T0.AddDays(29.9));
+        Assert.Empty(rig.Store.Offerable());
+        Assert.True(File.Exists(orphan));
+
+        rig.Store.Cleanup(T0.AddDays(30.1));
+
+        Assert.False(File.Exists(orphan));
+        Assert.True(File.Exists(evidenceNamed));
+        Assert.True(File.Exists(other));
+    }
+
+    [Fact]
     public void TheSidecarsFolderOfTheDefaultStoreIsOnlyForSystemAndAdministrators()
     {
         Assert.SkipUnless(OperatingSystem.IsWindows() && IsElevated(), "The folder's ACLs are Windows', and a store only SYSTEM and Administrators may open needs an elevated test.");
 #pragma warning disable CA1416 // Windows only: skipped above elsewhere.
-        var store = new SidecarStore(new EvidenceStore(Path.Combine(root, "secure"), TimeProvider.System, secure: true));
+        var store = new SidecarStore(new EvidenceStore(Path.Combine(root, "secure"), TimeProvider.System, secure: true), SidecarRig.Budget);
 
         store.EnsureFolder();
 
@@ -277,19 +357,19 @@ public sealed class RcaSidecarStoreTests : IDisposable
 }
 
 /// <summary>
-/// The sidecar's tests' rig: an evidence store on a manual clock, the sidecar store, the sealer with a reducer that keeps
-/// every draft it gets, and the store-backed sink.
+/// The sidecar's tests' rig: an evidence store on a manual clock, the sidecar store with a session budget (the default
+/// rule unless a test sets its own), the sealer with a reducer that keeps every draft it gets, and the store-backed sink.
 /// </summary>
 internal sealed class SidecarRig
 {
     public const string Session = "5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21";
 
-    public SidecarRig(string root, DateTimeOffset start, string host = "sqlvm01", long targetCap = EvidenceStore.DefaultTargetCap)
+    public SidecarRig(string root, DateTimeOffset start, string host = "sqlvm01", long targetCap = EvidenceStore.DefaultTargetCap, Func<IReadOnlyCollection<string>, int>? budget = null, RunnerLog? log = null)
     {
         Clock = new ManualTime(start);
         Evidence = new EvidenceStore(root, Clock, targetCap, host: host);
-        Store = new SidecarStore(Evidence);
-        Sealer = new SidecarSealer(Store, Reducer, Budget, "1.0.0");
+        Store = new SidecarStore(Evidence, budget ?? Budget, log);
+        Sealer = new SidecarSealer(Store, Reducer, "1.0.0", log);
         Sink = new StoreSidecarSink(Sealer);
     }
 
@@ -393,8 +473,10 @@ internal sealed class SidecarRig
 }
 
 /// <summary>
-/// A stand-in for T1c's reducer: it keeps each draft and its budget, and encodes the draft's header as the contract has
-/// it, then each table's rows as the store's lines, which is enough for the store's and the sealer's tests.
+/// A stand-in for T1c's reducer: it keeps each draft and its budget, cuts nothing, and encodes the draft as the contract
+/// encodes a sidecar (rca/README.md, The evidence document's encoding): one string dictionary, times as milliseconds
+/// after the window's start, all-null columns left out, and a coverage row for each target that has none, as T1c's
+/// reducer adds it. The store's and the sealer's tests then work on a sidecar's real structure.
 /// </summary>
 internal sealed class CapturingReducer : ISidecarReducer
 {
@@ -402,8 +484,37 @@ internal sealed class CapturingReducer : ISidecarReducer
 
     public static byte[] Encode(SidecarDraft draft)
     {
+        var epoch = SidecarStore.Second(draft.WindowStartUtc);
+        var strings = new List<string>();
+        var tables = new List<(string Name, List<(string Column, List<object?> Values)> Columns, int Rows)>();
+        foreach (var table in RcaContract.SidecarTables)
+        {
+            var rows = draft.Tables.TryGetValue(table.Name, out var kept) ? kept : [];
+            if (table.Name == RcaContract.QueryCoverage)
+            {
+                rows = [.. rows, .. draft.Targets.Where(t => !rows.Exists(r => r.Target == t)).Select(t => NoRead(draft, t))];
+            }
+
+            if (rows.Count == 0)
+            {
+                continue;
+            }
+
+            var columns = new List<(string, List<object?>)>();
+            foreach (var column in table.Columns)
+            {
+                var values = rows.Select(r => Value(column, r.Get(column.Name), strings, epoch)).ToList();
+                if (values.Exists(v => v is not null) || column.Required)
+                {
+                    columns.Add((column.Name, values));
+                }
+            }
+
+            tables.Add((table.Name, columns, rows.Count));
+        }
+
         using var buffer = new MemoryStream();
-        using (var json = new Utf8JsonWriter(buffer))
+        using (var json = new Utf8JsonWriter(buffer, new JsonWriterOptions { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping }))
         {
             json.WriteStartObject();
             json.WriteString("kind", RcaContract.SidecarKind);
@@ -436,16 +547,47 @@ internal sealed class CapturingReducer : ISidecarReducer
             }
 
             json.WriteEndArray();
-            json.WriteStartObject("rows");
-            foreach (var (table, rows) in draft.Tables.OrderBy(t => t.Key, StringComparer.Ordinal))
+            json.WriteString("epochUtc", Utc(epoch));
+            json.WriteStartArray("strings");
+            foreach (var text in strings)
             {
-                json.WriteStartArray(table);
-                foreach (var row in rows)
+                json.WriteStringValue(text);
+            }
+
+            json.WriteEndArray();
+            json.WriteStartObject("tables");
+            foreach (var (name, columns, count) in tables)
+            {
+                json.WriteStartObject(name);
+                json.WriteNumber("rows", count);
+                json.WriteStartObject("columns");
+                foreach (var (column, values) in columns)
                 {
-                    json.WriteStringValue(Encoding.UTF8.GetString(StoredLines.Row(row)).TrimEnd('\n'));
+                    json.WriteStartArray(column);
+                    foreach (var value in values)
+                    {
+                        switch (value)
+                        {
+                            case null:
+                                json.WriteNullValue();
+                                break;
+                            case long number:
+                                json.WriteNumberValue(number);
+                                break;
+                            case double number:
+                                json.WriteNumberValue(number);
+                                break;
+                            case bool flag:
+                                json.WriteBooleanValue(flag);
+                                break;
+                        }
+                    }
+
+                    json.WriteEndArray();
                 }
 
-                json.WriteEndArray();
+                json.WriteEndObject();
+                json.WriteEndObject();
             }
 
             json.WriteEndObject();
@@ -461,6 +603,61 @@ internal sealed class CapturingReducer : ISidecarReducer
         var json = Encode(draft);
         var gzip = PartCodec.Gzip(json);
         return new ReducedSidecar(json, gzip, PartCodec.Sha256(gzip), PartCodec.PartCount(gzip.Length), []);
+    }
+
+    /// <summary>Each coverage row's gaps in a sealed sidecar, by target, in the document's order.</summary>
+    public static List<(string Target, string? Gaps)> CoverageGaps(byte[] gzip)
+    {
+        var root = System.Text.Json.Nodes.JsonNode.Parse(PartCodec.Gunzip(gzip))!;
+        var strings = root["strings"]!.AsArray().Select(s => s!.GetValue<string>()).ToList();
+        var columns = root["tables"]![RcaContract.QueryCoverage]!["columns"]!;
+        var targets = columns["target"]!.AsArray().Select(t => strings[t!.GetValue<int>()]).ToList();
+        var gaps = columns["gaps"]?.AsArray().Select(g => g is null ? null : strings[g.GetValue<int>()]).ToList() ?? [.. targets.Select(_ => (string?)null)];
+        return [.. targets.Zip(gaps)];
+    }
+
+    /// <summary>A table's row count in a sealed sidecar, 0 when it has none.</summary>
+    public static int Rows(byte[] gzip, string table) =>
+        System.Text.Json.Nodes.JsonNode.Parse(PartCodec.Gunzip(gzip))!["tables"]![table]?["rows"]?.GetValue<int>() ?? 0;
+
+    private static CaptureRow NoRead(SidecarDraft draft, string target) =>
+        new CaptureRow(RcaContract.QueryCoverage, target, draft.WindowStartUtc, "coverage")
+            .Set("target", target)
+            .Set("window_start_utc", draft.WindowStartUtc)
+            .Set("window_end_utc", draft.WindowEndUtc)
+            .Set("backfill", false)
+            .Set("gaps", "No Query Store read of this target is recorded in this window.");
+
+    private static object? Value(RcaColumn column, object? value, List<string> strings, DateTimeOffset epoch)
+    {
+        if (value is null)
+        {
+            return column.Required ? throw new InvalidOperationException($"{column.Name} is required.") : null;
+        }
+
+        switch (column.Type)
+        {
+            case "string":
+                var text = value as string ?? Convert.ToString(value, CultureInfo.InvariantCulture)!;
+                var index = strings.IndexOf(text);
+                if (index < 0)
+                {
+                    strings.Add(text);
+                    index = strings.Count - 1;
+                }
+
+                return (long)index;
+            case "timestamp":
+                return (long)Math.Round(((DateTimeOffset)value - epoch).TotalMilliseconds, MidpointRounding.AwayFromZero);
+            case "long" or "integer":
+                return Convert.ToInt64(value, CultureInfo.InvariantCulture);
+            case "double":
+                return Convert.ToDouble(value, CultureInfo.InvariantCulture);
+            case "boolean":
+                return (bool)value;
+            default:
+                throw new InvalidOperationException($"{column.Name}'s type {column.Type} isn't in documents.");
+        }
     }
 
     private static string Utc(DateTimeOffset time) => time.UtcDateTime.ToString("yyyy-MM-dd'T'HH:mm:ss.fff'Z'", CultureInfo.InvariantCulture);

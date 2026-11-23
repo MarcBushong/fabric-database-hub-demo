@@ -2,7 +2,9 @@ using System.Globalization;
 using System.Security.AccessControl;
 using System.Security.Principal;
 using System.Text;
+using System.Text.Encodings.Web;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Rca.Export;
@@ -41,17 +43,27 @@ internal sealed partial class SidecarStore : ISidecarCatalog
 
     private static readonly TimeSpan LockWait = TimeSpan.FromSeconds(30);
 
+    private static readonly JsonSerializerOptions NoteJson = new() { Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping };
+
     private readonly RunnerLog log;
 
-    public SidecarStore(EvidenceStore evidence, RunnerLog? log = null)
+    /// <param name="evidence">The evidence store, whose root holds <c>sidecars\</c>.</param>
+    /// <param name="sessionBudget">A session's budget on this host, from its span's targets (64 KiB for several, 32 KiB for one, as <c>Exporter.cs</c> counts them).</param>
+    /// <param name="log">The runner's log.</param>
+    public SidecarStore(EvidenceStore evidence, Func<IReadOnlyCollection<string>, int> sessionBudget, RunnerLog? log = null)
     {
         ArgumentNullException.ThrowIfNull(evidence);
+        ArgumentNullException.ThrowIfNull(sessionBudget);
         Evidence = evidence;
+        SessionBudget = sessionBudget;
         Directory = Path.Combine(evidence.Root, FolderName);
         this.log = log ?? RunnerLog.Null;
     }
 
     public EvidenceStore Evidence { get; }
+
+    /// <summary>A session's budget on this host, from its span's targets: what the sealer fits a sidecar to, and what a bind checks.</summary>
+    public Func<IReadOnlyCollection<string>, int> SessionBudget { get; }
 
     public string Directory { get; }
 
@@ -168,26 +180,34 @@ internal sealed partial class SidecarStore : ISidecarCatalog
     }
 
     /// <summary>
-    /// The ledger, or a new one when there's none. One that can't be read is kept beside it, never deleted, and the
-    /// ledger is rebuilt from the sealed documents, each offered again as not acknowledged: the history answers
-    /// <c>already</c> for one it has. Call under the lock.
+    /// The ledger, read under the lock. One that can't be read is kept beside it, never deleted, and rebuilt from the
+    /// sealed documents, each offered again as not acknowledged (the history answers <c>already</c> for one it has); so
+    /// is a ledger that's missing while sealed documents remain. A rebuilt ledger, or a new one, is written at once:
+    /// whatever the caller does next, the next read finds it, and a sealing cut short leaves a ledger beside its
+    /// document, never a document alone that a rebuild would offer beside the same rows sealed again.
     /// </summary>
     public SidecarLedger ReadLedger()
     {
-        if (!File.Exists(LedgerPath))
+        if (File.Exists(LedgerPath))
         {
-            return new SidecarLedger();
+            if (EvidenceStore.ReadJson(LedgerPath, SidecarJsonContext.Default.SidecarLedger) is { Version: 1 } ledger)
+            {
+                return ledger;
+            }
+
+            var kept = LedgerPath + ".unreadable-" + Time.GetUtcNow().UtcDateTime.ToString("yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture);
+            File.Move(LedgerPath, kept, overwrite: false);
+            log.Warn("rca.sidecar-ledger-unreadable", "The sidecar ledger couldn't be read; it's kept beside a new one rebuilt from the sealed sidecars, which are offered again.", ("kept", Path.GetFileName(kept)));
+            return Saved(Rebuild());
         }
 
-        if (EvidenceStore.ReadJson(LedgerPath, SidecarJsonContext.Default.SidecarLedger) is { Version: 1 } ledger)
+        if (HasDocuments())
         {
-            return ledger;
+            log.Warn("rca.sidecar-ledger-missing", "The sidecar ledger was missing; it's rebuilt from the sealed sidecars, which are offered again.");
+            return Saved(Rebuild());
         }
 
-        var kept = LedgerPath + ".unreadable-" + Time.GetUtcNow().UtcDateTime.ToString("yyyyMMdd'T'HHmmssfff'Z'", CultureInfo.InvariantCulture);
-        File.Move(LedgerPath, kept, overwrite: false);
-        log.Warn("rca.sidecar-ledger-unreadable", "The sidecar ledger couldn't be read; it's kept beside a new one rebuilt from the sealed sidecars, which are offered again.", ("kept", Path.GetFileName(kept)));
-        return Rebuild();
+        return Saved(new SidecarLedger());
     }
 
     /// <summary>Writes the ledger whole, through a temporary file, as the evidence store writes its own. Call under the lock.</summary>
@@ -352,11 +372,12 @@ internal sealed partial class SidecarStore : ISidecarCatalog
 
         if (System.IO.Directory.Exists(Directory))
         {
-            // A document without an entry (a sealing cut short before its ledger was written) goes after the same 30 days.
+            // A document without an entry (a sealing cut short before its ledger was written) goes after the same 30 days;
+            // only a file named as a sidecar is ever deleted.
             foreach (var file in System.IO.Directory.GetFiles(Directory, "*" + DocumentSuffix))
             {
                 var documentId = Path.GetFileName(file)[..^DocumentSuffix.Length];
-                if (!ledger.Sidecars.Exists(s => string.Equals(s.DocumentId, documentId, StringComparison.Ordinal)) && now - new DateTimeOffset(File.GetLastWriteTimeUtc(file), TimeSpan.Zero) >= Retention)
+                if (IsSidecarId(documentId) && !ledger.Sidecars.Exists(s => string.Equals(s.DocumentId, documentId, StringComparison.Ordinal)) && now - new DateTimeOffset(File.GetLastWriteTimeUtc(file), TimeSpan.Zero) >= Retention)
                 {
                     DeleteFile(file);
                 }
@@ -384,34 +405,17 @@ internal sealed partial class SidecarStore : ISidecarCatalog
     }
 
     /// <summary>
-    /// Gives the sidecars sealed before their span was bound the span's session (call under the lock): their documents
-    /// are written again with it, and their bytes move to that session's budget. <see cref="Offerable"/> settles every
-    /// such sidecar before it lists any, so an offered sidecar's bytes never change.
+    /// Gives the sidecars sealed before their span was bound the span's session (call under the lock): each document is
+    /// written again with it, and its bytes move to that session's budget. <see cref="Offerable"/> settles every such
+    /// sidecar before it lists any, so an offered sidecar's bytes never change.
     /// </summary>
     internal void Bind(SidecarLedger ledger, string spanId, string? sessionId)
     {
-        foreach (var entry in ledger.Sidecars.Where(s => !s.Bound && string.Equals(s.SpanId, spanId, StringComparison.Ordinal)))
+        foreach (var entry in ledger.Sidecars.Where(s => !s.Bound && string.Equals(s.SpanId, spanId, StringComparison.Ordinal)).ToList())
         {
             if (sessionId is not null)
             {
-                var gzip = ReadDocument(entry.DocumentId);
-                var json = gzip is null ? null : BindJson(PartCodec.Gunzip(gzip), sessionId);
-                if (json is null)
-                {
-                    log.Warn("rca.sidecar-bind-failed", "A sidecar sealed before its span was bound couldn't take the span's session; it stays sessionless.", ("document", entry.DocumentId), ("span", spanId));
-                }
-                else
-                {
-                    var bound = PartCodec.Gzip(json);
-                    WriteDocument(entry.DocumentId, bound);
-                    Use(ledger, entry.Budget, -entry.Bytes, null);
-                    entry.Budget = BudgetKey(sessionId, spanId);
-                    Use(ledger, entry.Budget, bound.Length, entry.SealedUtc);
-                    entry.SessionId = sessionId;
-                    entry.Bytes = bound.Length;
-                    entry.Parts = PartCodec.PartCount(bound.Length);
-                    entry.Sha256 = PartCodec.Sha256(bound);
-                }
+                BindDocument(ledger, entry, sessionId);
             }
 
             entry.Bound = true;
@@ -422,6 +426,187 @@ internal sealed partial class SidecarStore : ISidecarCatalog
             span.Bound = true;
             span.SessionId = sessionId;
         }
+    }
+
+    /// <summary>
+    /// One sidecar's bind (call under the lock), the file first and its ledger entry after it.
+    /// <list type="bullet">
+    /// <item>A document with no session yet is written again with it.</item>
+    /// <item>A document that has a session already is one a bind wrote and the ledger never recorded (a crash, or a failure
+    /// before the ledger was written): the file is what counts, so the entry takes its hash, size, and parts.</item>
+    /// <item>When the bind takes the session over this host's budget, the sidecar isn't cut again: each of its coverage
+    /// rows gets a gap line that says by how much, and the log a warning. The transport pages what doesn't fit.</item>
+    /// </list>
+    /// </summary>
+    private void BindDocument(SidecarLedger ledger, SidecarEntry entry, string sessionId)
+    {
+        var gzip = ReadDocument(entry.DocumentId);
+        var json = gzip is null ? null : PartCodec.Gunzip(gzip);
+        var (found, current) = json is null ? (false, null) : TopLevelSession(json);
+        if (gzip is null || json is null || !found)
+        {
+            log.Warn("rca.sidecar-bind-failed", "A sidecar sealed before its span was bound couldn't take the span's session; it stays as it is.", ("document", entry.DocumentId), ("span", entry.SpanId));
+            return;
+        }
+
+        var session = current ?? sessionId;
+        var key = BudgetKey(session, entry.SpanId);
+        var others = (ledger.Budgets.TryGetValue(key, out var use) ? use.Bytes : 0L) - (string.Equals(entry.Budget, key, StringComparison.Ordinal) ? entry.Bytes : 0L);
+        var budget = SessionBudget(ledger.Spans.TryGetValue(entry.SpanId, out var span) ? span.Targets : []);
+        byte[] bound;
+        if (current is null)
+        {
+            var withSession = BindJson(json, sessionId)!;
+            bound = PartCodec.Gzip(withSession);
+            if (others + bound.Length > budget)
+            {
+                bound = WithOverBudgetNote(withSession, others, budget);
+            }
+
+            WriteDocument(entry.DocumentId, bound);
+        }
+        else
+        {
+            bound = gzip;
+            if (!string.Equals(current, sessionId, StringComparison.Ordinal))
+            {
+                log.Warn("rca.sidecar-bind-session", "A sidecar sealed before its span was bound already names another session; it keeps that one.", ("document", entry.DocumentId), ("span", entry.SpanId));
+            }
+            else
+            {
+                log.Info("rca.sidecar-bind-recovered", "A sidecar's bind that the ledger never recorded is taken from its file.", ("document", entry.DocumentId), ("span", entry.SpanId));
+            }
+        }
+
+        var excess = others + bound.Length - budget;
+        if (excess > 0)
+        {
+            log.Warn("rca.sidecar-over-budget", "A session's sidecars exceed this host's budget: a span was sealed before the session's first export, so its sidecar wasn't cut to the session's budget. The transport pages what doesn't fit.", ("document", entry.DocumentId), ("session", session), ("bytes", excess));
+        }
+
+        Use(ledger, entry.Budget, -entry.Bytes, null);
+        entry.Budget = key;
+        Use(ledger, key, bound.Length, entry.SealedUtc);
+        entry.SessionId = session;
+        entry.Bytes = bound.Length;
+        entry.Parts = PartCodec.PartCount(bound.Length);
+        entry.Sha256 = PartCodec.Sha256(bound);
+    }
+
+    /// <summary>The gap line a bind adds to a sidecar that takes its session over this host's budget.</summary>
+    internal static string OverBudgetLine(long excess) =>
+        string.Create(CultureInfo.InvariantCulture, $"the session's sidecars exceed this host's budget by {excess} bytes: a span was sealed before the session's first export.");
+
+    /// <summary>
+    /// A sidecar's JSON with one more line in each of its coverage rows' gaps, the string dictionary taking the new texts
+    /// (each distinct text once); null when it has no coverage table, or no room for another string.
+    /// </summary>
+    internal static byte[]? WithGapLine(byte[] json, string line)
+    {
+        ArgumentNullException.ThrowIfNull(json);
+        if (JsonNode.Parse(json) is not JsonObject root
+            || root["strings"] is not JsonArray strings
+            || root["tables"]?[RcaContract.QueryCoverage] is not JsonObject coverage
+            || coverage["columns"] is not JsonObject columns
+            || coverage["rows"] is not JsonValue count
+            || !count.TryGetValue<int>(out var rows)
+            || RcaContract.Table(RcaContract.QueryCoverage).Columns[^1].Name != "gaps")
+        {
+            return null;
+        }
+
+        if (columns["gaps"] is not JsonArray gaps)
+        {
+            // The encoder leaves out a column whose values are all null; gaps is the table's last, so it goes last.
+            gaps = new JsonArray(Enumerable.Repeat<JsonNode?>(null, rows).ToArray());
+            columns["gaps"] = gaps;
+        }
+
+        var texts = strings.Select(s => s?.GetValue<string>()).ToList();
+        for (var i = 0; i < rows && i < gaps.Count; i++)
+        {
+            var existing = gaps[i] is JsonValue value && value.TryGetValue<int>(out var index) && index >= 0 && index < texts.Count ? texts[index] : null;
+            var text = existing is null ? line : existing + "\n" + line;
+            if (text.Length > RcaContract.MaximumStringLength)
+            {
+                text = existing![..Math.Max(0, RcaContract.MaximumStringLength - line.Length - 5)] + "...\n" + line;
+            }
+
+            var at = texts.IndexOf(text);
+            if (at < 0)
+            {
+                if (texts.Count >= RcaContract.MaximumStrings)
+                {
+                    return null;
+                }
+
+                strings.Add(text);
+                texts.Add(text);
+                at = texts.Count - 1;
+            }
+
+            gaps[i] = at;
+        }
+
+        return Encoding.UTF8.GetBytes(root.ToJsonString(NoteJson));
+    }
+
+    /// <summary>The bound document with its over-budget line, whose figure is the excess of the document as written.</summary>
+    private static byte[] WithOverBudgetNote(byte[] json, long others, int budget)
+    {
+        var gzip = PartCodec.Gzip(json);
+        var excess = others + gzip.Length - budget;
+        for (var attempt = 0; attempt < 4; attempt++)
+        {
+            if (WithGapLine(json, OverBudgetLine(excess)) is not { } noted)
+            {
+                break;
+            }
+
+            gzip = PartCodec.Gzip(noted);
+            var written = others + gzip.Length - budget;
+            if (written == excess)
+            {
+                break;
+            }
+
+            excess = written;
+        }
+
+        return gzip;
+    }
+
+    /// <summary>A document's top-level sessionId: whether it has one, and its value (null for none).</summary>
+    private static (bool Found, string? Session) TopLevelSession(byte[] json)
+    {
+        var reader = new Utf8JsonReader(json);
+        if (!reader.Read() || reader.TokenType != JsonTokenType.StartObject)
+        {
+            return (false, null);
+        }
+
+        while (reader.Read() && reader.TokenType == JsonTokenType.PropertyName)
+        {
+            var isSession = reader.ValueTextEquals("sessionId"u8);
+            if (!reader.Read())
+            {
+                return (false, null);
+            }
+
+            if (isSession)
+            {
+                return reader.TokenType switch
+                {
+                    JsonTokenType.Null => (true, null),
+                    JsonTokenType.String => (true, reader.GetString()),
+                    _ => (false, null),
+                };
+            }
+
+            reader.Skip();
+        }
+
+        return (false, null);
     }
 
     /// <summary>Adds <paramref name="bytes"/> (or takes them away) from a budget's use.</summary>
@@ -503,7 +688,7 @@ internal sealed partial class SidecarStore : ISidecarCatalog
         }
     }
 
-    /// <summary>A ledger from the sealed documents' own headers: each kept, none acknowledged; the spans and budgets start again.</summary>
+    /// <summary>A ledger from the sealed documents' own headers: each kept, none acknowledged, its budget counted again; the spans start again.</summary>
     private SidecarLedger Rebuild()
     {
         var ledger = new SidecarLedger();
@@ -550,6 +735,24 @@ internal sealed partial class SidecarStore : ISidecarCatalog
         }
 
         ledger.Sidecars.Sort((a, b) => a.SealedUtc != b.SealedUtc ? a.SealedUtc.CompareTo(b.SealedUtc) : string.CompareOrdinal(a.DocumentId, b.DocumentId));
+        foreach (var entry in ledger.Sidecars)
+        {
+            Use(ledger, entry.Budget, entry.Bytes, entry.SealedUtc);
+        }
+
+        ledger.NextSequence = ledger.Sidecars.Count == 0 ? 1 : (ledger.Sidecars.Max(s => s.Sequence) % MaximumSequence) + 1;
+        return ledger;
+    }
+
+    /// <summary>True when <c>sidecars\</c> holds a document named as a sidecar.</summary>
+    private bool HasDocuments() =>
+        System.IO.Directory.Exists(Directory)
+        && System.IO.Directory.EnumerateFiles(Directory, "*" + DocumentSuffix).Any(f => IsSidecarId(Path.GetFileName(f)[..^DocumentSuffix.Length]));
+
+    /// <summary>Writes a ledger the read made, so the next read finds it, and returns it.</summary>
+    private SidecarLedger Saved(SidecarLedger ledger)
+    {
+        WriteLedger(ledger);
         return ledger;
     }
 

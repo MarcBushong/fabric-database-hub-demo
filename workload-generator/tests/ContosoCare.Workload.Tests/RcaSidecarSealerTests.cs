@@ -1,3 +1,5 @@
+using System.Globalization;
+using System.Text.Json;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Rca;
 using ContosoCare.Workload.Rca.Export;
@@ -316,6 +318,171 @@ public sealed class RcaSidecarSealerTests : IDisposable
     }
 
     [Fact]
+    public void ABindThatASealingFailureFollowsIsRecordedWithTheFilesHashAndSession()
+    {
+        // Review, High 1: a bind writes the document again before the rest of its sealing can fail; the ledger must record
+        // it, or the sidecar is offered under a hash its file no longer has, and every save rejects it.
+        var rig = new SidecarRig(root, T0);
+        var span = rig.Capture(T0, T0.AddMinutes(30), "T1");
+        var provisional = rig.Seal(span);
+        rig.Sink.ForSpan(span.Id)!.Write(SidecarRig.Stats("T1", T0.AddMinutes(30), 902, 10));
+        rig.Bind(rig.Span(span.Id), SidecarRig.Session);
+        rig.Sealer.Rotated = _ => throw new InvalidOperationException("The test's failure after the bind.");
+
+        Assert.Throws<InvalidOperationException>(() => rig.Sealer.SealSpan(rig.Span(span.Id)));
+
+        var file = rig.Store.ReadGzip(provisional.DocumentId)!;
+        var recorded = Assert.Single(ReadLedgerFile().Sidecars);
+        Assert.Equal((PartCodec.Sha256(file), (string?)SidecarRig.Session, true), (recorded.Sha256, recorded.SessionId, recorded.Bound));
+        rig.Sealer.Rotated = null;
+        var offered = Assert.Single(rig.Store.Offerable());
+        Assert.Equal((PartCodec.Sha256(file), (string?)SidecarRig.Session), (offered.Sha256, offered.SessionId));
+    }
+
+    [Fact]
+    public void ABindTheLedgerNeverRecordedIsTakenFromTheFile()
+    {
+        // Review, High 1: a crash between a bind's document and its ledger leaves the file bound and the ledger not; the
+        // next bind takes the hash, size, and parts from the file, and moves the budget.
+        var rig = new SidecarRig(root, T0);
+        var span = rig.Capture(T0, T0.AddMinutes(30), "T1");
+        var provisional = rig.Seal(span);
+        var ledgerPath = Path.Combine(root, "sidecars", "ledger.json");
+        var before = File.ReadAllBytes(ledgerPath);
+        Assert.Null(rig.Sealer.SealSpan(rig.Bind(span, SidecarRig.Session)));
+        File.WriteAllBytes(ledgerPath, before);
+
+        var offered = Assert.Single(rig.Store.Offerable());
+
+        var file = rig.Store.ReadGzip(provisional.DocumentId)!;
+        Assert.NotEqual(provisional.Sha256, offered.Sha256);
+        Assert.Equal((PartCodec.Sha256(file), PartCodec.PartCount(file.Length), (string?)SidecarRig.Session), (offered.Sha256, offered.Parts, offered.SessionId));
+        var budgets = ReadLedgerFile().Budgets;
+        Assert.Equal((long)file.Length, budgets[SidecarRig.Session].Bytes);
+        Assert.Equal(0, budgets["span:" + span.Id].Bytes);
+    }
+
+    [Fact]
+    public void RowsSealedBeforeACrashThatKeptThemAreDeletedAndNeverSealedTwice()
+    {
+        // Review, Medium 3: a crash after the ledger's write and before the rows' deletion leaves the files the ledger lists
+        // as sealed; the next sealing deletes them before it reads anything. Without DeleteSealed they'd be sealed again.
+        var rig = new SidecarRig(root, T0);
+        var span = rig.Observe(T0, T0.AddMinutes(30), SidecarRig.Session, "T1");
+        var aside = new Dictionary<string, byte[]>(StringComparer.Ordinal);
+        rig.Sealer.Rotated = s =>
+        {
+            foreach (var file in Directory.GetFiles(s.Directory, "sidecar-*"))
+            {
+                aside[file] = File.ReadAllBytes(file);
+            }
+        };
+        var sealedSidecar = rig.Seal(span);
+        rig.Sealer.Rotated = null;
+        Assert.NotEmpty(aside);
+        using (rig.Store.Lock())
+        {
+            var ledger = rig.Store.ReadLedger();
+            foreach (var (file, bytes) in aside)
+            {
+                File.WriteAllBytes(file, bytes);
+                ledger.Sealed.Add(Path.GetRelativePath(rig.Evidence.Root, file));
+            }
+
+            rig.Store.WriteLedger(ledger);
+        }
+
+        Assert.Null(rig.Sealer.SealSpan(rig.Span(span.Id)));
+
+        Assert.Single(rig.Reducer.Calls);
+        Assert.Empty(Directory.GetFiles(span.Directory, "sidecar-*"));
+        Assert.Empty(ReadLedgerFile().Sealed);
+        Assert.Equal(sealedSidecar.DocumentId, Assert.Single(rig.Store.Offerable()).DocumentId);
+    }
+
+    [Fact]
+    public void RowsSetAsideByAnInterruptedSealingAreSealedByTheNextWithTheRowsAfterThem()
+    {
+        // Review, Medium 3: a sealing that fails after it took the files aside leaves them; the next takes them first, then
+        // what the observer wrote since, into one sidecar, and leaves no file behind.
+        var rig = new SidecarRig(root, T0);
+        var span = rig.Open(T0, "T1");
+        rig.Sink.Write(SidecarRig.Stats("T1", T0, 412, 2400));
+        rig.Sink.Write(SidecarRig.Coverage("T1", T0, T0.AddMinutes(15)));
+        rig.Bind(rig.Span(span.Id), SidecarRig.Session);
+        rig.Sealer.Rotated = _ => throw new IOException("The test's failure after the files were taken aside.");
+        Assert.Throws<IOException>(() => rig.Sealer.SealSpan(rig.Span(span.Id)));
+        rig.Sealer.Rotated = null;
+        Assert.Single(Directory.GetFiles(span.Directory, "sidecar-T1.*.rows"));
+        rig.Sink.Write(SidecarRig.Stats("T1", T0.AddMinutes(15), 412, 2300));
+        rig.Sink.Write(SidecarRig.Coverage("T1", T0.AddMinutes(15), T0.AddMinutes(30)));
+
+        rig.Seal(rig.Span(span.Id));
+
+        var draft = Assert.Single(rig.Reducer.Calls).Draft;
+        Assert.Equal([2400.0, 2300.0], draft.Tables[RcaContract.QueryStats].Select(r => (double)r.Get("cpu_ms")!));
+        Assert.Equal((T0, T0.AddMinutes(30)), (draft.WindowStartUtc, draft.WindowEndUtc));
+        Assert.Empty(Directory.GetFiles(span.Directory, "sidecar-*"));
+    }
+
+    [Fact]
+    public void ABindThatTakesTheSessionOverItsHostsBudgetSaysSoInTheSidecarsCoverageWithoutCuttingIt()
+    {
+        // Review, Medium 4 (a soft cap at bind): two spans sealed before the session's first export, then bound to it; the
+        // second takes the session past this host's budget. It isn't cut again: its coverage says by how much, and the log
+        // warns. The transport pages and keeps pending whatever doesn't fit.
+        var budget = int.MaxValue;
+        using var logText = new StringWriter(CultureInfo.InvariantCulture);
+        using var log = new RunnerLog(logText);
+        var rig = new SidecarRig(root, T0, budget: _ => budget, log: log);
+        var first = rig.Capture(T0, T0.AddMinutes(30), "T2");
+        var second = rig.Capture(T0.AddHours(1), T0.AddHours(2), "T2");
+        rig.Sealer.SealAll();
+        var provisional = ReadLedgerFile().Sidecars.ToDictionary(s => s.SpanId, s => s.Bytes);
+        budget = (int)(provisional[first.Id] + (provisional[second.Id] / 2));
+
+        rig.Bind(first, SidecarRig.Session);
+        rig.Bind(second, SidecarRig.Session);
+        rig.Sealer.SealAll();
+
+        var ledger = ReadLedgerFile();
+        var entries = ledger.Sidecars.ToDictionary(s => s.SpanId);
+        var used = ledger.Budgets[SidecarRig.Session].Bytes;
+        Assert.Equal(entries.Values.Sum(e => e.Bytes), used);
+        Assert.True(used > budget);
+        Assert.All(CapturingReducer.CoverageGaps(rig.Store.ReadGzip(entries[first.Id].DocumentId)!), g => Assert.Null(g.Gaps));
+        var secondFile = rig.Store.ReadGzip(entries[second.Id].DocumentId)!;
+        Assert.Equal(PartCodec.Sha256(secondFile), entries[second.Id].Sha256);
+        Assert.All(CapturingReducer.CoverageGaps(secondFile), g => Assert.Equal(SidecarStore.OverBudgetLine(used - budget), g.Gaps));
+        var sealedDraft = rig.Reducer.Calls.Single(c => c.Draft.WindowStartUtc == T0.AddHours(1)).Draft;
+        Assert.Equal(sealedDraft.Tables[RcaContract.QueryStats].Count, CapturingReducer.Rows(secondFile, RcaContract.QueryStats));
+        Assert.Contains("rca.sidecar-over-budget", logText.ToString(), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void ASealedListNamingAnythingButAFileTakenAsideDeletesNothing()
+    {
+        // Review, Low 5: the ledger's list of sealed files can make the sealer delete only a file taken aside to be sealed.
+        var rig = new SidecarRig(root, T0);
+        var span = rig.Observe(T0, T0.AddMinutes(30), SidecarRig.Session, "T1");
+        var export = Path.Combine(span.Directory, "export.json");
+        var live = SidecarSealer.FileFor(span.Directory, "T1");
+        using (rig.Store.Lock())
+        {
+            var ledger = rig.Store.ReadLedger();
+            ledger.Sealed.Add(Path.GetRelativePath(rig.Evidence.Root, export));
+            ledger.Sealed.Add(Path.GetRelativePath(rig.Evidence.Root, live));
+            rig.Store.WriteLedger(ledger);
+        }
+
+        rig.Seal(rig.Span(span.Id));
+
+        Assert.True(File.Exists(export));
+        Assert.Equal(4, Assert.Single(rig.Reducer.Calls).Draft.Tables[RcaContract.QueryStats].Count);
+        Assert.Empty(ReadLedgerFile().Sealed);
+    }
+
+    [Fact]
     public void SealingRecordsOnlySpansThatHaveSidecarRows()
     {
         var rig = new SidecarRig(root, T0);
@@ -384,6 +551,9 @@ public sealed class RcaSidecarSealerTests : IDisposable
         Assert.Equal([Assert.Single(second.Sealed).DocumentId], second.SealedIds);
         Assert.Equal(first.SealedIds.Concat(second.SealedIds), rig.Store.Offerable().Select(s => s.DocumentId));
     }
+
+    /// <summary>The ledger as the file has it, read without the store, so nothing a read does can change what's checked.</summary>
+    private SidecarLedger ReadLedgerFile() => JsonSerializer.Deserialize(File.ReadAllText(Path.Combine(root, "sidecars", "ledger.json")), SidecarJsonContext.Default.SidecarLedger)!;
 
     private static List<CaptureValues> T4Settings(DateTimeOffset now) =>
     [

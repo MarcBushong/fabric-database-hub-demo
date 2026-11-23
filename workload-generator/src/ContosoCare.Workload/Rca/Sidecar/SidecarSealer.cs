@@ -33,29 +33,28 @@ internal sealed class SidecarSealer
     /// <summary>A sidecar is at most 64 KiB of gzip (28 parts).</summary>
     public const int MaximumDocumentBytes = RcaContract.MaximumDocumentBytes;
 
-    /// <summary>How far under its limits a sidecar sealed with no session stays, so its session's 32 characters always fit once it's bound.</summary>
-    public const int ProvisionalMargin = 64;
+    /// <summary>
+    /// How far under its limits a sidecar sealed with no session stays, so it's still within a document's 64 KiB once a
+    /// bind adds its session's 32 characters and, past the session's budget, the gap line that says so.
+    /// </summary>
+    public const int ProvisionalMargin = 512;
 
     private static readonly TimeSpan WriterWait = TimeSpan.FromSeconds(5);
 
     private readonly ISidecarReducer reducer;
-    private readonly Func<IReadOnlyCollection<string>, int> sessionBudget;
     private readonly string producerVersion;
     private readonly RunnerLog log;
 
-    /// <param name="store">The sidecar store.</param>
+    /// <param name="store">The sidecar store, whose session budget the sealer fits each sidecar to.</param>
     /// <param name="reducer">Encodes a draft and fits it to its budgets.</param>
-    /// <param name="sessionBudget">A session's budget on this host, from its span's targets (64 KiB for several, 32 KiB for one).</param>
     /// <param name="producerVersion">The runner's version, which each sidecar names.</param>
     /// <param name="log">The runner's log.</param>
-    public SidecarSealer(SidecarStore store, ISidecarReducer reducer, Func<IReadOnlyCollection<string>, int> sessionBudget, string producerVersion, RunnerLog? log = null)
+    public SidecarSealer(SidecarStore store, ISidecarReducer reducer, string producerVersion, RunnerLog? log = null)
     {
         ArgumentNullException.ThrowIfNull(store);
         ArgumentNullException.ThrowIfNull(reducer);
-        ArgumentNullException.ThrowIfNull(sessionBudget);
         Store = store;
         this.reducer = reducer;
-        this.sessionBudget = sessionBudget;
         this.producerVersion = producerVersion;
         this.log = log ?? RunnerLog.Null;
     }
@@ -86,14 +85,27 @@ internal sealed class SidecarSealer
         return target.Length > 0 && IsKey(target) && (tag is null || (tag.Length > 0 && IsKey(tag))) ? (target, tag) : null;
     }
 
-    /// <summary>Seals one span's new rows: its sidecar, or null when it had none.</summary>
+    /// <summary>
+    /// Seals one span's new rows: its sidecar, or null when it had none. When the sealing fails, what it did first (a
+    /// document a bind wrote again, files taken aside) is still recorded in the ledger before the failure goes on.
+    /// </summary>
     public SealedSidecar? SealSpan(SpanInfo span)
     {
         ArgumentNullException.ThrowIfNull(span);
         using var exclusive = Store.Lock();
         var ledger = Store.ReadLedger();
         var done = new List<string>();
-        var sealedSidecar = Seal(ledger, span, done);
+        SealedSidecar? sealedSidecar;
+        try
+        {
+            sealedSidecar = Seal(ledger, span, done);
+        }
+        catch
+        {
+            CommitAfterFailure(ledger, done);
+            throw;
+        }
+
         Commit(ledger, done);
         return sealedSidecar;
     }
@@ -104,30 +116,38 @@ internal sealed class SidecarSealer
     /// <summary>
     /// Retention, then one sidecar for each span with new rows, the oldest span first: at the observer's start, for spans a
     /// stop left unsealed, and at every export. A span that can't be sealed is a problem in the result and doesn't keep
-    /// the others from sealing; its rows wait for the next call.
+    /// the others from sealing; its rows wait for the next call. Whatever fails, what was done is recorded.
     /// </summary>
     public SidecarSealing SealAll()
     {
         using var exclusive = Store.Lock();
         var ledger = Store.ReadLedger();
-        Store.Cleanup(ledger, Store.Time.GetUtcNow());
         var done = new List<string>();
         var made = new List<SealedSidecar>();
         var problems = new List<string>();
-        foreach (var span in Store.Evidence.Spans())
+        try
         {
-            try
+            Store.Cleanup(ledger, Store.Time.GetUtcNow());
+            foreach (var span in Store.Evidence.Spans())
             {
-                if (Seal(ledger, span, done) is { } sealedSidecar)
+                try
                 {
-                    made.Add(sealedSidecar);
+                    if (Seal(ledger, span, done) is { } sealedSidecar)
+                    {
+                        made.Add(sealedSidecar);
+                    }
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or InvalidDataException)
+                {
+                    problems.Add($"Span {span.Id}'s sidecar rows couldn't be sealed ({Redactor.Redact(ex.Message)}); the next sealing tries again.");
+                    log.Warn("rca.sidecar-seal-failed", "Couldn't seal a span's sidecar rows; the others still seal.", ("span", span.Id), ("error", Redactor.Redact(ex.GetType().Name + ": " + ex.Message)));
                 }
             }
-            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException or InvalidDataException)
-            {
-                problems.Add($"Span {span.Id}'s sidecar rows couldn't be sealed ({Redactor.Redact(ex.Message)}); the next sealing tries again.");
-                log.Warn("rca.sidecar-seal-failed", "Couldn't seal a span's sidecar rows; the others still seal.", ("span", span.Id), ("error", Redactor.Redact(ex.GetType().Name + ": " + ex.Message)));
-            }
+        }
+        catch
+        {
+            CommitAfterFailure(ledger, done);
+            throw;
         }
 
         Commit(ledger, done);
@@ -287,7 +307,7 @@ internal sealed class SidecarSealer
         var (documentId, sequence) = Store.NextDocumentId(ledger, windowStart);
         var draft = new SidecarDraft(documentId, session, Store.Host, sequence, final, windowStart, windowEnd, now, producerVersion, [.. groups.Select(g => g.Key)], tables);
         var budget = SidecarStore.BudgetKey(session, spanId);
-        var remaining = (int)Math.Clamp(sessionBudget(spanTargets) - (ledger.Budgets.TryGetValue(budget, out var use) ? use.Bytes : 0L), 0L, int.MaxValue);
+        var remaining = (int)Math.Clamp(Store.SessionBudget(spanTargets) - (ledger.Budgets.TryGetValue(budget, out var use) ? use.Bytes : 0L), 0L, int.MaxValue);
         if (provisional)
         {
             remaining = Math.Max(0, Math.Min(remaining, MaximumDocumentBytes) - ProvisionalMargin);
@@ -349,14 +369,42 @@ internal sealed class SidecarSealer
         Store.WriteLedger(ledger);
     }
 
-    /// <summary>Deletes the span's files an earlier sealing sealed but couldn't delete.</summary>
+    /// <summary>
+    /// The commit after a sealing that failed, so what it did first is recorded. When the ledger can't be written either,
+    /// the log says so and the sealing's own failure goes on: the next bind takes what a bind wrote from its file.
+    /// </summary>
+    private void CommitAfterFailure(SidecarLedger ledger, List<string> done)
+    {
+        try
+        {
+            Commit(ledger, done);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            log.Warn("rca.sidecar-ledger-failed", "The sidecar ledger couldn't be written after a sealing failed; the next sealing records it again.", ("error", Redactor.Redact(ex.Message)));
+        }
+    }
+
+    /// <summary>
+    /// Deletes the span's files an earlier sealing sealed but couldn't delete, before anything is read, so they're never
+    /// sealed twice. It deletes only a file named as one taken aside to be sealed (<c>sidecar-&lt;target&gt;.&lt;tag&gt;.rows</c>):
+    /// any other name the list holds for the span is dropped from it and left alone.
+    /// </summary>
     private void DeleteSealed(SidecarLedger ledger, string directory)
     {
+        var folder = Path.GetFullPath(directory);
         foreach (var relative in ledger.Sealed.ToList())
         {
-            var path = Path.Combine(Store.Evidence.Root, relative);
-            if (!string.Equals(Path.GetDirectoryName(path), directory, StringComparison.OrdinalIgnoreCase))
+            var path = Path.GetFullPath(Path.Combine(Store.Evidence.Root, relative));
+            if (!string.Equals(Path.GetDirectoryName(path), folder, StringComparison.OrdinalIgnoreCase))
             {
+                continue;
+            }
+
+            if (ParseFile(Path.GetFileName(path)) is not { Tag: not null })
+            {
+                ledger.Sealed.Remove(relative);
+                log.Warn("rca.sidecar-sealed-name", "The sidecar ledger listed a file as sealed that isn't one taken aside to be sealed; it's left as it is.", ("file", Path.GetFileName(path)));
                 continue;
             }
 

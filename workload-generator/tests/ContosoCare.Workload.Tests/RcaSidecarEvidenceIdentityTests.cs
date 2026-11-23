@@ -80,13 +80,13 @@ public sealed class RcaSidecarEvidenceIdentityTests : IDisposable
             null,
             TestContext.Current.CancellationToken);
 
-    private static StoreSidecarSink Sink(EvidenceStore store) => new(new SidecarSealer(new SidecarStore(store), new CapturingReducer(), SidecarRig.Budget, "1.0.0"));
+    private static StoreSidecarSink Sink(EvidenceStore store) => new(new SidecarSealer(new SidecarStore(store, SidecarRig.Budget), new CapturingReducer(), "1.0.0"));
 
     /// <summary>Seals what the run's spans hold, as the next export would, and returns the drafts the reducer got.</summary>
     private List<SidecarDraft> Seal()
     {
         var reducer = new CapturingReducer();
-        var sealer = new SidecarSealer(new SidecarStore(new EvidenceStore(root, new ManualTime(T4To.AddMinutes(5)), host: "sqlvm01")), reducer, SidecarRig.Budget, "1.0.0");
+        var sealer = new SidecarSealer(new SidecarStore(new EvidenceStore(root, new ManualTime(T4To.AddMinutes(5)), host: "sqlvm01"), SidecarRig.Budget), reducer, "1.0.0");
         Assert.NotEmpty(sealer.SealAll().Sealed);
         return [.. reducer.Calls.Select(c => c.Draft)];
     }
