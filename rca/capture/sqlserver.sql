@@ -612,9 +612,10 @@ FROM sys.database_query_store_options AS o;
 -- match to RCA-SQL-10 and 14 as @left_out. Read before each RCA-SQL-10 read, with its @since and @final. Not returned: a
 -- text over 4,000 characters (the runner's are much shorter), a query the engine generated itself (is_internal_query,
 -- such as an automatic statistics update), and the capture's own statements, which carry the marker. At most 2,000
--- rows, the most executed first: the stop check every run polls is always near the top, and a rarer statement of the
--- runner's past them stays as evidence, as a form the match doesn't reach does; the read's coverage says when the bound
--- was hit. The texts are only compared, never kept. T1, T2, T3.
+-- rows, the most executed first: the stop check every run polls is always near the top, and the read's coverage says
+-- when the bound was hit. A statement of the runner's that this block doesn't return, past the bound or in an interval
+-- that ended between this read and RCA-SQL-10's, is matched by the text RCA-SQL-10 and 14 return: the runner drops its
+-- rows and reads RCA-SQL-10's page again without it. The texts are only compared, never kept. T1, T2, T3.
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 1000;

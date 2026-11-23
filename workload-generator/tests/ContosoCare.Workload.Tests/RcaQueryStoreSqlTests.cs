@@ -106,6 +106,7 @@ public sealed class RcaQueryStoreSqlTests
 
         // RCA-SQL-16 reads at most the reader's bound, the most executed first.
         Assert.Contains(string.Create(CultureInfo.InvariantCulture, $"SELECT TOP ({SqlQueryStoreRows.AdHocCap})"), CaptureCatalog.Get("RCA-SQL-16"), StringComparison.Ordinal);
+        Assert.Contains(string.Create(CultureInfo.InvariantCulture, $"AND LEN(qt.query_sql_text) <= {SqlQueryStoreRows.AdHocTextLength}"), CaptureCatalog.Get("RCA-SQL-16"), StringComparison.Ordinal);
         Assert.Contains("ORDER BY r.executions DESC, r.query_id;", CaptureCatalog.Get("RCA-SQL-16"), StringComparison.Ordinal);
 
         // RCA-AZ-04's CPU averages are microseconds, as Learn's details have them; nothing it reads isn't in Learn's schema.
@@ -746,6 +747,84 @@ public sealed class RcaQueryStoreSqlTests
         ("recommended_plan_cpu_us", "2100"));
 
     [Theory]
+    [InlineData(true)]
+    [InlineData(false)]
+    public async Task ARunnersStatementRcaSql16DidntReturnIsMatchedByItsOwnTextAndItsPageReadAgain(bool honorsLeftOut)
+    {
+        // RCA-SQL-16 didn't return the stop check: its interval ended between the two reads, or it was past the bound.
+        // RCA-SQL-10 returns it, with its text, as its interval's top plan by CPU; eleven of the workload's statements follow.
+        const long StopCheck = 501;
+        var start = RcaSimulation.At(16, 50, 0);
+        var interval = RcaSimulation.At(16, 30, 0);
+        var texts = new Dictionary<long, string> { [StopCheck] = "(@run_id varchar(64))SELECT demo.fn_run_stop_requested(@run_id);" };
+        for (var n = 1; n <= 11; n++)
+        {
+            texts[600 + n] = string.Create(CultureInfo.InvariantCulture, $"(@p int)SELECT a.appointment_id FROM care.appointments AS a WHERE a.clinic_id = @p AND a.slot = {n}");
+        }
+
+        double Cpu(long query) => query == StopCheck ? 1000 : 100 - (query - 600);
+        var access = new FakeSidecarAccess("T1", (block, parameters) => block switch
+        {
+            "RCA-SQL-16" => [.. texts.Where(t => t.Key != StopCheck).Select(t => Row(("query_id", t.Key), ("query_sql_text", t.Value)))],
+            "RCA-SQL-10" => (DateTimeOffset)parameters.Value("@since")! >= interval.AddMinutes(15) ? [] :
+                [.. texts.Keys.Except(honorsLeftOut ? T3QueryStore.LeftOut(parameters) : []).OrderByDescending(Cpu).ThenBy(q => q).Take(10)
+                    .Select(q => Row(("captured_at_utc", start.UtcDateTime), ("interval_start_utc", interval), ("interval_end_utc", interval.AddMinutes(15)), ("query_id", q), ("plan_id", q * 10), ("query_sql_text", texts[q]), ("executions", q == StopCheck ? 900L : 10L), ("cpu_ms", Cpu(q))))],
+            "RCA-SQL-15" => [StateRow(start, "READ_WRITE", 0, null)],
+            _ => [],
+        });
+        var sink = new MemorySidecarSink();
+        var reader = new SqlQueryStoreReader(access, automaticTuning: false, sink);
+
+        reader.Begin(start);
+        await TickAsync(reader, start, TimeSpan.FromMinutes(1));
+
+        // Nothing of the stop check's reaches the sidecar, by its query_id or by its text.
+        Assert.DoesNotContain(sink.Rows, r => r.Get("query_id") is StopCheck);
+        Assert.DoesNotContain(sink.Rows, r => r.Get("statement_text") is string text && HarnessStatements.IsRunners(text));
+
+        // Its page was read again, the read's next block, with the stop check in @left_out: the top 10 are the workload's
+        // next ten. A block that ignored @left_out is read twice all the same, and the row it returned again is dropped.
+        var reads = access.Calls.Where(c => c.BlockId == "RCA-SQL-10").Select(c => ((string)c.Parameters.Value("@left_out")!, c.At)).ToList();
+        Assert.Equal([("[]", RcaSimulation.At(16, 50, 1)), ("[501]", RcaSimulation.At(16, 50, 2))], reads);
+        Assert.Equal(Enumerable.Range(601, honorsLeftOut ? 10 : 9).Select(q => (long)q), sink.Table(RcaContract.QueryStats).Select(r => (long)r.Get("query_id")!).Order());
+        Assert.All(sink.Table(RcaContract.QueryCoverage), c => Assert.Null(c.Get("gaps")));
+    }
+
+    [Fact]
+    public async Task ARunnersForcedPlanRcaSql14ReturnsIsDroppedByItsOwnTextAndNotAskedForAgain()
+    {
+        // A plan of the warmup's first statement is forced, and no RCA-SQL-16 returned that statement: RCA-SQL-14 returns the
+        // forced plan with its text, as it returns every forced plan.
+        const long Warmup = 503, Forced = 5030;
+        var start = RcaSimulation.At(16, 50, 0);
+        var plans = new[] { (Query: 1007L, Plan: 7L, Text: "SELECT 1"), (Query: Warmup, Plan: Forced, Text: "SELECT COUNT_BIG(*) FROM care.facilities;") };
+        var access = new FakeSidecarAccess("T1", (block, parameters) => block switch
+        {
+            "RCA-SQL-10" => (DateTimeOffset)parameters.Value("@since")! >= RcaSimulation.At(16, 45, 0) ? [] : [StatRow(RcaSimulation.At(16, 30, 0), 7, cpu: 50)],
+            "RCA-SQL-14" => [.. plans.Where(p => !T3QueryStore.LeftOut(parameters).Contains(p.Query))
+                .Select(p => Row(("captured_at_utc", start.UtcDateTime), ("query_id", p.Query), ("plan_id", p.Plan), ("query_sql_text", p.Text), ("is_forced_plan", p.Plan == Forced), ("is_parallel", false)))],
+            "RCA-SQL-15" => [StateRow(start, "READ_WRITE", 0, "503:5030:MANUAL")],
+            _ => [],
+        });
+        var sink = new MemorySidecarSink();
+        var reader = new SqlQueryStoreReader(access, automaticTuning: false, sink);
+
+        reader.Begin(start);
+        await TickAsync(reader, start, TimeSpan.FromSeconds(10));
+        await reader.EndAsync(start.AddMinutes(1), TestContext.Current.CancellationToken);
+
+        // The workload's plan is in the sidecar; the warmup's isn't, by its query, its plan, or its text.
+        Assert.Contains(sink.Table(RcaContract.QueryPlans), p => (long)p.Get("plan_id")! == 7);
+        Assert.DoesNotContain(sink.Rows, r => r.Get("query_id") is Warmup || r.Get("plan_id") is Forced);
+        Assert.DoesNotContain(sink.Rows, r => r.Get("statement_text") is string text && HarnessStatements.IsRunners(text));
+
+        // It was asked for once, with its showplan; the end's read then had nothing to ask, and left the warmup out.
+        var asked = Assert.Single(access.Calls, c => c.BlockId == "RCA-SQL-14");
+        Assert.Contains(Forced, ParameterIds(asked.Parameters, "@with_plan"));
+        Assert.Equal("[503]", access.Calls.Last(c => c.BlockId == "RCA-SQL-10").Parameters.Value("@left_out"));
+    }
+
+    [Theory]
     [InlineData(2000, true)]
     [InlineData(1999, false)]
     public async Task AnAdHocReadAtItsBoundSaysSoInTheReadsCoverage(int statements, bool bound)
@@ -763,7 +842,7 @@ public sealed class RcaQueryStoreSqlTests
         reader.Begin(start);
         await TickAsync(reader, start, TimeSpan.FromSeconds(5));
 
-        const string Line = "16:50:00 UTC: RCA-SQL-16: 2,000 ad hoc statements read, the most executed first. On T1, one of the runner's own statements past them stays as evidence.";
+        const string Line = "16:50:00 UTC: RCA-SQL-16: 2,000 ad hoc statements read, the most executed first. On T1, a statement of the runner's past them is matched by the text RCA-SQL-10 and 14 return instead.";
         Assert.Equal(bound, Gaps(sink).Split('\n').Contains(Line));
     }
 
@@ -960,6 +1039,10 @@ public sealed class RcaQueryStoreSqlTests
 
     private static List<(DateTimeOffset Since, bool Final)> Reads(TimedConnector connector) =>
         [.. connector.Calls.Where(c => c.BlockId == "RCA-SQL-10").Select(c => ((DateTimeOffset)c.Parameters!.Value("@since")!, (bool)c.Parameters!.Value("@final")!))];
+
+    /// <summary>A parameter's comma-separated IDs (@queries, @plans, @with_plan).</summary>
+    private static List<long> ParameterIds(CaptureParameters parameters, string name) =>
+        [.. ((string?)parameters.Value(name) ?? string.Empty).Split(',', StringSplitOptions.RemoveEmptyEntries).Select(id => long.Parse(id, CultureInfo.InvariantCulture))];
 
     private static string Gaps(MemorySidecarSink sink) => string.Join('\n', sink.Table(RcaContract.QueryCoverage).Select(r => (string?)r.Get("gaps")).OfType<string>());
 

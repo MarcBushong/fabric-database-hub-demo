@@ -26,6 +26,9 @@ internal static class SqlQueryStoreRows
     /// <summary>RCA-SQL-16's bound, its TOP: the most executed first.</summary>
     public const int AdHocCap = 2000;
 
+    /// <summary>The longest text RCA-SQL-16 returns, and the longest the reader compares with the list: the runner's are much shorter.</summary>
+    public const int AdHocTextLength = 4000;
+
     /// <summary>One plan's runtime statistics over one interval, as one read saw them.</summary>
     public static CaptureRow? Stats(string target, CaptureValues row, DateTimeOffset now)
     {
