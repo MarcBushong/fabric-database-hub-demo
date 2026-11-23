@@ -93,8 +93,9 @@ internal sealed class SqlAutomaticTuning(string target)
 
     /// <summary>
     /// A recommendation in words: <c>FORCE_LAST_GOOD_PLAN for query 412: plan 31 over plan 58, CPU time per execution
-    /// 2.1 ms against 176 ms; Executing, applied by System at 17:09:22 UTC.</c> RCA-AZ-04's CPU averages are Learn's
-    /// microseconds (regressedPlanCpuTimeAverage), in milliseconds here.
+    /// 2.1 ms against 176 ms; Executing, applied by System at 17:09:22 UTC.</c> When it appears, its reason follows as a
+    /// sentence of its own. RCA-AZ-04's CPU averages are Learn's microseconds (regressedPlanCpuTimeAverage), in
+    /// milliseconds here.
     /// </summary>
     private static string Describe(CaptureValues row, string? state, bool appeared)
     {
@@ -109,7 +110,7 @@ internal sealed class SqlAutomaticTuning(string target)
             }
         }
 
-        if (Milliseconds(row.Double("recommended_plan_cpu_ms")) is { } good && Milliseconds(row.Double("regressed_plan_cpu_ms")) is { } bad)
+        if (Milliseconds(row.Double("recommended_plan_cpu_us")) is { } good && Milliseconds(row.Double("regressed_plan_cpu_us")) is { } bad)
         {
             text += string.Create(CultureInfo.InvariantCulture, $", CPU time per execution {good:0.###} ms against {bad:0.###} ms");
         }
@@ -127,7 +128,7 @@ internal sealed class SqlAutomaticTuning(string target)
 
         if (appeared && TextNormalizer.Detail(row.Text("reason")) is { } reason)
         {
-            text += ": " + reason.TrimEnd('.');
+            text += ". " + reason.TrimEnd('.');
         }
 
         return text + ".";
