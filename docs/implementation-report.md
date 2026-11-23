@@ -6317,3 +6317,26 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - **The model stays on the release's form** after the Fabric track's Warning, until `deploy.ps1 -FromStage Fabric` or a later run of the track. The end's step and DONE now say so. Its first-run follow-up (#68) deploys the release's form too; it reads as today.
 - **A first deployment whose first history run is still queued** at the track's step finds no table, so the model gets the release's form. The end's step then works out the snapshot's rows and is a Warning (`ModelOnRelease`), with `./scripts/deploy.ps1 -FromStage Fabric`. That's accurate, but it asks for one more step on such a first deployment.
 - **The one-time ALTER and a concurrent save:** the step's `ALTER TABLE ... ADD COLUMNS` changes the table's metadata, so a notebook save that started before it and commits after it fails with Delta's `MetadataChangedException` ([concurrency control for Delta tables](https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control)). The step's updates and a save's `DELETE` of its own run's rows can conflict the same way, but only when both write at the same moment. The step says so (`NoColumns` or `Partial`), and a later run finishes. Recommended for the notebook's session: `write_delta` retries the whole save once or twice on Delta's concurrent-modification exceptions, which is safe because it deletes its own `RUN_ID`'s rows before it appends. Done in def8f09b: the save runs its delete and append again together, at most 5 tries. An older notebook doesn't retry; the next save, or a rerun, writes what that one didn't.
+
+### F35 design (i): integrated (2026-11-23)
+
+**Why.** The coordinator's go: integrate F35's reviewed units on the groundwork branch, with the docs, for the next release, whose cut-off moved to Tuesday noon.
+
+**Work summary.**
+
+- **The units, merged as they were reviewed** (`marcbushong-microsoft-f35-save-time`, on the groundwork's 27d9e8d1): the notebook and model at def8f09b (re-check SHIP), then its follow-up 464b542d (the proof's grain fix, the save's retry docstring, and that session's report sections); the Livy steps at 25f2ebb8 (its review's fixes, with the tests' StrictMode mock). No code changed in the merges.
+- **The docs** as reviewed at 45b3effc, as one commit with the same changes, then matched to the merged code: the save's bounded retry (def8f09b), a query that filters which saves it sees reading the release's rule (4f44e7ce), and 25f2ebb8's one deadline per step, `Refused` for a refused statement, `Failed` for HTTP errors past the retries, `NoModule` for a module without `kept_value_step`, and `DEPLOY.FABRIC.KEPTVALUE.END`'s `ModelOnRelease` ([ADR 0014](adr/0014-notebook-role-and-capacity.md#amendment-2026-11-23-overlapping-saves-resolved-when-history-is-saved-f35-design-i), [limitations](limitations.md#the-history-models-overlapping-saves-f35), [troubleshooting](troubleshooting.md#the-historys-kept-values-f35)).
+- **This report:** both sessions' sections, the notebook's first, since the Livy steps build on its module; the Livy section's last risk says that def8f09b added the save's retry, and cites Fabric's concurrency page.
+- **The notebooks' versions file** (`fabric/notebooks/published-versions.json`, follow-ups decision 2a) isn't on this branch: the writer runs where F35 meets 2a, in the next release's integration.
+
+**Validation.**
+
+- Pester with StrictMode and the Azure CLI guard, targeted, one run at a time on a PC at 100 % CPU: DbHubDemo.HistoryKeptValue, DbHubDemo.PowerBI, Fabric.PowerBI, Fabric.History, Fabric.Notebooks, DbHubDemo.Progress, DbHubDemo.Fabric, Repo.Conventions, Repo.FunctionNames, and Repo.NeutralWording: 425 passed, 0 failed, 9 skipped, 0 az calls. The suites only the Livy steps changed (Lifecycle, Tracks, FirstRun, FabricTrack, LifecycleScripts) run in the next release's full validation.
+- With Python 3.11.9 and pandas 3.1.1 (`DBHUB_TEST_PYTHON`), so Fabric.History's module tests and Fabric.Notebooks' helper tests ran rather than skipped.
+- vitest: kept-value-cases, snapshot-value, and Ask's guide, 49 passed.
+- markdownlint: clean on the changed docs. The leak check is clean.
+
+**Risks.**
+
+- **Two changes still to come,** each merged when it's reviewed: the Livy steps' first deployment, whose end step deploys the kept form itself instead of warning, and the notebook session's report-only commit with its validation.
+- **Not proven live,** as ADR 0014's amendment lists: a net-new deployment and an update at the release's final SHA, and the deployed model's kept form against its reference, in Tuesday's timing run.
