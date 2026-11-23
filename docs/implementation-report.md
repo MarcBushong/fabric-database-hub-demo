@@ -5511,3 +5511,53 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - No app code changed, so `npm run verify` and the B/A sweep stand as they were at a57539ed.
 
 **What its live check needs.** The entry above's, with the Variable - Get after `./scripts/deploy.ps1` in a governed tenant.
+
+### Realistic names, unit A: procedure and function names on both engines (2026-11-23)
+
+**Why.** The owner approved ADR 0031's decision 6 on 2026-11-23: the workload reads like a real system, so the Incident RCA's evidence, Query Store, and Database Hub don't give away the demo's scenario. The coordinator split it into three units from one design: a base commit with the name mapping as data, unit A (option (c), realistic procedure and function names, on both engines), unit B (option (a'), application names), and unit C (the fixtures, the app's tests, and the docs). This entry is unit A's, two commits after edd01c86.
+
+- **The base (59d9dfb7): the mapping as data.** Each `scenario.json` gets its `service`, the middle segment of its sessions' application name, required by the schema. `rca/blind-detection.json` gets `answerKey.workloadNames`: every service, T-SQL module, PostgreSQL function, and T5 label, with the scenarios each can stand for, for grading only. Every one of those names, and `demo.fn_workload_procedures`, joins `forbiddenInDetectionCode.identifiers`, so the three blind tests fail when detection code names one.
+- **The names.** The 26 T-SQL modules of `database/common/120-scenario-procedures.sql` and the 15 step functions of `database/postgresql/120-scenario-functions.sql` move from `demo.usp_scenario_*` into six application schemas: `billing`, `frontdesk`, `records`, `reporting`, `scheduling`, and `supply`. They're named for what they do, for example `billing.usp_claim_work_item` for the blocked billing clerk and `scheduling.usp_assign_work_item` for the chain's head blocker, with one name per module on both engines. `demo` keeps the control objects and `demo.fn_seed_scale`. The runner's callers and each scenario's entry follow, and the schema's procedure pattern allows only those schemas, plus `events` for T5's label.
+- **No stored definition names a scenario.** SQL Server stores a module's whole batch, header comments included, and a DBA reads it with `sp_helptext`:
+  - Each module checks its run with `@procid = @@PROCID`. `demo.fn_workload_procedures()`, in `110-demo-control.sql` and part of the answer key, says which scenario's runs may run it, so the bound of ADR 0010 holds without a scenario ID in the module.
+  - Each header comment is a batch of its own, before a `GO`, so SQL Server never stores it with the module.
+  - The two modules that read `demo.scenario_runs` take its concurrency and start from `demo.usp_run_assert_running` instead.
+  - The in-body comments, messages, and event details that narrated the fault are neutral: no scenario ID, no "the head blocker", no "the Database Agent beat".
+  - PostgreSQL stores only a function's body, and no body names a scenario.
+- **One click.** `./scripts/deploy.ps1` changes nothing in how it updates the databases. The runner's `setup` applies `110` then `120`, as an administrator, on T1 to T3. On T4, `Enable-DemoT4Workload` runs `setup --target T4`.
+  - **T1 to T3:** `120` creates the schemas, owned by `dbo`, and grants `contosocare_runner` `EXECUTE` on them. It creates the new modules, then drops every earlier name once all of them exist, after it first unforces any Query Store plan forced for `demo.usp_visit_summary_lookup` on Azure SQL Database. `usp_reset` unforces the new lookup's plans.
+  - **T4:** `120` creates the schemas and functions, then drops every function of `demo` that has an earlier name, whatever its argument list. `PgScripts.GrantRunnerAsync` grants `USAGE` and `EXECUTE` on `PgScripts.ApplicationSchemas`. `VerifyScenarioFunctionsAsync` reads each step's schema from its name.
+- **Fail-safe while a runner and its database are out of step.** `deploy.ps1` installs the runner on T1 before it updates T3's and T4's modules:
+  - **A new runner, an old database:** the runner checks the scenario's entry module first. If it's missing, the run is **Refused**, with the reason `out-of-step` and the missing name. Nothing is registered and no session opens, and the profile host tries again, bounded, as for `connect`.
+  - **An old runner, a new database:** its first call to an earlier name fails (error 2812, or SQLSTATE 42883), and its run ends **Failed**. The run check still takes `@scenario_id` for a module that setup hasn't replaced yet.
+
+**Changed files.** `database/common/110-demo-control.sql` and `120-scenario-procedures.sql`; `database/postgresql/110-demo-control.sql` (a comment) and `120-scenario-functions.sql`; each `scenarios/*/scenario.json`'s `service` (base) and `procedure` lines, and `scenarios/scenario.schema.json`; `rca/blind-detection.json` (base); in the runner, `Runs/ScenarioRunner.cs`, `Postgres/PgScenarioRunner.cs`, `Postgres/ReplicaLag.cs`, `Postgres/PgScripts.cs`, and `Sql/SqlScripts.cs`; and the tests `SqlScriptTests`, `CatalogTests`, `PostgresTests`, `ReplicaLagTests`, `RunnerTests`, and `SqlIntegrationTests`.
+
+**Validation.** On edd01c86 with the two commits, on this PC (ARM64, with a .NET 10.0.403 SDK in the session's own folder):
+
+- **The runner's tests:** 817 tests, of which 795 passed, 22 were skipped, and none failed. The skipped ones are the integration tests, which need a disposable SQL Server or PostgreSQL server.
+- **New checks:**
+  - Every module the T-SQL script creates is in the answer key's map and forbidden in detection code.
+  - Every module that checks its run has its row in `demo.fn_workload_procedures()`, which agrees with the map.
+  - No stored module text, and no PostgreSQL function body, names a scenario or says "scenario".
+  - Each retired name is dropped once, after every replacement exists.
+  - The T4 steps live in the schemas that setup grants.
+  - An `out-of-step` refusal is retried.
+  - Two integration tests: the T-SQL upgrade, from earlier names to new ones with the run check following the module, and the refusal, which registers nothing.
+- **Pester:** under strict mode, with the Azure CLI guard, the eight suites that read the scripts or the catalog passed, with none failing: `Rca.Contract`, `Agent.PromptPack`, `Automation.Runbooks`, `DbHubDemo.Lifecycle`, `DbHubDemo.T3`, `DbHubDemo.T3Agent`, `DbHubDemo.T4`, and `DbHubDemo.Workload`, 1,341 in all.
+- **The leak check** finds no identifier in what these commits add.
+- **Not run here:** this PC has no SQL Server, so the new T-SQL is checked by the parser (ScriptDom) and the static tests, not by an engine.
+
+**Risks.**
+
+- The T-SQL runs on an engine for the first time in its live check, or under the integration tests on a disposable SQL Server.
+- Run IDs keep their form until unit B lands.
+- What's still readable as a demo, though it names no scenario, is listed for a follow-up in the design: the scratch and mark tables, parameter names and values such as `@variant = 'problem'`, PostgreSQL result columns, run-event names, and the `demo.` control helpers inside the bodies.
+
+**What its live check needs.** `./scripts/deploy.ps1` over an environment from before the rename, while its profile host runs.
+
+- `setup` passes on T1 to T4, and no `demo.usp_scenario_*` module is left.
+- In the minutes between the runner's install and T3's and T4's setup, a run on T3 or T4 is refused as `out-of-step`, and tried again after setup.
+- A Run all, then `./scripts/validate.ps1`.
+- On T3, plan-regression's beat runs on `frontdesk.usp_visit_summary`, and reset unforces its plans.
+- Query Store and Database Hub show the new names.
