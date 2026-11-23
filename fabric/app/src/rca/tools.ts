@@ -15,6 +15,7 @@ import { isPagedTable, MONITOR_PAGES, MONITOR_ROW_LIMIT, RcaReadError } from "./
 import { analyzeLocking, type ChainNode } from "./locking";
 import { analyzeQueries, queryStoreOf, type QueryStoreAnalysis } from "./queries";
 import { queryStoreNextStep, queryStoreNote, queryStoreQuery, unexplainedByQuery, type QueryStoreQuery } from "./query-store";
+import type { ConnectionGroup } from "./sidecar";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
@@ -645,10 +646,22 @@ export function createInvestigationTools(deps: InvestigationDeps) {
 
     /** T4's connections against the limit, explained by what held them (connections.ts). An episode its capture cut off (openEnded) says so, and one still on where the minutes read end (readEnd) says that. */
     async function connectionsAt(target: RcaTarget, from: Date, to: Date, openEnded = false, readEnd?: Date, readStopped?: boolean): Promise<InvestigationResult> {
-        const g = await gather(from, to, [target]);
-        const a = analyzeConnections({ target, from, to, resource: g.evidence.resource, sessions: g.evidence.sessions, metrics: g.evidence.metrics, openEnded, readEnd, readStopped });
+        const [g, held] = await Promise.all([gather(from, to, [target]), holdersIn(target, from, to)]);
+        const a = analyzeConnections({ target, from, to, resource: g.evidence.resource, sessions: g.evidence.sessions, metrics: g.evidence.metrics, openEnded, readEnd, readStopped, holders: held.groups, holdersUnread: held.note !== null });
         const base = envelope("explain_connections", from, to, [target], deps, g);
-        return { ...base, findings: a.findings, rootCause: a.rootCause, recommendations: a.recommendations, nextSteps: a.nextSteps, notCaptured: [...base.notCaptured, ...a.notCaptured], details: a.details };
+        return { ...base, findings: a.findings, rootCause: a.rootCause, recommendations: a.recommendations, nextSteps: a.nextSteps, notCaptured: [...base.notCaptured, ...a.notCaptured, ...(held.note ? [held.note] : [])], details: a.details };
+    }
+
+    /** Who held a target's connections in some minutes, from the sidecar's RCA Connections; or why that couldn't be read, said as such. */
+    async function holdersIn(target: RcaTarget, from: Date, to: Date): Promise<{ groups: ConnectionGroup[]; note: string | null }> {
+        if (!deps.sidecar) return { groups: [], note: null };
+        try {
+            const s = await deps.sidecar(from, to, [target], ["connections"]);
+            if (s.missing.length) return { groups: [], note: `${target}: who held the connections isn't in this history: its model doesn't have ${s.missing.join(", ")} yet; ./scripts/deploy.ps1 updates the model.` };
+            return { groups: s.connections, note: null };
+        } catch (err) {
+            return { groups: [], note: `${target}: who held the connections ${fromTo(from, to)} UTC couldn't be read, so they aren't named: ${err instanceof Error ? err.message : String(err)}` };
+        }
     }
 
     /**

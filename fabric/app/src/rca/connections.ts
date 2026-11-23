@@ -19,6 +19,7 @@
 // https://learn.microsoft.com/azure/postgresql/configure-maintain/concepts-limits
 
 import { recommend } from "./catalog";
+import type { ConnectionGroup } from "./sidecar";
 import { asWholeReadings, hhmmss, iso, metricIn, plural, type Confidence, type EvidenceRef, type Finding, type MetricPoint, type RcaTarget, type Recommendation, type ResourcePoint, type SessionSample } from "./types";
 
 /** The share of the limit at which the capture watches every 10 s, and the detector opens an episode. */
@@ -128,7 +129,97 @@ function wavesOf(samples: readonly ConnectionSample[], level: number, trough: nu
     return waves;
 }
 
-export function analyzeConnections(input: { target: RcaTarget; from: Date; to: Date; resource: readonly ResourcePoint[]; sessions: readonly SessionSample[]; metrics: readonly MetricPoint[]; openEnded?: boolean; readEnd?: Date; readStopped?: boolean }): ConnectionAnalysis {
+/** Who held the connections, as the capture counted them in a connection episode (RCA Connections): its sentence, evidence, and details. */
+export interface Holders {
+    text: string;
+    ref: EvidenceRef;
+    details: Record<string, unknown>;
+}
+
+/**
+ * Who held a target's client connections in some minutes, from the capture's counts by program, login, and state in each
+ * sample of a connection episode (RCA Connections; never the capture's own connection): each group's count and how it
+ * changed, how long its oldest idle connection had sat idle, the most they held together, and the groups gone by the last
+ * sample. A workload run is named by its opaque token, which names nothing; another application, which the capture
+ * doesn't name, as such. Null without any of its rows in the minutes.
+ */
+export function holdersOf(groups: readonly ConnectionGroup[], target: RcaTarget, from: Date, to: Date): Holders | null {
+    const rows = groups.filter((g) => g.target === target && g.capturedAt >= from && g.capturedAt <= to).sort((a, b) => a.capturedAt.getTime() - b.capturedAt.getTime());
+    if (rows.length === 0) return null;
+    const times = [...new Set(rows.map((g) => g.capturedAt.getTime()))].sort((a, b) => a - b);
+    const series = new Map<string, ConnectionGroup[]>();
+    for (const g of rows) {
+        const key = [g.program ?? "", g.runToken ?? "", g.login ?? "", g.state].join("|");
+        series.set(key, [...(series.get(key) ?? []), g]);
+    }
+    const nameOf = (g: ConnectionGroup) => {
+        const who = [g.program, g.login && `as ${g.login}`].filter(Boolean).join(", ");
+        return g.runToken ? `the run with token ${g.runToken}${who ? ` (${who})` : ""}` : who || "an application the capture doesn't name";
+    };
+    const most = (s: readonly ConnectionGroup[]) => Math.max(...s.map((g) => g.connections));
+    const ordered = [...series.values()].sort((a, b) => most(b) - most(a));
+    const at = (t: number) => hhmmss(new Date(t));
+    const fromTo = (a: number, b: number) => (a === b ? `at ${at(a)}` : `from ${at(a)} to ${at(b)}`);
+    const parts = ordered.map((s) => {
+        const first = s[0];
+        const end = s[s.length - 1];
+        const top = most(s);
+        const atTop = s.filter((g) => g.connections === top).map((g) => g.capturedAt.getTime());
+        const counts = s.every((g) => g.connections === top) ? `${top} ${first.state}` : `${first.connections} ${first.state} at ${at(first.capturedAt.getTime())} UTC and ${top} ${fromTo(atTop[0], atTop[atTop.length - 1])} UTC`;
+        const oldest =
+            first.state.startsWith("idle") && first.oldestStateS !== undefined && end.oldestStateS !== undefined
+                ? s.length > 1
+                    ? `, the oldest ${first.state} for ${span(first.oldestStateS * 1000)} at its first sample and ${span(end.oldestStateS * 1000)} at its last`
+                    : `, the oldest ${first.state} for ${span(first.oldestStateS * 1000)}`
+                : "";
+        return `${nameOf(first)} held ${counts}${oldest}`;
+    });
+    const totals = times.map((t) => ({ t, total: rows.filter((g) => g.capturedAt.getTime() === t).reduce((n, g) => n + g.connections, 0) }));
+    const peak = Math.max(...totals.map((x) => x.total));
+    const atPeak = totals.filter((x) => x.total === peak).map((x) => x.t);
+    const last = times[times.length - 1];
+    const gone = ordered.filter((s) => s[s.length - 1].capturedAt.getTime() < last).map((s) => `the ${s[s.length - 1].state} connections of ${nameOf(s[0])}`);
+    const groupList = parts.length === 1 ? parts[0] : `${parts.slice(0, -1).join("; ")}; and ${parts[parts.length - 1]}`;
+    const text =
+        `Who held them, as the capture counted them by program, login, and state in ${plural(times.length, "sample")} ${fromTo(times[0], last)} UTC (RCA Connections): ${groupList}. ` +
+        `Together they held ${peak} at most, ${fromTo(atPeak[0], atPeak[atPeak.length - 1])} UTC.${gone.length ? ` At ${at(last)} UTC, the capture counted none of ${sayList(gone)}.` : ""}`;
+    const peakRows = rows.filter((g) => g.capturedAt.getTime() === atPeak[0]);
+    return {
+        text,
+        ref: { table: "RCA Connections", at: iso(new Date(atPeak[0])), target, text: `${peak} client connections by program, login, and state: ${peakRows.map((g) => `${g.connections} ${g.state} of ${nameOf(g)}`).join("; ")}` },
+        details: {
+            samples: times.length,
+            from: iso(new Date(times[0])),
+            to: iso(new Date(last)),
+            peak: { connections: peak, from: iso(new Date(atPeak[0])), to: iso(new Date(atPeak[atPeak.length - 1])) },
+            groups: ordered.map((s) => ({
+                name: nameOf(s[0]),
+                state: s[0].state,
+                isWorkload: s[0].isDemo,
+                first: { at: iso(s[0].capturedAt), connections: s[0].connections },
+                most: most(s),
+                last: { at: iso(s[s.length - 1].capturedAt), connections: s[s.length - 1].connections },
+                ...(s[0].oldestStateS !== undefined ? { oldestStateS: { first: s[0].oldestStateS, last: s[s.length - 1].oldestStateS ?? null } } : {}),
+            })),
+        },
+    };
+}
+
+export function analyzeConnections(input: {
+    target: RcaTarget;
+    from: Date;
+    to: Date;
+    resource: readonly ResourcePoint[];
+    sessions: readonly SessionSample[];
+    metrics: readonly MetricPoint[];
+    openEnded?: boolean;
+    readEnd?: Date;
+    readStopped?: boolean;
+    /** Who held the connections, as the capture counted them in a connection episode (the sidecar's RCA Connections). */
+    holders?: readonly ConnectionGroup[];
+    /** Its caller couldn't read them (a failed read, or a model without the table) and says so itself: never "not captured". */
+    holdersUnread?: boolean;
+}): ConnectionAnalysis {
     const { target, from, to } = input;
     const notCaptured: string[] = [];
     const samples = connectionSamples(input.resource, target, from, to);
@@ -290,10 +381,16 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
     // failed connections, its trigger before, counted none of the refusals at the limit in the live check of 4e2c65ed.
     if (full.length > 0 && ruleId === "CONN-ACTIVE") ids.push("PG-MAXCONN");
 
-    // Who held them: only the sessions the capture sampled, which are the ones not idle, and only while a client waited on a lock.
+    // Who held them: the capture's counts by program, login, and state in a connection episode (RCA Connections), idle
+    // ones included; else only the sessions the capture sampled, which are the ones not idle, and only while a client
+    // waited on a lock.
+    const holders = holdersOf(input.holders ?? [], target, from, to);
     const seen = input.sessions.filter((s) => s.target === target && s.capturedAt >= from && s.capturedAt <= to && (s.backendType === undefined || s.backendType === "client backend"));
     let who = "";
-    if (seen.length > 0) {
+    if (holders) {
+        who = ` ${holders.text}`;
+        nextSteps = nextSteps.filter((step) => !step.startsWith("While it happens, list who holds"));
+    } else if (seen.length > 0) {
         const groups = new Map<string, { sessions: Set<number>; idleMs: number }>();
         for (const s of seen) {
             const key = [s.program ?? "an application the capture didn't name", s.login && `as ${s.login}`].filter(Boolean).join(" ");
@@ -303,8 +400,8 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
             groups.set(key, g);
         }
         who = ` Of the sessions the capture sampled (only those not idle), ${[...groups.entries()].map(([k, g]) => `${plural(g.sessions.size, "session")} came from ${k}${g.idleMs ? `, idle in a transaction for up to ${span(g.idleMs)}` : ""}`).join("; ")}.`;
-        notCaptured.push(`${target}: who held the idle connections isn't captured: the capture samples sessions (RCA-PG-01) that aren't idle, and only while a client waits on a lock; RCA-PG-10 counts the rest by state.`);
-    } else {
+        if (!input.holdersUnread) notCaptured.push(`${target}: who held the idle connections isn't captured: the capture samples sessions (RCA-PG-01) that aren't idle, and only while a client waits on a lock; RCA-PG-10 counts the rest by state.`);
+    } else if (!input.holdersUnread) {
         notCaptured.push(`${target}: who held the connections (their application, user, and client address) and how long each sat idle aren't captured for these minutes: RCA-PG-10 counts connections by state, and the capture samples sessions (RCA-PG-01) only while a client waits on a lock, which none did here.`);
     }
 
@@ -321,6 +418,7 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
         ref(peak, peakText),
         ...(first.at.getTime() !== peak.at.getTime() ? [ref(first, `${first.total} client connections`)] : []),
         ...(last.at.getTime() !== peak.at.getTime() ? [ref(last, `${last.total} client connections`)] : []),
+        ...(holders ? [holders.ref] : []),
         ...failedRefs,
     ];
     const title = `${target}: ${limit ? `${share} % of the connection limit` : `${peak.total} connections`} at ${hhmmss(peak.at)} UTC`;
@@ -342,6 +440,7 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
             captureEnded: input.openEnded && !input.readEnd ? iso(lastSample.at) : null,
             fellUnder: fell ? iso(fell.at) : null,
             readEnd: input.readEnd ? iso(input.readEnd) : null,
+            ...(holders ? { holders: holders.details } : {}),
         },
     };
 }

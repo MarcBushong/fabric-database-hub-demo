@@ -1,12 +1,13 @@
 import { describe, expect, it } from "vitest";
 import type { PostgresCapture } from "@/data/model";
+import { analyzeConnections } from "./connections";
 import { LOCK_WAIT_TABLES, QUERY_STORE_TABLES } from "./explain-queries";
 import { RcaReadError } from "./loader";
 import { emptySidecar, type SidecarEvidence } from "./sidecar";
 import type { SidecarTableKey } from "./spec";
 import { fixtureSidecar, namesAScenario } from "./testdata/contract";
 import { createInvestigationTools } from "./tools";
-import { emptyEvidence, type Evidence, type InvestigationResult, type RcaTarget, type SessionSample } from "./types";
+import { emptyEvidence, type Evidence, type InvestigationResult, type RcaTarget, type ResourcePoint, type SessionSample } from "./types";
 
 // Query Store's evidence in the investigations (unit 2's C3): explain_incident's CPU and wait classes, explain_locking's
 // lock waits, and explain_queries, from the sidecar fixtures' facts (rca/fixtures/README.md, What a blind RCA finds in the
@@ -173,5 +174,82 @@ describe("explain_queries, the chat's tool", () => {
         expect(await tools.investigate("explain_queries", { ...minutes, queryId: 1.5 })).toMatch(/^queryId takes /);
         expect(await toolsWith(null).tools.investigate("explain_queries", minutes)).toBe("This app doesn't read Query Store's evidence: explain_incident and run_dax on the telemetry are what it has.");
         expect(await toolsWith(failure()).tools.run("explain_queries", minutes)).toEqual({ ok: false, text: failure().message });
+    });
+});
+
+describe("T4's connections, by who held them (RCA Connections)", () => {
+    const surge = fixtureSidecar("surge");
+    const times = [...new Set(surge.connections.map((g) => g.capturedAt.getTime()))].sort((a, b) => a - b);
+    // RCA-PG-10's counts at the same samples, as it counts them: by state, and a total with the capture's own connection.
+    // max_connections 45 less 3 reserved: 42 slots clients can use, and the episode at 80 % of them from the first sample.
+    const counts: ResourcePoint[] = times.flatMap((t) => {
+        const rows = surge.connections.filter((g) => g.capturedAt.getTime() === t);
+        const of = (state: string) => rows.filter((g) => g.state === state).reduce((n, g) => n + g.connections, 0);
+        const values = { connections_total: of("active") + of("idle") + 1, connections_active: of("active"), connections_idle: of("idle"), connections_idle_in_transaction: 0, connections_waiting_lock: 0, max_connections: 45, reserved_connections: 3 };
+        return Object.entries(values).map(([metric, value]) => ({ target: "T4" as const, at: new Date(t), source: "RCA-PG-10", metric, value }));
+    });
+    const minutes = { target: "T4" as const, from: at("21T10:06:00"), to: at("21T10:12:00"), resource: counts, sessions: [], metrics: [] };
+    const RUN = "the run with token 7c3e91a05bd2 (ContosoCare.Demo, as contosocare_runner)";
+    const WHO =
+        `Who held them, as the capture counted them by program, login, and state in 37 samples from 10:06:00 to 10:12:00 UTC (RCA Connections): ${RUN} held 28 idle at 10:06:00 UTC and 36 from 10:10:00 to 10:11:50 UTC, the oldest idle for 40 s at its first sample and 6 min 30 s at its last; ` +
+        "an application the capture doesn't name held 3 idle, the oldest idle for 23 s at its first sample and 18 s at its last; and the run with token 2fa86c14e9b0 (ContosoCare.Demo, as contosocare_runner) held 2 active. " +
+        `Together they held 41 at most, from 10:10:00 to 10:11:50 UTC. At 10:12:00 UTC, the capture counted none of the idle connections of ${RUN}.`;
+    const WHO_NOT = /who held (the|them)|list who holds/i;
+
+    it("names who held the slots: each run by its opaque token, what it held and how long its oldest sat idle, and the most together", () => {
+        const a = analyzeConnections({ ...minutes, holders: surge.connections });
+        expect(a.rootCause?.ruleIds).toEqual(["CONN-IDLE"]);
+        expect(a.rootCause?.statement).toContain(` ${WHO}`);
+        expect(a.rootCause?.evidence).toContainEqual({
+            table: "RCA Connections",
+            at: "2026-11-21T10:10:00Z",
+            target: "T4",
+            text: `41 client connections by program, login, and state: 36 idle of ${RUN}; 2 active of the run with token 2fa86c14e9b0 (ContosoCare.Demo, as contosocare_runner); 3 idle of an application the capture doesn't name`,
+        });
+        // What the capture counted is no longer "not captured", nor a step to find out while it happens.
+        expect(a.notCaptured.join(" ")).not.toMatch(WHO_NOT);
+        expect(a.nextSteps.join(" ")).not.toMatch(WHO_NOT);
+        expect(a.nextSteps).toContain("Size each application's pool to the queries it runs at once, below the limit, and let it close the connections it doesn't use.");
+        expect(a.details.holders).toMatchObject({ samples: 37, from: "2026-11-21T10:06:00Z", to: "2026-11-21T10:12:00Z", peak: { connections: 41, from: "2026-11-21T10:10:00Z", to: "2026-11-21T10:11:50Z" } });
+        expect((a.details.holders as { groups: unknown[] }).groups[0]).toEqual({ name: RUN, state: "idle", isWorkload: true, first: { at: "2026-11-21T10:06:00Z", connections: 28 }, most: 36, last: { at: "2026-11-21T10:11:50Z", connections: 36 }, oldestStateS: { first: 40, last: 390 } });
+        expect(namesAScenario(JSON.stringify(a))).toEqual([]);
+    });
+
+    it("says who held them isn't captured only when nothing counted them, and leaves it to a caller that couldn't read them", () => {
+        expect(analyzeConnections({ ...minutes, holders: [] }).notCaptured).toContain(
+            "T4: who held the connections (their application, user, and client address) and how long each sat idle aren't captured for these minutes: RCA-PG-10 counts connections by state, and the capture samples sessions (RCA-PG-01) only while a client waits on a lock, which none did here.",
+        );
+        expect(analyzeConnections({ ...minutes, holdersUnread: true }).notCaptured.join(" ")).not.toMatch(WHO_NOT);
+    });
+
+    it("explain_incident reads them for the connections episode, and says when the model lacks them or the read failed", async () => {
+        // The capture's connection episode, as it records one: escalated at the first sample at the level, relaxed when they fell.
+        const code = "T4-20261121T100600Z";
+        const evidence: Evidence = {
+            ...emptyEvidence(),
+            resource: counts,
+            events: [
+                { target: "T4", at: at("21T10:06:00"), kind: "capture", name: "escalated", code, count: 1, detail: "client connections 34 >= 80 % of 42 (max_connections 45 minus 3 reserved)." },
+                { target: "T4", at: at("21T10:12:00"), kind: "capture", name: "relaxed", code, count: 1, detail: "client connections 6 < 80 % of 42." },
+            ],
+        };
+        const explain = async (sidecar: SidecarEvidence | Error) => {
+            const { tools, reads } = toolsWith(sidecar, evidence);
+            const [episode] = (await tools.episodes(at("21T10:00:00"), at("21T10:20:00"), ["T4"])).filter((e) => e.family === "connections");
+            expect(episode?.start).toEqual(at("21T10:06:00"));
+            return { r: await ask(tools, "explain_incident", { episodeKey: episode.key }), reads };
+        };
+        const { r, reads } = await explain(surge);
+        expect(reads).toEqual([{ from: "2026-11-21T10:06:00.000Z", to: "2026-11-21T10:13:00.000Z", targets: ["T4"], tables: ["connections"] }]);
+        expect(r.rootCause?.statement).toContain(WHO);
+        expect(r.notCaptured.join(" ")).not.toMatch(WHO_NOT);
+
+        const older = (await explain({ ...emptySidecar(), missing: ["RCA Connections"] })).r;
+        expect(older.notCaptured).toContain("T4: who held the connections isn't in this history: its model doesn't have RCA Connections yet; ./scripts/deploy.ps1 updates the model.");
+        expect(older.notCaptured.join(" ")).not.toMatch(/aren't captured for these minutes/);
+
+        const failed = (await explain(failure())).r;
+        expect(failed.notCaptured).toContain(`T4: who held the connections from 10:06:00 to 10:13:00 UTC couldn't be read, so they aren't named: ${failure().message}`);
+        expect(failed.rootCause?.statement).not.toContain("Who held them");
     });
 });
