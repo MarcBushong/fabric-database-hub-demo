@@ -167,6 +167,17 @@ An update leaves the demo as it found it (`Invoke-DemoUpdateEndStop`; the coordi
 - **A session that uses the demo:** a pending auto-stop of Run all, the Insights app's **Start**, or `start-demo.ps1`; Run all's busy marker, or a request to the session control on its way; or a `start-demo.ps1` that began during the run, which records its start (`DbHubStartDemoUtc`). It's read before the wait, after it, and twice in the stop (`STOP.SESSION`): before its first change, and before T2's guest and the VMs, which then keep running (a **Warning**: the activity is off already, so stop and start the session again). A session that starts during the deallocation itself is a **Warning** with how to start it again; an auto-stop left from before the run, whose session the nightly stop ended, doesn't count. When it can't be read, the demo keeps running.
 - **Where it shows:** the status page's **Stop at the end** row, **DONE**'s line, and `DEPLOY.ENDSTOP` in `out/deploy.jsonl`. A stop that fails is a **Warning** with `./scripts/stop-demo.ps1` as the fix, never **NOT DONE**, and tonight's nightly stop stays in place; a demo stopped this way needs no nightly stop that night, so **DONE** leaves out `DEPLOY.NIGHTLYSTOP`'s line, and since 2026-11-20 `DEPLOY.NIGHTLYSTOP` is a **Pass** that says this run stopped the demo itself, with no stop to offer. Ctrl+C during it leaves running what it hadn't stopped, and the row says so.
 
+### Older code over a newer demo (2026-11-23)
+
+`deploy.ps1` moves an environment forward: a clean checkout of `main` updates itself first ([updates from GitHub](#updates-from-github-2026-11-09)). An older checkout that can't update itself (`DEPLOY.SELFUPDATE`) runs the code it has, and that can put an older workload runner on the VMs. That isn't a supported path.
+
+For the Incident RCA's Query Store evidence, which waits on the VMs in sidecars until a history save takes it, two losses are accepted limits:
+
+- sidecars sealed more than 30 days before a newer runner comes back;
+- the rows of a session whose runner was replaced mid-session.
+
+[rca/README.md](../rca/README.md#versioning) says what an older runner keeps. Before you deploy older code, take every sidecar into the history with the VMs running: `./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity`, and run it again while its line says sidecars still wait.
+
 ## Day to day
 
 ### Run a session: Run all
