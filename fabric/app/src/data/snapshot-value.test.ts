@@ -299,3 +299,47 @@ describe("F35's per-bin rule in TypeScript, the reference for a fix of the histo
         expect(f35Check(rows, at("15:15"), at("15:30")).measures.T1.Batch).toEqual({ model: 96, finest: 96 });
     });
 });
+
+// The review of 67f08e7d: known differences from finestPerInterval, older than 67f08e7d, which design (i)'s build aligns.
+// A finer row straddles a coarser point's window cut, and part of what's left of it is in the part cut off.
+// finestPerInterval splits what's left across the row's uncovered stretches by length, and the coarser point takes only
+// the stretches that overlap the part its window keeps; this rule takes all of it there. Neither is always the data's
+// answer, so each case pins both rules' and names the closer. Background load is 4 a minute; stop-demo.ps1 -SaveHistory
+// at 15:24 cuts its 15:20 bin to 15:20 to 15:24; and the next day's update at 15:22 cuts its day save's 15:15 bin to 15:22
+// to 15:30.
+describe("known differences from finestPerInterval, where a window cuts through what's left of a finer row", () => {
+    const STOP = save("2026-11-21T15:24:30", "2026-11-21T03:24:00", "2026-11-21T15:24:00");
+    const NEXT_DAY = save("2026-11-22T15:33:00", "2026-11-21T15:22:00", "2026-11-22T15:22:00");
+
+    it("with a quiet minute in the straddling row, the data hold 86 from 15:15 to 15:30: this rule's answer, where finestPerInterval gives 89", () => {
+        // A session from 15:16 to 15:22 with 10 a minute of Lock waits, and none at 15:20, a bin WAITS_KQL leaves out
+        // (WaitMs > 0). The stop save's 15:20 holds 18: 10 at 15:21, beside the session's, and 8 from 15:22 to 15:24.
+        // finestPerInterval gives the quiet 15:20 3 of the 8, by length, so the day keeps 27 for 15:24 to 15:30, where 24
+        // is right; this rule takes all 8 from the day's part, as the data do. 76 before 67f08e7d.
+        const lock = (s: Record<string, string>) => row(s, "T1", "wait_deltas", "Lock");
+        const rows = [
+            ...([["15:16", 10], ["15:17", 10], ["15:18", 10], ["15:19", 10], ["15:21", 10]] as const).map(lock(save("2026-11-21T15:23:00", "2026-11-21T15:16:00", "2026-11-21T15:22:00"))),
+            ...every("15:15", 5, [44, 18]).map(lock(STOP)),
+            ...every("15:15", 15, [32, 60]).map(lock(NEXT_DAY)),
+        ];
+        expect(snapshotValues(rows).get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(28);
+        const { model, finest } = f35Check(rows, at("15:15"), at("15:30")).measures.T1.LockWaitS;
+        expect(model).toBeCloseTo(0.086, 9);
+        expect(finest).toBeCloseTo(0.089, 9);
+    });
+
+    it("with what's left of the straddling row on both sides of the cut, the data hold 72 from 15:15 to 15:30: finestPerInterval's answer, where this rule gives 68", () => {
+        // A session from 15:21 to 15:23 with 10 a minute. The stop save's 15:20 holds 28, 8 of it beside the session's
+        // minutes: 4 at 15:20, which the day's window cuts off, and 4 at 15:23. finestPerInterval gives each 4, so the day
+        // keeps 24 of its 38, as the data do; this rule takes all 8 from the day's part, which keeps 20. The same before
+        // 67f08e7d.
+        const batch = (s: Record<string, string>) => row(s, "T1", "counter_deltas", "Batch Requests/sec");
+        const rows = [
+            ...minutes("15:21", [10, 10]).map(batch(save("2026-11-21T15:23:30", "2026-11-21T15:21:00", "2026-11-21T15:23:00"))),
+            ...every("15:15", 5, [20, 28]).map(batch(STOP)),
+            ...every("15:15", 15, [38, 60]).map(batch(NEXT_DAY)),
+        ];
+        expect(snapshotValues(rows).get(key("T1", "counter_deltas", "Batch Requests/sec", "15:15"))).toBe(40);
+        expect(f35Check(rows, at("15:15"), at("15:30")).measures.T1.Batch).toEqual({ model: 68, finest: 72 });
+    });
+});

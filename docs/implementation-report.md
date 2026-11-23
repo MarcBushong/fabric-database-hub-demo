@@ -5637,7 +5637,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - `snapshotValues` took the fourth and later finer saves in a coarser point's interval against the first three only, where `finestPerInterval` takes each point against every one it kept before. Where those later saves overlap each other, a coarser total lost their shared time twice.
 - In the groundwork's named case, four 1-minute saves and a 5-minute one in a day save's 15:15 bin, `snapshotValues` gave 848 ms from 15:15 to 15:30 and `finestPerInterval` 900. So `f35Check`, documented to agree with `finestPerInterval`, read LockWaitS as 0.848 s against 0.9.
 - The review found rank 4 and later routine with the real producers, about 1.6 % of points on a typical day and 12 % on a busy one, though the double loss itself appeared in none of 700 simulated two-day histories.
-- The coordinator's decision: remove the divergence, so design (i) matches the app's views exactly, with nothing in `limitations.md`.
+- The coordinator's decision: remove the divergence, so design (i) matches the app's views exactly, with nothing in `limitations.md`. (i)'s build still has to make that true: two kinds of difference remain, which it aligns, a save whose bins don't show its step and what's left of a finer row where a window cuts through it ([the review of 67f08e7d](#the-review-of-67f08e7d-two-known-differences-pinned-2026-11-22)).
 
 **Work summary.**
 
@@ -5743,7 +5743,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 
   From 15:15 to 15:30, `snapshotValues` gave 76, and `finestPerInterval` 96, which the data hold. The session's rows end at 15:22, where the day save's window begins, so the day's point left the session's save out; the stop save's 15:20 then kept its 28 where 8 is its own, and the day's point kept 4 where 24 is.
 - **When:** an update that runs, a day later, at a time of day between a session's end and its stop save's. The review's simulation of the three producers found it in 32 of 9,390 hourly totals when forcing that timing after each session, and in none of 7,195 hours otherwise.
-- **The coordinator's decision:** fix it in both rules as the reviewer suggests, and correct the claims that the rules match `finestPerInterval` without that limit.
+- **The coordinator's decision:** fix it in both rules as the reviewer suggests, and correct the claims that the rules match `finestPerInterval` without that limit. (i)'s build still has to make them match: what's left of a finer row that straddles a window's cut is still counted differently where part of it is in the part cut off ([the review of 67f08e7d](#the-review-of-67f08e7d-two-known-differences-pinned-2026-11-22)).
 
 **Work summary.**
 
@@ -5767,3 +5767,34 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 
 - None for deployments: neither the app nor the model runs the reference.
 - More finer saves are ranked in an interval that a window cuts: those whose rows reach its cut-off part. An answer changes only where one of their rows straddles the cut.
+
+### The review of 67f08e7d: two known differences, pinned (2026-11-22)
+
+**Why.** The review of 67f08e7d, and of the groundwork's same change, found the fix correct in both rules: it moves bins toward `finestPerInterval`, and never away. One Low remains, older than these commits: a finer row that straddles a coarser point's window cut, with an uncovered stretch entirely in the part cut off.
+
+- **The difference:** `finestPerInterval` splits what's left of such a row across its uncovered stretches by length, and a later point takes only the stretches that overlap it. `snapshotValues`, and the groundwork's `kept_value.py`, keep it as one piece over the row's span, and count all of it against the part of the coarser point's interval that its window keeps, for a total's remainder and a peak's comparison alike.
+- **Neither rule is always the data's answer.** The reviewer's two cases, with [the review of 4944e22d's](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) producers and timing:
+  - **D:** the session's Lock waits are quiet at 15:20, a bin `WAITS_KQL` leaves out (`WaitMs > 0`). The stop save's 15:20 holds 18: 10 at 15:21, and 8 from 15:22 to 15:24. The data hold 86 from 15:15 to 15:30, `snapshotValues`' answer. `finestPerInterval` gives the quiet minute 3 of the 8, by length, so the day keeps 27 where 24 is right, and it gives 89. Before 67f08e7d, `snapshotValues` gave 76.
+  - **A:** a session from 15:21 to 15:23, `stop-demo.ps1` at 15:24, and the next day's update at 15:22. The stop save's remainder of 8 is 4 at 15:20, which the day's window cuts off, and 4 at 15:23. The data hold 72, `finestPerInterval`'s answer; `snapshotValues` gives 68, before and after 67f08e7d.
+- **How often,** in the review's simulation of the three producers, with its timing forced after each session: 14 of 2,800 sparse 15-minute bins differ, where 60 did before 67f08e7d, and 1 of 2,800 dense ones; about half of those are closer to the data with `snapshotValues`. None differ without that timing. 67f08e7d's own checks, with my generators, met neither case. A live proof that compares against `finestPerInterval` could meet one, and so could (i)'s T4 and T5 against the app's views: T5's sparse `ThrottledRequests`, for example.
+- **The coordinator's decision:** as for the step rule, no rule change now. Pin D and A as known differences beside the shared cases' `random 11`, soften the claims that the rules agree, and add a build-time item to the design note: both rules split a straddling row the same way.
+
+**Work summary.**
+
+- **Two tests,** D and A, in a new group of known differences. Each pins both rules' answers from 15:15 to 15:30 through `f35Check`, and the day's 15:15 bin; its name gives the data's answer and the rule that gives it.
+- **`snapshot-value.ts`'s notes:** the header and `snapshotValues`' notes say the rule keeps each point as `finestPerInterval` does but for two known differences, which they name: a save whose bins don't show its step, and this one. Design (i)'s build aligns them. `f35Check`'s two "which must agree" now say they agree but for those.
+- **This report:** the two "Why" bullets that quote the coordinator's decisions, in [4944e22d's section](#f35s-per-bin-reference-takes-every-finer-save-against-every-earlier-one-2026-11-22) and [67f08e7d's](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22), keep their words, with a note that (i)'s build still has to make them true.
+- **The groundwork branch** pins D and A in the shared cases, beside `random 11`. The design note's build-time item is in the coordinator's material for decision 3.
+- **What doesn't change:** every rule, the app's views, the model, and every doc a user reads. So there's no CHANGELOG entry.
+
+**Changed files.** `fabric/app/src/data/snapshot-value.ts` (comments), `fabric/app/src/data/snapshot-value.test.ts`, and this report.
+
+**Validation.**
+
+- **The pins catch a change in either rule,** each made in a copy:
+  - with 67f08e7d's choice of finer saves reverted, D fails: its 15:15 bin is 18, where it's 28, and 76 in all;
+  - with `finestPerInterval` splitting a remainder evenly, not by length, D fails: 0.09 s for 0.089;
+  - with this rule counting a finer row's remainder only for its share of the window's part, A fails (its bin is 44 for 40), and so do D and 67f08e7d's case.
+- vitest: the file's 18 tests, and the app's whole suite, 390 of 390 in 21 files. typecheck and eslint: clean. markdownlint: clean.
+
+**Risks.** None: two tests, comments, and this report.
