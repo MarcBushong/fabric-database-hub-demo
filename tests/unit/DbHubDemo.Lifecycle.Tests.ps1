@@ -1492,7 +1492,7 @@ Describe 'Invoke-DemoDeployment' {
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') | Should -BeLessThan ([array]::IndexOf($ids, 'DEPLOY.SUMMARY'))
         # Its kept values right after it, and the Fabric stage's before the history model's step (F35, 2026-11-23).
         [array]::IndexOf($ids, 'DEPLOY.FABRIC.KEPTVALUE.END') | Should -Be ([array]::IndexOf($ids, 'DEPLOY.FABRIC.HISTORY') + 1)
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'DEPLOY.FABRIC.KEPTVALUE' -and $ProgressId -eq 'Fabric.KeptValues' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'DEPLOY.FABRIC.KEPTVALUE' -and $ProgressId -eq 'Fabric.KeptValues' -and $RunAgain -eq './scripts/deploy.ps1 -FromStage Fabric' -and $DecidesModelForm }
         # T4's read replica goes after the snapshot (2026-11-16): DONE's checks and the snapshot read it first.
         $script:replicaEnd.Count | Should -Be 1
         $script:replicaEnd[0].Snapshots | Should -Be 1

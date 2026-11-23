@@ -1232,7 +1232,7 @@ Describe 'Invoke-DemoDeploymentTrack' {
             @($script:calls | Where-Object { $_ -in 'fabric stage', 'kept values', 'fabric app' -or $_ -like 'powerbi*' }) | Should -Be @('fabric stage', 'kept values', ('powerbi form={0}' -f $case.Form), 'fabric app')
             ($outcome.Results | Where-Object { $_.checkId -eq 'DEPLOY.FABRIC.KEPTVALUE' }).status | Should -Be $case.Status
         }
-        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -Times 2 -Exactly -ParameterFilter { $CheckId -eq 'DEPLOY.FABRIC.KEPTVALUE' -and $ProgressId -eq 'Fabric.KeptValues' -and $RunAgain -eq './scripts/deploy.ps1 -FromStage Fabric' -and $TimeoutMinutes -eq 30 }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -Times 2 -Exactly -ParameterFilter { $CheckId -eq 'DEPLOY.FABRIC.KEPTVALUE' -and $ProgressId -eq 'Fabric.KeptValues' -and $RunAgain -eq './scripts/deploy.ps1 -FromStage Fabric' -and $TimeoutMinutes -eq 30 -and $DecidesModelForm }
     }
 
     It 'ends a first deployment''s Fabric step without a Fail when a busy capacity kept the first history run queued past its wait: the model refreshes once it completes, before the Insights app (#68)' {

@@ -76,7 +76,9 @@ function Open-DemoLivySession {
     - Ended: the session ended before it was idle (dead, killed, error, or Fabric's acquisition failed); Error says why.
     - TimedOut: not idle after -TimeoutSeconds; a busy capacity queues a session (acquisition state queued).
     - Failed: any other answer.
-    A session that was created but isn't idle is deleted before the function returns, so a caller closes only an Idle one.
+    A session that was created but isn't idle is deleted before the function returns or throws (a network error past the
+    retries, or a stop of the run, included), so a caller closes only an Idle one. -TimeoutSeconds counts on the module's
+    clock (Get-DemoUtcNow), and on the polls' sleeps, whichever reaches it first.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -103,11 +105,12 @@ function Open-DemoLivySession {
     )
 
     $sessionsUri = Get-DemoLivySessionsUri -WorkspaceId $WorkspaceId -LakehouseId $LakehouseId
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $started = Get-DemoUtcNow
+    $elapsed = { ((Get-DemoUtcNow) - $started).TotalSeconds }
     $states = [System.Collections.Generic.List[string]]::new()
     $answer = {
         param([string] $Status, [int] $StatusCode, [string] $Text = '', [object] $Session = $null)
-        [pscustomobject]@{ Status = $Status; Session = $Session; StatusCode = $StatusCode; Error = $Text; States = $states.ToArray(); Seconds = [int]$watch.Elapsed.TotalSeconds }
+        [pscustomobject]@{ Status = $Status; Session = $Session; StatusCode = $StatusCode; Error = $Text; States = $states.ToArray(); Seconds = [int](& $elapsed) }
     }
 
     $create = Invoke-DemoFabricRequest -Method Post -Uri $sessionsUri -Token $Token -Body ([ordered]@{ name = $Name }) -NotIdempotent
@@ -122,50 +125,59 @@ function Open-DemoLivySession {
     $session = [pscustomobject]@{ Uri = ('{0}/{1}' -f $sessionsUri, $id); Id = $id; Name = $Name; Token = $Token }
 
     $outcome = $null
+    $idle = $false
     # The wait counts the polls' sleeps, or the clock when requests are slow, whichever reaches -TimeoutSeconds first.
     $waited = 0
-    while ($true) {
-        $read = Invoke-DemoFabricRequest -Method Get -Uri $session.Uri -Token $Token
-        if ($read.StatusCode -ne 200) {
-            $text = Get-DemoFabricErrorText -Response $read
-            $outcome = & $answer (Get-DemoLivyFailureKind -StatusCode $read.StatusCode -ErrorText $text) ([int]$read.StatusCode) $text
-            break
+    try {
+        while ($true) {
+            $read = Invoke-DemoFabricRequest -Method Get -Uri $session.Uri -Token $Token
+            if ($read.StatusCode -ne 200) {
+                $text = Get-DemoFabricErrorText -Response $read
+                $outcome = & $answer (Get-DemoLivyFailureKind -StatusCode $read.StatusCode -ErrorText $text) ([int]$read.StatusCode) $text
+                break
+            }
+            $state = [string](Get-DemoMemberValue -InputObject $read.Body -Name 'state')
+            $fabricState = Get-DemoMemberValue -InputObject $read.Body -Name 'fabricSessionStateInfo'
+            $acquisition = [string](Get-DemoMemberValue -InputObject $fabricState -Name 'state')
+            $seen = if ($acquisition) { '{0} ({1})' -f $state, $acquisition } else { $state }
+            if ($states.Count -eq 0 -or $states[$states.Count - 1] -ne $seen) {
+                $states.Add($seen)
+            }
+            if ($state -eq 'idle') {
+                $idle = $true
+                return (& $answer 'Idle' 200 '' $session)
+            }
+            # Why it ended: Fabric's acquisition error, or the first of its error details, or its cancellation's reason.
+            $why = [string](Get-DemoMemberValue -InputObject $fabricState -Name 'errorMessage')
+            $details = Get-DemoMemberValue -InputObject $read.Body -Name 'errorInfo'
+            if (-not $why -and $null -ne $details -and @($details).Count -gt 0) {
+                $first = @($details)[0]
+                $why = ('{0} {1}' -f (Get-DemoMemberValue -InputObject $first -Name 'errorCode'), (Get-DemoMemberValue -InputObject $first -Name 'message')).Trim()
+            }
+            if (-not $why) {
+                $why = [string](Get-DemoMemberValue -InputObject $read.Body -Name 'cancellationReason')
+            }
+            # not_submitted with an error is a submission that failed; without one, the session may still be submitted.
+            if ($state -in $script:LivySessionEnded -or $acquisition -in 'error', 'cancelled' -or ($state -eq 'not_submitted' -and $why)) {
+                $text = Protect-DemoText -Text ('the session is {0}{1}' -f $seen, $(if ($why) { ': ' + $why } else { '' }))
+                $outcome = & $answer $(if (Test-DemoFabricCapacityInactiveText -Text $why) { 'CapacityInactive' } else { 'Ended' }) 200 $text
+                break
+            }
+            if ($waited -ge $TimeoutSeconds -or (& $elapsed) -ge $TimeoutSeconds) {
+                $outcome = & $answer 'TimedOut' 200 ('the session was still {0} after {1} minutes' -f $seen, [int][System.Math]::Ceiling($TimeoutSeconds / 60.0))
+                break
+            }
+            Start-Sleep -Seconds $PollSeconds
+            $waited += $PollSeconds
         }
-        $state = [string](Get-DemoMemberValue -InputObject $read.Body -Name 'state')
-        $fabricState = Get-DemoMemberValue -InputObject $read.Body -Name 'fabricSessionStateInfo'
-        $acquisition = [string](Get-DemoMemberValue -InputObject $fabricState -Name 'state')
-        $seen = if ($acquisition) { '{0} ({1})' -f $state, $acquisition } else { $state }
-        if ($states.Count -eq 0 -or $states[$states.Count - 1] -ne $seen) {
-            $states.Add($seen)
-        }
-        if ($state -eq 'idle') {
-            return (& $answer 'Idle' 200 '' $session)
-        }
-        # Why it ended: Fabric's acquisition error, or the first of its error details, or its cancellation's reason.
-        $why = [string](Get-DemoMemberValue -InputObject $fabricState -Name 'errorMessage')
-        $details = Get-DemoMemberValue -InputObject $read.Body -Name 'errorInfo'
-        if (-not $why -and $null -ne $details -and @($details).Count -gt 0) {
-            $first = @($details)[0]
-            $why = ('{0} {1}' -f (Get-DemoMemberValue -InputObject $first -Name 'errorCode'), (Get-DemoMemberValue -InputObject $first -Name 'message')).Trim()
-        }
-        if (-not $why) {
-            $why = [string](Get-DemoMemberValue -InputObject $read.Body -Name 'cancellationReason')
-        }
-        # not_submitted with an error is a submission that failed; without one, the session may still be submitted.
-        if ($state -in $script:LivySessionEnded -or $acquisition -in 'error', 'cancelled' -or ($state -eq 'not_submitted' -and $why)) {
-            $text = Protect-DemoText -Text ('the session is {0}{1}' -f $seen, $(if ($why) { ': ' + $why } else { '' }))
-            $outcome = & $answer $(if (Test-DemoFabricCapacityInactiveText -Text $why) { 'CapacityInactive' } else { 'Ended' }) 200 $text
-            break
-        }
-        if ($waited -ge $TimeoutSeconds -or $watch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
-            $outcome = & $answer 'TimedOut' 200 ('the session was still {0} after {1} minutes' -f $seen, [int][System.Math]::Ceiling($TimeoutSeconds / 60.0))
-            break
-        }
-        Start-Sleep -Seconds $PollSeconds
-        $waited += $PollSeconds
     }
-    # Not idle: the session it created goes now, rather than when Fabric ends it after 20 minutes idle.
-    $null = Close-DemoLivySession -Session $session
+    finally {
+        # Not idle, a wait that threw included: the session it created goes now, rather than when Fabric ends it after 20
+        # minutes idle (the review of c96f790a).
+        if (-not $idle) {
+            $null = Close-DemoLivySession -Session $session
+        }
+    }
     return $outcome
 }
 
@@ -184,7 +196,9 @@ function Invoke-DemoLivyStatement {
     - Error: it raised (the output's status is error, or the statement's state is Error).
     - Cancelled: Fabric cancelled it.
     - TimedOut: it was still running after -TimeoutSeconds, so it was cancelled.
-    - Failed: the submit or a read failed (StatusCode).
+    - Failed: the submit or a read failed (StatusCode, after Invoke-DemoFabricRequest's retries): an HTTP answer, never
+      the code's own error.
+    -TimeoutSeconds counts on the module's clock (Get-DemoUtcNow), and on the polls' sleeps, whichever reaches it first.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -206,7 +220,8 @@ function Invoke-DemoLivyStatement {
         [int] $PollSeconds = 3
     )
 
-    $watch = [System.Diagnostics.Stopwatch]::StartNew()
+    $started = Get-DemoUtcNow
+    $elapsed = { ((Get-DemoUtcNow) - $started).TotalSeconds }
     $statementId = ''
     $answer = {
         param([string] $Status, [int] $StatusCode, [string] $Output = '', [string] $ErrorName = '', [string] $ErrorValue = '')
@@ -214,7 +229,7 @@ function Invoke-DemoLivyStatement {
         if ($value.Length -gt 1000) {
             $value = $value.Substring(0, 1000) + '...'
         }
-        [pscustomobject]@{ Status = $Status; Output = (Protect-DemoText -Text $Output); ErrorName = $ErrorName; ErrorValue = $value; StatusCode = $StatusCode; StatementId = $statementId; Seconds = [int]$watch.Elapsed.TotalSeconds }
+        [pscustomobject]@{ Status = $Status; Output = (Protect-DemoText -Text $Output); ErrorName = $ErrorName; ErrorValue = $value; StatusCode = $StatusCode; StatementId = $statementId; Seconds = [int](& $elapsed) }
     }
 
     $statementsUri = '{0}/statements' -f [string]$Session.Uri
@@ -229,7 +244,7 @@ function Invoke-DemoLivyStatement {
     $statement = $submit.Body
     $waited = 0
     while ([string](Get-DemoMemberValue -InputObject $statement -Name 'state') -notin 'available', 'Error', 'error', 'cancelled') {
-        if ($waited -ge $TimeoutSeconds -or $watch.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
+        if ($waited -ge $TimeoutSeconds -or (& $elapsed) -ge $TimeoutSeconds) {
             # Still running: cancelled, so it doesn't keep the session busy; a failed cancel ends with the session anyway.
             $null = Invoke-DemoFabricRequest -Method Post -Uri ('{0}/{1}/cancel' -f $statementsUri, $statementId) -Token $Session.Token -Body @{} -NotIdempotent
             return (& $answer 'TimedOut' 200 '' '' ('it was still {0} after {1} minutes, so it was cancelled' -f [string](Get-DemoMemberValue -InputObject $statement -Name 'state'), [int][System.Math]::Ceiling($TimeoutSeconds / 60.0)))

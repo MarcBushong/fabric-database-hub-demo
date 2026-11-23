@@ -953,7 +953,7 @@ function Invoke-DemoDeployment {
                     return (& $finishEarly)
                 }
                 # F35 (i): the history's kept values through Livy, before the model's step, as in the parallel Fabric track.
-                $keptValue = Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'DEPLOY.FABRIC.KEPTVALUE' -TimeoutMinutes 30 -ProgressPath $ProgressPath -ProgressId 'Fabric.KeptValues' -RunAgain './scripts/deploy.ps1 -FromStage Fabric'
+                $keptValue = Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'DEPLOY.FABRIC.KEPTVALUE' -TimeoutMinutes 30 -ProgressPath $ProgressPath -ProgressId 'Fabric.KeptValues' -RunAgain $script:KeptValueTrackRunAgain -DecidesModelForm
                 $results.Add($keptValue)
                 $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $ConfigPath -SnapshotValueForm (Get-DemoKeptValueForm -Result $keptValue))
                 & $addAll $powerBI

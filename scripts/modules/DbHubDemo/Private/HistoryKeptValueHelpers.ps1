@@ -10,23 +10,36 @@ $script:KeptValueModulePath = 'fabric/history/kept_value.py'
 $script:KeptValueJsonKeys = @('version', 'table', 'exists', 'missing', 'added', 'form', 'scope', 'read', 'resolved', 'pending', 'attempts', 'seconds', 'error')
 $script:KeptValueStepCode = 'import json; print(json.dumps(kept_value_step(spark)))'
 $script:KeptValueRunAgain = './scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity'
+# The command that also deploys the history model in the kept values' form: the Fabric track again, which a plain rerun skips
+# once an earlier run recorded it.
+$script:KeptValueTrackRunAgain = './scripts/deploy.ps1 -FromStage Fabric'
 $script:KeptValueDeployCheckId = 'DEPLOY.FABRIC.KEPTVALUE'
 $script:KeptValueEndCheckId = 'DEPLOY.FABRIC.KEPTVALUE.END'
 $script:KeptValueTrackRowId = 'Fabric.KeptValues'
 $script:KeptValueEndRowId = 'Fabric.HistoryKept'
 
 function Get-DemoKeptValueCode {
-    # This checkout's fabric/history/kept_value.py as text, which a Livy statement runs as it is, or '' when it isn't there.
-    # Internal.
+    # This checkout's fabric/history/kept_value.py as text, which a Livy statement runs as it is, or '' when it isn't there,
+    # or has no kept_value_step yet, as the groundwork's module hasn't: every step would then fail on a NameError (the review
+    # of c96f790a). -Path reads another file. Internal.
     [CmdletBinding()]
     [OutputType([string])]
-    param()
+    param(
+        [AllowEmptyString()]
+        [string] $Path = ''
+    )
 
-    $path = Join-Path -Path $script:RepoRoot -ChildPath $script:KeptValueModulePath
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+    if (-not $Path) {
+        $Path = Join-Path -Path $script:RepoRoot -ChildPath $script:KeptValueModulePath
+    }
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
         return ''
     }
-    return [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+    $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
+    if (-not $text.Contains('def kept_value_step(')) {
+        return ''
+    }
+    return $text
 }
 
 function Get-DemoKeptValueForm {
@@ -99,7 +112,10 @@ function Invoke-DemoKeptValueEndStep {
     -WhatIfRun, -SkipFabric, and a snapshot that saved nothing in this run (its outcome isn't Saved or SavedNotRefreshed):
     there's no new row to work out, and the Fabric track's step worked out the older ones. The history model isn't deployed
     again here: it reads the new kept values once Direct Lake updates it, which the snapshot's refresh, or Direct Lake's
-    automatic updates, do.
+    automatic updates, do. That needs the kept form: when this run's DEPLOY.FABRIC.KEPTVALUE (in -Result) didn't allow it,
+    the model reads the release's form until the Fabric track runs again, so the step runs with -ModelOnRelease, and its
+    fix is ./scripts/deploy.ps1 -FromStage Fabric, a Pass becoming a Warning (the review of c96f790a). A run whose Fabric
+    track didn't run its step (a resume) keeps the model its earlier run deployed.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -137,16 +153,24 @@ function Invoke-DemoKeptValueEndStep {
     if ($outcome -notin 'Saved', 'SavedNotRefreshed') {
         return (& $skip 'The history snapshot saved nothing in this run (DEPLOY.FABRIC.HISTORY says why), so there were no new rows whose kept values to work out.')
     }
-    return (Invoke-DemoHistoryKeptValue -Config $Config -CheckId $script:KeptValueEndCheckId -TimeoutMinutes $TimeoutMinutes -ProgressPath $ProgressPath -ProgressId $script:KeptValueEndRowId -RunAgain $script:KeptValueRunAgain)
+    $track = @($Result | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq $script:KeptValueDeployCheckId }) | Select-Object -Last 1
+    $modelOnRelease = $null -ne $track -and (Get-DemoKeptValueForm -Result $track) -cne 'Kept'
+    $runAgain = if ($modelOnRelease) { $script:KeptValueTrackRunAgain } else { $script:KeptValueRunAgain }
+    return (Invoke-DemoHistoryKeptValue -Config $Config -CheckId $script:KeptValueEndCheckId -TimeoutMinutes $TimeoutMinutes -ProgressPath $ProgressPath -ProgressId $script:KeptValueEndRowId -RunAgain $runAgain -ModelOnRelease:$modelOnRelease)
 }
 
 function Get-DemoKeptValueItem {
     <#
     .SYNOPSIS
     What DONE, NOT DONE, DEPLOY.SUMMARY, and the status page's Needs attention box say when deploy.ps1's kept-value steps
-    didn't work (F35, 2026-11-23): the latest DEPLOY.FABRIC.KEPTVALUE or DEPLOY.FABRIC.KEPTVALUE.END that isn't Not selected,
-    when it's a Warning, as an item of Get-DemoNonBlockingItem (name, state Action needed, message, howTo), or $null. A
-    Warning from the Fabric track that the end's step settled (a Pass) isn't listed. Pure. Internal.
+    didn't work (F35, 2026-11-23), as an item of Get-DemoNonBlockingItem (name, state Action needed, message, howTo), or
+    $null. Pure. Internal.
+
+    .DESCRIPTION
+    The latest DEPLOY.FABRIC.KEPTVALUE or DEPLOY.FABRIC.KEPTVALUE.END that isn't Not selected, when it's a Warning. A Pass at
+    the end settles the Fabric track's Warning only when that step allowed the kept form: otherwise this run's history model
+    reads the release's form, and the track's Warning, whose fix is ./scripts/deploy.ps1 -FromStage Fabric, stays listed
+    (the review of c96f790a). The end's step says so itself (ModelOnRelease); this keeps it so for any other caller.
     #>
     [CmdletBinding()]
     [OutputType([System.Collections.Specialized.OrderedDictionary])]
@@ -156,14 +180,23 @@ function Get-DemoKeptValueItem {
     )
 
     $ids = @($script:KeptValueDeployCheckId, $script:KeptValueEndCheckId)
-    $latest = @($Result | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -in $ids -and [string]$_.status -ne 'Not selected' }) | Select-Object -Last 1
-    if ($null -eq $latest -or [string]$latest.status -ne 'Warning') {
+    $mine = @($Result | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -in $ids })
+    $latest = @($mine | Where-Object { [string]$_.status -ne 'Not selected' }) | Select-Object -Last 1
+    $track = @($mine | Where-Object { [string]$_.checkId -eq $script:KeptValueDeployCheckId }) | Select-Object -Last 1
+    $open = $null
+    if ($null -ne $latest -and [string]$latest.status -eq 'Warning') {
+        $open = $latest
+    }
+    elseif ($null -ne $track -and [string]$track.status -eq 'Warning' -and (Get-DemoKeptValueForm -Result $track) -cne 'Kept') {
+        $open = $track
+    }
+    if ($null -eq $open) {
         return $null
     }
     return [ordered]@{
         name    = 'the history''s kept values (F35)'
         state   = 'Action needed'
-        message = ConvertTo-DemoPlainText -Value $latest.message
-        howTo   = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $latest -Name 'remediation')
+        message = ConvertTo-DemoPlainText -Value $open.message
+        howTo   = ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $open -Name 'remediation')
     }
 }

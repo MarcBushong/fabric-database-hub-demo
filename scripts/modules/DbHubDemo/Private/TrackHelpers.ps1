@@ -1853,7 +1853,7 @@ function Invoke-DemoDeploymentTrack {
                     # F35 (i): the history's kept values, worked out through Livy with this checkout's code before the model's
                     # step, which deploys the form of Snapshot Value that the step's own answer allows (Get-DemoKeptValueForm).
                     # Never a Fail, and never in DONE's way: a step that can't run leaves the model on the release's form.
-                    $keptValue = Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'DEPLOY.FABRIC.KEPTVALUE' -TimeoutMinutes ([int](& $option 'KeptValueMinutes' 30)) -ProgressPath $progress -ProgressId 'Fabric.KeptValues' -RunAgain './scripts/deploy.ps1 -FromStage Fabric'
+                    $keptValue = Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'DEPLOY.FABRIC.KEPTVALUE' -TimeoutMinutes ([int](& $option 'KeptValueMinutes' 30)) -ProgressPath $progress -ProgressId 'Fabric.KeptValues' -RunAgain $script:KeptValueTrackRunAgain -DecidesModelForm
                     & $addAll @($keptValue)
                     # The history semantic model and report (Phase 19), then the Insights app.
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message ''

@@ -419,7 +419,7 @@ function Stop-DemoEnvironment {
             # while the capacity still runs (Invoke-DemoHistoryKeptValue). Only after a run that completed: one still going
             # writes after it. Never a Fail.
             if ($null -ne $saved -and -not $historyRunning -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $saved.Result -Name 'evidence') -Name 'jobStatus') -eq 'Completed') {
-                $results.Add((Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'STOP.FABRIC.KEPTVALUE' -TimeoutMinutes 10 -SessionTimeoutMinutes 5))
+                $results.Add((Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'STOP.FABRIC.KEPTVALUE' -TimeoutMinutes 15 -SessionTimeoutMinutes 5))
             }
             # T4's read replica is deleted by now, and its metrics with it (ADR 0025): when the run that would have added them
             # to the history didn't (a paused capacity, for example), they're kept in out/history-pending, with the command
