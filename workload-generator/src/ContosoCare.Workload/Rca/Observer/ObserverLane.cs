@@ -11,11 +11,16 @@ namespace ContosoCare.Workload.Rca.Observer;
 /// one's end. T5 has no observer: it's only noted in the span, so its coverage says where its evidence is.
 /// A session's stop records the capture's end in the store (rca export --end-capture) while the workload runs on until
 /// the VM stops: each loop reads it at its next tick, a second at most, and ends its target's capture as a profile's end
-/// does, so the stop's export takes the span whole; only a profile set after the end is captured again.
+/// does; only a profile set after the end is captured again. The span then closes, unless the answer key still has to
+/// record a fault run that ended by the end: then only its close waits, capturing nothing, so the stop's export takes the
+/// span whole with those runs (the review of 1ca916a9).
 /// </summary>
 internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IReadOnlyList<DemoTarget> noted, IObservationGate gate, ICaptureStore store, RunnerLog log, TimeProvider time, ObserverOptions? options = null)
 {
-    /// <summary>An end later than this past the lane's clock is ignored (a clock that went back): capture goes on then.</summary>
+    /// <summary>
+    /// An end later than this past the lane's clock when the lane first reads it is ignored for good (a clock that went
+    /// back): capture goes on as before the end existed, and the stop's export names what stays on the VM.
+    /// </summary>
     internal static readonly TimeSpan FutureEndLimit = TimeSpan.FromMinutes(1);
 
     private readonly ObserverOptions settings = options ?? new ObserverOptions();
@@ -24,7 +29,16 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
     private ICaptureSpan? span;
     private int members;
     private DateTimeOffset storeRetryAt;
-    private DateTimeOffset? announcedEnd;
+
+    // The span's close that waits for the answer key after the capture's end: the latest time one of its members ended.
+    private DateTimeOffset? heldSince;
+
+    // The latest time a member of the open span ended (each loop stamps its own time), where a held span closes.
+    private DateTimeOffset? lastEnded;
+
+    // The decision about the last end read, kept for that end whatever the clock does later (the review of 1ca916a9): one
+    // ahead of the clock when first read stays ignored, and one applied stays applied.
+    private (DateTimeOffset End, bool Ignored)? decided;
 
     public async Task RunAsync(CancellationToken cancellationToken)
     {
@@ -35,6 +49,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
             loops.Add(Task.Run(() => NoteAsync(cancellationToken), CancellationToken.None));
         }
 
+        loops.Add(Task.Run(() => CloseHeldAsync(cancellationToken), CancellationToken.None));
         await Task.WhenAll(loops).ConfigureAwait(false);
         log.Info("rca.lane-stopped", "The RCA observer lane stopped.");
     }
@@ -75,7 +90,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                     }
                     finally
                     {
-                        Release(observer.Target, time.GetUtcNow());
+                        Release(observer.Target, time.GetUtcNow(), end);
                     }
                 }
                 else if (!wanted && observer.BeginsOnConnect)
@@ -150,7 +165,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                 }
                 else if (!wanted && active.Remove(target))
                 {
-                    Release(target.ToString(), now);
+                    Release(target.ToString(), now, end);
                 }
                 else if (active.Contains(target))
                 {
@@ -192,15 +207,18 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
 
     /// <summary>
     /// The capture's end that a session's stop recorded (rca export --end-capture), read from the store at each tick, or
-    /// null: none, one that can't be read, or one later than the lane's clock allows (a clock that went back), after which
-    /// capture goes on as before. The first tick that sees a new one says so in the log.
+    /// null: none, one that can't be read, or one that was later than the lane's clock allows when the lane first read it
+    /// (a clock that went back), which stays ignored, so capture goes on as before the end existed. The decision is kept for
+    /// that end: a clock that goes back or forward later neither lifts an end nor brings an ignored one into force (the
+    /// review of 1ca916a9: it only postponed it, until the clock caught up). The first tick that reads a new end says so in
+    /// the log.
     /// </summary>
     private DateTimeOffset? CaptureEnd(DateTimeOffset now)
     {
-        DateTimeOffset? end;
+        DateTimeOffset? read;
         try
         {
-            end = store.CaptureEndedAt();
+            read = store.CaptureEndedAt();
         }
         catch (Exception ex) when (ex is not OutOfMemoryException)
         {
@@ -208,30 +226,111 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
             return null;
         }
 
-        if (end is { } at && at > now + FutureEndLimit)
+        if (read is not { } end)
         {
-            end = null;
+            return null;
         }
 
-        if (end is not null && end != announcedEnd)
+        lock (endGate)
         {
-            lock (endGate)
+            if (decided is { } known && known.End == end)
             {
-                if (end != announcedEnd)
-                {
-                    announcedEnd = end;
-                    log.Info("rca.capture-ended", "A session's stop recorded the capture's end: the RCA observer ends its capture, and captures again once a profile is set after it.", ("endedUtc", end));
-                }
+                return known.Ignored ? null : end;
+            }
+
+            var ignored = end > now + FutureEndLimit;
+            decided = (end, ignored);
+            if (ignored)
+            {
+                log.Warn("rca.end-ahead", "A session's stop recorded the capture's end ahead of this clock, so the RCA observer ignores it and captures on; the stop's export names what stays on this VM.", ("endedUtc", end), ("nowUtc", now));
+                return null;
+            }
+
+            log.Info("rca.capture-ended", "A session's stop recorded the capture's end: the RCA observer ends its capture, and captures again once a profile is set after it.", ("endedUtc", end));
+            return end;
+        }
+    }
+
+    /// <summary>
+    /// Whether the span's close waits for the answer key after the capture's end at <paramref name="end"/>: a fault run of a
+    /// target this lane observes or notes that ended by then is still to be recorded (IObservationGate.HoldsAfter).
+    /// </summary>
+    private bool Holds(DateTimeOffset end)
+    {
+        try
+        {
+            // Every target this lane observes or notes: the answer key of any of them can hold the span's close.
+            return observers.Select(o => o.Gate).Concat(noted).Distinct().Any(t => gate.HoldsAfter(t, end));
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            log.Debug("rca.hold-failed", Redactor.Redact(ex.Message));
+            return false;
+        }
+    }
+
+    /// <summary>
+    /// Closes the span whose close waited for the answer key (Release), once it no longer has to: checked every second, and
+    /// whatever the answer key does, when the lane stops. It closes at the time its last member ended, so its coverage ends
+    /// where the capture did.
+    /// </summary>
+    private async Task CloseHeldAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            try
+            {
+                await Task.Delay(TimeSpan.FromSeconds(1), time, cancellationToken).ConfigureAwait(false);
+            }
+            catch (OperationCanceledException)
+            {
+                break;
+            }
+
+            bool held;
+            lock (spanGate)
+            {
+                held = heldSince is not null;
+            }
+
+            if (held)
+            {
+                CloseHeld(CaptureEnd(time.GetUtcNow()) is { } end && Holds(end));
             }
         }
 
-        return end;
+        CloseHeld(holds: false);
+    }
+
+    private void CloseHeld(bool holds)
+    {
+        lock (spanGate)
+        {
+            if (holds || span is null || members > 0 || heldSince is not { } since)
+            {
+                return;
+            }
+
+            span.Close(since);
+            span = null;
+            heldSince = null;
+            log.Info("rca.span-closed", "The answer key has the fault runs that ended by the capture's end, so the span closed for the stop's export.");
+        }
     }
 
     private ICaptureSpan? Acquire(string target, DateTimeOffset at)
     {
         lock (spanGate)
         {
+            if (span is not null && heldSince is { } since)
+            {
+                // A session that began after the capture's end: the span that waits for the answer key is the stopped
+                // session's, so it closes now, and the new session's capture goes into a span of its own.
+                span.Close(since);
+                span = null;
+                heldSince = null;
+            }
+
             if (span is null)
             {
                 if (at < storeRetryAt)
@@ -242,6 +341,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                 try
                 {
                     span = store.Open(at);
+                    lastEnded = null;
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or InvalidOperationException)
                 {
@@ -257,8 +357,15 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
         }
     }
 
-    private void Release(string target, DateTimeOffset at)
+    /// <summary>
+    /// A target's capture ended: the span closes once its last member has, except after the capture's end
+    /// (<paramref name="end"/>) while the answer key still has to record a fault run that ended by then: its close waits for
+    /// that, capturing nothing (CloseHeldAsync), so the stop's export takes those runs with it (the review of 1ca916a9).
+    /// </summary>
+    private void Release(string target, DateTimeOffset at, DateTimeOffset? end = null)
     {
+        // Asked before the span's lock: the profile host answers under its lanes' own locks.
+        var holds = end is { } ended && Holds(ended);
         lock (spanGate)
         {
             if (span is null)
@@ -267,9 +374,17 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
             }
 
             span.Ended(target, at);
+            lastEnded = lastEnded is { } known && known > at ? known : at;
             if (--members <= 0)
             {
                 members = 0;
+                if (holds)
+                {
+                    heldSince = lastEnded;
+                    log.Info("rca.span-held", "The RCA observer ended its capture at the session's stop; the span closes once the answer key has the fault runs that ended by then.");
+                    return;
+                }
+
                 span.Close(at);
                 span = null;
             }

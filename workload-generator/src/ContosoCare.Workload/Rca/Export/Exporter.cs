@@ -51,8 +51,10 @@ internal sealed record ExportResult(IReadOnlyList<ExportedDocument> Documents, s
 /// the budget to itself. A span that can't be exported is a Warning in the index, and the others still export.
 /// With <c>--final</c> it waits a bounded time for the observer to end its spans, so the session's last capture is in.
 /// With <c>--end-capture</c> (a session's stop, while the workload runs on), it first records the capture's end, which
-/// the observer reads within a second and ends its capture by, so that wait sees the spans end. When one still doesn't,
-/// the index's message says so first (<see cref="StillCapturing"/>), and the runbook names that VM's tail.
+/// the observer reads within a second and ends its capture by; a span then closes once the answer key has the fault runs
+/// that ended by the end, so that wait sees the spans end with those runs in. A second stop of the same session keeps the
+/// end its first recorded. When a span still doesn't end, the index's message says so first
+/// (<see cref="StillCapturing"/>), and the runbook names that VM's tail.
 /// </summary>
 internal sealed class Exporter(EvidenceStore store, RunnerLog log, string producerVersion)
 {
@@ -191,8 +193,16 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
     {
         try
         {
-            store.EndCapture(at, sessionId);
-            log.Info("rca.end-recorded", "Recorded the capture's end: the observer ends its capture within a second, and captures again once a profile is set after it.", ("endedUtc", at), ("session", sessionId ?? "none"));
+            var ended = store.EndCapture(at, sessionId);
+            if (ended == at)
+            {
+                log.Info("rca.end-recorded", "Recorded the capture's end: the observer ends its capture within a second, and captures again once a profile is set after it.", ("endedUtc", ended), ("session", sessionId ?? "none"));
+            }
+            else
+            {
+                log.Info("rca.end-kept", "Kept the capture's end that this session's first stop recorded.", ("endedUtc", ended), ("session", sessionId ?? "none"));
+            }
+
             return true;
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
