@@ -801,10 +801,11 @@ function Invoke-DemoFabricStage {
     notebooks and the Real-Time Dashboard while the targets deploy, and leaves the Hub checklist, the T3
     gate, and the dashboard's tile check to the validation, which passes -CheckDashboardData once telemetry
     flows, and -T3PerformanceMonitoringCheck with the T3.PROPERTY result, so the gate's extended-property part
-    isn't left as a manual step. While fabric.importNotebooks is false, deploy passes -NewNotebooksOnly: notebooks
-    that aren't in the workspace yet are imported without asking, and existing ones stay as they are (Phase 26a). The
-    track also passes -HistoryRunWaitMinutes and -ProgressPath (#68): a first deployment's first history run waits that
-    long while the capacity keeps it queued, and the status page's Fabric row shows the wait.
+    isn't left as a manual step. While fabric.importNotebooks is false, deploy passes -KeepEditedNotebooks: notebooks
+    that aren't in the workspace yet are imported without asking, one that's an earlier version of the demo's, which
+    nobody edited, is brought up to date, and an edited one stays as it is (Phase 26a; follow-ups decision 2a,
+    2026-11-23). The track also passes -HistoryRunWaitMinutes and -ProgressPath (#68): a first deployment's first
+    history run waits that long while the capacity keeps it queued, and the status page's Fabric row shows the wait.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -816,7 +817,7 @@ function Invoke-DemoFabricStage {
 
         [switch] $ImportNotebooks,
 
-        [switch] $NewNotebooksOnly,
+        [switch] $KeepEditedNotebooks,
 
         [switch] $ImportDashboard,
 
@@ -856,8 +857,8 @@ function Invoke-DemoFabricStage {
                 $arguments['T3PerformanceMonitoringCheck'] = $T3PerformanceMonitoringCheck
             }
         }
-        if ($NewNotebooksOnly -and -not $ImportNotebooks) {
-            $arguments['NewNotebooksOnly'] = $true
+        if ($KeepEditedNotebooks -and -not $ImportNotebooks) {
+            $arguments['KeepEditedNotebooks'] = $true
         }
         elseif (-not $ImportNotebooks) {
             $arguments['SkipNotebookImport'] = $true
@@ -1017,7 +1018,7 @@ function Merge-DemoBlankMeasureResult {
         return $all
     }
     $ids = @($blank | ForEach-Object { [string]$_.checkId })
-    $merged = New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURES' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The history report is empty until NB_DatabaseHub_LiveActivity saves its first snapshots; that''s expected right after a first deployment ({0} measures are blank for now).' -f $blank.Count) -Evidence ([ordered]@{ blankMeasures = $ids }) -Remediation 'Nothing to do now: ./scripts/stop-demo.ps1 -SaveHistory (or ./scripts/configure-fabric.ps1 -RunLiveActivity) runs NB_DatabaseHub_LiveActivity, which saves the snapshots the report shows; ./scripts/configure-powerbi.ps1 -CheckModelData then checks every measure again.' -DocUrl 'https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group'
+    $merged = New-DemoResult -CheckId 'FABRIC.SEMANTICMODEL.MEASURES' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The history report is empty until NB_DatabaseHub_LiveActivity saves its first snapshots; that''s expected right after a first deployment ({0} measures are blank for now).' -f $blank.Count) -Evidence ([ordered]@{ blankMeasures = $ids }) -Remediation 'Nothing to do now: ./scripts/stop-demo.ps1 -SaveHistory (or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity) runs NB_DatabaseHub_LiveActivity, which saves the snapshots the report shows; ./scripts/configure-powerbi.ps1 -CheckModelData then checks every measure again.' -DocUrl 'https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group'
     $kept = [System.Collections.Generic.List[object]]::new()
     $placed = $false
     foreach ($item in $all) {

@@ -464,7 +464,7 @@ function Get-DemoCosmosHistoryCapture {
         $evidence = [ordered]@{ account = [string]$capture.AccountName; series = [int]$capture.SeriesCount; points = [int]$capture.PointCount; bytes = [int]$capture.Bytes; intervalMinutes = [int]$capture.IntervalMinutes; windowMinutes = $WindowMinutes; peakNormalizedRuPercent = $capture.PeakNormalizedRu; requests = $capture.Requests; throttledRequests = $capture.ThrottledRequests; notes = @($capture.Notes) }
         $remediation = ''
         if ([string]$capture.Status -eq 'Warning') {
-            $remediation = 'Database Hub''s Cosmos DB views show T5''s metrics for Azure Monitor''s retention; the next ./scripts/stop-demo.ps1 -SaveHistory or ./scripts/configure-fabric.ps1 -RunLiveActivity reads them again.'
+            $remediation = 'Database Hub''s Cosmos DB views show T5''s metrics for Azure Monitor''s retention; the next ./scripts/stop-demo.ps1 -SaveHistory or ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity reads them again.'
         }
         return [pscustomobject]@{ Json = $json; Result = (New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'T5' -Status ([string]$capture.Status) -Message ([string]$capture.Message) -Evidence $evidence -Remediation $remediation -DocUrl $docUrl) }
     }

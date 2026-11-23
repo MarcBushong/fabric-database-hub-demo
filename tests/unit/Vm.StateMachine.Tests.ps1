@@ -199,6 +199,42 @@ Describe 'VM step runner' {
         $health.warnings | Should -Contain 'Media: Trusted on first use.' -Because 'validate.ps1 says which step warned (F24)'
     }
 
+    It 'records a note a new VM''s bootstrap gives by design as information, naming its step, so a Ready VM stays a Pass; a warning beside it sets the status, and the next generation lets the note go (2026-11-23)' {
+        $note = 'SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.'
+        $steps = @(
+            @{ Name = 'SqlAdminAccess'; Test = { $script:recovered }; Set = { $script:recovered = $true; New-DemoVmStepResult -Outcome 'Done' -NoteMessage 'SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.' } }
+            @{ Name = 'Media'; Test = { -not $script:mediaWarns }; Set = { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' -WarningMessage 'Trusted on first use.' } }
+        )
+        # The note alone: a Pass, and health.json still matches its schema.
+        $root = New-TestRoot
+        $script:recovered = $false
+        $script:mediaWarns = $false
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        $health.status | Should -Be 'Pass' -Because 'a note is information, not a warning'
+        @($health.warnings).Count | Should -Be 0
+        @($health.notes) | Should -Be @($note)
+        Test-Json -Json (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'health.json') -Raw) -SchemaFile $healthSchema | Should -BeTrue
+
+        # A warning beside it: the warning alone makes the status a Warning, and the note stays a note.
+        $root = New-TestRoot
+        $script:recovered = $false
+        $script:mediaWarns = $true
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        $health.status | Should -Be 'Warning'
+        @($health.warnings) | Should -Be @('Media: Trusted on first use.')
+        @($health.notes) | Should -Be @($note)
+
+        # A new generation clears the note, as it does a one-off warning, and the step passes its Test, so it doesn't come
+        # back; the lasting warning stays.
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        @($health.notes).Count | Should -Be 0
+        @((Get-DemoVmState)['notes']).Count | Should -Be 0
+        @($health.warnings) | Should -Be @('Media: Trusted on first use.')
+    }
+
     It 'keeps a lasting cause''s warning across a generation while its step passes its Test, and lets a one-off note and a fixed cause go (F24 review)' {
         $root = New-TestRoot
         $script:restartDone = $false

@@ -241,7 +241,7 @@ function Invoke-DemoHistorySnapshotRun {
         return (& $answer 'Warning' 'Failed' ('The history report got no snapshot: the workspace''s notebooks couldn''t be listed (HTTP {0}): {1}' -f $found.StatusCode, $listError) ('Run {0} once Fabric answers.' -f $again) 'Fail')
     }
     if (@($found.Items).Count -eq 0) {
-        return (& $answer 'Not selected' 'NotSelected' ('The Fabric track didn''t import {0}: it isn''t in the workspace "{1}", so the history report got no snapshot.' -f $notebook, $workspaceName) ('./scripts/deploy.ps1 imports it (its Fabric track), then runs it at its end; or run ./scripts/configure-fabric.ps1 -SkipHubChecks, then {0}.' -f $again))
+        return (& $answer 'Not selected' 'NotSelected' ('The Fabric track didn''t import {0}: it isn''t in the workspace "{1}", so the history report got no snapshot.' -f $notebook, $workspaceName) ('./scripts/deploy.ps1 imports it (its Fabric track), then runs it at its end; or run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook {0}, which imports that notebook alone, then {1}.' -f $notebook, $again))
     }
 
     # The Incident RCA's evidence (2026-11-20, ADR 0031): the runners' export, not a session's last (the activity goes on),

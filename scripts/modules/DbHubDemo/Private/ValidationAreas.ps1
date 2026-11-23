@@ -199,6 +199,13 @@ function Invoke-DemoValidationInfrastructure {
             # Every warning a one-off note that a new VM's bootstrap gives by design (F32).
             $healthEvidence['warningsExpected'] = [bool]$warningNote.Expected
         }
+        # The notes a new VM's bootstrap gives by design, as information, which leave it a Pass (2026-11-23).
+        $noteText = Get-DemoHealthNoteText -Health $health
+        if ($null -ne $noteText) {
+            $text = '{0} {1}' -f $text.TrimEnd(), $noteText.Text
+            $healthEvidence['noteCount'] = $noteText.Count
+            $healthEvidence['notes'] = Get-DemoMemberList -InputObject $health -Name 'notes'
+        }
         $results.Add((New-DemoResult -CheckId ('INFRA.HEALTH.{0}' -f $suffix) -Area 'infra' -Target $target -Status $healthStatus -Message $text -Evidence $healthEvidence -Remediation $remediation -DocUrl $healthDoc -EvaluationOnly:$evaluationOnly))
 
         if ($guestCheck) {

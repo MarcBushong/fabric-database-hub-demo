@@ -1844,7 +1844,7 @@ function Invoke-DemoDeploymentTrack {
                     # keeps it queued, on the status page; one still queued then is followed after the history model's step.
                     $historyWait = [int](& $option 'HistoryRunWaitMinutes' 45)
                     $historyFollow = [int](& $option 'HistoryFollowMinutes' 45)
-                    $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -NewNotebooksOnly -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks -HistoryRunWaitMinutes $historyWait -ProgressPath $progress)
+                    $fabric = @(Invoke-DemoFabricStage -Config $Config -ConfigPath $fabricConfigPath -ImportNotebooks:$import -KeepEditedNotebooks -ImportDashboard:([bool](& $option 'ImportDashboard' $true)) -SkipHubChecks -HistoryRunWaitMinutes $historyWait -ProgressPath $progress)
                     # A first history run that didn't complete is never a Fail: the history snapshot at the run's end runs it again.
                     $firstRun = Get-DemoHistoryFirstRun -Result $fabric
                     Set-DemoHistoryFirstRunWarning -FirstRun $firstRun

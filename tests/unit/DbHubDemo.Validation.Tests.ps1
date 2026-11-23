@@ -373,6 +373,31 @@ Describe 'Stopped VMs are expected (validation areas)' {
         $script:summary.warnings = @('AutoLogonSecret: Windows automatic sign-in was armed on sqlvm01, which nothing in the demo does; the cleanup turned it off and deleted its LSA secret and Winlogon values.')
         (& $read).message | Should -Not -Match 'expected'
     }
+
+    It 'passes a Ready VM whose bootstrap recorded its by-design notes as information, and still names them and why (2026-11-23)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        $cleanup = 'GuestSignInCleanup: The sign-in cleanup cleared Application on archost01, because they held token-shaped values; endpoint protection may report a cleared event log.'
+        $image = 'GuestImage: The image has no Content-MD5 here, so it was checked by its length and its pinned SHA-256.'
+        $script:summary = [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Pass'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 0; warnings = @(); noteCount = 2; notes = @($cleanup, $image) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:summary }
+        $read = {
+            $context = New-TestContext
+            @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.ARCHOST01' }
+        }
+        $health = & $read
+        $health.status | Should -Be 'Pass' -Because 'health.json''s own status is a Pass: a note is information'
+        $health.message | Should -Be ('archost01 reports Ready: Every step is in the desired state. Its bootstrap noted, as information: {0}; {1}. Those are expected: a sign-in cleanup that clears an event log follows T2''s Arc onboarding, on a new host or a rebuilt guest (ADR 0009); Jumpstart''s image has no Content-MD5, so a new T2 host checks it by its length and its pinned SHA-256.' -f $cleanup.TrimEnd('.'), $image.TrimEnd('.'))
+        $health.remediation | Should -BeNullOrEmpty
+        $health.evidence['noteCount'] | Should -Be 2
+        @($health.evidence['notes']).Count | Should -Be 2
+
+        # Beside a warning: the warning sets the status, and the notes are still named.
+        $script:summary = [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 1; warnings = @('GuestFirstBoot: Uninstalling SSIS in arcsql01 didn''t pass (setup exit code 1).'); noteCount = 1; notes = @($cleanup) }
+        $mixed = & $read
+        $mixed.status | Should -Be 'Warning'
+        $mixed.message | Should -Match 'Its bootstrap has a warning: GuestFirstBoot: Uninstalling SSIS in arcsql01 didn''t pass \(setup exit code 1\)\. Its bootstrap noted, as information: GuestSignInCleanup: '
+        $mixed.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it'
+    }
     It 'warns, with the extension-update finding, when health.json can''t be read' {
         Set-TestAzResponse (Get-TestAzResponse -Power 'running')
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'Reading health.json on sqlvm01 failed (execution state Pending, exit code ).' }

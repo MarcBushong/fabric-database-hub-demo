@@ -1203,6 +1203,11 @@ Describe 'Invoke-DemoDeployment' {
         $script:order | Should -Not -Contain 'DoneGate'
     }
 
+    It 'brings the demo''s notebooks that nobody edited up to date while fabric.importNotebooks is false, and keeps an edited one: the Fabric stage asks configure-fabric.ps1 for -KeepEditedNotebooks (follow-ups decision 2a, 2026-11-23)' {
+        $null = Invoke-DemoDeployment -Config $config
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['KeepEditedNotebooks'] -and -not $PesterBoundParameters.ContainsKey('NewNotebooksOnly') }
+    }
+
     It 'starts the Insights app''s sign-in before its stages and runs the app''s step after the report; a failed app never stops the stage or keeps the run from DONE (-Sequential, 2026-11-05)' {
         # Every requirement passes, so the outcome turns on the app alone.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoDoneGate -MockWith {
@@ -1651,6 +1656,26 @@ Describe 'Invoke-DemoDeployment' {
         $script:order.Clear()
         Invoke-DemoDeployment -Config $config -StopAfter Infrastructure | Out-Null
         $script:order | Should -Not -Contain 'KeyVault' -Because 'the default path creates no vault'
+    }
+}
+
+Describe 'Invoke-DemoFabricStage: the notebook mode it gives configure-fabric.ps1 (follow-ups decision 2a, 2026-11-23)' {
+    BeforeAll {
+        $config = New-TestConfig
+    }
+
+    It 'asks for -KeepEditedNotebooks while fabric.importNotebooks is false, every notebook with -ImportNotebooks, and no import with neither' {
+        # -KeepEditedNotebooks: a notebook that nobody edited is brought up to date, and an edited one is kept. With
+        # -ImportNotebooks (fabric.importNotebooks true, or deploy.ps1 -ImportNotebooks), every notebook is updated, edited
+        # or not; with neither (validate.ps1's checklist), none is imported.
+        $script:modes = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRepositoryScript -MockWith { $script:modes.Add((@($Argument.Keys | Where-Object { [string]$_ -in 'KeepEditedNotebooks', 'NewNotebooksOnly', 'SkipNotebookImport' } | Sort-Object) -join ',')) }
+        InModuleScope DbHubDemo -Parameters @{ Config = $config } {
+            $null = Invoke-DemoFabricStage -Config $Config -KeepEditedNotebooks
+            $null = Invoke-DemoFabricStage -Config $Config -KeepEditedNotebooks -ImportNotebooks
+            $null = Invoke-DemoFabricStage -Config $Config
+        }
+        $script:modes.ToArray() | Should -Be @('KeepEditedNotebooks', '', 'SkipNotebookImport')
     }
 }
 
@@ -3142,6 +3167,15 @@ Describe 'Get-DemoEnvironmentStatus' {
         $vm.status | Should -Be 'Warning'
         $vm.message | Should -Be 'sqlvm01 is running; bootstrap Ready: Every step is in the desired state. Its bootstrap has a warning: AssociatedServices: SQL Server setup asked for a restart; the next start completes it. That''s expected: SQL Server setup asks for a restart when it removes Analysis Services and Integration Services from a new T1.'
         $vm.evidence.warningCount | Should -Be 1
+    }
+
+    It 'passes STATUS.VM_SQLVM01 for a Ready VM whose bootstrap recorded its by-design notes as information, and names them (2026-11-23)' {
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'sqlvm01') { 'PowerState/running' } else { 'PowerState/deallocated' } }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { [pscustomobject]@{ status = 'Pass'; state = 'Ready'; message = 'Every step is in the desired state.'; warningCount = 0; warnings = @(); noteCount = 1; notes = @('SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.') } }
+        $vm = Get-DemoEnvironmentStatus -Config $config | Where-Object { $_.checkId -eq 'STATUS.VM_SQLVM01' }
+        $vm.status | Should -Be 'Pass'
+        $vm.message | Should -Be 'sqlvm01 is running; bootstrap Ready: Every step is in the desired state. Its bootstrap noted, as information: SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure. That''s expected: a new T1 needs the sysadmin recovery, because its image''s SQL IaaS Agent least-privilege mode doesn''t make SYSTEM a sysadmin.'
+        $vm.evidence.noteCount | Should -Be 1
     }
     It 'flags T2''s guest that a golden capture left air-gapped while archost01 runs, from the same health read (live, 2026-11-03)' {
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmPowerState -MockWith { if ($VmName -eq 'archost01') { 'PowerState/running' } else { 'PowerState/deallocated' } }

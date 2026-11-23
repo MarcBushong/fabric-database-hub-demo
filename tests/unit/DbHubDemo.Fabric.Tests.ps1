@@ -117,6 +117,44 @@ BeforeAll {
         $Request.Body | ConvertFrom-Json -Depth 32
     }
 
+    # A workspace's copy of a notebook as Fabric gives it back (Get Item Definition, ipynb), for -KeepEdited (2026-11-23):
+    # each cell's source in one string with CRLF, outputs and execution counts from a run, Fabric's own metadata, and a
+    # .platform part. -Change edits the parsed notebook first.
+    function New-WorkspaceCopy {
+        param([pscustomobject] $Notebook, [scriptblock] $Change = {})
+        $copy = ConvertFrom-TestPayload -Payload ([string]$Notebook.Definition['parts'][0]['payload']) | ConvertFrom-Json -AsHashtable
+        foreach ($cell in @($copy['cells'])) {
+            $cell['source'] = ((@($cell['source']) -join '') -replace "`n", "`r`n") + "`r`n"
+            if ($cell['cell_type'] -eq 'code') {
+                $cell['execution_count'] = 4
+                $cell['outputs'] = @(@{ output_type = 'stream'; name = 'stdout'; text = @('ran') })
+            }
+        }
+        $copy['metadata'] = @{ kernel_info = @{ name = 'synapse_pyspark' }; widgets = @{} }
+        & $Change $copy
+        $payload = [System.Convert]::ToBase64String([System.Text.UTF8Encoding]::new($false).GetBytes((ConvertTo-Json -InputObject $copy -Depth 20)))
+        New-FabricResponse -Status 200 -Body @{ definition = @{ format = 'ipynb'; parts = @(
+                    @{ path = 'notebook-content.ipynb'; payload = $payload; payloadType = 'InlineBase64' }
+                    @{ path = '.platform'; payload = [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes('{}')); payloadType = 'InlineBase64' }
+                ) }
+        }
+    }
+
+    # The fingerprint of a copy from New-WorkspaceCopy, as deploy.ps1 reads it.
+    function Get-CopyFingerprint {
+        param([object] $Response)
+        InModuleScope DbHubDemo -Parameters @{ Content = $Response.Content } {
+            Get-DemoNotebookFingerprint -Text ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([string]($Content | ConvertFrom-Json).definition.parts[0].payload)))
+        }
+    }
+
+    # An edit in Fabric: the first code cell after the parameters gets a line.
+    $script:editCode = {
+        param($Notebook)
+        $cell = @($Notebook['cells'] | Where-Object { $_['cell_type'] -eq 'code' -and -not (@($_['metadata']['tags']) -contains 'parameters') })[0]
+        $cell['source'] = '# my change' + "`r`n" + $cell['source']
+    }
+
     $script:listUri = [regex]::Escape("$script:api/workspaces/$script:workspaceId/items?type=Notebook")
     $script:createUri = '^' + [regex]::Escape("$script:api/workspaces/$script:workspaceId/items") + '$'
     $script:updateUri = '^' + [regex]::Escape("$script:api/workspaces/$script:workspaceId/items/$script:itemId/updateDefinition") + '$'
@@ -449,6 +487,128 @@ Describe 'Import-DemoFabricNotebook' {
         { InModuleScope DbHubDemo -Parameters @{ Token = $token } { Invoke-DemoFabricRequest -Method Get -Uri 'https://example.com/v1/workspaces' -Token $Token } } |
             Should -Throw '*Refusing*'
     }
+
+    Context 'with -KeepEdited: deploy.ps1 brings a copy that nobody edited up to date, and keeps an edited one (follow-ups decision 2a, 2026-11-23)' {
+        BeforeAll {
+            # The live-activity notebook as this run uploads it, bound to the workspace and a lakehouse.
+            $script:live = Get-DemoFabricNotebookDefinition -Path $liveNotebook -LakehouseId $otherLakehouseId -LakehouseWorkspaceId $workspaceId
+            $script:liveListUri = $listUri
+            $script:definitionUri = '^' + [regex]::Escape("$api/workspaces/$workspaceId/items/$itemId/getDefinition?format=ipynb") + '$'
+        }
+
+        BeforeEach {
+            # The versions this repository published: an earlier one of the live-activity notebook is known to the test,
+            # whatever the real file lists.
+            $script:earlier = $null
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoNotebookPublishedVersion -MockWith {
+                if ($null -ne $earlier) { @([pscustomobject]@{ Sha256 = $earlier; Since = '2026-11-13' }) } else { @() }
+            }
+        }
+
+        It 'updates an earlier version of the demo''s that nobody edited, read as ipynb, and says which' {
+            $older = New-WorkspaceCopy -Notebook $live -Change $editCode
+            $script:earlier = (Get-CopyFingerprint -Response $older).Sha256
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $liveListUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
+                @{ Method = 'Post'; Match = $definitionUri; Responses = @($older) }
+                @{ Method = 'Post'; Match = $updateUri; Responses = @(New-FabricResponse -Status 200 -Body $null) }
+            )
+            $result = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $live -Token $secureToken -KeepEdited -Confirm:$false
+            $result.status | Should -Be 'Pass'
+            $result.evidence.operation | Should -Be 'updated'
+            $result.evidence.notebookState | Should -Be 'Older'
+            $result.evidence.publishedSince | Should -Be '2026-11-13'
+            $result.message | Should -Match '^Updated notebook ''NB_DatabaseHub_LiveActivity'''
+            $result.message | Should -Match 'It was the demo''s version of 2026-11-13, and nobody had edited it\. fabric\.importNotebooks is false, so deploy\.ps1 adds a missing notebook, brings one that nobody edited up to date, and keeps an edited one\.$'
+            @($requests | Where-Object { $_.Uri -match $definitionUri }).Count | Should -Be 1
+            @($requests | Where-Object { $_.Uri -match $updateUri }).Count | Should -Be 1
+        }
+
+        It 'keeps an edited copy, with the command that replaces that notebook alone' {
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $liveListUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
+                @{ Method = 'Post'; Match = $definitionUri; Responses = @(New-WorkspaceCopy -Notebook $live -Change $editCode) }
+            )
+            $result = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $live -Token $secureToken -KeepEdited -Confirm:$false
+            $result.status | Should -Be 'Not selected'
+            $result.checkId | Should -Be 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY'
+            $result.evidence.operation | Should -Be 'unchanged'
+            $result.evidence.notebookState | Should -Be 'Edited'
+            $result.evidence.itemId | Should -Be $itemId
+            $result.message | Should -Match '^Kept notebook ''NB_DatabaseHub_LiveActivity'' in Fabric workspace .+ as it is: it isn''t a version the demo published, so someone edited it'
+            $result.remediation | Should -Match '^To replace it with this version, which drops the edits, run \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity: it updates that notebook alone\.'
+            @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -notmatch $definitionUri }).Count | Should -Be 0 -Because 'an edited notebook is kept'
+        }
+
+        It 'leaves this version as it is, and binds this version to another lakehouse again: <Case>' -ForEach @(
+            @{ Case = 'the same values'; Lakehouse = $null; Status = 'Pass'; State = 'Current'; Updates = 0 }
+            @{ Case = 'another lakehouse'; Lakehouse = '88888888-8888-8888-8888-888888888888'; Status = 'Pass'; State = 'Rebind'; Updates = 1 }
+        ) {
+            $other = $Lakehouse
+            $copy = New-WorkspaceCopy -Notebook $live -Change {
+                param($Notebook)
+                if ($other) {
+                    $parameters = @($Notebook['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]
+                    $parameters['source'] = $parameters['source'] -replace '(?m)^LAKEHOUSE_ID = "[^"]*"', ('LAKEHOUSE_ID = "{0}"' -f $other)
+                }
+            }
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $liveListUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
+                @{ Method = 'Post'; Match = $definitionUri; Responses = @($copy) }
+                @{ Method = 'Post'; Match = $updateUri; Responses = @(New-FabricResponse -Status 200 -Body $null) }
+            )
+            $result = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $live -Token $secureToken -KeepEdited -Confirm:$false
+            $result.status | Should -Be $Status
+            $result.evidence.notebookState | Should -Be $State
+            @($requests | Where-Object { $_.Uri -match $updateUri }).Count | Should -Be $Updates
+            if ($State -eq 'Current') {
+                $result.evidence.operation | Should -Be 'unchanged'
+                $result.message | Should -Match '^Notebook ''NB_DatabaseHub_LiveActivity'' in Fabric workspace .+ is this version already, so it was left as it is\.'
+            }
+            else {
+                $result.evidence.operation | Should -Be 'updated'
+                $result.message | Should -Match 'It was this version, bound to another workspace, lakehouse, or GitHub path than this run''s, and nobody had edited it\.'
+            }
+        }
+
+        It 'keeps a copy it couldn''t read: <Case>' -ForEach @(
+            @{ Case = 'an error, a Warning'; Body = @{ errorCode = 'InternalError'; message = 'Something went wrong.' }; HttpStatus = 500; Status = 'Warning'; Fix = '^The next \./scripts/deploy\.ps1 reads it again\. To update it now, run \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which replaces any edits\.$' }
+            @{ Case = 'a paused capacity, Manual action required'; Body = @{ errorCode = 'CapacityNotActive'; message = 'Capacity is not active' }; HttpStatus = 404; Status = 'Manual action required'; Fix = '^Resume the capacity' }
+        ) {
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $liveListUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
+                @{ Method = 'Post'; Match = $definitionUri; Responses = @(New-FabricResponse -Status $HttpStatus -Body $Body) }
+            )
+            $result = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $live -Token $secureToken -KeepEdited -Confirm:$false
+            $result.status | Should -Be $Status
+            $result.evidence.notebookState | Should -Be 'Unread'
+            $result.evidence.operation | Should -Be 'unchanged'
+            $result.message | Should -Match 'as it is: its definition couldn''t be read'
+            $result.remediation | Should -Match $Fix
+            @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -notmatch $definitionUri }).Count | Should -Be 0
+        }
+
+        It 'creates a missing notebook, and reads nothing' {
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $liveListUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @() }) }
+                @{ Method = 'Post'; Match = $createUri; Responses = @(New-FabricResponse -Status 201 -Body @{ id = $itemId }) }
+            )
+            $result = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $live -Token $secureToken -KeepEdited -Confirm:$false
+            $result.status | Should -Be 'Pass'
+            $result.evidence.operation | Should -Be 'created'
+            $result.evidence.notebookState | Should -Be 'Missing'
+            $result.message | Should -Match '^Created notebook'
+            @($requests | Where-Object { $_.Uri -like '*getDefinition*' }).Count | Should -Be 0
+        }
+
+        It 'sends nothing with -WhatIf, and says it reads a notebook that''s there first' {
+            Mock -ModuleName DbHubDemo -CommandName Invoke-WebRequest -MockWith { throw 'no network calls expected' }
+            $result = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $live -KeepEdited -WhatIf
+            $result.status | Should -Be 'Not selected'
+            $result.message | Should -Match 'It reads one that''s there first \(POST .+/getDefinition\?format=ipynb\)\.$'
+            Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-WebRequest -Times 0 -Exactly
+        }
+    }
 }
 
 Describe 'configure-fabric.ps1' {
@@ -715,13 +875,55 @@ Describe 'configure-fabric.ps1' {
         $live = $results | Where-Object checkId -EQ 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY'
         $deployment.status | Should -Be 'Not selected'
         $deployment.message | Should -Match 'already there, so it was left as it is'
-        $deployment.message | Should -Match 'fabric\.importNotebooks is false'
+        $deployment.message | Should -Match 'Only a missing notebook is imported \(-NewNotebooksOnly\): \./scripts/configure-fabric\.ps1 without it updates one that exists\.$'
         $live.status | Should -Be 'Pass'
         $live.message | Should -Match '^Created'
-        $live.message | Should -Match 'imports a missing notebook without asking'
+        $live.message | Should -Match 'Only a missing notebook is imported \(-NewNotebooksOnly\)'
         @($requests | Where-Object { $_.Uri -like '*/updateDefinition' }).Count | Should -Be 0
         # A newly created live-activity notebook runs once, so the lakehouse gets the history tables.
         ($results | Where-Object checkId -EQ 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY').status | Should -Be 'Pass'
+    }
+
+    It 'with -KeepEditedNotebooks, as deploy.ps1 runs it while fabric.importNotebooks is false, updates a notebook nobody edited and keeps an edited one (follow-ups decision 2a)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        # The copies this run's configuration binds: the ID overrides, and the example's placeholder repository, which stays.
+        $binding = @{ LakehouseId = $otherLakehouseId; LakehouseName = 'LH_DatabaseHub'; LakehouseWorkspaceId = $workspaceId }
+        $deployment = Get-DemoFabricNotebookDefinition -Path $deploymentNotebook @binding
+        $live = Get-DemoFabricNotebookDefinition -Path $liveNotebook @binding
+        # The deployment notebook is an earlier version of the demo's; the live-activity notebook was edited in Fabric.
+        $olderDeployment = New-WorkspaceCopy -Notebook $deployment -Change $editCode
+        $script:earlierDeployment = (Get-CopyFingerprint -Response $olderDeployment).Sha256
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoNotebookPublishedVersion -MockWith {
+            if ($Name -eq 'NB_DatabaseHub_Deployment') { @([pscustomobject]@{ Sha256 = $earlierDeployment; Since = '2026-11-03' }) } else { @() }
+        }
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_Deployment' }, @{ id = $operationId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
+            @{ Method = 'Post'; Match = [regex]::Escape("/items/$itemId/getDefinition?format=ipynb"); Responses = @($olderDeployment) }
+            @{ Method = 'Post'; Match = [regex]::Escape("/items/$operationId/getDefinition?format=ipynb"); Responses = @(New-WorkspaceCopy -Notebook $live -Change $editCode) }
+            @{ Method = 'Post'; Match = '/updateDefinition$'; Responses = @(New-FabricResponse -Status 200 -Body $null) }
+        )
+        $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -KeepEditedNotebooks -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
+        $LASTEXITCODE | Should -Be 0
+        $results = Read-ImportResult
+        $results.checkId | Should -Be @('FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT', 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY')
+        $updated = $results | Where-Object checkId -EQ 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT'
+        $kept = $results | Where-Object checkId -EQ 'FABRIC.IMPORT.NB_DATABASEHUB_LIVEACTIVITY'
+        $updated.status | Should -Be 'Pass'
+        $updated.evidence.notebookState | Should -Be 'Older'
+        $updated.message | Should -Match 'It was the demo''s version of 2026-11-03, and nobody had edited it\.'
+        $kept.status | Should -Be 'Not selected'
+        $kept.evidence.notebookState | Should -Be 'Edited'
+        $kept.remediation | Should -Match '-Notebook NB_DatabaseHub_LiveActivity'
+        $updates = @($requests | Where-Object { $_.Uri -like '*/updateDefinition' })
+        $updates.Count | Should -Be 1
+        $updates[0].Uri | Should -BeLike "*/items/$itemId/updateDefinition"
+        # The kept notebook wasn't created or bound again, so it doesn't run.
+        @($requests | Where-Object { $_.Uri -like '*jobType=RunNotebook*' }).Count | Should -Be 0
+    }
+
+    It 'refuses -NewNotebooksOnly and -KeepEditedNotebooks together' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        { & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -NewNotebooksOnly -KeepEditedNotebooks -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1 } | Should -Throw '*not both*'
     }
 
     It 'waits up to -HistoryRunWaitMinutes for the first history run, which a busy capacity keeps queued for more than 10 minutes, on the status page (#68)' {
@@ -865,7 +1067,7 @@ Describe 'configure-fabric.ps1' {
         $withheld = Read-ImportResult | Where-Object checkId -EQ 'FABRIC.T4.HISTORY'
         $withheld.status | Should -Be 'Warning'
         $withheld.message | Should -Match 'is from before T4''s history \(2026-11-13\), so it would ignore them\.$'
-        $withheld.remediation | Should -Match 'without -SkipNotebookImport'
+        $withheld.remediation | Should -Match '^Run this command again with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook alone first, edited or not; the file stays where it is\.$' -Because 'it leaves NB_DatabaseHub_Deployment as it is (2026-11-23)'
         $run = @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -like '*jobType=RunNotebook' })
         (Get-RequestBody -Request $run[-1]).executionData.parameters.PSObject.Properties.Name | Should -Not -Contain 'POSTGRES_METRICS'
         Test-Path -LiteralPath $file | Should -BeTrue -Because 'the metrics aren''t in the history'

@@ -114,7 +114,9 @@ function Invoke-DemoFabricNotebookRun {
     }
     if ($found.StatusCode -ne 200 -or @($found.Items).Count -ne 1) {
         $why = if ($found.StatusCode -ne 200) { 'the workspace couldn''t be read ({0})' -f $found.Error } else { 'it isn''t in the workspace' }
-        $fix = if ($found.StatusCode -ne 200) { 'Run it again in a few minutes: the workspace''s notebooks couldn''t be listed.' } else { 'Import the notebooks first: ./scripts/configure-fabric.ps1 -SkipHubChecks.' }
+        # One of the demo's notebooks is imported alone (2026-11-23), so an edited NB_DatabaseHub_Deployment stays as it is.
+        $import = if ($Name -cin @(Get-DemoFabricNotebookName)) { './scripts/configure-fabric.ps1 -SkipHubChecks -Notebook {0}' -f $Name } else { './scripts/configure-fabric.ps1 -SkipHubChecks' }
+        $fix = if ($found.StatusCode -ne 200) { 'Run it again in a few minutes: the workspace''s notebooks couldn''t be listed.' } else { 'Import it first: {0}.' -f $import }
         return (& $result 'Fail' ('{0} didn''t run: {1}.' -f $Name, $why) @{} $fix)
     }
     $itemId = [string](Get-DemoMemberValue -InputObject @($found.Items)[0] -Name 'id')

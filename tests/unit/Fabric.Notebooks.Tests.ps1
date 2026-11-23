@@ -107,6 +107,118 @@ Describe 'Fabric notebooks in the repo' {
     }
 }
 
+Describe 'The versions of the notebooks the demo published (fabric/notebooks/published-versions.json)' {
+    BeforeAll {
+        $script:versionsPath = Join-Path -Path $notebookFolder -ChildPath 'published-versions.json'
+        $script:names = @(Get-ChildItem -Path $notebookFolder -Filter '*.ipynb' -File | Sort-Object -Property Name | ForEach-Object BaseName)
+        $script:current = @{}
+        foreach ($name in $names) {
+            $text = [System.IO.File]::ReadAllText((Join-Path -Path $notebookFolder -ChildPath "$name.ipynb"))
+            $current[$name] = (InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }).Sha256
+        }
+
+        # DBHUB_WRITE_NOTEBOOK_VERSIONS=1 writes the file: what it lists, every version of each notebook in this checkout's
+        # git history (when git answers, with the day each first appeared), and the current one (today, when it's new),
+        # oldest first. CI never sets it; a change to a notebook needs it once, and the file committed with the change.
+        if ($env:DBHUB_WRITE_NOTEBOOK_VERSIONS -eq '1') {
+            $known = @{}
+            foreach ($name in $names) {
+                $known[$name] = @{}
+            }
+            if (Test-Path -LiteralPath $versionsPath) {
+                $existing = Get-Content -LiteralPath $versionsPath -Raw | ConvertFrom-Json -AsHashtable
+                foreach ($name in $names) {
+                    foreach ($entry in @($existing['notebooks'][$name])) {
+                        if ($entry) {
+                            $known[$name][[string]$entry['sha256']] = [string]$entry['since']
+                        }
+                    }
+                }
+            }
+            $git = Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            # The notebooks hold non-ASCII text, and PowerShell decodes git's output with the console's encoding.
+            $consoleEncoding = [Console]::OutputEncoding
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+            try {
+                foreach ($name in $names) {
+                    $relative = "fabric/notebooks/$name.ipynb"
+                    $commits = if ($git) { @(& $git.Source -C $repoRoot log --full-history '--format=%H %as' HEAD -- $relative 2>$null) } else { @() }
+                    foreach ($line in $commits) {
+                        $commit, $day = ([string]$line).Split(' ', 2)
+                        $text = (& $git.Source -C $repoRoot show "${commit}:$relative" 2>$null) -join "`n"
+                        if ($LASTEXITCODE -ne 0 -or -not $text) {
+                            continue
+                        }
+                        $sha = (InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }).Sha256
+                        if ($sha -and (-not $known[$name].ContainsKey($sha) -or [string]::CompareOrdinal($day, $known[$name][$sha]) -lt 0)) {
+                            $known[$name][$sha] = $day
+                        }
+                    }
+                    if (-not $known[$name].ContainsKey($current[$name])) {
+                        $known[$name][$current[$name]] = [DateTime]::UtcNow.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+                    }
+                }
+            }
+            finally {
+                [Console]::OutputEncoding = $consoleEncoding
+            }
+            $document = [ordered]@{
+                about     = 'Every version of the demo''s notebooks in this repository''s history, oldest first, by fingerprint: each cell''s type and code, without outputs, metadata, line endings, trailing spaces, or the workspace, lakehouse, and GitHub values the import sets (Get-DemoNotebookFingerprint). deploy.ps1 brings a workspace''s copy that matches one of them up to date, since nobody edited it, and keeps one that matches none, while fabric.importNotebooks is false. Written by tests/unit/Fabric.Notebooks.Tests.ps1 with DBHUB_WRITE_NOTEBOOK_VERSIONS=1; don''t edit.'
+                notebooks = [ordered]@{}
+            }
+            foreach ($name in $names) {
+                $document['notebooks'][$name] = @($known[$name].GetEnumerator() | Sort-Object -Property @{ Expression = { $_.Value } }, @{ Expression = { $_.Key } } | ForEach-Object { [ordered]@{ sha256 = $_.Key; since = $_.Value } })
+            }
+            $json = (ConvertTo-Json -InputObject $document -Depth 5) -replace "`r`n", "`n"
+            [System.IO.File]::WriteAllText($versionsPath, $json + "`n", [System.Text.UTF8Encoding]::new($false))
+        }
+    }
+
+    It 'lists each notebook''s current version, so deploy.ps1 can tell an earlier one that nobody edited from an edited one' {
+        Test-Path -LiteralPath $versionsPath | Should -BeTrue -Because 'deploy.ps1 reads it while fabric.importNotebooks is false'
+        $document = Get-Content -LiteralPath $versionsPath -Raw | ConvertFrom-Json -AsHashtable
+        @($document['notebooks'].Keys | Sort-Object) | Should -Be $names
+        foreach ($name in $names) {
+            $entries = @($document['notebooks'][$name])
+            $entries.Count | Should -BeGreaterThan 0
+            foreach ($entry in $entries) {
+                [string]$entry['sha256'] | Should -Match '^[0-9a-f]{64}$'
+                [string]$entry['since'] | Should -Match '^\d{4}-\d{2}-\d{2}$'
+            }
+            @($entries | ForEach-Object { [string]$_['sha256'] } | Select-Object -Unique).Count | Should -Be $entries.Count -Because 'each version is listed once'
+            $days = @($entries | ForEach-Object { [string]$_['since'] })
+            ($days -join ' ') | Should -BeExactly ((@($days | Sort-Object -CaseSensitive) -join ' ')) -Because 'the versions go oldest first'
+            @($entries | ForEach-Object { [string]$_['sha256'] }) | Should -Contain $current[$name] -Because ('{0}''s current version must be listed, or deploy.ps1 counts a copy of it as edited: run this test with DBHUB_WRITE_NOTEBOOK_VERSIONS=1, and commit the file' -f $name)
+        }
+    }
+
+    It 'reads the same fingerprint from the file the import binds, and from a copy Fabric gives back as one string per cell with CRLF and outputs' {
+        foreach ($name in $names) {
+            $path = Join-Path -Path $notebookFolder -ChildPath "$name.ipynb"
+            $bound = Get-DemoFabricNotebookDefinition -Path $path -LakehouseId '66666666-6666-6666-6666-666666666666' -LakehouseName 'LH_Other' -LakehouseWorkspaceId '11111111-1111-1111-1111-111111111111' -GitHubRepository 'contoso/fork'
+            $boundText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([string]$bound.Definition['parts'][0]['payload']))
+            $notebook = $boundText | ConvertFrom-Json -AsHashtable
+            foreach ($cell in @($notebook['cells'])) {
+                $cell['source'] = ((@($cell['source']) -join '') -replace "`n", "`r`n") + "`r`n"
+                $cell['metadata'] = @{ microsoft = @{ language = 'python' } }
+                if ($cell['cell_type'] -eq 'code') {
+                    $cell['execution_count'] = 7
+                    $cell['outputs'] = @(@{ output_type = 'stream'; name = 'stdout'; text = @('ran') })
+                }
+            }
+            $notebook['metadata'] = @{ kernel_info = @{ name = 'synapse_pyspark' } }
+            $fabricText = ConvertTo-Json -InputObject $notebook -Depth 20
+            $fingerprints = InModuleScope -ModuleName DbHubDemo -Parameters @{ Bound = $boundText; Fabric = $fabricText } {
+                @((Get-DemoNotebookFingerprint -Text $Bound), (Get-DemoNotebookFingerprint -Text $Fabric))
+            }
+            $fingerprints[0].Sha256 | Should -Be $current[$name] -Because 'the values the import binds aren''t edits'
+            $fingerprints[1].Sha256 | Should -Be $current[$name] -Because 'outputs, metadata, line endings, and a cell''s last newline aren''t edits'
+            $fingerprints[1].Bindings['LAKEHOUSE_ID'] | Should -Be '66666666-6666-6666-6666-666666666666'
+            $fingerprints[1].Bindings['LAKEHOUSE_NAME'] | Should -Be 'LH_Other'
+        }
+    }
+}
+
 Describe 'Notebook <_>' -ForEach $notebookNames {
     BeforeAll {
         $name = $_

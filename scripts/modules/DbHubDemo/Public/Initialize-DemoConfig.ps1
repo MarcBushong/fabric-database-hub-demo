@@ -34,8 +34,9 @@ function Initialize-DemoConfig {
     6. Fabric (INIT.FABRIC.CAPACITY, INIT.FABRIC.WORKSPACE): the capacities you can assign (Capacities - List
        Capacities; it asks when there's more than one) and whether the workspace fabric.workspaceName already exists
        (Workspaces - List Workspaces). A workspace that doesn't exist yet gets fabric.importNotebooks true; deploy.ps1
-       creates it, its lakehouse, and the notebooks (ADR 0021). One that exists gets false, so deploy.ps1 only adds the
-       notebooks that are missing, except a recovered environment's own (4b): the workspace its resource group records,
+       creates it, its lakehouse, and the notebooks (ADR 0021). One that exists gets false, so deploy.ps1 adds the
+       notebooks that are missing and brings one that nobody edited up to date, but keeps an edited one (follow-ups
+       decision 2a, 2026-11-23), except a recovered environment's own (4b): the workspace its resource group records,
        one that holds only what the demo creates, or one the demo's notebooks are already in (Items - List Items,
        read-only), gets true, as the update republishes its notebooks (Resolve-DemoRecoveredNotebookImport), and
        INIT.EXISTING says which and why. Nothing is created in Fabric here. A workspace that exists is checked against
@@ -628,7 +629,7 @@ function Initialize-DemoConfig {
             }
             elseif ($found.Count -eq 1) {
                 $workspaceExists = $true
-                $notebooks = if ($null -ne $notebookImport -and $notebookImport.Import) { 'deploy.ps1 updates its notebooks, as an update does (fabric.importNotebooks true; INIT.EXISTING says why)' } else { 'deploy.ps1 adds only the notebooks that are missing' }
+                $notebooks = if ($null -ne $notebookImport -and $notebookImport.Import) { 'deploy.ps1 updates its notebooks, as an update does (fabric.importNotebooks true; INIT.EXISTING says why)' } else { 'deploy.ps1 adds the notebooks that are missing, and brings one that nobody edited up to date' }
                 & $add 'INIT.FABRIC.WORKSPACE' 'fabric' 'fabric' $passOrWarn ('The Fabric workspace "{0}" exists; the scripts use it, and {1}.{2}{3}' -f $workspace, $notebooks, $note, $claimNote) ([ordered]@{ workspaceName = $workspace; recordedBy = $claimedBy }) $claimFix $docs.Workspaces
             }
             elseif ($capacityChosen) {

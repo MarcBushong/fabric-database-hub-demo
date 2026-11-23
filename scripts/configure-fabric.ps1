@@ -39,13 +39,17 @@ Step 2, the notebook import (Phase 12; -SkipNotebookImport skips it). For each n
 file and Import-DemoFabricNotebook creates the notebook or overrides its definition through Fabric REST, so
 re-runs converge. The uploaded copy is bound to the resolved lakehouse (ADR 0021); without a resolved lakehouse,
 nothing is imported. NB_DatabaseHub_Deployment's GITHUB_REPOSITORY and GITHUB_ENVIRONMENT come from github.repository
-and github.environment, unless the repository is still the example configuration's placeholder. With -NewNotebooksOnly, which deploy.ps1
-passes while fabric.importNotebooks is false, a notebook that isn't in the workspace yet is imported without asking
-and one that is stays as it is (Not selected).
+and github.environment, unless the repository is still the example configuration's placeholder. With -NewNotebooksOnly,
+a notebook that isn't in the workspace yet is imported without asking and one that is stays as it is (Not selected).
+With -KeepEditedNotebooks, which deploy.ps1 passes while fabric.importNotebooks is false (follow-ups decision 2a,
+2026-11-23), a missing notebook is created too, and one that's there is read first (Items - Get Item Definition, as
+ipynb): an earlier version of the demo's, which nobody edited, is updated, and an edited one is kept, with the command
+that replaces it (the -KeepEdited mode of Import-DemoFabricNotebook).
 The step runs only when the module has those functions; otherwise FABRIC.NOTEBOOKS.IMPORT is
 Manual action required. Without a workspace (resolved, or -WorkspaceId), it's Not selected. After a
 failed subscription guard, it runs only with -FabricToken or -WhatIf. Running this script without
--NewNotebooksOnly is the explicit request to create or update both notebooks. -WhatIf validates the
+-NewNotebooksOnly or -KeepEditedNotebooks is the explicit request to create or update the notebooks, edited or not;
+-Notebook names one. -WhatIf validates the
 notebooks and shows the planned requests; without the checklist or a token, it sends no request at all.
 
 Step 3, the Real-Time Dashboard (Phase 18; only with -ImportDashboard). Get-DemoFabricDashboardDefinition
@@ -153,9 +157,14 @@ How long to wait for a long-running Fabric operation.
 Skip step 2, the notebook import, and only run the checklist.
 
 .PARAMETER NewNotebooksOnly
-Step 2 imports only the notebooks that aren't in the workspace yet, and leaves the ones that are as they are.
-deploy.ps1's Fabric track passes it while fabric.importNotebooks is false, so a new workspace or lakehouse gets its
-notebooks without asking, and updating existing notebooks stays opt-in (Phase 26a).
+Step 2 imports only the notebooks that aren't in the workspace yet, and leaves the ones that are as they are. deploy.ps1
+passed it while fabric.importNotebooks was false, from Phase 26a until -KeepEditedNotebooks (2026-11-23).
+
+.PARAMETER KeepEditedNotebooks
+Step 2 creates a notebook that isn't in the workspace yet, updates one that's an earlier version of the demo's, which
+nobody edited (or this version bound to another workspace, lakehouse, or GitHub path), and keeps one someone edited.
+deploy.ps1's Fabric track passes it while fabric.importNotebooks is false, so an update is one click again, and an edited
+notebook stays as it is (follow-ups decision 2a, 2026-11-23). Not with -NewNotebooksOnly.
 
 .PARAMETER ImportDashboard
 Also run step 3: import or update the Real-Time Dashboard (fabric/realtime) in the workspace and read its
@@ -273,6 +282,8 @@ param(
 
     [switch] $NewNotebooksOnly,
 
+    [switch] $KeepEditedNotebooks,
+
     [switch] $ImportDashboard,
 
     [switch] $CheckDashboardData,
@@ -314,6 +325,9 @@ $ConfigPath = Resolve-DemoUserPath -Path $ConfigPath
 $OutputPath = Resolve-DemoUserPath -Path $OutputPath
 $PostgresMetricsPath = Resolve-DemoUserPath -Path $PostgresMetricsPath
 $ProgressPath = Resolve-DemoUserPath -Path $ProgressPath
+if ($NewNotebooksOnly -and $KeepEditedNotebooks) {
+    throw 'Pass -NewNotebooksOnly or -KeepEditedNotebooks, not both: the first leaves every notebook that''s there as it is.'
+}
 if ($PostgresMetricsPath) {
     if (-not $RunLiveActivity) {
         throw '-PostgresMetricsPath goes with -RunLiveActivity: the notebook run adds the file''s metrics to the history.'
@@ -428,10 +442,12 @@ $importWorkspaceId = if ($WorkspaceId) { $WorkspaceId } else { [string]$fabric['
 $lakehouseBound = [bool]($fabric['lakehouseId'] -and $fabric['workspaceId'])
 $resolved = (Test-Path -Path 'variable:resolution') -and $null -ne $resolution
 $newLakehouse = $resolved -and [bool]$resolution.LakehouseCreated
-# -NewNotebooksOnly (deploy.ps1 while fabric.importNotebooks is false): a notebook that isn't in the workspace yet,
-# as in a workspace or lakehouse that step 0 just created, is imported without asking; one that is stays as it is.
+# -NewNotebooksOnly: a notebook that isn't in the workspace yet, as in a workspace or lakehouse that step 0 just created,
+# is imported without asking; one that is stays as it is. -KeepEditedNotebooks (deploy.ps1 while fabric.importNotebooks is
+# false, since 2026-11-23): a missing one is created too, and one that's there is updated only when nobody edited it.
 $createOnly = $NewNotebooksOnly -and -not $SkipNotebookImport
-$importNote = if ($createOnly) { 'fabric.importNotebooks is false, so deploy.ps1 imports a missing notebook without asking and updates one that exists only when it''s true (or when you run ./scripts/configure-fabric.ps1 yourself).' } else { '' }
+$keepEdited = $KeepEditedNotebooks -and -not $SkipNotebookImport
+$importNote = if ($createOnly) { 'Only a missing notebook is imported (-NewNotebooksOnly): ./scripts/configure-fabric.ps1 without it updates one that exists.' } else { '' }
 if ($SkipNotebookImport) {
     Write-DemoLog -Message 'Skipping the notebook import (-SkipNotebookImport).'
 }
@@ -453,8 +469,8 @@ elseif ($guardFailed -and $null -eq $FabricToken -and -not $WhatIfPreference) {
     Write-DemoLog -Level Warning -Message 'The notebooks weren''t imported: the import needs an Azure CLI token, and the subscription guard failed.'
 }
 else {
-    if ($config -and -not $fabric['importNotebooks'] -and -not $createOnly) {
-        Write-DemoLog -Message 'fabric.importNotebooks is false, so deploy.ps1 imports only the notebooks that are missing. Running this script is an explicit request, so it creates or updates them.'
+    if ($config -and -not $fabric['importNotebooks'] -and -not $createOnly -and -not $keepEdited) {
+        Write-DemoLog -Message 'fabric.importNotebooks is false, so deploy.ps1 keeps a notebook that someone edited. Running this script is an explicit request, so it creates or updates the notebooks, edited or not.'
     }
 
     # The lakehouse lives in the configured workspace, even when -WorkspaceId imports the notebooks somewhere else.
@@ -484,9 +500,10 @@ else {
     }
 
     $token = $sessionToken
-    $importAction = if ($createOnly) { 'Create through the Fabric REST API when it''s missing' } else { 'Create or update through the Fabric REST API' }
-    # Only a create-only import passes the Phase 26a parameters, so the call stays the same as before otherwise.
-    $importMode = if ($createOnly) { @{ CreateOnly = $true; Note = $importNote } } else { @{} }
+    $importAction = if ($createOnly) { 'Create through the Fabric REST API when it''s missing' } elseif ($keepEdited) { 'Create through the Fabric REST API when it''s missing, or update it when nobody edited it' } else { 'Create or update through the Fabric REST API' }
+    # Only a create-only import passes the Phase 26a parameters, and only deploy.ps1's keeps an edited notebook (2026-11-23),
+    # so the call stays the same as before otherwise.
+    $importMode = if ($createOnly) { @{ CreateOnly = $true; Note = $importNote } } elseif ($keepEdited) { @{ KeepEdited = $true } } else { @{} }
     foreach ($definition in $definitions) {
         $notebookTarget = "notebook '{0}' in Fabric workspace {1}" -f $definition.DisplayName, $importWorkspaceId
         if ($WhatIfPreference) {
@@ -632,7 +649,7 @@ if ($liveReady -and -not $firstRun -and -not $RunLiveActivity -and $liveOperatio
 if ($newLakehouse -and $liveOperation -eq 'unchanged') {
     $results.Add((New-DemoResult -CheckId 'FABRIC.NOTEBOOKS.IMPORT' -Area 'fabric' -Target 'fabric' -Status 'Manual action required' `
                 -Message ('The lakehouse "{0}" was just created, but NB_DatabaseHub_LiveActivity was already in the workspace and was left as it is, so it may still be bound to another lakehouse, and the history tables weren''t created.' -f [string]$fabric['lakehouseName']) `
-                -Remediation 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -RunLiveActivity: it updates the notebooks, binds them to the new lakehouse, and runs NB_DatabaseHub_LiveActivity once to create the tables.' `
+                -Remediation 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity -RunLiveActivity: it updates that notebook alone, edited or not, binds it to the new lakehouse, and runs it once to create the tables.' `
                 -DocUrl 'https://learn.microsoft.com/fabric/data-engineering/notebook-public-api'))
 }
 if ($RunLiveActivity -or $firstRun) {
@@ -714,7 +731,7 @@ if ($RunLiveActivity -or $firstRun) {
             if ($knows.Known -and -not $knows.Has) {
                 $notebookParameters.Remove('POSTGRES_METRICS')
                 $postgresWithheld = $true
-                $results.Add((New-DemoResult -CheckId 'FABRIC.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'T4''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history (2026-11-13), so it would ignore them.' -Remediation $(if ($PostgresMetricsPath) { 'Run this command again without -SkipNotebookImport, which updates the notebook first; the file stays where it is.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' })))
+                $results.Add((New-DemoResult -CheckId 'FABRIC.T4.HISTORY' -Area 'fabric' -Target 'T4' -Status 'Warning' -Message 'T4''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T4''s history (2026-11-13), so it would ignore them.' -Remediation $(if ($PostgresMetricsPath) { 'Run this command again with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook alone first, edited or not; the file stays where it is.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, which updates the notebook, or this script with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook alone.' } else { 'Run ./scripts/deploy.ps1, which updates the notebook unless someone edited it, or this script with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook alone, edited or not.' })))
             }
         }
         # The same for T5's, with a copy from before 2026-11-18; Azure Monitor keeps them, so a later run adds them.
@@ -722,7 +739,7 @@ if ($RunLiveActivity -or $firstRun) {
             $knowsCosmos = & $module { param($Configuration, $FabricToken) Test-DemoFabricNotebookParameter -WorkspaceId ([string](Get-DemoMemberValue -InputObject $Configuration['fabric'] -Name 'workspaceId')) -Name 'NB_DatabaseHub_LiveActivity' -Parameter 'COSMOS_METRICS' -Token $FabricToken } $config $runToken
             if ($knowsCosmos.Known -and -not $knowsCosmos.Has) {
                 $notebookParameters.Remove('COSMOS_METRICS')
-                $results.Add((New-DemoResult -CheckId 'FABRIC.T5.HISTORY' -Area 'fabric' -Target 'T5' -Status 'Warning' -Message 'T5''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T5''s history (2026-11-18), so it would ignore them. Azure Monitor keeps them.' -Remediation $(if ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script without -SkipNotebookImport, which updates the notebook; then this command again adds them.' } else { 'Run this script without -SkipNotebookImport, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy); then this command again adds them.' })))
+                $results.Add((New-DemoResult -CheckId 'FABRIC.T5.HISTORY' -Area 'fabric' -Target 'T5' -Status 'Warning' -Message 'T5''s metrics weren''t sent with the run: the workspace''s NB_DatabaseHub_LiveActivity is from before T5''s history (2026-11-18), so it would ignore them. Azure Monitor keeps them.' -Remediation $(if ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, which updates the notebook, or this script with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook alone; then this command again adds them.' } else { 'Run ./scripts/deploy.ps1, which updates the notebook unless someone edited it, or this script with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook alone, edited or not; then this command again adds them.' })))
             }
         }
         $runTimeout = [Math]::Max(5, [int][Math]::Ceiling($TimeoutSeconds / 60.0))

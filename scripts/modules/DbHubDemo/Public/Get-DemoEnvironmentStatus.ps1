@@ -197,6 +197,12 @@ function Get-DemoEnvironmentStatus {
                 $message = '{0} {1}' -f $message.TrimEnd(), $warningNote.Text
                 $evidence['warningCount'] = $warningNote.Count
             }
+            # And its notes, by design and as information, which leave it a Pass (2026-11-23).
+            $noteText = Get-DemoHealthNoteText -Health $health
+            if ($null -ne $noteText) {
+                $message = '{0} {1}' -f $message.TrimEnd(), $noteText.Text
+                $evidence['noteCount'] = $noteText.Count
+            }
             if ($null -ne $days) {
                 $message += (' Guest evaluation days left: {0}.' -f $days)
             }
