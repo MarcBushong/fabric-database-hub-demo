@@ -2726,6 +2726,95 @@ def latest(lake):
     return found
 
 
+def blind_facts(lake):
+    """rca/fixtures/README.md's "What a blind RCA finds in the sidecars", read back from the rows the notebook wrote."""
+    def at(value):
+        return value.strftime("%H:%M:%S.%f")[:-3]
+
+    def pick(name, document, **where):
+        return [row for row in lake.tables[name] if row["document_id"] == document and all(
+            (at(row[key]) if isinstance(row[key], dt.datetime) else row[key]) == value for key, value in where.items())]
+
+    def one(name, document, **where):
+        found = pick(name, document, **where)
+        if len(found) != 1:
+            raise AssertionError("%d row(s) in %s for %s" % (len(found), name, where))
+        return found[0]
+
+    def number(value):
+        return "%.12g" % value
+
+    def waits(document, interval, query, plan=None):
+        return ", ".join(sorted(("%s:%s %d" % (row["wait_category"], row["wait_event"], row["samples"]) if row["samples"] is not None
+                                 else "%s %s" % (row["wait_category"], number(row["wait_ms"])))
+                                for row in pick("rca_query_waits", document, interval_start_utc=interval, query_id=query)
+                                if plan is None or row["plan_id"] == plan))
+
+    facts = []
+    # T3: query 412's plan regressed, and automatic plan correction forced its last good plan.
+    baseline = [one("rca_query_stats", T3, interval_start_utc=start, query_id=412, plan_id=31) for start in ("16:15:00.000", "16:30:00.000", "16:45:00.000")]
+    facts.append("T3 412/31 at 16:15, 16:30, 16:45: %s executions at %s ms of CPU each" % (
+        ", ".join("%d" % row["executions"] for row in baseline), "/".join(sorted({"%.1f" % (row["cpu_ms"] / row["executions"]) for row in baseline}))))
+    bad = one("rca_query_stats", T3, interval_start_utc="17:00:00.000", query_id=412, plan_id=58)
+    facts.append("T3 412/58 at 17:00: %d executions to %s at %s ms of CPU each (%s ms), %s logical reads each, DOP %d, %s ms of waits: %s" % (
+        bad["executions"], at(bad["last_execution_utc"]), number(bad["cpu_ms"] / bad["executions"]), number(bad["cpu_ms"]),
+        number(bad["logical_reads"] / bad["executions"]), bad["max_dop"], number(bad["wait_ms"]), waits(T3, "17:00:00.000", 412, 58)))
+    good = one("rca_query_stats", T3, interval_start_utc="17:00:00.000", query_id=412, plan_id=31)
+    facts.append("T3 at 17:00: 412/31 ran %d times (%s ms); 412/58 used %s of %s ms of CPU" % (
+        good["executions"], number(good["cpu_ms"]), number(bad["cpu_ms"]),
+        number(sum(row["cpu_ms"] for row in pick("rca_query_stats", T3, interval_start_utc="17:00:00.000")))))
+    plans = {row["plan_id"]: row for row in sorted(pick("rca_query_plans", T3, query_id=412), key=lambda row: row["captured_at_utc"])}
+    facts.append("T3 412/58: cost %s, %s, compiled %s; 412/31: cost %s, forced %s, last compiled %s" % (
+        number(plans[58]["estimated_cost"]), "parallel" if plans[58]["is_parallel"] else "serial", at(plans[58]["compiled_utc"]),
+        number(plans[31]["estimated_cost"]), plans[31]["forcing_type"] if plans[31]["is_forced_plan"] else "no", at(plans[31]["last_compiled_utc"])))
+    for row in sorted(pick("rca_query_events", T3), key=lambda row: row["event_time_utc"]):
+        facts.append("T3 %s %s %d/%d: %s to %s, from %s" % (at(row["event_time_utc"]), " ".join(filter(None, (row["kind"], row["forcing_type"]))),
+                                                            row["query_id"], row["plan_id"], row["previous_state"], row["state"], at(row["time_from_utc"])))
+    last = pick("rca_query_stats", T3, interval_start_utc="17:15:00.000", query_id=412)
+    facts.append("T3 17:15, read at %s: 412/%s%s at %s ms of CPU each" % (
+        "/".join(sorted({at(row["captured_at_utc"]) for row in last})), "/".join("%d" % row["plan_id"] for row in last), " alone" if len(last) == 1 else "",
+        "/".join("%.1f" % (row["cpu_ms"] / row["executions"]) for row in last)))
+    coverage = one("rca_query_coverage", T3)
+    facts.append("T3 queries %s; %s, %s, %d minutes, read %s to %s" % (
+        ", ".join("%d" % query for query in sorted({row["query_id"] for row in pick("rca_query_stats", T3)})), coverage["state"],
+        coverage["capture_mode"], coverage["interval_minutes"], at(coverage["read_from_utc"]), at(coverage["read_to_utc"])))
+    # T4's Query Store beside the chain. Its query IDs are 64-bit hashes, which stay exact.
+    chain = -6412873301142229951
+    hot, base = (one("rca_query_stats", T4, interval_start_utc=start, query_id=chain) for start in ("17:00:00.000", "16:45:00.000"))
+    facts.append("T4 %d (%s) at 17:00: %d calls in %s ms, the longest %s ms, waits %s; at 16:45: %d calls in %s ms, %s" % (
+        hot["query_id"], hot["login_name"], hot["executions"], number(hot["duration_ms"]), number(hot["max_duration_ms"]),
+        waits(T4, "17:00:00.000", chain), base["executions"], number(base["duration_ms"]), waits(T4, "16:45:00.000", chain) or "no waits"))
+    beside = sorted((row for row in pick("rca_query_stats", T4, interval_start_utc="17:00:00.000") if row["query_id"] != chain),
+                    key=lambda row: -row["executions"])
+    facts.append("T4 beside it at 17:00: " + "; ".join("%d (%s), %d calls%s" % (
+        row["query_id"], row["login_name"] or "no login", row["executions"],
+        "".join(", " + text for text in [waits(T4, "17:00:00.000", row["query_id"])] if text)) for row in beside))
+    for row in sorted(pick("rca_query_coverage", T4), key=lambda row: row["target"]):
+        facts.append("%s coverage: %s" % (row["target"], "pending %s to %s" % (at(row["pending_from_utc"]), at(row["pending_to_utc"]))
+                                           if row["pending_from_utc"] else row["gaps"]))
+    # The surge, outside a session: who held T4's connections.
+    samples = {}
+    for row in pick("rca_connections", SURGE):
+        samples.setdefault(row["captured_at_utc"], []).append(row)
+    times = sorted(samples)
+    totals = [sum(row["connections"] for row in samples[when]) for when in times]
+    facts.append("Surge: %d samples from %s to %s, the peak %d from %s" % (
+        len(times), at(times[0]), at(times[-1]), max(totals), at(times[totals.index(max(totals))])))
+    held = {when: row for when in times for row in samples[when] if row["run_token"] == "7c3e91a05bd2"}
+    most = min(when for when in held if held[when]["connections"] == max(row["connections"] for row in held.values()))
+    facts.append("Surge 7c3e91a05bd2: %d %s at %s (the oldest %s s), %d from %s to %s (the oldest %s s), %s at %s" % (
+        held[times[0]]["connections"], held[times[0]]["state"], at(times[0]), number(held[times[0]]["oldest_state_s"]), held[most]["connections"],
+        at(most), at(max(held)), number(held[max(held)]["oldest_state_s"]), held[times[-1]]["connections"] if times[-1] in held else "none", at(times[-1])))
+    facts.append("Surge beside it at %s: %s" % (at(times[0]), "; ".join("%s: %d %s" % (
+        row["run_token"] or ("no program or login" if not (row["program_name"] or row["login_name"]) else row["program_name"]), row["connections"], row["state"])
+        for row in samples[times[0]] if row["run_token"] != "7c3e91a05bd2")))
+    top = max(pick("rca_query_stats", SURGE), key=lambda row: row["executions"])
+    coverage = one("rca_query_coverage", SURGE)
+    facts.append("Surge Query Store: %d (%s), %d calls; pending %s to %s" % (
+        top["query_id"], top["login_name"], top["executions"], at(coverage["pending_from_utc"]), at(coverage["pending_to_utc"])))
+    return facts
+
+
 report = {}
 
 # The contract: the six tables, their columns and types in order, the required ones, and the primary times.
@@ -2771,6 +2860,7 @@ for document_id, document in DOCUMENTS.items():
 first.update(staged=staged, mismatches=mismatches, runs={key: sorted(value) for key, value in runs.items()}, badDates=dates,
              expectedCounts={name: sum(len(expected(document).get(name, [])) for document in DOCUMENTS.values()) for name in SIDECAR})
 report["fixtures"] = first
+report["facts"] = blind_facts(lake)
 
 # The same sidecars again (the scripts stage a new file): every one is in the history already, and nothing is written twice.
 before = len(lake.log)
@@ -3026,6 +3116,33 @@ print(json.dumps(report, default=str))
         @($fixtures['left']) | Should -Contain $fixtures['ackPath']
         @($fixtures['findings'] | ForEach-Object { $_[0..1] -join ' ' }) | Should -Be @('Pass all')
         $fixtures['findings'][0][2] | Should -BeExactly ('RCA.SIDECAR: ' + $fixtures['message'])
+    }
+
+    It 'writes rows that read back as what a blind RCA finds in the sidecars (rca/fixtures/README.md)' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        # Exact 64-bit query IDs, milliseconds, nulls, and booleans included.
+        @($sidecarReport['facts']) | Should -Be @(
+            'T3 412/31 at 16:15, 16:30, 16:45: 1180, 1204, 1192 executions at 2.1 ms of CPU each'
+            'T3 412/58 at 17:00: 524 executions to 17:09:40.215 at 176 ms of CPU each (92224 ms), 4100 logical reads each, DOP 4, 31440 ms of waits: Buffer IO 920, CPU 18900, Parallelism 11620'
+            'T3 at 17:00: 412/31 ran 668 times (1403 ms); 412/58 used 92224 of 95644 ms of CPU'
+            'T3 412/58: cost 38.6, parallel, compiled 17:03:11.870; 412/31: cost 0.0331, forced AUTO, last compiled 17:09:41.120'
+            'T3 17:09:30.000 tuning 412/31: Active to Executing, from 17:09:00.000'
+            'T3 17:10:00.000 forced AUTO 412/31: not forced to forced, from 17:09:00.000'
+            'T3 17:10:30.000 tuning 412/31: Executing to Verifying, from 17:10:00.000'
+            'T3 17:15, read at 17:20:10.050: 412/31 alone at 2.1 ms of CPU each'
+            'T3 queries 377, 412, 902; READ_WRITE, AUTO, 15 minutes, read 16:15:00.000 to 17:30:00.000'
+            'T4 -6412873301142229951 (contosocare_runner) at 17:00: 214 calls in 251300 ms, the longest 20050 ms, waits LWLock:LockManager 6, Lock:transactionid 2480; at 16:45: 220 calls in 61.6 ms, no waits'
+            'T4 beside it at 17:00: 8164251097732651127 (contosocare_runner), 1792 calls, IO:WALSync 14; 2871345566190021453 (contosocare_runner), 30 calls; -1129384756610293847 (no login), 15 calls'
+            'T4 coverage: pending 17:15:00.000 to 17:20:00.000'
+            'T4-replica coverage: T4-replica is a read replica, which records nothing in Query Store.'
+            'Surge: 37 samples from 10:06:00.000 to 10:12:00.000, the peak 41 from 10:10:00.000'
+            'Surge 7c3e91a05bd2: 28 idle at 10:06:00.000 (the oldest 40 s), 36 from 10:10:00.000 to 10:11:50.000 (the oldest 390 s), none at 10:12:00.000'
+            'Surge beside it at 10:06:00.000: 2fa86c14e9b0: 2 active; no program or login: 3 idle'
+            'Surge Query Store: 4415920376611208842 (contosocare_runner), 452 calls; pending 10:15:00.000 to 10:20:00.000'
+        )
     }
 
     It 'files a session''s sidecars under that session whatever run reads them, and one with no session under the reading run''s' {
