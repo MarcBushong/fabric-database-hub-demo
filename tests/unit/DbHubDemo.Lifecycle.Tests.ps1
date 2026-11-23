@@ -982,6 +982,10 @@ Describe 'Invoke-DemoDeployment' {
         # The history's kept values (F35, 2026-11-23) have their own tests (DbHubDemo.HistoryKeptValue.Tests.ps1); here the
         # Fabric stage's step never reaches Fabric, and the end's finds no saved snapshot above, so it's Not selected.
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoHistoryKeptValue -MockWith { New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Not selected' -Message 'kept values' -Evidence @{ nonBlocking = 'keptValue' } }
+        # Whether this checkout's configure-powerbi.ps1 has the kept form (F35, design A): not unless a test says so, so what
+        # the Fabric stage records doesn't depend on that script's version.
+        $script:keptDeployable = $false
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoKeptFormDeployable -MockWith { $script:keptDeployable }
         # T4's read replica at the run's end (2026-11-16) has its own tests (DbHubDemo.T4Replica.Tests.ps1); here it notes
         # what had run before it, and never reaches Azure.
         $script:replicaEnd = [System.Collections.Generic.List[object]]::new()
@@ -1188,6 +1192,19 @@ Describe 'Invoke-DemoDeployment' {
         $script:state = New-TestState @{ Stage = 'Fabric' }
         $null = @(Invoke-DemoDeployment -Config $config -Resume)
         $script:order | Should -Not -Contain 'Fabric'
+    }
+
+    It 'clears the Fabric stage''s record of its content while the history model went out in the release''s form although this checkout has the kept one, an earlier run''s record of the same content included (F35, design A; the re-check of 32e39e6a)' {
+        # The stage's kept-value step here has no answer (Not selected, no form), as with no history yet. An earlier run of
+        # this version recorded the same content, which tags keep unless a value replaces it.
+        $script:keptDeployable = $true
+        $script:state = New-TestState @{ FabricSha256 = ('f' * 64) }
+        $null = @(Invoke-DemoDeployment -Config $config)
+        $script:order | Should -Contain 'Fabric'
+        $cleared = @($script:recorded | Where-Object { $_.Contains('FabricSha256') })
+        $cleared.Count | Should -Be 1
+        $cleared[0]['FabricSha256'] | Should -BeExactly '' -Because 'an empty value clears the tag, so the next deploy.ps1, a resume included, runs the stage again'
+        $script:state.FabricSha256 | Should -BeExactly ''
     }
 
     It 'imports the Real-Time Dashboard and the history model and report in the Fabric stage, as the parallel Fabric track does (review follow-up)' {

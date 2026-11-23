@@ -61,7 +61,8 @@ function Invoke-DemoDeployment {
         activity profile, on a run whose validation ran: NB_DatabaseHub_LiveActivity once, analyze-only (CONFIRM false),
         then the history model's refresh (Invoke-DemoHistorySnapshotStep, DEPLOY.FABRIC.HISTORY), as the parallel path
         does. It never stops the run or keeps it from DONE. Then the kept values of the rows it saved, through Livy (F35,
-        2026-11-23; Invoke-DemoKeptValueEndStep, DEPLOY.FABRIC.KEPTVALUE.END), never a Fail either.
+        2026-11-23; Invoke-DemoKeptValueEndStep, DEPLOY.FABRIC.KEPTVALUE.END), with the history model in their form when
+        the Fabric stage couldn't deploy it so (design A), never a Fail either.
     12. T4's read replica at the run's end (2026-11-16; Invoke-DemoT4ReplicaDeployEnd, DEPLOY.T4.REPLICA.END), as the
         parallel path does: deleted unless a session uses it now, on a run that stops at a Fail too. Never a Fail.
     13. Not here: once deploy.ps1 judges the run DONE, its ending stops again what the run started when it found the demo
@@ -979,6 +980,12 @@ function Invoke-DemoDeployment {
                 if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') {
                     $published['FabricSha256'] = $fabricContent
                 }
+                # F35, design A, as in the parallel Fabric track: cleared while the model went out in the release's form although
+                # this checkout has the kept one, so the next deploy.ps1, a resume included, runs the stage again. Cleared, not
+                # left out: tags merge, so an earlier run's record of the same content would stay (the re-check of 32e39e6a).
+                if (Test-DemoKeptFormPending -Result $keptValue) {
+                    $published['FabricSha256'] = ''
+                }
                 & $recordStage 'Fabric' $published
                 & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}{1}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }), $appText)
             }
@@ -1031,8 +1038,9 @@ function Invoke-DemoDeployment {
     # NB_DatabaseHub_LiveActivity runs once, analyze-only, and the history model is refreshed. Never a Fail.
     if ($validated) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
-        # F35 (i): the snapshot's kept values through Livy, as in the parallel path. Never a Fail.
-        $results.Add((Invoke-DemoKeptValueEndStep -Config $Config -Result $results.ToArray() -SkipFabric:$SkipFabric -ProgressPath $ProgressPath))
+        # F35 (i): the snapshot's kept values through Livy, as in the parallel path, and the model in their form when the
+        # Fabric stage couldn't deploy it so (design A). Never a Fail.
+        $results.Add((Invoke-DemoKeptValueEndStep -Config $Config -Result $results.ToArray() -SkipFabric:$SkipFabric -ProgressPath $ProgressPath -ConfigPath $ConfigPath))
     }
     # T5's container lifecycle once more, now that the session control is done (2026-11-19, F14), as in the parallel path:
     # only when this run granted the control's role and the first check, right after the grant, didn't see it.

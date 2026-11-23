@@ -32,7 +32,8 @@ Stops the demo's compute after a session (plan section 9.4, ADR 0016).
   says so). When the control can't take it, the stop goes on as before, with a Warning.
 - -SaveHistory (or fabric.saveHistoryOnStop): after the VMs stop, runs NB_DatabaseHub_LiveActivity on demand to save
   the session's history to the lakehouse, at most 15 minutes (STOP.FABRIC.SAVEHISTORY), then works out the kept values
-  of the rows it saved through Fabric's Livy API, at most another 15 (F35; STOP.FABRIC.KEPTVALUE, never a Fail). Then,
+  of the rows it saved through Fabric's Livy API, at most another 15 while Fabric answers; if it stops answering, retries
+  and the session's delete can add up to about 18 more (F35; STOP.FABRIC.KEPTVALUE, never a Fail). Then,
   only with fabric.manageCapacity true, the Fabric capacity that start-demo.ps1 resumed is paused, never while that run
   is still going (STOP.FABRIC.CAPACITY). With the defaults, the capacity isn't called (Phase 26b, ADR 0023).
 

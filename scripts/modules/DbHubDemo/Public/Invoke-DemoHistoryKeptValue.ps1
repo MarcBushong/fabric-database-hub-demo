@@ -26,19 +26,23 @@ function Invoke-DemoHistoryKeptValue {
 
     The record (-CheckId) has evidence nonBlocking keptValue, outcome, form, the step's counts (step), and the session's
     states (session):
-    - Pass: every row is worked out (outcome Done).
+    - Pass: every row is worked out (outcome Done); with -SwitchModelForm, every row is worked out and the history model is
+      deployed in their form (Switched).
     - Not selected: no history table yet (NoTable); the workspace or the lakehouse isn't there (NotResolved); this
       checkout's kept_value.py isn't there, or has no kept_value_step yet, as the groundwork's module hasn't (NoModule).
     - Warning: a paused or inactive capacity (CapacityPaused); no token (NoToken); Fabric's refusal of the session or of
       a statement, HTTP 401 or 403 (Refused); a session that wasn't ready in time or ended (SessionFailed); the module's
       load or kept_value_step raising (StepFailed); no time left (TimedOut); an answer without the step's JSON (NoAnswer);
       a table still without the columns (NoColumns); a step that stopped with rows left (Partial); with -ModelOnRelease,
-      every row worked out while this run's history model doesn't read them (ModelOnRelease); or an HTTP error past
+      every row worked out while this run's history model doesn't read them (ModelOnRelease), or, with -SwitchModelForm,
+      a deployment of the model in their form that didn't work (SwitchFailed); or an HTTP error past
       Invoke-DemoFabricRequest's retries, a statement Fabric cancelled, or any other error (Failed; evidence networkError
       for a network error).
     Each Warning says what didn't work, then until when the history's totals read as before F35: until a later run works
     out the rest; or, when this run's history model reads the release's form (-ModelOnRelease, or -DecidesModelForm with
-    an answer that doesn't allow the kept form), until the Fabric track runs again. Its fix ends with -RunAgain.
+    an answer that doesn't allow the kept form, when this checkout's configure-powerbi.ps1 has it), until the Fabric track
+    runs again. Its fix ends with -RunAgain. NoTable says, with -DecidesModelForm, that deploy.ps1 deploys the model in the
+    kept form once the history has rows, and with -ModelOnRelease, that the next ./scripts/deploy.ps1 does.
     Evidence form is the step's own answer, Kept when telemetry_snapshots has the three columns after it: only then does
     configure-powerbi.ps1 get -SnapshotValueForm Kept (Get-DemoKeptValueForm). With -ProgressPath and -ProgressId, the
     status page's row says what runs, then the outcome. It never throws but for a stop of the run (Ctrl+C).
@@ -81,7 +85,17 @@ function Invoke-DemoHistoryKeptValue {
     .PARAMETER ModelOnRelease
     This run's history model reads the release's form, since its Fabric-track step didn't allow the kept one (deploy.ps1's
     end, Invoke-DemoKeptValueEndStep): the Warnings say so, and a step that works out every row is a Warning too, since
-    the model doesn't read them until the Fabric track runs again.
+    the model doesn't read them until the Fabric track runs again, unless -SwitchModelForm deploys it in their form.
+
+    .PARAMETER SwitchModelForm
+    With -ModelOnRelease, once every row is worked out, deploys the history model in the kept values' form by the Fabric
+    track's own step (Invoke-DemoKeptValueModelSwitch): a Pass (Switched), or a Warning (SwitchFailed) that never blocks
+    DONE. A SwitchFailed whose import of the kept form passed says the model is deployed in it and what failed after it,
+    not that the history reads as before. It runs after the step's deadline, within configure-powerbi.ps1's own limits
+    (design A, approved 2026-11-23).
+
+    .PARAMETER ConfigPath
+    The configuration file configure-powerbi.ps1 reads for -SwitchModelForm; without it, a private copy of -Config.
 
     .PARAMETER PollSeconds
     Seconds between reads of the session and of the step.
@@ -119,6 +133,11 @@ function Invoke-DemoHistoryKeptValue {
 
         [switch] $ModelOnRelease,
 
+        [switch] $SwitchModelForm,
+
+        [AllowEmptyString()]
+        [string] $ConfigPath = '',
+
         [ValidateRange(1, 60)]
         [int] $PollSeconds = 5
     )
@@ -130,8 +149,9 @@ function Invoke-DemoHistoryKeptValue {
     $left = { [int][System.Math]::Floor(($deadline - (Get-DemoUtcNow)).TotalSeconds) }
     $evidence = [ordered]@{ nonBlocking = 'keptValue'; outcome = ''; form = '' }
     $showRow = [bool]($ProgressPath -and $ProgressId)
-    # Read here: PSReviewUnusedParameter doesn't count a use in $record, a scriptblock.
-    $modelFollows = [bool]$DecidesModelForm
+    # Read here: PSReviewUnusedParameter doesn't count a use in $record, a scriptblock. The model's form follows only when this
+    # checkout's configure-powerbi.ps1 has the kept one; without it, no run of the track changes the model.
+    $modelFollows = [bool]$DecidesModelForm -and (Test-DemoKeptFormDeployable)
     $asBefore = 'Until a later run works them out, the history''s totals read as before F35, where overlapping saves can count twice.'
     $modelBefore = 'This run''s history model reads the release''s form, so its totals read as before F35, where overlapping saves can count twice, until the Fabric track runs again.'
     # Not $later: variable names ignore case, so $record's -Later switch would hide it.
@@ -142,14 +162,17 @@ function Invoke-DemoHistoryKeptValue {
     $refusedFix = 'Check that your account has Contributor or higher on the demo''s workspace, and that a Fabric administrator allows the Livy API in the tenant settings; then run {0}.' -f $RunAgain
     $timedOut = @{ Status = 'Warning'; Outcome = 'TimedOut'; Message = ('Working out the history''s kept values didn''t finish in {0} minutes, so it was stopped; the rows it finished keep theirs.' -f $TimeoutMinutes); Later = $true }
     $record = {
-        param([string] $Status, [string] $Outcome, [string] $Message, [string] $Remediation = '', [switch] $Later)
+        param([string] $Status, [string] $Outcome, [string] $Message, [string] $Remediation = '', [switch] $Later, [switch] $ReadsKept)
         $evidence['outcome'] = $Outcome
         $evidence['seconds'] = [int]((Get-DemoUtcNow) - $started).TotalSeconds
         if ($Status -eq 'Warning') {
             # Until when the history reads as before F35: until a later run works out the rest, or, when this run's history
-            # model reads the release's form, until the Fabric track runs again (the review of c96f790a).
+            # model reads the release's form, until the Fabric track runs again (the review of c96f790a). Neither once the
+            # model reads the kept values (-ReadsKept: a switch whose import passed and what followed didn't).
             $onRelease = [bool]$ModelOnRelease -or ($modelFollows -and [string]$evidence['form'] -cne 'Kept')
-            $Message = '{0} {1}' -f $Message, $(if ($onRelease) { $modelBefore } else { $asBefore })
+            if (-not $ReadsKept) {
+                $Message = '{0} {1}' -f $Message, $(if ($onRelease) { $modelBefore } else { $asBefore })
+            }
             if ($Later) {
                 $tail = if ($onRelease) { $modelLaterFix } else { $laterFix }
                 $Remediation = if ($Remediation) { '{0} {1}' -f $Remediation, $tail } else { $tail }
@@ -320,7 +343,10 @@ function Invoke-DemoHistoryKeptValue {
             error    = $stepError
         }
         if ($answer.exists -ne $true) {
-            return (& $record 'Not selected' 'NoTable' 'The lakehouse has no history yet (no telemetry_snapshots table), so there were no kept values to work out. The history model keeps the release''s form until there is.')
+            # With no history yet, as on a first deployment whose first history run hasn't saved any: never a Warning, and
+            # what deploys the model in the kept form once there is (design A, approved 2026-11-23).
+            $noTableTail = if ($ModelOnRelease) { $script:KeptValueNextDeployNote } elseif ($modelFollows) { 'The history model gets the release''s form for now, and deploy.ps1 deploys it in the kept values'' form once the history has rows: at this run''s end, after its history snapshot, or else the next ./scripts/deploy.ps1.' } else { 'The history model keeps the release''s form until there is.' }
+            return (& $record 'Not selected' 'NoTable' ('The lakehouse has no history yet (no telemetry_snapshots table), so there were no kept values to work out. {0}' -f $noTableTail))
         }
         $addedText = if ($added.Count -gt 0) { '; it added {0} to telemetry_snapshots' -f ($added -join ', ') } else { '' }
         if ($form -cne 'Kept') {
@@ -330,6 +356,26 @@ function Invoke-DemoHistoryKeptValue {
             return (& $record 'Warning' 'Partial' ('The history''s kept values are only partly worked out: {0:N0} rows this time{1}, {2:N0} still to do{3}.' -f $resolved, $addedText, $pending, $(if ($stepError) { ' ({0})' -f $stepError } else { '' })) -Later)
         }
         if ($ModelOnRelease) {
+            if ($SwitchModelForm) {
+                # Every row is worked out, so the model gets their form now, by the Fabric track's own step, rather than a
+                # Warning that asks for the track again (design A, approved 2026-11-23). Never a Fail: the script's records
+                # stay out of the run's results, and this record says what happened.
+                if ($showRow) {
+                    Set-DemoProgressStep -Path $ProgressPath -Id $ProgressId -State 'Running' -Message 'Deploying the history model in the kept values'' form, by the Fabric track''s own step (configure-powerbi.ps1). It doesn''t block DONE.'
+                }
+                Write-DemoLog -Message ('{0}: every row''s kept value is worked out, and this run''s Fabric track deployed the history model in the release''s form, so it''s deployed in the kept values'' form now (configure-powerbi.ps1).' -f $CheckId)
+                $deployKept = Invoke-DemoKeptValueModelSwitch -Config $Config -ConfigPath $ConfigPath -ProgressPath $ProgressPath
+                $evidence['modelSwitch'] = $deployKept.Evidence
+                if ($deployKept.Switched) {
+                    return (& $record 'Pass' 'Switched' ('Worked out the history''s kept values: {0:N0} rows this time{1}, none left, and deployed the history model in their form (this run''s Fabric track had deployed the release''s).' -f $resolved, $addedText))
+                }
+                if ($deployKept.KeptDeployed) {
+                    # The model reads the kept values: its import in their form passed, and what followed it didn't (the
+                    # re-check of 32e39e6a).
+                    return (& $record 'Warning' 'SwitchFailed' ('The history''s kept values are worked out, {0:N0} rows this time{1}, with none left, and the history model is deployed in their form, but what followed didn''t work: {2}.' -f $resolved, $addedText, $deployKept.Why) $bugFix -ReadsKept)
+                }
+                return (& $record 'Warning' 'SwitchFailed' ('The history''s kept values are worked out, {0:N0} rows this time{1}, with none left, but deploying the history model in their form didn''t work: {2}.' -f $resolved, $addedText, $deployKept.Why) $bugFix)
+            }
             # Every row is worked out, but this run's history model reads the release's form: its Fabric-track step didn't
             # allow the kept one, and the model doesn't read them until the Fabric track runs again (the review of c96f790a).
             return (& $record 'Warning' 'ModelOnRelease' ('The history''s kept values are worked out, {0:N0} rows this time{1}, with none left, but the history model doesn''t read them yet.' -f $resolved, $addedText) -Later)
