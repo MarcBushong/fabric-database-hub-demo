@@ -181,7 +181,15 @@ Describe 'Get-DemoFabricSemanticModelDefinition' {
         $kept = Get-DemoFabricSemanticModelDefinition -WorkspaceId $script:workspaceId -LakehouseId $script:lakehouseId -SnapshotValueForm Kept
         $release.Evidence.snapshotValueForm | Should -Be 'Release'
         $kept.Evidence.snapshotValueForm | Should -Be 'Kept'
-        $kept.Evidence.measures | Should -Be $release.Evidence.measures -Because 'the kept form replaces Snapshot Value, and adds no measure'
+        # The measures in the parts sent: Evidence.measures counts the model's folder, the same for both forms.
+        $measures = {
+            param($Model)
+            @(@($Model.Definition.parts) | Where-Object { $_.path -like 'definition/tables/*.tmdl' } | ForEach-Object {
+                ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($_.payload)) -split "`n") -match "^ {4}measure\s+('(?:[^']|'')+'|[^\s='][^\s=]*)\s*="
+            }).Count
+        }
+        (& $measures $release) | Should -Be $release.Evidence.measures
+        (& $measures $kept) | Should -Be (& $measures $release) -Because 'the kept form replaces Snapshot Value, and adds no measure'
         (& $part $release $table) | Should -BeExactly ([System.IO.File]::ReadAllText((Join-Path -Path $script:modelPath -ChildPath $table)))
         @($kept.Definition.parts | ForEach-Object { $_.path }) | Should -Be @($release.Definition.parts | ForEach-Object { $_.path })
         foreach ($path in @($release.Definition.parts | ForEach-Object { $_.path } | Where-Object { $_ -ne $table })) {

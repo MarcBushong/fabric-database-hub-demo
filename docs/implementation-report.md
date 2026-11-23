@@ -8552,7 +8552,16 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
   - **The fix:** `-EndCapture` is a switch on `Invoke-DbHubRcaStop` that only `Stop-DbHubDemo` passes, so the takeover's end exports as it did at 66cc5326.
   - **The test:** the takeover flow's test asserts that none of its exports carries `endCapture`. The stop's own test still asserts that each of its exports does.
   - **Docs:** O1's CHANGELOG entry, `rca/README.md`'s runbook, ADR 0031's capture's end, and ADR 0026's takeover.
+- **Low: the kept form's measure count couldn't fail.**
+  - **The cause:** `DbHubDemo.PowerBI.Tests.ps1` compared the two forms' `Evidence.measures`, which `Get-DemoFabricSemanticModelDefinition` counts from the model's folder, the same for both.
+  - **The fix:** the test counts the `measure` lines in the table parts actually sent, with `Get-DemoTmdlMeasure`'s pattern. It holds the release form's count to `Evidence.measures`, and the kept form's to the release form's.
 
-**Changed files (High).** `automation/runbooks/DbHubControl.Common.ps1`, `tests/unit/Automation.Runbooks.Tests.ps1`, the CHANGELOG, `rca/README.md`, ADR 0026, ADR 0031, and this report.
+**Changed files.**
 
-**Validation (High).** Pester with StrictMode and the Azure CLI guard, on `Automation.Runbooks.Tests.ps1`: the takeover flow's test passed, and all 29 of the capture's tests (`*capture*`), the stop's own `endCapture` among them; 0 az calls. With only the runbook's change stashed, the takeover flow's test fails: both of its exports carry `endCapture`.
+- **High:** `automation/runbooks/DbHubControl.Common.ps1`, `tests/unit/Automation.Runbooks.Tests.ps1`, the CHANGELOG, `rca/README.md`, ADR 0026, ADR 0031, and this report.
+- **Low:** `tests/unit/DbHubDemo.PowerBI.Tests.ps1`, and this report.
+
+**Validation.** Pester with StrictMode and the Azure CLI guard, targeted, with 0 az calls; PSScriptAnalyzer found nothing on the changed files, and markdownlint is clean.
+
+- **High:** on `Automation.Runbooks.Tests.ps1`, the takeover flow's test passed, and all 29 of the capture's tests (`*capture*`), the stop's own `endCapture` among them. With only the runbook's change stashed, the takeover flow's test fails: both of its exports carry `endCapture`.
+- **Low:** `DbHubDemo.PowerBI.Tests.ps1`, 32 passed. With an extra measure inside the kept fragment's measure block, which every other assertion lets through to the parts sent, the new count fails (121 expected, 122 sent), and the test as it was passes.
