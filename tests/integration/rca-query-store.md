@@ -37,6 +37,21 @@ sorted AS (
                WHEN EXISTS (SELECT 1 FROM sys.extended_properties AS ep
                             WHERE ep.class = 1 AND ep.major_id = q.object_id AND ep.minor_id = 0
                               AND ep.name = N'dbhubdemo.role' AND CAST(ep.value AS nvarchar(100)) = N'harness') THEN 'harness'
+               -- The runner's own ad hoc statements (rca/README.md, What the capture leaves out, 3), by their names:
+               -- the probe may know them; the capture matches their normalized texts instead.
+               WHEN q.object_id = 0 AND (t.query_sql_text LIKE N'%fn[_]run[_]stop[_]requested%'
+                                      OR t.query_sql_text LIKE N'%fn[_]can[_]view[_]sessions%'
+                                      OR t.query_sql_text LIKE N'%fn[_]demo[_]sessions%'
+                                      OR t.query_sql_text LIKE N'%scenario[_]control%'
+                                      OR t.query_sql_text LIKE N'%scenario[_]runs%'
+                                      OR t.query_sql_text LIKE N'%fn[_]scenario[_]catalog%'
+                                      OR t.query_sql_text LIKE N'%database[_]files%'
+                                      OR t.query_sql_text LIKE N'%database[_]query[_]store[_]options%'
+                                      OR t.query_sql_text LIKE N'%COUNT[_]BIG(*)%care%facilities%'
+                                      OR t.query_sql_text LIKE N'%OBJECT[_]ID(@name%') THEN 'runner'
+               -- Any other ad hoc statement on the demo's own schema: the scripts' setup and status batches, which item 3
+               -- leaves on the list's outside.
+               WHEN q.object_id = 0 AND (t.query_sql_text LIKE N'%demo.%' OR t.query_sql_text LIKE N'%[[]demo].%') THEN 'adhoc-demo'
                WHEN q.object_id IN (SELECT OBJECT_ID(w.procedure_name) FROM demo.fn_workload_procedures() AS w) THEN 'workload'
                ELSE 'other' END
     FROM ran AS r
@@ -98,7 +113,8 @@ CALCULATETABLE(
 
 **Pass, per target:**
 
-- **Nothing left out leaks in:** no `observer`, `observer-catalog`, `harness`, `harness-call`, or `harness-table` ID is retained.
+- **Nothing left out leaks in:** no `observer`, `observer-catalog`, `harness`, `runner`, `harness-call`, or `harness-table` ID is retained. The `runner` set holds the polled stop check whenever a run ran in the window, so it's never "not exercised" on a target with runs.
+- **The scripts' batches:** an `adhoc-demo` ID that's retained is reported by count, target, and interval. One from the deploy's or the start's intervals is the residual item 3 names: a **Warning** naming the batch it came from. One from an interval in which runs ran is a **Fail**, and the list grows.
 - **The workload is kept:** each `workload` ID in the incident's top lists is retained, which the positive controls below check.
 - **The log-rate scenario's writes stay:** writes to `demo`'s scratch tables (`billing.usp_import_remittances`, by the names) are retained on the targets it ran on. That's review High 1's case.
 - **Each set is exercised:** every category is non-empty, or reported as "not exercised" with the reason. For example, Query Store's AUTO capture on SQL Server may not record the observer's cheap statements.
@@ -165,6 +181,13 @@ SUMMARIZECOLUMNS(
 
    **Pass:** the read returns within its timeout, with the name null or a gap. If AUTO capture never records the scratch procedure, the check isn't exercised, and the report says so.
 7. **The harness rule:** the blindness probe's `harness` set, after H's marks.
+8. **H's marks, deployed twice** (review-h): on T1, T2's guest, and T3:
+   - after the net-new deployment, and again after `./scripts/deploy.ps1` runs a second time over it, `sys.extended_properties` (`class` 1, `name` `dbhubdemo.role`, value `harness`) lists exactly the 21 modules `database/common/110-demo-control.sql` creates, and nothing else;
+   - the second run's setup reports no error;
+   - the observer reads the marks as it runs: through `contosocare_runner`'s schema grant on T1 and T2, and as `dbo` on T3. RCA-SQL-10's `harness` CTE returns the 21 there.
+9. **The engine's own tests,** against a disposable SQL Server (`CONTOSOCARE_TEST_SQL_SERVER`, never a demo target):
+   - `SqlIntegrationTests.SetupMarksExactlyTheHarnessModulesAsTheRcaReadsThem`, H's first run on a real SQL Server;
+   - A1's real-engine test for the runner's own statements, once it's built (item 3): every statement Query Store records from DemoDatabase's methods matches the list.
 
 ## T4's live checks (S11)
 
@@ -175,3 +198,4 @@ SUMMARIZECOLUMNS(
 5. **The public role:** A2's connection line names the runner's role and `azure_sys`, with no grant beyond `public`'s.
 6. **A NULL `event_type`:** how often it appears, and the waits around it.
 7. **RCA-PG-16:** the routines it lists match H's 13; the harness tables are exactly `demo.scenario_control`, `demo.scenario_runs`, and `demo.scenario_run_events`; and there's **no `unsure` row** (`dynamic_sql`, `no_source`).
+8. **H's marks on T4, deployed twice** (review-h): setup runs as the P6 role. After the net-new deployment and after the second `./scripts/deploy.ps1`, `obj_description(p.oid, 'pg_proc') = 'dbhubdemo:harness'` holds for exactly the 13 control routines, every overload, and the second run reports no error.
