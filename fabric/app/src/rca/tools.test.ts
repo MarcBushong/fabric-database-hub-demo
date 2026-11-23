@@ -197,7 +197,7 @@ describe("the Root cause page's facets, in the chat", () => {
         const all = await ask("triage_window", { from: "11:50", to: "12:20" });
         const replica = await ask("find_incidents", { from: "11:50", to: "12:20", categories: ["replica_lag"] });
         expect(replica.episodes.map((e) => e.key)).toEqual(["T4-replica-replica_lag-20261120T171200Z"]);
-        expect(replica.details!.filters).toEqual({ categories: ["replica_lag"], severities: [] });
+        expect(replica.details!.filters).toEqual({ categories: ["replica_lag"], severities: [], targets: [] });
         const leftOut = replica.details!.leftOut as { episodes: number; byCategory: Record<string, number> };
         expect(leftOut.episodes).toBe(all.episodes.length - 1);
         expect(Object.values(leftOut.byCategory).reduce((a, b) => a + b, 0)).toBe(leftOut.episodes);
@@ -212,6 +212,28 @@ describe("the Root cause page's facets, in the chat", () => {
         expect(hypotheses.find((h) => h.family === "blocking")).toMatchObject({ category: "blocking", severity: "high" });
         const high = await ask("triage_window", { from: "11:50", to: "12:20", severities: ["high"], targets: ["T1", "T5"] });
         expect((high.details!.hypotheses as Array<{ severity: string; target: string }>).every((h) => h.severity === "high" && ["T1", "T5"].includes(h.target))).toBe(true);
+        // An episode's severityReason is in the episode list once, never again in its hypothesis (the review of 90e9d914).
+        expect((all.details!.hypotheses as Array<Record<string, unknown>>).filter((h) => h.episodeKey && "severityReason" in h)).toEqual([]);
+    });
+
+    // The review of 90e9d914: targets narrowed the read, so a triage of the replica's high incidents said nothing abnormal,
+    // and none left out, beside the window's incidents on other targets.
+    it("takes targets as a facet too: the verdicts stay the whole window's, and what it leaves out on other targets is counted", async () => {
+        const all = await ask("triage_window", { from: "11:50", to: "12:20" });
+        const replicaHigh = await ask("triage_window", { from: "11:50", to: "12:20", targets: ["T4-replica"], severities: ["high"] });
+        const kept = all.episodes.filter((e) => e.target === "T4-replica" && e.severity === "high");
+        expect(replicaHigh.episodes.map((e) => e.key)).toEqual(kept.map((e) => e.key));
+        expect(replicaHigh.details).toMatchObject({ nothingAbnormal: all.details!.nothingAbnormal, quiet: all.details!.quiet, filters: { categories: [], severities: ["high"], targets: ["T4-replica"] } });
+        expect(all.details!.nothingAbnormal).toBe(false);
+        const leftOut = replicaHigh.details!.leftOut as { episodes: number; hypotheses: number; notCaptured: number; byTarget: Record<string, number> };
+        expect(leftOut.episodes).toBe(all.episodes.length - kept.length);
+        expect(leftOut.byTarget.T1).toBe(all.episodes.filter((e) => e.target === "T1").length);
+        expect(leftOut.hypotheses).toBe((all.details!.hypotheses as unknown[]).length - (replicaHigh.details!.hypotheses as unknown[]).length);
+        // What wasn't captured is the targets' asked about; the other targets' lines are counted.
+        expect(replicaHigh.notCaptured.filter((line) => /^T(1|2|3|4|5): /.test(line))).toEqual([]);
+        expect(leftOut.notCaptured).toBe(all.notCaptured.length - replicaHigh.notCaptured.length);
+        // A target it doesn't have is refused, as a category is.
+        expect(await tools().run("triage_window", { from: "11:50", to: "12:20", targets: ["T9"] })).toEqual({ ok: false, text: 'targets takes T1, T2, T3, T4, T4-replica, T5; ["T9"] isn\'t one of them.' });
     });
 
     it("refuses a category or a severity it doesn't have, so a filtered list is never taken for the whole one", async () => {
