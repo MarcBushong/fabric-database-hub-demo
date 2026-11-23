@@ -133,7 +133,17 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
     /// RCA.CAPTURE.&lt;target&gt; Warning with its fix and isn't tried again for a while; a lost connection is reopened
     /// later. With <paramref name="timed"/>, its duration feeds the self-throttling.
     /// </summary>
-    protected async Task<IReadOnlyList<CaptureValues>?> RunAsync(string blockId, DateTimeOffset now, CancellationToken cancellationToken, int[]? parameter = null, bool timed = true, bool longRunning = false, string? text = null)
+    protected Task<IReadOnlyList<CaptureValues>?> RunAsync(string blockId, DateTimeOffset now, CancellationToken cancellationToken, int[]? parameter = null, bool timed = true, bool longRunning = false, string? text = null) =>
+        RunCoreAsync(blockId, now, (open, statement, timeout) => open.QueryAsync(blockId, statement, parameter, timeout, cancellationToken), timed, longRunning, text, cancellationToken);
+
+    /// <summary>
+    /// Runs one catalog block with its parameters (T-SQL's by name, PostgreSQL's by position), as the other RunAsync runs
+    /// one: the sidecar's Query Store reads take a since, a flag, and lists (rca/capture/README.md).
+    /// </summary>
+    protected Task<IReadOnlyList<CaptureValues>?> RunAsync(string blockId, DateTimeOffset now, CaptureParameters parameters, CancellationToken cancellationToken, bool timed = true, bool longRunning = false, string? text = null) =>
+        RunCoreAsync(blockId, now, (open, statement, timeout) => open.QueryAsync(blockId, statement, parameters, timeout, cancellationToken), timed, longRunning, text, cancellationToken);
+
+    private async Task<IReadOnlyList<CaptureValues>?> RunCoreAsync(string blockId, DateTimeOffset now, Func<ICaptureConnection, string, TimeSpan, Task<IReadOnlyList<CaptureValues>>> query, bool timed, bool longRunning, string? text, CancellationToken cancellationToken)
     {
         if (refusedUntil.TryGetValue(blockId, out var until) && now < until)
         {
@@ -149,7 +159,7 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
-            var rows = await open.QueryAsync(blockId, text ?? CaptureCatalog.Get(blockId), parameter, longRunning ? Options.LongStatementTimeout : Options.StatementTimeout, cancellationToken).ConfigureAwait(false);
+            var rows = await query(open, text ?? CaptureCatalog.Get(blockId), longRunning ? Options.LongStatementTimeout : Options.StatementTimeout).ConfigureAwait(false);
             if (timed)
             {
                 Throttle(blockId, System.Diagnostics.Stopwatch.GetElapsedTime(started), now);

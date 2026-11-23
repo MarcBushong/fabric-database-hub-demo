@@ -57,7 +57,17 @@ internal sealed class SqlCaptureConnector(TargetEndpoint endpoint, RunnerLog log
 
     private sealed class SqlCaptureConnection(SqlConnection connection) : ICaptureConnection
     {
-        public async Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken)
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken) =>
+            RunAsync(text, CaptureParameters.None, timeout, cancellationToken);
+
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken) =>
+            parameters.Count > 0 && !parameters.IsNamed
+                ? throw new NotSupportedException($"{blockId} is T-SQL, whose parameters are bound by name.")
+                : RunAsync(text, parameters, timeout, cancellationToken);
+
+        public ValueTask DisposeAsync() => connection.DisposeAsync();
+
+        private async Task<IReadOnlyList<CaptureValues>> RunAsync(string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken)
         {
             try
             {
@@ -67,6 +77,11 @@ internal sealed class SqlCaptureConnector(TargetEndpoint endpoint, RunnerLog log
                 command.CommandText = text;
 #pragma warning restore CA2100
                 command.CommandTimeout = Math.Max(1, (int)Math.Ceiling(timeout.TotalSeconds));
+                foreach (var parameter in parameters)
+                {
+                    command.Parameters.Add(Bind(parameter.Name!, parameter.Value));
+                }
+
                 var rows = new List<CaptureValues>();
                 await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
                 do
@@ -90,7 +105,17 @@ internal sealed class SqlCaptureConnector(TargetEndpoint endpoint, RunnerLog log
                 throw Translate(ex, connecting: false);
             }
         }
-
-        public ValueTask DisposeAsync() => connection.DisposeAsync();
     }
+
+    /// <summary>A T-SQL parameter with its type stated, so the block's comparisons don't depend on inference.</summary>
+    internal static SqlParameter Bind(string name, object? value) => value switch
+    {
+        null => new SqlParameter(name, SqlDbType.NVarChar, -1) { Value = DBNull.Value },
+        DateTimeOffset time => new SqlParameter(name, SqlDbType.DateTimeOffset) { Value = time.ToUniversalTime() },
+        bool flag => new SqlParameter(name, SqlDbType.Bit) { Value = flag },
+        long number => new SqlParameter(name, SqlDbType.BigInt) { Value = number },
+        int number => new SqlParameter(name, SqlDbType.Int) { Value = number },
+        string text => new SqlParameter(name, SqlDbType.NVarChar, -1) { Value = text },
+        _ => throw new ArgumentException($"A T-SQL capture parameter can't be a {value.GetType().Name} ({name}).", nameof(value)),
+    };
 }

@@ -95,11 +95,73 @@ internal sealed class CaptureValues(IReadOnlyDictionary<string, object?> values)
     };
 }
 
+/// <summary>One parameter of a capture block: T-SQL's by name (<c>@since</c>), PostgreSQL's by position (<c>$1</c>, then <c>$2</c>), with no name.</summary>
+internal sealed record CaptureParameter(string? Name, object? Value);
+
+/// <summary>
+/// A capture block's parameters, so the block runs exactly as the catalog has it: T-SQL's bound by name, PostgreSQL's by
+/// position in this order. Values are plain values (a time, a flag, a string, an array of numbers or strings).
+/// </summary>
+internal sealed class CaptureParameters : IReadOnlyList<CaptureParameter>
+{
+    private readonly List<CaptureParameter> items;
+
+    private CaptureParameters(List<CaptureParameter> items) => this.items = items;
+
+    public static CaptureParameters None { get; } = new([]);
+
+    public int Count => items.Count;
+
+    /// <summary>True for T-SQL's named parameters; false for PostgreSQL's positional ones, or none.</summary>
+    public bool IsNamed => items.Count > 0 && items[0].Name is not null;
+
+    public CaptureParameter this[int index] => items[index];
+
+    /// <summary>T-SQL's: each name starts with @ and appears once.</summary>
+    public static CaptureParameters Named(params (string Name, object? Value)[] values)
+    {
+        var list = new List<CaptureParameter>(values.Length);
+        foreach (var (name, value) in values)
+        {
+            if (name is not ['@', _, ..] || list.Exists(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase)))
+            {
+                throw new ArgumentException($"A T-SQL capture parameter needs a name of its own that starts with @ ('{name}').", nameof(values));
+            }
+
+            list.Add(new CaptureParameter(name, value));
+        }
+
+        return new CaptureParameters(list);
+    }
+
+    /// <summary>PostgreSQL's: the first value is <c>$1</c>.</summary>
+    public static CaptureParameters Positional(params object?[] values) => new([.. values.Select(v => new CaptureParameter(null, v))]);
+
+    /// <summary>A named parameter's value, or null when there's none of that name.</summary>
+    public object? Value(string name) => items.Find(p => string.Equals(p.Name, name, StringComparison.OrdinalIgnoreCase))?.Value;
+
+    public IEnumerator<CaptureParameter> GetEnumerator() => items.GetEnumerator();
+
+    System.Collections.IEnumerator System.Collections.IEnumerable.GetEnumerator() => GetEnumerator();
+}
+
 /// <summary>One open connection to one target: the observer runs one statement at a time on it.</summary>
 internal interface ICaptureConnection : IAsyncDisposable
 {
     /// <summary>Runs a catalog block and returns its rows. <paramref name="parameter"/> is RCA-PG-11's $1, the head blockers' pids.</summary>
     Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken);
+
+    /// <summary>
+    /// Runs a catalog block with its parameters: T-SQL's by name, PostgreSQL's by position. A connection that takes only the
+    /// first method's runs a block with none, or with one array of pids, and refuses others.
+    /// </summary>
+    Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken) =>
+        parameters.Count switch
+        {
+            0 => QueryAsync(blockId, text, (int[]?)null, timeout, cancellationToken),
+            1 when !parameters.IsNamed && parameters[0].Value is int[] pids => QueryAsync(blockId, text, pids, timeout, cancellationToken),
+            _ => throw new NotSupportedException($"This capture connection can't bind {blockId}'s parameters."),
+        };
 }
 
 /// <summary>Opens connections to one target with the runner's existing sign-in and the observer's own application name.</summary>

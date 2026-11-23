@@ -87,20 +87,23 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
     It 'reads only the thirteen notebook tables, from schema dbo, through the Direct Lake expression' {
         $text = ($tableFiles | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join "`n"
         $entities = @([regex]::Matches($text, '(?m)^\s+entityName:\s*(\S+)\s*$') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
-        $rca = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).tables.name
+        $rca = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).tables | Where-Object { $_.document -eq 'evidence' } | ForEach-Object { $_.name }
         $entities | Should -Be @(@('analysis_findings', 'incident_windows', 'scenario_runs', 'telemetry_snapshots', 'validation_results') + @($rca) | Sort-Object)
         @([regex]::Matches($text, '(?m)^\s+schemaName:\s*(\S+)\s*$') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique) | Should -Be @('dbo')
         @([regex]::Matches($text, "(?m)^\s+expressionSource:\s*(.+?)\s*$") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique) | Should -Be @("'DirectLake - LH_DatabaseHub'")
     }
 
-    It 'models the Incident RCA''s eight tables as rca/history-tables.json says: columns, types, hidden ones, formats, measures, and Target and Date relationships (ADR 0031)' {
+    It 'models the Incident RCA''s evidence tables as rca/history-tables.json says: columns, types, hidden ones, formats, measures, and Target and Date relationships (ADR 0031)' {
         $contract = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json -AsHashtable
+        # The sidecar's tables join the model with the sidecar's notebook (rca/README.md, The sidecar); until then, the
+        # evidence document's eight.
+        $modelTables = @($contract['tables'] | Where-Object { $_['document'] -eq 'evidence' })
         $relationships = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/relationships.tmdl'))
         $notebook = @{}
         foreach ($column in $contract['notebookColumns']) {
             $notebook[$column['name']] = $column
         }
-        foreach ($table in $contract['tables']) {
+        foreach ($table in $modelTables) {
             $name = $table['model']
             $file = Join-Path -Path $modelRoot -ChildPath ('definition/tables/{0}.tmdl' -f $name)
             Test-Path -LiteralPath $file | Should -BeTrue -Because $name
@@ -128,7 +131,7 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
             $relationships | Should -Match ("(?m)^ {{4}}fromColumn: '{0}'\.'Report Date UTC'\n {{4}}toColumn: Date\.Date$" -f [regex]::Escape($name))
             @([regex]::Matches($relationships, ("(?m)^ {{4}}(from|to)Column: '{0}'\." -f [regex]::Escape($name)))).Count | Should -Be 2 -Because $name
         }
-        foreach ($measure in $contract['measures']) {
+        foreach ($measure in @($contract['measures'] | Where-Object { $_['table'] -notin @($contract['tables'] | Where-Object { $_['document'] -eq 'sidecar' } | ForEach-Object { $_['model'] }) })) {
             $file = Join-Path -Path $modelRoot -ChildPath ('definition/tables/{0}.tmdl' -f $measure['table'])
             $text = [System.IO.File]::ReadAllText($file)
             $block = [regex]::Match($text, ("(?ms)^ {{4}}/// (?<description>[^\n]*)\n {{4}}measure '{0}' =(?<body>.*?)(?=^ {{4}}\S|\z)" -f [regex]::Escape($measure['name'])))
