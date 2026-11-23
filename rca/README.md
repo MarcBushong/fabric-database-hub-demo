@@ -176,20 +176,22 @@ What the observer captures beyond the evidence document, in documents of their o
 - **The latest read wins.** An interval read twice (open, then closed; or by two sessions' baselines) is in both reads' rows. The notebook writes the latest read of each target, interval, login, query, and plan. The model's measures take the latest read too, so a history written otherwise still counts each interval once.
 - **The top lists:**
   - each interval's top 10 by CPU (on T4, total time), and top 5 by duration, by logical reads (on T4, blocks), and by waits;
-  - with every plan of those queries that ran in it; at most 600 rows a read.
+  - ranked after the leave-outs ([what the capture leaves out](#what-the-capture-leaves-out)); a plan is in a list only when it used what the list ranks, more than 0, and ties go to the lower `plan_id`, so two reads of an interval rank it alike;
+  - with every plan of those queries that ran in it; at most 600 rows a read, the oldest intervals first, and the next read starts from the last whole interval it got.
   - A query missing from earlier top lists isn't necessarily new: a reader says "new" only when its plan's compile time (RCA-SQL-14) is in the window, and otherwise "not in the top lists before".
 - **What a reader may claim,** at Query Store's 15-minute granularity, which every claim names:
   - before and after a plan change come from intervals wholly before or after the new plan's first execution; an interval with both plans is mixed, and named so;
   - a CPU share is of the captured top queries, or of the target's measured CPU (RCA Resource) when that's in the window;
   - a baseline is the same query's intervals in the 60 minutes before an incident, at least 2 with executions; otherwise the claim says there's none.
 - **Plans:**
-  - at most the 5 that ran last per query, and every forced plan;
+  - every plan the statistics rows name, so each row has its plan (RCA-SQL-14's `@plans`); at most the 5 that ran last per query besides; and every forced plan;
+  - a plan's row is written when a read first returns it, and again when its forcing, compiles, or compile time change. So its `last_execution_utc` is as of that row's read;
   - a showplan's XML is read once and reduced to `plan_summary` and `estimated_cost`: its costliest operators with their objects and indexes, its warnings, and a missing index. It's never stored whole and never keeps a parameter's value;
   - T4 stores no plans (`pg_qs.store_query_plans` stays off).
 - **Events:** `rca_query_events` records:
   - a plan forced or unforced;
   - Query Store's state changing, with READ_ONLY's reason in words;
-  - automatic tuning's option or a recommendation's state.
+  - automatic tuning's option, or a recommendation's state, from its first appearance (with no previous state).
 
   Each is timed within its read's period (`time_from_utc` to `event_time_utc`).
 - **Coverage:** `rca_query_coverage` holds one row per target per sidecar: Query Store's state and capture mode as read, the intervals read, PostgreSQL's pending publication, and the gaps:

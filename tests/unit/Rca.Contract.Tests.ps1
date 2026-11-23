@@ -254,6 +254,39 @@ Describe 'The Incident RCA contract: document fixtures (ADR 0031)' {
         $covered | Should -Be @($document.targets | Sort-Object)
     }
 
+    It '<Name> has a plan row for every plan its statistics name, and writes a plan again only when it changed' -ForEach @($documentFixtures | Where-Object { $_.Kind -eq 'sidecar' }) {
+        # rca/README.md, Query Store, Plans: RCA-SQL-14's @plans, and a plan's row again only when its forcing, compiles,
+        # or compile time change. T4 stores no plans: its statistics name plan 0.
+        $document = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable
+        $stats = $document.tables['rca_query_stats']
+        $plans = $document.tables['rca_query_plans']
+        $value = { param($Table, $Column, $Row) $values = $Table.columns[$Column]; if ($null -eq $values) { $null } else { $values[$Row] } }
+        $keys = [System.Collections.Generic.HashSet[string]]::new()
+        $rows = [System.Collections.Generic.List[object]]::new()
+        if ($null -ne $plans) {
+            for ($i = 0; $i -lt $plans.columns.plan_id.Count; $i++) {
+                $key = '{0}/{1}' -f $document.strings[$plans.columns.target[$i]], $plans.columns.plan_id[$i]
+                $null = $keys.Add($key)
+                $forcing = & $value $plans 'forcing_type' $i
+                $change = '{0}|{1}|{2}|{3}|{4}' -f (& $value $plans 'is_forced_plan' $i), $(if ($null -ne $forcing) { $document.strings[$forcing] }), (& $value $plans 'compiles' $i), (& $value $plans 'last_compiled_utc' $i), (& $value $plans 'force_failures' $i)
+                $rows.Add([pscustomobject]@{ Key = $key; At = [long]$plans.columns.captured_at_utc[$i]; Change = $change })
+            }
+        }
+        if ($null -ne $stats) {
+            for ($i = 0; $i -lt $stats.columns.plan_id.Count; $i++) {
+                if ([long]$stats.columns.plan_id[$i] -eq 0) { continue }
+                $key = '{0}/{1}' -f $document.strings[$stats.columns.target[$i]], $stats.columns.plan_id[$i]
+                $keys.Contains($key) | Should -BeTrue -Because ('the statistics name plan {0}, which has no plan row' -f $key)
+            }
+        }
+        foreach ($group in ($rows | Group-Object -Property Key)) {
+            $ordered = @($group.Group | Sort-Object -Property At)
+            for ($j = 1; $j -lt $ordered.Count; $j++) {
+                $ordered[$j].Change | Should -Not -Be $ordered[$j - 1].Change -Because ('plan {0} is written again unchanged' -f $group.Name)
+            }
+        }
+    }
+
     It '<Name> keeps the detection tables blind: no scenario ID, run ID, or answer-key string, and program names without their segments' -ForEach $documentFixtures {
         $document = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -AsHashtable
         $violations = foreach ($text in $document.strings) { Get-DetectionStringViolation -Text $text }
