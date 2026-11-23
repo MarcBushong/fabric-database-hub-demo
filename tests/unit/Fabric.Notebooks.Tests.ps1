@@ -469,7 +469,7 @@ Describe 'NB_DatabaseHub_Deployment content' {
         $markdown | Should -Match 'the scripts'' import binds the notebook to it'
     }
 
-    It 'never drops a table on Run all with its defaults, and drops all thirteen and the staged RCA evidence only with PURGE_DEMO_TABLES and CONFIRM (2026-11-03, ADR 0031)' {
+    It 'never drops a table on Run all with its defaults, and drops every demo table, the staged RCA evidence, and the acknowledgements only with PURGE_DEMO_TABLES and CONFIRM (2026-11-03, ADR 0031)' {
         if (-not $python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
             return
@@ -518,12 +518,14 @@ ns, dropped, removed = run()
 assert ns["CONFIRM"] is True and ns["PURGE_DEMO_TABLES"] is False, (ns["CONFIRM"], ns["PURGE_DEMO_TABLES"])
 assert dropped == [] and removed == [], (dropped, removed)
 ns, dropped, removed = run(PURGE_DEMO_TABLES=True)
-assert len(dropped) == 13 and all(text.startswith("DROP TABLE IF EXISTS ") for text in dropped), dropped
-assert removed == [("Files/rca/inbox", True), ("Files/rca", False)], removed
+# The five history tables and the Incident RCA's fourteen (rca/history-tables.json, purge), then its two folders (purgeFiles),
+# each followed by Files/rca once it's empty, which this stand-in always says it is.
+assert dropped == ["DROP TABLE IF EXISTS " + table for table in ns["DEMO_TABLES"]] and len(dropped) == 19, dropped
+assert removed == [("Files/rca/inbox", True), ("Files/rca", False), ("Files/rca/acks", True), ("Files/rca", False)], removed
 workspace, lakehouse = "-".join(("1" * 8, "2" * 4, "3" * 4, "4" * 4, "5" * 12)), "-".join(("6" * 8, "7" * 4, "8" * 4, "9" * 4, "a" * 12))
 ns, dropped, removed = run(PURGE_DEMO_TABLES=True, WORKSPACE_ID=workspace, LAKEHOUSE_ID=lakehouse)
-assert removed == [("abfss://%s@onelake.dfs.fabric.microsoft.com/%s/Files/rca/inbox" % (workspace, lakehouse), True),
-                   ("abfss://%s@onelake.dfs.fabric.microsoft.com/%s/Files/rca" % (workspace, lakehouse), False)], removed
+root = "abfss://%s@onelake.dfs.fabric.microsoft.com/%s/" % (workspace, lakehouse)
+assert removed == [(root + "Files/rca/inbox", True), (root + "Files/rca", False), (root + "Files/rca/acks", True), (root + "Files/rca", False)], removed
 ns, dropped, removed = run(PURGE_DEMO_TABLES=True, CONFIRM=False)
 assert dropped == [] and removed == [], (dropped, removed)
 print("ok")
@@ -1658,6 +1660,7 @@ sys.modules.update({"pyspark": types.ModuleType("pyspark"), "pyspark.sql": pyspa
 notebook, repo = sys.argv[1], sys.argv[2]
 code = ["".join(cell["source"]) for cell in json.load(open(notebook, encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
 setup = [cell for cell in code if cell.startswith(("# Parameters cell", "# Helpers, part"))]
+sidecar = next(cell for cell in code if cell.startswith("# The Incident RCA's sidecar"))
 this_session = next(cell for cell in code if cell.startswith("# This session"))
 persist = next(cell for cell in code if cell.startswith("# Persist:"))
 spec = {table["name"]: table for table in json.load(open(repo + "/rca/history-tables.json", encoding="utf-8"))["tables"]}
@@ -1784,7 +1787,8 @@ class Lake:
 
 
 def run(lake, files, session_id=SID, evidence_file="", evidence="", rca_only=False, save=True, reference=False):
-    """One run of the notebook: its setup, section 3, and the persist cell, which sections 4 to 10 add nothing to here."""
+    """One run of the notebook: its setup, the sidecar's cell (no sidecar passed), section 3, and the persist cell, which
+    sections 4 to 10 add nothing to here."""
     exits, printed = [], io.StringIO()
     utils = types.SimpleNamespace(fs=files, notebook=types.SimpleNamespace(exit=exits.append))
     ns = {}
@@ -1798,13 +1802,14 @@ def run(lake, files, session_id=SID, evidence_file="", evidence="", rca_only=Fal
         ns.update(_spark=lambda: lake, runtime_context=lambda: {"defaultLakehouseId": LH}, _notebookutils=lambda: utils,
                   REFERENCE_RUN=reference, incident_window_rows=lambda: ([], []),
                   merge_incident_windows=lambda session, recorded, detected: (0, 0))
+        exec(sidecar, ns)
         exec(this_session, ns)
         exec(persist, ns)
     state = ns["RCA_STATE"]
     findings = [row for row in lake.tables.get("analysis_findings", []) if row["analysis"] == "rca_evidence"]
     return {"status": state["status"], "message": state["message"], "documents": state["documents"], "skipped": state["skipped"],
             "exits": exits, "findings": [[row["status"], row["target"], row["finding"]] for row in findings],
-            "counts": {name: len(lake.tables[name]) for name in ns["RCA_TABLES"] if name in lake.tables},
+            "counts": {name: len(lake.tables[name]) for name in list(ns["RCA_TABLES"]) + list(ns["RCA_SIDECAR_TABLES"]) if name in lake.tables},
             "telemetry": len(lake.tables.get("telemetry_snapshots", [])), "left": files.left(), "reads": list(files.reads)}, ns
 
 
@@ -2118,7 +2123,7 @@ print(json.dumps(report, default=str))
         $rcaReport['redacted']['statement'] | Should -BeExactly 'SELECT 1 -- [REDACTED:jwt]'
     }
 
-    It 'is Not selected without evidence, and still creates the eight tables, so the history model frames them' {
+    It 'is Not selected without evidence, and still creates the RCA tables, the sidecar''s among them, so the history model frames them' {
         if ($rcaSkip) {
             Set-ItResult -Skipped -Because $rcaSkip
             return
@@ -2407,5 +2412,789 @@ print("ok")
 '@
         $output = & $python $script $live.Path 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+    }
+}
+
+Describe 'The Incident RCA''s sidecar in NB_DatabaseHub_LiveActivity (2026-11-23, rca/README.md, The sidecar)' {
+    BeforeAll {
+        $live = Get-Notebook -Name 'NB_DatabaseHub_LiveActivity'
+        $part5 = @($live.Code | Where-Object { $_.Source -match '^# Helpers, part 5' })
+        $saveCell = @($live.Code | Where-Object { $_.Source -match '^# The Incident RCA''s sidecar' })
+        $contract = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json -AsHashtable
+        $transportPath = Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json'
+        $transport = Get-Content -LiteralPath $transportPath -Raw | ConvertFrom-Json -AsHashtable
+        $sidecarTables = @($contract['tables'] | Where-Object { $_['document'] -eq 'sidecar' })
+        $fixtureIds = @('20261120T165000Z-sqlvm01-0001-sidecar', '20261120T170000Z-sqlvm01-0002-sidecar', '20261121T100000Z-sqlvm01-0001-sidecar')
+        $sessionRun = 'session-5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21'
+
+        # The notebook's own cells run here (parameters, the helper cells, the sidecar's cell, section 3, and the persist cell)
+        # against a lakehouse in memory, with the contract's sidecar fixtures, staged as the scripts stage them.
+        $sidecarReport = $null
+        $sidecarSkip = ''
+        if (-not $pandasPython) {
+            $sidecarSkip = 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+        }
+        else {
+            $PSNativeCommandUseErrorActionPreference = $false
+            $null = & $pandasPython -c 'import pandas' 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                $sidecarSkip = 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            }
+        }
+        if (-not $sidecarSkip) {
+            $script = Join-Path -Path $TestDrive -ChildPath 'rca_sidecar.py'
+            Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import base64, contextlib, copy, datetime as dt, gzip, hashlib, io, json, re, sys, types
+
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+spark_types = types.ModuleType("pyspark.sql.types")
+for name in ("StringType", "BooleanType", "TimestampType", "DoubleType", "LongType", "IntegerType", "DateType"):
+    setattr(spark_types, name, type(name, (), {}))
+spark_types.StructField = lambda name, kind, nullable: name
+spark_types.StructType = list
+pyspark_sql = types.ModuleType("pyspark.sql")
+pyspark_sql.types = spark_types
+sys.modules.update({"pyspark": types.ModuleType("pyspark"), "pyspark.sql": pyspark_sql, "pyspark.sql.types": spark_types})
+
+notebook, repo = sys.argv[1], sys.argv[2]
+code = ["".join(cell["source"]) for cell in json.load(open(notebook, encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+setup = [cell for cell in code if cell.startswith(("# Parameters cell", "# Helpers, part"))]
+sidecar_cell = next(cell for cell in code if cell.startswith("# The Incident RCA's sidecar"))
+this_session = next(cell for cell in code if cell.startswith("# This session"))
+persist = next(cell for cell in code if cell.startswith("# Persist:"))
+contract = json.load(open(repo + "/rca/history-tables.json", encoding="utf-8"))
+spec = {table["name"]: table for table in contract["tables"]}
+SIDECAR = [table["name"] for table in contract["tables"] if table["document"] == "sidecar"]
+UNIX = dt.datetime(1970, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def fixture(name):
+    return json.load(open(repo + "/rca/fixtures/" + name, encoding="utf-8"))
+
+
+PARAMETER = fixture("rca-sidecar.parameter.json")
+DOCUMENTS = {document["documentId"]: document for document in (
+    fixture("t3-plan-regression.sidecar.json"), fixture("t4-query-store.sidecar.json"), fixture("t4-connection-surge.sidecar.json"))}
+T3, T4, SURGE = sorted(DOCUMENTS)
+SID = DOCUMENTS[T3]["sessionId"]
+# GUID-shaped IDs, built here so no file holds one.
+WS = "-".join(("1" * 8, "2" * 4, "3" * 4, "4" * 4, "5" * 12))
+LH = "-".join(("6" * 8, "7" * 4, "8" * 4, "9" * 4, "a" * 12))
+ROOT = "abfss://%s@onelake.dfs.fabric.microsoft.com/%s/" % (WS, LH)
+NOW = dt.datetime.now(dt.timezone.utc)
+
+
+def stamp(delta=dt.timedelta(0)):
+    return (NOW - delta).strftime("%Y%m%dT%H%M%SZ")
+
+
+class Files:
+    """notebookutils.fs over the lakehouse's Files, in memory: files by their OneLake path, and folders."""
+
+    def __init__(self):
+        self.files, self.folders, self.reads = {}, set(), []
+
+    def add(self, relative, text):
+        self.files[ROOT + relative] = text
+        parent = (ROOT + relative).rsplit("/", 1)[0]
+        while parent.startswith(ROOT + "Files/"):
+            self.folders.add(parent)
+            parent = parent.rsplit("/", 1)[0]
+
+    def head(self, path, max_bytes):
+        self.reads.append(path[len(ROOT):])
+        return self.files[path][:max_bytes]
+
+    def exists(self, path):
+        return path in self.files or path in self.folders
+
+    def ls(self, path):
+        prefix = path.rstrip("/") + "/"
+        names = {item[len(prefix):].split("/")[0] for item in list(self.files) + list(self.folders) if item.startswith(prefix)}
+        return [types.SimpleNamespace(name=name) for name in sorted(names)]
+
+    def rm(self, path, recurse=False):
+        if path in self.files:
+            del self.files[path]
+        elif self.ls(path) and not recurse:
+            raise IOError("the folder isn't empty")
+        else:
+            self.folders.discard(path)
+        return True
+
+    def mkdirs(self, path):
+        self.add(path[len(ROOT):] + "/.keep", "")
+        del self.files[path + "/.keep"]
+        return True
+
+    def put(self, path, content, overwrite=False):
+        if path in self.files and not overwrite:
+            raise IOError("the file exists")
+        self.add(path[len(ROOT):], content)
+        return True
+
+    def text(self, relative):
+        return self.files.get(ROOT + relative)
+
+    def left(self):
+        return sorted(item[len(ROOT):] for item in self.files) + sorted(item[len(ROOT):] + "/" for item in self.folders)
+
+
+class Rows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def filter(self, condition):
+        column, value = re.fullmatch(r"(\w+) = '([^']*)'", condition).groups()
+        return Rows([row for row in self.rows if row.get(column) == value])
+
+    def limit(self, count):
+        return Rows(self.rows[:count])
+
+    def count(self):
+        return len(self.rows)
+
+
+def ms(value):
+    return (value - UNIX) // dt.timedelta(milliseconds=1)
+
+
+class Lake:
+    """The default lakehouse's tables in memory, with the statements the notebook sends, Delta's MERGE among them."""
+
+    def __init__(self):
+        self.tables, self.columns, self.log, self.views = {}, {}, [], {}
+        self.catalog = types.SimpleNamespace(tableExists=lambda name: name in self.tables)
+        self.conf = types.SimpleNamespace(get=lambda key: "UTC", set=lambda key, value: None)
+
+    def table(self, name):
+        rows = Rows(self.tables[name])
+        rows.schema = types.SimpleNamespace(fields=[types.SimpleNamespace(name=column) for column, _ in self.columns[name]])
+        return rows
+
+    def createDataFrame(self, data, schema):
+        lake, rows = self, [dict(zip(schema, values)) for values in data]
+
+        class Writer:
+            def format(self, name):
+                return self
+
+            def mode(self, name):
+                return self
+
+            def option(self, key, value):
+                return self
+
+            def saveAsTable(self, table):
+                lake.log.append("append %s %d" % (table, len(rows)))
+                lake.tables.setdefault(table, []).extend(rows)
+
+        def view(name):
+            lake.views[name] = rows
+
+        return types.SimpleNamespace(coalesce=lambda count: types.SimpleNamespace(write=Writer()), createOrReplaceTempView=view)
+
+    def sql(self, statement):
+        result = []
+        by_run = re.fullmatch(r"DELETE FROM (\w+) WHERE run_id = '([^']*)'", statement)
+        by_document = re.fullmatch(r"DELETE FROM (\w+) WHERE document_id IN \(('[^']*'(?:, '[^']*')*)\)", statement)
+        reads = re.fullmatch(r"SELECT target, unix_millis\(interval_start_utc\) AS interval_ms, login_name, query_id, plan_id, "
+                             r"unix_millis\(captured_at_utc\) AS captured_ms FROM (\w+) WHERE unix_millis\(interval_start_utc\) "
+                             r"BETWEEN (-?\d+) AND (-?\d+)", statement)
+        merge = re.fullmatch(r"MERGE INTO (\w+) AS t USING rca_sidecar_reads AS s ON t\.target = s\.target AND t\.interval_start_utc = "
+                             r"s\.interval_start_utc AND t\.login_name <=> s\.login_name AND t\.query_id = s\.query_id AND t\.plan_id = "
+                             r"s\.plan_id AND t\.captured_at_utc < s\.captured_at_utc WHEN MATCHED THEN DELETE", statement)
+        saved = re.fullmatch(r"SELECT DISTINCT document_id FROM (rca_coverage|rca_query_coverage) WHERE document_id IN \((.*)\)", statement)
+        if by_run or by_document:
+            column, gone = ("run_id", {by_run.group(2)}) if by_run else ("document_id", set(re.findall(r"'([^']*)'", by_document.group(2))))
+            name = (by_run or by_document).group(1)
+            kept = [row for row in self.tables[name] if row.get(column) not in gone]
+            self.log.append("delete %s %d" % (name, len(self.tables[name]) - len(kept)))
+            self.tables[name][:] = kept
+        elif reads:
+            low, high = int(reads.group(2)), int(reads.group(3))
+            result = [{"target": row["target"], "interval_ms": ms(row["interval_start_utc"]), "login_name": row.get("login_name"),
+                       "query_id": row["query_id"], "plan_id": row["plan_id"], "captured_ms": ms(row["captured_at_utc"])}
+                      for row in self.tables[reads.group(1)] if low <= ms(row["interval_start_utc"]) <= high]
+        elif merge:
+            # <=> is null-safe: two null logins are equal, as SQL Server's rows have them.
+            key = ("target", "interval_start_utc", "login_name", "query_id", "plan_id")
+            source = self.views["rca_sidecar_reads"]
+            kept = [row for row in self.tables[merge.group(1)] if not any(
+                all(row.get(column) == item.get(column) for column in key) and row["captured_at_utc"] < item["captured_at_utc"] for item in source)]
+            self.log.append("merge-delete %s %d" % (merge.group(1), len(self.tables[merge.group(1)]) - len(kept)))
+            self.tables[merge.group(1)][:] = kept
+        elif statement.startswith("CREATE TABLE IF NOT EXISTS "):
+            self.tables.setdefault(statement.split()[5], [])
+        elif saved:
+            wanted = set(re.findall(r"'([^']*)'", saved.group(2)))
+            result = [{"document_id": value} for value in sorted({row["document_id"] for row in self.tables[saved.group(1)]} & wanted)]
+        elif statement.startswith("SELECT COUNT(*) AS n FROM "):
+            result = [{"n": 0}]
+        elif statement.startswith("DESCRIBE DETAIL "):
+            result = [{"numFiles": 1}]
+        else:
+            raise AssertionError("unexpected statement: " + statement)
+        return types.SimpleNamespace(collect=lambda: result)
+
+
+def run(lake, files, sidecar_file="", session_id="", rca_only=False, save=True):
+    """One run of the notebook: its setup, the sidecar's cell, section 3, and the persist cell when section 3 didn't end it."""
+    exits, printed = [], io.StringIO()
+    utils = types.SimpleNamespace(fs=files, notebook=types.SimpleNamespace(exit=exits.append))
+    ns = {}
+    with contextlib.redirect_stdout(printed):
+        exec(setup[0], ns)
+        ns.update(SESSION_ID=session_id, SESSION_PLAN="", RCA_EVIDENCE="", RCA_EVIDENCE_FILE="", RCA_ONLY=rca_only,
+                  RCA_SIDECAR_FILE=sidecar_file, SAVE_RESULTS=save, WORKSPACE_ID=WS, LAKEHOUSE_ID=LH)
+        for cell in setup[1:]:
+            exec(cell, ns)
+        lake.columns = ns["TABLE_COLUMNS"]
+        ns.update(_spark=lambda: lake, runtime_context=lambda: {"defaultLakehouseId": LH}, _notebookutils=lambda: utils,
+                  REFERENCE_RUN=False, incident_window_rows=lambda: ([], []),
+                  merge_incident_windows=lambda session, recorded, detected: (0, 0))
+        exec(sidecar_cell, ns)
+        exec(this_session, ns)
+        if not exits:
+            exec(persist, ns)
+    state = ns["RCA_SIDECAR_STATE"]
+    findings = [row for row in lake.tables.get("analysis_findings", []) if row["analysis"] == "rca_sidecar" and row["run_id"] == ns["RUN_ID"]]
+    return {"status": state["status"], "message": state["message"], "documents": state["documents"], "skipped": state["skipped"],
+            "replaced": state["replaced"], "superseded": state["superseded"], "ackPath": state["ack"],
+            "ack": files.text(state["ack"]) if state["ack"] else None, "exits": exits, "runId": ns["RUN_ID"],
+            "findings": [[row["status"], row["target"], row["finding"]] for row in findings],
+            "counts": {name: len(lake.tables[name]) for name in SIDECAR if name in lake.tables},
+            "left": files.left(), "reads": list(files.reads)}, ns
+
+
+def encode(document, size=2400, marker="DBHUBDEMO-RCAS 1"):
+    """The runner's part lines for a sidecar (rca/README.md, Part lines)."""
+    stream = gzip.compress(json.dumps(document, separators=(",", ":")).encode("utf-8"))
+    digest = hashlib.sha256(stream).hexdigest()
+    chunks = [stream[index:index + size] for index in range(0, len(stream), size)]
+    return ["%s %s %d/%d %s %s" % (marker, document["documentId"], index + 1, len(chunks), digest, base64.b64encode(chunk).decode("ascii"))
+            for index, chunk in enumerate(chunks)]
+
+
+def parameter(parts, **changes):
+    return json.dumps(dict({"kind": "ContosoCare.RcaSidecarParts", "version": 1, "sessionId": None, "parts": parts}, **changes))
+
+
+def stage(files, text, delta=dt.timedelta(0), suffix=""):
+    """Stages a file as the scripts do: Files/rca/inbox/sidecar-<when, UTC>[-<name>].json."""
+    name = "Files/rca/inbox/sidecar-%s%s.json" % (stamp(delta), suffix)
+    files.add(name, text)
+    return name
+
+
+def plain(value):
+    return value.isoformat() if isinstance(value, (dt.datetime, dt.date)) else value
+
+
+def expected(document):
+    """The sidecar's rows decoded on their own, from the contract, to compare with what the notebook wrote."""
+    epoch = dt.datetime.fromisoformat(document["epochUtc"].replace("Z", "+00:00"))
+    rows = {}
+    for name, table in document["tables"].items():
+        kinds = {column["name"]: column["type"] for column in spec[name]["columns"]}
+        decoded = []
+        for index in range(table["rows"]):
+            row = {}
+            for column, values in table["columns"].items():
+                value = values[index]
+                if value is not None and kinds[column] == "string":
+                    value = document["strings"][value]
+                elif value is not None and kinds[column] == "timestamp":
+                    value = (epoch + dt.timedelta(milliseconds=value)).isoformat()
+                elif value is not None and kinds[column] == "double":
+                    value = float(value)
+                row[column] = value
+            decoded.append(row)
+        rows[name] = decoded
+    return rows
+
+
+def latest(lake):
+    """Each target, interval, login, query, and plan in rca_query_stats and rca_query_waits, with the reads it holds."""
+    found = {}
+    for table in ("rca_query_stats", "rca_query_waits"):
+        reads = {}
+        for row in lake.tables.get(table, []):
+            key = "%s %s %s %s %s" % (row["target"], row["interval_start_utc"].strftime("%H:%M"), row.get("login_name"), row["query_id"], row["plan_id"])
+            reads.setdefault(key, set()).add(row["captured_at_utc"].strftime("%H:%M:%S"))
+        found[table] = {key: sorted(value) for key, value in sorted(reads.items())}
+    return found
+
+
+report = {}
+
+# The contract: the six tables, their columns and types in order, the required ones, and the primary times.
+lake, files = Lake(), Files()
+ns = run(lake, files)[1]
+report["contract"] = {
+    "tables": {name: {"primary": table["primary"], "columns": [list(column) for column in table["columns"]],
+                      "required": list(table["required"])} for name, table in ns["RCA_SIDECAR_TABLES"].items()},
+    "tableColumns": {name: [list(column) for column in ns["TABLE_COLUMNS"][name]] for name in ns["RCA_SIDECAR_TABLES"]},
+    "dateSources": {name: list(ns["REPORT_DATE_SOURCES"][name]) for name in ns["RCA_SIDECAR_TABLES"]},
+    "writeOrder": list(ns["RCA_SIDECAR_WRITE_ORDER"]), "evidenceTables": list(ns["RCA_TABLES"])}
+
+# The fixtures' parts decode to the fixture sidecars, from the parameter and from each parts file; part 4's evidence
+# decoder takes none of them (a sidecar is invisible to it).
+decoded, skipped = ns["decode_rca_sidecar_parts"](PARAMETER["parts"])
+from_files = {}
+for name in ("t3-plan-regression", "t4-query-store", "t4-connection-surge"):
+    lines = [line for line in open(repo + "/rca/fixtures/%s.sidecar-parts.txt" % name, encoding="utf-8").read().splitlines() if line]
+    from_files.update(ns["decode_rca_sidecar_parts"](lines)[0])
+evidence_decoded, evidence_skipped = ns["decode_rca_parts"](PARAMETER["parts"])
+report["decode"] = {"same": decoded == DOCUMENTS, "sameFromFiles": from_files == DOCUMENTS, "documents": sorted(decoded), "skipped": skipped,
+                    "evidenceDocuments": sorted(evidence_decoded), "evidenceSkipped": evidence_skipped}
+
+# The scripts' save, outside a session: the fixtures' file, staged as the scripts stage it.
+lake, files = Lake(), Files()
+staged = stage(files, json.dumps(PARAMETER))
+first, ns = run(lake, files, sidecar_file=staged)
+mismatches, runs, dates = [], {}, []
+for document_id, document in DOCUMENTS.items():
+    for name, rows in expected(document).items():
+        written = [row for row in lake.tables[name] if row["document_id"] == document_id]
+        if len(written) != len(rows):
+            mismatches.append("%s %s: %d rows, not %d" % (document_id, name, len(written), len(rows)))
+            continue
+        for want, got in zip(rows, written):
+            if {column: plain(got[column]) for column in want} != want:
+                mismatches.append("%s %s: a row differs" % (document_id, name))
+            if any(got[column["name"]] is not None for column in spec[name]["columns"] if column["name"] not in want):
+                mismatches.append("%s %s: a column the sidecar left out isn't null" % (document_id, name))
+            runs.setdefault(document_id, set()).add(got["run_id"])
+            if got["report_date_utc"] != got[spec[name]["primaryTime"]].date():
+                dates.append("%s %s" % (name, got["report_date_utc"]))
+first.update(staged=staged, mismatches=mismatches, runs={key: sorted(value) for key, value in runs.items()}, badDates=dates,
+             expectedCounts={name: sum(len(expected(document).get(name, [])) for document in DOCUMENTS.values()) for name in SIDECAR})
+report["fixtures"] = first
+
+# The same sidecars again (the scripts stage a new file): every one is in the history already, and nothing is written twice.
+before = len(lake.log)
+name = stage(files, json.dumps(PARAMETER), suffix="-again")
+again, _ = run(lake, files, sidecar_file=name)
+again["writes"], again["file"] = [entry for entry in lake.log[before:] if entry.split()[1] in SIDECAR], name
+report["again"] = again
+
+# A write cut off before a sidecar's coverage rows: the next save deletes what it left and writes it again, whole.
+lake, files = Lake(), Files()
+run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER)))
+lake.tables["rca_query_coverage"][:] = [row for row in lake.tables["rca_query_coverage"] if row["document_id"] != T3]
+before = len(lake.log)
+resumed, _ = run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER), suffix="-resumed"))
+resumed["deleted"] = sum(int(entry.split()[-1]) for entry in lake.log[before:] if entry.startswith("delete rca_"))
+report["resumed"] = resumed
+
+# A session's run reads the same file, its own session's or another's: the session's sidecars go under their session's
+# run whichever run reads them, and the one with no session under the reading run's.
+for case, session_id in (("ownSession", SID), ("otherSession", "f" * 32)):
+    lake, files = Lake(), Files()
+    result, _ = run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER)), session_id=session_id)
+    result["runs"] = {document_id: sorted({row["run_id"] for name in SIDECAR for row in lake.tables.get(name, [])
+                                           if row["document_id"] == document_id}) for document_id in DOCUMENTS}
+    report[case] = result
+
+
+def reread(document, document_id, captured, keep, changes):
+    """A later sidecar that read some of a fixture's intervals again: its rows at those indexes, read at captured (UTC), with
+    changed values, and the fixture's coverage rows to captured."""
+    later = copy.deepcopy(document)
+    later["documentId"], later["sequence"], later["windowEndUtc"] = document_id, int(document_id.split("-")[-2]), captured
+    epoch = dt.datetime.fromisoformat(document["epochUtc"].replace("Z", "+00:00"))
+    offset = int((dt.datetime.fromisoformat(captured.replace("Z", "+00:00")) - epoch).total_seconds() * 1000)
+    later["tables"] = {"rca_query_coverage": copy.deepcopy(document["tables"]["rca_query_coverage"])}
+    later["tables"]["rca_query_coverage"]["columns"]["window_end_utc"] = [offset] * document["tables"]["rca_query_coverage"]["rows"]
+    for name, indexes in keep.items():
+        columns = {column: [values[index] for index in indexes] for column, values in document["tables"][name]["columns"].items()}
+        columns["captured_at_utc"] = [offset] * len(indexes)
+        columns.update(changes.get(name, {}))
+        later["tables"][name] = {"rows": len(indexes), "columns": columns}
+    return later
+
+
+# T3's 17:15 interval read whole at 17:35 (the fixture read it open, at 17:20:10), and T4's chain read again at 17:32: by
+# the workload's role, and by another role, which is a query of its own.
+T3_LATER = reread(DOCUMENTS[T3], "20261120T165000Z-sqlvm01-0003-sidecar", "2026-11-20T17:35:05.000Z",
+                  {"rca_query_stats": [10, 11], "rca_query_waits": [7]},
+                  {"rca_query_stats": {"executions": [1500, 560]}, "rca_query_waits": {"wait_ms": [4321.0]}})
+t4 = DOCUMENTS[T4]
+chain = next(index for index, query in enumerate(t4["tables"]["rca_query_stats"]["columns"]["query_id"]) if query == -6412873301142229951)
+T4_LATER = reread(t4, "20261120T170000Z-sqlvm01-0004-sidecar", "2026-11-20T17:32:05.000Z", {"rca_query_stats": [chain, chain]},
+                  {"rca_query_stats": {"login_name": [t4["strings"].index("contosocare_runner"), None], "executions": [230, 12]}})
+lake, files = Lake(), Files()
+run(lake, files, sidecar_file=stage(files, parameter(encode(DOCUMENTS[T3]) + encode(DOCUMENTS[T4]))))
+report["laterRead"] = dict(run(lake, files, sidecar_file=stage(files, parameter(encode(T3_LATER) + encode(T4_LATER)), suffix="-later"))[0],
+                           reads=latest(lake))
+lake, files = Lake(), Files()
+run(lake, files, sidecar_file=stage(files, parameter(encode(T3_LATER))))
+report["earlierRead"] = dict(run(lake, files, sidecar_file=stage(files, parameter(encode(DOCUMENTS[T3])), suffix="-earlier"))[0], reads=latest(lake))
+lake, files = Lake(), Files()
+report["bothReads"] = dict(run(lake, files, sidecar_file=stage(files, parameter(encode(DOCUMENTS[T3]) + encode(T3_LATER))))[0], reads=latest(lake))
+
+# A sidecar with a missing part, a bad SHA-256, a newer version, or lines in a part format this notebook can't read is
+# skipped and named, and the others are written; the file stays.
+t3_parts = encode(DOCUMENTS[T3], size=1500)
+others = encode(DOCUMENTS[T4]) + encode(DOCUMENTS[SURGE])
+newer = copy.deepcopy(DOCUMENTS[T3])
+newer["version"] = 2
+evidence_line = open(repo + "/rca/fixtures/t1-blocking-chain.parts.txt", encoding="utf-8").read().splitlines()[0]
+for case, parts in (("missing", [part for part in t3_parts if " 2/" not in part] + others),
+                    ("corrupt", [re.sub(r" ([0-9a-f]{64}) ", " " + "0" * 64 + " ", part) for part in t3_parts] + others),
+                    ("newerDocument", encode(newer) + others), ("newerFormat", encode(DOCUMENTS[T3], marker="DBHUBDEMO-RCAS 2") + others),
+                    ("evidenceLine", PARAMETER["parts"] + [evidence_line])):
+    files = Files()
+    name = stage(files, parameter(parts))
+    report[case] = dict(run(Lake(), files, sidecar_file=name)[0], file=name)
+files = Files()
+name = stage(files, parameter(PARAMETER["parts"], version=2))
+report["newerFile"] = dict(run(Lake(), files, sidecar_file=name)[0], file=name)
+files = Files()
+files.add("Files/other.json", json.dumps(PARAMETER))
+report["outside"] = run(Lake(), files, sidecar_file="Files/other.json")[0]
+report["unread"] = run(Lake(), Files(), sidecar_file="Files/rca/inbox/sidecar-20261121T102531Z.json")[0]
+
+# Nothing passed: Not selected, no finding, and the six tables all the same, so the history model frames them.
+lake = Lake()
+report["none"] = dict(run(lake, Files())[0], tables=sorted(name for name in lake.tables if name in SIDECAR))
+# SAVE_RESULTS False: nothing is written, acknowledged, or deleted.
+files = Files()
+name = stage(files, json.dumps(PARAMETER))
+report["unsaved"] = dict(run(Lake(), files, sidecar_file=name, save=False)[0], file=name)
+# RCA_ONLY (the control's save of an earlier session's evidence): the sidecar is written before section 3 ends the run.
+lake, files = Lake(), Files()
+only, _ = run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER)), session_id=SID, rca_only=True, save=False)
+report["rcaOnly"] = dict(only, telemetry=len(lake.tables.get("telemetry_snapshots", [])))
+
+# The sweep, in a run with nothing passed: a kept file goes once later runs have written every sidecar in it, or after 30
+# days; an acknowledgement a day after its file is gone, or after 30 days. Part 4's day-old sweep never takes a sidecar file.
+lake, files = Lake(), Files()
+run(lake, files, sidecar_file=stage(files, json.dumps(PARAMETER)))
+names = {"ancient": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta(days=31), suffix="-ancient"),
+         "written": stage(files, json.dumps(PARAMETER), delta=dt.timedelta(hours=2), suffix="-written"),
+         "pending": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta(hours=3), suffix="-pending"),
+         "dayOld": stage(files, parameter(encode(T4_LATER)), delta=dt.timedelta(days=2), suffix="-dayold"),
+         "evidence": "Files/rca/inbox/%s-script-1234abcd.json" % stamp(dt.timedelta(days=2)), "notes": "Files/rca/inbox/notes.txt"}
+acks = {"gone": "Files/rca/acks/sidecar-%s-gone.ack.json" % stamp(dt.timedelta(days=2)),
+        "kept": "Files/rca/acks/sidecar-%s-dayold.ack.json" % stamp(dt.timedelta(days=2)),
+        "ancient": "Files/rca/acks/sidecar-%s-old.ack.json" % stamp(dt.timedelta(days=31)),
+        "fresh": "Files/rca/acks/sidecar-%s-fresh.ack.json" % stamp(dt.timedelta(hours=1)), "other": "Files/rca/acks/notes.json"}
+for name in [names["evidence"], names["notes"]] + list(acks.values()):
+    files.add(name, "{}")
+report["sweep"] = dict(run(lake, files)[0], names=names, acks=acks)
+
+# A secret-looking string in a sidecar is redacted before it's written.
+leaky = copy.deepcopy(DOCUMENTS[T3])
+statement = next(value for value in leaky["tables"]["rca_query_stats"]["columns"]["statement_text"] if value is not None)
+leaky["strings"][statement] = "SELECT 1 -- " + "eyJ" + "a" * 12 + "." + "b" * 12 + "." + "c" * 12
+lake, files = Lake(), Files()
+report["redacted"] = dict(run(lake, files, sidecar_file=stage(files, parameter(encode(leaky))))[0],
+                          statement=next(row["statement_text"] for row in lake.tables["rca_query_stats"] if row["statement_text"].startswith("SELECT 1")))
+print(json.dumps(report, default=str))
+'@
+            $PSNativeCommandUseErrorActionPreference = $false
+            $output = & $pandasPython $script $live.Path $repoRoot 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw ('The RCA sidecar script failed: {0}' -f ($output -join "`n"))
+            }
+            $sidecarReport = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+        }
+
+        # An acknowledgement as the scripts read it: transport.schema.json's ack, with each sidecar's status.
+        function Assert-SidecarAck {
+            param([System.Collections.IDictionary] $Result, [string] $Payload, [hashtable] $Status)
+            $Result['ackPath'] | Should -Be ('Files/rca/acks/{0}.ack.json' -f [System.IO.Path]::GetFileNameWithoutExtension($Payload))
+            $schemaErrors = $null
+            Test-Json -Json $Result['ack'] -SchemaFile $transportPath -ErrorAction SilentlyContinue -ErrorVariable schemaErrors | Should -BeTrue -Because ($schemaErrors | Out-String)
+            $ack = $Result['ack'] | ConvertFrom-Json -AsHashtable
+            $ack['kind'] | Should -Be 'ContosoCare.RcaAck'
+            $ack['payload'] | Should -Be $Payload
+            $ack['runId'] | Should -Be $Result['runId']
+            @($ack['documents'] | ForEach-Object { '{0}={1}' -f $_['documentId'], $_['status'] } | Sort-Object) | Should -Be @($Status.Keys | Sort-Object | ForEach-Object { '{0}={1}' -f $_, $Status[$_] })
+            foreach ($document in $ack['documents']) {
+                $document['kind'] | Should -Be 'ContosoCare.RcaSidecar'
+                ([bool]$document['reason']) | Should -Be ($document['status'] -eq 'skipped') -Because $document['documentId']
+            }
+        }
+    }
+
+    It 'has one helpers cell and one cell that saves it before section 3, which make no network call and read no secret' {
+        $part5.Count | Should -Be 1
+        $saveCell.Count | Should -Be 1
+        # Part 4, then part 5, then the cell that saves the sidecar, then section 3, which can end the run.
+        $order = foreach ($pattern in '^# Helpers, part 4', '^# Helpers, part 5', '^# The Incident RCA''s sidecar', '^# This session') {
+            $found = -1
+            for ($index = 0; $index -lt $live.Code.Count -and $found -lt 0; $index++) {
+                if ($live.Code[$index].Source -match $pattern) { $found = $index }
+            }
+            $found
+        }
+        @($order | Where-Object { $_ -lt 0 }) | Should -BeNullOrEmpty
+        @($order) | Should -Be @($order | Sort-Object)
+        @($order | Select-Object -Unique).Count | Should -Be 4
+        $saveCell[0].Source | Should -Match '(?m)^save_rca_sidecar\(\)$'
+        # RCA_SIDECAR_FILE, which the scripts look for before they stage a file (Test-DemoFabricNotebookParameter), empty by
+        # default, and read as transport.schema.json's sidecarFile says.
+        @($live.Code | Where-Object { @($_.Metadata['tags']) -contains 'parameters' })[0].Source | Should -Match '(?m)^RCA_SIDECAR_FILE = ""$'
+        $pattern = $transport['$defs']['sidecarFile']['pattern']
+        $part5[0].Source | Should -Match ('(?m)^RCA_SIDECAR_FILE_PATTERN = re\.compile\(r"{0}"\)$' -f [regex]::Escape($pattern.TrimStart('^').TrimEnd('$')))
+        $part5[0].Source | Should -Match 'utils\.fs\.head\(_rca_path\(RCA_SIDECAR_FILE\), RCA_LIMITS\["fileBytes"\]\)'
+        foreach ($source in $part5[0].Source, $saveCell[0].Source) {
+            $source | Should -Not -Match 'requests\.|get_token\(|getToken\(|getSecret\(|KEY_VAULT|vault\.azure\.net'
+            foreach ($url in [regex]::Matches($source, 'https://[^\s)"]+')) {
+                $url.Value | Should -Match '^https://learn\.microsoft\.com/'
+            }
+        }
+        # Every fixture part line is the sidecar's part line, which part 4's evidence pattern never matches.
+        foreach ($line in (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/fixtures/rca-sidecar.parameter.json') -Raw | ConvertFrom-Json).parts) {
+            $line | Should -MatchExactly $transport['$defs']['sidecarPartLine']['pattern']
+            $line | Should -Not -Match $transport['$defs']['partLine']['pattern']
+        }
+    }
+
+    It 'mirrors rca/history-tables.json: the sidecar''s six tables, their columns and types in order, the required ones, the primary times, and the notebook''s columns' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $tables = $sidecarReport['contract']['tables']
+        @($tables.Keys) | Should -Be @($sidecarTables | ForEach-Object { $_['name'] })
+        $notebookColumns = @($contract['notebookColumns'] | ForEach-Object { '{0}:{1}' -f $_['name'], $_['type'] })
+        foreach ($table in $sidecarTables) {
+            $name = $table['name']
+            $tables[$name]['primary'] | Should -Be $table['primaryTime'] -Because $name
+            @($tables[$name]['columns'] | ForEach-Object { $_ -join ':' }) | Should -Be @($table['columns'] | ForEach-Object { '{0}:{1}' -f $_['name'], $_['type'] }) -Because $name
+            @($tables[$name]['required']) | Should -Be @($table['columns'] | Where-Object { $_['required'] } | ForEach-Object { $_['name'] }) -Because $name
+            @($sidecarReport['contract']['tableColumns'][$name] | ForEach-Object { $_ -join ':' }) | Should -Be @($notebookColumns[0..1] + @($table['columns'] | ForEach-Object { '{0}:{1}' -f $_['name'], $_['type'] }) + $notebookColumns[2]) -Because $name
+            @($sidecarReport['contract']['dateSources'][$name]) | Should -Be @($table['primaryTime']) -Because $name
+        }
+        # rca_query_coverage last, as rca_coverage is the evidence's; and the evidence's own eight are as they were.
+        $sidecarReport['contract']['writeOrder'][-1] | Should -Be 'rca_query_coverage'
+        @($sidecarReport['contract']['evidenceTables']) | Should -Be @($contract['tables'] | Where-Object { $_['document'] -eq 'evidence' } | ForEach-Object { $_['name'] })
+    }
+
+    It 'decodes the fixtures'' parts into the fixture sidecars, which today''s evidence decoder never takes' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $decode = $sidecarReport['decode']
+        $decode['same'] | Should -BeTrue
+        $decode['sameFromFiles'] | Should -BeTrue
+        @($decode['documents']) | Should -Be $fixtureIds
+        @($decode['skipped']) | Should -BeNullOrEmpty
+        @($decode['evidenceDocuments']) | Should -BeNullOrEmpty
+        $decode['evidenceSkipped'][0][1] | Should -Match '^3 part line\(s\) that part format 1 doesn''t describe'
+    }
+
+    It 'writes the fixtures'' rows once to the six tables, each sidecar under its own session''s run, acknowledges each by its ID, and deletes the file' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $fixtures = $sidecarReport['fixtures']
+        $fixtures['status'] | Should -Be 'Pass'
+        $fixtures['message'] | Should -Match '^Wrote 3 sidecar\(s\) from sqlvm01 \(T3, T4, T4-replica; 2026-11-20 16:50 to 2026-11-21 10:20 UTC\): 156 row\(s\), under session 5f1c0e7a''s run and this run''s\. Acknowledged in Files/rca/acks/sidecar-\d{8}T\d{6}Z\.ack\.json\.$'
+        @($fixtures['documents']) | Should -Be $fixtureIds
+        @($fixtures['mismatches']) | Should -BeNullOrEmpty
+        @($fixtures['badDates']) | Should -BeNullOrEmpty
+        foreach ($name in $fixtures['expectedCounts'].Keys) {
+            [int]$fixtures['counts'][$name] | Should -Be ([int]$fixtures['expectedCounts'][$name]) -Because $name
+        }
+        $fixtures['counts']['rca_connections'] | Should -Be 110
+        # The scripts' save has no session: the session's two sidecars go under its run, the surge's under this run's.
+        @($fixtures['runs'][$fixtureIds[0]]) | Should -Be @($sessionRun)
+        @($fixtures['runs'][$fixtureIds[1]]) | Should -Be @($sessionRun)
+        @($fixtures['runs'][$fixtureIds[2]]) | Should -Be @($fixtures['runId'])
+        $fixtures['runId'] | Should -Match '^\d{8}T\d{6}Z-[0-9a-f]{8}$'
+        Assert-SidecarAck -Result $fixtures -Payload $fixtures['staged'] -Status @{ $fixtureIds[0] = 'written'; $fixtureIds[1] = 'written'; $fixtureIds[2] = 'written' }
+        # The file was read once and deleted; the acknowledgement stays for the scripts.
+        @($fixtures['reads']) | Should -Be @($fixtures['staged'])
+        @($fixtures['left'] | Where-Object { $_ -like 'Files/rca/inbox*' }) | Should -BeNullOrEmpty
+        @($fixtures['left']) | Should -Contain $fixtures['ackPath']
+        @($fixtures['findings'] | ForEach-Object { $_[0..1] -join ' ' }) | Should -Be @('Pass all')
+        $fixtures['findings'][0][2] | Should -BeExactly ('RCA.SIDECAR: ' + $fixtures['message'])
+    }
+
+    It 'files a session''s sidecars under that session whatever run reads them, and one with no session under the reading run''s' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $own = $sidecarReport['ownSession']
+        $own['status'] | Should -Be 'Pass'
+        foreach ($id in $fixtureIds) {
+            @($own['runs'][$id]) | Should -Be @($sessionRun) -Because $id
+        }
+        $other = $sidecarReport['otherSession']
+        $other['status'] | Should -Be 'Pass'
+        @($other['documents']) | Should -Be $fixtureIds -Because 'no sidecar is skipped for another session'
+        @($other['runs'][$fixtureIds[0]]) | Should -Be @($sessionRun)
+        @($other['runs'][$fixtureIds[1]]) | Should -Be @($sessionRun)
+        @($other['runs'][$fixtureIds[2]]) | Should -Be @('session-ffffffffffffffffffffffffffffffff')
+    }
+
+    It 'writes each sidecar once: a second save finds it written, and one cut off before its coverage rows is written again whole' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $again = $sidecarReport['again']
+        $again['status'] | Should -Be 'Pass'
+        $again['message'] | Should -Match '^The 3 sidecar\(s\) from sqlvm01 \(.*\) were in the history already: each is written once'
+        @($again['writes'] | Where-Object { $_ -notlike 'read *' }) | Should -BeNullOrEmpty
+        foreach ($name in $sidecarReport['fixtures']['counts'].Keys) {
+            $again['counts'][$name] | Should -Be $sidecarReport['fixtures']['counts'][$name] -Because $name
+        }
+        Assert-SidecarAck -Result $again -Payload $again['file'] -Status @{ $fixtureIds[0] = 'already'; $fixtureIds[1] = 'already'; $fixtureIds[2] = 'already' }
+        $resumed = $sidecarReport['resumed']
+        $resumed['status'] | Should -Be 'Pass'
+        $resumed['message'] | Should -Match '^Wrote 1 sidecar\(s\) .*; 2 more already in the history'
+        $resumed['deleted'] | Should -BeGreaterThan 0
+        foreach ($name in $sidecarReport['fixtures']['expectedCounts'].Keys) {
+            [int]$resumed['counts'][$name] | Should -Be ([int]$sidecarReport['fixtures']['expectedCounts'][$name]) -Because $name
+        }
+    }
+
+    It 'keeps only Query Store''s latest read of each interval: over the history''s, under it, and within one file' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        # One read each: T3's 17:15 interval at 17:35:05, not the open one at 17:20:10, and its other intervals as read.
+        foreach ($case in 'laterRead', 'earlierRead', 'bothReads') {
+            $result = $sidecarReport[$case]
+            $result['status'] | Should -Be 'Pass' -Because $case
+            foreach ($table in 'rca_query_stats', 'rca_query_waits') {
+                foreach ($key in $result['reads'][$table].Keys) {
+                    @($result['reads'][$table][$key]).Count | Should -Be 1 -Because "$case $table $key"
+                }
+            }
+            @($result['reads']['rca_query_stats']['T3 17:15 None 412 31']) | Should -Be @('17:35:05') -Because $case
+            @($result['reads']['rca_query_stats']['T3 17:15 None 377 12']) | Should -Be @('17:35:05') -Because $case
+            @($result['reads']['rca_query_waits']['T3 17:15 None 412 31']) | Should -Be @('17:35:05') -Because $case
+            @($result['reads']['rca_query_stats']['T3 17:00 None 412 58']) | Should -Be @('17:17:05') -Because $case
+        }
+        $later = $sidecarReport['laterRead']
+        $later['replaced'] | Should -Be 4
+        $later['message'] | Should -Match 'Query Store''s latest read of each interval kept \(4 earlier read\(s\) in the history replaced\)'
+        # T4's chain read again by the workload's role replaces that role's earlier read; another role's is a query of its own.
+        @($later['reads']['rca_query_stats']['T4 16:45 contosocare_runner -6412873301142229951 0']) | Should -Be @('17:32:05')
+        @($later['reads']['rca_query_stats']['T4 16:45 None -6412873301142229951 0']) | Should -Be @('17:32:05')
+        @($later['reads']['rca_query_stats']['T4 16:45 None -1129384756610293847 0']) | Should -Be @('17:02:05')
+        $sidecarReport['earlierRead']['superseded'] | Should -Be 3
+        $sidecarReport['earlierRead']['message'] | Should -Match '\(3 not written because the history holds a later read\)'
+        $sidecarReport['bothReads']['message'] | Should -Match '\(3 earlier read\(s\) among these sidecars left out\)'
+    }
+
+    It 'skips a sidecar with <Case>, writes the others, keeps the file, and acknowledges which' -ForEach @(
+        @{ Case = 'missing'; Why = 'part\(s\) 2 of \d+ are missing' }
+        @{ Case = 'corrupt'; Why = 'its SHA-256 doesn''t match its parts' }
+        @{ Case = 'newerDocument'; Why = 'its version 2 is newer than this notebook''s 1 \(\./scripts/deploy\.ps1 updates the notebook\)' }
+        @{ Case = 'newerFormat'; Why = 'its part lines are in a part format this notebook doesn''t read' }
+    ) {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $result = $sidecarReport[$Case]
+        $result['status'] | Should -Be 'Warning'
+        $result['message'] | Should -Match ('skipped 1 sidecar\(s\) or line\(s\): 20261120T165000Z-sqlvm01-0001-sidecar: {0}.*\. Acknowledged in .*, and the file stays\.$' -f $Why)
+        @($result['documents']) | Should -Be $fixtureIds[1..2]
+        $result['counts']['rca_query_plans'] | Should -Be 0 -Because 'T3''s sidecar is never written in part'
+        @($result['left']) | Should -Contain $result['file']
+        Assert-SidecarAck -Result $result -Payload $result['file'] -Status @{ $fixtureIds[0] = 'skipped'; $fixtureIds[1] = 'written'; $fixtureIds[2] = 'written' }
+        @($result['findings'] | ForEach-Object { $_[0] }) | Should -Be @('Warning')
+    }
+
+    It 'keeps a file it can''t use, and acknowledges the sidecars it names as skipped; a file outside the inbox, or unread, gets no acknowledgement' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $newer = $sidecarReport['newerFile']
+        $newer['status'] | Should -Be 'Warning'
+        $newer['message'] | Should -Match '^The sidecar file Files/rca/inbox/sidecar-\d{8}T\d{6}Z\.json wasn''t used: its version 2 is newer than this notebook''s 1'
+        @($newer['left']) | Should -Contain $newer['file']
+        Assert-SidecarAck -Result $newer -Payload $newer['file'] -Status @{ $fixtureIds[0] = 'skipped'; $fixtureIds[1] = 'skipped'; $fixtureIds[2] = 'skipped' }
+        # A line that isn't a sidecar's: every sidecar is written, and the file stays, since that line's document isn't.
+        $mixed = $sidecarReport['evidenceLine']
+        $mixed['status'] | Should -Be 'Warning'
+        $mixed['message'] | Should -Match '1 line\(s\) that aren''t a sidecar''s part lines'
+        @($mixed['left']) | Should -Contain $mixed['file']
+        Assert-SidecarAck -Result $mixed -Payload $mixed['file'] -Status @{ $fixtureIds[0] = 'written'; $fixtureIds[1] = 'written'; $fixtureIds[2] = 'written' }
+        $outside = $sidecarReport['outside']
+        $outside['status'] | Should -Be 'Warning'
+        $outside['message'] | Should -Match 'RCA_SIDECAR_FILE must name a file in Files/rca/inbox'
+        @($outside['reads']) | Should -BeNullOrEmpty
+        @($outside['left']) | Should -Be @('Files/other.json')
+        $outside['ackPath'] | Should -BeNullOrEmpty
+        $unread = $sidecarReport['unread']
+        $unread['status'] | Should -Be 'Warning'
+        $unread['message'] | Should -Match 'the staged file couldn''t be read'
+        $unread['ackPath'] | Should -BeNullOrEmpty
+    }
+
+    It 'is Not selected without a sidecar and still creates the six tables; with SAVE_RESULTS False it writes, acknowledges, and deletes nothing' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $none = $sidecarReport['none']
+        $none['status'] | Should -Be 'Not selected'
+        @($none['findings']) | Should -BeNullOrEmpty
+        @($none['tables']) | Should -Be @($sidecarTables | ForEach-Object { $_['name'] } | Sort-Object)
+        foreach ($name in $none['tables']) {
+            $none['counts'][$name] | Should -Be 0 -Because $name
+        }
+        $unsaved = $sidecarReport['unsaved']
+        $unsaved['status'] | Should -Be 'Not selected'
+        $unsaved['message'] | Should -Match '^SAVE_RESULTS is False, so the 3 sidecar\(s\) in .* weren''t written or acknowledged, and the file stays\.$'
+        @($unsaved['left']) | Should -Contain $unsaved['file']
+        @($unsaved['left'] | Where-Object { $_ -like 'Files/rca/acks*' }) | Should -BeNullOrEmpty
+        $unsaved['counts'].Count | Should -Be 0
+    }
+
+    It 'writes the sidecar with RCA_ONLY before section 3 ends the run' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $only = $sidecarReport['rcaOnly']
+        $only['status'] | Should -Be 'Pass'
+        $only['counts']['rca_query_stats'] | Should -Be $sidecarReport['fixtures']['counts']['rca_query_stats']
+        $only['telemetry'] | Should -Be 0
+        @($only['exits']) | Should -Be @('RCA.EVIDENCE Not selected: No RCA evidence was passed (RCA_EVIDENCE and RCA_EVIDENCE_FILE are empty), so no RCA rows were written.')
+    }
+
+    It 'sweeps a kept file once later runs wrote its sidecars, or after 30 days, and an acknowledgement a day after its file; part 4''s day-old sweep never takes a sidecar file' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $sweep = $sidecarReport['sweep']
+        $left = @($sweep['left'])
+        $left | Should -Not -Contain $sweep['names']['ancient']
+        $left | Should -Not -Contain $sweep['names']['written']
+        $left | Should -Contain $sweep['names']['pending']
+        $left | Should -Contain $sweep['names']['dayOld'] -Because 'part 4 deletes staged evidence a day old, never a sidecar file'
+        $left | Should -Not -Contain $sweep['names']['evidence'] -Because 'part 4''s sweep still takes day-old evidence'
+        $left | Should -Contain $sweep['names']['notes']
+        $left | Should -Not -Contain $sweep['acks']['gone']
+        $left | Should -Not -Contain $sweep['acks']['ancient']
+        $left | Should -Contain $sweep['acks']['kept']
+        $left | Should -Contain $sweep['acks']['fresh']
+        $left | Should -Contain $sweep['acks']['other']
+    }
+
+    It 'redacts a value that looks like a secret' {
+        if ($sidecarSkip) {
+            Set-ItResult -Skipped -Because $sidecarSkip
+            return
+        }
+        $sidecarReport['redacted']['status'] | Should -Be 'Pass'
+        $sidecarReport['redacted']['statement'] | Should -BeExactly 'SELECT 1 -- [REDACTED:jwt]'
     }
 }
