@@ -18,19 +18,31 @@ internal sealed record SpanInfo(string Directory, SpanFile Span, SpanExport Expo
     public bool Orphaned => Span.ClosedUtc is null && !EvidenceStore.IsAlive(Span.ProcessId, Span.ProcessStartedUtc);
 
     public bool Finished => Span.ClosedUtc is not null || Orphaned;
+
+    /// <summary>
+    /// Where the span's evidence ends, which its sidecar's window shares: its close, at the evidence's own end even when a
+    /// sidecar's last reads came after it; for a span whose process is gone, its targets' last interval end or watermark;
+    /// null while it's open.
+    /// </summary>
+    public DateTimeOffset? EvidenceEndUtc =>
+        Span.ClosedUtc ?? (Orphaned ? Span.Targets.Values.Select(t => t.Intervals.LastOrDefault()?.To ?? t.WatermarkUtc).Max() : null);
 }
 
 /// <summary>
 /// The local evidence store (ADR 0031): <c>C:\ProgramData\DbHubDemo\rca\</c>, SYSTEM and Administrators only, one folder
 /// per observation span with a JSON-lines file per target (at most 20 MB each), the span's answer key, and what the
-/// export took; the exported documents' gzip in <c>exports\</c>. A span is deleted 7 days after its export took all of
-/// it, and one never exported after 30 days; an exported document after 7 days.
+/// export took; the exported documents' gzip in <c>exports\</c>; and the capture's end that the last session's stop
+/// recorded (<c>capture-end.json</c>). A span is deleted 7 days after its export took all of it, and one never exported
+/// after 30 days, but never while it holds sidecar rows not sealed yet; an exported document after 7 days.
 /// </summary>
 internal sealed class EvidenceStore : ICaptureStore
 {
     public const string AnswerKeyFile = "answer-key.jsonl";
 
     public const long DefaultTargetCap = 20L * 1024 * 1024;
+
+    /// <summary>A span's files of sidecar rows not sealed yet, a taken-aside one's included (rca/README.md, The sidecar).</summary>
+    public const string UnsealedRowsPattern = "sidecar-*" + RcaContract.SidecarRowsExtension;
 
     public static readonly TimeSpan Retention = TimeSpan.FromDays(7);
 
@@ -39,6 +51,7 @@ internal sealed class EvidenceStore : ICaptureStore
     private readonly Lock gate = new();
     private SpanWriter? current;
     private (SpanWriter Writer, DateTimeOffset At)? lastClosed;
+    private (DateTime WrittenUtc, long Length, DateTimeOffset? EndedUtc)? captureEnd;
 
     public EvidenceStore(string root, TimeProvider? time = null, long targetCap = DefaultTargetCap, bool secure = false, string? host = null)
     {
@@ -69,6 +82,9 @@ internal sealed class EvidenceStore : ICaptureStore
     public string LockPath => Path.Combine(Root, "export.lock");
 
     public string LedgerPath => Path.Combine(Root, "sessions.json");
+
+    /// <summary>capture-end.json: the capture's end that the last session's stop recorded (rca export --end-capture).</summary>
+    public string CaptureEndPath => Path.Combine(Root, "capture-end.json");
 
     /// <summary>The span this process has open, if any: the answer key's runs go into it.</summary>
     public SpanWriter? Current
@@ -155,6 +171,13 @@ internal sealed class EvidenceStore : ICaptureStore
         return writer;
     }
 
+    /// <summary>
+    /// Called with a span's ID once this process has closed it and written its span.json (SpanWriter.Close): where the
+    /// sidecar seals a span at its end (rca/README.md, The sidecar). It runs on the closing thread, which may hold the
+    /// observer lane's lock, so it only hands the work off.
+    /// </summary>
+    public Action<string>? SpanClosed { get; set; }
+
     internal void Closed(SpanWriter writer)
     {
         lock (gate)
@@ -165,9 +188,13 @@ internal sealed class EvidenceStore : ICaptureStore
                 lastClosed = (writer, Time.GetUtcNow());
             }
         }
+
+        SpanClosed?.Invoke(Path.GetFileName(writer.Directory));
     }
 
     ICaptureSpan ICaptureStore.Open(DateTimeOffset at) => Open(at);
+
+    DateTimeOffset? ICaptureStore.CaptureEndedAt() => CaptureEndedAt();
 
     /// <summary>
     /// Adds one answer-key row to the span this process has open, or to the one it closed in the last hour (a run that
@@ -221,7 +248,9 @@ internal sealed class EvidenceStore : ICaptureStore
 
     /// <summary>
     /// Retention: a span the export took all of goes 7 days after that export; a span never exported, 30 days after it
-    /// started; an exported document's gzip, 7 days after the export wrote it.
+    /// started; an exported document's gzip, 7 days after the export wrote it. A span that still holds sidecar rows not
+    /// sealed yet stays until they are, whoever runs this: an export after its sealing, or a span's opening, which takes no
+    /// lock and seals nothing.
     /// </summary>
     public int Cleanup(DateTimeOffset now, RunnerLog log)
     {
@@ -233,6 +262,12 @@ internal sealed class EvidenceStore : ICaptureStore
                 : span.Export.LastExportUtc is null && span.Finished && now - span.Span.StartedUtc >= UnexportedRetention;
             if (!expired)
             {
+                continue;
+            }
+
+            if (HoldsUnsealedRows(span.Directory))
+            {
+                log.Info("rca.retention-held", "Kept an expired observation span: its sidecar rows aren't sealed yet.", ("span", span.Id));
                 continue;
             }
 
@@ -272,6 +307,99 @@ internal sealed class EvidenceStore : ICaptureStore
     public SessionLedger ReadLedger() => ReadJson(LedgerPath, RcaStoreJsonContext.Default.SessionLedger) ?? new SessionLedger();
 
     public void WriteLedger(SessionLedger ledger) => WriteJson(LedgerPath, ledger, RcaStoreJsonContext.Default.SessionLedger);
+
+    /// <summary>
+    /// True when a span's folder holds sidecar rows not sealed yet: a <c>sidecar-&lt;target&gt;.rows</c>, or one the sealer
+    /// took aside (<c>sidecar-&lt;target&gt;.&lt;tag&gt;.rows</c>), since the sealer deletes what it sealed.
+    /// </summary>
+    public static bool HoldsUnsealedRows(string spanDirectory) =>
+        Directory.Exists(spanDirectory) && Directory.EnumerateFiles(spanDirectory, UnsealedRowsPattern).Any();
+
+    /// <summary>
+    /// Waits until every span is exported whole or finished (closed, or its process gone), at most
+    /// <paramref name="wait"/>; false when one is still open. A target's capture ends with the observer's last reads, its
+    /// sidecar's included, so a final export of either kind takes them.
+    /// </summary>
+    public bool WaitForSpans(TimeSpan wait)
+    {
+        var deadline = Time.GetUtcNow() + wait;
+        while (true)
+        {
+            if (Spans().All(s => s.Export.Complete || s.Finished))
+            {
+                return true;
+            }
+
+            if (Time.GetUtcNow() >= deadline)
+            {
+                return false;
+            }
+
+            Thread.Sleep(TimeSpan.FromMilliseconds(500));
+        }
+    }
+
+    /// <summary>
+    /// Records the capture's end (rca export --end-capture, a session's stop): the observer lane of 'profile run' reads it
+    /// at its next tick and ends its capture, as a profile's end does, while the workload runs on. A second stop of the same
+    /// session keeps the end its first recorded, untouched, so the fault runs that ended between the two never hold the span
+    /// again (the review of 1ca916a9). Returns the end in effect. Call under the export's lock.
+    /// </summary>
+    public DateTimeOffset EndCapture(DateTimeOffset at, string? sessionId)
+    {
+        EnsureRoot();
+        if (sessionId is not null && ReadJson(CaptureEndPath, RcaStoreJsonContext.Default.CaptureEndFile) is { SessionId: { } recorded } existing && string.Equals(recorded, sessionId, StringComparison.Ordinal))
+        {
+            return existing.EndedUtc;
+        }
+
+        WriteJson(CaptureEndPath, new CaptureEndFile { EndedUtc = at, SessionId = sessionId }, RcaStoreJsonContext.Default.CaptureEndFile);
+        return at;
+    }
+
+    /// <summary>
+    /// The capture's end the last session's stop recorded, or null for none. The file is read again only when it changed,
+    /// so the observer's loops can ask at every tick; one that can't be read keeps what was read last.
+    /// </summary>
+    public DateTimeOffset? CaptureEndedAt()
+    {
+        var file = new FileInfo(CaptureEndPath);
+        if (!file.Exists)
+        {
+            lock (gate)
+            {
+                captureEnd = null;
+            }
+
+            return null;
+        }
+
+        lock (gate)
+        {
+            if (captureEnd is { } known && known.WrittenUtc == file.LastWriteTimeUtc && known.Length == file.Length)
+            {
+                return known.EndedUtc;
+            }
+        }
+
+        try
+        {
+            var ended = ReadJson(CaptureEndPath, RcaStoreJsonContext.Default.CaptureEndFile)?.EndedUtc;
+            lock (gate)
+            {
+                captureEnd = (file.LastWriteTimeUtc, file.Length, ended);
+            }
+
+            return ended;
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            lock (gate)
+            {
+                return captureEnd?.EndedUtc;
+            }
+        }
+    }
 
     public static void WriteExport(SpanInfo span) => WriteJson(Path.Combine(span.Directory, "export.json"), span.Export, RcaStoreJsonContext.Default.SpanExport);
 
