@@ -9,7 +9,7 @@ BeforeDiscovery {
         @(Get-ChildItem -Path $fixtureRoot -Filter '*.sidecar.json' -File -ErrorAction SilentlyContinue | Sort-Object -Property Name |
                 ForEach-Object { @{ Name = $_.Name; Path = $_.FullName; Parts = $_.FullName -replace '\.sidecar\.json$', '.sidecar-parts.txt'; Kind = 'sidecar' } })
     )
-    $transportFixtures = @('rca-evidence.parameter.json', 'metrics-bundle.json', 'metrics-rca-member.json', 'export-index.json') |
+    $transportFixtures = @('rca-evidence.parameter.json', 'metrics-bundle.json', 'metrics-rca-member.json', 'export-index.json', 'rca-sidecar.parameter.json', 'sidecar-index.json', 'rca-ack.json') |
         ForEach-Object { @{ Name = $_; Path = (Join-Path -Path $repoRootForDiscovery -ChildPath "rca/fixtures/$_") } }
 }
 
@@ -341,6 +341,27 @@ Describe 'The Incident RCA contract: transport fixtures (ADR 0031)' {
         # A sidecar's file stays in the same inbox, with its own kind and parameter.
         $defs.sidecarFile.pattern | Should -Be $defs.evidenceFile.pattern
         $defs.sidecarParameter.properties.kind.const | Should -Be 'ContosoCare.RcaSidecarParts'
+    }
+
+    It 'passes RCA_SIDECAR_FILE every part of the sidecars the index lists, and the acknowledgement names each by ID' {
+        $fixtureRoot = Join-Path -Path $rcaRoot -ChildPath 'fixtures'
+        $parameter = Get-Content -LiteralPath (Join-Path -Path $fixtureRoot -ChildPath 'rca-sidecar.parameter.json') -Raw | ConvertFrom-Json
+        $allParts = @(Get-ChildItem -Path $fixtureRoot -Filter '*.sidecar-parts.txt' -File | ForEach-Object { Get-Content -LiteralPath $_.FullName } | Where-Object { $_ })
+        @($parameter.parts | Sort-Object) | Should -Be @($allParts | Sort-Object)
+        # The evidence document's RCA_EVIDENCE never holds a sidecar's part.
+        @((Get-Content -LiteralPath (Join-Path -Path $fixtureRoot -ChildPath 'rca-evidence.parameter.json') -Raw | ConvertFrom-Json).parts | Where-Object { $_.StartsWith('DBHUBDEMO-RCAS ', [System.StringComparison]::Ordinal) }) | Should -BeNullOrEmpty
+        $sidecars = @(Get-ChildItem -Path $fixtureRoot -Filter '*.sidecar.json' -File | ForEach-Object { (Get-Content -LiteralPath $_.FullName -Raw | ConvertFrom-Json).documentId } | Sort-Object)
+        $index = Get-Content -LiteralPath (Join-Path -Path $fixtureRoot -ChildPath 'sidecar-index.json') -Raw | ConvertFrom-Json
+        @($index.documents.documentId | Sort-Object) | Should -Be $sidecars
+        ($index.documents | Measure-Object -Property parts -Sum).Sum | Should -Be $allParts.Count
+        $index.page | Should -BeLessOrEqual $index.pages
+        # Every line of the index fits what a Run Command keeps.
+        ('DBHUBDEMO-RCAS-INDEX ' + ($index | ConvertTo-Json -Depth 10 -Compress)).Length | Should -BeLessOrEqual 3400
+        $ack = Get-Content -LiteralPath (Join-Path -Path $fixtureRoot -ChildPath 'rca-ack.json') -Raw | ConvertFrom-Json
+        @($ack.documents.documentId | Sort-Object) | Should -Be $sidecars
+        foreach ($document in $ack.documents) {
+            if ($document.status -eq 'skipped') { $document.reason | Should -Not -BeNullOrEmpty -Because $document.documentId }
+        }
     }
 }
 
