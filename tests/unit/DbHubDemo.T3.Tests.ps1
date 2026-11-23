@@ -636,6 +636,41 @@ Describe 'Test-DemoT3' {
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -Times 1 -Exactly -ParameterFilter { $Name -eq 'Status' -and $CheckId -eq 'T3.PROPERTY' }
     }
 
+    # 2026-11-23 (user-directed: "We would want query store enabled wherever possible"): T3.QUERYSTORE from the same status
+    # row, which only validate.ps1 asks for, so Query Store never stops a deployment.
+    It 'checks Query Store from the status row with -IncludeQueryStore: <Name>' -ForEach @(
+        @{ Name = 'READ_WRITE'; Row = @{ query_store_state = 'READ_WRITE'; query_store_desired_state = 'READ_WRITE'; query_store_readonly_reason = 0; query_store_capture_mode = 'AUTO'; query_store_storage_mb = 40; query_store_max_storage_mb = 1024 }; Status = 'Pass'; Pattern = '^Query Store is on in ContosoCare on T3: READ_WRITE \(AUTO capture, 40 of 1024 MB\)'; Fix = '' }
+        @{ Name = 'turned off'; Row = @{ query_store_state = 'OFF'; query_store_desired_state = 'OFF'; query_store_readonly_reason = 0 }; Status = 'Fail'; Pattern = '^Query Store in ContosoCare on T3 is OFF, so it records no queries\.$'; Fix = 'its T3 stage runs database/azuresql/030-configure\.sql again' }
+        @{ Name = 'full'; Row = @{ query_store_state = 'READ_ONLY'; query_store_desired_state = 'READ_WRITE'; query_store_readonly_reason = 65536; query_store_capture_mode = 'AUTO'; query_store_storage_mb = 1024; query_store_max_storage_mb = 1024 }; Status = 'Fail'; Pattern = 'is READ_ONLY \(AUTO capture, 1024 of 1024 MB\) because Query Store reached its size limit \(max_storage_size_mb\), so it keeps what it has but records nothing new\.$'; Fix = '^Raise MAX_STORAGE_SIZE_MB or remove the queries you don''t need' }
+    ) {
+        $script:row = @{ performance_monitoring = 'true'; seed_status = 'Completed'; force_last_good_plan_desired = 'DEFAULT'; force_last_good_plan_actual = 'ON' } + $Row
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -MockWith {
+            [pscustomobject]@{ Status = 'Pass'; Reason = 'Ok'; Message = 'ok'; Data = @{}; Rows = @($script:row); Result = [pscustomobject]@{ remediation = '' } }
+        }
+        $results = Test-DemoT3 -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $true -IncludeQueryStore
+        @($results.checkId) | Should -Be @('T3.EXISTS', 'T3.ENTRAONLY', 'T3.NETWORK', 'T3.DATABASE', 'T3.FREEOFFER', 'T3.PROPERTY', 'T3.QUERYSTORE', 'T3.AUTOTUNING', 'T3.AGENT')
+        $check = $results | Where-Object checkId -EQ 'T3.QUERYSTORE'
+        $check.area | Should -Be 't3'
+        $check.status | Should -Be $Status
+        $check.message | Should -Match $Pattern
+        if ($Fix) {
+            $check.remediation | Should -Match $Fix
+        }
+        $check.evidence.source | Should -Be 'T3''s status row'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -Times 1 -Exactly -ParameterFilter { $Name -eq 'Status' }
+    }
+
+    It 'says T3''s Query Store wasn''t read as a Warning when the status row wasn''t, and Not selected with -SkipSqlCheck' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoT3SqlFromT1 -MockWith {
+            [pscustomobject]@{ Status = 'Warning'; Reason = 'T1NotRunning'; Message = 'sqlvm01 is deallocated.'; Data = @{}; Rows = @(); Result = [pscustomobject]@{ remediation = 'Start the demo.' } }
+        }
+        $check = Test-DemoT3 -Config (New-TestConfig) -NetworkMode private -T3UseFreeLimit $true -IncludeQueryStore | Where-Object checkId -EQ 'T3.QUERYSTORE'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Be 'Query Store''s state on T3 wasn''t read: its status row wasn''t read, as T3.PROPERTY says.'
+        (Test-DemoT3 -Config (New-TestConfig) -NetworkMode private -SkipSqlCheck -IncludeQueryStore | Where-Object checkId -EQ 'T3.QUERYSTORE').status | Should -Be 'Not selected'
+        @(Test-DemoT3 -Config (New-TestConfig) -NetworkMode private -SkipSqlCheck | Where-Object checkId -EQ 'T3.QUERYSTORE') | Should -BeNullOrEmpty -Because 'deploy.ps1''s own T3 checks don''t ask for it'
+    }
+
     It 'fails the network check in private mode when the zone isn''t linked or public access is on' {
         $script:links = @()
         $script:server.publicNetworkAccess = 'Enabled'

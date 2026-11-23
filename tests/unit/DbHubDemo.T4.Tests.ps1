@@ -114,6 +114,14 @@ BeforeAll {
             if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/configurations/metrics\.collector_database_activity\?') {
                 return (New-AzResult -Json @{ properties = @{ value = $script:t4.Enhanced } })
             }
+            if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/configurations/(pg_qs\.query_capture_mode|pgms_wait_sampling\.query_capture_mode)\?') {
+                # Query Store and its wait sampling (T4.QUERYSTORE, 2026-11-23).
+                $value = if ($Matches[1] -eq 'pg_qs.query_capture_mode') { $script:t4.QueryCapture } else { $script:t4.WaitSampling }
+                if ($null -eq $value) {
+                    return (New-AzResult -ExitCode 1 -StdErr 'A fake read error.')
+                }
+                return (New-AzResult -Json @{ name = $Matches[1]; properties = @{ value = $value; isConfigPendingRestart = $false; isDynamicConfig = $true; source = 'user-override' } })
+            }
             if ($text -match '--method get --url \S+/flexibleServers/pgflex01-abc123/configurations/max_connections\?') {
                 if (-not $script:t4.MaxConnections) {
                     return (New-AzResult -ExitCode 1 -StdErr 'A fake read error.')
@@ -135,7 +143,7 @@ BeforeAll {
     }
 
     function Reset-T4State {
-        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_D4ds_v5'; MaxConnections = '50'; MaxPending = $false; Restarts = 0; ReadErrors = @{} }
+        $script:t4 = @{ Exists = $true; State = 'Ready'; PasswordAuth = 'Disabled'; Enhanced = 'on'; Metrics = $true; Sku = 'Standard_D4ds_v5'; MaxConnections = '50'; MaxPending = $false; QueryCapture = 'all'; WaitSampling = 'all'; Restarts = 0; ReadErrors = @{} }
         $script:events = [System.Collections.Generic.List[string]]::new()
     }
 }
@@ -296,6 +304,50 @@ Describe 'Test-DemoT4' {
         $database = Test-DemoT4 -Config (New-TestConfig) | Where-Object checkId -EQ 'T4.DATABASE'
         $database.status | Should -Be 'Fail'
         $database.message | Should -Be 'T4''s database contosocare wasn''t found: ERROR: (AuthorizationFailed) A fake read error.'
+    }
+
+    # 2026-11-23 (user-directed: "We would want query store enabled wherever possible"): T4.QUERYSTORE, which only validate.ps1
+    # asks for, so Query Store never stops a deployment.
+    It 'checks Query Store and its wait sampling with -IncludeQueryStore: <Name> (2026-11-23)' -ForEach @(
+        @{ Name = 'all and all on General Purpose'; Sku = 'Standard_D4ds_v5'; Capture = 'all'; Wait = 'all'; Status = 'Pass'; Pattern = '^Query Store is on on T4 \(Standard_D4ds_v5\): pg_qs\.query_capture_mode all \(top-level and nested statements\) and its wait sampling all' }
+        @{ Name = 'top, which still records the top-level statements'; Sku = 'Standard_D4ds_v5'; Capture = 'top'; Wait = 'all'; Status = 'Pass'; Pattern = 'pg_qs\.query_capture_mode top \(top-level statements only\)' }
+        @{ Name = 'wait sampling off'; Sku = 'Standard_D2ds_v5'; Capture = 'all'; Wait = 'none'; Status = 'Warning'; Pattern = 'but its wait sampling is off \(pgms_wait_sampling\.query_capture_mode none\)' }
+        @{ Name = 'off on General Purpose'; Sku = 'Standard_D4ds_v5'; Capture = 'none'; Wait = 'none'; Status = 'Fail'; Pattern = '^Query Store is off on T4 \(Standard_D4ds_v5; pg_qs\.query_capture_mode none\), so it records no queries\.$' }
+        @{ Name = 'off on Burstable, as Learn advises'; Sku = 'Standard_B1ms'; Capture = 'none'; Wait = 'none'; Status = 'Not supported'; Pattern = '^Query Store is off at T4''s Burstable size \(Standard_B1ms\), as Learn advises' }
+        @{ Name = 'on at Burstable'; Sku = 'Standard_B2s'; Capture = 'top'; Wait = 'none'; Status = 'Warning'; Pattern = '^Query Store is on at T4''s Burstable size \(Standard_B2s; pg_qs\.query_capture_mode top\), where Learn says' }
+        @{ Name = 'a read that failed'; Sku = 'Standard_D4ds_v5'; Capture = $null; Wait = 'all'; Status = 'Warning'; Pattern = '^T4''s Query Store parameters couldn''t be read: A fake read error\.$' }
+    ) {
+        $script:t4.Sku = $Sku
+        $script:t4.QueryCapture = $Capture
+        $script:t4.WaitSampling = $Wait
+        $config = New-TestConfig
+        $config['t4SkuName'] = $Sku
+        $results = @(Test-DemoT4 -Config $config -IncludeQueryStore)
+        $check = $results | Where-Object checkId -EQ 'T4.QUERYSTORE'
+        $check.area | Should -Be 't4'
+        $check.status | Should -Be $Status
+        $check.message | Should -Match $Pattern
+        $check.evidence.wanted.queryCaptureMode | Should -Be 'all'
+        if ($Status -in 'Fail', 'Warning' -and $Capture) {
+            $check.remediation | Should -Match '\./scripts/deploy\.ps1'
+        }
+        if ($Status -eq 'Not supported') {
+            $check.remediation | Should -Match 'General Purpose size'
+        }
+        @($script:azCalls | Where-Object { $_ -match '--method (post|put|patch|delete)' }).Count | Should -Be 0 -Because 'the check only reads'
+        # deploy.ps1's own T4 checks don't ask for it.
+        @(Test-DemoT4 -Config $config | Where-Object checkId -EQ 'T4.QUERYSTORE') | Should -BeNullOrEmpty
+    }
+
+    It 'says a stopped T4''s Query Store parameters weren''t read, as a Warning, and Not selected without T4' {
+        $script:t4.State = 'Stopped'
+        $script:t4.ReadErrors['configurations'] = 'ERROR: Bad Request({"error":{"code":"ServerStoppedError","message":"Server ''pgflex01-abc123'' is in ''Stopped'' state. Start the server ..."}})'
+        $check = Test-DemoT4 -Config (New-TestConfig) -IncludeQueryStore | Where-Object checkId -EQ 'T4.QUERYSTORE'
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Be 'T4 (pgflex01-abc123) is Stopped between sessions, so its Query Store parameters can''t be read.'
+        $check.remediation | Should -Match 'start-demo\.ps1'
+        $script:t4.Exists = $false
+        (Test-DemoT4 -Config (New-TestConfig) -IncludeQueryStore | Where-Object checkId -EQ 'T4.QUERYSTORE').status | Should -Be 'Not selected'
     }
 
     It 'doesn''t call the enhanced metrics off when their setting couldn''t be read on a running T4' {

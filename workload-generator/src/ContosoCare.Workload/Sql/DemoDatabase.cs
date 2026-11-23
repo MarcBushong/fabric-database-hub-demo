@@ -35,6 +35,12 @@ internal sealed record DemoSession(int SessionId, string ProgramName, string Sta
 
 internal sealed record SpaceHeadroom(int? DataHeadroomMb, int? LogHeadroomMb);
 
+/// <summary>Query Store's state in the database (sys.database_query_store_options), as <c>status --json</c> reports it.</summary>
+internal sealed record QueryStoreState(string? ActualState, string? DesiredState, long? ReadonlyReason, string? CaptureMode, long? IntervalMinutes, long? StorageMb, long? MaxStorageMb);
+
+/// <summary>A read of Query Store's state: the state, or why it couldn't be read.</summary>
+internal sealed record QueryStoreRead(QueryStoreState? State, string? Error);
+
 internal sealed record StopFlag(string ScenarioId, DateTimeOffset? RequestedAt, string? RequestedBy);
 
 /// <summary>Typed calls to the demo schema's control procedures (database/common/110-demo-control.sql).</summary>
@@ -297,6 +303,37 @@ internal sealed class DemoDatabase(SqlConnection connection)
         var log = Output(command, "@log_headroom_mb", SqlDbType.Int);
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
         return new SpaceHeadroom(data.Value as int?, log.Value as int?);
+    }
+
+    /// <summary>
+    /// Query Store's state in the database (2026-11-23): sys.database_query_store_options, which needs VIEW DATABASE STATE
+    /// (the runner's own sign-in has it on T1 to T3). A refusal or another SQL error is returned, never thrown, so the
+    /// status still shows the rest. https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-database-query-store-options-transact-sql
+    /// </summary>
+    public async Task<QueryStoreRead> ReadQueryStoreAsync(CancellationToken cancellationToken)
+    {
+        try
+        {
+            await using var command = Text(
+                """
+                SELECT TOP (1) actual_state_desc, desired_state_desc, readonly_reason, query_capture_mode_desc,
+                    interval_length_minutes, current_storage_size_mb, max_storage_size_mb
+                FROM sys.database_query_store_options;
+                """);
+            await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+            if (!await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+            {
+                return new QueryStoreRead(null, "sys.database_query_store_options returned no row.");
+            }
+
+            string? ReadText(int ordinal) => reader.IsDBNull(ordinal) ? null : Convert.ToString(reader.GetValue(ordinal), CultureInfo.InvariantCulture);
+            long? ReadNumber(int ordinal) => reader.IsDBNull(ordinal) ? null : Convert.ToInt64(reader.GetValue(ordinal), CultureInfo.InvariantCulture);
+            return new QueryStoreRead(new QueryStoreState(ReadText(0), ReadText(1), ReadNumber(2), ReadText(3), ReadNumber(4), ReadNumber(5), ReadNumber(6)), null);
+        }
+        catch (SqlException ex)
+        {
+            return new QueryStoreRead(null, string.Create(CultureInfo.InvariantCulture, $"{ex.Number}: {ex.Message}"));
+        }
     }
 
     /// <summary>Paths of ContosoCare's files (catalog view sys.database_files, visible to any database user).</summary>

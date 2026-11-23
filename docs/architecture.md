@@ -310,6 +310,7 @@ sequenceDiagram
 | `T3.DATABASE` | General Purpose serverless with the profile's sizing and the configured auto-pause | Pass, Warning (drift), or Fail |
 | `T3.FREEOFFER` | The free offer with `BillOverUsage`, as preflight decided | Pass, Warning, or Not selected |
 | `T3.PROPERTY` | `MS_EnablePerformanceMonitoringPreview = 'true'`, read on T3 through T1 | Pass, Fail, Warning when T1 can't run the query, or Not selected |
+| `T3.QUERYSTORE` | Query Store in `ContosoCare` is `READ_WRITE`, from the same status row (2026-11-23; `validate.ps1` only) | Pass; Fail with the measured reason's fix; Warning when the row wasn't read or Learn says the reason is temporary; Not selected |
 | `T3.WARMUP` | T3 answered, and how long a resume took | Pass, Warning, or Fail |
 | `T3.REMOVE` | The server and private endpoint are gone | Pass or Fail |
 | `T3.SQL` | Any other T-SQL run from T1 | Pass, Warning, or Fail |
