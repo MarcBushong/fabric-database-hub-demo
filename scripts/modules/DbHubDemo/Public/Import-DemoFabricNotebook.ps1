@@ -21,7 +21,9 @@ function Import-DemoFabricNotebook {
     notebook is created, and one that's there is read first (Get-DemoFabricNotebookState): an earlier version of the demo's,
     or this version bound to another workspace, lakehouse, or GitHub path, is updated, since nobody edited it; this version
     already is a Pass, left as it is; and one that's none of them, edited or published by another copy of the scripts, is
-    kept (Not selected) with the command that replaces it. A copy that couldn't be read is kept too, as a Warning (Manual
+    kept (Not selected) with the command that replaces it. So is a copy whose code is a version the demo published but
+    which has another value in a parameter that -Notebook doesn't set (evidence editedParameters; the review of 42acec35).
+    A copy that couldn't be read is kept too, as a Warning (Manual
     action required while the capacity is paused). The records have evidence operation (created, updated, or unchanged) and
     notebookState.
 
@@ -129,6 +131,9 @@ function Import-DemoFabricNotebook {
         if ([string]$state.Error) {
             $evidence['readError'] = [string]$state.Error
         }
+        if (@($state.EditedKeys | Where-Object { $_ }).Count -gt 0) {
+            $evidence['editedParameters'] = @($state.EditedKeys | Where-Object { $_ })
+        }
         New-DemoResult -CheckId ('FABRIC.IMPORT.' + ($Notebook.DisplayName.ToUpperInvariant() -replace '[^A-Z0-9_]', '_')) -Area 'fabric' -Target 'fabric' -Status $Status -Message $Message -Evidence $evidence -Remediation $Remediation -DocUrl $DocUrl
     }
     switch ([string]$state.State) {
@@ -145,6 +150,12 @@ function Import-DemoFabricNotebook {
             return (& $record 'Pass' ('{0} is this version already, so it was left as it is. {1}' -f ($target.Substring(0, 1).ToUpperInvariant() + $target.Substring(1)), $rule))
         }
         'Edited' {
+            $keys = @($state.EditedKeys | Where-Object { $_ })
+            if ($keys.Count -gt 0) {
+                # This version's code, or an earlier one's, with another value in a parameter the import doesn't set (the
+                # review of 42acec35).
+                return (& $record 'Not selected' ('Kept {0} as it is: its {1} {2} the value the demo publishes there, and this run doesn''t set {3}, so it counts as an edit. {4}' -f $target, ($keys -join ' and '), $(if ($keys.Count -eq 1) { 'isn''t' } else { 'aren''t' }), $(if ($keys.Count -eq 1) { 'it' } else { 'them' }), $rule) ('To replace it with this version, which drops the edits, run {0}: it updates that notebook alone. With fabric.importNotebooks true, every ./scripts/deploy.ps1 updates both notebooks, edited or not.' -f $replace))
+            }
             return (& $record 'Not selected' ('Kept {0} as it is: it isn''t a version the demo published, so someone edited it, or another copy of the scripts published it. {1}' -f $target, $rule) ('To replace it with this version, which drops the edits, run {0}: it updates that notebook alone. With fabric.importNotebooks true, every ./scripts/deploy.ps1 updates both notebooks, edited or not.' -f $replace))
         }
         'Unread' {
