@@ -7490,6 +7490,7 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 - **96f81133:** older notebooks leave the sidecar's tables and files alone. That's matrix M4's N0 and M5, from INT's harness over edd01c86's notebooks, 12 checks of 12.
 - **dd4fd393:** RCA-PG-17 reads T4's primary only, and the backfill always waits after T4's start.
 - **45f947b7:** `rca ack` is idempotent, and Run all counts an ID acknowledged before as sent.
+- **7050b882, the answer-key recorder** (the review of A1's harness statements, a High): its reads of the harness's run events reached Query Store on T1 to T4, and no leave-out covered them. They now carry the observer's markers, so item 1 leaves them out on every engine. Its reads from before then fall under T4's harness-table rule, and on T1 to T3 under item 3 by the SHA-256 of their normalized text, so no detection code names the table.
 
 **The integration,** `marcbushong-microsoft-qs-evidence-integration`, takes only reviewed heads:
 
@@ -7500,9 +7501,9 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
   - The generated model guide was rebuilt with the app's pinned `tsx`.
   - `published-versions.json` lists the merged notebooks' versions (abd30713).
 - **A2,** PostgreSQL's reads and the holders, at 83344ef0 (41645fa9). Its `TargetObserver.cs` is A1's 3cea6ac9, cherry-picked.
-- **The contract,** through 45f947b7.
+- **The contract,** through 7050b882.
 - **INT's own commits:**
-  - the live probes (`tests/integration/rca-query-store.md`): S7's blindness sets, the runner's own statements among them; S10's and S11's review checks; H's checks deployed twice; and S12, the scripts' transport's checks;
+  - the live probes (`tests/integration/rca-query-store.md`): S7's blindness sets, the runner's own statements and the answer-key recorder's reads among them, with a check that no sidecar row names the recorder's table; S10's and S11's review checks; H's checks deployed twice; and S12, the scripts' transport's checks;
   - a guard that RCA Query Waits, which has no measure, is totaled nowhere but through the latest read (review-qs-b's caveat);
   - the cost estimate's comment and `docs/cost-management.md`: the sidecars share the export's limits, so the ceiling holds.
 - **H, the harness's marks** (dc5735a8 on `marcbushong-microsoft-harness-marks`), merges after the realistic names' release. Its SQL Server block sits just before `110-demo-control.sql`'s last step, setup's `EXEC demo.usp_release_auto_tuning_hold`, which `SqlScriptTests` pins as the script's end, and counts down with `@remaining`. Its PostgreSQL block follows a `-- @batch` line after `usp_restore_seed`.
@@ -7539,6 +7540,7 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
   - whether `qs_view` keeps each window's `search_path`, or the first one it saw. The catalog-text rule covers the observer's statements either way.
 - **The harness's marks (unit H)** merge after the realistic names' release. H's T-SQL block first runs on an engine at the rehearsal: its opt-in test against a disposable SQL Server, and S10's check after two deployments.
 - **The runner's own ad hoc statements (item 3) wait on A1's build.** Until then RCA-SQL-10 and 14 keep the polled stop check, so the rehearsal's blindness check (S7) needs A1's commit. Which form Query Store keeps for a statement under simple parameterization is proven only by A1's opt-in real-engine test and by S7.
+- **The answer-key recorder's markers wait on A1's and A2's fixes.** Until both are merged, its one read per fault run can reach the sidecar on T1 to T4, so A1's harness head stays out of the integration until its fix is re-checked. S7's `recorder` set and its name check prove it live.
 - **A Run all session's Query Store evidence** comes through Run all's own path (T2c), which joins this release by the coordinator's decision. If it isn't reviewed by 2026-11-24 18:00, it reaches the history with the next scripts' save until Run all's path ships as its own release.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
 
