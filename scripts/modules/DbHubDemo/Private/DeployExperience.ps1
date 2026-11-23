@@ -217,7 +217,8 @@ function Get-DemoNonBlockingItem {
     when it wasn't created or doesn't work (Get-DemoInsightsAppSummary: State Failed; it's part of every deployment),
     the history report's data check while the Execute Queries setting is off (FABRIC.SEMANTICMODEL.* Manual action
     required), and deploy.ps1's history snapshot at the end of the run when it didn't work (Get-DemoHistorySnapshotItem,
-    2026-11-06). Each item has name, state (Failed or Action needed, as on the status page), message, and howTo;
+    2026-11-06), and the history's kept values when deploy.ps1's last step for them is a Warning (Get-DemoKeptValueItem,
+    F35, 2026-11-23). Each item has name, state (Failed or Action needed, as on the status page), message, and howTo;
     Format-DemoNonBlockingLine words it the same everywhere. Pure. Internal.
     #>
     [CmdletBinding()]
@@ -262,6 +263,11 @@ function Get-DemoNonBlockingItem {
     $history = Get-DemoHistorySnapshotItem -Result $Result
     if ($null -ne $history) {
         $items.Add($history)
+    }
+    # The history's kept values (F35, 2026-11-23), when deploy.ps1's last step that ran for them is a Warning.
+    $keptValue = Get-DemoKeptValueItem -Result $Result
+    if ($null -ne $keptValue) {
+        $items.Add($keptValue)
     }
     return $items.ToArray()
 }
@@ -433,8 +439,9 @@ function Get-DemoAskSummary {
 function Test-DemoNonBlockingResult {
     # True for a result that never blocks DONE (2026-11-05): the Insights app's (Test-DemoInsightsAppRecord; it's part of
     # every deployment, but DONE never waits for it), the history report's data check waiting for the Execute Queries
-    # setting, or deploy.ps1's history snapshot (DEPLOY.FABRIC.HISTORY, 2026-11-06; never a Fail or Manual action required
-    # anyway). Internal.
+    # setting, deploy.ps1's history snapshot (DEPLOY.FABRIC.HISTORY, 2026-11-06), or the history's kept values
+    # (DEPLOY.FABRIC.KEPTVALUE and DEPLOY.FABRIC.KEPTVALUE.END, F35, 2026-11-23); the last two are never a Fail or Manual
+    # action required anyway. Internal.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -446,7 +453,7 @@ function Test-DemoNonBlockingResult {
         return $false
     }
     $id = [string]$Result.checkId
-    return ((Test-DemoInsightsAppRecord -Result $Result) -or ($id -like 'FABRIC.SEMANTICMODEL.*' -and [string]$Result.status -eq 'Manual action required') -or $id -eq 'DEPLOY.FABRIC.HISTORY')
+    return ((Test-DemoInsightsAppRecord -Result $Result) -or ($id -like 'FABRIC.SEMANTICMODEL.*' -and [string]$Result.status -eq 'Manual action required') -or $id -in 'DEPLOY.FABRIC.HISTORY', 'DEPLOY.FABRIC.KEPTVALUE', 'DEPLOY.FABRIC.KEPTVALUE.END')
 }
 
 function Test-DemoTenantSettingRead {

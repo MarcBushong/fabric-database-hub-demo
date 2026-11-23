@@ -41,6 +41,22 @@
       {
         "sha256": "f7e28b9d0f2c32ff355bf39a1f470ec3980f27d8fce9f9d5483c0bee599bbe27",
         "since": "2026-11-20"
+      },
+      {
+        "sha256": "1d41a971d0f289eb4041c7b1ef8c650d948ff087daf2a86121ecd483ef7e86b4",
+        "since": "2026-11-23"
+      },
+      {
+        "sha256": "4230d20ccb95ba8064dffe8fe0ada6810cc6788c99493c1bcc8dd975508c2b19",
+        "since": "2026-11-23"
+      },
+      {
+        "sha256": "6b2577cabab8fad5502999a08176604cb778a852da3514f8d1e0e596ee83176f",
+        "since": "2026-11-23"
+      },
+      {
+        "sha256": "94b6347503edf0f4c9ef08a08f58edd28f96395134d8ef98d188d3a23e3a9c26",
+        "since": "2026-11-23"
       }
     ],
     "NB_DatabaseHub_LiveActivity": [
@@ -141,7 +157,23 @@
         "since": "2026-11-22"
       },
       {
+        "sha256": "243a97687514dff7bb60042a333cde84875774824cd02fb4b316303d2affe179",
+        "since": "2026-11-23"
+      },
+      {
+        "sha256": "318e2525c72abb3dd4108f0066e2cf932d975bf00ae4dc56356a81906631c515",
+        "since": "2026-11-23"
+      },
+      {
         "sha256": "36d394b7dc921070baae0261f458e612e57068755cca5185527ce45434cd0e69",
+        "since": "2026-11-23"
+      },
+      {
+        "sha256": "5ba04ad13f4e3cdef5c789763006f1493199284e8fd9a35d2b87ec20e00efc1e",
+        "since": "2026-11-23"
+      },
+      {
+        "sha256": "edbe64cefe3e224f0f3e3b2eb5fa90f0b7f850536f50c1e96ca5526003145cbc",
         "since": "2026-11-23"
       }
     ]

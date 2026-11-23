@@ -1,0 +1,30 @@
+// F35, design (i): the deployed model's Snapshot Value per target, analysis, metric, and bin, from the rows captured from
+// CapturedFrom to CapturedTo alone: a filter on the saves, as Ask reads T5's latest run, which the kept form reads by the
+// release's rule (the review of f2298b18). For the live proof's check of that (in fabric/app: npx tsx scripts/f35-proof.ts
+// <export.jsonl> --from <instant> --to <instant> --captured-from <instant> --captured-to <instant> --model-captured
+// <response.json>). Run it as model-bins.dax, with the same BinsFrom and BinsTo; CapturedFrom and CapturedTo are
+// --captured-from and --captured-to, in UTC, to the second.
+DEFINE
+    VAR BinsFrom = DATE ( 2026, 11, 18 ) + TIME ( 0, 0, 0 )
+    VAR BinsTo = DATE ( 2026, 11, 22 ) + TIME ( 0, 0, 0 )
+    VAR CapturedFrom = DATE ( 2026, 11, 20 ) + TIME ( 0, 0, 0 )
+    VAR CapturedTo = DATE ( 2026, 11, 21 ) + TIME ( 0, 0, 0 )
+
+EVALUATE
+SUMMARIZECOLUMNS (
+    'Telemetry Snapshots'[Target Key],
+    'Telemetry Snapshots'[Analysis Key],
+    'Telemetry Snapshots'[Metric],
+    'Telemetry Snapshots'[Bucket UTC],
+    FILTER (
+        ALL ( 'Telemetry Snapshots'[Bucket UTC] ),
+        'Telemetry Snapshots'[Bucket UTC] >= BinsFrom
+            && 'Telemetry Snapshots'[Bucket UTC] < BinsTo
+    ),
+    FILTER (
+        ALL ( 'Telemetry Snapshots'[Captured At UTC] ),
+        'Telemetry Snapshots'[Captured At UTC] >= CapturedFrom
+            && 'Telemetry Snapshots'[Captured At UTC] < CapturedTo
+    ),
+    "snapshot_value", [Snapshot Value]
+)

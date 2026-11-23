@@ -1850,9 +1850,14 @@ function Invoke-DemoDeploymentTrack {
                     Set-DemoHistoryFirstRunWarning -FirstRun $firstRun
                     & $addAll $fabric
                     & $partDone 'Fabric.Items' $fabric
+                    # F35 (i): the history's kept values, worked out through Livy with this checkout's code before the model's
+                    # step, which deploys the form of Snapshot Value that the step's own answer allows (Get-DemoKeptValueForm).
+                    # Never a Fail, and never in DONE's way: a step that can't run leaves the model on the release's form.
+                    $keptValue = Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'DEPLOY.FABRIC.KEPTVALUE' -TimeoutMinutes ([int](& $option 'KeptValueMinutes' 30)) -ProgressPath $progress -ProgressId 'Fabric.KeptValues' -RunAgain $script:KeptValueTrackRunAgain -DecidesModelForm
+                    & $addAll @($keptValue)
                     # The history semantic model and report (Phase 19), then the Insights app.
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message ''
-                    $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $fabricConfigPath)
+                    $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $fabricConfigPath -SnapshotValueForm (Get-DemoKeptValueForm -Result $keptValue))
                     # Its refresh found no tables while the first history run hadn't completed: a Warning that says what fills
                     # the model (#68). With the run still queued or running, it's followed now, and the model's step runs again
                     # once it completes, before the Insights app, whose checks read the model.

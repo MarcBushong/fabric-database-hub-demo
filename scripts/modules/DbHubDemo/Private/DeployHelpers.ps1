@@ -967,6 +967,9 @@ function Invoke-DemoPowerBIStage {
     .DESCRIPTION
     -CheckModelData runs only the data check against the deployed model (configure-powerbi.ps1 -CheckModelData).
     Without a Fabric workspace and lakehouse in the configuration, the script reports Not selected itself.
+    -SnapshotValueForm Kept (F35, 2026-11-23) goes to the script only when the step before it found the history's kept
+    values' columns (Get-DemoKeptValueForm) and this checkout's script takes the parameter; otherwise the script deploys
+    its default, the release's form.
     #>
     [CmdletBinding()]
     [OutputType([object[]])]
@@ -976,7 +979,10 @@ function Invoke-DemoPowerBIStage {
 
         [string] $ConfigPath = '',
 
-        [switch] $CheckModelData
+        [switch] $CheckModelData,
+
+        [ValidateSet('', 'Kept')]
+        [string] $SnapshotValueForm = ''
     )
 
     $scriptPath = Join-Path -Path $script:RepoRoot -ChildPath 'scripts/configure-powerbi.ps1'
@@ -986,6 +992,9 @@ function Invoke-DemoPowerBIStage {
     $argument = @{}
     if ($CheckModelData) {
         $argument['CheckModelData'] = $true
+    }
+    elseif ($SnapshotValueForm -eq 'Kept' -and (Get-Command -Name $scriptPath -ErrorAction Stop).Parameters.ContainsKey('SnapshotValueForm')) {
+        $argument['SnapshotValueForm'] = 'Kept'
     }
     $records = @(Invoke-DemoFabricScriptStep -Config $Config -ConfigPath $ConfigPath -ScriptPath $scriptPath -CheckId 'DEPLOY.POWERBI' -Argument $argument)
     return @(Merge-DemoBlankMeasureResult -Result $records)

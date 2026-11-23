@@ -31,9 +31,10 @@ Stops the demo's compute after a session (plan section 9.4, ADR 0016).
   evidence, which the control keeps for the next Run all that starts a session within 7 days (STOP.FABRIC.SAVEHISTORY
   says so). When the control can't take it, the stop goes on as before, with a Warning.
 - -SaveHistory (or fabric.saveHistoryOnStop): after the VMs stop, runs NB_DatabaseHub_LiveActivity on demand to save
-  the session's history to the lakehouse, at most 15 minutes (STOP.FABRIC.SAVEHISTORY). Then, only with
-  fabric.manageCapacity true, the Fabric capacity that start-demo.ps1 resumed is paused, never while that run is
-  still going (STOP.FABRIC.CAPACITY). With the defaults, the capacity isn't called (Phase 26b, ADR 0023).
+  the session's history to the lakehouse, at most 15 minutes (STOP.FABRIC.SAVEHISTORY), then works out the kept values
+  of the rows it saved through Fabric's Livy API, at most another 15 (F35; STOP.FABRIC.KEPTVALUE, never a Fail). Then,
+  only with fabric.manageCapacity true, the Fabric capacity that start-demo.ps1 resumed is paused, never while that run
+  is still going (STOP.FABRIC.CAPACITY). With the defaults, the capacity isn't called (Phase 26b, ADR 0023).
 
 It never signs in: sign in first with 'az login --tenant <tenantId>'. You don't need to change the Azure CLI's default subscription.
 
@@ -53,8 +54,8 @@ With -RemoveBastionOnly: only after the Bastion's expiry tag.
 Also delete T3.
 
 .PARAMETER SaveHistory
-Save the session's history with NB_DatabaseHub_LiveActivity first (at most 15 minutes), before the Fabric capacity is
-paused. Not with -ParkT2 or -RemoveBastionOnly.
+Save the session's history with NB_DatabaseHub_LiveActivity first (at most 15 minutes), and work out its kept values
+through Livy (F35), before the Fabric capacity is paused. Not with -ParkT2 or -RemoveBastionOnly.
 
 .PARAMETER SaveHistoryWindowMinutes
 How far back the saved history goes (default 720).
