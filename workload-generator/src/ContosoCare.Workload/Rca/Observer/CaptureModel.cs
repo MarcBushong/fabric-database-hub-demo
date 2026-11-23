@@ -73,6 +73,12 @@ internal interface ICaptureSpan : ICaptureSink
 internal interface ICaptureStore
 {
     ICaptureSpan Open(DateTimeOffset at);
+
+    /// <summary>
+    /// The capture's end that a session's stop recorded (rca export --end-capture), or null for none: the observer captures
+    /// a target after it only once the target's profile is set after it (<see cref="IObservationGate.IsActiveAfter"/>).
+    /// </summary>
+    DateTimeOffset? CaptureEndedAt();
 }
 
 /// <summary>
@@ -82,4 +88,17 @@ internal interface ICaptureStore
 internal interface IObservationGate
 {
     bool IsActive(Catalog.DemoTarget target);
+
+    /// <summary>
+    /// After the capture's end at <paramref name="end"/>, which a session's stop records while the workload runs on until
+    /// the VM stops: whether the target is in a session that began after it (its profile was set after it, and it's in a
+    /// session as <see cref="IsActive"/> says). Nothing else captures a target after the end.
+    /// </summary>
+    bool IsActiveAfter(Catalog.DemoTarget target, DateTimeOffset end);
+
+    /// <summary>
+    /// After the capture's end: whether the answer key still has to record a fault run of the target that ended by then,
+    /// so the span that the stop's export takes waits to close, capturing nothing, until it has (the review of 1ca916a9).
+    /// </summary>
+    bool HoldsAfter(Catalog.DemoTarget target, DateTimeOffset end);
 }
