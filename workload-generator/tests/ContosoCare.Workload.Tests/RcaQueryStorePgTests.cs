@@ -365,6 +365,98 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.All(replica.Calls.Where(c => c.BlockId == "RCA-PG-13"), c => Assert.Equal(CaptureCatalog.Get("RCA-PG-13"), c.Text));
     }
 
+    // ---- Who holds T4's connections ------------------------------------------------------------------------------------
+
+    [Fact]
+    public void TheHoldersOfASurgeRoundTripTheFixture()
+    {
+        var fixture = new SidecarFixture("t4-connection-surge.sidecar.json");
+        var expected = fixture.Table(RcaContract.Connections);
+        var runA = ApplicationNames.RunToken("20261121100500-t4-aa11bb");
+        var runB = ApplicationNames.RunToken("20261121090000-t4-cc22dd");
+        var tokens = new Dictionary<string, string>(StringComparer.Ordinal) { ["7c3e91a05bd2"] = runA, ["2fa86c14e9b0"] = runB };
+        var actual = new List<CaptureRow>();
+        foreach (var sample in expected.GroupBy(r => (DateTimeOffset)r["captured_at_utc"]!))
+        {
+            // The block's groups, as pg_stat_activity would give them: each fixture group split in two where it can be,
+            // another application under two names and roles, and the observer's own connection.
+            var raw = new List<CaptureValues>();
+            foreach (var group in sample)
+            {
+                var count = (long)group["connections"]!;
+                var state = (string)group["state"]!;
+                var oldestState = (double)group["oldest_state_s"]!;
+                var oldestConnection = (double)group["oldest_connection_s"]!;
+                var name = group["run_token"] is string token
+                    ? ApplicationNames.Program + "/svc-intake/" + (tokens[token] == runA ? "20261121100500-t4-aa11bb" : "20261121090000-t4-cc22dd")
+                    : "psql";
+                var role = group["is_demo"] is true ? Runner : "monitoring_reader";
+                raw.Add(HolderRow(sample.Key, name, role, state, count - 1, 0, oldestState, oldestConnection));
+                raw.Add(HolderRow(sample.Key, group["is_demo"] is true ? name.Replace("svc-intake", "svc-billing", StringComparison.Ordinal) : string.Empty, group["is_demo"] is true ? Runner : "another_role", state, 1, 0, oldestState / 2, oldestConnection / 2));
+            }
+
+            raw.Add(HolderRow(sample.Key, ApplicationNames.Observer, Runner, "active", 1, 0, 0, 900));
+            actual.AddRange(ConnectionHolders.Rows("T4", raw, sample.Key.AddSeconds(3)));
+        }
+
+        Assert.Equal(expected.Count, actual.Count);
+        for (var i = 0; i < expected.Count; i++)
+        {
+            var row = new Dictionary<string, object?>(expected[i], StringComparer.Ordinal);
+            if (row["run_token"] is string token)
+            {
+                row["run_token"] = tokens[token];
+            }
+
+            AssertSameRow(row, actual[i], $"row {i}");
+            Assert.Equal("RCA-PG-17", actual[i].Source);
+        }
+
+        // The fixture's facts, from the rows the observer built.
+        Assert.Equal(37, actual.Select(r => r.At).Distinct().Count());
+        var peak = actual.GroupBy(r => r.At).Select(g => (At: g.Key, Total: g.Sum(r => (long)r.Get("connections")!))).ToList();
+        Assert.Equal(41, peak.Max(p => p.Total));
+        Assert.Equal(new DateTimeOffset(2026, 11, 21, 10, 10, 0, TimeSpan.Zero), peak.First(p => p.Total == 41).At);
+        Assert.DoesNotContain(actual, r => r.At == new DateTimeOffset(2026, 11, 21, 10, 12, 0, TimeSpan.Zero) && (string?)r.Get("run_token") == runA);
+    }
+
+    [Fact]
+    public async Task AConnectionEpisodeCountsItsHoldersWithEverySampleAndOnceWhenItEnds()
+    {
+        var from = RcaSimulation.T4From;
+        var busy = (From: from.AddMinutes(1), To: from.AddMinutes(3));
+        var clock = new ManualTime(from);
+        var connector = new ScriptedConnector((block, _) => block switch
+        {
+            "RCA-PG-10" => [Row(("captured_at", clock.Now.UtcDateTime), ("max_connections", 50), ("reserved_connections", 3), ("client_connections", clock.Now >= busy.From && clock.Now < busy.To ? 45L : 10L), ("waiting_lock", 0L))],
+            "RCA-PG-17" =>
+            [
+                HolderRow(clock.Now, ApplicationNames.Program + "/svc-intake/20261120170000-t4-0a0b0c", Runner, "idle", clock.Now >= busy.From && clock.Now < busy.To ? 40 : 5, 0, 12.5, 60),
+                HolderRow(clock.Now, ApplicationNames.Observer, Runner, "active", 1, 0, 0, 600),
+            ],
+            _ => [],
+        });
+        var sidecar = new MemorySidecar();
+        var evidence = new MemorySink();
+
+        await RcaSimulation.DriveAsync([new PgPrimaryObserver(connector, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink(), sidecar)], evidence, clock, from, from.AddMinutes(6), TestContext.Current.CancellationToken);
+
+        // From the sample that started the episode, every 10 s, to the one that ended it, 60 s after the last busy one.
+        var samples = sidecar.Table(RcaContract.Connections).Select(r => r.At).ToList();
+        Assert.Equal(Enumerable.Range(0, 18).Select(i => busy.From.AddSeconds(10 * i)), samples);
+        Assert.Equal(busy.To.AddSeconds(50), samples[^1]);
+        Assert.Equal(evidence.Events("capture")[1].At, samples[^1]);
+        Assert.All(sidecar.Table(RcaContract.Connections), r => Assert.Equal(Runner, r.Get("login_name")));
+        Assert.All(sidecar.Table(RcaContract.Connections), r => Assert.True(r.Get("is_demo") is true));
+
+        // Without a sidecar the holders aren't read, and the evidence document's rows are the same either way.
+        var plain = new MemorySink();
+        var without = new ScriptedConnector((block, _) => block == "RCA-PG-10" ? [Row(("captured_at", clock.Now.UtcDateTime), ("max_connections", 50), ("reserved_connections", 3), ("client_connections", clock.Now >= busy.From && clock.Now < busy.To ? 45L : 10L), ("waiting_lock", 0L))] : []);
+        await RcaSimulation.DriveAsync([new PgPrimaryObserver(without, RcaSimulation.Options(), RunnerLog.Null, new ReplicaLink())], plain, clock, from, from.AddMinutes(6), TestContext.Current.CancellationToken);
+        Assert.DoesNotContain(without.Calls, c => c.BlockId == "RCA-PG-17");
+        Assert.Equal(Lines(plain), Lines(evidence));
+    }
+
     // ---- Phase 1 stays as it was -------------------------------------------------------------------------------------
 
     [Fact]
