@@ -151,7 +151,7 @@ What the observer captures beyond the evidence document, in documents of their o
 | Everything else | As the evidence document's (`sessionId`, `producer`, the window, `sequence`, `final`, `targets`, `epochUtc`, `strings`, `tables`), with no `answerKey`. Each target has an `rca_query_coverage` row |
 
 - **Its tables** ([history-tables.json](history-tables.json), document `sidecar`): `rca_query_stats`, `rca_query_waits`, `rca_query_plans`, `rca_query_events`, `rca_query_coverage`, and `rca_connections`, encoded as the evidence document's tables are. The evidence document never holds one, and a sidecar never holds an evidence table.
-- **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.jsonl`, beside its evidence files, which the evidence export never reads.
+- **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.rows` (`RcaContract.SidecarRowsFile`), beside its evidence files. Never `.jsonl`: every evidence export, an older runner's included, reads each `*.jsonl` in a span as a target's file, so sidecar rows there would end up in an evidence document.
 - **Sealed outside the spans:** the runner seals a span's rows into the store's `sidecars\` folder:
   - at every export that reads the span, the evidence document's included, whose output doesn't change;
   - at the span's end;

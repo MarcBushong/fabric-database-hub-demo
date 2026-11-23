@@ -91,6 +91,15 @@ internal static class RcaContract
 
     public const int SidecarVersion = 1;
 
+    /// <summary>
+    /// The extension of the files a span keeps the sidecar's rows in until they're sealed (rca/README.md, The sidecar).
+    /// Never <c>.jsonl</c>: every evidence export, an older runner's included, reads each <c>*.jsonl</c> in a span as a target's file.
+    /// </summary>
+    public const string SidecarRowsExtension = ".rows";
+
+    /// <summary>A span's file for one target's sidecar rows: <c>sidecar-&lt;target&gt;.rows</c>.</summary>
+    public static string SidecarRowsFile(string target) => "sidecar-" + target + SidecarRowsExtension;
+
     private static readonly Lazy<IReadOnlyList<RcaTable>> Loaded = new(Load);
 
     /// <summary>The evidence document's tables, which the evidence export writes: never a sidecar's.</summary>
