@@ -253,6 +253,29 @@ Describe 'Agent prompt files' {
         }
     }
 
+    It '<Name> reads one run''s sessions, never every demo session' -ForEach $promptFiles {
+        # A session's name is ContosoCare.Demo/<service>/<run>, and services are shared, so a prompt that names the prefix
+        # reads its run from demo.scenario_runs and matches it: the showcase runs incidents side by side (ADR 0031,
+        # decision 6; the review of e21c3431).
+        $prompt = Read-PromptFile -Path $Path
+        foreach ($block in @(Get-PromptBlock -Body $prompt.Body | Where-Object { $_.Contains('ContosoCare.Demo/') })) {
+            $block | Should -Match 'demo\.scenario_runs' -Because $block
+            $block | Should -Match 'ends with [a-z'' ]*run_ids?\b' -Because $block
+        }
+    }
+
+    It '<Name> picks the latest run by started_at, since run IDs are random' -ForEach $promptFiles {
+        # Run IDs no longer start with their time (ADR 0031, decision 6), so an agent that sorts by run_id picks any run:
+        # wherever a prompt reads the latest run from demo.scenario_runs, it says which column decides (the re-check of
+        # e0966579).
+        $prompt = Read-PromptFile -Path $Path
+        foreach ($block in @(Get-PromptBlock -Body $prompt.Body | Where-Object { $_.Contains('demo.scenario_runs') })) {
+            foreach ($pick in [regex]::Matches($block, '\b(latest|most recent|newest)\b[^.;:]*\b(rows?|runs?)\b[^.;:]*')) {
+                $pick.Value | Should -Match '\bby started_at\b' -Because $block
+            }
+        }
+    }
+
     It 'every scenario folder has an in-Hub and a skills prompt file with the same targets' {
         foreach ($scenario in $scenarioFolders) {
             $files = @($prompts | Where-Object { $_.FrontMatter['scenario'] -eq $scenario })

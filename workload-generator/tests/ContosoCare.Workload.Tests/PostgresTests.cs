@@ -238,11 +238,11 @@ public sealed partial class PostgresTests
     [Fact]
     public void EveryT4ApplicationNameFitsInSixtyThreeCharacters()
     {
-        var runId = SessionNames.NewRunId(new DateTimeOffset(2026, 10, 23, 23, 59, 59, TimeSpan.Zero), DemoTarget.T4);
+        var runId = SessionNames.NewRunId();
 
         foreach (var scenario in ScenarioCatalog.Default.All.Where(s => s.AppliesTo(DemoTarget.T4)))
         {
-            Assert.True(SessionNames.ForRun(scenario.Id, runId).Length <= PgConnectionOpener.MaximumApplicationNameLength, scenario.Id);
+            Assert.True(SessionNames.ForRun(scenario.Service, runId).Length <= PgConnectionOpener.MaximumApplicationNameLength, scenario.Id);
         }
 
         Assert.True(SessionNames.ForControl(runId).Length <= PgConnectionOpener.MaximumApplicationNameLength);

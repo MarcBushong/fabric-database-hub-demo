@@ -122,26 +122,41 @@ public sealed class ReplicaLagTests
         Assert.Contains("a.pid <> pg_backend_pid()", sql, StringComparison.Ordinal);
         Assert.Contains("a.application_name LIKE 'ContosoCare.Demo/%'", sql, StringComparison.Ordinal);
         Assert.Contains("a.application_name NOT LIKE 'ContosoCare.Demo/control/%'", sql, StringComparison.Ordinal);
-        Assert.Contains("a.application_name LIKE 'ContosoCare.Demo/%/' || @run_id::text", sql, StringComparison.Ordinal);
-        Assert.Contains("a.application_name LIKE 'ContosoCare.Demo/' || @scenario_id::text || '/%'", sql, StringComparison.Ordinal);
+
+        // One run's sessions, or a stopped scenario's runs', by the run at the end of their name: never by the service in
+        // the middle, which other scenarios' runs share (ADR 0031, decision 6).
+        Assert.Contains("FROM unnest(@run_ids::text[]) AS r(run_id)", sql, StringComparison.Ordinal);
+        Assert.Contains("a.application_name LIKE 'ContosoCare.Demo/%/' || r.run_id", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("scenario", sql, StringComparison.OrdinalIgnoreCase);
+        Assert.DoesNotContain("service", sql, StringComparison.OrdinalIgnoreCase);
         Assert.DoesNotMatch(@"(?i)\b(insert|update|delete|truncate)\b|demo\.usp_", sql);
         var signals = Regex.Count(sql, @"pg_(cancel|terminate)_backend\(");
         Assert.Equal(signal == ReplicaSignal.None ? 0 : 1, signals);
         Assert.Equal(signal != ReplicaSignal.None, sql.Contains("AND a.pid = @pid", StringComparison.Ordinal));
     }
 
-    [Theory]
-    [InlineData("run", "20261113180000-t4-a1b2c3", null, "20261113180000-t4-a1b2c3", null)]
-    [InlineData("scenario", null, "replica-lag", null, "replica-lag")]
-    [InlineData("all", null, null, null, null)]
-    public void AStopEndsItsOwnScopeOnTheReplica(string scope, string? runId, string? scenarioId, string? expectedRun, string? expectedScenario)
+    [Fact]
+    public void AStopEndsItsOwnScopeOnTheReplica()
     {
-        var replicaScope = ReplicaSessionScope.ForStop(scope, runId, scenarioId);
+        RunRecord Running(string runId, string scenarioId, string status = "Running") => new(runId, scenarioId, "T4", status, Now, Now.AddMinutes(10), null, 900, 1, 1, null, null, null);
+        var running = new[]
+        {
+            Running("9f2c4e1a7b3d5f60", "replica-lag"),
+            Running("20261113180000-t4-a1b2c3", "replica-lag"),
+            Running("0b1c2d3e4f506172", "missing-index"),
+            Running("5e6f708192a3b4c5", "replica-lag", "Cancelled"),
+        };
 
-        Assert.Equal(expectedRun, replicaScope.RunId);
-        Assert.Equal(expectedScenario, replicaScope.ScenarioId);
+        Assert.Equal(["9f2c4e1a7b3d5f60"], ReplicaSessionScope.ForStop("run", "9f2c4e1a7b3d5f60", null, null).RunIds);
+        Assert.Equal(["20261113180000-t4-a1b2c3", "9f2c4e1a7b3d5f60"], ReplicaSessionScope.ForStop("scenario", null, "replica-lag", running).RunIds);
+        Assert.Null(ReplicaSessionScope.ForStop("all", null, null, null).RunIds);
+
+        // missing-index and replica-lag share their service on T4, so a stop of one never reaches the other's runs.
+        Assert.Equal(["0b1c2d3e4f506172"], ReplicaSessionScope.ForStop("scenario", null, "missing-index", running).RunIds);
+        Assert.Empty(ReplicaSessionScope.ForStop("scenario", null, "missing-index", running.Take(2)).RunIds!);
         Assert.Throws<ArgumentException>(() => ReplicaSessionScope.Run("x%"));
-        Assert.Throws<ArgumentException>(() => ReplicaSessionScope.Scenario("replica_lag"));
+        Assert.Throws<ArgumentException>(() => ReplicaSessionScope.Scenario("replica_lag", []));
+        Assert.Throws<ArgumentException>(() => ReplicaSessionScope.Scenario("replica-lag", ["x%"]));
     }
 
     [Theory]

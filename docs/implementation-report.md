@@ -5595,3 +5595,101 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **On T1 and T2:** the runner's `setup` applies `120`'s comment-only batches, one before each module, with no error.
 - **On T3:** `sp_helptext 'billing.usp_claim_work_item'` shows no header comment and no scenario ID.
 - **The RCA's capture of a 50111:** an `error_reported` event names a module and a run, never a scenario.
+
+### Realistic names, unit B: application names `ContosoCare.Demo/<service>/<run>` (2026-11-23)
+
+**Why.** On 2026-11-23 the owner approved [ADR 0031's decision 6](adr/0031-incident-rca.md#2-names), the realistic workload names, (a′) and (c). A session's application name, which the DMVs, `pg_stat_activity`, and Database Hub's session lists show, named the fault it played: `ContosoCare.Demo/locking-blocking/20261120170200-t1-9b7c1d`. This is unit B, (a′): the name becomes `ContosoCare.Demo/<service>/<run>`, the ContosoCare client service that runs the scenario and an opaque run ID. It builds on unit A's shared base, 59d9dfb7: each `scenario.json`'s `service`, the schema's `service`, and the answer key's `workloadNames`. Unit A renames the modules, (c), and unit C the fixtures and docs. One commit.
+
+- **The run ID says nothing about the run.** `SessionNames.NewRunId()` returns 16 lowercase hex characters, 64 random bits, with no time and no target. `demo.scenario_runs`, or T5's run store, maps it to its scenario, target, and times, as before. It fits `IsValidRunId`, `demo.usp_run_begin`'s rule on both engines, which an older runner's IDs (`20261120170200-t1-9b7c1d`) still fit. The observer hashes a name's last segment and the answer key hashes the run ID, so they still agree, and nothing under `Rca/**` changes.
+- **The middle segment is the service.** `ScenarioDefinition.Service` is required. The catalog refuses a service that isn't lowercase words joined by hyphens, 32 characters at most; `control`, which would hide a run's sessions from the session tools; and one that names a scenario, whole or as hyphen-separated words (`cpu-pressure-api`). `SessionNames.ForRun(service, runId)` refuses the same services, and a run ID with a LIKE wildcard, since the session tools now match by the run alone. The three runners name runs `ForRun(plan.Scenario.Service, runId)`: on T5 that's each request's User-Agent prefix and each document's `source`. The run command's JSON `applicationName` says the same.
+- **The kill tools match a run's sessions by the run ID alone.** `demo.usp_kill_demo_sessions`' past-deadline match, on both engines, built `ContosoCare.Demo/<scenario_id>/<run_id>`, which a new name never equals. It's `LIKE 'ContosoCare.Demo/%/' + run_id` now, as `demo.fn_demo_sessions` already was. A run ID has no LIKE wildcard, so the match is exact, and it matches an older runner's names too.
+  - **Out of step** (the design's 5.2): the runner's watchdog, reset, and stop call the kill tool by run with `past_deadline_only` off, which goes through `fn_demo_sessions`' match, so a new runner on an old database, and an older runner on a new one, still end their runs' sessions.
+  - **Unchanged:** the prefix filters, `ContosoCare.Demo/control/`, and ADR 0010's bounds.
+- **T4's read replica: a scenario stop matches by run, not by service.** The design proposed the service, with a by-run match as the alternative if the service could reach another run's session. It can: on T4, missing-index and replica-lag share `reporting-jobs`, so a stop of missing-index would end a replica-lag report on the replica. The coordinator accepted the by-run match.
+  - **How:** with a replica, `stop --target T4 --scenario <id>` reads T4's Running runs before it stops them, then ends the replica's sessions of that scenario's runs among them (`ReplicaSessionScope.ForStop`; the statements take `@run_ids`, matched through `unnest`). A run's own last check, by its run, and reset, of all, are as before.
+  - **What changes:** a scenario stop no longer ends a replica session of that scenario's run that had already ended. The run's own last check ends those, and reset ends them all. A run that begins between the read and the stop is stopped but isn't in the replica scope: its runner ends its sessions within seconds of the stop, and its last check ends any left.
+- **Readers:** the agent prompts that picked the workload's sessions by a scenario segment (`blocking-chain`, `locking-blocking`, `deadlock-storm`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`) pick a run's sessions instead: they read its `run_id` from `demo.scenario_runs` and match the sessions whose names start with `ContosoCare.Demo/` and end with it (corrected by [the review of e21c3431](#realistic-names-unit-b-the-review-of-e21c3431-2026-11-23), below: at e21c3431, four of them read every `ContosoCare.Demo/` session). The deployment notebook's Workload paragraph, the runner's root description, and `stop --run-id`'s example say the new form.
+- **Left to the other units, as agreed with the coordinator:** the comments in `database/postgresql/120-scenario-functions.sql` that still say `ContosoCare.Demo/<scenario>/<run>` and `ContosoCare.Demo/replica-lag` (A); and the docs, scenario READMEs, and `scenario.json` prose that quote a tag (C). A's `SqlIntegrationTests` still pass a scenario ID as the service in two `ForRun` calls, which now stand for an older runner's names; the kill tools match them by run.
+
+**Changed files.**
+
+- **Runner:** `Sql/TargetEndpoint.cs` (`SessionNames`), `Catalog/ScenarioCatalog.cs`, `Runs/ScenarioRunner.cs`, `Postgres/PgScenarioRunner.cs`, `Cosmos/CosmosScenarioRunner.cs`, `Cosmos/CosmosRestClient.cs` (a comment), `Postgres/PgReplica.cs`, and `Cli/CommandLine.cs`.
+- **Scripts:** the kill tool's run match, with a comment, and the `fn_demo_sessions` header in `database/common/110-demo-control.sql` and `database/postgresql/110-demo-control.sql`.
+- **Tests:** `ConnectionTests`; `CatalogTests`' service cases, the refusals and the answer key (every service in `workloadNames.services` with exactly its scenarios, and in `forbiddenInDetectionCode`); `CosmosClientTests`; `CosmosRunnerTests`; `ReplicaLagTests`; `RcaSimulation`'s application names, whose middle segment only changes, since C's fixtures bind their run segments; and two lines of `PostgresTests`, agreed with A.
+- **Readers:** the seven agent prompts above, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, and this report.
+
+**Validation.** On 59d9dfb7 with this commit, on this PC:
+
+- **The runner's tests** (`dotnet test` in `workload-generator`): 828, none failed, 21 skipped, the opt-in integration tests that need a disposable SQL Server or PostgreSQL. At 59d9dfb7: 808, none failed, 21 skipped. The build has no warning.
+- **The new tests fail without the change:** with five mutations in one build (the old exact kill-tool match on both engines, the replica's scenario scope by service, no scenario check of a service in the catalog, no checks in `ForRun`, and T5's tag by scenario), 16 of the 21 targeted cases fail, each on its own mutation. The other 5 are the catalog's format cases, which no mutation touches. Restored, the 12 test classes that cover what changed pass: 529, with 2 skipped.
+- **The replica's statements parse:** PostgreSQL 17's parser (libpg_query) parses `PgReplicaSessions.Sql`'s three statements, with the positional parameters Npgsql sends, and reads the kill tool's match as `LIKE ('ContosoCare.Demo/%/' || r.run_id)`. No test runs them offline; the live check does.
+- **Pester,** under strict mode with the Azure CLI guard, one suite at a time:
+  - `Agent.PromptPack`: 472 passed, none failed.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - `Fabric.Notebooks`, for the deployment notebook: 121 passed, 1 failed, 8 skipped, as at 59d9dfb7 without this commit. The failure is a date bomb in `NB_DatabaseHub_LiveActivity`'s staged evidence case (`stagedOtherSession`): the test stages a file named for 2026-11-20 17:25 UTC, and the notebook's inbox sweep deletes a file staged more than 24 hours earlier, so the test has failed on every branch since 2026-11-21 17:25 UTC. The RCA release's integration fixes the test in 5633c574, with no notebook change. With 5633c574 applied, the suite passes: 122, with 8 skipped.
+  - The guard saw no Azure CLI call in any of them.
+- markdownlint found no issue in 152 files. The notebook parses, 31 cells, with one line changed.
+- No PowerShell changed, so PSScriptAnalyzer has nothing new to read.
+- The leak check prints nothing.
+
+**Risks.**
+
+- Run IDs lose their readable time and target. No code parses them: the design checked the runner, scripts, runbooks, notebooks, and app, and a search here found no slice or split of a run ID. Wherever a run ID is shown, its scenario, target, and start are shown with it.
+- A scenario stop on T4's replica covers that scenario's Running runs only (above).
+
+**What its live check needs.** In the Final tests session, with A and C:
+
+- A Run all, with the runs' sessions in `sys.dm_exec_sessions` and `pg_stat_activity` as `ContosoCare.Demo/<service>/<16 hex characters>`, and T5's requests' User-Agent and documents' `source` the same.
+- A run's sessions ended at its deadline or stop on every target, including a run an older runner started before the update (the design's 5.2).
+- `stop --target T4 --scenario replica-lag` during a replica-lag run: `replica-sessions-ended` passes, with the report's sessions ended. And `stop --target T4 --scenario missing-index` during one leaves the report running.
+
+### Realistic names, unit B: the review of e21c3431 (2026-11-23)
+
+**Why.** A fresh reviewer said to ship e21c3431 with fixes: the bounds, the kill tools, the run IDs, the names' lengths, and the replica's scenario stop are sound, with one Medium, in the agent prompts. The coordinator asked for its fix in a follow-up commit.
+
+- **Medium: four incident prompts read every demo session, not their incident's run.** e21c3431 took the scenario out of their prompt 3's filter, a `program_name` that starts with `ContosoCare.Demo/` and the scenario, and put no run in its place: `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`.
+  - **The effect:** each also read the healthy baseline's sessions and those of any incident at the same time, and the showcase runs exactly these with another (`scenarios/activity-profiles.json`): memory-grant-pressure with cpu-pressure on T2, parallel-scans and tempdb-contention with io-pressure, and slow-consumer with locking-blocking on T3. An agent would have reported another run's plans, grants, or waits as the incident's, such as a blocking incident's `LCK_M_*` in the slow client's answer. And memory-grant-pressure's way to judge the answer asked for the run's `run_id`, which none of its prompts read.
+  - **The fix:** each prompt 3 first reads the `run_id` of the scenario's latest row in `demo.scenario_runs`, then reads only that run's sessions: those whose `program_name` starts with `ContosoCare.Demo/` and ends with that `run_id`, as blocking-chain's and locking-blocking's prompt 4 match them. It tells the agent why, since other runs can be active at the same time, and to say so when it can't read the row, instead of reading other sessions. memory-grant-pressure's prompt 4 reads that run's statement, and each file's way to judge the answer says the sessions are the run's.
+  - **slow-consumer by its run, not by its `session_ids`:** the reviewer offered the `session_ids` that its prompt 2 reads. But `demo.usp_run_end` writes them when the run ends, so they're empty while the incident runs, when prompt 3 reads its live sessions; and once the run's sessions close, another session can take one of their IDs.
+  - **Front matter:** memory-grant-pressure and parallel-scans now read the scenario record, so their `dataSources` add `scenario-record`, and their `capability` says they read the run's sessions. Their `permission` stays the other scenario-record prompts'. `reviewed` stays as it was, since it dates a check of the prompt's sources too, which this didn't redo.
+  - **A test,** in `Agent.PromptPack`: a prompt block that names `ContosoCare.Demo/` reads `demo.scenario_runs` and matches a session's name by its end, the run. It fails for exactly the four prompts as e21c3431 left them, and passes with the fix.
+- **The review's live checks,** which the coordinator gives to Final tests, beside the entry above's:
+  - the past-deadline kill, `EXEC demo.usp_kill_demo_sessions;` with its defaults, on T1 to T3, with a session of each name form and a run past its deadline, and no collation conflict (Msg 468) between `program_name` and `run_id`;
+  - T4's, `SELECT * FROM demo.usp_kill_demo_sessions(NULL, true, 'check')`;
+  - the replica's statements through Npgsql, with an empty, a null, and a one-element run list;
+  - an older runner's session, ended by the new runner's watchdog and by reset.
+
+**Changed files.** The four prompts above, `tests/unit/Agent.PromptPack.Tests.ps1`, and this report: the entry above's Readers, and this entry.
+
+**Validation.** On 7c8272ba with this commit:
+
+- **The sweep:** every prompt block that names `ContosoCare.Demo/` reads `demo.scenario_runs` and matches the run: blocking-chain's, locking-blocking's, and the four above.
+- **Pester,** under strict mode with the Azure CLI guard:
+  - `Agent.PromptPack`: 512 passed, none failed, the new test's 40 cases among them. With the four prompts as 7c8272ba has them and the new test copied in, 4 failed, the new test on each of the four prompts, and nothing else.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - The guard saw no Azure CLI call.
+- PSScriptAnalyzer, with the repo's settings for tests, found nothing in the changed test file, which is ASCII-only, and markdownlint found no issue.
+- No runner code or SQL changed, so the runner's tests stand as at e21c3431.
+- The leak check prints nothing.
+
+**What its live check needs.** A presenter's rehearsal, since an agent runs the prompts, not a script: during the showcase, prompt 3 of memory-grant-pressure on T2 while cpu-pressure runs there, and of slow-consumer on T3 while locking-blocking runs, each reading only its own run's sessions.
+
+### Realistic names, unit B: the re-check of e0966579 (2026-11-23)
+
+**Why.** The re-check of e0966579 said to ship it, with one improvement, which the coordinator asked for as a quick commit. The prompts read "the latest" row of `demo.scenario_runs` without saying which column decides. An older runner's run IDs began with their time, so even a sort by `run_id` found the latest run, but the random run IDs of unit B's entry above don't. An agent that sorts by `run_id` would pick any run, find none of its sessions, and could report mid-incident that no grant is waiting.
+
+- **The fix:** every prompt that reads the latest row of `demo.scenario_runs` says it's the latest by `started_at`. That's the four of [the review's entry](#realistic-names-unit-b-the-review-of-e21c3431-2026-11-23), blocking-chain's and locking-blocking's prompt 4, and two more that the guard found, deadlock-storm's and log-flush-waits' reads of the record: ten prompts in eight files. The showcase's and the wrap-up's reads of the record pick their rows by the incident window and by the run concluded on, not the latest, so they stay.
+- **The guard,** in `Agent.PromptPack`: wherever a prompt block that reads `demo.scenario_runs` picks the latest, most recent, or newest row or run, it says `by started_at`. It fails for exactly the eight files as e0966579 left them, and passes with the fix.
+
+**Changed files.** The eight prompts above (`blocking-chain`, `deadlock-storm`, `locking-blocking`, `log-flush-waits`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`), `tests/unit/Agent.PromptPack.Tests.ps1`, and this report.
+
+**Validation.** On e0966579 with this commit:
+
+- **Pester,** under strict mode with the Azure CLI guard:
+  - `Agent.PromptPack`: 552 passed, none failed, the new test's 40 cases among them. With the prompts as e0966579 has them and the new test copied in, 8 failed: the new test on each of the eight files, and nothing else.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - The guard saw no Azure CLI call.
+- PSScriptAnalyzer, with the repo's settings for tests, found nothing in the changed test file, which is ASCII-only, and markdownlint found no issue.
+- The leak check prints nothing.
+
+**What its live check needs.** Nothing new: the rehearsal in the entry above checks the run each prompt picks.

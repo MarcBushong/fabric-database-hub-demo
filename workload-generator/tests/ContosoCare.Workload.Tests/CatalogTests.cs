@@ -61,6 +61,44 @@ public sealed partial class CatalogTests
     }
 
     [Theory]
+    [InlineData("control")]
+    [InlineData("Billing-worker")]
+    [InlineData("billing_worker")]
+    [InlineData("billing-worker-")]
+    [InlineData("a23456789012345678901234567890123")]
+    [InlineData("cpu-pressure")]
+    [InlineData("cpu-pressure-api")]
+    [InlineData("scheduling-cpu-pressure")]
+    public void TheCatalogRefusesAServiceThatNamesAScenarioOrIsntOne(string service)
+    {
+        // ADR 0031, decision 6: a session's name never says which fault it plays, and 'control' would hide a run's
+        // sessions from the session tools.
+        var definitions = ScenarioCatalog.Default.All.Select(s => s.Id == "blocking-chain" ? s with { Service = service } : s).ToList();
+
+        var error = Assert.Throws<InvalidOperationException>(() => new ScenarioCatalog(definitions));
+
+        Assert.Contains("'blocking-chain'", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EveryServiceIsInTheAnswerKeyAndForbiddenInDetectionCode()
+    {
+        using var blind = JsonDocument.Parse(File.ReadAllText(RepositoryPaths.Combine("rca", "blind-detection.json")));
+        var answerKey = blind.RootElement.GetProperty("answerKey").GetProperty("workloadNames").GetProperty("services").EnumerateObject()
+            .ToDictionary(p => p.Name, p => p.Value.EnumerateArray().Select(e => e.GetString()!).Order(StringComparer.Ordinal).ToList(), StringComparer.Ordinal);
+        var forbidden = blind.RootElement.GetProperty("forbiddenInDetectionCode").GetProperty("identifiers").EnumerateArray().Select(e => e.GetString()!).ToHashSet(StringComparer.Ordinal);
+        var catalog = ScenarioCatalog.Default.All.GroupBy(s => s.Service, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.Select(s => s.Id).Order(StringComparer.Ordinal).ToList(), StringComparer.Ordinal);
+
+        Assert.Equal(catalog.Keys.Order(StringComparer.Ordinal), answerKey.Keys.Order(StringComparer.Ordinal));
+        foreach (var (service, scenarios) in catalog)
+        {
+            Assert.Equal(scenarios, answerKey[service]);
+            Assert.Contains(service, forbidden);
+        }
+    }
+
+    [Theory]
     [MemberData(nameof(ScenarioIds))]
     public void EveryIncidentRunsOnEveryTarget(string id)
     {
