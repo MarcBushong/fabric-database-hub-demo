@@ -178,6 +178,81 @@ describe("incidents, blind", () => {
     });
 });
 
+// The owner's feedback on the Root cause page (2026-11-23): the chat slices the incidents by the page's own facets.
+describe("the Root cause page's facets, in the chat", () => {
+    it("gives each incident its category, and its severity with the measurements behind it", async () => {
+        const found = await ask("find_incidents", { from: "11:50", to: "12:20" });
+        const t1 = found.episodes.find((e) => e.key === "T1-blocking-20261120T165230Z");
+        expect(t1).toMatchObject({ category: "blocking", severity: "high", severityReason: "High: peak 7 processes, four times its level or more (it opens on any, so 4 or more), there for 6.8 minutes in all; over its level for 9.1 minutes, 5 or more; high confidence." });
+        for (const e of found.episodes) {
+            expect(["blocking", "deadlocks", "cpu", "waits", "errors", "connections", "replica_lag", "throttling", "io"], e.key).toContain(e.category);
+            expect(e.severityReason.startsWith(`${e.severity[0].toUpperCase()}${e.severity.slice(1)}: peak `), e.key).toBe(true);
+        }
+        // The servers the telemetry named, for the targets asked about only.
+        expect(found.details!.servers).toEqual({ T5: "cosmos01" });
+        expect((await ask("find_incidents", { from: "11:50", to: "12:20", targets: ["T1"] })).details!.servers).toBeUndefined();
+    });
+
+    it("filters by category and severity beside targets, counts what they leave out, and keeps the window's own verdicts", async () => {
+        const all = await ask("triage_window", { from: "11:50", to: "12:20" });
+        const replica = await ask("find_incidents", { from: "11:50", to: "12:20", categories: ["replica_lag"] });
+        expect(replica.episodes.map((e) => e.key)).toEqual(["T4-replica-replica_lag-20261120T171200Z"]);
+        expect(replica.details!.filters).toEqual({ categories: ["replica_lag"], severities: [], targets: [] });
+        const leftOut = replica.details!.leftOut as { episodes: number; byCategory: Record<string, number> };
+        expect(leftOut.episodes).toBe(all.episodes.length - 1);
+        expect(Object.values(leftOut.byCategory).reduce((a, b) => a + b, 0)).toBe(leftOut.episodes);
+        // No incident matches, but the window wasn't quiet: nothingAbnormal and quiet are about every incident in it.
+        const low = await ask("triage_window", { from: "11:50", to: "12:20", categories: ["cpu"] });
+        expect(low.episodes).toEqual([]);
+        expect(low.findings).toEqual([]);
+        expect(low.details).toMatchObject({ nothingAbnormal: false, quiet: all.details!.quiet, leftOut: { episodes: all.episodes.length } });
+        // Each hypothesis has the facets it's filtered by, and a finding's severity is its incident's.
+        const hypotheses = all.details!.hypotheses as Array<{ category: string; severity: string; family: string }>;
+        expect(all.findings.map((f) => f.severity)).toEqual(hypotheses.map((h) => ({ high: "critical", medium: "warning", low: "info" })[h.severity]));
+        expect(hypotheses.find((h) => h.family === "blocking")).toMatchObject({ category: "blocking", severity: "high" });
+        const high = await ask("triage_window", { from: "11:50", to: "12:20", severities: ["high"], targets: ["T1", "T5"] });
+        expect((high.details!.hypotheses as Array<{ severity: string; target: string }>).every((h) => h.severity === "high" && ["T1", "T5"].includes(h.target))).toBe(true);
+        // An episode's severityReason is in the episode list once, never again in its hypothesis (the review of 90e9d914).
+        expect((all.details!.hypotheses as Array<Record<string, unknown>>).filter((h) => h.episodeKey && "severityReason" in h)).toEqual([]);
+    });
+
+    // The review of 90e9d914: targets narrowed the read, so a triage of the replica's high incidents said nothing abnormal,
+    // and none left out, beside the window's incidents on other targets.
+    it("takes targets as a facet too: the verdicts stay the whole window's, and what it leaves out on other targets is counted", async () => {
+        const all = await ask("triage_window", { from: "11:50", to: "12:20" });
+        const replicaHigh = await ask("triage_window", { from: "11:50", to: "12:20", targets: ["T4-replica"], severities: ["high"] });
+        const kept = all.episodes.filter((e) => e.target === "T4-replica" && e.severity === "high");
+        expect(replicaHigh.episodes.map((e) => e.key)).toEqual(kept.map((e) => e.key));
+        expect(replicaHigh.details).toMatchObject({ nothingAbnormal: all.details!.nothingAbnormal, quiet: all.details!.quiet, filters: { categories: [], severities: ["high"], targets: ["T4-replica"] } });
+        expect(all.details!.nothingAbnormal).toBe(false);
+        const leftOut = replicaHigh.details!.leftOut as { episodes: number; hypotheses: number; notCaptured: number; byTarget: Record<string, number> };
+        expect(leftOut.episodes).toBe(all.episodes.length - kept.length);
+        expect(leftOut.byTarget.T1).toBe(all.episodes.filter((e) => e.target === "T1").length);
+        expect(leftOut.hypotheses).toBe((all.details!.hypotheses as unknown[]).length - (replicaHigh.details!.hypotheses as unknown[]).length);
+        // What wasn't captured is the targets' asked about; the other targets' lines are counted.
+        expect(replicaHigh.notCaptured.filter((line) => /^T(1|2|3|4|5): /.test(line))).toEqual([]);
+        expect(leftOut.notCaptured).toBe(all.notCaptured.length - replicaHigh.notCaptured.length);
+        // A target it doesn't have is refused, as a category is.
+        expect(await tools().run("triage_window", { from: "11:50", to: "12:20", targets: ["T9"] })).toEqual({ ok: false, text: 'targets takes T1, T2, T3, T4, T4-replica, T5; ["T9"] isn\'t one of them.' });
+    });
+
+    it("refuses a category or a severity it doesn't have, so a filtered list is never taken for the whole one", async () => {
+        const deps = tools();
+        expect(await deps.run("find_incidents", { from: "11:50", to: "12:20", categories: ["locking"] })).toEqual({
+            ok: false,
+            text: 'categories takes blocking, deadlocks, cpu, waits, errors, connections, replica_lag, throttling, io; ["locking"] isn\'t one of them.',
+        });
+        expect((await deps.run("triage_window", { at: "11:56", severities: ["critical"] })).ok).toBe(false);
+        for (const name of ["find_incidents", "triage_window"]) {
+            const spec = INVESTIGATION_TOOL_SPECS.find((s) => s.name === name)!.parameters as { properties: Record<string, { items?: { enum?: string[] }; description?: string }> };
+            expect(spec.properties.categories.items?.enum, name).toEqual(["blocking", "deadlocks", "cpu", "waits", "errors", "connections", "replica_lag", "throttling", "io"]);
+            expect(spec.properties.severities.items?.enum, name).toEqual(["high", "medium", "low"]);
+            // The rule as severityOf applies it: the time at the far mark, in all.
+            expect(spec.properties.severities.description, name).toContain("where far is 4 times its level, or 90 % of a capacity: high (at or over far for 5 minutes or more in all), medium (far at its peak, or over its level 5 minutes or more), low (neither)");
+        }
+    });
+});
+
 // The live findings' audit (2026-11-21): T4's connection surge was listed as explained, but only its errors were read, so
 // its report was blank. Every family EXPLAINED_FAMILIES lists has an explainer now, which gives a cause or says exactly
 // what's missing.

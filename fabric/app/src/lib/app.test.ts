@@ -16,7 +16,7 @@ import { describeRequest, notebookParameters, validateRequest } from "@/lib/cont
 import { parameterCellText } from "@/lib/manage-client";
 import { profileLabel, SCENARIOS } from "@/lib/scenarios";
 import { weekOverWeek } from "@/lib/trends";
-import { DEFAULT_VIEW, mergeView, parseHash, replaceAddress, toHash } from "@/lib/view-state";
+import { DEFAULT_VIEW, mergeView, openView, parseHash, replaceAddress, toHash } from "@/lib/view-state";
 import { APP_TOKENS, contrastRatio, FABRIC_BRAND, FLUENT_THEMES, loadThemeChoice, resolveTheme, type ThemeId } from "@/theme/fluent";
 import { APP_BRAND, MICROSOFT_ACCENTS, MICROSOFT_BRAND, MICROSOFT_LOGO } from "@/theme/identity";
 import { STAGE_TOKENS, stageStyle, stageTheme } from "@/theme/stage";
@@ -209,6 +209,47 @@ describe("view state", () => {
         expect(parseHash("#/admin?t=T9,T2&w=1y&i=<script>&r=-3")).toEqual({ targets: ["T2"] });
         expect(parseHash("#/estate/T9")).toEqual({ page: "estate" });
         expect(parseHash("#/incidents/%E0%A4%A")).toEqual({ page: "incidents" });
+    });
+
+    // The owner's feedback on the Root cause page (2026-11-23): its filters stay in the address, so a view can be shared.
+    it("keeps the Root cause page's filters in the address, only those that aren't its defaults, and drops unknown values", () => {
+        const window = { from: new Date("2026-11-17T14:00:00Z"), to: new Date("2026-11-17T15:30:00Z") };
+        const sliced = mergeView({ page: "rca", incident: "T1-blocking-20261117T140230Z", rcaFilters: { categories: ["blocking", "deadlocks"], severities: ["high"], targets: ["T1", "T4-replica"], window, group: "target", sort: "time" } });
+        expect(toHash(sliced)).toBe("#/rca/T1-blocking-20261117T140230Z?cat=blocking%2Cdeadlocks&sev=high&tg=T1%2CT4-replica&win=20261117T140000Z.20261117T153000Z&group=target&sort=time");
+        expect(mergeView(parseHash(toHash(sliced)))).toEqual(sliced);
+        const newest = mergeView({ page: "rca", rcaFilters: { categories: [], severities: [], targets: [], window: { newest: 360 }, group: "category", sort: "severity" } });
+        expect(toHash(newest)).toBe("#/rca?win=6h");
+        expect(mergeView(parseHash(toHash(newest)))).toEqual(newest);
+        // The defaults write nothing, and only the Root cause page reads them.
+        expect(toHash(mergeView({ page: "rca", rcaFilters: { categories: [], severities: [], targets: [], window: { newest: 90 }, group: "category", sort: "severity" } }))).toBe("#/rca");
+        expect(parseHash("#/estate?cat=blocking&sev=high").rcaFilters).toBeUndefined();
+        // Unknown values go, and a window that's backward or not a time is ignored.
+        expect(parseHash("#/rca?cat=blocking,locking&sev=critical&tg=T9,T5&win=20261117T153000Z.20261117T140000Z&group=server&sort=size").rcaFilters).toEqual({
+            categories: ["blocking"],
+            severities: [],
+            targets: ["T5"],
+            window: { newest: 90 },
+            group: "category",
+            sort: "severity",
+        });
+        expect(parseHash("#/rca?win=1y").rcaFilters).toBeUndefined();
+    });
+
+    // The review of 90e9d914: an address's 528 hours were read on all six targets at once.
+    it("reads a Root cause window from the address only up to the page's 24 hours", () => {
+        expect(parseHash("#/rca?win=20261101T000000Z.20261123T000000Z").rcaFilters).toBeUndefined();
+        expect(parseHash("#/rca?win=20261122T000000Z.20261123T000001Z").rcaFilters).toBeUndefined();
+        expect(parseHash("#/rca?win=20261122T000000Z.20261123T000000Z").rcaFilters?.window).toEqual({ from: new Date("2026-11-22T00:00:00Z"), to: new Date("2026-11-23T00:00:00Z") });
+    });
+
+    // The review of 90e9d914: a shared link with the page's default filters opened with the recipient's saved ones.
+    it("opens the Root cause page with its address's filters alone, never the browser's saved ones", () => {
+        const saved = parseHash("#/rca?sev=high&tg=T5");
+        expect(saved.rcaFilters?.severities).toEqual(["high"]);
+        expect(openView(saved, parseHash("#/rca/T1-blocking-20261117T140230Z")).rcaFilters).toBeNull();
+        expect(openView(saved, parseHash("#/rca?sev=low")).rcaFilters?.severities).toEqual(["low"]);
+        // Another page keeps the saved view under its address, as before.
+        expect(openView(saved, parseHash("#/mission")).rcaFilters?.severities).toEqual(["high"]);
     });
 });
 

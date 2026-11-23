@@ -12,6 +12,7 @@ import { SESSION_END, SESSION_START } from "@/preview/sample-session";
 import { createRcaClient, type RcaClient } from "./client";
 import { RcaReadError, type DaxLog } from "./loader";
 import { blindCauses, MAX_CAUSES } from "./postmortem";
+import { categoryOf } from "./facets";
 import { namesAScenario } from "./testdata/contract";
 import type { InvestigationTools } from "./tools";
 import type { InvestigationResult } from "./types";
@@ -25,7 +26,7 @@ const sampleRca = () => createRcaClient(createSourceClient([{ provenance: "sampl
 
 type Listed = InvestigationResult["episodes"][number];
 
-const episode = (key: string, family: string, source: string, start: string): Listed => ({ key, target: key.split("-")[0] as Listed["target"], family, signal: family, support: "sustained", source, start, end: null, peak: "" });
+const episode = (key: string, family: string, source: string, start: string): Listed => ({ key, target: key.split("-")[0] as Listed["target"], family, signal: family, support: "sustained", source, start, end: null, peak: "", category: categoryOf(family), severity: "medium", severityReason: "" });
 
 const result = (patch: Partial<InvestigationResult>): InvestigationResult => ({
     tool: "stub",
