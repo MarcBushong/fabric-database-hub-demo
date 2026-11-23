@@ -74,11 +74,19 @@ Query Store records every statement a database runs, the capture's and the harne
 1. **The capture's own statements.**
    - **SQL Server and Azure SQL Database:** every catalog statement carries the marker `/* dbhubdemo:rca-observer */` inside its text, which Query Store keeps ("Comments and spaces inside text aren't ignored", [sys.query_store_query_text](https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-query-store-query-text-transact-sql)). RCA-SQL-10 and 14 leave out texts that carry it.
    - **PostgreSQL:** Query Store keeps one text per `query_id`, the first it saw, and `query_id` ignores comments, so a marker in the text isn't enough: T4 recorded the observer's statements before they carried one. So RCA-PG-14 has two rules:
-     - **the `search_path`:** the observer's T4 connections set `search_path` to `"$user", public, dbhubdemo_rca_observer`, a schema that doesn't exist, so names resolve as before. `query_store.qs_view` records `search_path` per row, and RCA-PG-14 leaves out the rows that name it, and the texts that carry the marker;
-     - **the catalog's own texts:** it also leaves out a row whose text equals one of the catalog's own PostgreSQL statements, today's or edd01c86's, once comments are stripped and white space is collapsed on both sides, prefix-matched where Query Store truncated the text (`pg_qs.max_query_text_length`). This covers the windows where an earlier runner's statements ran without the marker, which the first read after an update reaches. It also covers a `search_path` that Query Store kept from a query's first capture, which the live check L0c measures.
+     - **the `search_path`:** the observer's T4 connections, and only those, carry `search_path` `"$user", public, dbhubdemo_rca_observer` in their startup packet (`Options=-c search_path=...`); the schema doesn't exist, so names resolve as before. `query_store.qs_view` records `search_path` per row, and RCA-PG-14 leaves out the rows that name it, and the texts that carry the marker;
+     - **the catalog's own texts:** it also leaves out a row whose text equals one of the observer's own statements (RCA-PG-14's `$7`, `PgObserverStatements`):
+       - the catalog's PostgreSQL blocks, today's and edd01c86's;
+       - the observer's snapshot clear, and its limits' `SET` statements;
+       - Npgsql 10.0.3's type loading.
+
+       Both sides are compared with comments stripped, white space collapsed, and a final semicolon dropped. A row whose text Query Store didn't keep stays as evidence. The rule covers the windows where an earlier runner's statements ran without the marker, which the first read after an update reaches. It also covers a `search_path` that Query Store kept from a query's first capture, which the live check L0c measures.
 2. **The harness's bookkeeping and control modules,** which the demo marks where it defines them, so a rename carries the mark:
    - **SQL Server:** the extended property `dbhubdemo.role` = `harness` on every module `database/common/110-demo-control.sql` creates. RCA-SQL-10 and 14 leave out every statement whose `object_id` carries it.
-   - **PostgreSQL:** `COMMENT ON FUNCTION ... IS 'dbhubdemo:harness'` on its control functions. Query Store records a statement nested in a function without its function (`pg_qs.query_capture_mode` `all`), so RCA-PG-16 reads, at the observer's start, the marked functions and the tables only marked functions write; RCA-PG-14 leaves out a call of a marked function, and a statement whose tables are all ones only the harness writes. A scenario function's own read of a run table is then left out too: it's bookkeeping.
+   - **PostgreSQL:** `COMMENT ON ROUTINE ... IS 'dbhubdemo:harness'` on its control routines. Query Store records a statement nested in a function without its function (`pg_qs.query_capture_mode` `all`). So, at the observer's start, RCA-PG-16 reads the marked routines and the tables they write.
+     - **A table is the workload's** when any unmarked routine mentions it at all.
+     - **When the rule turns off:** a routine with `EXECUTE` (dynamic SQL), or with no source, makes RCA-PG-16 report it as unsure (`dynamic_sql`, `no_source`). It then names no harness table, and the sidecar's coverage says why.
+     - **What RCA-PG-14 leaves out:** a call of a marked routine, and a statement whose tables are all harness tables.
 
 Everything else is measured evidence, normalized as RCA Sessions' text is: the scenario modules' reads and writes, other applications' statements, and monitoring queries (Database Hub's among them). Modules keep their database names ([Names](#names)).
 
@@ -148,7 +156,7 @@ What the observer captures beyond the evidence document, in documents of their o
 |---|---|
 | `kind`, `version` | `ContosoCare.RcaSidecar`, 1 |
 | `documentId` | The evidence document's form with `-sidecar` after it: `20261120T165000Z-sqlvm01-0001-sidecar`. Unique; the notebook writes a sidecar once |
-| Everything else | As the evidence document's (`sessionId`, `producer`, the window, `sequence`, `final`, `targets`, `epochUtc`, `strings`, `tables`), with no `answerKey`. Each target has an `rca_query_coverage` row |
+| Everything else | As the evidence document's (`sessionId`, `producer`, the window, `sequence`, `final`, `targets`, `epochUtc`, `strings`, `tables`), with no `answerKey`. Each target has an `rca_query_coverage` row. The header's times carry milliseconds, as the evidence document's do, and sidecar.schema.json requires them |
 
 - **Its tables** ([history-tables.json](history-tables.json), document `sidecar`): `rca_query_stats`, `rca_query_waits`, `rca_query_plans`, `rca_query_events`, `rca_query_coverage`, and `rca_connections`, encoded as the evidence document's tables are. The evidence document never holds one, and a sidecar never holds an evidence table.
 - **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.rows` (`RcaContract.SidecarRowsFile`), beside its evidence files. Never `.jsonl`: every evidence export, an older runner's included, reads each `*.jsonl` in a span as a target's file, so sidecar rows there would end up in an evidence document.
@@ -168,7 +176,7 @@ What the observer captures beyond the evidence document, in documents of their o
 
 - **What's read:** RCA-SQL-10, 11, 14, and 15 on T1 to T3, and RCA-AZ-03 and 04 for T3's automatic tuning; RCA-PG-13 to 16 on T4. T4's replica records nothing in Query Store ([Learn](https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store)), which its coverage says.
 - **When:**
-  - every 15 minutes, 2 minutes after a Query Store interval ends. The intervals are 15 minutes on every target: `database/*/030-configure.sql`, and T4's `pg_qs.interval_length_minutes` default;
+  - every 15 minutes, 2 minutes after a Query Store interval ends. The intervals are 15 minutes on every target: `database/*/030-configure.sql`, and T4's `pg_qs.interval_length_minutes` default. On T4, each read takes again the intervals that ended in the last 20 minutes, until they've settled, and writes a row again only when it changed;
   - at the observer's start, the 2 hours before it (8 intervals), so a rule has a baseline;
   - at its end, with SQL Server's open interval: Query Store unifies its in-memory and on-disk data when it's read;
   - RCA-SQL-15 every 60 s; RCA-PG-13 with each read.
@@ -254,7 +262,7 @@ The runbook and the scripts call the runner through managed Run Commands, which 
 |---|---|
 | `ContosoCare.Workload rca export --session <sessionId or none> [--final] [--end-capture]` | Reduces what's been captured since the previous export into documents and prints `DBHUBDEMO-RCA-INDEX <json>`: `{"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"...","parts":n,"sha256":"..."}],"status":"Pass","message":"..."}` (transport.schema.json), at most 3,400 characters. Status is ADR 0012's. Exit code 0, or 2 when there's nothing to export. `--final` first waits up to 60 s (`--wait-seconds`) for the observer to end its capture; when it doesn't, the message says so right after its summary ("The observer was still capturing here, ..."), and what it captured after its last complete time stays for the next export. `--end-capture` implies `--final` and records the capture's end first ([below](#the-captures-end-at-a-sessions-stop)) |
 | `ContosoCare.Workload rca part --document <documentId> --part <index>` | That part's line, an evidence document's or a sidecar's. Exit code 0, or 1 when the document or part doesn't exist |
-| `ContosoCare.Workload rca sidecar-export --session <sessionId or none> [--final] [--page <n>]` | Makes a sidecar for each span with new sidecar rows and prints `DBHUBDEMO-RCAS-INDEX <json>` (transport.schema.json, `sidecarIndex`): one page of at most 8 sidecars, new and pending, at most 3,400 characters. Exit code 0, or 2 when there's nothing to fetch |
+| `ContosoCare.Workload rca sidecar-export --session <sessionId or none> [--final] [--page <n>]` | Makes a sidecar for each span with new sidecar rows and prints `DBHUBDEMO-RCAS-INDEX <json>` (transport.schema.json, `sidecarIndex`): one page of at most 8 sidecars, new and pending, at most 3,400 characters. Exit code 2 only when nothing is offerable, new or pending; otherwise 0, and a page past the last is empty, with the true `pages`. The line is printed either way and its status stands: a **Warning** that counts sidecars expired unread is reported with exit code 2 too |
 | `ContosoCare.Workload rca ack --document <documentId>[,<documentId>...]` | Marks sidecars as written into the history, so the runner stops offering them and may delete them. Exit code 0 |
 
 - **The sidecar's Run Command actions:** the VM's control script runs the two sidecar commands as `RcaSidecarExport` and `RcaAck`. An older VM bundle answers "Unknown action", the scripts' `OldBundle` outcome: a Warning naming `./scripts/deploy.ps1`, and the evidence document goes on as before.
@@ -313,10 +321,20 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 | `RCA_EVIDENCE_FILE` | 262,144 bytes: one `RCA_EVIDENCE` document of 64 parts is about 218 KB | What the notebook passes to `notebookutils.fs.head`, whose default is 100 KB |
 | A bundle | 6 parts, 24,000 bytes | The runbook's existing bound for the metrics secret |
 | The bundle index | 16 bundles, 4,000 bytes | Inside the metrics document's 24,000 bytes |
-| A sidecar | 64 KiB of gzip (at most 28 parts), as a document | The reducer cuts waits past each plan's first three, then plan summaries, then the lowest-ranked queries, each cut a gap in `rca_query_coverage` |
+| A sidecar | 64 KiB of gzip (at most 28 parts), as a document, and at least 2 KiB | The reducer cuts in the order below, each cut a gap in `rca_query_coverage`. The 2 KiB are the evidence export's minimum, so a sidecar's coverage travels even when its host's session budget is spent |
 | A session's sidecars | 96 KiB of gzip, apart from the evidence documents': 64 KiB on T1's VM and 32 KiB in T2's guest, the evidence documents' split | A budget of their own, so Query Store never crowds out the evidence document. Each host's reducer cuts across its spans by priority |
 | `RCA_SIDECAR_FILE` | 64 parts and 262,144 bytes, of whole documents | The rest waits on the VMs for the next save, which the save's line says |
 | `rca sidecar-export`'s index | 8 sidecars a page, 3,400 characters | A managed Run Command keeps the last 4 KB of output |
+
+**A sidecar's cuts.** The reducer fits a sidecar to the smaller of 64 KiB and what's left of its host's session budget, never less than 2 KiB. It cuts in this order, each step only as far as it must, and each cut is a line in its target's `rca_query_coverage` gaps:
+
+1. **Waits:** each plan's wait categories past its three largest (on T4, events), by time waited summed across the sidecar's intervals. Every interval's rows of those three stay, so a plan's baseline intervals keep the waits the rules compare against.
+2. **Plan summaries,** set to null plan by plan: the lowest-ranked queries' plans first, and within a query its lowest-ranked plans. A forced plan, or a plan an event names, keeps its summary until every other plan's is cut.
+3. **The lowest-ranked queries,** one interval at a time: all of a query's rows in that interval. A query's plans go once it has no rows left, unless a plan is forced or an event names it.
+4. **Connection samples:** each target's thinned, its first, its peak (the most connections), and its last always kept.
+5. **Everything but `rca_query_coverage`,** which is never cut.
+
+A query's rank is its best place in the reads' top lists ([Query Store](#query-store)), from the latest read of each plan, with ties to the lower `plan_id`.
 
 ## Versioning
 
