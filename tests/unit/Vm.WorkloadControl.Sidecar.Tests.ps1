@@ -89,6 +89,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: the Query Store sidecar''s actions (rc
             (New-LongSidecarId -Sequence 1).Length | Should -Be 88
             Test-DemoControlRcaSidecarId -Value (New-LongSidecarId -Sequence 1) | Should -BeTrue
             Test-DemoControlRcaSidecarId -Value (New-LongSidecarId -Sequence 1 -HostLength 59) | Should -BeFalse -Because 'an 89-character ID matches the pattern, but not the document''s length'
+            Test-DemoControlRcaSidecarId -Value "20261120T165000Z-sqlvm01-0001-sidecar`n" | Should -BeFalse -Because '.NET''s $ matches before a final line feed, which the schema''s pattern doesn''t'
             Test-DemoControlRcaSidecarId -Value '20261120T165000Z-sqlvm01-0001' | Should -BeFalse
         }
 
@@ -206,6 +207,23 @@ Describe 'Invoke-DemoWorkloadControl.ps1: the Query Store sidecar''s actions (rc
             Invoke-DemoWorkloadControl -ActionName 'RcaSidecarExport' -Request (ConvertTo-Request @{}) -StateRoot (New-ControlRoot -NoInstall)
             (Get-Result).status | Should -Be 'Not selected'
         }
+
+        It 'is a Warning, with the index''s message and line, when nothing is offerable but sidecars expired unread' {
+            # rca/README.md (8afcca24): exit code 2 only when nothing is offerable; the line is printed either way, and its
+            # status stands. Its message here is the schema's longest, 500 characters.
+            $root = New-ControlRoot
+            $expired = ('2 sidecars expired unread: sealed more than 30 days ago, and no save acknowledged them: ' + ('20261020T165000Z-sqlvm01-0001-sidecar, ' * 12)).Substring(0, 500)
+            $script:expiredLine = 'DBHUBDEMO-RCAS-INDEX ' + (ConvertTo-Json -Compress -InputObject ([ordered]@{ kind = 'ContosoCare.RcaSidecarIndex'; version = 1; page = 1; pages = 0; documents = @(); status = 'Warning'; message = $expired }))
+            Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 2; StdOut = $script:expiredLine; StdErr = '' } }
+            Invoke-DemoWorkloadControl -ActionName 'RcaSidecarExport' -Request (ConvertTo-Request @{ final = $true }) -StateRoot $root
+            $result = Get-Result
+            $result.status | Should -Be 'Warning'
+            $result.evidence.exitCode | Should -Be 2
+            $result.message | Should -BeExactly ('runner rca sidecar-export: there is no sidecar to fetch. ' + $expired)
+            $script:lines.Count | Should -Be 2
+            $script:lines[1] | Should -BeExactly $script:expiredLine
+            [System.Text.Encoding]::UTF8.GetByteCount((($script:lines | ForEach-Object { $_ + "`r`n" }) -join '')) | Should -BeLessOrEqual 4096
+        }
     }
 
     Context 'RcaAck' {
@@ -266,6 +284,8 @@ Describe 'Invoke-DemoWorkloadControl.ps1: the Query Store sidecar''s actions (rc
                 @{ documentIds = @('../20261120T165000Z-sqlvm01-0001-sidecar') }
                 @{ documentIds = @('20261120T165000Z-sqlvm01-0001-sidecar,--session none') }
                 @{ documentIds = @('20261120T165000Z-sqlvm01-0001-sidecar --final') }
+                # .NET's $ matches before a final line feed, which the schema's pattern doesn't (review of f6f3f7f1).
+                @{ documentIds = @("20261120T165000Z-sqlvm01-0001-sidecar`n") }
                 @{ documentIds = @('20261120T165000Z-sqlvm01-0001-sidecar', 7) }
                 @{ documentIds = @{ documentId = '20261120T165000Z-sqlvm01-0001-sidecar' } }
                 @{ documentIds = @() }
@@ -290,6 +310,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: the Query Store sidecar''s actions (rc
             $cases = @(
                 @{ Action = 'RcaSidecarExport'; Request = @{ sessionId = $script:session.ToUpperInvariant() }; Why = 'sessionId' }
                 @{ Action = 'RcaSidecarExport'; Request = @{ sessionId = 'none; whoami' }; Why = 'sessionId' }
+                @{ Action = 'RcaSidecarExport'; Request = @{ sessionId = ($script:session + "`n") }; Why = 'sessionId' }
                 @{ Action = 'RcaSidecarExport'; Request = @{ page = 0 }; Why = 'page' }
                 @{ Action = 'RcaSidecarExport'; Request = @{ page = 1000 }; Why = 'page' }
                 @{ Action = 'RcaSidecarExport'; Request = @{ page = -1 }; Why = 'page' }
@@ -299,6 +320,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1: the Query Store sidecar''s actions (rc
                 @{ Action = 'Rca'; Request = @{ command = 'part'; documentId = (New-LongSidecarId -Sequence 1 -HostLength 59); part = 1 }; Why = 'documentId' }
                 @{ Action = 'Rca'; Request = @{ command = 'part'; documentId = '20261120T165000Z-SQLVM01-0001-sidecar'; part = 1 }; Why = 'documentId' }
                 @{ Action = 'Rca'; Request = @{ command = 'part'; documentId = '20261120T165000Z-sqlvm01-0001-sidecar --final'; part = 1 }; Why = 'documentId' }
+                @{ Action = 'Rca'; Request = @{ command = 'part'; documentId = "20261120T165000Z-sqlvm01-0001-sidecar`n"; part = 1 }; Why = 'documentId' }
             )
             foreach ($case in $cases) {
                 $script:lines.Clear()

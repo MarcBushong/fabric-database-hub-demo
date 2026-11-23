@@ -54,7 +54,8 @@ Actions:
 - RcaSidecarExport (sqlvm01, and archost01 for T2's guest) { sessionId, final, page, timeoutSeconds, lockSeconds }: the
   Query Store sidecar's index (rca/README.md, The sidecar; 2026-11-23): 'rca sidecar-export --session <id or none>
   [--final] [--page <n>]', run where and as the Rca action runs. It prints the result line, then the runner's
-  'DBHUBDEMO-RCAS-INDEX <json>' line, whole, last. The runner's exit code 2 (nothing to fetch) is Not selected.
+  'DBHUBDEMO-RCAS-INDEX <json>' line, whole, last. The runner's exit code 2 (nothing to fetch) is Not selected, or a
+  Warning when the index it still prints is one (sidecars that expired unread).
 - RcaAck (sqlvm01, and archost01 for T2's guest) { documentIds[], timeoutSeconds, lockSeconds }: 'rca ack --document
   <id>[,<id>...]' for 1 to 64 sidecar IDs, so the runner stops offering them; then the runner's own line, last. For
   both, a runner that predates the sidecar is Not supported, with oldRunner in the evidence.
@@ -1627,7 +1628,8 @@ function Invoke-DemoControlStopGuest {
 
 function Test-DemoControlRcaSidecarId {
     # Whether a value is a Query Store sidecar's documentId (rca/transport.schema.json, sidecarId; at most 88 characters,
-    # sidecar.schema.json). An evidence document's ID never is one: it doesn't end in -sidecar.
+    # sidecar.schema.json). An evidence document's ID never is one: it doesn't end in -sidecar. .NET's $ also matches
+    # before a final line feed, which the schema's pattern doesn't, so a value with a line feed is refused.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -1635,7 +1637,7 @@ function Test-DemoControlRcaSidecarId {
         [object] $Value
     )
 
-    return ($Value -is [string] -and $Value.Length -le 88 -and $Value -cmatch $script:ControlRcaSidecarIdPattern)
+    return ($Value -is [string] -and $Value.Length -le 88 -and -not $Value.Contains("`n") -and $Value -cmatch $script:ControlRcaSidecarIdPattern)
 }
 
 function Get-DemoControlRcaArgument {
@@ -1898,7 +1900,8 @@ function Get-DemoControlRcaSidecarArgument {
         $command = 'sidecar-export'
         $timeout = 600
         $session = if ($Request.Contains('sessionId') -and $null -ne $Request['sessionId']) { [string]$Request['sessionId'] } else { '' }
-        if ($session -and $session -cnotmatch $script:ControlRcaSessionPattern) {
+        # The pattern's $ also matches before a final line feed, as in Test-DemoControlRcaSidecarId.
+        if ($session -and ($session -cnotmatch $script:ControlRcaSessionPattern -or $session.Contains("`n"))) {
             throw 'The request''s sessionId must be a control session''s ID (32 lowercase hex characters) or empty.'
         }
         if (-not $session) {
@@ -2003,8 +2006,9 @@ function Invoke-DemoControlRcaSidecar {
     4 KB of output that the instance view keeps always holds it whole: the index line of up to 3,400 characters, which
     the Runner action's 1,800-character stdout tail would cut
     (https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed). The runner's exit code goes into the
-    evidence as it gave it: 0, or 2 from rca sidecar-export when there's nothing to fetch (Not selected). A runner from
-    before the sidecar refuses the command before it runs anything (System.CommandLine's parse error): Not supported,
+    evidence as it gave it: 0, or 2 from rca sidecar-export when nothing is offerable (Not selected, or a Warning with the
+    index's message when its status is one: sidecars that expired unread). A runner from before the sidecar refuses the
+    command before it runs anything (System.CommandLine's parse error): Not supported,
     with oldRunner, which the scripts report as OldRunner, a Warning naming ./scripts/deploy.ps1, while the evidence
     document's export goes on. A request outside the contract is a Fail, and nothing runs.
     #>
@@ -2084,7 +2088,25 @@ function Invoke-DemoControlRcaSidecar {
         return
     }
     if ($sidecar.Command -eq 'sidecar-export' -and $run.ExitCode -eq 2) {
-        Write-DemoControlResult -ActionName $ActionName -Status 'Not selected' -Message ('{0}: there is no sidecar to fetch.' -f $label) -Evidence $evidence
+        # Nothing is offerable, new or pending, but the index's own status stands (rca/README.md, The runner's commands):
+        # a Warning that counts sidecars expired unread is reported with exit code 2 too, so it's this result's.
+        $status = 'Not selected'
+        $message = '{0}: there is no sidecar to fetch.' -f $label
+        if ($line) {
+            try {
+                $index = $line.Substring('DBHUBDEMO-RCAS-INDEX '.Length) | ConvertFrom-Json
+                if ($null -ne $index.PSObject.Properties['status'] -and [string]$index.status -ceq 'Warning') {
+                    $status = 'Warning'
+                    if ($null -ne $index.PSObject.Properties['message']) {
+                        $message = '{0} {1}' -f $message, [string]$index.message
+                    }
+                }
+            }
+            catch {
+                $status = 'Not selected'
+            }
+        }
+        Write-DemoControlResult -ActionName $ActionName -Status $status -Message $message -Evidence $evidence
         if ($line) {
             Write-DemoControlLine -Line $line
         }
