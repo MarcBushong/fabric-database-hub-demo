@@ -126,34 +126,55 @@ internal sealed partial class SqlTargetObserver(string target, DemoTarget gate, 
 
     protected override async Task StopAsync(DateTimeOffset now, CancellationToken cancellationToken)
     {
-        if (eventSession)
+        try
         {
-            await ReadEventsAsync(now, cancellationToken).ConfigureAwait(false);
+            if (eventSession)
+            {
+                await ReadEventsAsync(now, cancellationToken).ConfigureAwait(false);
+            }
+
+            if (databaseScoped)
+            {
+                await ResourceStatsAsync(now, cancellationToken).ConfigureAwait(false);
+            }
+
+            FlushEscalations();
+            Close(blocking, now);
+            Close(errors, now);
+            await DropEventSessionAsync(now, cancellationToken).ConfigureAwait(false);
         }
-
-        if (databaseScoped)
+        finally
         {
-            await ResourceStatsAsync(now, cancellationToken).ConfigureAwait(false);
-        }
-
-        FlushEscalations();
-        Close(blocking, now);
-        Close(errors, now);
-        await DropEventSessionAsync(now, cancellationToken).ConfigureAwait(false);
-
-        // The evidence's own end is done: the lane takes its time now, so Query Store's end reads don't move the span's end.
-        EvidenceEnded(now);
-        if (queryStore is not null)
-        {
-            // Bounded by the reader's own budget.
+            // The evidence's own end is done, or failed (the host stop's limit can cancel it): its end time is taken now,
+            // for its last watermark and the lane, so Query Store's end reads don't move the span's end. They run even when
+            // the evidence's end, the watermark, or the lane's hook failed, and write the sidecar's coverage row, with the
+            // gap that says what a cancelled end didn't read; the failure then follows them.
             try
             {
-                await queryStore.EndAsync(now, cancellationToken).ConfigureAwait(false);
+                EvidenceEnded(now);
             }
-            catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+            finally
             {
-                QueryStoreFailed(ex);
+                await EndQueryStoreAsync(now, cancellationToken).ConfigureAwait(false);
             }
+        }
+    }
+
+    /// <summary>Query Store's end reads, bounded by the reader's own budget; a failure is logged, as a tick's is.</summary>
+    private async Task EndQueryStoreAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    {
+        if (queryStore is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await queryStore.EndAsync(now, cancellationToken).ConfigureAwait(false);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+        {
+            QueryStoreFailed(ex);
         }
     }
 

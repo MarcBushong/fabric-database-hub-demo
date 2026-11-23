@@ -20,6 +20,8 @@ public sealed class RcaQueryStoreSqlTests
 {
     private const string Marker = "/* dbhubdemo:rca-observer */";
 
+    private const string HookFailure = "The lane's end hook failed (a test's failure).";
+
     private static readonly string[] SourceOrder = ["RCA-SQL-10", "RCA-SQL-11", "RCA-SQL-14", "RCA-SQL-15", "RCA-AZ-03", "RCA-AZ-04"];
 
     [Theory]
@@ -497,6 +499,97 @@ public sealed class RcaQueryStoreSqlTests
     }
 
     [Fact]
+    public async Task AFailedLastWatermarkStillGivesTheLaneTheEvidencesEndAndQueryStoreItsEndReads()
+    {
+        var end = RcaSimulation.T1To.AddSeconds(1);
+        var without = await RunT1Async(sidecar: null, SlowEnd, watermarkFailsAt: RcaSimulation.T1To);
+        var sidecar = new MemorySidecarSink();
+        var hooked = new List<DateTimeOffset>();
+        var with = await RunT1Async(sidecar, SlowEnd, watermarkFailsAt: RcaSimulation.T1To, evidenceEnded: hooked.Add);
+        var written = new MemorySidecarSink();
+        await RunT1Async(written, SlowEnd);
+
+        // The evidence's end time, taken once when the event session's drop was done, 17:05:01: its watermark's write failed
+        // (span.json, after its retries), the hook still got it, each once, and the failure still reached the lane.
+        Assert.Equal([end], hooked);
+        Assert.Equal([end], with.WatermarkAttempts.Where(a => a >= RcaSimulation.T1To));
+        Assert.Equal(WatermarkLog.Failure, without.Failure?.Message);
+        Assert.Equal(WatermarkLog.Failure, with.Failure?.Message);
+
+        // The span ends at that time, as without a sink, not after Query Store's end reads.
+        AssertSameEvidence(without, with);
+        Assert.Equal(string.Create(CultureInfo.InvariantCulture, $"closed|{end:HH:mm:ss.fff}"), with.Span[^1]);
+
+        // Query Store's end reads still ran after it: the sidecar is the one a written watermark gives.
+        Assert.Contains(with.Connector.Calls, c => c.BlockId == "RCA-SQL-10" && c.At > end && (bool)c.Parameters!.Value("@final")!);
+        Assert.Equal(Canonical(written.Rows), Canonical(sidecar.Rows));
+    }
+
+    [Fact]
+    public async Task AHookThatThrowsStillHasTheLastWatermarkAtTheEvidencesEndAndQueryStoreItsEndReads()
+    {
+        var end = RcaSimulation.T1To.AddSeconds(1);
+        var withoutHooked = new List<DateTimeOffset>();
+        var without = await RunT1Async(sidecar: null, SlowEnd, evidenceEnded: Throwing(withoutHooked));
+        var sidecar = new MemorySidecarSink();
+        var hooked = new List<DateTimeOffset>();
+        var with = await RunT1Async(sidecar, SlowEnd, evidenceEnded: Throwing(hooked));
+        var written = new MemorySidecarSink();
+        await RunT1Async(written, SlowEnd);
+
+        // The lane's hook failed with the evidence's end time, taken once when the event session's drop was done, 17:05:01:
+        // the last watermark is still written at it, each once, as without a sink, and the failure still reached the lane.
+        Assert.Equal([end], withoutHooked);
+        Assert.Equal([end], hooked);
+        Assert.Equal([end], with.WatermarkAttempts.Where(a => a >= RcaSimulation.T1To));
+        Assert.Equal(end, with.Watermarks[^1]);
+        Assert.Equal(HookFailure, without.Failure?.Message);
+        Assert.Equal(HookFailure, with.Failure?.Message);
+        AssertSameEvidence(without, with);
+
+        // Query Store's end reads still ran after it: the sidecar is the one a hook that worked gives.
+        Assert.Contains(with.Connector.Calls, c => c.BlockId == "RCA-SQL-10" && c.At > end && (bool)c.Parameters!.Value("@final")!);
+        Assert.Equal(Canonical(written.Rows), Canonical(sidecar.Rows));
+
+        static Action<DateTimeOffset> Throwing(List<DateTimeOffset> hooked) => at =>
+        {
+            hooked.Add(at);
+            throw new InvalidOperationException(HookFailure);
+        };
+    }
+
+    [Fact]
+    public async Task AnEndCancelledInTheEvidencesOwnEndStillWritesQueryStoresCoverageWithItsGap()
+    {
+        using var withoutStop = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var without = await RunT1Async(sidecar: null, CancelAtTheEndsEventRead(withoutStop), stop: withoutStop);
+        using var withStop = CancellationTokenSource.CreateLinkedTokenSource(TestContext.Current.CancellationToken);
+        var sidecar = new MemorySidecarSink();
+        var with = await RunT1Async(sidecar, CancelAtTheEndsEventRead(withStop), stop: withStop);
+
+        // The host stop's limit cancels the end while the evidence's own end reads the event session: the cancellation
+        // reaches the lane, and the last watermark is still written, as without a sink.
+        Assert.IsAssignableFrom<OperationCanceledException>(without.Failure);
+        Assert.IsAssignableFrom<OperationCanceledException>(with.Failure);
+        AssertSameEvidence(without, with);
+        Assert.Equal(RcaSimulation.T1To, with.Watermarks[^1]);
+
+        // Query Store's end reads still run, cancelled too, and write the sidecar's last coverage row with the gap that
+        // says what the end didn't read.
+        var coverage = sidecar.Table(RcaContract.QueryCoverage);
+        Assert.Equal(3, coverage.Count);
+        Assert.Contains("17:05:00 UTC: The end's Query Store reads on T1 were cut short with the observer's end, before the intervals that ended after 14:50 UTC.", ((string?)coverage[^1].Get("gaps") ?? string.Empty).Split('\n'));
+
+        static Action<TimedConnector> CancelAtTheEndsEventRead(CancellationTokenSource stop) => connector => connector.Before = (block, at) =>
+        {
+            if (block == "RCA-XE-02" && at >= RcaSimulation.T1To)
+            {
+                stop.Cancel();
+            }
+        };
+    }
+
+    [Fact]
     public async Task ARefusedRcaAz04IsAGapWithItsPermissionAndItsOwnFixWhileTheRestMatchesTheFixture()
     {
         var without = await RunT3FixtureAsync(sidecar: null, refused: "RCA-AZ-04");
@@ -593,19 +686,37 @@ public sealed class RcaQueryStoreSqlTests
 
     /// <summary>
     /// T1's simulated session (RcaSimulation's blocking chain), 16:50 to 17:05, driven as the lane drives it, through a
-    /// TimedConnector whose Query Store blocks the test sets up: the evidence, its watermarks, its span, and the connector.
+    /// TimedConnector whose Query Store blocks the test sets up: the evidence, its watermarks, its span, and the connector;
+    /// with <paramref name="watermarkFailsAt"/>, the span's watermarks fail to be written from then; with
+    /// <paramref name="evidenceEnded"/>, the test's part of the end hook; with <paramref name="stop"/>, the token the
+    /// lane runs with, which the test can cancel; and the failure that reached the lane, if any of them made one.
     /// </summary>
-    private static async Task<SessionRun> RunT1Async(ISidecarSink? sidecar, Action<TimedConnector>? setUp = null)
+    private static async Task<SessionRun> RunT1Async(ISidecarSink? sidecar, Action<TimedConnector>? setUp = null, DateTimeOffset? watermarkFailsAt = null, Action<DateTimeOffset>? evidenceEnded = null, CancellationTokenSource? stop = null)
     {
         var clock = new ManualTime(RcaSimulation.T1From);
         var connector = new TimedConnector(clock, RcaSimulation.T1(clock)) { QueryStore = (block, _) => block == "RCA-SQL-15" ? [StateRow(clock.Now, "READ_WRITE", 0, null)] : [] };
         setUp?.Invoke(connector);
-        var span = new WatermarkLog(new MemorySink());
+        var span = new WatermarkLog(new MemorySink()) { FailsAt = watermarkFailsAt };
         var observer = new SqlTargetObserver("T1", DemoTarget.T1, connector, RcaSimulation.Options(), RunnerLog.Null, sidecar, new SqlQueryStoreOptions { Clock = new SteppedClock(clock) });
 
-        await LaneDriver.RunAsync(observer, span, clock, RcaSimulation.T1From, RcaSimulation.T1To, TestContext.Current.CancellationToken);
+        Exception? failure = null;
+        try
+        {
+            await LaneDriver.RunAsync(observer, span, clock, RcaSimulation.T1From, RcaSimulation.T1To, stop?.Token ?? TestContext.Current.CancellationToken, evidenceEnded);
+        }
+        catch (Exception ex) when (watermarkFailsAt is not null || evidenceEnded is not null || stop is not null)
+        {
+            failure = ex;
+        }
 
-        return SessionRun.Of(span, connector);
+        return SessionRun.Of(span, connector) with { Failure = failure };
+    }
+
+    /// <summary>Query Store's blocks cost 3 s each, and the event session's drop at the end 1 s: the evidence's own end is done at 17:05:01.</summary>
+    private static void SlowEnd(TimedConnector connector)
+    {
+        connector.Cost = _ => TimeSpan.FromSeconds(3);
+        connector.EvidenceCost = (block, at) => block == "RCA-XE-05" && at >= RcaSimulation.T1To ? TimeSpan.FromSeconds(1) : TimeSpan.Zero;
     }
 
     /// <summary>T3 with T1's blocking chain (RcaSimulation.T1AsT3), 16:50 to 17:05, driven as the lane drives it; Query Store answers as a quiet T3's would.</summary>
@@ -790,6 +901,12 @@ public sealed class RcaQueryStoreSqlTests
     /// </summary>
     private sealed record SessionRun(List<string> Evidence, List<DateTimeOffset> Watermarks, List<string> Span, TimedConnector Connector)
     {
+        /// <summary>The failure that reached the lane, when the end's watermark or the lane's end hook failed.</summary>
+        public Exception? Failure { get; init; }
+
+        /// <summary>Every attempt to write a watermark, in order, those that failed included.</summary>
+        public List<DateTimeOffset> WatermarkAttempts { get; init; } = [];
+
         public static SessionRun Of(WatermarkLog span, TimedConnector? connector)
         {
             var evidence = span.Inner.Rows.Select(r => string.Join('|', new[] { r.Table, r.Target, Norm(r.At), r.Source, r.Sentinel ? "sentinel" : string.Empty }.Concat(r.Values.OrderBy(v => v.Key, StringComparer.Ordinal).Select(v => $"{v.Key}={Norm(v.Value)}"))))
@@ -799,7 +916,7 @@ public sealed class RcaQueryStoreSqlTests
             var intervals = span.Inner.Membership.Select(m => string.Create(CultureInfo.InvariantCulture, $"{(m.Began ? "began" : "ended")}|{m.Target}|{m.At:HH:mm:ss.fff}"))
                 .Append(string.Create(CultureInfo.InvariantCulture, $"closed|{span.Inner.ClosedAt:HH:mm:ss.fff}"))
                 .ToList();
-            return new SessionRun(evidence, watermarks, intervals, connector!);
+            return new SessionRun(evidence, watermarks, intervals, connector!) { WatermarkAttempts = [.. span.Attempts] };
         }
     }
 
