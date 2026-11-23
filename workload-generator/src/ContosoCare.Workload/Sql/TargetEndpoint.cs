@@ -108,8 +108,24 @@ internal static class SessionNames
     public const string Prefix = "ContosoCare.Demo/";
     public const string ControlScenario = "control";
 
-    /// <summary><c>ContosoCare.Demo/&lt;scenarioId&gt;/&lt;runId&gt;</c>: the sessions that do the scenario's work.</summary>
-    public static string ForRun(string scenarioId, string runId) => Checked($"{Prefix}{scenarioId}/{runId}");
+    /// <summary>The longest service name (scenario.schema.json's <c>service</c>).</summary>
+    public const int MaximumServiceLength = 32;
+
+    /// <summary>
+    /// <c>ContosoCare.Demo/&lt;service&gt;/&lt;runId&gt;</c>: the sessions that do a run's work, named for the ContosoCare client
+    /// service that runs its scenario (the catalog's <c>service</c>) and for the run, never for the scenario, so a session's
+    /// name doesn't say which fault it plays (ADR 0031, decision 6). The session tools match a run's sessions by the run ID
+    /// alone (<c>ContosoCare.Demo/%/&lt;runId&gt;</c>), so an older runner's <c>ContosoCare.Demo/&lt;scenario&gt;/&lt;runId&gt;</c> matches too.
+    /// </summary>
+    public static string ForRun(string service, string runId)
+    {
+        if (!IsValidService(service))
+        {
+            throw new ArgumentException($"Not a service name: lowercase words joined by hyphens, at most {MaximumServiceLength} characters, never '{ControlScenario}'.", nameof(service));
+        }
+
+        return IsValidRunId(runId) ? Checked($"{Prefix}{service}/{runId}") : throw new ArgumentException("Not a run ID.", nameof(runId));
+    }
 
     /// <summary><c>ContosoCare.Demo/control/&lt;id&gt;</c>: bookkeeping sessions, which the session tools never kill.</summary>
     public static string ForControl(string id) => Checked($"{Prefix}{ControlScenario}/{id}");
@@ -119,17 +135,29 @@ internal static class SessionNames
         && applicationName.StartsWith(Prefix, StringComparison.OrdinalIgnoreCase)
         && !applicationName.StartsWith(Prefix + ControlScenario + "/", StringComparison.OrdinalIgnoreCase);
 
-    /// <summary>A new run ID: UTC time, target, and random hex, lowercase, at most 40 characters (demo.usp_run_begin's rule).</summary>
-    public static string NewRunId(DateTimeOffset now, DemoTarget target)
-    {
-        var suffix = Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(3));
-        return string.Create(CultureInfo.InvariantCulture, $"{now.UtcDateTime:yyyyMMddHHmmss}-{target.ToString().ToLowerInvariant()}-{suffix}");
-    }
+    /// <summary>
+    /// A new run ID: 16 lowercase hex characters (64 random bits), which say nothing about the run; demo.scenario_runs (for T5,
+    /// its run store) maps it to its scenario, target, and times. It fits <see cref="IsValidRunId"/>, demo.usp_run_begin's rule.
+    /// </summary>
+    public static string NewRunId() => Convert.ToHexStringLower(RandomNumberGenerator.GetBytes(8));
 
+    /// <summary>
+    /// demo.usp_run_begin's rule on both engines: 1 to 40 of a-z, 0-9, and '-', not starting with '-'. An older runner's run IDs
+    /// (<c>20261120170200-t1-9b7c1d</c>: time, target, random hex) fit it too. Nothing that LIKE reads as a wildcard.
+    /// </summary>
     public static bool IsValidRunId(string? runId) =>
         runId is { Length: > 0 and <= 40 }
         && runId.All(c => c is (>= 'a' and <= 'z') or (>= '0' and <= '9') or '-')
         && runId[0] != '-';
+
+    /// <summary>A service name (scenario.schema.json's <c>service</c>): lowercase words joined by single hyphens, at most 32 characters, never <c>control</c>.</summary>
+    public static bool IsValidService(string? service) =>
+        service is { Length: > 0 and <= MaximumServiceLength }
+        && service != ControlScenario
+        && service[0] is >= 'a' and <= 'z'
+        && service[^1] != '-'
+        && !service.Contains("--", StringComparison.Ordinal)
+        && service.All(c => c is (>= 'a' and <= 'z') or (>= '0' and <= '9') or '-');
 
     private static string Checked(string name)
     {

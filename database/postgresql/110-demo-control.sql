@@ -163,7 +163,7 @@ BEGIN
 END;
 $$;
 -- @batch
--- Demo sessions in this database: application name ContosoCare.Demo/<scenario>/<run>, never the runner's control
+-- Demo sessions in this database: application name ContosoCare.Demo/<service>/<run>, never the runner's control
 -- sessions (ContosoCare.Demo/control/...), never the caller. Optionally one run only. The statistics snapshot is
 -- cleared first, so a caller that asks again in the same transaction sees current sessions.
 CREATE OR REPLACE FUNCTION demo.fn_demo_sessions(p_run_id varchar)
@@ -402,7 +402,8 @@ BEGIN
            OR EXISTS (
                 SELECT 1
                 FROM demo.scenario_runs AS r
-                WHERE s.application_name = 'ContosoCare.Demo/' || r.scenario_id || '/' || r.run_id
+                -- By the run alone, as fn_demo_sessions: whatever precedes it (the service, or an older runner's scenario).
+                WHERE s.application_name LIKE 'ContosoCare.Demo/%/' || r.run_id
                   AND clock_timestamp() > r.deadline_at)
     LOOP
         BEGIN

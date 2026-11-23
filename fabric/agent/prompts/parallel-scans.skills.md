@@ -44,7 +44,7 @@ Compare {baselineWindow} and {incidentWindow} on {target}: adapt sample query 9 
 ### 3. The plan, with the SQL diagnostics skill
 
 ```text
-Use the read-execution-plan skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. For sessions whose program_name starts with ContosoCare.Demo/parallel-scans, read the dop column of sys.dm_exec_requests, then get their statement's cached plan from sys.dm_exec_query_plan or Query Store, without running it. Report whether the plan is parallel, its parallelism operators, its memory grant, and any warnings. Don't change anything: don't run the query, don't use SET STATISTICS XML, and don't change MAXDOP or any setting.
+Use the read-execution-plan skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. For sessions whose program_name starts with ContosoCare.Demo/, read the dop column of sys.dm_exec_requests, then get their statement's cached plan from sys.dm_exec_query_plan or Query Store, without running it. Report whether the plan is parallel, its parallelism operators, its memory grant, and any warnings. Don't change anything: don't run the query, don't use SET STATISTICS XML, and don't change MAXDOP or any setting.
 ```
 
 ## Signals to look for

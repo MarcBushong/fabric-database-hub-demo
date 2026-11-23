@@ -5511,3 +5511,50 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - No app code changed, so `npm run verify` and the B/A sweep stand as they were at a57539ed.
 
 **What its live check needs.** The entry above's, with the Variable - Get after `./scripts/deploy.ps1` in a governed tenant.
+
+### Realistic names, unit B: application names `ContosoCare.Demo/<service>/<run>` (2026-11-23)
+
+**Why.** On 2026-11-23 the owner approved [ADR 0031's decision 6](adr/0031-incident-rca.md#2-names), the realistic workload names, (a′) and (c). A session's application name, which the DMVs, `pg_stat_activity`, and Database Hub's session lists show, named the fault it played: `ContosoCare.Demo/locking-blocking/20261120170200-t1-9b7c1d`. This is unit B, (a′): the name becomes `ContosoCare.Demo/<service>/<run>`, the ContosoCare client service that runs the scenario and an opaque run ID. It builds on unit A's shared base, 59d9dfb7: each `scenario.json`'s `service`, the schema's `service`, and the answer key's `workloadNames`. Unit A renames the modules, (c), and unit C the fixtures and docs. One commit.
+
+- **The run ID says nothing about the run.** `SessionNames.NewRunId()` returns 16 lowercase hex characters, 64 random bits, with no time and no target. `demo.scenario_runs`, or T5's run store, maps it to its scenario, target, and times, as before. It fits `IsValidRunId`, `demo.usp_run_begin`'s rule on both engines, which an older runner's IDs (`20261120170200-t1-9b7c1d`) still fit. The observer hashes a name's last segment and the answer key hashes the run ID, so they still agree, and nothing under `Rca/**` changes.
+- **The middle segment is the service.** `ScenarioDefinition.Service` is required. The catalog refuses a service that isn't lowercase words joined by hyphens, 32 characters at most; `control`, which would hide a run's sessions from the session tools; and one that names a scenario, whole or as hyphen-separated words (`cpu-pressure-api`). `SessionNames.ForRun(service, runId)` refuses the same services, and a run ID with a LIKE wildcard, since the session tools now match by the run alone. The three runners name runs `ForRun(plan.Scenario.Service, runId)`: on T5 that's each request's User-Agent prefix and each document's `source`. The run command's JSON `applicationName` says the same.
+- **The kill tools match a run's sessions by the run ID alone.** `demo.usp_kill_demo_sessions`' past-deadline match, on both engines, built `ContosoCare.Demo/<scenario_id>/<run_id>`, which a new name never equals. It's `LIKE 'ContosoCare.Demo/%/' + run_id` now, as `demo.fn_demo_sessions` already was. A run ID has no LIKE wildcard, so the match is exact, and it matches an older runner's names too.
+  - **Out of step** (the design's 5.2): the runner's watchdog, reset, and stop call the kill tool by run with `past_deadline_only` off, which goes through `fn_demo_sessions`' match, so a new runner on an old database, and an older runner on a new one, still end their runs' sessions.
+  - **Unchanged:** the prefix filters, `ContosoCare.Demo/control/`, and ADR 0010's bounds.
+- **T4's read replica: a scenario stop matches by run, not by service.** The design proposed the service, with a by-run match as the alternative if the service could reach another run's session. It can: on T4, missing-index and replica-lag share `reporting-jobs`, so a stop of missing-index would end a replica-lag report on the replica. The coordinator accepted the by-run match.
+  - **How:** with a replica, `stop --target T4 --scenario <id>` reads T4's Running runs before it stops them, then ends the replica's sessions of that scenario's runs among them (`ReplicaSessionScope.ForStop`; the statements take `@run_ids`, matched through `unnest`). A run's own last check, by its run, and reset, of all, are as before.
+  - **What changes:** a scenario stop no longer ends a replica session of that scenario's run that had already ended. The run's own last check ends those, and reset ends them all. A run that begins between the read and the stop is stopped but isn't in the replica scope: its runner ends its sessions within seconds of the stop, and its last check ends any left.
+- **Readers:** the agent prompts that picked the workload's sessions by a scenario segment (`blocking-chain`, `locking-blocking`, `deadlock-storm`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`) pick them by the `ContosoCare.Demo/` prefix, and match a run by the `run_id` at the end of the name. The deployment notebook's Workload paragraph, the runner's root description, and `stop --run-id`'s example say the new form.
+- **Left to the other units, as agreed with the coordinator:** the comments in `database/postgresql/120-scenario-functions.sql` that still say `ContosoCare.Demo/<scenario>/<run>` and `ContosoCare.Demo/replica-lag` (A); and the docs, scenario READMEs, and `scenario.json` prose that quote a tag (C). A's `SqlIntegrationTests` still pass a scenario ID as the service in two `ForRun` calls, which now stand for an older runner's names; the kill tools match them by run.
+
+**Changed files.**
+
+- **Runner:** `Sql/TargetEndpoint.cs` (`SessionNames`), `Catalog/ScenarioCatalog.cs`, `Runs/ScenarioRunner.cs`, `Postgres/PgScenarioRunner.cs`, `Cosmos/CosmosScenarioRunner.cs`, `Cosmos/CosmosRestClient.cs` (a comment), `Postgres/PgReplica.cs`, and `Cli/CommandLine.cs`.
+- **Scripts:** the kill tool's run match, with a comment, and the `fn_demo_sessions` header in `database/common/110-demo-control.sql` and `database/postgresql/110-demo-control.sql`.
+- **Tests:** `ConnectionTests`; `CatalogTests`' service cases, the refusals and the answer key (every service in `workloadNames.services` with exactly its scenarios, and in `forbiddenInDetectionCode`); `CosmosClientTests`; `CosmosRunnerTests`; `ReplicaLagTests`; `RcaSimulation`'s application names, whose middle segment only changes, since C's fixtures bind their run segments; and two lines of `PostgresTests`, agreed with A.
+- **Readers:** the seven agent prompts above, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, and this report.
+
+**Validation.** On 59d9dfb7 with this commit, on this PC:
+
+- **The runner's tests** (`dotnet test` in `workload-generator`): 828, none failed, 21 skipped, the opt-in integration tests that need a disposable SQL Server or PostgreSQL. At 59d9dfb7: 808, none failed, 21 skipped. The build has no warning.
+- **The new tests fail without the change:** with five mutations in one build (the old exact kill-tool match on both engines, the replica's scenario scope by service, no scenario check of a service in the catalog, no checks in `ForRun`, and T5's tag by scenario), 16 of the 21 targeted cases fail, each on its own mutation. The other 5 are the catalog's format cases, which no mutation touches. Restored, the 12 test classes that cover what changed pass: 529, with 2 skipped.
+- **The replica's statements parse:** PostgreSQL 17's parser (libpg_query) parses `PgReplicaSessions.Sql`'s three statements, with the positional parameters Npgsql sends, and reads the kill tool's match as `LIKE ('ContosoCare.Demo/%/' || r.run_id)`. No test runs them offline; the live check does.
+- **Pester,** under strict mode with the Azure CLI guard, one suite at a time:
+  - `Agent.PromptPack`: 472 passed, none failed.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - `Fabric.Notebooks`, for the deployment notebook: 121 passed, 1 failed, 8 skipped, the same counts as at 59d9dfb7 without this commit. The failure is `NB_DatabaseHub_LiveActivity`'s staged evidence case (`stagedOtherSession`), which this commit doesn't touch.
+  - The guard saw no Azure CLI call in any of them.
+- markdownlint found no issue in 152 files. The notebook parses, 31 cells, with one line changed.
+- No PowerShell changed, so PSScriptAnalyzer has nothing new to read.
+- The leak check prints nothing.
+
+**Risks.**
+
+- Run IDs lose their readable time and target. No code parses them: the design checked the runner, scripts, runbooks, notebooks, and app, and a search here found no slice or split of a run ID. Wherever a run ID is shown, its scenario, target, and start are shown with it.
+- A scenario stop on T4's replica covers that scenario's Running runs only (above).
+
+**What its live check needs.** In the Final tests session, with A and C:
+
+- A Run all, with the runs' sessions in `sys.dm_exec_sessions` and `pg_stat_activity` as `ContosoCare.Demo/<service>/<16 hex characters>`, and T5's requests' User-Agent and documents' `source` the same.
+- A run's sessions ended at its deadline or stop on every target, including a run an older runner started before the update (the design's 5.2).
+- `stop --target T4 --scenario replica-lag` during a replica-lag run: `replica-sessions-ended` passes, with the report's sessions ended. And `stop --target T4 --scenario missing-index` during one leaves the report running.

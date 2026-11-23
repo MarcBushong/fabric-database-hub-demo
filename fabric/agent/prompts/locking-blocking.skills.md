@@ -49,14 +49,14 @@ Use the diagnose-blocking-and-deadlocks skill on the ContosoCare database of {ta
 ### 4. Line it up with the scenario record
 
 ```text
-Read the latest locking-blocking rows from demo.scenario_runs in ContosoCare on {target}: run_id, target, status, started_at, deadline_at, stopped_at, and expected_symptoms. Compare that window with what you found, and say whether the blocking sessions' program_name matches the run. Don't change anything.
+Read the latest locking-blocking rows from demo.scenario_runs in ContosoCare on {target}: run_id, target, status, started_at, deadline_at, stopped_at, and expected_symptoms. Compare that window with what you found, and say whether the blocking sessions' program_name starts with ContosoCare.Demo/ and ends with one of those run_ids. Don't change anything.
 ```
 
 ## Signals to look for
 
 | Target | Telemetry (prompts 1 and 2) | SQL diagnostics skill (prompt 3) |
 |---|---|---|
-| T1 (default) | `Processes blocked` above 0; `LCK_M_*` waits in the Lock category with few tasks and long average waits; `Active Transactions` up; deadlocks flat unless the optional deadlock runs | Undocumented on SQL Server: the skill can decline. If it runs, a chain whose head blocker's `program_name` starts with `ContosoCare.Demo/` |
+| T1 (default) | `Processes blocked` above 0; `LCK_M_*` waits in the Lock category with few tasks and long average waits; `Active Transactions` up; deadlocks flat unless the optional deadlock runs | Undocumented on SQL Server: the skill can decline. If it runs, a chain whose head blocker's `program_name` starts with `ContosoCare.Demo/` and ends with the run's `run_id` |
 | T2 | The same as T1 | The same as T1 |
 | T3 | Lock-category waits and `Processes blocked`; optimized locking means writer-to-writer waits can be on `XACT` resources | Documented: the chain, the head blocker (possibly idle with an open transaction), and its last statement |
 

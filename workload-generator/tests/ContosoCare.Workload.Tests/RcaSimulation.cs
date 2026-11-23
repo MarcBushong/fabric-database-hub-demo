@@ -23,13 +23,13 @@ internal static class RcaSimulation
 
     public static readonly DateTimeOffset T4To = new(2026, 11, 20, 17, 20, 0, TimeSpan.Zero);
 
-    public const string ChainApp = "ContosoCare.Demo/blocking-chain/20261120165200-t1-a1b2c3";
+    public const string ChainApp = "ContosoCare.Demo/scheduling-service/20261120165200-t1-a1b2c3";
 
-    public const string BaselineApp = "ContosoCare.Demo/healthy-baseline/20261120160000-t1-0f0e0d";
+    public const string BaselineApp = "ContosoCare.Demo/careportal-api/20261120160000-t1-0f0e0d";
 
-    public const string LockingApp = "ContosoCare.Demo/locking-blocking/20261120170200-t4-9b7c1d";
+    public const string LockingApp = "ContosoCare.Demo/billing-worker/20261120170200-t4-9b7c1d";
 
-    public const string ReplicaApp = "ContosoCare.Demo/replica-lag/20261120171100-t4-5e8f21";
+    public const string ReplicaApp = "ContosoCare.Demo/reporting-jobs/20261120171100-t4-5e8f21";
 
     /// <summary>Fast options for tests: the same cadences, a short slow-sample threshold.</summary>
     public static ObserverOptions Options() => new() { SlowSample = TimeSpan.FromSeconds(2) };

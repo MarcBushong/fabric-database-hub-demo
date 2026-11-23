@@ -50,14 +50,14 @@ Use the diagnose-blocking-and-deadlocks skill on the ContosoCare database of {ta
 ### 4. Line it up with the scenario record
 
 ```text
-Read the latest blocking-chain row from demo.scenario_runs in ContosoCare on {target}: run_id, status, started_at, deadline_at, stopped_at, parameters, and expected_symptoms, and that run's lock-escalation events from demo.scenario_run_events. Compare the depth, branches, and escalation times in the record with what you found, and say whether every blocked session's program_name matches the run. Don't change anything.
+Read the latest blocking-chain row from demo.scenario_runs in ContosoCare on {target}: run_id, status, started_at, deadline_at, stopped_at, parameters, and expected_symptoms, and that run's lock-escalation events from demo.scenario_run_events. Compare the depth, branches, and escalation times in the record with what you found, and say whether every blocked session's program_name starts with ContosoCare.Demo/ and ends with that run_id. Don't change anything.
 ```
 
 ## Signals to look for
 
 | Target | Telemetry (prompts 1 and 2) | SQL diagnostics skill (prompts 3 and 4) |
 |---|---|---|
-| T1 (default) | `Processes blocked` near the number of waiting links; `LCK_M_U` waits with few tasks and long average waits, plus `LCK_M_IS` and `LCK_M_IX` behind an escalation; `Active Transactions` up; batch requests dip while the table lock is held | Undocumented on SQL Server: the skill can decline. If it runs, a tree under one head blocker whose `program_name` starts with `ContosoCare.Demo/blocking-chain/`, and an `OBJECT` lock in `X` mode during an escalation |
+| T1 (default) | `Processes blocked` near the number of waiting links; `LCK_M_U` waits with few tasks and long average waits, plus `LCK_M_IS` and `LCK_M_IX` behind an escalation; `Active Transactions` up; batch requests dip while the table lock is held | Undocumented on SQL Server: the skill can decline. If it runs, a tree under one head blocker whose `program_name` starts with `ContosoCare.Demo/` and ends with the run's `run_id`, and an `OBJECT` lock in `X` mode during an escalation |
 | T2 | The same as T1 | The same as T1 |
 | T3 | `Processes blocked` and Lock waits on transaction-ID locks (`LCK_M_S_XACT_MODIFY`); no escalation | Documented: the tree, the head blocker (idle with an open transaction between its updates), and its last statement |
 

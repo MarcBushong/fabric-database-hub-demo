@@ -55,7 +55,7 @@ Read the latest deadlock-storm row from demo.scenario_runs in ContosoCare on {ta
 | T2 | The same as T1 | The same as T1 |
 | T3 | The same counters | No built-in `system_health` session: graphs exist only if a database-scoped session already captures them, and the demo creates none |
 
-- Victims run at `DEADLOCK_PRIORITY LOW`, so one side of each pair is always picked; graphs show the inventory rows of the `ContosoCare` pair and sessions tagged `ContosoCare.Demo/deadlock-storm/`.
+- Victims run at `DEADLOCK_PRIORITY LOW`, so one side of each pair is always picked; graphs show the inventory rows of the `ContosoCare` pair and sessions tagged `ContosoCare.Demo/`, whose names end with the run's `run_id`.
 - `Number of Deadlocks/sec` is sampled every minute, so per-minute totals can lag the victim events by a bin.
 
 ## How to judge the answer

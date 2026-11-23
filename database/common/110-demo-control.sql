@@ -279,7 +279,7 @@ BEGIN
 END;
 GO
 
--- Demo sessions in this database: application name ContosoCare.Demo/<scenario>/<run>, never the runner's own
+-- Demo sessions in this database: application name ContosoCare.Demo/<service>/<run>, never the runner's own
 -- control sessions (ContosoCare.Demo/control/...), never the caller. Optionally one run only.
 CREATE OR ALTER FUNCTION demo.fn_demo_sessions (@run_id varchar(64))
 RETURNS TABLE
@@ -823,7 +823,8 @@ BEGIN
        OR EXISTS (
             SELECT 1
             FROM demo.scenario_runs AS r
-            WHERE s.program_name = CONCAT('ContosoCare.Demo/', r.scenario_id, '/', r.run_id)
+            -- By the run alone, as fn_demo_sessions: whatever precedes it (the service, or an older runner's scenario).
+            WHERE s.program_name LIKE CONCAT('ContosoCare.Demo/%/', r.run_id)
               AND (r.status <> 'Running' OR r.deadline_at < SYSUTCDATETIME()));
 
     SET @remaining = @@ROWCOUNT;

@@ -11,9 +11,26 @@ public sealed class ConnectionTests
     private static readonly string[] SecretKeywords = ["password", "pwd", "accesstoken", "access token", "client secret", "sig="];
 
     [Fact]
-    public void RunSessionsAreTaggedWithScenarioAndRun()
+    public void RunSessionsAreTaggedWithServiceAndRun()
     {
-        Assert.Equal("ContosoCare.Demo/locking-blocking/20261020170000-t1-abcdef", SessionNames.ForRun("locking-blocking", "20261020170000-t1-abcdef"));
+        Assert.Equal("ContosoCare.Demo/billing-worker/9f2c4e1a7b3d5f60", SessionNames.ForRun("billing-worker", "9f2c4e1a7b3d5f60"));
+    }
+
+    [Theory]
+    [InlineData("control", "9f2c4e1a7b3d5f60")]
+    [InlineData("billing/worker", "9f2c4e1a7b3d5f60")]
+    [InlineData("Billing-worker", "9f2c4e1a7b3d5f60")]
+    [InlineData("billing-worker-", "9f2c4e1a7b3d5f60")]
+    [InlineData("billing--worker", "9f2c4e1a7b3d5f60")]
+    [InlineData("a23456789012345678901234567890123", "9f2c4e1a7b3d5f60")]
+    [InlineData("billing-worker", "9f2c%")]
+    [InlineData("billing-worker", "9f2c_4e1a")]
+    [InlineData("billing-worker", "")]
+    public void ARunsNameNeverPassesForAControlSessionOrMatchesAnotherRun(string service, string runId)
+    {
+        // A 'control' service would hide the run's sessions from the session tools, and a LIKE wildcard in the run ID would
+        // make their run match reach other runs' sessions.
+        Assert.Throws<ArgumentException>(() => SessionNames.ForRun(service, runId));
     }
 
     [Fact]
@@ -26,6 +43,7 @@ public sealed class ConnectionTests
     }
 
     [Theory]
+    [InlineData("ContosoCare.Demo/scheduling-service/9f2c4e1a7b3d5f60", true)]
     [InlineData("ContosoCare.Demo/cpu-pressure/20261020170000-t2-abcdef", true)]
     [InlineData("contosocare.demo/cpu-pressure/x", true)]
     [InlineData("ContosoCare.Demo/control/status", false)]
@@ -39,14 +57,23 @@ public sealed class ConnectionTests
     }
 
     [Fact]
-    public void RunIdsAreShortLowercaseAndUnique()
+    public void RunIdsAreOpaqueLowercaseHexAndUnique()
     {
-        var now = new DateTimeOffset(2026, 10, 20, 17, 30, 0, TimeSpan.Zero);
-        var ids = Enumerable.Range(0, 50).Select(_ => SessionNames.NewRunId(now, DemoTarget.T3)).ToList();
+        var ids = Enumerable.Range(0, 50).Select(_ => SessionNames.NewRunId()).ToList();
 
-        Assert.All(ids, id => Assert.Matches("^20261020173000-t3-[0-9a-f]{6}$", id));
+        // 64 random bits and nothing else: no time, no target.
+        Assert.All(ids, id => Assert.Matches("^[0-9a-f]{16}$", id));
         Assert.All(ids, id => Assert.True(SessionNames.IsValidRunId(id)));
         Assert.Equal(ids.Count, ids.Distinct(StringComparer.Ordinal).Count());
+    }
+
+    [Theory]
+    [InlineData("9f2c4e1a7b3d5f60")]
+    [InlineData("20261120170200-t1-9b7c1d")]
+    public void RunIdsOfThisAndOlderRunnersAreValid(string runId)
+    {
+        // An older runner's run IDs (time, target, random hex) stay valid: its runs are stopped, reset, and watched by run ID.
+        Assert.True(SessionNames.IsValidRunId(runId));
     }
 
     [Theory]
@@ -64,12 +91,28 @@ public sealed class ConnectionTests
     [Fact]
     public void EveryScenarioFitsTheApplicationNameLimit()
     {
-        var runId = SessionNames.NewRunId(DateTimeOffset.UtcNow, DemoTarget.T1);
+        var runId = SessionNames.NewRunId();
 
         foreach (var scenario in ScenarioCatalog.Default.All)
         {
-            Assert.True(SessionNames.ForRun(scenario.Id, runId).Length <= 128, scenario.Id);
+            Assert.True(SessionNames.ForRun(scenario.Service, runId).Length <= 128, scenario.Id);
         }
+    }
+
+    [Fact]
+    public void TheWatchdogMatchesARunsSessionsByTheRunAlone()
+    {
+        // ContosoCare.Demo/<service>/<run>, and an older runner's ContosoCare.Demo/<scenario>/<run>: the past-deadline kill
+        // finds a session's run by the run ID at the end of its name, whatever precedes it (ADR 0031, decision 6).
+        var sql = SqlScriptTests.ProcedureText("demo.usp_kill_demo_sessions");
+        var postgres = Postgres.PgScripts.Read("110-demo-control.sql");
+        postgres = postgres[postgres.IndexOf("CREATE OR REPLACE FUNCTION demo.usp_kill_demo_sessions", StringComparison.Ordinal)..];
+        postgres = postgres[..postgres.IndexOf("$$;", StringComparison.Ordinal)];
+
+        Assert.Contains("WHERE s.program_name LIKE CONCAT('ContosoCare.Demo/%/', r.run_id)", sql, StringComparison.Ordinal);
+        Assert.Contains("WHERE s.application_name LIKE 'ContosoCare.Demo/%/' || r.run_id", postgres, StringComparison.Ordinal);
+        Assert.DoesNotContain("scenario_id", sql, StringComparison.Ordinal);
+        Assert.DoesNotContain("scenario_id", postgres, StringComparison.Ordinal);
     }
 
     [Theory]
@@ -126,11 +169,11 @@ public sealed class ConnectionTests
     public void EveryConnectionIsBoundedToContosoCareWithoutSecrets(string target, string? server, bool sqlLogin)
     {
         var endpoint = TargetEndpoint.Create(Enum.Parse<DemoTarget>(target), server, sqlLogin, null);
-        var connectionString = ConnectionStrings.Build(endpoint, SessionNames.ForRun("cpu-pressure", "20261020170000-t1-abcdef"), 30);
+        var connectionString = ConnectionStrings.Build(endpoint, SessionNames.ForRun("scheduling-service", "9f2c4e1a7b3d5f60"), 30);
         var builder = new SqlConnectionStringBuilder(connectionString);
 
         Assert.Equal("ContosoCare", builder.InitialCatalog);
-        Assert.Equal("ContosoCare.Demo/cpu-pressure/20261020170000-t1-abcdef", builder.ApplicationName);
+        Assert.Equal("ContosoCare.Demo/scheduling-service/9f2c4e1a7b3d5f60", builder.ApplicationName);
         Assert.False(builder.Pooling);
         Assert.False(builder.MultipleActiveResultSets);
         Assert.Empty(builder.Password);

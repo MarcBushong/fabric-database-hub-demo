@@ -43,7 +43,7 @@ Read the session_ids, started_at, and stopped_at of the latest slow-consumer row
 ### 3. No resource limit, with the SQL diagnostics skill
 
 ```text
-Use the diagnose-resource-pressure skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. Read sys.dm_exec_requests and sys.dm_exec_sessions for sessions whose program_name starts with ContosoCare.Demo/slow-consumer: their wait type, wait time, CPU time, and reads, and the client's host_name. Tell me whether any resource limit of the database is the constraint, or say that the skill doesn't apply to {target}. Don't change anything: don't KILL a session or change any setting.
+Use the diagnose-resource-pressure skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. Read sys.dm_exec_requests and sys.dm_exec_sessions for sessions whose program_name starts with ContosoCare.Demo/: their wait type, wait time, CPU time, and reads, and the client's host_name. Tell me whether any resource limit of the database is the constraint, or say that the skill doesn't apply to {target}. Don't change anything: don't KILL a session or change any setting.
 ```
 
 ## Signals to look for

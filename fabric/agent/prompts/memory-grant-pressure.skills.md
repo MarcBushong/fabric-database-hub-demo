@@ -44,7 +44,7 @@ For {incidentWindow} on {target}, adapt sample query 8 to report Granted Workspa
 ### 3. Grants now, with the SQL diagnostics skill
 
 ```text
-Use the diagnose-resource-pressure skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. Read sys.dm_exec_query_memory_grants joined to sys.dm_exec_sessions for sessions whose program_name starts with ContosoCare.Demo/memory-grant-pressure, and report requested, granted, and used memory, and how many are still waiting for a grant and for how long. Tell me whether memory grants or another limit is the constraint, or that the skill doesn't apply to {target}. Don't change anything: don't change memory settings, Resource Governor, or query hints.
+Use the diagnose-resource-pressure skill on the ContosoCare database of {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. Read sys.dm_exec_query_memory_grants joined to sys.dm_exec_sessions for sessions whose program_name starts with ContosoCare.Demo/, and report requested, granted, and used memory, and how many are still waiting for a grant and for how long. Tell me whether memory grants or another limit is the constraint, or that the skill doesn't apply to {target}. Don't change anything: don't change memory settings, Resource Governor, or query hints.
 ```
 
 ### 4. The plan's memory grant
@@ -66,7 +66,7 @@ Use the read-execution-plan skill on the ContosoCare database of {target}, with 
 ## How to judge the answer
 
 - Waits and counters are deltas or gauges over a UTC window, never sums of cumulative values.
-- The grants it lists belong to sessions tagged `ContosoCare.Demo/memory-grant-pressure/`.
+- The grants it lists belong to sessions tagged `ContosoCare.Demo/`, whose names end with the scenario run's `run_id`.
 - When a skill declines on T1 or T2, it says so, and the answer rests on the telemetry.
 
 ## Safety

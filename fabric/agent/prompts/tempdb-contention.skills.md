@@ -44,7 +44,7 @@ For {incidentWindow} on {target}, adapt sample query 9 to report Temp Tables Cre
 ### 3. Which pages, with the SQL diagnostics skill
 
 ```text
-Use the diagnose-resource-pressure skill on {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. Read sys.dm_os_waiting_tasks for sessions whose program_name starts with ContosoCare.Demo/tempdb-contention, and group their PAGELATCH waits by resource_description. Database 2 is tempdb; say whether the pages are allocation pages (PFS, GAM, SGAM) or system catalog pages, or that the skill doesn't apply to {target}. Don't change anything: don't add tempdb files, enable trace flags, or change any setting.
+Use the diagnose-resource-pressure skill on {target}, connected as me (Microsoft Entra on Azure SQL Database, Windows authentication on SQL Server), never with a SQL login or password. Read sys.dm_os_waiting_tasks for sessions whose program_name starts with ContosoCare.Demo/, and group their PAGELATCH waits by resource_description. Database 2 is tempdb; say whether the pages are allocation pages (PFS, GAM, SGAM) or system catalog pages, or that the skill doesn't apply to {target}. Don't change anything: don't add tempdb files, enable trace flags, or change any setting.
 ```
 
 ### 4. Line it up with the scenario record

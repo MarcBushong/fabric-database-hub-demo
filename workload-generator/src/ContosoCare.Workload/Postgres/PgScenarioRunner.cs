@@ -46,8 +46,8 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     public async Task<RunResult> RunAsync(RunPlan plan, CancellationToken cancellationToken)
     {
-        var runId = SessionNames.NewRunId(time.GetUtcNow(), plan.Target);
-        var applicationName = SessionNames.ForRun(plan.Scenario.Id, runId);
+        var runId = SessionNames.NewRunId();
+        var applicationName = SessionNames.ForRun(plan.Scenario.Service, runId);
         var parameters = plan.Parameters.ToDictionary(p => p.Key, p => p.Value.ToString(), StringComparer.Ordinal);
         log.Info(
             "run.planned",

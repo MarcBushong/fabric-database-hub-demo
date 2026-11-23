@@ -50,7 +50,7 @@ public sealed class CosmosRunnerTests : IDisposable
         Assert.Equal("Completed", result.Status);
         Assert.Equal("Pass", result.Result);
         Assert.InRange((result.EndedAt!.Value - result.DeadlineAt!.Value).TotalSeconds, -2, 10);
-        var tag = SessionNames.ForRun("healthy-baseline", result.RunId);
+        var tag = SessionNames.ForRun("careportal-api", result.RunId);
         var work = account.Requests.Where(r => r.Header("User-Agent")!.StartsWith(tag + " ", StringComparison.Ordinal)).ToList();
         Assert.True(work.Count >= 40, $"Only {work.Count} requests ran.");
         Assert.Contains(work, r => r.IsUpsert);
@@ -92,6 +92,9 @@ public sealed class CosmosRunnerTests : IDisposable
         Assert.Equal("Completed", result.Status);
         var writes = account.Requests.Where(r => r.IsUpsert).ToList();
         Assert.NotEmpty(writes);
+
+        // Tagged with the client service and the run, never the scenario (ADR 0031, decision 6).
+        var tag = SessionNames.ForRun("patient-events-ingest", result.RunId);
         foreach (var write in writes)
         {
             // A write starts only in a wave; one that started just before the calm may arrive a moment later.
@@ -101,6 +104,8 @@ public sealed class CosmosRunnerTests : IDisposable
             Assert.Equal("p-storm-01", write.PartitionKey);
             Assert.Matches("^storm-01-0[0-9]{2}$", FakeCosmosAccount.Body(write)["id"]!.GetValue<string>());
             Assert.Equal(RuStorm.Kind, FakeCosmosAccount.Body(write)["kind"]!.GetValue<string>());
+            Assert.Equal(tag, FakeCosmosAccount.Body(write)["source"]!.GetValue<string>());
+            Assert.StartsWith(tag + " ", write.Header("User-Agent"), StringComparison.Ordinal);
         }
 
         var waves = writes.Select(w => RuStorm.PhaseAt(w.At - result.StartedAt!.Value, 30, 30).Wave).Distinct().Count();
@@ -225,7 +230,7 @@ public sealed class CosmosRunnerTests : IDisposable
 
         await WaitForAsync(() => Task.FromResult(ContainerReads(account).Count >= 3), token);
         account.ContainerMissing = false;
-        await WaitForAsync(() => Task.FromResult(account.Requests.Any(r => r.Path.StartsWith(FakeCosmosAccount.DocumentsPath, StringComparison.Ordinal) && r.Header("User-Agent")!.StartsWith("ContosoCare.Demo/healthy-baseline/", StringComparison.Ordinal))), token);
+        await WaitForAsync(() => Task.FromResult(account.Requests.Any(r => r.Path.StartsWith(FakeCosmosAccount.DocumentsPath, StringComparison.Ordinal) && r.Header("User-Agent")!.StartsWith("ContosoCare.Demo/careportal-api/", StringComparison.Ordinal))), token);
         await stop.CancelAsync();
         await hosting.WaitAsync(TimeSpan.FromSeconds(30), token);
 
