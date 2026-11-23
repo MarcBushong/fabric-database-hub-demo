@@ -149,7 +149,7 @@ param t4Enabled bool = true
 ])
 param t4SkuName string = 'Standard_D4ds_v5'
 
-@description('T4\'s autonomous tuning (Query Store and index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019).')
+@description('T4\'s autonomous tuning (index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019). Query Store and its wait sampling are on at every size but Burstable either way (2026-11-23).')
 param t4AutonomousTuning bool = false
 
 @description('T4\'s availability zone at creation: empty for no preference, or 1, 2, or 3.')
@@ -454,6 +454,7 @@ module pgflex01 'pgflex01.bicep' = if (t4Enabled) {
     maxConnections: postgres.maxConnections
     autonomousTuning: t4AutonomousTuning
     tuning: postgres.autonomousTuning
+    queryStore: postgres.queryStore
   }
 }
 

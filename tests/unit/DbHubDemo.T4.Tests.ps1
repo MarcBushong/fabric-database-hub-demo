@@ -1029,23 +1029,67 @@ Describe 'T4 autonomous tuning (2026-11-04)' {
         (InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoDeploymentParameter -Config $Config -NetworkMode private -T3UseFreeLimit $false }).parameters['t4AutonomousTuning'].value | Should -BeFalse
     }
 
-    It 'sets Query Store and index tuning in the template, the interval before the mode, only when it''s on, and Query Store off on Burstable' {
+    It 'sets Query Store and its wait sampling at every size but Burstable whatever tuning says, and index tuning only when it''s on, the interval before the mode' {
         $postgres = InModuleScope DbHubDemo { Get-DemoPostgresSetting }
         $postgres['autonomousTuning']['minVCores'] | Should -Be 4
-        $postgres['autonomousTuning']['queryCaptureMode'] | Should -Be 'top'
+        $postgres['autonomousTuning'].Contains('queryCaptureMode') | Should -BeFalse -Because 'Query Store''s capture mode is queryStore''s, whatever the tuning'
         $postgres['autonomousTuning']['parametersCaptureMode'] | Should -Be 'capture_first_sample'
         $postgres['autonomousTuning']['analysisIntervalMinutes'] | Should -Be 60
         $postgres['autonomousTuning']['mode'] | Should -Be 'report'
+        # 2026-11-23 (user-directed): "We would want query store enabled wherever possible". all, so Query Store records the
+        # statements the workload's functions run, not only the calls ("top" is top-level statements only), whatever the tuning:
+        # autonomous tuning takes "TOP or ALL".
+        $postgres['queryStore']['queryCaptureMode'] | Should -Be 'all'
+        $postgres['queryStore']['waitSamplingCaptureMode'] | Should -Be 'all'
         $bicep = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/pgflex01.bicep') -Raw
-        $order = @('max_connections', 'pg_qs.query_capture_mode', 'pg_qs.parameters_capture_mode', 'index_tuning.analysis_interval', 'index_tuning.mode') | ForEach-Object { $bicep.IndexOf("name: '$_'") }
+        $order = @('max_connections', 'pg_qs.query_capture_mode', 'pgms_wait_sampling.query_capture_mode', 'pg_qs.parameters_capture_mode', 'index_tuning.analysis_interval', 'index_tuning.mode') | ForEach-Object { $bicep.IndexOf("name: '$_'") }
         $order | Should -Not -Contain -1
         @($order | Sort-Object) | Should -Be $order -Because 'each depends on the one before, so the interval is in effect when the mode turns tuning on'
-        $bicep | Should -Match "resource queryCaptureMode '[^']+' = if \(autonomousTuning \|\| sizing\.tier == 'Burstable'\)"
-        $bicep | Should -Match "value: autonomousTuning \? string\(tuning\.queryCaptureMode\) : 'none'"
+        # Query Store and its wait sampling on every server, off on Burstable ("Don't enable query store on the Burstable
+        # pricing tier as it causes performance problems").
+        $bicep | Should -Match "resource queryCaptureMode '[^']+' = \{"
+        $bicep | Should -Match "value: sizing\.tier == 'Burstable' \? 'none' : string\(queryStore\.queryCaptureMode\)"
+        $bicep | Should -Not -Match 'tuning\.queryCaptureMode' -Because 'the tuning never changes what Query Store records'
+        # One resource per parameter, with the wait sampling in the chain between the capture mode and the tuning's.
+        @([regex]::Matches($bicep, "(?m)^  name: 'pg_qs\.query_capture_mode'$")).Count | Should -Be 1
+        @([regex]::Matches($bicep, "(?m)^  name: 'pgms_wait_sampling\.query_capture_mode'$")).Count | Should -Be 1
+        $bicep | Should -Match "resource waitSamplingCaptureMode [^\n]+\n(?:[^\n]*\n)*?  dependsOn: \[\n    queryCaptureMode\n  \]"
+        $bicep | Should -Match "resource parametersCaptureMode [^\n]+\n(?:[^\n]*\n)*?  dependsOn: \[\n    waitSamplingCaptureMode\n  \]"
+        $bicep | Should -Match "resource waitSamplingCaptureMode '[^']+' = \{\s+parent: server\s+name: 'pgms_wait_sampling\.query_capture_mode'"
+        $bicep | Should -Match "value: sizing\.tier == 'Burstable' \? 'none' : string\(queryStore\.waitSamplingCaptureMode\)"
         foreach ($name in 'parametersCaptureMode', 'tuningInterval', 'tuningMode') {
             $bicep | Should -Match ("resource {0} '[^']+' = if \(autonomousTuning\)" -f $name)
         }
-        (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw) | Should -Match 'tuning: postgres\.autonomousTuning'
+        $demo = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/modules/demo.bicep') -Raw
+        $demo | Should -Match 'tuning: postgres\.autonomousTuning'
+        $demo | Should -Match 'queryStore: postgres\.queryStore'
+        # The template deploy.ps1 deploys has them too: both parameters on every server, so an update sets them.
+        $template = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'azuredeploy.json') -Raw
+        $template | Should -Match ([regex]::Escape(@'
+"name": "[format('{0}/{1}', parameters('serverName'), 'pgms_wait_sampling.query_capture_mode')]",
+'@.Trim()))
+        $template | Should -Match ([regex]::Escape(@'
+"value": "[if(equals(parameters('sizing').tier, 'Burstable'), 'none', string(parameters('queryStore').queryCaptureMode))]",
+'@.Trim()))
+        $template | Should -Not -Match ([regex]::Escape("or(parameters('autonomousTuning'), equals(parameters('sizing').tier, 'Burstable'))")) -Because 'Query Store no longer waits for tuning'
+    }
+
+    It 'says Query Store''s state in the tuning check''s words, whatever the tuning: on at General Purpose, off at Burstable' -ForEach @(
+        @{ Switch = 'false'; Sku = ''; Pattern = 'Query Store and its wait sampling stay on, as at every size but Burstable\.$' }
+        @{ Switch = 'false'; Sku = 'Standard_B1ms'; Pattern = 'Query Store stays off at this size, where Learn advises against it\.$' }
+        @{ Switch = 'unset'; Sku = 'Standard_D2ds_v5'; Pattern = 'Query Store and its wait sampling stay on, as at every size but Burstable\.$' }
+        @{ Switch = 'unset'; Sku = 'Standard_B2s'; Pattern = 'Query Store stays off at this size, where Learn advises against it\.$' }
+    ) {
+        $config = New-TestConfig
+        if ($Switch -ne 'unset') {
+            $config['t4AutonomousTuning'] = $Switch -eq 'true'
+        }
+        if ($Sku) {
+            $config['t4SkuName'] = $Sku
+        }
+        $tuning = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4Tuning -Config $Config }
+        $tuning.Message | Should -Match $Pattern
+        $tuning.Message | Should -Not -Match 'Query Store and index-tuning parameters are left as they are'
     }
 
     It 'reads the zones the region lists for a General Purpose size, and nothing when it can''t' {
