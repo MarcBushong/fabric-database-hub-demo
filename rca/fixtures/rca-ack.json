@@ -1,0 +1,24 @@
+{
+  "kind": "ContosoCare.RcaAck",
+  "version": 1,
+  "payload": "Files/rca/inbox/sidecar-20261121T102531Z.json",
+  "runId": "run-20261121T102531Z",
+  "documents": [
+    {
+      "documentId": "20261120T165000Z-sqlvm01-0001-sidecar",
+      "kind": "ContosoCare.RcaSidecar",
+      "status": "already",
+      "reason": "An earlier run wrote it; its acknowledgement never reached the runner."
+    },
+    {
+      "documentId": "20261120T170000Z-sqlvm01-0002-sidecar",
+      "kind": "ContosoCare.RcaSidecar",
+      "status": "written"
+    },
+    {
+      "documentId": "20261121T100000Z-sqlvm01-0001-sidecar",
+      "kind": "ContosoCare.RcaSidecar",
+      "status": "written"
+    }
+  ]
+}
