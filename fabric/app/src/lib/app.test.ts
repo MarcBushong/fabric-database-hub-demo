@@ -31,28 +31,105 @@ describe("themes", () => {
     };
     const token = (id: "light" | "dark", name: string) => (warm[id] as unknown as Record<string, string>)[name] ?? `no ${name}`;
 
-    it("keeps every status color readable (4.5:1) and every target and chart color visible (3:1) on each surface", () => {
+    it("keeps every status color readable (4.5:1) and every target and chart color visible (3:1) on each surface, and on a hovered or pressed row, button, or menu item", () => {
         for (const [id, tokens] of Object.entries(APP_TOKENS)) {
-            for (const surface of tokens.surfaces) {
+            for (const surface of [...tokens.surfaces, ...tokens.states]) {
                 for (const [name, color] of Object.entries(tokens.text)) expect(contrastRatio(color, surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(4.5);
                 for (const [name, color] of Object.entries(tokens.graphic)) expect(contrastRatio(color, surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(3);
             }
         }
+        // The fills a status or a target's mark sits on in a hovered or pressed row, subtle button, button, or menu item.
+        for (const id of ["light", "dark"] as const) {
+            for (const name of ["colorSubtleBackgroundHover", "colorSubtleBackgroundPressed", "colorNeutralBackground1Hover", "colorNeutralBackground1Pressed"]) expect(APP_TOKENS[id].states, `${id} ${name}`).toContain(token(id, name));
+        }
     });
 
-    it("keeps Fluent's text, links, buttons, inputs, and focus ring at WCAG 2.2 AA on the warm surfaces", () => {
+    it("keeps Fluent's text, links, buttons, inputs, and focus ring at WCAG 2.2 AA on the warm surfaces, and on a hovered or pressed fill", () => {
         for (const id of ["light", "dark"] as const) {
-            const all = SURFACES[id];
+            const rest = SURFACES[id];
+            const all = [...rest, ...APP_TOKENS[id].states];
             for (const name of ["colorNeutralForeground1", "colorNeutralForeground2", "colorNeutralForeground3", "colorBrandForeground1", "colorBrandForegroundLink", "colorBrandForegroundLinkHover"]) {
                 for (const surface of all) expect(contrastRatio(token(id, name), surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(4.5);
             }
+            // A pressed or selected link sits on a card, the navigation, or the page: the app's rows hold no links.
+            for (const name of ["colorBrandForegroundLinkPressed", "colorBrandForegroundLinkSelected"]) {
+                for (const surface of rest) expect(contrastRatio(token(id, name), surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(4.5);
+            }
             // Hints and placeholders sit on cards, the navigation, and the page.
-            for (const surface of all.slice(0, 3)) expect(contrastRatio(token(id, "colorNeutralForeground4"), surface), `${id} foreground 4 on ${surface}`).toBeGreaterThanOrEqual(4.5);
+            for (const surface of rest.slice(0, 3)) expect(contrastRatio(token(id, "colorNeutralForeground4"), surface), `${id} foreground 4 on ${surface}`).toBeGreaterThanOrEqual(4.5);
             for (const name of ["colorNeutralStrokeAccessible", "colorStrokeFocus2", "colorCompoundBrandForeground1", "colorCompoundBrandStroke"]) {
                 for (const surface of all) expect(contrastRatio(token(id, name), surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(3);
             }
             for (const fill of ["colorBrandBackground", "colorBrandBackgroundHover", "colorBrandBackgroundPressed", "colorBrandBackgroundSelected"]) {
                 expect(contrastRatio(token(id, "colorNeutralForegroundOnBrand"), token(id, fill)), `${id} button text on ${fill}`).toBeGreaterThanOrEqual(4.5);
+            }
+        }
+    });
+
+    it("keeps the chart's incident band label readable (4.5:1) with the band over each surface a chart sits on, the stage's included", () => {
+        // The band is translucent: its label sits on the band blended over the surface, as the browser composites it.
+        const over = (rgba: string, base: string) => {
+            const [r, g, b, a] = (rgba.match(/[\d.]+/g) ?? []).map(Number);
+            const channel = (i: number) => parseInt(base.slice(1 + 2 * i, 3 + 2 * i), 16);
+            return `#${[r, g, b].map((c, i) => Math.round(c * a + channel(i) * (1 - a)).toString(16).padStart(2, "0")).join("")}`;
+        };
+        for (const id of ["light", "dark", "contrast"] as const) {
+            const { decor, text, surfaces } = APP_TOKENS[id];
+            expect(decor["--chart-band"]).toMatch(/^rgba\(/);
+            for (const surface of new Set([...surfaces, ...Object.values(STAGE_TOKENS[id].surfaces)])) {
+                const fill = over(decor["--chart-band"], surface);
+                expect(contrastRatio(text["--chart-band-ink"], fill), `${id}: the band's label on ${fill}, the band over ${surface}`).toBeGreaterThanOrEqual(4.5);
+            }
+        }
+    });
+
+    it("keeps every badge the app shows legible in light and dark: its text on its own fill, or on each surface for an outline", () => {
+        // Fluent 9's badge colors (useBadgeStyles): the text's token, and its fill's, or none for an outline, which sits on
+        // the surface. Subtle's outline draws its text in the static inverted color, meant for a dark or brand fill: on the
+        // app's surfaces it was invisible, cream on cream (the review of 2b0e46b0).
+        const BADGES: Record<string, [text: string, fill: string | null]> = {
+            "filled-brand": ["colorNeutralForegroundOnBrand", "colorBrandBackground"],
+            "tint-informative": ["colorNeutralForeground3", "colorNeutralBackground4"],
+            "tint-success": ["colorPaletteGreenForeground1", "colorPaletteGreenBackground1"],
+            "tint-warning": ["colorPaletteYellowForeground1", "colorPaletteYellowBackground1"],
+            "outline-informative": ["colorNeutralForeground3", null],
+            "outline-subtle": ["colorNeutralForegroundStaticInverted", null],
+        };
+        const COLOR = /^(brand|danger|important|informative|severe|subtle|success|warning)$/;
+        // A JSX opening tag, to its closing angle bracket outside any braces (an icon prop holds a tag of its own).
+        const openingTag = (source: string, from: number) => {
+            let depth = 0;
+            for (let i = from; i < source.length; i++) {
+                if (source[i] === "{") depth++;
+                else if (source[i] === "}") depth--;
+                else if (source[i] === ">" && depth === 0) return source.slice(from, i + 1);
+            }
+            return source.slice(from);
+        };
+        const src = join(process.cwd(), "src");
+        const files = (readdirSync(src, { recursive: true, encoding: "utf8" }) as string[]).filter((f) => f.endsWith(".tsx") && !f.endsWith(".test.tsx"));
+        const used = new Set<string>();
+        for (const file of files) {
+            const source = readFileSync(join(src, file), "utf8");
+            for (const match of source.matchAll(/<Badge\b/g)) {
+                const tag = openingTag(source, match.index ?? 0);
+                const appearance = tag.match(/\bappearance="(\w+)"/)?.[1] ?? "filled";
+                const literal = tag.match(/\bcolor="(\w+)"/)?.[1];
+                const expression = tag.match(/\bcolor=\{([^{}]*)\}/)?.[1] ?? "";
+                // A helper's colors are the literals of its definition in the same file (MigrationCard's badgeColor).
+                const helper = expression.match(/^\s*(\w+)\(/)?.[1];
+                const scope = helper ? (source.match(new RegExp(`\\b${helper}\\s*=[^;]*;`))?.[0] ?? "") : expression;
+                const colors = literal ? [literal] : /\bcolor=/.test(tag) ? [...scope.matchAll(/"(\w+)"/g)].map((m) => m[1]).filter((c) => COLOR.test(c)) : ["brand"];
+                expect(colors.length, `${file}: a badge whose color the test can't read`).toBeGreaterThan(0);
+                for (const color of colors) used.add(`${appearance}-${color}`);
+            }
+        }
+        expect(used.size).toBeGreaterThanOrEqual(4);
+        for (const combination of used) {
+            expect(BADGES[combination], `${combination}: add Fluent's tokens for it to this test`).toBeDefined();
+            const [text, fill] = BADGES[combination];
+            for (const id of ["light", "dark"] as const) {
+                for (const background of fill ? [token(id, fill)] : SURFACES[id]) expect(contrastRatio(token(id, text), background), `${id} ${combination} badge on ${background}`).toBeGreaterThanOrEqual(4.5);
             }
         }
     });
