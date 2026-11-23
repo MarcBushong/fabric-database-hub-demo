@@ -8940,3 +8940,51 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 **Changed files.** `fabric/app/rayfin/functions/package.json` and `package-lock.json`, `config/versions.json`, `tests/unit/DbHubDemo.FabricApp.Tests.ps1`, the CHANGELOG, and this report.
 
 **Validation.** `DbHubDemo.FabricApp.Tests.ps1` with StrictMode and the Azure CLI guard: 115 passed, 0 az calls. With the functions' `package.json` and lock as they were, the new test fails: "fabric/app/rayfin/functions/package-lock.json: node_modules/zod@4.3.6, below GHSA-mrhx-c7xc-m3w5's fix (4.6.6)". The functions' `npm ci` and build, the app's license check, and the vitest files that run the functions' code wait for the end of the coordinator's CPU quiet window, in the release's full validation.
+
+### The next release's integration (2026-11-23)
+
+**Why.** The coordinator's assignment: integrate the release after the Incident RCA's, first planned for Wednesday, now cut off Tuesday noon, with its live proof overnight and the owner's test Tuesday morning. Each piece is merged as its reviewed head arrives, on `marcbushong-microsoft-next-release-integration`, built on the RCA release's final head, 66cc5326.
+
+**What it holds,** each merge with the head it took:
+
+- **F35 design (i):** the integrated branch at 305df261 (663aa367) and its report entry, 4a3039e8 (07dc860c); the Livy steps' design A at 887fb1ed (82b9dd73); and the F35 session's typecheck fix, 792e9a19 (5eebcfa0).
+  - In the notebook, F35's kept values are the helpers' part 5, after the Incident RCA's part 4, and the persist cell works them out before the reference run's exit, since that exit ends the run. The notebooks' versions file was written again after each merge that changed a notebook.
+  - With the Livy steps, the first history run's follow-up keeps the RCA release's wider condition (the model waiting for the Incident RCA's tables too) and deploys the form the track's step allowed.
+- **The realistic names,** ee9cb224 (75f370be).
+- **Stop-tail:** O1 and the golden job at d06899f6 (5232b77e), then the role's network join actions and the Lows at 57f7160f (e107ed8a).
+- **Query Store on's ready-to-run query,** 816ae32a (59db48dd).
+- **High contrast and the chart's hover band,** a02516a1 (c63b155b).
+- **The integration's own commits:**
+  - the CHANGELOG's `[Unreleased]`, and each dated release named (d78bb1f0, the coordinator's decision);
+  - [the review of the merges](#the-next-releases-integration-the-review-of-its-merges-2026-11-23): fff65c3b, d4154fde, and 1582e482, then the re-check's nits (ef551956);
+  - the app's typecheck (2a356245), replaced by F35's own fix;
+  - F35's docs for the Livy steps' design A (243ba79b);
+  - [zod 4.6.7 in the functions](#zod-in-the-functions-lock-dependabot-alert-14-2026-11-23) (c0d61282).
+- **The CHANGELOG:** every piece's entries are under `[Unreleased]`, and the RCA release's section reads as 66cc5326 has it. Two merges had put theirs there: stop-tail's Fixed and Security entries, and High contrast's Fixed entries with an edit of the RCA's earth tones entry, which ships as it is.
+
+**Conflicts, and how they were resolved,** besides this report (each merge's message says more):
+
+- `Send-DbHubT4ReplicaCreate`'s help: F37's `QuotaExceeded` and 061db648's `Refused`, both; the code merged without a conflict.
+- `TrackHelpers.ps1`: the RCA release's condition for the first run's follow-up, with 32e39e6a's `-SnapshotValueForm`; the Tracks test keeps both sides' assertions.
+- The app's playbook and README: 816ae32a's next-step query beside HEAD's F18 text.
+- `snapshot-value.test.ts`: 792e9a19's file.
+
+**Validation, targeted at each step,** with StrictMode and the Azure CLI guard, while this PC was loaded and then in the coordinator's CPU quiet window:
+
+- Query Store: the app's typecheck (then failing on F35's test alone), lint, and vitest on `src/rca` and `src/copilot`, 422 passed.
+- Stop-tail: Pester on the runbook, ActivityControl, Golden, and OneCommand, 856 passed; the RCA lane's and export's tests, 47 passed.
+- The Livy steps: Pester on HistoryKeptValue, Tracks, Lifecycle, FabricItem, FirstRun, and FabricTrack, 721 passed.
+- The typecheck: `npm run typecheck` clean, and `snapshot-value.test.ts` 23 passed.
+- High contrast: `src/lib/app.test.ts` and `src/visuals/ChartView.test.tsx`, 61 passed.
+- gitleaks 8.30.1, as CI pins it, checksum checked: the range's 69 commits, and its net diff, found no leak.
+- markdownlint is clean on every commit.
+
+The full validation runs once, at the final head, after the quiet window.
+
+**What still needs live proof,** on a new deployment and an update at the final SHA:
+
+- the reference run's time with the kept values before its exit, against the control notebook's 1,800-second limit;
+- a Run all session that `start-demo.ps1` takes over, end to end, with the newer session's capture going on after the older one's end;
+- `stop-demo.ps1`'s kept-value step, and an update from 66cc5326;
+- design A on a real first deployment: the end's switch of the history model to the kept form;
+- the functions on zod 4.6.7 in Fabric: the app has run its own override, and the functions' build is part of the full validation.
