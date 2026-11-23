@@ -7495,3 +7495,53 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 - **The harness's marks (unit H) land after the realistic names' unit A.** Until then the rules leave out the capture's own statements only.
 - **A Run all session's Query Store evidence** reaches the history with the next scripts' save, until Run all's path ships.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
+
+### Query Store's evidence: the scripts' transport and the golden guard (T2a, 2026-11-23)
+
+**Why.** Unit 2's evidence reaches the history only when something carries it from the VMs. This entry is T2a, the operator scripts' side: each of the scripts' three history saves fetches the VMs' sidecars right after the evidence document's export, sends them with its history run, and tells each runner what the history holds ([the sidecar](../rca/README.md#the-sidecar), [the acknowledgement](../rca/README.md#acknowledgement)). The contract is C0's at 4083d329 and 61eced5d; T2b's f6f3f7f1 gives the VMs' control script the two new actions, T1a's runner keeps the sidecars and its ledger, and unit B's notebook writes them. Commit 9ca9f8ab on `marcbushong-microsoft-qs-evidence-scripts-sidecar-transport`, after three merges with no conflict outside this report: the RCA release at 83a6fcb1 (c4124fff), and the contract at 27c14daa (795237c0) and 61eced5d (a3066a68).
+
+**What the saves do.**
+
+- **Fetch, per VM** (`Invoke-DemoRcaSidecarFetch`), in `stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s snapshot, and `configure-fabric.ps1 -RunLiveActivity`:
+  1. the acknowledgements an earlier save deferred, first (`RcaAck`, `rca ack`, at most 32 IDs a Run Command);
+  2. the index (`RcaSidecarExport`, `rca sidecar-export --session none`, with `--final` on the stop's save), every page up to 16;
+  3. each part, through the `Rca` action's `part` command, reassembled and checked against its SHA-256, as the evidence document's are.
+
+  Managed Run Commands named `DbHubDemo-Rca-<vm>-k`, `-i`, or `-s` and the time, each deleted once read. On the T2 host, one at a time, once Azure lists none of the scripts' others (R871).
+- **Each VM's outcome is its own:** `OldBundle`, `OldRunner`, `Failed`, `TimedOut`, `NoRoom`, or `Busy`; one VM's never stops another's or the evidence document's. `OldBundle` is an "Unknown action" answer that doesn't name the action it ran: today's bundle names `Rca` in its list, so v1's rule would have missed it (T2b's interface note), and a test holds today's exact answer to both actions.
+- **Staged** (`Send-DemoRcaSidecarBatch`) as `Files/rca/inbox/sidecar-<UTC>-script-<8 hex>.json`, `RCA_SIDECAR_FILE`, only for a notebook that declares it: whole sidecars, at most 64 parts and 262,144 bytes a run, those of no session in the save's first run only, since they go under the reading run's `RUN_ID` (F7).
+- **Acknowledged** (`Read-DemoRcaSidecarAck`, `Complete-DemoRcaSidecarSave`): only what the run's acknowledgement says is `written` or `already`, and only an acknowledgement that names that payload and exactly its documents (F1, F3, F4). At once while the VMs run (the snapshot, `configure-fabric.ps1`); deferred on the stop, which runs the notebook after the VMs deallocate, and sent first at the next save (F5, F6). The scripts delete a payload only when no run read it.
+- **More runs** (`Invoke-DemoRcaSidecarDrain`, F9): `RCA_ONLY` runs for what the first couldn't take, each after the last one's acknowledgement, at most 3 runs in all, and none started more than 15 minutes after the first ended. The stop's save takes one run.
+- **The PC's lists,** in `out/history-pending/`, with IDs only, never evidence; written through a temporary file, and one that can't be read is moved aside as `<name>.unreadable-<UTC>.json`, never deleted:
+  - `rca-sidecar-pending-<resource group>.json`: `{"kind":"DbHubDemo.RcaSidecarPending","version":1,"sidecars":[{documentId, vm, sessionId, parts, sha256, reason, firstSeenUtc, expiresUtc}]}`. `expiresUtc` is 30 days after the ID's time, the earliest the runner deletes it; one leaves the list when its VM, read whole, no longer offers it, and is "expired unread" past `expiresUtc`, or 30 days after `firstSeenUtc`.
+  - `rca-sidecar-acks-<resource group>.json`: `{"kind":"DbHubDemo.RcaSidecarAcks","version":1,"acknowledgements":[{documentId, vm, status, recordedUtc}]}`, with `status` `written` or `already`, each dropped 30 days after `recordedUtc`.
+- **The lines:** `STOP.RCA.SIDECAR` and `FABRIC.RCA.SIDECAR`, and `DEPLOY.RCA.SIDECAR` in `DEPLOY.FABRIC.HISTORY`'s message and evidence (`rca.sidecar`), as the evidence document's lines go there. **Pass**, a **Warning** while sidecars wait or anything above went wrong, with the command that takes them, or **Not selected** when there was nothing to fetch and nothing waits.
+- **The golden guard** (`Test-DemoGoldenRcaSidecar`, step 5a of `capture-t2-golden.ps1`, after T2's activity is off and before the host password's rotation): the acknowledgements a stop deferred to `archost01` go first; then the guest is asked, read-only (`Invoke-DemoGoldenGuest.ps1 -Action RcaSidecars`), for sealed sidecars its ledger doesn't mark acknowledged, spans with `sidecar-*.rows`, and a ledger it can't read. Any of them: `GOLDEN.CAPTURE.RCA` **Fail**, nothing captured, and the fix a history save from the scripts. Prepare's clear block counts the same with the runner stopped, and refuses to delete a store that holds one (`GOLDEN.CAPTURE.PREPARE`). It reads only `documentId` and `acknowledgedUtc` from T1a's `sidecars\ledger.json`, in one function.
+- **Two shared helpers:** `WorkloadHelpers.ps1`'s two `ValidateSet`s take `RcaSidecarExport` and `RcaAck`; `Invoke-DemoOneLakeRequest` returns a file that OneLake sends as bytes as its UTF-8 text, as the acknowledgement needs.
+
+**The coordinator's decisions (2026-11-23).**
+
+1. `rca ack` exits 0 for IDs the runner no longer holds; T1a, and T1c's command wiring, keep it.
+2. A stop handed to the session control fetches no sidecars, as v1 exports nothing there; Run all's path is a later release.
+3. Any other file in the guest's `sidecars\` counts as unacknowledged, so the golden guard fails safe.
+4. The changes outside T2a's files are accepted: the two `ValidateSet`s, the UTF-8 decoding, and the save paths' test mocks.
+
+**Changed files.**
+
+- **The module:** `Private/RcaExportHelpers.ps1` (the sidecar's functions; v1's keep their behavior), `HistorySnapshotHelpers.ps1`, `FabricCapacityHelpers.ps1`, `GoldenHelpers.ps1`, `WorkloadHelpers.ps1`, `OneLakeHelpers.ps1`, and `Public/Stop-DemoEnvironment.ps1` and `New-DemoT2GoldenSnapshot.ps1`;
+- **the scripts:** `scripts/configure-fabric.ps1`;
+- **the VM:** `vm/bootstrap/Invoke-DemoGoldenGuest.ps1`;
+- **the tests:** `DbHubDemo.RcaSidecar.Tests.ps1` (new), and additions to `DbHubDemo.HistorySnapshot`, `DbHubDemo.Golden`, `Vm.GoldenGuest`, `DbHubDemo.FirstRun`, `DbHubDemo.Lifecycle`, and `DbHubDemo.Fabric`;
+- **the docs:** `AGENTS.md`, `docs/troubleshooting.md`, and this report.
+
+**Validation.**
+
+- **Pester,** under strict mode with the Azure CLI guard, one file at a time while the PC's CPU was saturated: `DbHubDemo.RcaSidecar` 24, `DbHubDemo.HistorySnapshot` 37, `DbHubDemo.Golden` 124, `Vm.GoldenGuest` 29, `DbHubDemo.FirstRun` 105, `DbHubDemo.Lifecycle` 298, and `DbHubDemo.Fabric` 53 passed, with no Azure CLI call.
+- **The spec's cases,** each a test that fails without its change: F1, F3 to F9, F11, L3, M2 with both kinds of older VM, the order in each save path, the golden guard (refused for a sidecar alone with nothing deleted, captured after its acknowledgement, and the clear block's own refusal), and lists and a ledger that can't be read.
+- **Lint and checks:** PSScriptAnalyzer found nothing in the 17 changed PowerShell files (the VM settings for `vm/bootstrap`), all ASCII; markdownlint-cli2 0.23.3 on the docs; the leak check prints nothing.
+
+**Risks and what its live check needs.**
+
+- **Nothing has met a real runner yet:** T1a's runner, T2b's control script, and B's notebook meet first in the live proof, on a new deployment and on an update. It needs: `rca ack`'s exit code for IDs it no longer holds; a 3,400-character index line through T2's host within the Run Command's 4 KB; OneLake's answer for the acknowledgement; and the drain's bounds behind a real capacity queue.
+- **Run all's sessions leave their sidecars on the VMs** until a history save from the scripts, or Run all's own path in a later release; one sealed more than 30 days before such a save is lost, which the line says ("expired unread").
+- **A stop handed to the session control** fetches none, so after Run all sessions the scripts' save that brings them in is `./scripts/start-demo.ps1`, then `./scripts/stop-demo.ps1 -SaveHistory` ([troubleshooting](troubleshooting.md#the-incident-rcas-capture)).
