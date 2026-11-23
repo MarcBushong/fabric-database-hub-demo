@@ -32,6 +32,11 @@ c. A read-back of the copy, per analysis: rows, rows worked out, rows with a kep
    kept_value.
 d. kept_value_step again, which should find nothing left to work out (a rerun changes nothing).
 e. DROP TABLE of the copy, always, unless -KeepCopy.
+With -ExportPath too, between d. and e.: every row of the resolved copy goes to a local JSON lines file, for F35's live
+proof (fabric/app/scripts/f35-proof.ts): target, analysis, metric, value, grain_minutes, kept_value, and bucket_utc,
+captured_at_utc, window_start_utc, window_end_utc, and resolved_at_utc as ISO 8601 UTC text (the session's time zone set to
+UTC first). It's read in pages, each a statement whose output stays small: an analysis, or a day of it, or an hour of that
+day, so each holds at most -ExportPageRows rows where the data allow. Nothing is written to the lakehouse.
 
 Results (ADR 0012), printed and written as JSON lines to -OutputPath:
 - PROBE.LIVY.SESSION: Pass when the session started; Fail when Fabric refused it (its status and error code are in the
@@ -41,9 +46,10 @@ Results (ADR 0012), printed and written as JSON lines to -OutputPath:
 - PROBE.LIVY.DELETE: Pass when the session was deleted.
 - PROBE.LIVY.TOKEN: the answer. Pass when the Azure CLI's token started a session, ran SQL, and read the lakehouse;
   Fail when Fabric refused it.
-- With -KeptValueModule: PROBE.KEPTVALUE.COPY, .LOAD, .STEP, .READBACK, .RERUN, and .DROP, one per step above, and
-  PROBE.KEPTVALUE.SMOKE, its answer: Pass when the step worked out every row of the copy with form Kept and no error,
-  the read-back found the three columns, and the rerun had nothing left.
+- With -KeptValueModule: PROBE.KEPTVALUE.COPY, .LOAD, .STEP, .READBACK, .RERUN, .EXPORT (with -ExportPath), and .DROP,
+  one per step above, and PROBE.KEPTVALUE.SMOKE, its answer: Pass when the step worked out every row of the copy with
+  form Kept and no error, the read-back found the three columns, and the rerun had nothing left. An export that doesn't
+  have every row of the copy is a Fail.
 Exit code: 0 without a Fail, 1 with one.
 
 Sources (checked 2026-11-23):
@@ -73,11 +79,20 @@ of a whole history can take minutes: raise -TimeoutMinutes for a long one.
 .PARAMETER KeepCopy
 With -KeptValueModule: keep the scratch copy for inspection; the result says how to drop it.
 
+.PARAMETER ExportPath
+With -KeptValueModule: a local JSON lines file for every row of the resolved copy (step f. above). It's overwritten.
+
+.PARAMETER ExportPageRows
+With -ExportPath: the most rows a page holds where the data allow (an analysis, then a day of it, then an hour).
+
 .EXAMPLE
 pwsh -NoProfile -File ./tests/integration/Invoke-LivyTokenProbe.ps1 -ConfigPath ./config/demo.config.json
 
 .EXAMPLE
 pwsh -NoProfile -File ./tests/integration/Invoke-LivyTokenProbe.ps1 -ConfigPath ./config/demo.config.json -KeptValueModule ./fabric/history/kept_value.py -TimeoutMinutes 20
+
+.EXAMPLE
+pwsh -NoProfile -File ./tests/integration/Invoke-LivyTokenProbe.ps1 -ConfigPath ./config/demo.config.json -KeptValueModule ./fabric/history/kept_value.py -TimeoutMinutes 20 -ExportPath ./out/f35-export.jsonl
 #>
 [CmdletBinding()]
 param(
@@ -92,7 +107,12 @@ param(
 
     [string] $KeptValueModule = '',
 
-    [switch] $KeepCopy
+    [switch] $KeepCopy,
+
+    [string] $ExportPath = '',
+
+    [ValidateRange(500, 50000)]
+    [int] $ExportPageRows = 5000
 )
 
 Set-StrictMode -Version Latest
@@ -216,6 +236,12 @@ if ($KeptValueModule) {
     if (-not $keptValueText.Contains('def kept_value_step(')) {
         throw "The module to smoke-test has no kept_value_step function: $KeptValueModule."
     }
+}
+if ($ExportPath) {
+    if (-not $KeptValueModule) {
+        throw '-ExportPath goes with -KeptValueModule: it exports the scratch copy that kept_value_step worked out.'
+    }
+    $ExportPath = Resolve-DemoUserPath -Path $ExportPath
 }
 $config = Get-DemoConfig -Path $ConfigPath
 try {
@@ -541,6 +567,134 @@ $deadline = { param([datetime] $Start) $Start.AddMinutes($TimeoutMinutes) }
                     & $smokeAdd 'PROBE.KEPTVALUE.RERUN' 'Warning' ('kept_value_step''s rerun wrote {0:N0} rows and left {1:N0}{2}; a rerun should find nothing left.' -f $again, $left, $(if ($rerunError) { ' ({0})' -f $rerunError } else { '' })) $rerunEvidence
                 }
             }
+
+            # With -ExportPath (between d. and e. above): every row of the resolved copy, as JSON lines in a local file, for F35's
+            # live proof (fabric/app/scripts/f35-proof.ts). Nothing is written to the lakehouse. Pages keep each statement's output
+            # small: an analysis, or a day of it, or an hour of that, at most -ExportPageRows rows where the data allow.
+            if ($ExportPath) {
+                $exportWatch = [System.Diagnostics.Stopwatch]::StartNew()
+                $exportEvidence = [ordered]@{ path = $ExportPath; pageRows = $ExportPageRows }
+                $planCode = @(
+                    'import json'
+                    'from pyspark.sql import functions as F'
+                    'spark.conf.set("spark.sql.session.timeZone", "UTC")'
+                    ('frame = spark.table("{0}")' -f $copyName)
+                    'groups = frame.groupBy(F.col("analysis"), F.date_format(F.col("bucket_utc"), "yyyy-MM-dd").alias("day"), F.date_format(F.col("bucket_utc"), "HH").alias("hour")).count().collect()'
+                    'print("DBHUB_PROBE " + json.dumps([[g["analysis"], g["day"], g["hour"], g["count"]] for g in groups]))'
+                ) -join "`n"
+                $plan = & $runStatement 'pyspark' $planCode
+                $planLine = @(([string]$plan.Full) -split "`r?`n" | Where-Object { $_.StartsWith('DBHUB_PROBE ', [System.StringComparison]::Ordinal) }) | Select-Object -Last 1
+                $groups = $null
+                if ($plan.Ok -and $planLine) {
+                    try {
+                        $groups = @($planLine.Substring('DBHUB_PROBE '.Length) | ConvertFrom-Json -Depth 8 -NoEnumerate)
+                    }
+                    catch {
+                        $groups = $null
+                    }
+                }
+                if ($null -eq $groups) {
+                    $exportEvidence['output'] = $plan.Text
+                    & $smokeAdd 'PROBE.KEPTVALUE.EXPORT' 'Fail' ('The copy''s rows weren''t counted for the export: {0}' -f $plan.Text) $exportEvidence
+                    break probe
+                }
+                # Each group: analysis, day (yyyy-MM-dd, or null without a bucket), hour (HH), rows.
+                $entries = @(foreach ($group in @($groups[0])) {
+                        [pscustomobject]@{ Analysis = $group[0]; Day = $group[1]; Hour = $group[2]; Rows = [long]$group[3] }
+                    })
+                $pages = [System.Collections.Generic.List[object]]::new()
+                foreach ($analysis in @($entries | Group-Object -Property { [string]$_.Analysis })) {
+                    $name = $analysis.Group[0].Analysis
+                    $analysisRows = [long](($analysis.Group | Measure-Object -Property Rows -Sum).Sum)
+                    if ($analysisRows -le $ExportPageRows) {
+                        $pages.Add([pscustomobject]@{ Analysis = $name; Day = '*'; Hour = '*'; Rows = $analysisRows })
+                        continue
+                    }
+                    foreach ($day in @($analysis.Group | Group-Object -Property { [string]$_.Day })) {
+                        $dayValue = $day.Group[0].Day
+                        $dayRows = [long](($day.Group | Measure-Object -Property Rows -Sum).Sum)
+                        if ($dayRows -le $ExportPageRows -or $null -eq $dayValue) {
+                            $pages.Add([pscustomobject]@{ Analysis = $name; Day = $dayValue; Hour = '*'; Rows = $dayRows })
+                            continue
+                        }
+                        foreach ($hour in $day.Group) {
+                            $pages.Add([pscustomobject]@{ Analysis = $name; Day = $dayValue; Hour = $hour.Hour; Rows = [long]$hour.Rows })
+                        }
+                    }
+                }
+                $expected = [long](($entries | Measure-Object -Property Rows -Sum).Sum)
+                $exportEvidence['pages'] = $pages.Count
+                $exportEvidence['copyRows'] = $expected
+                $folder = Split-Path -Path $ExportPath -Parent
+                if ($folder -and -not (Test-Path -LiteralPath $folder)) {
+                    $null = New-Item -ItemType Directory -Path $folder -Force
+                }
+                $written = [long]0
+                $failure = ''
+                $writer = [System.IO.StreamWriter]::new($ExportPath, $false, [System.Text.UTF8Encoding]::new($false))
+                try {
+                    $writer.NewLine = "`n"
+                    foreach ($page in $pages) {
+                        # A JSON string is a Python string literal too, so names reach the code as data.
+                        $where = [System.Collections.Generic.List[string]]::new()
+                        $where.Add($(if ($null -eq $page.Analysis) { 'F.col("analysis").isNull()' } else { 'F.col("analysis") == {0}' -f (ConvertTo-Json -InputObject ([string]$page.Analysis) -Compress) }))
+                        if ($null -eq $page.Day) {
+                            $where.Add('F.col("bucket_utc").isNull()')
+                        }
+                        elseif ([string]$page.Day -ne '*') {
+                            $where.Add(('F.date_format(F.col("bucket_utc"), "yyyy-MM-dd") == {0}' -f (ConvertTo-Json -InputObject ([string]$page.Day) -Compress)))
+                        }
+                        if ([string]$page.Hour -ne '*' -and $null -ne $page.Hour) {
+                            $where.Add(('F.date_format(F.col("bucket_utc"), "HH") == {0}' -f (ConvertTo-Json -InputObject ([string]$page.Hour) -Compress)))
+                        }
+                        $pageCode = @(
+                            'import json, math'
+                            'from pyspark.sql import functions as F'
+                            'spark.conf.set("spark.sql.session.timeZone", "UTC")'
+                            'ISO = "yyyy-MM-dd''T''HH:mm:ss.SSSSSS''Z''"'
+                            'TIMES = ("bucket_utc", "captured_at_utc", "window_start_utc", "window_end_utc", "resolved_at_utc")'
+                            ('page = spark.table("{0}").where({1})' -f $copyName, (@($where | ForEach-Object { '({0})' -f $_ }) -join ' & '))
+                            'rows = page.select("target", "analysis", "metric", "value", "grain_minutes", "kept_value", *[F.date_format(F.col(n), ISO).alias(n) for n in TIMES]).orderBy("target", "metric", "bucket_utc", "captured_at_utc").collect()'
+                            'def number(x):'
+                            '    return None if x is None or (isinstance(x, float) and not math.isfinite(x)) else x'
+                            'lines = [json.dumps({"target": r["target"], "analysis": r["analysis"], "metric": r["metric"], "bucket_utc": r["bucket_utc"], "captured_at_utc": r["captured_at_utc"], "window_start_utc": r["window_start_utc"], "window_end_utc": r["window_end_utc"], "value": number(r["value"]), "grain_minutes": r["grain_minutes"], "kept_value": number(r["kept_value"]), "resolved_at_utc": r["resolved_at_utc"]}) for r in rows]'
+                            'print("DBHUB_EXPORT %d" % len(lines))'
+                            'print("\n".join(lines))'
+                        ) -join "`n"
+                        $answer = & $runStatement 'pyspark' $pageCode
+                        $lines = @(([string]$answer.Full) -split "`r?`n" | Where-Object { $_.Trim() })
+                        $header = [array]::FindIndex([string[]]$lines, [Predicate[string]] { param($Line) $Line.StartsWith('DBHUB_EXPORT ', [System.StringComparison]::Ordinal) })
+                        $count = -1
+                        if ($answer.Ok -and $header -ge 0) {
+                            $count = [int]$lines[$header].Substring('DBHUB_EXPORT '.Length)
+                        }
+                        $body = if ($header -ge 0) { @($lines | Select-Object -Skip ($header + 1)) } else { @() }
+                        if ($count -lt 0 -or $body.Count -ne $count -or $count -ne $page.Rows) {
+                            $failure = 'the page for {0}, day {1}, hour {2} returned {3} of its {4} rows{5}' -f $page.Analysis, $(if ($null -eq $page.Day) { 'none' } else { $page.Day }), $page.Hour, $(if ($count -lt 0) { 'none' } else { $body.Count }), $page.Rows, $(if (-not $answer.Ok) { ' ({0})' -f $answer.Text } else { '' })
+                            break
+                        }
+                        foreach ($line in $body) {
+                            $writer.WriteLine($line)
+                        }
+                        $written += $body.Count
+                    }
+                }
+                finally {
+                    $writer.Dispose()
+                }
+                $exportEvidence['exportedRows'] = $written
+                $exportEvidence['seconds'] = [int]$exportWatch.Elapsed.TotalSeconds
+                Write-DemoLog -Message ('Exported {0:N0} rows of the copy''s {1:N0} to {2}, in {3} pages.' -f $written, $expected, $ExportPath, $pages.Count)
+                if ($failure) {
+                    & $smokeAdd 'PROBE.KEPTVALUE.EXPORT' 'Fail' ('The export stopped: {0}; {1:N0} rows of the copy''s {2:N0} are in {3}.' -f $failure, $written, $expected, $ExportPath) $exportEvidence ('Run the probe again with a smaller -ExportPageRows (now {0}).' -f $ExportPageRows)
+                }
+                elseif ($written -ne $expected) {
+                    & $smokeAdd 'PROBE.KEPTVALUE.EXPORT' 'Fail' ('The export has {0:N0} rows, where the copy has {1:N0}.' -f $written, $expected) $exportEvidence
+                }
+                else {
+                    & $smokeAdd 'PROBE.KEPTVALUE.EXPORT' 'Pass' ('Exported every row of the resolved copy, {0:N0}, to {1} in {2} pages, in about {3} seconds.' -f $written, $ExportPath, $pages.Count, [int]$exportWatch.Elapsed.TotalSeconds) $exportEvidence
+                }
+            }
         }
         #endregion
     }
@@ -601,6 +755,9 @@ else {
     & $add 'PROBE.LIVY.TOKEN' 'Warning' 'The probe didn''t reach an answer (PROBE.LIVY.* says why); it isn''t a refusal of the token.' @{} 'Fix what PROBE.LIVY.* names, then run the probe again.'
 }
 if ($KeptValueModule) {
+    if ($ExportPath -and -not $smokeStatus.Contains('PROBE.KEPTVALUE.EXPORT')) {
+        & $smokeAdd 'PROBE.KEPTVALUE.EXPORT' 'Not selected' 'The smoke test stopped before the export (PROBE.KEPTVALUE.* says why), so nothing was exported.'
+    }
     $needed = @('PROBE.KEPTVALUE.STEP', 'PROBE.KEPTVALUE.READBACK', 'PROBE.KEPTVALUE.RERUN')
     $failed = @($smokeStatus.Keys | Where-Object { $smokeStatus[$_] -eq 'Fail' })
     if ($failed.Count -gt 0) {
