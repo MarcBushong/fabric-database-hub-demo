@@ -729,6 +729,28 @@ Describe 'configure-fabric.ps1' {
         $sent.PSObject.Properties.Name | Should -Not -Contain 'POSTGRES_METRICS' -Because 'with -FabricToken no subscription guard runs, so Azure Monitor isn''t read'
     }
 
+    It 'works out the run''s kept values through Livy after -RunLiveActivity''s run completed, with the run''s token, and not after a run that failed (F35, 2026-11-23)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        Mock -CommandName Invoke-DemoHistoryKeptValue -MockWith { New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'worked out' }
+        foreach ($job in 'Completed', 'Failed') {
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
+                @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = $job }) }
+                @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$itemId/jobs/instances/$operationId" }) }
+            )
+            $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
+            $kept = @(Read-ImportResult | Where-Object checkId -EQ 'FABRIC.KEPTVALUE')
+            if ($job -eq 'Completed') {
+                $kept.Count | Should -Be 1
+                $kept[0].status | Should -Be 'Pass'
+            }
+            else {
+                $kept.Count | Should -Be 0 -Because 'a run that failed saved nothing to work out'
+            }
+        }
+        Should -Invoke -CommandName Invoke-DemoHistoryKeptValue -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'FABRIC.KEPTVALUE' -and $null -ne $Token -and [string]$Config['fabric']['workspaceId'] -eq $workspaceId }
+    }
+
     It 'adds the PostgreSQL metrics stop-demo.ps1 kept for a paused capacity with -PostgresMetricsPath, then moves the file aside (ADR 0025)' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
         $pending = Join-Path -Path $TestDrive -ChildPath 'history-pending'
