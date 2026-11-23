@@ -80,7 +80,7 @@ Query Store records every statement a database runs, the capture's and the harne
        - the observer's snapshot clear, and its limits' `SET` statements;
        - Npgsql 10.0.3's type loading.
 
-       Both sides are compared with comments stripped, white space collapsed, and a final semicolon dropped. A row whose text Query Store didn't keep stays as evidence. The rule covers the windows where an earlier runner's statements ran without the marker, which the first read after an update reaches. It also covers a `search_path` that Query Store kept from a query's first capture, which the live check L0c measures.
+       Both sides are compared with comments stripped, white space collapsed, and a final semicolon dropped. A text Query Store cut short (within one byte of `pg_qs.max_query_text_length`) matches an observer statement it begins; a shorter workload text that only begins like one stays as evidence. A row whose text Query Store didn't keep stays as evidence. The rule covers the windows where an earlier runner's statements ran without the marker, which the first read after an update reaches. It also covers a `search_path` that Query Store kept from a query's first capture, which the live check L0c measures.
 2. **The harness's bookkeeping and control modules,** which the demo marks where it defines them, so a rename carries the mark:
    - **SQL Server:** the extended property `dbhubdemo.role` = `harness` on every module `database/common/110-demo-control.sql` creates. RCA-SQL-10 and 14 leave out every statement whose `object_id` carries it.
    - **PostgreSQL:** `COMMENT ON ROUTINE ... IS 'dbhubdemo:harness'` on its control routines. Query Store records a statement nested in a function without its function (`pg_qs.query_capture_mode` `all`). So, at the observer's start, RCA-PG-16 reads the marked routines and the tables they write.
@@ -205,7 +205,7 @@ What the observer captures beyond the evidence document, in documents of their o
 
   Each is timed within its read's period (`time_from_utc` to `event_time_utc`).
 - **Coverage:** `rca_query_coverage` holds one row per target per sidecar: Query Store's state and capture mode as read, the intervals read, PostgreSQL's pending publication, and the gaps:
-  - Query Store off or read-only, a permission, a timeout, an expired pending range, the sidecar's budget;
+  - Query Store off or read-only, a permission (the gap names the grant that fixes it: for example RCA-PG-17's `pg_read_all_stats`, which T4's read replica has once T4 does, since a replica copies its primary's roles; or RCA-AZ-04's server role), a timeout, an expired pending range, the sidecar's budget;
   - on a Burstable T4: Query Store is off, as Learn advises there;
   - on T2's kept PaygWizard guest: not captured, because its runner identity has no `VIEW DATABASE STATE`, with `RCA.CAPTURE.T2`'s fix.
 
@@ -216,7 +216,7 @@ PostgreSQL shows an interval only once it ends and is persisted ("Data that the 
 - **The watermark:** `rca\query-watermark\T4.json` in the store, outside the spans: the newest persisted interval end read, and the pending ranges, each with its session and span.
 - **The backfill:** whenever the observer runs with T4 reachable (the next session's start, or a save's `rca sidecar-export` while T4 runs), it reads the pending ranges' intervals into a sidecar of the original session and span, with `rca_query_coverage.backfill` true.
 - **Until then,** the coverage says "pending publication", never "not captured". A range older than T4's retention (`pg_qs.retention_period_in_days`, 7 by default) expires as a gap that says so.
-- **A stop in the window:** the demo's stops stop T4 mid-window, and Learn doesn't say whether a stop keeps the window that's still in memory. So the observer records T4's start time (`pg_postmaster_start_time()`) with each read and pending range. A backfill that finds no rows for a range T4 restarted after says it was lost when T4 stopped, never pending or not captured.
+- **A stop in the window:** the demo's stops stop T4 mid-window, and Learn doesn't say whether a stop keeps the window that's still in memory. So RCA-PG-13 records T4's start time (`pg_postmaster_start_time()`) with each read and pending range. A backfill that finds T4 restarted since closes the range: it writes what Query Store shows, and the part after the newest interval it shows is "Lost when T4 stopped", never pending or not captured. Like any rule on what Query Store lacks, it can't tell an interval in which nothing ran from a lost one. The live check L0a measures whether a stop keeps the window.
 
 ### Who holds T4's connections
 
@@ -316,6 +316,7 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 | A session's sidecars | 96 KiB of gzip, apart from the evidence documents': 64 KiB on T1's VM and 32 KiB in T2's guest, the evidence documents' split | A budget of their own, so Query Store never crowds out the evidence document. Each host's reducer cuts across its spans by priority |
 | `RCA_SIDECAR_FILE` | 64 parts and 262,144 bytes, of whole documents | The rest waits on the VMs for the next save, which the save's line says |
 | `rca sidecar-export`'s index | 8 sidecars a page, 3,400 characters | A managed Run Command keeps the last 4 KB of output |
+| An open span's evidence window | Ends up to one Query Store block's length early: about 5 s, or 20 s for an `azure_sys` block | `rca export` of an open span (the runbook's re-check, or a mid-session save) ends each target's window at `span.json`'s persisted watermark, which a running sidecar block holds back, as a slow evidence block already does. The next document starts there, so no row is lost or doubled, and a closed span's final export is unaffected. Accepted as timing variance, not a version change (the coordinator's decision, 2026-11-23) |
 
 **A sidecar's cuts.** The reducer fits a sidecar to the smaller of 64 KiB and what's left of its host's session budget, never less than 2 KiB. It cuts in this order, each step only as far as it must, and each cut is a line in its target's `rca_query_coverage` gaps:
 
