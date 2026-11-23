@@ -149,9 +149,18 @@ What the observer captures beyond the evidence document, in documents of their o
 | Everything else | As the evidence document's (`sessionId`, `producer`, the window, `sequence`, `final`, `targets`, `epochUtc`, `strings`, `tables`), with no `answerKey`. Each target has an `rca_query_coverage` row |
 
 - **Its tables** ([history-tables.json](history-tables.json), document `sidecar`): `rca_query_stats`, `rca_query_waits`, `rca_query_plans`, `rca_query_events`, `rca_query_coverage`, and `rca_connections`, encoded as the evidence document's tables are. The evidence document never holds one, and a sidecar never holds an evidence table.
-- **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.jsonl`, beside its evidence files, which the evidence export never reads. A span stays until its sidecars are acknowledged, or for 30 days.
+- **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.jsonl`, beside its evidence files, which the evidence export never reads.
+- **Sealed outside the spans:** the runner seals a span's rows into the store's `sidecars\` folder:
+  - at every export that reads the span, the evidence document's included, whose output doesn't change;
+  - at the span's end;
+  - at the observer's start, for a span left unsealed.
+
+  It never keeps them in `exports\`, which an older runner's retention empties after 7 days. It doesn't delete a span whose rows aren't sealed. A sealed sidecar stays until it's acknowledged, or for 30 days after its sealing.
 - **One per span per export:** `rca sidecar-export` makes one sidecar for each span with new rows, and offers a sidecar not yet acknowledged again (state `pending`) at every later call.
-- **Its session:** a sidecar keeps its span's session, as the evidence document does, a backfill's included ([pending publication](#pending-publication)). The notebook writes a sidecar's rows under that session's run, `session-<sessionId>`, whichever run reads it, and a sidecar with no session under the reading run's `RUN_ID`. On the scripts' path, which fetches a Run all session's sidecars at a later save, the evidence lands with its session, never with the save.
+- **Its session:** a sidecar keeps its span's session, as the evidence document does, a backfill's included ([pending publication](#pending-publication)).
+  - **Binding:** the first export of either kind that takes from a span binds it to its caller's session, as `rca export` does.
+  - **Its run:** the notebook writes a sidecar's rows under that session's run, `session-<sessionId>`, whichever run reads it, and a sidecar with no session under the reading run's `RUN_ID`.
+  - **On the scripts' path,** which fetches a Run all session's sidecars at a later save, the evidence lands with its session, never with the save.
 
 ### Query Store
 
@@ -195,6 +204,7 @@ PostgreSQL shows an interval only once it ends and is persisted ("Data that the 
 - **The watermark:** `rca\query-watermark\T4.json` in the store, outside the spans: the newest persisted interval end read, and the pending ranges, each with its session and span.
 - **The backfill:** whenever the observer runs with T4 reachable (the next session's start, or a save's `rca sidecar-export` while T4 runs), it reads the pending ranges' intervals into a sidecar of the original session and span, with `rca_query_coverage.backfill` true.
 - **Until then,** the coverage says "pending publication", never "not captured". A range older than T4's retention (`pg_qs.retention_period_in_days`, 7 by default) expires as a gap that says so.
+- **A stop in the window:** the demo's stops stop T4 mid-window, and Learn doesn't say whether a stop keeps the window that's still in memory. So the observer records T4's start time (`pg_postmaster_start_time()`) with each read and pending range. A backfill that finds no rows for a range T4 restarted after says it was lost when T4 stopped, never pending or not captured.
 
 ### Who holds T4's connections
 
@@ -204,11 +214,18 @@ PostgreSQL shows an interval only once it ends and is persisted ("Data that the 
 
 ### Acknowledgement
 
-The notebook acknowledges every sidecar payload it reads, by document ID, in `Files/rca/acks/<payload's name>.ack.json` (transport.schema.json, `ack`). Each document is `written` (by this run), `already` (an earlier run wrote it), or `skipped`, with the reason.
+The notebook acknowledges every sidecar payload it reads, by document ID, in `Files/rca/acks/<the payload's name without .json>.ack.json` (transport.schema.json, `ack`; for the payload `Files/rca/inbox/sidecar-20261121T102531Z.json`, `Files/rca/acks/sidecar-20261121T102531Z.ack.json`). Each document is `written` (by this run), `already` (an earlier run wrote it), or `skipped`, with the reason.
 
+- **Exactly once:**
+  - the notebook writes a sidecar's rows table by table, replacing any rows of its `document_id` that an earlier run wrote, and its `rca_query_coverage` rows last;
+  - a document is `already` only when its coverage rows are there, so a run that stopped halfway through a document is completed by the next, never skipped;
+  - `written` and `already` both mean every table holds the document's rows.
+- **The acknowledgement file** names its payload and lists exactly that payload's documents. The notebook writes it once every one of them is committed. A reader treats one whose payload or documents differ from what it staged as missing.
+- **No acknowledgement** when the run doesn't save its results (`SAVE_RESULTS` false, outside `RCA_ONLY`), or can't read the payload: a missing acknowledgement, so everything in the payload stays pending.
 - **It deletes a payload** only when every document in it is `written` or `already`. A payload that holds a skipped document stays until its documents are acknowledged, or for 30 days.
 - **The scripts read the acknowledgement,** never the payload's disappearance. They run `rca ack` for the written documents on the VMs that hold them, and keep the rest pending with the reason.
-- **The runner** keeps an unacknowledged sidecar, and offers it again, until it's acknowledged or 30 days have passed.
+- **When the VMs are already stopped:** `stop-demo.ps1 -SaveHistory` runs the notebook after the VMs deallocate. So it keeps the written IDs per VM in `out/history-pending/`, and the next export with that VM running sends `rca ack` first. `deploy.ps1`'s snapshot and `configure-fabric.ps1 -RunLiveActivity` run the notebook while the VMs run, and acknowledge at once.
+- **The runner** keeps an unacknowledged sidecar, and offers it again, until it's acknowledged or 30 days have passed. A sidecar offered again after it was written is `already`, so nothing is written twice.
 - **The evidence document** keeps today's transport: acknowledging it by ID is a later change, with its own proof.
 
 ## Transport
@@ -267,9 +284,9 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 
 ### `RCA_SIDECAR_FILE`
 
-`NB_DatabaseHub_LiveActivity`'s parameter for sidecars: a path in the demo's lakehouse, `Files/rca/inbox/<name>.json` (transport.schema.json, `sidecarFile`), to a file that holds exactly one `ContosoCare.RcaSidecarParts` document (`sidecarParameter`): every part line of the sidecars a save fetched, at most 64.
+`NB_DatabaseHub_LiveActivity`'s parameter for sidecars: a path in the demo's lakehouse, `Files/rca/inbox/sidecar-<yyyyMMddTHHmmssZ>[-<name>].json` (transport.schema.json, `sidecarFile`), to a file that holds exactly one `ContosoCare.RcaSidecarParts` document (`sidecarParameter`): every part line of the sidecars a save fetched, at most 64.
 
-- **Staging:** the scripts write it as they write `RCA_EVIDENCE_FILE`, and only when the workspace's notebook declares the parameter (`Test-DemoFabricNotebookParameter`). For an older or edited notebook they stage none, leave the sidecars pending, and say so in a Warning with the fix.
+- **Staging:** the scripts write it as they write `RCA_EVIDENCE_FILE`, and only when the workspace's notebook declares the parameter (`Test-DemoFabricNotebookParameter`). For an older or edited notebook they stage none, leave the sidecars pending, and say so in a Warning with the fix. Its name starts with `sidecar-`, which the sweep of evidence files staged more than a day ago never matches: a sidecar payload goes by [acknowledgement](#acknowledgement).
 - **Reading:** as `RCA_EVIDENCE_FILE` (`notebookutils.fs.head`, 262,144 bytes). It writes each sidecar once, by `documentId`, replacing that document's earlier rows, under its session's run ([the sidecar](#the-sidecar)), acknowledges the payload ([acknowledgement](#acknowledgement)), and reports `RCA.SIDECAR` with ADR 0012's statuses, as `RCA_EVIDENCE` reports `RCA.EVIDENCE`.
 - **The deployment notebook's purge** removes the sidecar's six tables with the others, and `Files/rca/acks` with `Files/rca/inbox` (history-tables.json, `purge` and `purgeFiles`).
 
@@ -284,7 +301,8 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 | A bundle | 6 parts, 24,000 bytes | The runbook's existing bound for the metrics secret |
 | The bundle index | 16 bundles, 4,000 bytes | Inside the metrics document's 24,000 bytes |
 | A sidecar | 64 KiB of gzip (at most 28 parts), as a document | The reducer cuts waits past each plan's first three, then plan summaries, then the lowest-ranked queries, each cut a gap in `rca_query_coverage` |
-| A session's sidecars | 96 KiB of gzip, apart from the evidence documents' (at most 64 parts in `RCA_SIDECAR_FILE`) | A budget of their own, so Query Store never crowds out the evidence document |
+| A session's sidecars | 96 KiB of gzip, apart from the evidence documents': 64 KiB on T1's VM and 32 KiB in T2's guest, the evidence documents' split | A budget of their own, so Query Store never crowds out the evidence document. Each host's reducer cuts across its spans by priority |
+| `RCA_SIDECAR_FILE` | 64 parts and 262,144 bytes, of whole documents | The rest waits on the VMs for the next save, which the save's line says |
 | `rca sidecar-export`'s index | 8 sidecars a page, 3,400 characters | A managed Run Command keeps the last 4 KB of output |
 
 ## Versioning
@@ -294,6 +312,12 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 - A consumer accepts only the versions it knows and reports any other as a **Warning** whose fix is `./scripts/deploy.ps1`, which updates the runner, the runbook, the notebooks, the model, and the app in one run.
 - Older pieces degrade and say so: an older runner has no `rca` commands (`RCA.EXPORT` **Warning**); an older notebook ignores `RCA_EVIDENCE`; a session saved before the feature has no RCA rows, and the app says "no RCA capture recorded" for its windows.
 - **A sidecar is invisible to the pieces that predate it:** its own command, part marker, and notebook parameter. They never reject or lose one; they leave it pending on the VM, where the runner keeps it until a newer piece acknowledges it.
+- **An older runner installed over a newer one:**
+  - it neither deletes nor offers the sealed sidecars, and a newer runner offers them again, until 30 days after their sealing;
+  - T4's pending ranges wait in `query-watermark\` within T4's retention;
+  - only the rows of a session whose runner was replaced mid-session can go, with their span.
+
+  Before installing an older runner, a scripts' save with the VMs running takes every sealed sidecar into the history: `./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity`, again while its line says sidecars still wait.
 
 ## Who builds what in Phase 1
 

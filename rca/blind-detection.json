@@ -22,7 +22,7 @@
   },
   "detectionCode": {
     "app": { "include": ["fabric/app/src/rca/**/*.ts", "fabric/app/src/rca/**/*.tsx"], "exclude": ["**/*.test.ts", "**/*.test.tsx", "**/testdata/**"] },
-    "runner": { "include": ["workload-generator/src/ContosoCare.Workload/Rca/Observer/**/*.cs", "workload-generator/src/ContosoCare.Workload/Rca/QueryStore/**/*.cs"], "exclude": [] },
+    "runner": { "include": ["workload-generator/src/ContosoCare.Workload/Rca/Observer/**/*.cs", "workload-generator/src/ContosoCare.Workload/Rca/QueryStore/**/*.cs", "workload-generator/src/ContosoCare.Workload/Rca/Sidecar/**/*.cs"], "exclude": [] },
     "exceptions": [
       { "identifier": "ContosoCare.Demo/", "files": ["workload-generator/src/ContosoCare.Workload/Rca/Observer/ApplicationNames.cs"], "why": "The one place that reduces a workload application name to the name the evidence keeps and its run token (rca/README.md, Names)." }
     ]

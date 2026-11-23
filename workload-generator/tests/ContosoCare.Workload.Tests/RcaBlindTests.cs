@@ -134,10 +134,16 @@ public sealed partial class RcaBlindTests
         var files = new List<string>();
         foreach (var pattern in runner.GetProperty("include").EnumerateArray().Select(p => p.GetString()!))
         {
-            // The contract's runner patterns are <folder>/**/<file pattern>.
+            // The contract's runner patterns are <folder>/**/<file pattern>. A folder a builder hasn't created yet has no
+            // files to scan; Rca.Contract.Tests.ps1 checks that every folder under Rca/ is scanned or exempt.
             var split = pattern.Split("/**/");
             Assert.Equal(2, split.Length);
             var folder = Path.Combine(RepositoryPaths.Root, split[0].Replace('/', Path.DirectorySeparatorChar));
+            if (!Directory.Exists(folder))
+            {
+                continue;
+            }
+
             files.AddRange(Directory.GetFiles(folder, split[1], SearchOption.AllDirectories).Select(f => Path.GetRelativePath(RepositoryPaths.Root, f).Replace('\\', '/')));
         }
 

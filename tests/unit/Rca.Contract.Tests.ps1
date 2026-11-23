@@ -338,8 +338,15 @@ Describe 'The Incident RCA contract: transport fixtures (ADR 0031)' {
         }
         '20261120T165000Z-sqlvm01-0001-sidecar' | Should -Not -Match $defs.documentRef.properties.documentId.pattern
         '20261120T165000Z-sqlvm01-0001' | Should -Not -Match $defs.sidecarId.pattern
-        # A sidecar's file stays in the same inbox, with its own kind and parameter.
-        $defs.sidecarFile.pattern | Should -Be $defs.evidenceFile.pattern
+        # A sidecar's file stays in the same inbox, with its own name, kind, and parameter: sidecar-<UTC>, which the day-old
+        # sweep of evidence files never matches (the notebook's staging rule, acde5510).
+        foreach ($path in 'Files/rca/inbox/sidecar-20261121T102531Z.json', 'Files/rca/inbox/sidecar-20261121T102531Z-stop.json') {
+            $path | Should -MatchExactly $defs.sidecarFile.pattern
+            $path | Should -MatchExactly $defs.evidenceFile.pattern
+        }
+        foreach ($path in 'Files/rca/inbox/rca-20261121T102531Z.json', 'Files/rca/inbox/sidecar-latest.json', 'Files/rca/inbox/sidecar-20261121T102531Z.json.tmp', 'Files/rca/acks/sidecar-20261121T102531Z.json') {
+            $path | Should -Not -MatchExactly $defs.sidecarFile.pattern
+        }
         $defs.sidecarParameter.properties.kind.const | Should -Be 'ContosoCare.RcaSidecarParts'
     }
 
@@ -384,9 +391,10 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
                 Where-Object { $_.Name -notmatch '\.test\.tsx?$' -and $_.FullName -notmatch '[\\/]testdata[\\/]' } |
                 ForEach-Object { $files.Add($_) }
         }
-        # The observer's code and the sidecar's readers (blind-detection.json, detectionCode.runner).
-        foreach ($folder in 'Observer', 'QueryStore') {
-            $observerRoot = Join-Path -Path $repoRoot -ChildPath "workload-generator/src/ContosoCare.Workload/Rca/$folder"
+        # The observer's code and the sidecar's readers and store (blind-detection.json, detectionCode.runner); a folder a
+        # builder hasn't created yet has nothing to scan.
+        foreach ($pattern in @($blind.detectionCode.runner.include)) {
+            $observerRoot = Join-Path -Path $repoRoot -ChildPath ($pattern -split '/\*\*/')[0]
             if (Test-Path -LiteralPath $observerRoot) {
                 Get-ChildItem -LiteralPath $observerRoot -Recurse -File -Filter '*.cs' | ForEach-Object { $files.Add($_) }
             }
@@ -401,6 +409,24 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
             foreach ($hit in (Get-DetectionStringViolation -Text $text)) { '{0}: {1}' -f $relative, $hit }
         }
         @($violations) | Should -BeNullOrEmpty
+    }
+
+    It 'scans every folder of the runner''s RCA code for answer-key names, or says why one is exempt' {
+        # A new folder (the sidecar's store, 2026-11-23) must join blind-detection.json's runner include, or this list.
+        $exempt = @{
+            AnswerKey = 'it records the answer key, which only the evaluation reads'
+            Export    = 'it packs the answer key apart from the evidence; its Reducer.cs is scanned by name (RcaBlindTests)'
+            Store     = 'it keeps the answer key''s file beside the evidence, unread by detection'
+        }
+        $rcaCode = Join-Path -Path $repoRoot -ChildPath 'workload-generator/src/ContosoCare.Workload/Rca'
+        $scanned = @($blind.detectionCode.runner.include | ForEach-Object { ($_ -split '/\*\*/')[0] })
+        foreach ($folder in Get-ChildItem -LiteralPath $rcaCode -Directory) {
+            $relative = 'workload-generator/src/ContosoCare.Workload/Rca/' + $folder.Name
+            ($relative -in $scanned -or $exempt.ContainsKey($folder.Name)) | Should -BeTrue -Because ('{0} holds RCA code that the blind-detection guard neither scans nor exempts' -f $relative)
+        }
+        foreach ($pattern in $scanned) {
+            $pattern | Should -Match '^workload-generator/src/ContosoCare\.Workload/Rca/[A-Za-z]+$'
+        }
     }
 
     It 'keeps the capture catalog off the answer key: no scenario ID, and nothing the workload reports about itself' {
