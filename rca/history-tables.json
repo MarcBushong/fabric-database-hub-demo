@@ -11,7 +11,7 @@
     "date": { "document": "not in the document: the notebook derives it", "model": "dateTime" }
   },
   "notebookColumns": [
-    { "name": "run_id", "type": "string", "model": { "column": "Run ID", "hidden": true }, "description": "The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables." },
+    { "name": "run_id", "type": "string", "model": { "column": "Run ID", "hidden": true }, "description": "The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables. A sidecar's rows take their own session's, session-<sessionId>, whichever run wrote them (rca/README.md, The sidecar)." },
     { "name": "document_id", "type": "string", "model": { "column": "Document ID", "hidden": true }, "description": "The document the row came from (documentId): an evidence document's, or a sidecar's." },
     { "name": "report_date_utc", "type": "date", "model": { "column": "Report Date UTC", "hidden": true }, "description": "The UTC date of the row's primary time; relates the table to Date, as the other history tables." }
   ],

@@ -151,7 +151,7 @@ What the observer captures beyond the evidence document, in documents of their o
 - **Its tables** ([history-tables.json](history-tables.json), document `sidecar`): `rca_query_stats`, `rca_query_waits`, `rca_query_plans`, `rca_query_events`, `rca_query_coverage`, and `rca_connections`, encoded as the evidence document's tables are. The evidence document never holds one, and a sidecar never holds an evidence table.
 - **Where the rows wait:** the observer writes them to each span's own `sidecar-<target>.jsonl`, beside its evidence files, which the evidence export never reads. A span stays until its sidecars are acknowledged, or for 30 days.
 - **One per span per export:** `rca sidecar-export` makes one sidecar for each span with new rows, and offers a sidecar not yet acknowledged again (state `pending`) at every later call.
-- **Its session:** a sidecar keeps its span's session, as the evidence document does, a backfill's included ([pending publication](#pending-publication)), and the notebook applies [`RCA_EVIDENCE`](#rca_evidence)'s session rule to it.
+- **Its session:** a sidecar keeps its span's session, as the evidence document does, a backfill's included ([pending publication](#pending-publication)). The notebook writes a sidecar's rows under that session's run, `session-<sessionId>`, whichever run reads it, and a sidecar with no session under the reading run's `RUN_ID`. On the scripts' path, which fetches a Run all session's sidecars at a later save, the evidence lands with its session, never with the save.
 
 ### Query Store
 
@@ -270,7 +270,7 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 `NB_DatabaseHub_LiveActivity`'s parameter for sidecars: a path in the demo's lakehouse, `Files/rca/inbox/<name>.json` (transport.schema.json, `sidecarFile`), to a file that holds exactly one `ContosoCare.RcaSidecarParts` document (`sidecarParameter`): every part line of the sidecars a save fetched, at most 64.
 
 - **Staging:** the scripts write it as they write `RCA_EVIDENCE_FILE`, and only when the workspace's notebook declares the parameter (`Test-DemoFabricNotebookParameter`). For an older or edited notebook they stage none, leave the sidecars pending, and say so in a Warning with the fix.
-- **Reading:** as `RCA_EVIDENCE_FILE` (`notebookutils.fs.head`, 262,144 bytes), with `RCA_EVIDENCE`'s session rule. It writes each sidecar once (by `documentId`), acknowledges the payload ([acknowledgement](#acknowledgement)), and reports `RCA.SIDECAR` with ADR 0012's statuses, as `RCA_EVIDENCE` reports `RCA.EVIDENCE`.
+- **Reading:** as `RCA_EVIDENCE_FILE` (`notebookutils.fs.head`, 262,144 bytes). It writes each sidecar once, by `documentId`, replacing that document's earlier rows, under its session's run ([the sidecar](#the-sidecar)), acknowledges the payload ([acknowledgement](#acknowledgement)), and reports `RCA.SIDECAR` with ADR 0012's statuses, as `RCA_EVIDENCE` reports `RCA.EVIDENCE`.
 - **The deployment notebook's purge** removes the sidecar's six tables with the others, and `Files/rca/acks` with `Files/rca/inbox` (history-tables.json, `purge` and `purgeFiles`).
 
 ### Limits
