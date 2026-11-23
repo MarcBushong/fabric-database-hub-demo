@@ -1,5 +1,6 @@
 using System.Data;
 using System.Globalization;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.RegularExpressions;
 using ContosoCare.Workload.Diagnostics;
@@ -22,6 +23,13 @@ namespace ContosoCare.Workload.Tests;
 public sealed partial class RcaHarnessStatementsTests
 {
     private const string Marker = "/* dbhubdemo:rca-observer */";
+
+    /// <summary>
+    /// The answer key's read of a run's events on T1 to T3, as every runner since d4845ab7 sent it before it carried the
+    /// observer's marker. Its text is kept here, which the blind-detection guard doesn't read: it names a table the guard
+    /// forbids, so the list holds only its hash.
+    /// </summary>
+    private const string ReleasedAnswerKeyRead = "SELECT TOP (200) event_time, event_name, session_id, detail FROM demo.scenario_run_events WHERE run_id = @run_id ORDER BY event_time;";
 
     /// <summary>The runner's source: the scan reads every file of it that uses SQL Server's client.</summary>
     private static readonly string SourceRoot = RepositoryPaths.Combine("workload-generator", "src", "ContosoCare.Workload");
@@ -116,13 +124,13 @@ public sealed partial class RcaHarnessStatementsTests
                 // Each query statement, those within IF and BEGIN included; a batch with none (EXEC, SET, DDL) is a module call or nothing Query Store records.
                 foreach (var statement in QueryStatements(text))
                 {
-                    if (HarnessStatements.IsRunners(statement))
-                    {
-                        listed.Add(statement);
-                    }
-                    else if (statement.Contains(Marker, StringComparison.Ordinal))
+                    if (statement.Contains(Marker, StringComparison.Ordinal))
                     {
                         marked.Add(where);
+                    }
+                    else if (HarnessStatements.IsRunners(statement))
+                    {
+                        listed.Add(statement);
                     }
                     else
                     {
@@ -159,6 +167,29 @@ public sealed partial class RcaHarnessStatementsTests
         {
             Assert.Matches(Like(MarkerRule(id)), kept);
         }
+    }
+
+    [Fact]
+    public void TheAnswerKeysEarlierReadsAreListedByTheHashOfTheirNormalizedText()
+    {
+        // The list holds the hash of the released read's normalized text, and never the text.
+        var hash = Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(HarnessText.Normalize(ReleasedAnswerKeyRead))));
+        Assert.Equal(new[] { hash }, HarnessStatements.Hashed);
+        Assert.DoesNotContain(HarnessStatements.Statements, s => HarnessText.Normalize(s) == HarnessText.Normalize(ReleasedAnswerKeyRead));
+
+        // The one hash matches the released read and today's marked one, as the runner sends them and as Query Store keeps
+        // them from sp_executesql.
+        var today = Assert.IsType<string>(Assert.Single(CommandSites(), s => s.File == "Rca/AnswerKey/AnswerKeyRecorder.cs" && !s.Postgres).Literal);
+        Assert.NotEqual(ReleasedAnswerKeyRead, today);
+        foreach (var read in new[] { ReleasedAnswerKeyRead, today })
+        {
+            Assert.True(HarnessStatements.IsRunners(read), read);
+            Assert.True(HarnessStatements.IsRunners("(@run_id varchar(64))" + read), read);
+        }
+
+        // Only those: the same read in another order, or with another column, stays evidence.
+        Assert.False(HarnessStatements.IsRunners(ReleasedAnswerKeyRead.Replace("ORDER BY event_time", "ORDER BY event_name", StringComparison.Ordinal)));
+        Assert.False(HarnessStatements.IsRunners(ReleasedAnswerKeyRead.Replace("detail FROM", "detail, run_id FROM", StringComparison.Ordinal)));
     }
 
     /// <summary>

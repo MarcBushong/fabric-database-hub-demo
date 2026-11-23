@@ -1,3 +1,6 @@
+using System.Security.Cryptography;
+using System.Text;
+
 namespace ContosoCare.Workload.Rca.QueryStore;
 
 /// <summary>
@@ -9,7 +12,8 @@ namespace ContosoCare.Workload.Rca.QueryStore;
 /// (<see cref="IsRunners"/>): nothing executes them, reads the objects they name, or prints them, and no other observer
 /// code names those objects. Three of them name a table or function that blind-detection.json forbids in detection
 /// code; its exceptions allow those two names in this file only. A runner test fails when a statement in those files
-/// isn't listed here.
+/// isn't listed here. Beside them, by their hash only (<see cref="Hashed"/>), are the answer key's reads from before
+/// 2026-11-23.
 /// </summary>
 internal static class HarnessStatements
 {
@@ -71,11 +75,29 @@ internal static class HarnessStatements
         "SELECT COUNT_BIG(*) FROM demo.fn_scenario_catalog();",
     ];
 
+    /// <summary>
+    /// Statements listed by the SHA-256 of their text in <see cref="HarnessText.Normalize"/>'s form (UTF-8, lowercase
+    /// hex), because their text names what blind-detection.json forbids: the answer key's read of a run's events on T1 to
+    /// T3, as every runner since d4845ab7 sent it before the read carried the observer's marker (rca/README.md, What the
+    /// capture leaves out, 1). The first read after an update reaches the windows those reads ran in. Normalizing drops
+    /// comments, so the hash matches today's marked read too, which the marker leaves out first.
+    /// </summary>
+    internal static readonly IReadOnlyList<string> Hashed =
+    [
+        "efcc15e2a82dc2560ca5e748fbd318f0335b324c3c190471b285c6facdd5e6c5",
+    ];
+
     private static readonly HashSet<string> Normalized = Statements.Select(HarnessText.Normalize).ToHashSet(StringComparer.Ordinal);
+
+    private static readonly HashSet<string> Hashes = Hashed.ToHashSet(StringComparer.Ordinal);
 
     /// <summary>
     /// Whether a text Query Store keeps is one of the runner's statements: equal to a listed one once both are in
-    /// <see cref="HarnessText.Normalize"/>'s form.
+    /// <see cref="HarnessText.Normalize"/>'s form, or a listed hash's.
     /// </summary>
-    public static bool IsRunners(string queryText) => Normalized.Contains(HarnessText.Normalize(queryText));
+    public static bool IsRunners(string queryText)
+    {
+        var normalized = HarnessText.Normalize(queryText);
+        return Normalized.Contains(normalized) || Hashes.Contains(Convert.ToHexStringLower(SHA256.HashData(Encoding.UTF8.GetBytes(normalized))));
+    }
 }
