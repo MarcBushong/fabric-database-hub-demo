@@ -165,6 +165,31 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
         }
     }
 
+    It 'totals RCA Query Waits nowhere, since no measure of it takes the latest read (review-qs-b)' {
+        # Its rows hold every read of an interval, so a sum over them counts an interval read twice. The app totals them
+        # through latestReads (fabric/app/src/rca), and the chat's guide says so.
+        $tables = Join-Path -Path $modelRoot -ChildPath 'definition/tables'
+        $waits = [System.IO.File]::ReadAllLines((Join-Path -Path $tables -ChildPath 'RCA Query Waits.tmdl'))
+        @($waits | Where-Object { $_ -match '^\s+measure ' }) | Should -BeNullOrEmpty
+        $column = $null
+        $numbers = [System.Collections.Generic.Dictionary[string, string]]::new()
+        foreach ($line in $waits) {
+            if ($line -match "^\s+column '?([^'=]+?)'?\s*$") { $column = $Matches[1] }
+            elseif ($column -and $line -match '^\s+dataType:\s*(int64|double|decimal)\s*$') { $numbers[$column] = '' }
+            elseif ($column -and $line -match '^\s+summarizeBy:\s*(\S+)') { if ($numbers.ContainsKey($column)) { $numbers[$column] = $Matches[1] } }
+        }
+        $numbers.Count | Should -BeGreaterThan 3
+        @($numbers.GetEnumerator() | Where-Object { $_.Value -ne 'none' } | ForEach-Object { $_.Key }) | Should -BeNullOrEmpty -Because 'a number column that summarizes sums every read of an interval in a visual'
+        $readers = foreach ($file in Get-ChildItem -LiteralPath $tables -Filter '*.tmdl' | Where-Object { $_.Name -ne 'RCA Query Waits.tmdl' }) {
+            foreach ($line in [System.IO.File]::ReadAllLines($file.FullName)) {
+                if ($line -notmatch '^\s*///' -and $line.Contains("'RCA Query Waits'")) { '{0}: {1}' -f $file.Name, $line.Trim() }
+            }
+        }
+        @($readers) | Should -BeNullOrEmpty -Because 'no measure or calculated column reads it'
+        $report = Join-Path -Path $repoRoot -ChildPath 'fabric/powerbi/RPT_DatabaseHub_History.Report'
+        @(Get-ChildItem -LiteralPath $report -Recurse -File | Where-Object { [System.IO.File]::ReadAllText($_.FullName).Contains('RCA Query Waits') } | ForEach-Object { $_.Name }) | Should -BeNullOrEmpty -Because 'no report visual reads it'
+    }
+
     It 'gives every measure a /// description' {
         @($script:measures | Where-Object { -not $_.Description } | ForEach-Object { '{0}[{1}]' -f $_.Table, $_.Name }) | Should -BeNullOrEmpty
     }
