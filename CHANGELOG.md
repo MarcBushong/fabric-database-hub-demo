@@ -48,7 +48,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
   - **Replaced on every target:** the runner's `setup` drops the old names once every replacement exists. Until it has, a newer runner refuses a run there (`out-of-step`), which the profile host tries again.
 - **The answer key maps the new names back,** for grading only (`answerKey.workloadNames` in [`rca/blind-detection.json`](rca/blind-detection.json)), and every one of them is forbidden in detection code. The Incident RCA's fixtures and evaluation set carry the new module names, with their facts otherwise unchanged.
 - **The presenter's cheat sheet** names each scenario's service, so a presenter can tell whose sessions are whose ([walkthrough](docs/demo-walkthrough.md#per-scenario-cheat-sheet)).
-- **The agent prompts** find the workload's sessions by their `ContosoCare.Demo/` prefix, since the name no longer carries the scenario ([the prompt pack](fabric/agent/prompts/README.md)).
+- **The agent prompts** find an incident's sessions by its run, since the name no longer carries the scenario: the scenario's latest run in `demo.scenario_runs`, by `started_at`, and the sessions whose name ends with its run ID ([the prompt pack](fabric/agent/prompts/README.md)).
 
 ### Security
 

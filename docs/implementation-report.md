@@ -5514,7 +5514,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 
 ### Realistic names, unit C: the readers and the docs (2026-11-23)
 
-**Why.** Unit C of ADR 0031's decision 6, which the owner approved on 2026-11-23: what reads the workload's names, besides the code. It was built from the design's tables on the shared base (59d9dfb7) and checked against units A's and B's heads (45f37c4c and c6ed5d2e). One commit after the base.
+**Why.** Unit C of ADR 0031's decision 6, which the owner approved on 2026-11-23: what reads the workload's names, besides the code. It was built from the design's tables on the shared base (59d9dfb7) and checked against units A's and B's heads (186dfccb and d53e62d0). Two commits after the base: the change, and its docs following A's and B's review fixes.
 
 - **The RCA fixtures carry the new module names.** Only their string dictionaries change, so every row, index, and fact stays:
   - **T1's document:** `[scheduling].[usp_assign_work_item]`, the head blocker, whose last call is now `scheduling.usp_assign_work_item;1`; `[scheduling].[usp_route_work_item]`; `[scheduling].[usp_bulk_reschedule]`; and `[frontdesk].[usp_process_requests]`.
@@ -5537,7 +5537,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 
 **Changed files.** In `rca/fixtures/`: both documents and their parts, `rca-evidence.parameter.json`, `metrics-bundle.json`, `metrics-rca-member.json`, `export-index.json`, and the README; and `rca/README.md`. In the runner's tests, `RcaSimulation.cs` and `RcaObserverTests.cs`. In `fabric/app/src`: `rca/testdata/eval-set.ts`, `rca/rules.test.ts`, `rca/postmortem.test.ts`, `rca/view/rca-view.test.tsx`, `pages/mission.test.tsx`, `lib/mission.test.ts`, `preview/data/pg-local.evidence.json`, `preview/sample-data.ts`, and `preview/sample-rca.ts`, a comment. Every scenario README, every `scenario.json`'s prose, and `scenarios/README.md`. The docs above, `CHANGELOG.md`, and this entry. New: `tests/Update-RcaFixtures.ps1`, and one test in `tests/unit/Rca.Contract.Tests.ps1`.
 
-**Validation.** On 59d9dfb7 with this commit, on this PC (ARM64, with a .NET 10.0.403 SDK and an npm cache in the session's own folder):
+**Validation.** On 59d9dfb7 with these commits, on this PC (ARM64, with a .NET 10.0.403 SDK and an npm cache in the session's own folder):
 
 - **The runner's tests:** 808, of which 787 passed, 21 were skipped, and none failed. The skipped ones are the integration tests, which need a disposable SQL Server or PostgreSQL server.
 - **The app's suites that read what changed,** in one process with one worker, as the coordinator asked until 2 PM: 13 files and 281 tests, all passed.
@@ -5545,13 +5545,13 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
   - `Rca.Contract`, whose 31 include the fixtures' blind checks, their parts' decode, and the new test of retired names, with the doc suites `Repo.Conventions` (every relative link and fragment), `Repo.NeutralWording`, and `Docs.Walkthrough`: 225 passed.
   - The fixtures' other readers, `DbHubDemo.HistorySnapshot`, `Vm.WorkloadSteps`, `Automation.Runbooks`, `Fabric.ControlNotebook`, and `Fabric.Notebooks`: 582 passed and 88 skipped, the notebook cases that need Python with pandas, which this PC lacks.
 - **markdownlint** found no issue, and PSScriptAnalyzer, with the repo's settings, found nothing in `tests/Update-RcaFixtures.ps1` or the changed test file, both ASCII-only.
-- **Merges:** `git merge-tree` of this commit with A's head and with B's head shows no conflict. `RcaSimulation.cs` and the `scenario.json` files, which A or B change too, merge by hunk.
+- **Merges:** `git merge-tree` of these commits with A's head and with B's head conflicts only at this report's end, where each unit appends its own entry: keep both. `RcaSimulation.cs` and the `scenario.json` files, which A or B change too, merge by hunk.
 - **The leak check** prints nothing.
 
 **Risks.**
 
 - The fixtures' module names postdate their 2026-11-20 session, and their run IDs are in the earlier form; their README says both.
 - A module renamed again in unit A's review means the same rename here: one more pair in `Update-RcaFixtures.ps1`'s table and in the contract test's list, then the script. The Query Store session's fixtures and app tests take the script as they are, whichever branch lands second.
-- The docs describe A's and B's behavior as of their heads above: the refusal `out-of-step`, setup's drops, and the match by run. A review that changes one changes its sentence here.
+- The docs describe A's and B's behavior as of their heads above: the refusal `out-of-step`, which on T4 also covers a step the runner's role can't run yet; setup's drops; the match by run; and the prompts that read an incident's sessions by its run. A review that changes one changes its sentence here.
 
 **What its live check needs.** Nothing of its own: the fixtures and tests are offline. A's and B's live round shows what the docs describe: Database Hub's sessions as `ContosoCare.Demo/<service>/<run>`, Query Store's modules in the application schemas, and the cheat sheet's services matching what Database Hub shows.
