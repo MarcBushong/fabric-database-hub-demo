@@ -5514,7 +5514,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 
 ### Query Store's evidence: the sidecar's contract (2026-11-23)
 
-**Why.** The owner, investigating in the Insights app's chat, was told T1 had no Query Store. T1 to T3 have it on, and the capture never read it. Unit 2 brings Query Store's evidence into the RCA. After an independent review (RETHINK) and the coordinator's decisions 1 to 7, the evidence travels in a sidecar beside the evidence document, which stays version 1, byte for byte ([ADR 0031's amendment](adr/0031-incident-rca.md#amendment-2026-11-23-query-stores-evidence-in-a-sidecar)). This entry is the contract's step, C0, which the parallel builders started from. Ten commits on `marcbushong-microsoft-rca-query-store-evidence`, on edd01c86:
+**Why.** The owner, investigating in the Insights app's chat, was told T1 had no Query Store. T1 to T3 have it on, and the capture never read it. Unit 2 brings Query Store's evidence into the RCA. After an independent review (RETHINK) and the coordinator's decisions 1 to 7, the evidence travels in a sidecar beside the evidence document, which stays version 1, byte for byte ([ADR 0031's amendment](adr/0031-incident-rca.md#amendment-2026-11-23-query-stores-evidence-in-a-sidecar)). This entry is the contract's step, C0, which the parallel builders started from, and the integration's, INT. The contract's commits on `marcbushong-microsoft-rca-query-store-evidence`, on edd01c86:
 
 - **ab515ad2, the contract:**
   - `history-tables.json` names each table's document, `evidence` or `sidecar`, and adds the sidecar's six tables with latest-read measures;
@@ -5556,6 +5556,45 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 
   `rca/README.md` gives the top lists' rules, and a test checks both plan rules on every sidecar fixture.
 - **84d2e92c, the interfaces between T1a and T1c,** fixed first so the two builders work at once: `Rca/Sidecar/SidecarInterfaces.cs` (`SealedSidecar`, `SidecarDraft`, `ReducedSidecar`, `ISidecarReducer`, `ISidecarCatalog`), which the blind-detection guard scans.
+- **aafee3e2:** ADR 0031's amendment, `docs/deployment.md`'s "Older code over a newer demo", and this entry.
+- **61eced5d:** a span's unsealed rows wait in `sidecar-<target>.rows`, never `.jsonl`. Every evidence export, an older runner's included, reads each `*.jsonl` in a span as a target's file (`Exporter.cs`). `RcaSidecarRowsTests` checks that edd01c86's glob never takes the new name.
+- **53d0272e:** A1's and A2's review fixes in the contract. RCA-SQL-14's showplan bound, RCA-AZ-03 and 04's permissions and microseconds, T4's startup-packet marker and catalog-text rule, RCA-PG-16's mention and unsure rules, and the T3 fixture in the reader's words.
+- **8afcca24, T1c's six questions:**
+  - the sidecar's header times carry milliseconds, which `sidecar.schema.json` now requires, and the fixtures are regenerated;
+  - the fixtures' parts are illustrative;
+  - the cut order is pinned, with the waits cut kept per wait category so baselines survive;
+  - `rca sidecar-export` exits 2 only when nothing is offerable.
+- **49d26c87:** T3's permissions per Learn (RCA-AZ-04's VIEW SERVER PERFORMANCE STATE comes only through `##MS_ServerStateReader##`), T4's lost window and cut texts, and the open span's window end, accepted as timing variance.
+- **94b48a11, the runner's own statements outside any module:** item 3 of the leave-outs, on T1 to T3.
+  - **The gap:** review-h found that the stop check the runner polls during every run, an ad hoc statement with `object_id` 0, was kept.
+  - **The list:** in `Rca/QueryStore/HarnessStatements.cs`, which unit A1 builds. `blind-detection.json` excepts its two forbidden names there only, and a contract test ties the exceptions to the names the runner's statements use.
+- **b1c12d23:** the README's wording for A2's and T1c's review fixes: a backfill splits a range at T4's start, cut texts need 64 characters, and T4's text rule covers only the observer's own statements and role.
+- **0347ad56, T1a's re-check:** a session's sidecar budget is soft at a bind, with a gap line and a Warning; a lost ledger offers acknowledged sidecars again.
+- **1e13e9aa, Run all's path (T2c's contract):** the coordinator's decision for the owner, who runs demos only through Run all.
+  - the runbooks fetch the sidecars within each export's bounds, after the evidence, into bundles and an index of their own;
+  - the final metrics carry a pointer of at most 300 bytes;
+  - the control notebook stages them, and the next start acknowledges them;
+  - five new kinds in `transport.schema.json`, with fixtures.
+- **72cd3f95:** the start's acknowledgements share its bound, so the session control's job-minute ceiling, 116 a session, holds.
+- **96f81133:** older notebooks leave the sidecar's tables and files alone. That's matrix M4's N0 and M5, from INT's harness over edd01c86's notebooks, 12 checks of 12.
+- **dd4fd393:** RCA-PG-17 reads T4's primary only, and the backfill always waits after T4's start.
+- **45f947b7:** `rca ack` is idempotent, and Run all counts an ID acknowledged before as sent.
+
+**The integration,** `marcbushong-microsoft-qs-evidence-integration`, takes only reviewed heads:
+
+- **B,** the notebook and the model, at e968004d (d6a77fa9), with two of its test expectations fixed (d8207618).
+- **A1,** SQL Server's reads, at f6fcdafa (893a3bf3), then its seam's hardening at 4fbd21b2 (ca66a103), which A2's head needed.
+- **T2a,** the scripts' transport, at 8e2ada18 (d76a028b).
+  - It brings the RCA release integration's 83a6fcb1, T2a's approved base.
+  - The generated model guide was rebuilt with the app's pinned `tsx`.
+  - `published-versions.json` lists the merged notebooks' versions (abd30713).
+- **A2,** PostgreSQL's reads and the holders, at 83344ef0 (41645fa9). Its `TargetObserver.cs` is A1's 3cea6ac9, cherry-picked.
+- **The contract,** through 45f947b7.
+- **INT's own commits:**
+  - the live probes (`tests/integration/rca-query-store.md`): S7's blindness sets, the runner's own statements among them; S10's and S11's review checks; H's checks deployed twice; and S12, the scripts' transport's checks;
+  - a guard that RCA Query Waits, which has no measure, is totaled nowhere but through the latest read (review-qs-b's caveat);
+  - the cost estimate's comment and `docs/cost-management.md`: the sidecars share the export's limits, so the ceiling holds.
+- **H, the harness's marks** (dc5735a8 on `marcbushong-microsoft-harness-marks`), merges after the realistic names' release. Its SQL Server block sits just before `110-demo-control.sql`'s last step, setup's `EXEC demo.usp_release_auto_tuning_hold`, which `SqlScriptTests` pins as the script's end, and counts down with `@remaining`. Its PostgreSQL block follows a `-- @batch` line after `usp_restore_seed`.
 
 **Changed files.**
 
@@ -5564,16 +5603,22 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **Fabric:** `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb` (the purge) and `fabric/README.md`;
 - **the module:** `scripts/modules/DbHubDemo/Private/OneLakeHelpers.ps1`;
 - **the tests:** `Rca.Contract`, `Fabric.Notebooks`, `Fabric.PowerBI`;
-- **the docs:** ADR 0031, `docs/deployment.md` (older code over a newer demo), and this report.
+- **the docs:** ADR 0031, `docs/deployment.md` (older code over a newer demo), and this report;
+- **the integration only:** the live probes, `tests/integration/rca-query-store.md` and its README entry, and RCA Query Waits' guard in `Fabric.PowerBI`.
 
 **Validation.**
 
-- **Pester,** under strict mode with the Azure CLI guard: `Rca.Contract` 63 passed; `Fabric.PowerBI` 16 passed and 1 skipped; `DbHubDemo.PowerBI` 29 passed; `DbHubDemo.Fabric` 42 passed; `Fabric.Notebooks` 101 passed, its 29 pandas cases skipped on this PC; `Repo.Conventions` 123 and `Repo.NeutralWording` 3 passed.
-- **The runner,** with SDK 10.0.403: `RcaQueryStoreSeamTests` 7, `RcaBlindTests` 5, `RcaObserverTests` 22, `RcaExportTests` 25, `RcaLaneTests` 2, `RcaNormalizerTests` 29, and `RcaTriggerTests` 9 passed; `RcaIntegrationTests`' 2 skip without a local PostgreSQL, as before. ScriptDom parses all 26 T-SQL blocks, and the 17 PostgreSQL blocks only read.
-- **Proven to fail without the change:** the folder guard, with a temporary unscanned folder; the plan rules, on the previous T3 fixture.
+- **Pester,** under strict mode with the Azure CLI guard: `Rca.Contract` 70 passed; `DbHubDemo.RcaSidecar` 28 and `DbHubDemo.Cost` 74 passed; `Fabric.PowerBI` 17 passed and 1 skipped; `DbHubDemo.PowerBI` 30 passed; `DbHubDemo.Fabric` 42 passed; `Fabric.Notebooks` 152 of 152 on the integration, its pandas cases in a session-local Python 3.12; `Repo.Conventions` 123 and `Repo.NeutralWording` 3 passed.
+- **The runner,** with SDK 10.0.403, on the integration with A1, A2, and T2a: the whole suite, 961 tests, 940 passed, and the 21 real-engine tests skip without a server, as before. ScriptDom parses every T-SQL block, and the PostgreSQL blocks only read.
+- **Proven to fail without the change:**
+  - the folder guard, with a temporary unscanned folder;
+  - the plan rules, on the previous T3 fixture;
+  - the `.rows` name, with `.jsonl`;
+  - the header's milliseconds, on the previous fixtures and schema;
+  - the guard's exceptions for item 3;
+  - RCA Query Waits' guard, with a SUM measure added.
 - **The schemas:** `evidence.schema.json` is byte-identical to edd01c86's, and both schemas regenerate byte for byte.
 - **Lint and checks:** PSScriptAnalyzer found nothing; markdownlint 0.23.3 found no issue; the leak check prints nothing.
-- **Before the integration:** the 29 pandas cases, in a session-local venv.
 
 **Risks and what its live check needs.**
 
@@ -5581,6 +5626,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **Two of T4's behaviors aren't documented, so L0 measures them first,** on Tuesday:
   - whether stopping T4 keeps the window Query Store still holds in memory;
   - whether `qs_view` keeps each window's `search_path`, or the first one it saw. The catalog-text rule covers the observer's statements either way.
-- **The harness's marks (unit H) land after the realistic names' unit A.** Until then the rules leave out the capture's own statements only.
-- **A Run all session's Query Store evidence** reaches the history with the next scripts' save, until Run all's path ships.
+- **The harness's marks (unit H)** merge after the realistic names' release. H's T-SQL block first runs on an engine at the rehearsal: its opt-in test against a disposable SQL Server, and S10's check after two deployments.
+- **The runner's own ad hoc statements (item 3) wait on A1's build.** Until then RCA-SQL-10 and 14 keep the polled stop check, so the rehearsal's blindness check (S7) needs A1's commit. Which form Query Store keeps for a statement under simple parameterization is proven only by A1's opt-in real-engine test and by S7.
+- **A Run all session's Query Store evidence** comes through Run all's own path (T2c), which joins this release by the coordinator's decision. If it isn't reviewed by 2026-11-24 18:00, it reaches the history with the next scripts' save until Run all's path ships as its own release.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.

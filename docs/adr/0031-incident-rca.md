@@ -378,11 +378,13 @@ For the owner's decision: neither is in Phase 2's scope above until it's decided
 
 A first design put Query Store's tables into a version 2 of the evidence document. An independent review answered RETHINK, and the coordinator decided (decisions 1 to 7 of 2026-11-23):
 
-1. **The capture never reads the answer key.** It leaves out exactly two things, by fixed rules in the demo's own code, and nothing by schema:
-   - **its own statements:**
+1. **The capture never reads the answer key.** It leaves out exactly three things, by fixed rules in the demo's own code, and nothing by schema:
+   - **its own statements, and the runner's other RCA reads:**
      - on SQL Server, a marker in each catalog statement's text;
-     - on T4, its connections' `search_path`, which Query Store records per row, and the catalog's own statement texts, today's and edd01c86's. Query Store keeps the first text it saw per query, and the first update's look-back reaches the windows where the earlier runner's statements ran without a marker;
-   - **the harness's bookkeeping and control modules:** marked where `110-demo-control.sql` defines them, with an extended property on SQL Server and a comment on PostgreSQL. On T4, which records statements nested in functions without their function, it also leaves out a statement that touches only tables that nothing but the harness writes.
+     - on T4, its connections' `search_path`, which Query Store records per row, and, for its own role only, its own specific statements: the catalog's blocks, today's and edd01c86's, and its snapshot clear. Query Store keeps the first text it saw per query, and the first update's look-back reaches the windows where the earlier runner's statements ran without a marker;
+     - the answer-key recorder's reads of the harness's run events carry the same markers (added after the review of the runner's harness statements): on SQL Server the marker in the text, on T4 the observer's startup. Its reads from before then are left out on T4 by the harness-table rule below, and on T1 to T3 by the SHA-256 of their normalized text, so no detection code names their table;
+   - **the harness's bookkeeping and control modules:** marked where `110-demo-control.sql` defines them, with an extended property on SQL Server and a comment on PostgreSQL. On T4, which records statements nested in functions without their function, it also leaves out a statement that touches only tables that nothing but the harness writes;
+   - **the runner's own statements outside any module,** on T1 to T3: the ad hoc statements of its harness code, such as the stop check it polls during every run, which no module's mark reaches. They're matched by their normalized text against a list in the runner's code, kept complete by a test (added after review-h).
 
    Everything else is measured evidence: the scenario modules' writes to `demo`'s scratch tables, other applications' statements, and monitoring. Editing `blind-detection.json` changes no captured byte.
 2. **The evidence document stays version 1, byte for byte.** Query Store's evidence and T4's connection holders travel in a **sidecar**, kind `ContosoCare.RcaSidecar`, version 1, which pieces that predate it never meet: its own command (`rca sidecar-export`, a paginated index), part marker (`DBHUBDEMO-RCAS`), Run Command actions, and notebook parameter (`RCA_SIDECAR_FILE`). Index versions are separate from document versions.
@@ -397,6 +399,10 @@ A first design put Query Store's tables into a version 2 of the evidence documen
 5. **Precision:** execution-weighted interval totals; a 2-hour first read and a 60-minute baseline; claims qualified at Query Store's 15-minute granularity; the latest read of an interval counts once, in the notebook and in the model's measures. On T4: `all`, the source keys kept, and the identity's `azure_sys` access and UTC proven live.
 6. **Ownership:** parallel builders by file. The runner's and the VM control script's wiring waits for the stop tail's changes; the app and its report wait for the Root cause page's facets.
 7. **The estimate, rebaselined:** about 23 builder-days. The scripts' path first (`stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s snapshot, `configure-fabric.ps1 -RunLiveActivity`); Run all's path in a later release. One release, with T1 to T3's evidence shipping alone, and T4's right after, if T4's part isn't proven by the cut-off.
+   - **Revised the same day:** Run all's path joins this release (rca/README.md, Run all's path for the sidecars), because demos run only through Run all.
+   - **How:** the runbooks fetch the sidecars at each export, within the evidence's bounds, and write them as their own bundles with an index of their own. The final metrics carry only a pointer. The control notebook stages them, and the next start acknowledges them.
+   - **Cost:** two builders, about 16 to 20 builder-hours, and about 6 to 10 more job minutes a session.
+   - **The cut line:** if it isn't reviewed by 2026-11-24 18:00, the scripts' path ships first, and Run all's path follows as its own release.
 
 **Older runners.** A rollback isn't a supported path: `deploy.ps1` moves an environment forward. An older runner deletes neither the store's `sidecars\`, where the runner seals a span's rows at each export, at the span's end, and at its start, nor T4's watermark. Two losses are accepted limits (the coordinator's decision for the owner, who can reverse it):
 
