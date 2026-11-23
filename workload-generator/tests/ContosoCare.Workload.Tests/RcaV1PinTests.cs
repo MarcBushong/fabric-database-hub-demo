@@ -89,17 +89,20 @@ public sealed class RcaV1PinTests : IDisposable
     public async Task ASessionlessExportsAreThePinnedBytes() =>
         AssertPinned(SessionlessPin, await RunAsync(root, null, null, null, TestContext.Current.CancellationToken), "none");
 
+    /// <summary>The expected lines of a control session's run (<see cref="Session"/>), for tests that add to the pin's simulation.</summary>
+    internal static IReadOnlyList<string> SessionLines => SessionPin;
+
     /// <summary>
     /// The pin's simulation, in a new store under <paramref name="root"/>: T1 and T3 in one span from 16:50 to 17:05,
     /// exported once it's closed (not final); then T4 and its read replica in a second span from 17:00 to 17:20, exported
     /// at 17:10 while it's open (not final), and once it's closed (final). The observers are the defaults unless a test
-    /// passes its own, built on the same connectors. Returns what the pin compares, one line each.
+    /// passes its own, built on the same connectors and the run's store. Returns what the pin compares, one line each.
     /// </summary>
     internal static async Task<List<string>> RunAsync(
         string root,
         string? session,
-        Func<ManualTime, IReadOnlyList<TargetObserver>>? sqlObservers,
-        Func<ManualTime, ReplicaLink, IReadOnlyList<TargetObserver>>? pgObservers,
+        Func<ManualTime, EvidenceStore, IReadOnlyList<TargetObserver>>? sqlObservers,
+        Func<ManualTime, EvidenceStore, ReplicaLink, IReadOnlyList<TargetObserver>>? pgObservers,
         CancellationToken cancellationToken)
     {
         var clock = new ManualTime(T1From);
@@ -109,7 +112,7 @@ public sealed class RcaV1PinTests : IDisposable
 
         var sql = store.Open(T1From);
         await DriveAsync(
-            sqlObservers?.Invoke(clock) ?? [new SqlTargetObserver("T1", DemoTarget.T1, RcaSimulation.T1(clock), PinOptions, RunnerLog.Null), new SqlTargetObserver("T3", DemoTarget.T3, T1AsT3(clock), PinOptions, RunnerLog.Null)],
+            sqlObservers?.Invoke(clock, store) ?? [new SqlTargetObserver("T1", DemoTarget.T1, RcaSimulation.T1(clock), PinOptions, RunnerLog.Null), new SqlTargetObserver("T3", DemoTarget.T3, T1AsT3(clock), PinOptions, RunnerLog.Null)],
             sql,
             clock,
             T1From,
@@ -121,7 +124,7 @@ public sealed class RcaV1PinTests : IDisposable
 
         var pg = store.Open(T4From);
         var link = new ReplicaLink();
-        var observers = pgObservers?.Invoke(clock, link) ?? [new PgPrimaryObserver(T4Primary(clock), PinOptions, RunnerLog.Null, link), new PgReplicaObserver(T4Replica(clock), PinOptions, RunnerLog.Null, link)];
+        var observers = pgObservers?.Invoke(clock, store, link) ?? [new PgPrimaryObserver(T4Primary(clock), PinOptions, RunnerLog.Null, link), new PgReplicaObserver(T4Replica(clock), PinOptions, RunnerLog.Null, link)];
         clock.Set(T4From);
         foreach (var observer in observers)
         {
