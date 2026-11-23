@@ -10125,12 +10125,16 @@ function Complete-DbHubTakenOverSession {
     <#
     .SYNOPSIS
     A session's own end after a start-demo.ps1 session took over from it (Get-DbHubSessionTakeover, 2026-11-20): the newer
-    session's auto-stop wins, so nothing is stopped. The session still ends: T4's, its replica's, and T5's metrics are
-    saved for its history (Save-DbHubSessionMetric), its busy marker is cleared when it's still this session's, so the
-    nightly stop goes on as usual for the start-demo.ps1 session, and its status says it stopped, with takenOver (who, and
-    the auto-stop's time) and its plan (Write-DbHubStopStatus), so the control notebook saves its history. The VMs, T4,
-    its read replica, T5's container, and start-demo.ps1's auto-stop stay as they are. Returns the stop's result, status
-    TakenOver.
+    session's auto-stop wins, so nothing is stopped. The session still ends, and its own part is a stop's (the RCA
+    release's merge): its evidence for the Incident RCA is exported first (Invoke-DbHubRcaStop, ADR 0031), through Run
+    Commands that only read, so the VMs the start-demo.ps1 session uses keep running; then T4's, its replica's, and T5's
+    metrics are saved for its history with the export's bundle index (Save-DbHubSessionMetric), which the control
+    notebook reads the session's evidence from. Another stop of the session that began, or ran, keeps that part
+    (Resolve-DbHubStopClaim). Its busy marker is cleared when it's still this session's, so the nightly stop goes on as
+    usual for the start-demo.ps1 session, and its status says it stopped, with takenOver (who, and the auto-stop's time),
+    its plan, its metrics' version, and its evidence's lines (Write-DbHubStopStatus), so the notebook saves its history.
+    The VMs, T4, its read replica, T5's container, and start-demo.ps1's auto-stop stay as they are. Returns the stop's
+    result, status TakenOver.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -10152,15 +10156,30 @@ function Complete-DbHubTakenOverSession {
     $done.Add(('nothing stopped: a start-demo.ps1 session took over from this one, and its auto-stop stops the demo at {0}' -f $until))
     $metricsStatus = ''
     $metricsMessage = ''
+    $metricsVersion = ''
+    $rca = $null
+    $yielded = $null
     if (Test-DbHubSessionCapable -Settings $settings) {
-        $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId $SessionId
-        $metricsStatus = [string]$saved.Status
-        $metricsMessage = [string]$saved.Message
-        if ($saved.Status -in 'Pass', 'Warning') {
-            $done.Add('the history''s metrics saved to the control vault')
+        $yielded = Resolve-DbHubStopClaim -Context $Context -SessionId $SessionId
+        if ($null -ne $yielded) {
+            $done.Add((Get-DbHubStopYieldText -Yielded $yielded))
         }
         else {
-            $done.Add(('the history''s metrics not saved ({0})' -f $saved.Message))
+            $rca = Invoke-DbHubRcaStop -Context $Context -Tags $Tags -SessionId $SessionId
+            $rcaIndex = $null
+            if ($null -ne $rca) {
+                $rcaIndex = $rca.Index
+            }
+            $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId $SessionId -Rca $rcaIndex
+            $metricsStatus = [string]$saved.Status
+            $metricsMessage = [string]$saved.Message
+            $metricsVersion = [string](Get-DbHubMember -InputObject $saved -Name 'Version')
+            if ($saved.Status -in 'Pass', 'Warning') {
+                $done.Add('the history''s metrics saved to the control vault')
+            }
+            else {
+                $done.Add(('the history''s metrics not saved ({0})' -f $saved.Message))
+            }
         }
     }
     $busy = Get-DbHubBusyMarker -Tags $Tags -Settings $settings -NowUtc $Context.NowUtc
@@ -10175,9 +10194,58 @@ function Complete-DbHubTakenOverSession {
     }
     $message = 'The session''s end: a start-demo.ps1 session took over from it, so nothing was stopped; that session''s auto-stop stops the demo at {0}, and Stop now again, or ./scripts/stop-demo.ps1, stops it sooner.' -f $until
     Write-DbHubLog -Context $Context -Message $message
-    $stopped = [pscustomobject]@{ Done = $done.ToArray(); Failed = @(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage; T5Status = '' }
-    Write-DbHubStopStatus -Context $Context -Tags $Tags -SessionId $SessionId -Stopped $stopped -By 'session end' -TakenOver ([ordered]@{ by = 'start-demo'; autoStopUtc = $until })
-    return [pscustomobject]@{ action = 'stop'; status = 'TakenOver'; message = $message; done = $stopped.Done; failed = @(); t5Status = ''; autoStopUtc = $until }
+    $stopped = [pscustomobject]@{ Done = $done.ToArray(); Failed = @(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage; MetricsVersion = $metricsVersion; T5Status = ''; Rca = $rca; Yielded = $yielded }
+    # A stop of the session that began first keeps its status (Resolve-DbHubStopClaim).
+    if ($null -eq $yielded) {
+        Write-DbHubStopStatus -Context $Context -Tags $Tags -SessionId $SessionId -Stopped $stopped -By 'session end' -TakenOver ([ordered]@{ by = 'start-demo'; autoStopUtc = $until })
+    }
+    return [pscustomobject]@{ action = 'stop'; status = 'TakenOver'; message = $message; done = $stopped.Done; failed = @(); t5Status = ''; autoStopUtc = $until; rca = (Get-DbHubRcaResult -Rca $rca) }
+}
+
+function Complete-DbHubTakenOverStatus {
+    <#
+    .SYNOPSIS
+    A whole stop after a taken-over session's end (Complete-DbHubTakenOverSession): that end did the session's own part,
+    its evidence, its metrics, and its stopped status, so this stop left it (Resolve-DbHubStopClaim, State Stopped) and
+    stopped the rest, the start-demo.ps1 session's demo. The status says so (the RCA release's merge): that end's, with
+    takenOver gone, and this stop's done, failed, and stoppedBy, so the control notebook's Stop now again, which waits for
+    a stopped status without takenOver (the re-review of 2026-11-20), sees the demo stopped. The rest stays that end's: its
+    stoppedUtc, which tells the session's capture apart (review of 02d398a), its jobId, its metrics' version, its plan,
+    and its RCA lines. Only when the status's copy is the yielded-to session's, stopped, with takenOver. Returns whether it
+    was written. Never throws.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Yielded,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Stopped,
+
+        [Parameter(Mandatory = $true)]
+        [string] $By
+    )
+
+    if ($null -eq $Yielded -or [string](Get-DbHubMember -InputObject $Yielded -Name 'State') -ne 'Stopped') {
+        return $false
+    }
+    try {
+        $copy = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -eq $copy -or [string]$copy['sessionId'] -ne [string](Get-DbHubMember -InputObject $Yielded -Name 'SessionId') -or [string]$copy['phase'] -ne 'stopped' -or -not $copy.Contains('takenOver')) {
+            return $false
+        }
+        $copy.Remove('takenOver')
+        $copy['stoppedBy'] = $By
+        $copy['done'] = @($Stopped.Done)
+        $copy['failed'] = @($Stopped.Failed)
+        return (Write-DbHubSessionStatus -Context $Context -Status $copy)
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The taken-over session''s status doesn''t say this stop stopped the demo: {0}' -f $_.Exception.Message)
+        return $false
+    }
 }
 
 function Write-DbHubStopStatus {
@@ -10332,9 +10400,14 @@ function Invoke-DbHubControl {
             $status = 'Partial'
             $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
         }
-        # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status.
-        if ($null -eq (Get-DbHubMember -InputObject $stopped -Name 'Yielded')) {
+        # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status, and
+        # after a taken-over end, says this stop stopped the demo (Complete-DbHubTakenOverStatus).
+        $yielded = Get-DbHubMember -InputObject $stopped -Name 'Yielded'
+        if ($null -eq $yielded) {
             Write-DbHubStopStatus -Context $Context -Tags $group.Tags -SessionId $request.SessionId -Stopped $stopped -By 'Stop now'
+        }
+        else {
+            $null = Complete-DbHubTakenOverStatus -Context $Context -Yielded $yielded -Stopped $stopped -By 'Stop now'
         }
         return [pscustomobject]@{ action = 'stop'; status = $status; message = ('Stop now: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
     }
@@ -10498,10 +10571,14 @@ function Invoke-DbHubStop {
         $status = 'Partial'
         $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
     }
-    # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status.
+    # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status, and
+    # after a taken-over end, says this stop stopped the demo (Complete-DbHubTakenOverStatus).
     $yielded = Get-DbHubMember -InputObject $stopped -Name 'Yielded'
     if ($null -eq $yielded) {
         Write-DbHubStopStatus -Context $Context -Tags $group.Tags -Stopped $stopped -By $RequestedBy
+    }
+    else {
+        $null = Complete-DbHubTakenOverStatus -Context $Context -Yielded $yielded -Stopped $stopped -By $RequestedBy
     }
     $result = [pscustomobject]@{ action = $label; status = $status; message = ('{0}: {1}{2}.' -f $RequestedBy, (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
     if ($RequestedBy -eq 'stop-demo.ps1') {

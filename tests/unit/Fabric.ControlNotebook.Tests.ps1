@@ -173,7 +173,7 @@ VERSIONS, FILES, FOLDERS, STAGED, VAULTREADS = {}, {}, set(), [], []
 # job's state at Run all's look is queued, Completed after its notebook deleted the file, Completed with the file left (a
 # copy from before the Incident RCA), or Failed; or Completed with the staged file's check raising (review of 37a546bc).
 RCA_JOB_SCENARIOS = ("rcajobqueued", "rcajobdone", "rcajobold", "rcajobfailed", "rcajobunchecked")
-RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail") + RCA_JOB_SCENARIOS
+RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail", "takenoverrca") + RCA_JOB_SCENARIOS
 FIXTURE = json.load(open(sys.argv[4] + "/rca/fixtures/rca-evidence.parameter.json", encoding="utf-8")) if len(sys.argv) > 4 else {"parts": []}
 BUNDLE_PARTS = {"1" * 32: FIXTURE["parts"][:2], "2" * 32: FIXTURE["parts"][2:], "3" * 32: FIXTURE["parts"][:2]}
 DOCUMENT_REFS = [{"documentId": part.split()[2], "parts": int(part.split()[3].split("/")[1]), "sha256": part.split()[4]} for part in FIXTURE["parts"][::2]]
@@ -352,9 +352,10 @@ def runbook(body):
             session = json.loads(VAULT["dbhub-session-status"]).get("sessionId") or ""
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "Stop now", "failed": [],
                                                     "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}})
-        if (scenario == "takenover" or (scenario == "takenoverstop" and body.get("sessionId"))) and session:
+        if (scenario in ("takenover", "takenoverrca") or (scenario == "takenoverstop" and body.get("sessionId"))) and session:
             # A start-demo.ps1 session took over from this one (2026-11-20): the runbook stops nothing at its end, and says
-            # when that session's auto-stop stops the demo (Complete-DbHubTakenOverSession).
+            # when that session's auto-stop stops the demo (Complete-DbHubTakenOverSession). With the RCA (takenoverrca),
+            # that end exports the session's evidence, as a stop does (the RCA release's merge).
             until = iso(Clock.now + real_dt.timedelta(hours=3))
             VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "session end", "failed": [],
                                                         "done": ["nothing stopped: a start-demo.ps1 session took over from this one, and its auto-stop stops the demo at " + until,
@@ -1350,6 +1351,23 @@ print(json.dumps(out))
         $report.printed | Should -Match 'Waiting \d+ minutes for the last telemetry to arrive \(until \d\d:\d\d\)\.'
         @($report.refs).Count | Should -Be 1 -Because 'the session''s history is saved as at any end'
         $report.refs[0].args.SESSION_ID | Should -Be $report.sent[0].sessionId
+    }
+    It 'saves a taken-over session''s Incident RCA evidence with its history, and says what its end exported (the RCA release''s merge)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'takenoverrca' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+        $report.printed | Should -Match 'Taken over: a start-demo\.ps1 session runs the demo now, so nothing was stopped'
+        $report.printed | Should -Match 'RCA\.EXPORT Pass: 2 evidence documents in 4 parts from sqlvm01\.'
+        $report.printed | Should -Match 'RCA\.CAPTURE\.T1 Pass: T1: captured from 16:50 to 17:05 UTC\.'
+        $report.printed | Should -Not -Match 'the control''s runbook is from before'
+        @($report.refs).Count | Should -Be 1
+        $report.refs[0].args.SESSION_ID | Should -Be $report.sent[0].sessionId
+        $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Be $report.staged[0].name
+        $report.staged[0].document.sessionId | Should -Be $report.sent[0].sessionId
     }
     It 'stops everything when Stop now comes inside a taken-over session''s end, and when it comes again after that end (the re-review of 2026-11-20)' {
         if (-not $script:python) {

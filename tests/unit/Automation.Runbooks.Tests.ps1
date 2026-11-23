@@ -1707,6 +1707,7 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $script:t4 = 'Ready'
         $script:replica = 'Ready'
         $script:calls.Clear()
+        $script:rcaCommands.Clear()
 
         # The control notebook's stop at the session's planned end (WAIT_FOR_END): the newer session's auto-stop wins.
         $script:clock = $runEnd.AddSeconds(30)
@@ -1731,14 +1732,35 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         ([datetime]$stopped.takenOver.autoStopUtc).ToUniversalTime() | Should -Be ([datetime]$script:autostop).ToUniversalTime()
         $stopped.planKept | Should -BeTrue -Because 'the notebook saves the session''s history with its beats'
         @($stopped.done)[0] | Should -Match '^nothing stopped: a start-demo\.ps1 session took over from this one'
+        # The session's own part is a stop's (the RCA release's merge): its evidence's final export first, through Run Commands
+        # that only read, then the metrics' version that lists its bundles, which the notebook reads, and its lines.
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { '{0}:{1}' -f $_.Request.sessionId, $_.Request.final } | Select-Object -Unique) | Should -Be @(('{0}:True' -f $script:sessionId))
+        @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+        $stopped.PSObject.Properties.Name | Should -Contain 'rca'
+        $stopped.PSObject.Properties.Name | Should -Contain 'rcaLines'
+        $stopped.metrics.version | Should -Be $script:secrets['dbhub-session-metrics'][-1].Version
+        $stopped.stoppedUtc | Should -Not -BeNullOrEmpty
+        $result.rca | Should -Not -BeNullOrEmpty
 
         # Stop now again inside the window (the re-review of 2026-11-20): the notebook's stop then has no session ID, as
         # after an explicit Stop now that came back taken over, and the runbook never takes that for a session's end.
         $script:calls.Clear()
+        $script:rcaCommands.Clear()
         $plain = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop' }) -Context (New-TestContext -NowUtc $runEnd.AddMinutes(1))
         $plain.status | Should -Be 'Stopped'
         @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate' }).Count | Should -Be 2
         $script:autostop | Should -BeNullOrEmpty -Because 'start-demo.ps1''s auto-stop goes with the demo it stopped'
+        # The end did the session's part, so this stop exports nothing again, and the status says it stopped the demo,
+        # without takenOver, which the notebook's Stop now again waits for; the rest is the end's (the RCA release's merge).
+        @($script:rcaCommands) | Should -BeNullOrEmpty
+        $again = Get-SessionStatus
+        $again.PSObject.Properties.Name | Should -Not -Contain 'takenOver'
+        $again.phase | Should -Be 'stopped'
+        $again.stoppedBy | Should -Be 'Stop now'
+        $again.stoppedUtc | Should -Be $stopped.stoppedUtc
+        $again.metrics.version | Should -Be $stopped.metrics.version
+        $again.jobId | Should -Be $stopped.jobId
+        @($again.done) | Should -Contain 'sqlvm01 deallocating'
         $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
         $script:t4 = 'Ready'
         $script:replica = 'Ready'
