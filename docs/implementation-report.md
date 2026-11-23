@@ -6032,3 +6032,36 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - **And:** vitest, the cases file's 11 tests and the app's whole suite, 401 of 401 in 22 files; typecheck and eslint clean; markdownlint clean; the changed files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames, with the follow-ups' two commits under it: 135 passed, 3 skipped.
 
 **Risks.** None: nothing runs this code yet, and no rule changes.
+
+### F35 design (i): the Livy steps (2026-11-23)
+
+**Why.** An existing demo's workspace keeps its old `NB_DatabaseHub_LiveActivity` unless `fabric.importNotebooks`, `-ImportNotebooks`, or `configure-fabric.ps1` updates it, so a fix that lives only in the notebook misses those demos until the owner opts in. The approved design (i) has the PC's scripts work out the history's kept values themselves, through Fabric's Livy API, sending this checkout's `fabric/history/kept_value.py` each time. Learn documents the Livy API for a Microsoft Entra app or a service principal with the `Lakehouse.*` and `Code.*` scopes ([authentication](https://learn.microsoft.com/fabric/data-engineering/get-started-api-livy)), and the Azure CLI's token carries only `user_impersonation`, so a probe checked it first.
+
+**Work summary.**
+
+- **The token probe** (`tests/integration/Invoke-LivyTokenProbe.ps1`, new): after the subscription guard, it starts a Livy session in the demo's lakehouse with the Azure CLI's Fabric token, runs `SELECT 1` and a read of `telemetry_snapshots` in PySpark, and deletes the session in a `finally`. `PROBE.LIVY.TOKEN` is the answer. With `-KeptValueModule`, it smoke-tests a `kept_value.py` on a scratch copy of the history table (`CREATE TABLE ... AS SELECT`, the step, a read-back, a rerun, and the drop); with `-ExportPath` too, it exports the resolved copy as JSON lines for `fabric/app/scripts/f35-proof.ts`, in pages by analysis, day, and hour.
+- **The Livy client** (`FabricLivyHelpers.ps1`, new): `Open-DemoLivySession` creates a session on the workspace's starter pool, once, and waits until it's idle; one that ends or isn't ready in time is deleted before it says so. `Invoke-DemoLivyStatement` runs one statement and cancels it past its time. `Close-DemoLivySession` never throws. Every request goes through `Invoke-DemoFabricRequest` ([session jobs](https://learn.microsoft.com/fabric/data-engineering/get-started-api-livy-session), and the Livy API's Swagger for the states, the output, and cancel).
+- **The step** (`Invoke-DemoHistoryKeptValue`, new and public): the workspace and the lakehouse (resolved, or by name, read-only), a session, `kept_value.py`'s text as one statement, then `kept_value_step(spark)`, whose JSON is the output's last line, by the resolve module's interface. One record, never a Fail or Manual action required: Pass, Not selected (no history table yet), or a Warning with its fix (a paused capacity, a refused session, a session that didn't start, a step that failed, ran out of time, or stopped with rows left). Evidence `form` is the step's own answer.
+- **Where it runs:**
+  - `deploy.ps1`'s Fabric track, both paths, before the history model's step (`DEPLOY.FABRIC.KEPTVALUE`, row `Fabric.KeptValues`). `Invoke-DemoPowerBIStage` gives `configure-powerbi.ps1` `-SnapshotValueForm Kept` only when that step's form is `Kept` and the script declares the parameter; otherwise the release's form. A Warning's fix is `./scripts/deploy.ps1 -FromStage Fabric`, since a plain rerun skips a Fabric track it recorded as finished.
+  - `deploy.ps1`'s end, right after the history snapshot, when it saved (`DEPLOY.FABRIC.KEPTVALUE.END`, row `Fabric.HistoryKept`).
+  - `stop-demo.ps1 -SaveHistory`, after a run that completed and before any pause (`STOP.FABRIC.KEPTVALUE`; at most 5 minutes for the session and 10 for the step).
+  - `configure-fabric.ps1 -RunLiveActivity`, after a run that passed (`FABRIC.KEPTVALUE`), not after a first run of its own.
+- **DONE:** both rows are non-blocking (`Test-DemoNonBlockingResult`), and DONE's list of what doesn't block it names the kept values while deploy's last step for them is a Warning (`Get-DemoKeptValueItem`).
+
+**Changed files.** New: `scripts/modules/DbHubDemo/Private/FabricLivyHelpers.ps1`, `scripts/modules/DbHubDemo/Private/HistoryKeptValueHelpers.ps1`, `scripts/modules/DbHubDemo/Public/Invoke-DemoHistoryKeptValue.ps1`, `tests/integration/Invoke-LivyTokenProbe.ps1`, and `tests/unit/DbHubDemo.HistoryKeptValue.Tests.ps1`. Changed: `DbHubDemo.psd1`, `DeployExperience.ps1`, `DeployHelpers.ps1`, `ParallelDeployment.ps1`, `ProgressHelpers.ps1`, `TrackHelpers.ps1`, `Invoke-DemoDeployment.ps1`, `Stop-DemoEnvironment.ps1`, `scripts/configure-fabric.ps1`, `scripts/stop-demo.ps1`, `tests/integration/README.md`, five unit suites (Fabric, FirstRun, Lifecycle, Progress, Tracks), and this report.
+
+**Validation.**
+
+- **Live, on Final tests' environment:**
+  - **The token (09:49 to 09:51 ET):** the session was idle in about 14 seconds; `SELECT 1` returned 1; the read found 33,115 rows and 16 columns; the session was deleted. The Azure CLI's token is accepted, so the maintenance-notebook route isn't needed.
+  - **The smoke test with the export (10:46 to 10:51 ET, probe bc730bd9, module 1786a139):** the step worked out 32,402 rows in 21.5 seconds, and the rerun found nothing left. The export had 33,115 of 33,115 rows in 17 pages, in about 149 seconds, and the copy was dropped.
+  - **`f35-proof.ts` on that export:** no difference. 20,779 of 20,779 bins equal `snapshotValues`, 1,551 series-hours equal `finestPerInterval`, and 151 saves have no step difference.
+- **Pester with StrictMode, under the Azure CLI guard, no call reached it:** the new suite (35), and the suites whose code changed or that run it: Tracks 178, Lifecycle 282, OneCommand 208, ActivityControl 150, FirstRun 102, FabricAppSignIn 90, T4Replica 71, Fabric 41, Progress 35, FabricTrack 28, HistorySnapshot 28, PowerBI 21, Ask 18, TransientRetry 18, GuestRestart 7. Repo.Conventions 123, Repo.FunctionNames 2, and Repo.NeutralWording 3.
+- **The probe** ran against mocked Fabric answers: accepted, refused, a paused capacity, a session that ended, a statement that failed, the smoke test, a module that doesn't load, `-KeepCopy`, a 4-page export, and a short page. PSSA: no findings in the 20 changed PowerShell files. markdownlint: clean. ASCII, with LF line endings.
+
+**Risks.**
+
+- **The Azure CLI's token isn't among Learn's documented ones.** It's accepted today; if Fabric refuses it later, each step is a Warning (`Refused`) and the history reads as before F35, until the maintenance-notebook route is built.
+- **A session can queue** behind a notebook run on a small capacity: it's bounded (10 minutes; 5 in `stop-demo.ps1`), and the step is then a Warning.
+- **The model stays on the release's form** after the Fabric track's Warning, until `deploy.ps1 -FromStage Fabric` or a later run of the track. Its first-run follow-up (#68) deploys the release's form too; it reads as today.
