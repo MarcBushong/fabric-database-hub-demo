@@ -26,6 +26,8 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
     // The tries, a second apart, to close a held span whose write fails as the lane stops.
     private const int StopCloseAttempts = 3;
 
+    private const string CloseFailed = "The RCA observer couldn't write its span's close; it tries again in a second.";
+
     private readonly ObserverOptions settings = options ?? new ObserverOptions();
     private readonly Lock spanGate = new();
     private readonly Lock endGate = new();
@@ -273,10 +275,11 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
     }
 
     /// <summary>
-    /// Closes the span whose close waited for the answer key (Release), once it no longer has to: checked every second, and
-    /// whatever the answer key does, when the lane stops. It closes at the time its last member ended, so its coverage ends
-    /// where the capture did. A close whose write fails is tried again a second later, and at the lane's stop for a few
-    /// seconds at most (the re-check of 9440acf2: it ended this loop, and the lane's stop threw it).
+    /// Closes the span whose close waited (Release), once it no longer has to: for the answer key after the capture's end,
+    /// or after a write of its close that failed. Checked every second, and whatever the answer key does, when the lane
+    /// stops. It closes at the time its last member ended, so its coverage ends where the capture did. A close whose write
+    /// fails is tried again a second later, and at the lane's stop for a few seconds at most (the re-check of 9440acf2: it
+    /// ended this loop, and the lane's stop threw it).
     /// </summary>
     private async Task CloseHeldAsync(CancellationToken cancellationToken)
     {
@@ -325,7 +328,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
-            log.Warn("rca.close-failed", "The RCA observer couldn't close the span that waited for the answer key; it tries again in a second.", ("error", Redactor.Redact(ex.Message)));
+            log.Warn("rca.close-failed", CloseFailed, ("error", Redactor.Redact(ex.Message)));
             return false;
         }
     }
@@ -342,7 +345,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
             span.Close(since);
             span = null;
             heldSince = null;
-            log.Info("rca.span-closed", "The answer key has the fault runs that ended by the capture's end, so the span closed for the stop's export.");
+            log.Info("rca.span-closed", "The RCA observer closed the span whose close waited, for the answer key's fault runs or after a write that failed.");
         }
     }
 
@@ -361,7 +364,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                 }
                 catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
                 {
-                    log.Warn("rca.close-failed", "The RCA observer couldn't close the span that waited for the answer key; it tries again in a second.", ("error", Redactor.Redact(ex.Message)));
+                    log.Warn("rca.close-failed", CloseFailed, ("error", Redactor.Redact(ex.Message)));
                     return null;
                 }
 
@@ -398,7 +401,8 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
     /// <summary>
     /// A target's capture ended: the span closes once its last member has, except after the capture's end
     /// (<paramref name="end"/>) while the answer key still has to record a fault run that ended by then: its close waits for
-    /// that, capturing nothing (CloseHeldAsync), so the stop's export takes those runs with it (the review of 1ca916a9).
+    /// that, capturing nothing (CloseHeldAsync), so the stop's export takes those runs with it (the review of 1ca916a9). A
+    /// close whose write fails waits the same way, for CloseHeldAsync's next try (the re-check of d06899f6).
     /// </summary>
     private void Release(string target, DateTimeOffset at, DateTimeOffset? end = null)
     {
@@ -423,7 +427,19 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                     return;
                 }
 
-                span.Close(at);
+                try
+                {
+                    span.Close(at);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // Held for another try (the re-check of d06899f6): CloseHeldAsync tries again each second, and a session that
+                    // begins meanwhile closes it first (Acquire), so its capture never goes into a span that's closed in memory.
+                    heldSince = at;
+                    log.Warn("rca.close-failed", CloseFailed, ("error", Redactor.Redact(ex.Message)));
+                    return;
+                }
+
                 span = null;
             }
         }
