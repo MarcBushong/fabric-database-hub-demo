@@ -290,7 +290,7 @@ The runbook and the scripts call the runner through managed Run Commands, which 
 
 Run all takes a session's sidecars the way it takes its evidence: the runbooks fetch them from the VMs and write them as earlier versions of `dbhub-session-metrics`, and the control notebook stages them for the activity notebook. Nothing needs a new secret, grant, or resource.
 
-- **The fetch:** at each export (a re-check's, the stop's, and a start's for an earlier session), after the evidence, within the same bound (`rca.recheckMinutes`, `rca.stopMinutes`, `rca.startMinutes`).
+- **The fetch:** at each export (a re-check's, the stop's, and a start's for an earlier session), after the evidence, within the same bound (`rca.recheckMinutes`, `rca.stopMinutes`, `rca.startMinutes`). So the session control's job minutes keep their ceiling, and the sidecars use what the evidence leaves of it.
   - It reads `RcaSidecarExport`'s pages, then each part through the `Rca` action's `part`, one Run Command at a time on the T2 host.
   - Sidecars never delay the evidence. What a bound cuts stays pending on the VM, which offers it again at the next export.
   - A sidecar the session's exports already bundled isn't fetched again.
@@ -307,7 +307,7 @@ Run all takes a session's sidecars the way it takes its evidence: the runbooks f
   - After the run, it reads the payload's acknowledgement and deletes the payload by [the acknowledgement's rules](#acknowledgement).
 - **Acknowledgement at the next start:** Run all saves after the stop deallocates the VMs, so the next start's request carries the acknowledgements.
   - **The request:** the IDs a `-runall-` acknowledgement says are `written` or `already` ride on it as `rcaAcks`: `{"kind":"ContosoCare.RcaAckRequest","version":1,"documents":[...]}`, at most 64 ([fixture](fixtures/rca-ack-request.json)).
-  - **The start:** before any export, the runbook sends `RcaAck` to the VM each ID names (its host segment), one Run Command at a time on the T2 host. It records what it sent in the status's `rcaAcks`: `{"kind":"ContosoCare.RcaAckResult","version":1,"sent":[...],"left":[...],"status":...,"message":...}` ([fixture](fixtures/rca-ack-result.json)).
+  - **The start:** before any export, the runbook sends `RcaAck` to the VM each ID names (its host segment), one Run Command at a time on the T2 host, within the start's `rca.startMinutes`, so they share its bound. It records what it sent in the status's `rcaAcks`: `{"kind":"ContosoCare.RcaAckResult","version":1,"sent":[...],"left":[...],"status":...,"message":...}` ([fixture](fixtures/rca-ack-result.json)).
   - **Cleanup:** the notebook deletes a `-runall-` acknowledgement once every ID in it is sent.
   - **Without a start,** the sidecars stay pending, and a later save answers `already`.
   - **Each path reads only its own acknowledgements:** `-runall-` for Run all, and `-script-` for the scripts.
