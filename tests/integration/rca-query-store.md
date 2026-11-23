@@ -204,6 +204,8 @@ SUMMARIZECOLUMNS(
    - **Pass:** the runner's log names each connection's `options`. After the update, Query Store's rows under the runner's role hold no type-loading query and no limits' `SET` from the observer.
    - L0's probe reads with `NoTypeLoading` too, so its own type loading never lands in Query Store under the workload's role.
 10. **RCA-PG-14 on shared rows:** a text that both the observer and the workload sent under the same role stays as evidence, unless it's one of the observer's own specific statements: the catalog's blocks and its snapshot clear. The probe reports each such shared row's `query_id` and whether it was kept.
+11. **Before the rehearsal, on a local PostgreSQL 18** (A2's re-check): Phase 1's T4 connections now carry the startup packet's `-c` options and `NoTypeLoading` too. So run the opt-in `RcaIntegrationTests` (PostgreSQL), and `PostgresTests`, at the integration's head against a disposable local PostgreSQL 18, as T2b did on 18.7. Pass: every case passes, none skipped for want of a server.
+12. **One connection to T4 and one to its replica,** before the rehearsal's first session, with the runner's own connection code: each accepts the startup packet's `options` with `NoTypeLoading`, and `current_setting('search_path')` ends in `dbhubdemo_rca_observer` on the observer's connection only.
 
 ## The scripts' transport's live checks (S12)
 
