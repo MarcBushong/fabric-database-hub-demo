@@ -276,6 +276,64 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
+    public async Task WhatT4StillHeldInMemoryWhenItStoppedIsLostNeverPending()
+    {
+        // Session A ends at 17:20 with 17:00 to 17:20 unsettled, and T4's start time recorded with it. The 17:15 interval
+        // was still in memory at the end, and T4 never shows it.
+        var store = new T4QueryStore(T4Statistics(), T4Waits());
+        var (first, _, watermark) = Capture(store, SpanA);
+        await ReadAtAsync(first, store, At(17, 2, 5610));
+        await ReadAtAsync(first, store, At(17, 17, 5700));
+        store.Clock = At(17, 20);
+        await first.EndAsync(store.Clock, TestContext.Current.CancellationToken);
+        Assert.Equal(ServerStart, Assert.Single(watermark.Read().Pending).ServerStartedUtc);
+        Assert.Equal(ServerStart, watermark.Read().ServerStartedUtc);
+
+        // T4 still up at 17:32 (the observer started again, T4 didn't): 17:15 isn't surely published yet, so it's pending.
+        var spans = new MemorySpans { CurrentSpan = SpanB };
+        var backfilled = spans.Add(SpanA);
+        var second = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
+        await ReadAtAsync(second, store, At(17, 32));
+        Assert.Equal(At(17, 15), backfilled.Table(RcaContract.QueryCoverage)[^1].Get("pending_from_utc"));
+        Assert.Single(watermark.Read().Pending, p => p.SpanId == SpanA);
+
+        // T4 stopped and started again at 17:40: what it doesn't show now never will. Lost, not pending, and done.
+        store.ServerStarted = At(17, 40);
+        spans.CurrentSpan = "20261120T174500Z";
+        var third = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
+        await ReadAtAsync(third, store, At(17, 47));
+        var coverage = backfilled.Table(RcaContract.QueryCoverage)[^1];
+        Assert.Null(coverage.Get("pending_from_utc"));
+        Assert.Equal("Lost when T4 stopped: Query Store shows nothing of 2026-11-20 17:15 to 2026-11-20 17:20 UTC, which it still held in memory when T4 stopped, and T4 has started again since, so none of it will show.", coverage.Get("gaps"));
+        Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
+        Assert.Equal(At(17, 40), watermark.Read().ServerStartedUtc);
+    }
+
+    [Fact]
+    public async Task WhatT4KeptAcrossItsRestartIsReadWithNothingLost()
+    {
+        // As above, but T4 kept the 17:15 interval: after its restart, the backfill reads it, and nothing is lost.
+        var store = new T4QueryStore([.. T4Statistics(), .. Later()], T4Waits());
+        var (first, _, watermark) = Capture(store, SpanA);
+        await ReadAtAsync(first, store, At(17, 2, 5610));
+        await ReadAtAsync(first, store, At(17, 17, 5700));
+        store.Clock = At(17, 20);
+        await first.EndAsync(store.Clock, TestContext.Current.CancellationToken);
+
+        store.ServerStarted = At(17, 40);
+        var spans = new MemorySpans { CurrentSpan = SpanB };
+        var backfilled = spans.Add(SpanA);
+        var second = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
+        await ReadAtAsync(second, store, At(17, 47));
+
+        var coverage = Assert.Single(backfilled.Table(RcaContract.QueryCoverage));
+        Assert.Null(coverage.Get("pending_from_utc"));
+        Assert.Null(coverage.Get("gaps"));
+        Assert.Equal(2, backfilled.Table(RcaContract.QueryStats).Count(r => (DateTimeOffset)r.Get("interval_start_utc")! == At(17, 15)));
+        Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
+    }
+
+    [Fact]
     public async Task ARangeStaysPendingUntilItsIntervalIsSurelyPublished()
     {
         var store = new T4QueryStore(T4Statistics(), T4Waits()) { PublishedAfter = TimeSpan.FromHours(4) };
@@ -915,6 +973,50 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     }
 
     [Fact]
+    public void AnOwnStatementQueryStoreCutShortIsLeftOutByItsBeginning()
+    {
+        // edd01c86's blocks, which carry no marker, and Npgsql's type loading, cut where Query Store cuts a text longer than
+        // pg_qs.max_query_text_length (100 to 10,000; 6,000 by default).
+        var rule = LeaveOut.FromCatalog();
+        var none = PgHarness.Parse([]);
+        var statements = CaptureCatalog.Parse(RcaPgCatalogHistory.Edd01c86)
+            .Where(b => b.Key.StartsWith("RCA-PG-", StringComparison.Ordinal))
+            .Select(b => b.Value)
+            .Append(PgObserverStatements.NpgsqlTypeLoadingQuery)
+            .ToList();
+        foreach (var max in new[] { 100, 1000 })
+        {
+            var longer = statements.Where(s => s.Length > max).ToList();
+            Assert.NotEmpty(longer);
+            foreach (var text in longer)
+            {
+                // At the limit, or one short of it (a C string keeps its terminator): one of ours, cut short.
+                Assert.True(rule.LeftOut(text[..max], WorkloadPath, none, maxTextLength: max), text[..60]);
+                Assert.True(rule.LeftOut(text[..(max - 1)], WorkloadPath, none, maxTextLength: max), text[..60]);
+
+                // No limit read, or one the text doesn't reach: it's whole, so it's no statement of ours.
+                Assert.False(rule.LeftOut(text[..max], WorkloadPath, none), text[..60]);
+                Assert.False(rule.LeftOut(text[..max], WorkloadPath, none, maxTextLength: max + 2), text[..60]);
+            }
+        }
+    }
+
+    [Fact]
+    public void AWorkloadTextThatBeginsLikeAnOwnStatementIsKept()
+    {
+        var rule = LeaveOut.FromCatalog();
+        var none = PgHarness.Parse([]);
+
+        // Shorter than the limit, a text is whole: the workload's, however its first words go.
+        Assert.False(rule.LeftOut("SELECT clock_timestamp() AS captured_at", WorkloadPath, none, maxTextLength: 100));
+        Assert.False(rule.LeftOut("SELECT a.pid, a.state FROM pg_stat_activity AS a", WorkloadPath, none, maxTextLength: 100));
+
+        // As long as the limit, but how none of ours begins.
+        var workload = "SELECT p.patient_id, p.family_name FROM care.patients AS p WHERE p.patient_id = $1 AND p.active ORDER BY p.family_name";
+        Assert.False(rule.LeftOut(workload[..100], WorkloadPath, none, maxTextLength: 100));
+    }
+
+    [Fact]
     public void WhatTheObserverSentBeforeEitherMarkerIsLeftOutByItsTextAlone()
     {
         // Phase 1's statements carry neither marker: under the workload's role and search_path, only the text rule, read
@@ -1361,6 +1463,11 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             Assert.Equal([3, 4, 5], patterns.Keys.Order());
             var rule = TextRule().Match(text);
             Assert.True(rule.Success, "RCA-PG-14 no longer compares Query Store's text with $7, both normalized alike, in the form this test reads.");
+            var truncated = TruncatedRule().Match(text);
+            Assert.True(truncated.Success, "RCA-PG-14 no longer takes a text Query Store cut short for the beginning of one of $7's, in the form this test reads.");
+            Assert.Equal(
+                (rule.Groups["comment"].Value, rule.Groups["line"].Value, rule.Groups["space"].Value),
+                (truncated.Groups["comment"].Value, truncated.Groups["line"].Value, truncated.Groups["space"].Value));
             return new LeaveOut(patterns, rule.Groups["comment"].Value, rule.Groups["line"].Value, rule.Groups["space"].Value);
         }
 
@@ -1373,7 +1480,11 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             return result.Trim(' ', ';');
         }
 
-        public bool LeftOut(string text, string? searchPath, PgHarness harness, IReadOnlyList<string>? ownStatements = null)
+        /// <summary>
+        /// Whether RCA-PG-14 leaves the text out. <paramref name="maxTextLength"/> is pg_qs.max_query_text_length as
+        /// pg_settings has it, or null when it doesn't: a text within one byte of it was cut short.
+        /// </summary>
+        public bool LeftOut(string text, string? searchPath, PgHarness harness, IReadOnlyList<string>? ownStatements = null, int? maxTextLength = null)
         {
             if ((searchPath ?? string.Empty).Contains("dbhubdemo_rca_observer", StringComparison.Ordinal) || text.Contains("dbhubdemo:rca-observer", StringComparison.Ordinal))
             {
@@ -1381,7 +1492,13 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             }
 
             var normalized = Normalize(text);
-            if ((ownStatements ?? PgObserverStatements.All).Any(s => string.Equals(Normalize(s), normalized, StringComparison.Ordinal)))
+            var own = (ownStatements ?? PgObserverStatements.All).Select(Normalize).ToList();
+            if (own.Contains(normalized, StringComparer.Ordinal))
+            {
+                return true;
+            }
+
+            if (maxTextLength is { } max && System.Text.Encoding.UTF8.GetByteCount(text) + 1 >= max && own.Any(o => o.StartsWith(normalized, StringComparison.Ordinal)))
             {
                 return true;
             }
@@ -1398,6 +1515,9 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
         [GeneratedRegex(@"btrim\(regexp_replace\(regexp_replace\(regexp_replace\(COALESCE\(q\.query_sql_text, ''\), '(?<comment>[^']*)', ' ', 'g'\), '(?<line>[^']*)', ' ', 'g'\), '(?<space>[^']*)', ' ', 'g'\), ' ' \|\| chr\(59\)\)\s*<> ALL \(SELECT btrim\(regexp_replace\(regexp_replace\(regexp_replace\(o\.statement, '\k<comment>', ' ', 'g'\), '\k<line>', ' ', 'g'\), '\k<space>', ' ', 'g'\), ' ' \|\| chr\(59\)\)\s*FROM unnest\(\$7::text\[\]\) AS o\(statement\)\)")]
         private static partial Regex TextRule();
+
+        [GeneratedRegex(@"CASE WHEN octet_length\(COALESCE\(q\.query_sql_text, ''\)\) \+ 1\s+< COALESCE\(\(SELECT NULLIF\(m\.setting, ''\)::integer FROM pg_settings AS m WHERE m\.name = 'pg_qs\.max_query_text_length'\), 2147483647\)\s+THEN true\s+ELSE NOT EXISTS \(SELECT 1\s+FROM unnest\(\$7::text\[\]\) AS t\(statement\)\s+WHERE starts_with\(btrim\(regexp_replace\(regexp_replace\(regexp_replace\(t\.statement, '(?<comment>[^']*)', ' ', 'g'\), '(?<line>[^']*)', ' ', 'g'\), '(?<space>[^']*)', ' ', 'g'\), ' ' \|\| chr\(59\)\),\s+btrim\(regexp_replace\(regexp_replace\(regexp_replace\(q\.query_sql_text, '\k<comment>', ' ', 'g'\), '\k<line>', ' ', 'g'\), '\k<space>', ' ', 'g'\), ' ' \|\| chr\(59\)\)\)\)\s+END")]
+        private static partial Regex TruncatedRule();
     }
 
     /// <summary>

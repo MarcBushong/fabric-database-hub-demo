@@ -7,8 +7,9 @@ namespace ContosoCare.Workload.Rca.QueryStore;
 /// <summary>
 /// Query Store's settings on a PostgreSQL server, as RCA-PG-13 read them from pg_settings
 /// (https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store): what it records, whether wait sampling
-/// records and how often it samples, its interval and retention, and whether the server is in recovery, where Query Store
-/// records nothing.
+/// records and how often it samples, its interval and retention, whether the server is in recovery, where Query Store
+/// records nothing, and when the server started (pg_postmaster_start_time()), which tells a backfill whether T4 stopped
+/// since a range was recorded.
 /// </summary>
 internal sealed record PgQueryStoreSettings(
     DateTimeOffset At,
@@ -18,7 +19,8 @@ internal sealed record PgQueryStoreSettings(
     TimeSpan? HistoryPeriod,
     TimeSpan? Interval,
     TimeSpan? Retention,
-    IReadOnlyList<string> Missing)
+    IReadOnlyList<string> Missing,
+    DateTimeOffset? ServerStarted = null)
 {
     public const string CaptureModeSetting = "pg_qs.query_capture_mode";
 
@@ -59,7 +61,8 @@ internal sealed record PgQueryStoreSettings(
             Duration(byName, "pgms_wait_sampling.history_period", "ms"),
             Duration(byName, "pg_qs.interval_length_minutes", "min"),
             Duration(byName, "pg_qs.retention_period_in_days", "d"),
-            [.. Read.Where(n => !byName.ContainsKey(n))]);
+            [.. Read.Where(n => !byName.ContainsKey(n))],
+            rows.Select(r => r.Time("server_started")).FirstOrDefault(t => t is not null));
     }
 
     /// <summary>What these settings keep out of the capture, one gap per line (rca/README.md, Query Store).</summary>

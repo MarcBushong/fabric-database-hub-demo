@@ -262,9 +262,12 @@ FROM pg_stat_activity AS a;
 -- RCA-PG-14 read (the first at the observer's start), on T4's observer connection: none, or a missing setting, is a
 -- coverage gap that says which; a change between reads is an RCA Query Events row; and a server in recovery records
 -- nothing in Query Store (https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store, Read-only mode),
--- which is why T4's read replica isn't read at all.
+-- which is why T4's read replica isn't read at all. server_started (pg_postmaster_start_time()) goes with each read and
+-- pending range into the watermark: a backfill that finds T4 started since knows that what Query Store still held in
+-- memory at the stop shows by then or never will (rca/README.md, Pending publication).
 SELECT /* dbhubdemo:rca-observer */ clock_timestamp() AS captured_at,
        pg_is_in_recovery() AS in_recovery,
+       pg_postmaster_start_time() AS server_started,
        s.name,
        s.setting,
        s.unit
@@ -296,9 +299,11 @@ ORDER BY s.name;
 -- statements, whose connections' search_path names dbhubdemo_rca_observer (qs_view records it per row), whose text
 -- carries the marker, or whose text is one of $7's once comments are stripped, white space collapsed, and a final
 -- semicolon dropped, which also catches what the observer sent before either marker existed (its blocks then were these
--- same statements without the marker's comment); and the harness's: a call of one of its functions, or a statement that
--- references a table only the harness writes and no other table, since Query Store records a statement nested in a
--- function without its function (pg_qs.query_capture_mode all). Everything else is measured evidence.
+-- same statements without the marker's comment), and a text that begins one of $7's, so normalized, when it's as long as
+-- Query Store keeps a text, less one (pg_qs.max_query_text_length, which cuts longer ones short); and the harness's: a
+-- call of one of its functions, or a statement that references a table only the harness writes and no other table,
+-- since Query Store records a statement nested in a function without its function (pg_qs.query_capture_mode all).
+-- Everything else is measured evidence.
 SELECT /* dbhubdemo:rca-observer */ clock_timestamp() AS captured_at,
        r.start_time AT TIME ZONE 'UTC' AS interval_start_utc,
        r.end_time AT TIME ZONE 'UTC' AS interval_end_utc,
@@ -366,6 +371,14 @@ FROM (SELECT s.start_time,
                     AND btrim(regexp_replace(regexp_replace(regexp_replace(COALESCE(q.query_sql_text, ''), '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59))
                         <> ALL (SELECT btrim(regexp_replace(regexp_replace(regexp_replace(o.statement, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59))
                                 FROM unnest($7::text[]) AS o(statement))
+                    AND CASE WHEN octet_length(COALESCE(q.query_sql_text, '')) + 1
+                                  < COALESCE((SELECT NULLIF(m.setting, '')::integer FROM pg_settings AS m WHERE m.name = 'pg_qs.max_query_text_length'), 2147483647)
+                             THEN true
+                             ELSE NOT EXISTS (SELECT 1
+                                              FROM unnest($7::text[]) AS t(statement)
+                                              WHERE starts_with(btrim(regexp_replace(regexp_replace(regexp_replace(t.statement, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59)),
+                                                                btrim(regexp_replace(regexp_replace(regexp_replace(q.query_sql_text, '/\*.*?\*/', ' ', 'g'), '--[^\n]*', ' ', 'g'), '\s+', ' ', 'g'), ' ' || chr(59))))
+                        END
                     AND NOT (cardinality($3::text[]) > 0 AND COALESCE(q.query_sql_text, '') ~* ('\m(' || array_to_string($3::text[], '|') || ')\s*\('))
                     AND NOT (cardinality($4::text[]) > 0
                              AND COALESCE(q.query_sql_text, '') ~* ('\m(' || array_to_string($4::text[], '|') || ')\M')

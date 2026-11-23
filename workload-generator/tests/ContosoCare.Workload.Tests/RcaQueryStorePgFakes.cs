@@ -35,18 +35,24 @@ internal static class T4Fixtures
 
     public static DateTimeOffset At(int hour, int minute, int milliseconds = 0) => new DateTimeOffset(2026, 11, 20, hour, minute, 0, TimeSpan.Zero).AddMilliseconds(milliseconds);
 
+    /// <summary>When T4 started before the fixtures' sessions (pg_postmaster_start_time()).</summary>
+    public static readonly DateTimeOffset ServerStart = new(2026, 11, 20, 8, 0, 0, TimeSpan.Zero);
+
     /// <summary>A harness of one marked function and no table only it writes.</summary>
     public static PgHarness Harness() => PgHarness.Parse([Row(("kind", "function"), ("name", "fn_harness_event"))]);
 
     /// <summary>RCA-PG-13's rows: Query Store on T4 as the demo sets it (capture mode all, 15-minute intervals, 7 days).</summary>
-    public static List<CaptureValues> Settings(DateTimeOffset now, bool inRecovery, string captureMode = "all") =>
+    public static List<CaptureValues> Settings(DateTimeOffset now, bool inRecovery, string captureMode = "all", DateTimeOffset? started = null) =>
     [
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pg_qs.interval_length_minutes"), ("setting", "15"), ("unit", "min")),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pg_qs.query_capture_mode"), ("setting", captureMode), ("unit", null)),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pg_qs.retention_period_in_days"), ("setting", "7"), ("unit", null)),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pg_qs.store_query_plans"), ("setting", "off"), ("unit", null)),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pgms_wait_sampling.history_period"), ("setting", "100"), ("unit", "ms")),
-        Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("name", "pgms_wait_sampling.query_capture_mode"), ("setting", "all"), ("unit", null)),
+        .. new (string Name, string Setting, string? Unit)[]
+        {
+            ("pg_qs.interval_length_minutes", "15", "min"),
+            ("pg_qs.query_capture_mode", captureMode, null),
+            ("pg_qs.retention_period_in_days", "7", null),
+            ("pg_qs.store_query_plans", "off", null),
+            ("pgms_wait_sampling.history_period", "100", "ms"),
+            ("pgms_wait_sampling.query_capture_mode", "all", null),
+        }.Select(s => Row(("captured_at", now.UtcDateTime), ("in_recovery", inRecovery), ("server_started", (started ?? ServerStart).UtcDateTime), ("name", s.Name), ("setting", s.Setting), ("unit", s.Unit))),
     ];
 
     /// <summary>RCA-PG-14's rows behind the T4 fixture: what qs_view returns for 16:45 and 17:00, the leave-outs applied.</summary>
@@ -165,6 +171,9 @@ internal sealed class T4QueryStore
 
     public string CaptureMode { get; set; } = "all";
 
+    /// <summary>When T4 last started (pg_postmaster_start_time()), as RCA-PG-13 returns it.</summary>
+    public DateTimeOffset ServerStarted { get; set; } = T4Fixtures.ServerStart;
+
     public bool HarnessFails { get; set; }
 
     public List<CaptureValues> Harness { get; set; } =
@@ -182,7 +191,7 @@ internal sealed class T4QueryStore
     /// <summary>What the observer's own connection returns for RCA-PG-13 and 16 at the store's clock; null for a block it doesn't answer, or a harness that fails.</summary>
     public IReadOnlyList<CaptureValues>? ObserverAnswer(string block) => block switch
     {
-        "RCA-PG-13" => T4Fixtures.Settings(Clock, inRecovery: false, CaptureMode),
+        "RCA-PG-13" => T4Fixtures.Settings(Clock, inRecovery: false, CaptureMode, ServerStarted),
         "RCA-PG-16" => HarnessFails ? null : Harness,
         _ => null,
     };

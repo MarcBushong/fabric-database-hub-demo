@@ -646,9 +646,16 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
             Failed(coverage, read.FailedBlock ?? PgQueryStoreRows.Statistics, partial);
         }
 
-        var done = read.Failure is null && read.Complete && now >= to + schedule.Interval + PublishedAfter;
+        // T4 started again since the range was recorded: what Query Store held in memory at the stop shows by now or never
+        // will, so what this read doesn't show is lost, never pending (rca/README.md, Pending publication).
+        var restarted = settings?.ServerStarted is { } started && range.ServerStartedUtc is { } before && started > before;
+        var done = read.Failure is null && read.Complete && (restarted || now >= to + schedule.Interval + PublishedAfter);
         var shown = read.Through is { } reached && reached > reader.From ? reached : reader.From;
-        if (!done && shown < to)
+        if (shown < to && restarted && done)
+        {
+            coverage.Gaps.Add(Lost(shown, to));
+        }
+        else if (!done && shown < to)
         {
             coverage.Pending = (shown, to);
             coverage.Gaps.Add(PgQueryStoreRows.PendingGap(Target, shown, to));
@@ -736,6 +743,13 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
                     state.ThroughUtc = newest;
                 }
 
+                // T4's start as of this read, with the state and the range: a later backfill compares it with T4's then.
+                var started = settings?.ServerStarted;
+                if (started is not null)
+                {
+                    state.ServerStartedUtc = started;
+                }
+
                 if (span is null)
                 {
                     return;
@@ -761,6 +775,7 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
                 mine.FromUtc = unsettled;
                 mine.ToUtc = final ? now : null;
                 mine.RecordedUtc = now;
+                mine.ServerStartedUtc = started ?? mine.ServerStartedUtc;
             });
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
@@ -799,6 +814,9 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
 
     private string Expired(DateTimeOffset from, DateTimeOffset to, TimeSpan retention) =>
         string.Create(CultureInfo.InvariantCulture, $"Pending publication expired: {Target}'s Query Store keeps {retention.TotalDays:0} days, so {from:yyyy-MM-dd HH:mm} to {to:yyyy-MM-dd HH:mm} UTC can't be read any more.");
+
+    private string Lost(DateTimeOffset from, DateTimeOffset to) =>
+        string.Create(CultureInfo.InvariantCulture, $"Lost when {Target} stopped: Query Store shows nothing of {from:yyyy-MM-dd HH:mm} to {to:yyyy-MM-dd HH:mm} UTC, which it still held in memory when {Target} stopped, and {Target} has started again since, so none of it will show.");
 
     /// <summary>What was written of one row or wait group: its interval's end, and its values.</summary>
     private sealed record Written(DateTimeOffset End, string Signature);
