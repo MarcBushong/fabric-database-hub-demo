@@ -29,7 +29,7 @@ $script:KeptValueReportRowId = 'Fabric.Report'
 $script:KeptValueFormSettled = 'Snapshot Value reads the kept values in telemetry_snapshots (F35): this run''s end deployed that form after its history snapshot, once every row''s kept value was worked out (DEPLOY.FABRIC.KEPTVALUE.END).'
 # What that Warning says instead, Not selected with the next-deploy fix, when deploy.ps1's end had no rows to work out: no
 # Warning asks for a step that the next deploy.ps1 takes by itself (design A, the re-check of 5411cca1).
-$script:KeptValueFormWaits = 'Snapshot Value has the release''s form for now: this run''s end had no rows whose kept values to work out (DEPLOY.FABRIC.KEPTVALUE.END), so the history''s totals can count a minute twice where saves at different intervals hold it (F35).'
+$script:KeptValueFormWaits = 'Snapshot Value has the release''s form for now: this run''s end didn''t work out the history''s kept values (DEPLOY.FABRIC.KEPTVALUE.END: its history snapshot saved nothing, or there was no table), so the history''s totals can count a minute twice where saves at different intervals hold it (F35).'
 # The history model and report's records (configure-powerbi.ps1 through Invoke-DemoPowerBIStage), which the history report's
 # row shows, as the Fabric track's step sets it.
 $script:KeptValueReportRecordPattern = '^(FABRIC\.(SEMANTICMODEL|REPORT)\.|FABRIC\.(IMPORT|READBACK)\.(SM|RPT)_|DEPLOY\.POWERBI$)'
@@ -330,7 +330,7 @@ function Invoke-DemoKeptValueEndStep {
             return
         }
         if ([string]$track.status -eq 'Warning') {
-            Set-DemoHistoryResultText -Result $track -Status 'Not selected' -Message ('This step didn''t work out the history''s kept values ({0}), and this run''s end had none to work out, so this run''s history model keeps the release''s form for now, where overlapping saves can count twice.' -f $trackOutcome) -Remediation $script:KeptValueNextDeployFix
+            Set-DemoHistoryResultText -Result $track -Status 'Not selected' -Message ('This step didn''t work out the history''s kept values ({0}), and this run''s end didn''t work them out either (its history snapshot saved nothing, or there was no table), so this run''s history model keeps the release''s form for now, where overlapping saves can count twice.' -f $trackOutcome) -Remediation $script:KeptValueNextDeployFix
             Set-DemoProgressStep -Path $ProgressPath -Id $script:KeptValueTrackRowId -State 'Skipped' -Status 'Not selected' -Message ('{0} {1}' -f [string]$track.message, $script:KeptValueNextDeployFix) -MaxLength 1200
         }
         $forms = @($Result | Where-Object { $null -ne $_ -and [string](Get-DemoMemberValue -InputObject $_ -Name 'checkId') -eq $script:KeptValueFormCheckId -and [string]$_.status -eq 'Warning' })

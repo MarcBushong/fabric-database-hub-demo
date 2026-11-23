@@ -719,7 +719,7 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
         }
         $script:formSettled = 'Snapshot Value reads the kept values in telemetry_snapshots (F35): this run''s end deployed that form after its history snapshot, once every row''s kept value was worked out (DEPLOY.FABRIC.KEPTVALUE.END).'
         $script:nextDeployFix = 'Nothing to do now: the next ./scripts/deploy.ps1 works out the history''s kept values and deploys the history model in their form by itself.'
-        $script:formWaits = 'Snapshot Value has the release''s form for now: this run''s end had no rows whose kept values to work out (DEPLOY.FABRIC.KEPTVALUE.END), so the history''s totals can count a minute twice where saves at different intervals hold it (F35).'
+        $script:formWaits = 'Snapshot Value has the release''s form for now: this run''s end didn''t work out the history''s kept values (DEPLOY.FABRIC.KEPTVALUE.END: its history snapshot saved nothing, or there was no table), so the history''s totals can count a minute twice where saves at different intervals hold it (F35).'
     }
 
     BeforeEach {
@@ -886,7 +886,7 @@ Describe 'deploy.ps1''s end deploys the kept form when the Fabric track couldn''
         $item = InModuleScope DbHubDemo -Parameters @{ R = @($track, $import, $form, $end) } { Get-DemoKeptValueItem -Result $R }
         if ($Settled) {
             $track.status | Should -Be 'Not selected' -Because $Name
-            $track.message | Should -BeExactly ('This step didn''t work out the history''s kept values ({0}), and this run''s end had none to work out, so this run''s history model keeps the release''s form for now, where overlapping saves can count twice.' -f $Outcome)
+            $track.message | Should -BeExactly ('This step didn''t work out the history''s kept values ({0}), and this run''s end didn''t work them out either (its history snapshot saved nothing, or there was no table), so this run''s history model keeps the release''s form for now, where overlapping saves can count twice.' -f $Outcome)
             $track.remediation | Should -BeExactly $script:nextDeployFix
             $track.evidence.earlierMessage | Should -BeExactly $trackBefore
             $form.status | Should -Be 'Not selected'
