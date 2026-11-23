@@ -13,11 +13,13 @@ function Invoke-DemoValidation {
       also while sqlvm01 is deallocated: Pass when it lists only the database engine, a Warning while it still
       lists Analysis Services or Integration Services (T1's AssociatedServices bootstrap step removes them).
     - T2: Get-DemoArcCheck, and the read-only isolation probe of the guest (T2.GUEST.ISOLATION).
-    - T3: Test-DemoT3.
-    - T4 (Phase 24, ADR 0019): Test-DemoT4 -IncludeMetrics: the PostgreSQL flexible server, Entra-only, its
-      network, administrator, database, enhanced metrics, and METRICS.T4 (Azure Monitor has its metrics).
+    - T3: Test-DemoT3 -IncludeQueryStore, with T3.QUERYSTORE (2026-11-23): Query Store in ContosoCare, from its status row.
+    - T4 (Phase 24, ADR 0019): Test-DemoT4 -IncludeMetrics -IncludeQueryStore: the PostgreSQL flexible server, Entra-only,
+      its network, administrator, database, enhanced metrics, Query Store and its wait sampling (T4.QUERYSTORE,
+      2026-11-23), and METRICS.T4 (Azure Monitor has its metrics).
     - T5 (2026-11-18, ADR 0027): Test-DemoT5 -IncludeMetrics: the Azure Cosmos DB for NoSQL account, Entra-only, its
-      private endpoint, container and throughput, free tier, T1's data-plane role, and METRICS.T5 (Azure Monitor has its
+      network (its private endpoint, or T1's subnet rule; 2026-11-21), container and throughput, free tier, T1's
+      data-plane role, and METRICS.T5 (Azure Monitor has its
       requests and normalized RU). Without requests while sqlvm01, which runs T5's workload, is deallocated, METRICS.T5
       is a Warning.
     - Hub: Test-DemoFabricHubSetting (P4), Test-DemoFabricWorkspace (P5), Test-DemoHubEstate, and presenter
@@ -25,7 +27,8 @@ function Invoke-DemoValidation {
     - Telemetry: Test-DemoHubTelemetry over the retention window, and the T3 readiness gate
       (Test-DemoT3Readiness).
     - Workload: the runner's status on each target (Invoke-DemoWorkloadCommand status --json) and the
-      scenario bounds.
+      scenario bounds, with T1.QUERYSTORE and T2.QUERYSTORE (2026-11-23, areas t1 and t2): Query Store's state from the
+      same status.
     - Cost: the live-price estimate (Get-DemoCostEstimate, reused from Preflight), the budget, the
       auto-shutdown schedules, and a Bastion or public IP left billing.
     - Security: secret scans of the local output, the Run Command instance views, and the ARM deployments

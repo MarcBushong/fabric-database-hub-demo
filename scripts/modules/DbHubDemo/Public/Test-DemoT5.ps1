@@ -104,15 +104,43 @@ function Test-DemoT5 {
     $connections = Get-DemoMemberList -InputObject $properties -Name 'privateEndpointConnections'
     $approved = @($connections | Where-Object { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'privateLinkServiceConnectionState') -Name 'status') -ieq 'Approved' })
     $endpoints = @($approved | ForEach-Object { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $_ -Name 'properties') -Name 'privateEndpoint') -Name 'id') -replace '^.*/privateEndpoints/', '' })
-    $networkEvidence = [ordered]@{ publicNetworkAccess = $public; privateEndpoints = @($endpoints); expectedPrivateEndpoint = $names.PrivateEndpointName; privateDnsZone = $names.PrivateDnsZoneName }
+    # In public mode without a policy that needs the endpoint (2026-11-21, ADR 0027): public network access on, limited by a
+    # virtual network rule to T1's subnet, snet-sqlvm in the demo resource group's network, through its service endpoint,
+    # with no IP rule (DEPLOY.T5.NETWORK).
+    $filtered = [string](Get-DemoMemberValue -InputObject $properties -Name 'isVirtualNetworkFilterEnabled') -ieq 'true'
+    $ruleIds = @(foreach ($rule in (Get-DemoMemberList -InputObject $properties -Name 'virtualNetworkRules')) { [string](Get-DemoMemberValue -InputObject $rule -Name 'id') })
+    $subnets = @($ruleIds | ForEach-Object { $_ -replace '^.*/subnets/', '' })
+    $ownSubnet = '(?i)/resourceGroups/{0}/providers/Microsoft\.Network/virtualNetworks/[^/]+/subnets/snet-sqlvm$' -f [regex]::Escape([string]$names.ResourceGroup)
+    $ipRules = Get-DemoMemberList -InputObject $properties -Name 'ipRules'
+    $viaRule = $public -ieq 'Enabled' -and $filtered -and $ipRules.Count -eq 0 -and $ruleIds.Count -gt 0 -and @($ruleIds | Where-Object { $_ -notmatch $ownSubnet }).Count -eq 0
+    $networkEvidence = [ordered]@{ path = $(if ($public -ieq 'Disabled') { 'PrivateEndpoint' } elseif ($viaRule) { 'ServiceEndpoint' } else { 'Open' }); publicNetworkAccess = $public; privateEndpoints = @($endpoints); expectedPrivateEndpoint = $names.PrivateEndpointName; privateDnsZone = $names.PrivateDnsZoneName; virtualNetworkFilter = $filtered; virtualNetworkRules = @($subnets); ipRules = $ipRules.Count }
     if ($public -ieq 'Disabled' -and $endpoints -contains $names.PrivateEndpointName) {
-        & $add 'T5.NETWORK' 'Pass' ('T5 is reachable only through its private endpoint {0} in snet-pe (public network access is off), in both network modes; only T1''s subnet reaches it, over HTTPS.' -f $names.PrivateEndpointName) $networkEvidence
+        & $add 'T5.NETWORK' 'Pass' ('T5 is reachable only through its private endpoint {0} in snet-pe (public network access is off); only T1''s subnet reaches it, over HTTPS. It has one in private mode, under a policy that needs it, or because it was created with one (DEPLOY.T5.NETWORK says which).' -f $names.PrivateEndpointName) $networkEvidence
     }
     elseif ($public -ieq 'Disabled') {
         & $add 'T5.NETWORK' 'Fail' ('T5''s public network access is off, but its private endpoint {0} isn''t approved, so T1 can''t reach it.' -f $names.PrivateEndpointName) $networkEvidence 'Run ./scripts/deploy.ps1, which creates the private endpoint and its DNS zone group.' $docs['privateEndpoint']
     }
+    elseif ($viaRule) {
+        # The rule admits T1's subnet only through its Azure Cosmos DB service endpoint, which sends the subnet's identity;
+        # without it T1's requests get 403 (the review of 31ccf40, 2026-11-22).
+        $subnetEndpoint = Get-DemoT5SubnetServiceEndpoint -Config $Config -SubnetId $ruleIds[0]
+        $networkEvidence['subnetServiceEndpoint'] = $subnetEndpoint.Present
+        $networkEvidence['subnetServiceEndpointState'] = $subnetEndpoint.State
+        if ($subnetEndpoint.Present -eq $true -and $subnetEndpoint.State -in '', 'Succeeded') {
+            & $add 'T5.NETWORK' 'Pass' 'T5 is reachable from T1''s subnet only: its public network access is on, limited to snet-sqlvm by a virtual network rule through that subnet''s Azure Cosmos DB service endpoint, with no IP rule and no private endpoint, as T3 in public mode, since no policy needs one. Database Hub''s Security page lists T5''s public network access, as it does T3''s.' $networkEvidence
+        }
+        elseif ($subnetEndpoint.Present -eq $true) {
+            & $add 'T5.NETWORK' 'Warning' ('T5 is limited to T1''s subnet by a virtual network rule, and snet-sqlvm''s Azure Cosmos DB service endpoint is {0}, so T1 may not reach T5 until Azure finishes it.' -f $subnetEndpoint.State) $networkEvidence 'Check again in a few minutes (validate.ps1 -Area T5); if it stays, run ./scripts/deploy.ps1.' $docs['vnetServiceEndpoint']
+        }
+        elseif ($subnetEndpoint.Present -eq $false) {
+            & $add 'T5.NETWORK' 'Fail' ('T5''s public network access is limited to {0} by a virtual network rule, but {0} has no Azure Cosmos DB service endpoint, so T1 can''t reach T5: Azure Cosmos DB answers its requests with 403 (Forbidden).' -f $subnetEndpoint.Subnet) $networkEvidence 'Run ./scripts/deploy.ps1, which gives snet-sqlvm its Microsoft.AzureCosmosDB service endpoint again; a new service endpoint can take up to 15 minutes to apply.' $docs['vnetServiceEndpoint']
+        }
+        else {
+            & $add 'T5.NETWORK' 'Warning' ('T5 is limited to T1''s subnet by a virtual network rule, but snet-sqlvm couldn''t be read to confirm its Azure Cosmos DB service endpoint, which that rule needs: {0}' -f $subnetEndpoint.Error) $networkEvidence 'Check again in a few minutes (validate.ps1 -Area T5).' $docs['vnetServiceEndpoint']
+        }
+    }
     else {
-        & $add 'T5.NETWORK' 'Fail' ('T5''s public network access is {0}; the demo keeps it off and uses the private endpoint, so Database Hub''s Security page would list it as an issue.' -f $(if ($public) { $public } else { 'not set' })) $networkEvidence 'Run ./scripts/deploy.ps1, which turns public network access off.' $docs['privateEndpoint']
+        & $add 'T5.NETWORK' 'Fail' ('T5''s public network access is {0}, and not limited to T1''s subnet alone by a virtual network rule (subnets: {1}; IP rules: {2}), so it''s open wider than the demo sets it.' -f $(if ($public) { $public } else { 'not set' }), $(if ($subnets.Count -gt 0) { $subnets -join ', ' } else { 'none' }), $ipRules.Count) $networkEvidence 'Run ./scripts/deploy.ps1, which sets T5''s network again: a private endpoint with public network access off, or T1''s subnet alone (DEPLOY.T5.NETWORK says which).' $docs['vnetServiceEndpoint']
     }
 
     $containerPath = Get-DemoT5ContainerPath

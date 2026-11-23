@@ -525,7 +525,7 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
             [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes(($Request | ConvertTo-Json -Depth 5 -Compress)))
         }
 
-        function New-RunnerStatus([int] $Runs, [string] $Target = 'T1') {
+        function New-RunnerStatus([int] $Runs, [string] $Target = 'T1', [System.Collections.IDictionary] $QueryStore = $null) {
             # The runner's 'status --json' as it writes it, indented: the profile near the top, one node per run (each with
             # its own "profile" string), and the host node last (CommandLine.cs). 2 runs make 2,128 characters, 5 make 3,584,
             # with the line breaks the runner writes on the Windows VMs (System.Text.Json's indented output uses
@@ -558,8 +558,12 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
                 demoSessions   = @()
                 dataHeadroomMb = 1834
                 logHeadroomMb  = 912
-                host           = [ordered]@{ status = 'Fail'; message = ('The {0} lane keeps failing: the host restarted it 3 times in the last hour.' -f $Target); file = 'C:\ProgramData\DbHubDemo\host-lanes.json'; processId = 4312; hostStartedAt = '2026-11-03T12:58:40.000Z'; heartbeatAt = '2026-11-03T14:06:58.000Z'; heartbeatAgeSeconds = 2; processAlive = $true; stoppedAt = $null; stopReason = $null; lane = [ordered]@{ state = 'Serving'; generation = 4; restarts = 3; restartsLastHour = 3; lastRestartReason = 'no poll finished for 301 s'; lastPollAt = '2026-11-03T14:06:50.000Z'; lastPollAgeSeconds = 10; operation = 'polling'; consecutiveFailures = 0; lastError = $null; runningRuns = 1 } }
             }
+            if ($null -ne $QueryStore) {
+                # Last but one, before the host node, as the runner writes it since 2026-11-23 (CommandLine.QueryStore.cs).
+                $document['queryStore'] = $QueryStore
+            }
+            $document['host'] = [ordered]@{ status = 'Fail'; message = ('The {0} lane keeps failing: the host restarted it 3 times in the last hour.' -f $Target); file = 'C:\ProgramData\DbHubDemo\host-lanes.json'; processId = 4312; hostStartedAt = '2026-11-03T12:58:40.000Z'; heartbeatAt = '2026-11-03T14:06:58.000Z'; heartbeatAgeSeconds = 2; processAlive = $true; stoppedAt = $null; stopReason = $null; lane = [ordered]@{ state = 'Serving'; generation = 4; restarts = 3; restartsLastHour = 3; lastRestartReason = 'no poll finished for 301 s'; lastPollAt = '2026-11-03T14:06:50.000Z'; lastPollAgeSeconds = 10; operation = 'polling'; consecutiveFailures = 0; lastError = $null; runningRuns = 1 } }
             return (($document | ConvertTo-Json -Depth 8) -replace '\r?\n', "`r`n")
         }
     }
@@ -761,12 +765,125 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         $result.evidence.profile.name | Should -Be 'business-day'
     }
 
+    It 'Runner keeps a status''s running runs'' bounds from the whole output when the request asks, so validate.ps1 checks them during a session (F20)' {
+        $root = New-ControlRoot
+        # Five runs, two of them still Running: the kept tail has neither, and the line still fits.
+        $script:status = (New-RunnerStatus -Runs 5) -replace '("runId": "20261103T133500-io-pressure",\s+"scenario": "io-pressure",\s+"target": "T1",\s+"status": )"Completed"', '$1"Running"'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5'); bounds = $true }) -StateRoot $root
+        $script:lines[0].Length | Should -BeLessThan 3900 -Because 'the line fits the 4,096 bytes a Run Command keeps'
+        $result = Get-ControlResult
+        $result.evidence.stdout | Should -Not -Match '"description"' -Because 'the kept tail leaves the status''s top out'
+        $result.evidence.bounds.listed | Should -Be 5
+        $running = @($result.evidence.bounds.running)
+        $running.Count | Should -Be 2
+        $running.runId | Should -Be @('20261103T133500-io-pressure', '20261103T140500-healthy-baseline')
+        $running[1].scenario | Should -Be 'healthy-baseline'
+        # The test reads the line with ConvertFrom-Json, which makes its ISO 8601 times DateTime values.
+        ([datetime]$running[1].startedAt).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 3, 14, 5, 0, [System.DateTimeKind]::Utc))
+        ([datetime]$running[1].deadlineAt).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 3, 14, 13, 0, [System.DateTimeKind]::Utc))
+        $script:lines[0] | Should -Match ([regex]::Escape('"startedAt":"2026-11-03T14:05:00.000Z"'))
+        $running[1].maxDurationSeconds | Should -Be 600
+        $result.evidence.bounds.demoSessions | Should -Be 0
+        $result.evidence.PSObject.Properties['boundsCut'] | Should -BeNullOrEmpty
+
+        # Without the request's bounds, the line is as before.
+        $script:lines.Clear()
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5') }) -StateRoot $root
+        (Get-ControlResult).evidence.PSObject.Properties['bounds'] | Should -BeNullOrEmpty
+    }
+
+    It 'Runner leaves the bounds out, and says so, when the line wouldn''t fit what a Run Command keeps (F20)' {
+        $root = New-ControlRoot
+        # Every run Running, a long error output, and the longest message (a guest recovery's, for example): the bounds would
+        # push the line past its budget.
+        $script:status = (New-RunnerStatus -Runs 5) -replace '"status": "Completed"', '"status": "Running"'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = ('warn: the profile host''s lane polled late. ' * 20) } }
+        Mock -CommandName Get-DemoVmRunnerOutcome -MockWith { [pscustomobject]@{ Status = 'Pass'; Message = ('The guest''s PowerShell Direct channel broke, and its restart cleared it. ' * 12) } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5'); bounds = $true }) -StateRoot $root
+        $script:lines[0].Length | Should -BeLessThan 3900
+        $result = Get-ControlResult
+        $result.evidence.PSObject.Properties['bounds'] | Should -BeNullOrEmpty
+        $result.evidence.boundsCut | Should -BeTrue
+        $result.evidence.profile.name | Should -Be 'business-day'
+    }
+
     It 'Runner adds no profile for output that has none' {
         $root = New-ControlRoot
         Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = '[{"checkId":"WORKLOAD.T1.PROFILE.SET","status":"Pass","message":"ok"}]'; StdErr = '' } }
         Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('profile', 'set', '--name', 'baseline', '--json') }) -StateRoot $root
         $script:lines[0] | Should -Not -Match '"profile":\{'
+        $script:lines[0] | Should -Not -Match '"queryStore"'
         (Get-ControlResult).status | Should -Be 'Pass'
+    }
+
+    # 2026-11-23: the runner writes Query Store's state last but one, before the host node, but the kept tail of a status
+    # with runs is 1,800 characters, which loses it (the review of the Query Store design, finding 6), so the relay reads it
+    # from the whole output, bounded, for validate.ps1's T1.QUERYSTORE and T2.QUERYSTORE.
+    It 'Runner keeps Query Store''s state from the whole status with <Runs> runs, bounded, and the line within a Run Command''s 4 KB (T2''s relay takes the same step after its guest''s run)' -ForEach @(
+        @{ Target = 'T1'; Runs = 2 }
+        @{ Target = 'T1'; Runs = 5 }
+    ) {
+        $root = New-ControlRoot
+        $script:status = New-RunnerStatus -Runs $Runs -Target $Target -QueryStore ([ordered]@{ actualState = 'READ_ONLY'; desiredState = 'READ_WRITE'; readonlyReason = 65536; captureMode = 'AUTO'; intervalMinutes = 15; storageMb = 1024; maxStorageMb = 1024 })
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = $Target; arguments = @('status', '--json', '--runs', '5') }) -StateRoot $root
+        $script:lines[0].Length | Should -BeLessThan 3500 -Because 'the line fits the 4,096 bytes a Run Command keeps'
+        $result = Get-ControlResult
+        $result.evidence.queryStore.actualState | Should -Be 'READ_ONLY'
+        $result.evidence.queryStore.desiredState | Should -Be 'READ_WRITE'
+        $result.evidence.queryStore.readonlyReason | Should -Be 65536
+        $result.evidence.queryStore.maxStorageMb | Should -Be 1024
+        @($result.evidence.queryStore.PSObject.Properties.Name) | Should -Be @('actualState', 'desiredState', 'captureMode', 'readonlyReason', 'intervalMinutes', 'storageMb', 'maxStorageMb')
+    }
+
+    It 'Runner cuts Query Store''s strings and its error, so the node stays under 400 characters escaped' {
+        $long = '"' + ('x' * 500)
+        $node = Get-DemoControlRunnerQueryStore -Text (@{ target = 'T1'; queryStore = @{ actualState = $long; desiredState = $long; captureMode = $long; readonlyReason = 1; intervalMinutes = 15; storageMb = 2; maxStorageMb = 3; extra = $long }; host = @{ status = 'Pass' } } | ConvertTo-Json -Depth 4)
+        ((ConvertTo-Json -InputObject $node.actualState -Compress).Length - 2) | Should -BeLessOrEqual 64 -Because 'the cut is of the escaped text'
+        $node.captureMode | Should -Match '^"x+$'
+        $node.Contains('extra') | Should -BeFalse -Because 'only the known members are kept'
+        ($node | ConvertTo-Json -Compress).Length | Should -BeLessThan 400
+        $failed = Get-DemoControlRunnerQueryStore -Text (@{ queryStore = @{ error = ('300: ' + ('"' * 600)) } } | ConvertTo-Json -Depth 4)
+        ((ConvertTo-Json -InputObject $failed.error -Compress).Length - 2) | Should -BeLessOrEqual 200
+        $failed.error | Should -Match '^300: "+$'
+        $quoted = Get-DemoControlRunnerQueryStore -Text (@{ queryStore = @{ error = ("300: permission denied in database 'ContosoCare' <&> " * 20) } } | ConvertTo-Json -Depth 4)
+        ((ConvertTo-Json -InputObject $quoted.error -Compress).Length - 2) | Should -BeLessOrEqual 200 -Because 'apostrophes and <, >, & take more escaped in Windows PowerShell'
+        $failed.actualState | Should -BeNullOrEmpty
+        ($failed | ConvertTo-Json -Compress).Length | Should -BeLessThan 400 -Because 'escaped quotes double, and the error is cut to 200 characters first'
+        Get-DemoControlRunnerQueryStore -Text 'not json' | Should -BeNullOrEmpty
+        Get-DemoControlRunnerQueryStore -Text '{"target":"T1","host":{"status":"Pass"}}' | Should -BeNullOrEmpty -Because 'a runner from before it writes none'
+    }
+
+    # The RCA release (2026-11-23): validate.ps1's one status read carries both the running runs' bounds (F20) and Query
+    # Store's state (part 3) in the same line. Query Store's node, under 400 characters, always stays (T1.QUERYSTORE would
+    # otherwise blame a runner from before it); the bounds go first when the line wouldn't fit, and boundsCut says so.
+    It 'Runner keeps a session''s running runs'' bounds and Query Store''s state in one line, and leaves the bounds out first when it wouldn''t fit (the RCA release)' {
+        $root = New-ControlRoot
+        $queryStore = [ordered]@{ actualState = 'READ_ONLY'; desiredState = 'READ_WRITE'; readonlyReason = 65536; captureMode = 'AUTO'; intervalMinutes = 15; storageMb = 1024; maxStorageMb = 1024 }
+        # During a session: five runs, two of them still Running, as validate.ps1 reads them.
+        $script:status = (New-RunnerStatus -Runs 5 -QueryStore $queryStore) -replace '("runId": "20261103T133500-io-pressure",\s+"scenario": "io-pressure",\s+"target": "T1",\s+"status": )"Completed"', '$1"Running"'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5'); bounds = $true }) -StateRoot $root
+        $script:lines[0].Length | Should -BeLessThan 3900 -Because 'the line fits the 4,096 bytes a Run Command keeps'
+        $result = Get-ControlResult
+        @($result.evidence.bounds.running).Count | Should -Be 2
+        $result.evidence.PSObject.Properties['boundsCut'] | Should -BeNullOrEmpty
+        $result.evidence.queryStore.actualState | Should -Be 'READ_ONLY'
+        $result.evidence.queryStore.readonlyReason | Should -Be 65536
+
+        # The longest: every run Running, a long error output, the longest message, and Query Store's longest node (its error
+        # cut to 200 characters). The bounds go, Query Store's state stays, and the line still fits.
+        $script:lines.Clear()
+        $script:status = (New-RunnerStatus -Runs 5 -QueryStore ([ordered]@{ error = ("300: permission denied in database 'ContosoCare' <&> " * 20) })) -replace '"status": "Completed"', '"status": "Running"'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = ('warn: the profile host''s lane polled late. ' * 20) } }
+        Mock -CommandName Get-DemoVmRunnerOutcome -MockWith { [pscustomobject]@{ Status = 'Pass'; Message = ('The guest''s PowerShell Direct channel broke, and its restart cleared it. ' * 12) } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5'); bounds = $true }) -StateRoot $root
+        [System.Text.Encoding]::UTF8.GetByteCount($script:lines[0]) | Should -BeLessThan 4096
+        $result = Get-ControlResult
+        $result.evidence.PSObject.Properties['bounds'] | Should -BeNullOrEmpty
+        $result.evidence.boundsCut | Should -BeTrue
+        $result.evidence.queryStore.error | Should -Match '^300: permission denied in database'
     }
 
     It 'EnableT4: sets T4 up as the P6 group''s role, records the marker, sets the profile, and restarts the host' {
@@ -1758,6 +1875,36 @@ Describe 'The health read''s live view of the T2 guest (T2.GUEST.STATE, 2026-11-
         Mock -CommandName Get-GoldenImdsVmId -MockWith { $hostVmId }
     }
 
+    It 'prints the first two warnings, each naming its step and cut to 240 characters, and how many there are, in the summary (F24)' {
+        $root = New-HealthRoot
+        $long = 'AssociatedServices: ' + ('x' * 300)
+        # And the first two notes the same way, which a Ready VM records as information (2026-11-23).
+        $longNote = 'GuestSignInCleanup: ' + ('y' * 300)
+        $health = [ordered]@{ schemaVersion = 1; role = 'SqlVm'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; warnings = @('SqlAdminAccess: SYSTEM was not a sysadmin.', $long, 'Media: Trusted on first use.'); notes = @('SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one.', $longNote, 'GuestImage: checked by its pinned SHA-256.'); steps = @() }
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), ($health | ConvertTo-Json -Depth 5))
+        $text = & $healthScript -Root $root -View Summary
+        $summary = $text | ConvertFrom-Json
+        $summary.warningCount | Should -Be 3
+        @($summary.warnings).Count | Should -Be 2
+        $summary.warnings[0] | Should -Be 'SqlAdminAccess: SYSTEM was not a sysadmin.'
+        $summary.warnings[1].Length | Should -Be 240
+        $summary.warnings[1] | Should -BeLike 'AssociatedServices: xxx*...'
+        $summary.noteCount | Should -Be 3
+        @($summary.notes).Count | Should -Be 2
+        $summary.notes[0] | Should -Be 'SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one.'
+        $summary.notes[1].Length | Should -Be 240
+        $text.Length | Should -BeLessThan 3500 -Because 'the summary fits the 4 KB a Run Command keeps'
+        # A health.json without warnings or notes, as an older bundle's has no notes, prints none.
+        $health.Remove('warnings')
+        $health.Remove('notes')
+        $health['status'] = 'Pass'
+        [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), ($health | ConvertTo-Json -Depth 5))
+        $clean = (& $healthScript -Root $root -View Summary) | ConvertFrom-Json
+        $clean.warningCount | Should -Be 0
+        @($clean.warnings).Count | Should -Be 0
+        $clean.noteCount | Should -Be 0
+        @($clean.notes).Count | Should -Be 0
+    }
     It 'reports a source a golden capture left air-gapped, with its role and no ID, in both views' {
         $root = New-HealthRoot -Capture ([ordered]@{ snapshotName = 'snap-dbhub-t2golden-202601020304'; sourceAzureVmId = $hostVmId; released = $false })
         $text = & $healthScript -Root $root -View Summary

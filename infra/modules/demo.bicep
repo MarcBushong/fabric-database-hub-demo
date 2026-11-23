@@ -149,7 +149,7 @@ param t4Enabled bool = true
 ])
 param t4SkuName string = 'Standard_D4ds_v5'
 
-@description('T4\'s autonomous tuning (Query Store and index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019).')
+@description('T4\'s autonomous tuning (index tuning in REPORT mode), only on a size that runs it; deploy.ps1 decides (2026-11-04, ADR 0019). Query Store and its wait sampling are on at every size but Burstable either way (2026-11-23).')
 param t4AutonomousTuning bool = false
 
 @description('T4\'s availability zone at creation: empty for no preference, or 1, 2, or 3.')
@@ -164,11 +164,17 @@ param t4AvailabilityZone string = ''
 @description('Current storage types of existing disks that drifted from the profile, keyed by disk name; the VMs keep them (Phase 24).')
 param diskSkuOverrides object = {}
 
-@description('Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Entra-only, a private endpoint in snet-pe in both network modes, and one container at 400 RU/s (ADR 0027).')
+@description('Deploy T5, the Azure Cosmos DB for NoSQL account cosmos01-<deploymentId>: Entra-only, reached from T1\'s subnet only, and one container at 400 RU/s (ADR 0027).')
 param t5Enabled bool = true
 
 @description('T5 uses the subscription\'s one free-tier account, which Azure sets only at creation; deploy.ps1 decides, and passes an existing account\'s own value (ADR 0027).')
 param t5FreeTier bool = false
+
+@description('T5 keeps a private endpoint in snet-pe, with public network access off (true, the default; always in private mode). False, which deploy.ps1 passes only in public mode, for a new account or one without an endpoint, when no policy needs one and the policies could all be read: public network access limited to T1\'s subnet through its service endpoint, as T3 (ADR 0027, 2026-11-21).')
+param t5PrivateAccess bool = true
+
+@description('T5\'s account has public network access on before this deployment: snet-sqlvm keeps its Azure Cosmos DB service endpoint, in either network mode, while the account moves to its private endpoint, so T1 reaches T5 until that move succeeds (ADR 0027, 2026-11-22).')
+param t5WasPublic bool = false
 
 // Single sources: profile sizing and disk tiers (config/profiles.json) and images (config/versions.json).
 var catalogProfile = loadJsonContent('../../config/profiles.json', '$.profiles')[profile]
@@ -205,10 +211,12 @@ var t4ServerFqdn = '${t4ServerName}.postgres.database.azure.com'
 var t4ReplicaServerName = '${postgres.replica.serverNamePrefix}-${deploymentId}'
 var t4ReplicaServerFqdn = startsWith(t4SkuName, 'Standard_B') ? '' : '${t4ReplicaServerName}.postgres.database.azure.com'
 
-// T5's names are computed too (ADR 0027), so T1's settings never wait for the Cosmos DB account. Inside the VNet its
-// documents host resolves to the private endpoint through the linked privatelink zone.
+// T5's names are computed too (ADR 0027), so T1's settings never wait for the Cosmos DB account. With its private endpoint,
+// its documents host resolves to the endpoint inside the VNet through the linked privatelink zone; without it, to its
+// public address, which T1 reaches through snet-sqlvm's service endpoint. Private mode always keeps the endpoint.
 var t5AccountName = '${cosmos.accountNamePrefix}-${deploymentId}'
 var t5AccountHost = '${t5AccountName}.documents.azure.com'
+var t5Private = t5PrivateAccess || networkMode == 'private'
 
 // The workload runner (ADR 0010, Phase 13): a new runner SHA-256 changes the settings, which re-runs the loader,
 // and the WorkloadRunner steps install it. The auto-shutdown schedule bounds the activity profiles (--not-after).
@@ -242,6 +250,10 @@ module network 'network.bicep' = {
     networkMode: networkMode
     outboundMode: outboundMode
     tags: tags
+    // T1's subnet's Azure Cosmos DB service endpoint: for a T5 without a private endpoint, and while an account that's public
+    // now moves to its endpoint, so a move that Azure refuses (a policy the endpoint doesn't satisfy, say) never leaves the
+    // account's virtual network rule without the endpoint it needs (the review of 31ccf40, 2026-11-22).
+    cosmosServiceEndpoint: t5Enabled && (!t5Private || t5WasPublic)
   }
 }
 
@@ -442,12 +454,14 @@ module pgflex01 'pgflex01.bicep' = if (t4Enabled) {
     maxConnections: postgres.maxConnections
     autonomousTuning: t4AutonomousTuning
     tuning: postgres.autonomousTuning
+    queryStore: postgres.queryStore
   }
 }
 
-// T5 (ADR 0027): stable names, Entra-only, and a private endpoint in snet-pe in both network modes (public network access
-// off), with the privatelink.documents.azure.com zone linked to the network. Database Hub finds it through Azure Resource
-// Graph and charts its Azure Monitor metrics, with no setup.
+// T5 (ADR 0027): stable names, Entra-only, and reached from T1's subnet only: through a private endpoint in snet-pe (public
+// network access off, the privatelink.documents.azure.com zone linked to the network) when t5Private, otherwise through
+// snet-sqlvm's service endpoint and a virtual network rule (2026-11-21). Database Hub finds it through Azure Resource Graph
+// and charts its Azure Monitor metrics, with no setup.
 module cosmos01 'cosmos01.bicep' = if (t5Enabled) {
   name: 'cosmos01'
   params: {
@@ -461,6 +475,8 @@ module cosmos01 'cosmos01.bicep' = if (t5Enabled) {
     indexingPolicy: cosmos.indexingPolicy
     throughput: cosmos.throughputRUs
     enableFreeTier: t5FreeTier
+    privateAccess: t5Private
+    allowedSubnetId: network.outputs.subnetIds[0]
     privateEndpointSubnetId: network.outputs.subnetIds[2]
     virtualNetworkId: network.outputs.virtualNetworkId
     privateEndpointName: 'pe-${prefix}-${environment}-cosmos01'

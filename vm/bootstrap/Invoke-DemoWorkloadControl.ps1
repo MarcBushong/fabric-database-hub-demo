@@ -20,13 +20,15 @@ Actions:
   object ID), applies and seeds the schema, records t4-workload.json, sets T4's activity profile, and
   restarts DbHubDemo-Workload so its host adds T4.
 - Runner (sqlvm01 for T1, T3, T4, and T5; archost01 relays T2 into the guest over PowerShell Direct)
-  { target, arguments[], timeoutSeconds, readySeconds, replicaServerFqdn, recoveryKey, lockSeconds }: runs one runner command. The token
+  { target, arguments[], timeoutSeconds, readySeconds, replicaServerFqdn, recoveryKey, lockSeconds, bounds }: runs one runner command. The token
   {{NEXT_SHUTDOWN}} in an argument becomes the next auto-shutdown time, T3 commands get the server's FQDN, T4
   commands the flexible server's FQDN, the runner's role, and T4's read replica when it's known (--replica-server, from
   the request's optional replicaServerFqdn or else workload-install.json; ADR 0025), and T5 commands the Cosmos DB
   account's documents host (ADR 0027). The evidence keeps the end of the
   runner's output, and the active profile's name and expiry, read from the whole output first (re-review of PR 16,
-  2026-11-04). Before a command that starts activity ('profile set' with a profile other than off, or 'run'), the
+  2026-11-04). With the request's optional bounds (validate.ps1, F20, 2026-11-20), it keeps a status's running runs'
+  bounds too, read from the whole output the same way (Get-DemoControlRunnerBound), while the line still fits
+  (boundsCut says when it didn't). Before a command that starts activity ('profile set' with a profile other than off, or 'run'), the
   target must accept connections within readySeconds (10 minutes by default, 20 for T2; 0 skips the wait): the
   runner's warmup is retried while it fails with a documented transient error (Wait-DemoControlTargetReady), so a
   cold start doesn't fail the command.
@@ -70,6 +72,8 @@ $ErrorActionPreference = 'Stop'
 
 $script:ControlBundleRoot = Split-Path -Path (Split-Path -Path $PSScriptRoot -Parent) -Parent
 $script:ControlMarker = 'DBHUBDEMO-WORKLOAD'
+# The longest result line with optional evidence (the runner's bounds, F20): a Run Command keeps the last 4,096 bytes.
+$script:ControlLineBudget = 3900
 # Connection errors that pass by themselves (Test-DemoControlTransientFailure; sources in its help). SqlClient's built-in
 # transient list, and -2, its client timeout.
 $script:ControlSqlTransient = @(233, 997, 10060, 4060, 4221, 1204, 1205, 1222, 10928, 10929, 40501, 49918, 49919, 49920, 40143, 40197, 40540, 40613, 42108, 42109, -2)
@@ -96,9 +100,11 @@ function Write-DemoControlLine {
     [Console]::Out.WriteLine($Line)
 }
 
-function Write-DemoControlResult {
-    # Prints the one result line. Long text is cut from the front, so the end of an error survives.
+function Get-DemoControlResultLine {
+    # The one result line, as Write-DemoControlResult prints it. Long text is cut from the front, so the end of an error
+    # survives.
     [CmdletBinding()]
+    [OutputType([string])]
     param(
         [Parameter(Mandatory = $true)]
         [string] $ActionName,
@@ -126,7 +132,28 @@ function Write-DemoControlResult {
         evidence = $Evidence
     }
     $json = Protect-DemoVmText -Text (ConvertTo-Json -InputObject $result -Depth 6 -Compress)
-    Write-DemoControlLine -Line ($script:ControlMarker + ' ' + $json)
+    return ($script:ControlMarker + ' ' + $json)
+}
+
+function Write-DemoControlResult {
+    # Prints the one result line (Get-DemoControlResultLine).
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $ActionName,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('Pass', 'Fail', 'Warning', 'Manual action required', 'Not supported', 'Not selected')]
+        [string] $Status,
+
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyString()]
+        [string] $Message,
+
+        [System.Collections.IDictionary] $Evidence = @{}
+    )
+
+    Write-DemoControlLine -Line (Get-DemoControlResultLine -ActionName $ActionName -Status $Status -Message $Message -Evidence $Evidence)
 }
 
 function Get-DemoControlRequest {
@@ -209,6 +236,143 @@ function Get-DemoControlRunnerProfile {
         $expires = [string]$expires
     }
     return [ordered]@{ name = [string]$node.name; expiresAt = $expires }
+}
+
+function Get-DemoControlRunnerBound {
+    <#
+    .SYNOPSIS
+    What validate.ps1's WORKLOAD.<target>.BOUNDS reads, from a 'status --json' output whole, before Get-DemoControlTail cuts
+    it (F20, 2026-11-20): each Running run's ID, scenario, start, deadline, and maximum duration, how many runs the status
+    listed, and how many live demo sessions it saw. The status writes its runs near its top, so once it lists two or more
+    runs (always, during a session), the tail the result keeps leaves them out, and the bounds weren't checked. $null for
+    output without a profile and a runs list.
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    $value = [string]$Text
+    $start = $value.IndexOf('{')
+    $end = $value.LastIndexOf('}')
+    if ($start -lt 0 -or $end -le $start) {
+        return $null
+    }
+    try {
+        $document = $value.Substring($start, $end - $start + 1) | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+    if ($null -eq $document -or $null -eq $document.PSObject.Properties['profile'] -or $null -eq $document.PSObject.Properties['runs']) {
+        return $null
+    }
+    $member = {
+        param($Item, [string] $Name)
+        $property = $Item.PSObject.Properties[$Name]
+        if ($null -eq $property) {
+            return $null
+        }
+        $found = $property.Value
+        if ($found -is [datetime]) {
+            return $found.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ss.fffZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        }
+        return $found
+    }
+    $listed = @($document.runs | Where-Object { $null -ne $_ -and $_ -isnot [string] })
+    $running = @(foreach ($run in $listed) {
+            if ([string](& $member $run 'status') -ne 'Running') {
+                continue
+            }
+            $maximum = & $member $run 'maxDurationSeconds'
+            [ordered]@{
+                runId              = [string](& $member $run 'runId')
+                scenario           = [string](& $member $run 'scenario')
+                startedAt          = [string](& $member $run 'startedAt')
+                deadlineAt         = [string](& $member $run 'deadlineAt')
+                maxDurationSeconds = $(if ($null -ne $maximum) { [int]$maximum } else { 0 })
+            }
+        })
+    $sessions = $null
+    if ($null -ne $document.PSObject.Properties['demoSessions'] -and $null -ne $document.demoSessions) {
+        $sessions = @($document.demoSessions).Count
+    }
+    return [ordered]@{ listed = $listed.Count; running = $running; demoSessions = $sessions }
+}
+
+function Get-DemoControlRunnerQueryStore {
+    <#
+    .SYNOPSIS
+    Query Store's state from 'status --json''s whole output on T1 to T3, read before Get-DemoControlTail cuts it
+    (2026-11-23): the result keeps 1,800 characters of stdout, and a status with runs and sessions runs past that, so
+    validate.ps1's T1.QUERYSTORE and T2.QUERYSTORE read it from here. Only its known members, each string cut to 64
+    characters escaped and the error to 200, so the node stays under 400 characters and the result inside a Run Command's
+    4 KB. $null for output without a queryStore node (another command, or a runner from before it).
+    #>
+    [CmdletBinding()]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text
+    )
+
+    $value = [string]$Text
+    $start = $value.IndexOf('{')
+    $end = $value.LastIndexOf('}')
+    if ($start -lt 0 -or $end -le $start) {
+        return $null
+    }
+    try {
+        $document = $value.Substring($start, $end - $start + 1) | ConvertFrom-Json
+    }
+    catch {
+        return $null
+    }
+    if ($null -eq $document -or $null -eq $document.PSObject.Properties['queryStore']) {
+        return $null
+    }
+    $node = $document.queryStore
+    if ($null -eq $node -or $node -is [string]) {
+        return $null
+    }
+    # Each string as the result writes it, escaped (ConvertTo-Json: a quote takes two characters, and Windows PowerShell's
+    # serializer writes an apostrophe, <, >, or & as six), so the node's size holds whatever the runner wrote.
+    $cut = {
+        param([object] $Item, [int] $Length)
+        if ($null -eq $Item) {
+            return $null
+        }
+        $itemText = [string]$Item
+        if ($itemText.Length -gt $Length) {
+            $itemText = $itemText.Substring(0, $Length)
+        }
+        while ($itemText.Length -gt 0 -and ((ConvertTo-Json -InputObject $itemText -Compress).Length - 2) -gt $Length) {
+            $itemText = $itemText.Substring(0, $itemText.Length - 1)
+        }
+        return $itemText
+    }
+    $result = [ordered]@{}
+    foreach ($name in 'actualState', 'desiredState', 'captureMode') {
+        $result[$name] = if ($null -ne $node.PSObject.Properties[$name]) { & $cut $node.$name 64 } else { $null }
+    }
+    foreach ($name in 'readonlyReason', 'intervalMinutes', 'storageMb', 'maxStorageMb') {
+        $number = $null
+        if ($null -ne $node.PSObject.Properties[$name] -and $null -ne $node.$name) {
+            try {
+                $number = [long]$node.$name
+            }
+            catch {
+                $number = $null
+            }
+        }
+        $result[$name] = $number
+    }
+    if ($null -ne $node.PSObject.Properties['error'] -and $null -ne $node.error) {
+        $result['error'] = & $cut $node.error 200
+    }
+    return $result
 }
 
 function Get-DemoControlArgument {
@@ -1303,6 +1467,19 @@ function Invoke-DemoControlRunner {
     if ($null -ne $runnerProfile) {
         $evidence['profile'] = $runnerProfile
     }
+    # The running runs' bounds from the whole status, when the request asks for them (validate.ps1, F20, 2026-11-20).
+    $wantBounds = $Request.Contains('bounds') -and [bool]$Request['bounds']
+    if ($wantBounds) {
+        $bounds = Get-DemoControlRunnerBound -Text $run.StdOut
+        if ($null -ne $bounds) {
+            $evidence['bounds'] = $bounds
+        }
+    }
+    # Query Store's state from the whole output too (T1.QUERYSTORE and T2.QUERYSTORE, 2026-11-23).
+    $runnerQueryStore = Get-DemoControlRunnerQueryStore -Text $run.StdOut
+    if ($null -ne $runnerQueryStore) {
+        $evidence['queryStore'] = $runnerQueryStore
+    }
     $message = $outcome.Message
     if ($readyNote.Contains('readySeconds') -and [int]$readyNote['readySeconds'] -gt 0) {
         $message = '{0} ({1} accepted connections after {2} seconds.)' -f $message, $target, [int]$readyNote['readySeconds']
@@ -1315,6 +1492,13 @@ function Invoke-DemoControlRunner {
         if ($status -eq 'Pass') {
             $status = 'Warning'
         }
+    }
+    # The bounds only while the line still fits what a Run Command returns (4,096 bytes): otherwise they're left out, and the
+    # check says the status was too long to carry them (boundsCut). Query Store's node, under 400 characters, stays: without
+    # it T1.QUERYSTORE and T2.QUERYSTORE would blame a runner from before it (the RCA release, 2026-11-23).
+    if ($evidence.Contains('bounds') -and (Get-DemoControlResultLine -ActionName 'Runner' -Status $status -Message $message -Evidence $evidence).Length -gt $script:ControlLineBudget) {
+        $evidence.Remove('bounds')
+        $evidence['boundsCut'] = $true
     }
     Write-DemoControlResult -ActionName 'Runner' -Status $status -Message $message -Evidence $evidence
 }

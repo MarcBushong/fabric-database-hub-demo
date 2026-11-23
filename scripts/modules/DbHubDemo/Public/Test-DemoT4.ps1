@@ -10,11 +10,12 @@ function Test-DemoT4 {
     Reads only, with the documented REST APIs through 'az rest --method get'. The server's own read (Servers - Get) works
     while T4 is stopped, so T4.SERVER, T4.CONFIG, T4.ENTRAONLY, and T4.NETWORK are checked then too.
     Results: T4.SERVER, T4.CONFIG, T4.ENTRAONLY, T4.NETWORK, T4.ADMIN, T4.DATABASE, T4.ENHANCEDMETRICS,
-    T4.MAXCONNECTIONS, and METRICS.T4. Database Hub's PostgreSQL monitoring reads the same Azure Monitor metrics (it's metrics-only,
+    T4.MAXCONNECTIONS, T4.QUERYSTORE with -IncludeQueryStore, and METRICS.T4. Database Hub's PostgreSQL monitoring reads the same Azure Monitor metrics (it's metrics-only,
     with no query-level diagnostics), so METRICS.T4 passing is what the Hub's PostgreSQL dashboard needs;
     seeing T4 on the Estate page stays a manual check (HUB.ESTATE.T4 checks Resource Graph).
     T4.MAXCONNECTIONS (2026-11-03): the template sets max_connections to config/versions.json's postgresql.maxConnections
-    on every size, so connection-surge reaches the limit and Database Hub's Failed connections fill; a static parameter,
+    on every size, so connection-surge reaches the limit, which Database Hub's Connections chart shows (its refused attempts
+    aren't in Failed connections: Azure Monitor counted none of them live, 2026-11-21); a static parameter,
     so a new value waits for a restart (isConfigPendingRestart), which deploy.ps1 does before T1 sets T4 up.
     A stopped T4 (2026-11-18): T4.ADMIN, T4.DATABASE, T4.ENHANCEDMETRICS, and T4.MAXCONNECTIONS read through the running
     server, and a stopped one answers ServerStoppedError ("Server '<name>' is in 'Stopped' state", live 2026-11-18;
@@ -40,6 +41,12 @@ function Test-DemoT4 {
     .PARAMETER IncludeMetrics
     Also read the last 15 minutes of T4's Azure Monitor metrics (METRICS.T4).
 
+    .PARAMETER IncludeQueryStore
+    Also check Query Store and its wait sampling (T4.QUERYSTORE, 2026-11-23; ConvertTo-DemoT4QueryStoreResult):
+    pg_qs.query_capture_mode and pgms_wait_sampling.query_capture_mode through Azure Resource Manager, as
+    T4.MAXCONNECTIONS reads max_connections. validate.ps1 passes it; deploy.ps1 doesn't, so Query Store never stops a
+    deployment. https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store
+
     .EXAMPLE
     Test-DemoT4 -Config $config -IncludeMetrics
     #>
@@ -54,6 +61,8 @@ function Test-DemoT4 {
 
         [switch] $IncludeMetrics,
 
+        [switch] $IncludeQueryStore,
+
         [ValidateRange(5, 1440)]
         [int] $MetricMinutes = 15
     )
@@ -66,7 +75,7 @@ function Test-DemoT4 {
         $area = if ($CheckId -like 'METRICS.*') { 'hub' } else { 't4' }
         $results.Add((New-DemoResult -CheckId $CheckId -Area $area -Target 'T4' -Status $Status -Message $Message -Evidence $Evidence -Remediation $Remediation -DocUrl $DocUrl))
     }
-    $later = @('T4.CONFIG', 'T4.ENTRAONLY', 'T4.NETWORK', 'T4.ADMIN', 'T4.DATABASE', 'T4.ENHANCEDMETRICS', 'T4.MAXCONNECTIONS') + @(if ($IncludeMetrics) { 'METRICS.T4' })
+    $later = @('T4.CONFIG', 'T4.ENTRAONLY', 'T4.NETWORK', 'T4.ADMIN', 'T4.DATABASE', 'T4.ENHANCEDMETRICS', 'T4.MAXCONNECTIONS') + @(if ($IncludeQueryStore) { 'T4.QUERYSTORE' }) + @(if ($IncludeMetrics) { 'METRICS.T4' })
 
     $names = Get-DemoT4Name -Config $Config -DeploymentId $DeploymentId
     if (-not $names.Enabled) {
@@ -223,13 +232,30 @@ function Test-DemoT4 {
         & $add 'T4.MAXCONNECTIONS' 'Warning' ('T4''s max_connections couldn''t be read: {0}' -f $connections.Error) $connectionEvidence 'Run the check again.' $docs['serverParameters']
     }
     elseif ($connections.Value -ne $wantedConnections) {
-        & $add 'T4.MAXCONNECTIONS' 'Warning' ('max_connections is {0}, not {1}, so connection-surge may not reach the limit on this size, and Database Hub''s Failed connections may stay empty.' -f $connections.Value, $wantedConnections) $connectionEvidence 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template sets it, and the T4 setup restarts T4 to apply it.' $docs['serverParameters']
+        & $add 'T4.MAXCONNECTIONS' 'Warning' ('max_connections is {0}, not {1}, so connection-surge may not reach the limit on this size, and Database Hub''s Connections chart won''t show it there.' -f $connections.Value, $wantedConnections) $connectionEvidence 'Run ./scripts/deploy.ps1 -FromStage Infrastructure: the template sets it, and the T4 setup restarts T4 to apply it.' $docs['serverParameters']
     }
     elseif ($connections.PendingRestart) {
         & $add 'T4.MAXCONNECTIONS' 'Warning' ('max_connections {0} is set but waits for a restart (a static parameter), so the old limit still applies.' -f $connections.Value) $connectionEvidence 'deploy.ps1 restarts T4 before T1 sets it up (DEPLOY.T4.RESTART), or restart it yourself (az postgres flexible-server restart).' $docs['restartServer']
     }
     else {
-        & $add 'T4.MAXCONNECTIONS' 'Pass' ('max_connections is {0} and in effect, so connection-surge reaches the limit and Database Hub''s Failed connections fill on this size.' -f $connections.Value) $connectionEvidence
+        & $add 'T4.MAXCONNECTIONS' 'Pass' ('max_connections is {0} and in effect, so connection-surge reaches the limit on this size: Database Hub''s Connections chart shows it there.' -f $connections.Value) $connectionEvidence
+    }
+
+    # Query Store and its wait sampling (2026-11-23, ADR 0019): both parameters through Azure Resource Manager, judged by the
+    # tier. A stopped T4 is a Warning, as its other parameters are.
+    if ($IncludeQueryStore) {
+        $capture = Get-DemoT4ParameterState -Config $Config -ServerId $names.ServerId -Name 'pg_qs.query_capture_mode'
+        $waitSampling = Get-DemoT4ParameterState -Config $Config -ServerId $names.ServerId -Name 'pgms_wait_sampling.query_capture_mode'
+        $unread = & $unreadState $capture
+        if (-not $unread) {
+            $unread = & $unreadState $waitSampling
+        }
+        if ($unread) {
+            & $notRead 'T4.QUERYSTORE' $unread 'its Query Store parameters' ([ordered]@{ queryCaptureMode = $capture.Value; waitSamplingCaptureMode = $waitSampling.Value }) $(if ($capture.Found) { $waitSampling } else { $capture })
+        }
+        else {
+            $results.Add((ConvertTo-DemoT4QueryStoreResult -Tier ([string](Get-DemoMemberValue -InputObject $sku -Name 'tier')) -SkuName $skuName -Capture $capture -WaitSampling $waitSampling))
+        }
     }
 
     if ($IncludeMetrics) {

@@ -555,3 +555,74 @@ function Resolve-DemoInitCommandText {
         })
     return [string](Resolve-DemoDeployCommandText -Text $rewritten -Command $command).Text
 }
+
+function Get-DemoInitialMonthlyCeiling {
+    <#
+    .SYNOPSIS
+    The hard monthly ceiling init.ps1 writes for a new configuration (decision 8b, 2026-11-20): the region's worst-case month
+    for a Contributor's new deployment, which preflight checks against it (PREFLIGHT.COST.MONTHLY), with 4% headroom for
+    list-price changes, as 415 has over West US 3's, rounded up to the next 5 USD, and never below Floor, the example
+    configuration's 415. Before, every new configuration got 415, which fits a Contributor's first deployment only in West
+    US 3 and East US 2: Central US and North Europe got a Warning, and UK South, West Europe, Japan East, and Australia East
+    failed preflight. Returns Ceiling (whole USD), WorstCase, Priced, DefenderIncluded, and Note, the sentence INIT.CONFIG
+    adds. Never throws: when the prices can't be read, Ceiling is Floor, and Note says why. Internal.
+
+    .DESCRIPTION
+    The worst case is preflight's for a Contributor's first deployment (Get-DemoCostEstimate), at list prices from the Azure
+    Retail Prices API, read now (ADR 0016): with the subscription's Defender for Cloud plans (Get-DemoDefenderPlan; left out,
+    and said, when they can't be read); T4's 7-day automatic restart for the rest of the month, since no nightly safety stop is
+    in place before an Owner's grant; T5's container all month, which only stop-demo.ps1 deletes then; and neither free offer
+    (T3's or T5's), an upper bound.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [System.Collections.IDictionary] $Config,
+
+        [AllowEmptyString()]
+        [string] $SubscriptionId = '',
+
+        [double] $Floor = 415
+    )
+
+    $culture = [System.Globalization.CultureInfo]::InvariantCulture
+    $parameters = @{ Config = $Config; PriceCache = @{}; T5ContainerLifecycle = 'AlwaysOn'; T5ManualDeleteOnly = $true }
+    $plansError = ''
+    if ($SubscriptionId) {
+        try {
+            $parameters['DefenderPlans'] = @(Get-DemoDefenderPlan -SubscriptionId $SubscriptionId)
+        }
+        catch {
+            $plansError = Protect-DemoText -Text $_.Exception.Message
+        }
+    }
+    $fallback = {
+        param([string] $Why)
+        [pscustomobject]@{ Ceiling = [int]$Floor; WorstCase = $null; Priced = $false; DefenderIncluded = $false; Note = [string]::Format($culture, 'The monthly ceiling is {0:N0} USD, the example''s: this region''s worst case couldn''t be priced now ({1}); preflight.ps1 prices it, and when it''s over, its Fail names the ceiling to set.', $Floor, $Why.TrimEnd('.')) }
+    }
+    try {
+        $estimate = Get-DemoCostEstimate @parameters
+    }
+    catch {
+        return (& $fallback (Protect-DemoText -Text $_.Exception.Message))
+    }
+    $worst = [double]$estimate.MonthlyWorstCase
+    if (-not ($worst -gt 0)) {
+        return (& $fallback 'the Azure Retail Prices API gave no prices')
+    }
+    $ceiling = [System.Math]::Max($Floor, [System.Math]::Ceiling($worst * 1.04 / 5) * 5)
+    $defender = [bool]$estimate.DefenderIncluded
+    $basis = if ($defender) { 'with your subscription''s Defender for Cloud plans' } elseif ($plansError) { 'without your subscription''s Defender for Cloud plans, which couldn''t be read: ' + $plansError.TrimEnd('.') } else { 'without Defender for Cloud plans' }
+    $note = if ($ceiling -le $Floor) {
+        [string]::Format($culture, 'The monthly ceiling is {0:N0} USD, the default: it holds this region''s worst case for a Contributor''s new deployment, {1:N2} USD a month (list prices from the Azure Retail Prices API, read now, {2}).', $ceiling, $worst, $basis)
+    }
+    else {
+        [string]::Format($culture, 'The monthly ceiling is {0:N0} USD, not the default {1:N0}: this region''s worst case for a Contributor''s new deployment is {2:N2} USD a month (list prices from the Azure Retail Prices API, read now, {3}), with 4% headroom, rounded up to 5 USD.', $ceiling, $Floor, $worst, $basis)
+    }
+    $missing = @(@(Get-DemoMemberValue -InputObject $estimate -Name 'MissingPrices') | Where-Object { $_ })
+    if ($missing.Count -gt 0) {
+        $note += ' Some prices were missing ({0}), so preflight.ps1 checks it again.' -f ($missing -join ', ')
+    }
+    return [pscustomobject]@{ Ceiling = [int]$ceiling; WorstCase = [System.Math]::Round($worst, 2); Priced = $true; DefenderIncluded = $defender; Note = $note }
+}

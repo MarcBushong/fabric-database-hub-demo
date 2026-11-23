@@ -4,6 +4,14 @@
 // (checked 2026-10-21). Rules applied: 1 (filter on SampleTimeUTC first), 2 (per-file deltas that skip
 // resets), 4 (series by ResourceID, SqlServerInstanceName, database, and file), 10 (row limit). Per-file IO
 // latency from this table isn't supported for Azure SQL Database, so consumers don't compute it for T3.
+// F36 (2026-11-22): on Azure SQL Database, every sample holds two files under each of DatabaseID and FileID 1 and 2,
+// with their own cumulative counters, and no column tells them apart. A series by file key then stepped between
+// the two in its first and last samples, so each step up counted the gap between their totals as IO, and each step
+// down was skipped as a reset: live, T3's IO in one session came to 735,042 MB read and written, where its files'
+// own counters rose by 10,358 MB. So the files of a key are added within each sample first, a sum by SampleTimeUTC
+// whose counters are cumulative again, never a sum across samples (rule 2), and a step whose number of files changed
+// is skipped, as a reset is. For one file a key, as on T1 and T2, nothing changes. T3's IO is all its files', the
+// second set's too, as T1's and T2's is every database's.
 // Contract: runs after Live.Prelude.kql, which defines _start, _end, _bin, _rg, _db, and _target(). The body is
 // identical to STORAGE_IO_KQL in fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb, and the Real-Time Dashboard
 // (fabric/realtime) is generated from this file; tests/unit/Fabric.Dashboard.Tests.ps1 fails if they drift.
@@ -13,16 +21,19 @@ SqlServerStorageIO
 | where FileType in ('Data', 'Log')
 | extend Target = _target(ResourceType, ResourceName)
 | where isnotempty(Target)
-| summarize (FirstT, R1, W1, RS1, WS1, NR1, NW1) = arg_min(SampleTimeUTC, NumOfBytesRead, NumOfBytesWritten, IOStallReadMs, IOStallWriteMs, NumOfReads, NumOfWrites),
-            (LastT, R2, W2, RS2, WS2, NR2, NW2) = arg_max(SampleTimeUTC, NumOfBytesRead, NumOfBytesWritten, IOStallReadMs, IOStallWriteMs, NumOfReads, NumOfWrites)
+| summarize Files = count(), R = sum(NumOfBytesRead), W = sum(NumOfBytesWritten), RS = sum(IOStallReadMs), WS = sum(IOStallWriteMs),
+            NR = sum(NumOfReads), NW = sum(NumOfWrites)
+        by Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, SampleTimeUTC
+| summarize (FirstT, F1, R1, W1, RS1, WS1, NR1, NW1) = arg_min(SampleTimeUTC, Files, R, W, RS, WS, NR, NW),
+            (LastT, F2, R2, W2, RS2, WS2, NR2, NW2) = arg_max(SampleTimeUTC, Files, R, W, RS, WS, NR, NW)
         by Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, Bucket = bin(SampleTimeUTC, _bin)
-| extend T = pack_array(FirstT, LastT), R = pack_array(R1, R2), W = pack_array(W1, W2), RS = pack_array(RS1, RS2),
+| extend T = pack_array(FirstT, LastT), F = pack_array(F1, F2), R = pack_array(R1, R2), W = pack_array(W1, W2), RS = pack_array(RS1, RS2),
          WS = pack_array(WS1, WS2), NR = pack_array(NR1, NR2), NW = pack_array(NW1, NW2)
-| mv-expand T to typeof(datetime), R to typeof(long), W to typeof(long), RS to typeof(long), WS to typeof(long), NR to typeof(long), NW to typeof(long)
-| distinct Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, Bucket, T, R, W, RS, WS, NR, NW
+| mv-expand T to typeof(datetime), F to typeof(long), R to typeof(long), W to typeof(long), RS to typeof(long), WS to typeof(long), NR to typeof(long), NW to typeof(long)
+| distinct Target, ResourceID, SqlServerInstanceName, DatabaseID, FileID, FileType, Bucket, T, F, R, W, RS, WS, NR, NW
 | sort by ResourceID asc, SqlServerInstanceName asc, DatabaseID asc, FileID asc, T asc
 | extend Keep = ResourceID == prev(ResourceID) and SqlServerInstanceName == prev(SqlServerInstanceName)
-                and DatabaseID == prev(DatabaseID) and FileID == prev(FileID)
+                and DatabaseID == prev(DatabaseID) and FileID == prev(FileID) and F == prev(F)
                 and R >= prev(R) and W >= prev(W) and RS >= prev(RS) and WS >= prev(WS) and NR >= prev(NR) and NW >= prev(NW)
 | extend dR = iff(Keep, R - prev(R), long(0)), dW = iff(Keep, W - prev(W), long(0)), dRS = iff(Keep, RS - prev(RS), long(0)),
          dWS = iff(Keep, WS - prev(WS), long(0)), dNR = iff(Keep, NR - prev(NR), long(0)), dNW = iff(Keep, NW - prev(NW), long(0))

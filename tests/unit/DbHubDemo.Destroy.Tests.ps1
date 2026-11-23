@@ -625,3 +625,116 @@ Describe 'Get-DemoDestroyExtraPlan keeps T3''s selection in Database agent setti
         $plan.Keep | Should -Contain 'the Fabric capacity and your licenses, which you manage'
     }
 }
+
+Describe 'destroy.ps1 -WhatIf in a non-interactive shell (the final tests, 2026-11-22)' {
+    # Live: an assistant's destroy.ps1 -WhatIf failed with "PowerShell is in NonInteractive mode". Without -Force,
+    # destroy.ps1 passes -WhatIf with -Confirm, and before the one question, with the plan, the subscription guard skipped
+    # recording its context (a what-if), and the Azure CLI's temporary file asked to be deleted. Here destroy.ps1 runs as an
+    # assistant runs it, in a pwsh -NonInteractive child, with this module and a stand-in Azure CLI first on PATH that
+    # answers only the guard, as a service principal (so no Microsoft Graph read), and one token per audience: every
+    # other call fails, as a read that can't be made, and nothing reaches Azure or another endpoint (a proxy on a closed
+    # port stops any HTTP call).
+    BeforeAll {
+        $script:whatIfRoot = Join-Path -Path $TestDrive -ChildPath 'whatif'
+        $bin = Join-Path -Path $script:whatIfRoot -ChildPath 'bin'
+        $null = New-Item -ItemType Directory -Path $bin -Force
+        $pwshPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        Set-Content -LiteralPath (Join-Path -Path $bin -ChildPath 'stand-in-az.ps1') -Encoding ascii -Value @(
+            '$all = [System.Environment]::GetCommandLineArgs()'
+            '$joined = @($all | Select-Object -Skip ([array]::IndexOf($all, ''--dbhub-begin'') + 1)) -join '' '''
+            '$state = $env:DBHUB_TEST_STANDIN_AZ_STATE'
+            'Add-Content -LiteralPath (Join-Path -Path $state -ChildPath ''calls.log'') -Value $joined'
+            '$subscription = ''11111111-2222-3333-4444-555555555555'''
+            '$tenant = ''66666666-7777-8888-9999-000000000000'''
+            '$client = ''cccccccc-1111-2222-3333-444444444444'''
+            '$answer = $null'
+            'if ($joined -like ''account show*'') {'
+            '    $answer = @{ id = $subscription; tenantId = $tenant; user = @{ name = $client; type = ''servicePrincipal'' } } | ConvertTo-Json -Compress'
+            '}'
+            'elseif ($joined -like ''group list*'') {'
+            '    $answer = ''[]'''
+            '}'
+            'elseif ($joined -like ''group exists*'') {'
+            '    $answer = ''false'''
+            '}'
+            'elseif ($joined -like (''rest --method get --url https://management.azure.com/subscriptions/{0}[?]*'' -f $subscription)) {'
+            '    $answer = @{ subscriptionId = $subscription; tenantId = $tenant; state = ''Enabled'' } | ConvertTo-Json -Compress'
+            '}'
+            'elseif ($joined -match ''^account get-access-token --resource (\S+)'') {'
+            '    $marker = Join-Path -Path $state -ChildPath (''token-'' + ($Matches[1] -replace ''[^A-Za-z0-9]'', ''_''))'
+            '    if (-not (Test-Path -LiteralPath $marker)) {'
+            '        Set-Content -LiteralPath $marker -Value ''issued'''
+            '        $encode = { param([string] $Text) [System.Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($Text)).TrimEnd(''='').Replace(''+'', ''-'').Replace(''/'', ''_'') }'
+            '        $claims = @{ tid = $tenant; oid = ''aaaaaaaa-1111-2222-3333-444444444444''; appid = $client; idtyp = ''app''; exp = 4102444800 } | ConvertTo-Json -Compress'
+            '        $answer = @{ accessToken = (''{0}.{1}.{2}'' -f (& $encode ''{"alg":"none"}''), (& $encode $claims), (& $encode ''unsigned'')); expiresOn = ''2100-01-01 00:00:00.000000'' } | ConvertTo-Json -Compress'
+            '    }'
+            '}'
+            'if ($null -eq $answer) {'
+            '    [Console]::Error.WriteLine(''ERROR: the stand-in Azure CLI answers only the subscription guard.'')'
+            '    exit 3'
+            '}'
+            '[Console]::Out.WriteLine($answer)'
+            'exit 0'
+        )
+        if ($IsWindows) {
+            Set-Content -LiteralPath (Join-Path -Path $bin -ChildPath 'az.cmd') -Encoding ascii -Value ('@"{0}" -NoLogo -NoProfile -NonInteractive -File "%~dp0stand-in-az.ps1" --dbhub-begin %*' -f $pwshPath)
+        }
+        else {
+            $wrapper = Join-Path -Path $bin -ChildPath 'az'
+            Set-Content -LiteralPath $wrapper -Encoding ascii -Value @('#!/bin/sh', ('exec "{0}" -NoLogo -NoProfile -NonInteractive -File "$(dirname "$0")/stand-in-az.ps1" --dbhub-begin "$@"' -f $pwshPath))
+            & chmod '+x' $wrapper
+        }
+        $config = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/demo.config.example.json') -Raw | ConvertFrom-Json -AsHashtable
+        $config['subscriptionId'] = '11111111-2222-3333-4444-555555555555'
+        $config['tenantId'] = '66666666-7777-8888-9999-000000000000'
+        $config['t3AdminGroupObjectId'] = '77777777-7777-7777-7777-777777777777'
+        $config['azureAccount'] = 'cccccccc-1111-2222-3333-444444444444'
+        $script:whatIfConfig = Join-Path -Path $script:whatIfRoot -ChildPath 'demo.config.json'
+        Set-Content -LiteralPath $script:whatIfConfig -Value ($config | ConvertTo-Json -Depth 10)
+        $script:whatIfChild = Join-Path -Path $script:whatIfRoot -ChildPath 'run-destroy.ps1'
+        Set-Content -LiteralPath $script:whatIfChild -Encoding ascii -Value @(
+            'param([string] $Repo, [string] $Bin, [string] $State, [string] $Config, [string] $Out, [switch] $Preview)'
+            '$env:PATH = $Bin + [System.IO.Path]::PathSeparator + $env:PATH'
+            '$env:DBHUB_TEST_STANDIN_AZ_STATE = $State'
+            '$env:HTTPS_PROXY = ''http://127.0.0.1:9'''
+            '$env:HTTP_PROXY = ''http://127.0.0.1:9'''
+            '$env:NO_PROXY = '''''
+            '& (Join-Path -Path $Repo -ChildPath ''scripts/destroy.ps1'') -ConfigPath $Config -WhatIf:$Preview -ManifestPath (Join-Path -Path $Out -ChildPath ''manifest.json'') -OutputPath (Join-Path -Path $Out -ChildPath ''destroy.jsonl'')'
+            '''EXIT:{0}'' -f $LASTEXITCODE'
+        )
+        $script:whatIfBin = $bin
+        $script:whatIfPwsh = $pwshPath
+        # One run of destroy.ps1 in the child, with a stand-in state of its own: the guard's tokens are issued once per run.
+        $script:runDestroy = {
+            param([string] $Name, [switch] $Preview)
+            $state = Join-Path -Path $script:whatIfRoot -ChildPath ('state-' + $Name)
+            $null = New-Item -ItemType Directory -Path $state -Force
+            $output = @(& $script:whatIfPwsh -NoProfile -NonInteractive -File $script:whatIfChild -Repo $repoRoot -Bin $script:whatIfBin -State $state -Config $script:whatIfConfig -Out $script:whatIfRoot -Preview:$Preview 2>&1 | ForEach-Object { [string]$_ })
+            [pscustomobject]@{ Output = $output; Text = ($output -join "`n"); Exit = $LASTEXITCODE; Calls = @(Get-Content -LiteralPath (Join-Path -Path $state -ChildPath 'calls.log')) }
+        }
+    }
+
+    It 'previews the destroy up to its question without asking anything, and changes nothing' {
+        $run = & $script:runDestroy 'preview' -Preview
+        $run.Text | Should -Not -Match 'NonInteractive mode' -Because 'a preview asks nothing'
+        $run.Exit | Should -Be 0 -Because $run.Text
+        $run.Output[-1] | Should -Be 'EXIT:0' -Because $run.Text
+        $run.Text | Should -Match 'What if: Performing the operation "Delete the Arc resources, rg-dbhub-demo and everything in it'
+        $run.Text | Should -Match 'DESTROY\.RESOURCEGROUP'
+        # The guard recorded its context, so the plan's own reads ran: the Fabric token was asked for a second time.
+        @($run.Calls | Where-Object { $_ -like 'account get-access-token --resource https://api.fabric.microsoft.com*' }).Count | Should -Be 2 -Because ($run.Calls -join "`n")
+        # Only reads went out.
+        @($run.Calls | Where-Object { $_ -match '^(group delete|resource delete|deployment sub delete|rest --method (delete|put|patch|post))' }) | Should -BeNullOrEmpty
+    }
+
+    It 'asks one question, with the plan, and nothing before it: without -Force, a non-interactive shell stops there' {
+        $run = & $script:runDestroy 'ask'
+        # The plan was read and listed first, and the only prompt is destroy's own question.
+        $run.Text | Should -Match 'destroy\.ps1 deletes the Arc resources, rg-dbhub-demo and everything in it'
+        @($run.Calls | Where-Object { $_ -like 'account get-access-token --resource https://api.fabric.microsoft.com*' }).Count | Should -Be 2 -Because ($run.Calls -join "`n")
+        $run.Text | Should -Match 'NonInteractive mode' -Because 'destroy asks unless -Force'
+        $run.Text | Should -Match 'Remove-DemoEnvironment\.ps1' -Because 'the question is the plan''s'
+        $run.Text | Should -Not -Match 'Invoke-DemoAzCli\.ps1' -Because 'an Azure CLI call never asks'
+        @($run.Calls | Where-Object { $_ -match '^(group delete|resource delete|deployment sub delete|rest --method (delete|put|patch|post))' }) | Should -BeNullOrEmpty
+    }
+}

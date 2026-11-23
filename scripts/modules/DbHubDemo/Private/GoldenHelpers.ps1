@@ -582,6 +582,8 @@ function Invoke-DemoGoldenGuestAction {
         Parameter           = $values
         TimeoutSeconds      = $TimeoutSeconds
         PollIntervalSeconds = 15
+        # A fresh name each time: the VM's Run Command handler can skip a name it ran before (the review of F31).
+        FreshAction         = $true
         Confirm             = $false
     }
     if ($ResourceGroupName) {
@@ -903,8 +905,11 @@ function Get-DemoT2GuestStateResult {
         $problems.Add(('it''s {0}' -f $(if ($evidence['state']) { $evidence['state'] } else { 'in no state' })))
     }
     if ($problems.Count -gt 0) {
-        # Scripted fixes first; the by-hand command is the last resort (the coordinator's decision, 2026-11-19).
-        $fix = if ($evidence['connected'] -lt $evidence['adapters'] -or $evidence['adapters'] -eq 0) { 'Run ./scripts/deploy.ps1; if T2.GUEST.STATE still says this, deploy the environment again: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1. As a last resort, connect, set, and start it on archost01: {0}' -f $connect } else { 'Use {0}, which starts an off guest and sets its automatic start. As a last resort, run on archost01: {1}' -f $fabricStart, $connect }
+        # Scripted fixes first; the by-hand command is the last resort (the coordinator's decision, 2026-11-19). Since
+        # 2026-11-21, deploy.ps1's GuestNetwork step connects the adapter again, and reset-demo.ps1 -RebuildGuest makes a
+        # guest that has none again, where Arc Jumpstart's image makes T2.
+        $rebuild = if ((Get-DemoArcTarget -Config $Config).InstallMode -in 'JumpstartImage', 'PaygWizard') { 'run ./scripts/reset-demo.ps1 -RebuildGuest, which makes {0} again from Arc Jumpstart''s image and onboards it (about an hour), or ' -f $guestName } else { '' }
+        $fix = if ($evidence['connected'] -lt $evidence['adapters'] -or $evidence['adapters'] -eq 0) { 'Run ./scripts/deploy.ps1: archost01''s GuestNetwork step connects {0}''s network adapter to {1} again. If T2.GUEST.STATE still says this (a guest with no adapter, say), {2}deploy the environment again: ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1. As a last resort, connect, set, and start it on archost01: {3}' -f $guestName, $switchName, $rebuild, $connect } else { 'Use {0}, which starts an off guest and sets its automatic start. As a last resort, run on archost01: {1}' -f $fabricStart, $connect }
         return (& $new 'Fail' ('{0} can''t be in Database Hub while archost01 runs: {1} ({2}).' -f $guestName, ($problems -join '; '), $seen) $fix)
     }
     $notes = [System.Collections.Generic.List[string]]::new()
@@ -1003,10 +1008,15 @@ function Get-DemoGoldenControlRcaPending {
     An encrypted variable is unreadable here (2026-11-23): a tenant's policy can re-create Automation variables encrypted,
     and then only a runbook's Get-AutomationVariable reads the value, while Resource Manager returns the variable with no
     value, which would otherwise read as a status that lists nothing. So isEncrypted, or a variable with no value, is an
-    Error, and Encrypted says why.
+    Error, and Encrypted says why. So is a variable that's missing from an account that exists (the review of 40124992):
+    since 2026-11-23 deploy.ps1 creates it only when it's missing, so a deletion, or a deployment that couldn't create it,
+    can leave it missing while sessions run, and their stops' lists are then only in the control vault, which the runbooks
+    can't read back; Missing says so. Only a control whose account doesn't exist has had no session that listed any.
     Returns Read (a status was read), Documents, Error (a read that failed), Encrypted (Resource Manager returned no value:
-    the variable is encrypted, or came with none), Variable, and Notebook. Never throws. Internal.
+    the variable is encrypted, or came with none), Missing (the variable doesn't exist, though its account does),
+    Variable, and Notebook. Never throws. Internal.
     https://learn.microsoft.com/rest/api/automation/variable/get,
+    https://learn.microsoft.com/rest/api/automation/automation-account/get,
     https://learn.microsoft.com/azure/automation/shared-resources/variables
     #>
     [CmdletBinding()]
@@ -1019,15 +1029,28 @@ function Get-DemoGoldenControlRcaPending {
     )
 
     $name = Get-DemoActivityControlName -Config $Config
-    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
+    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Missing = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
     if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
         return $answer
     }
     $read = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/variables/DbHubSessionStatus' -f $name.AutomationAccountId) -ApiVersion '2024-10-23')
     if (-not $read.Ok) {
-        # A control from before 2026-11-16 has no such variable, and so no session that listed any.
         if (-not $read.Missing) {
             $answer.Error = [string]$read.Error
+            return $answer
+        }
+        # Missing: from an account that doesn't exist, which has had no session, or from one that does, whose sessions' stops
+        # can have listed evidence the runbooks couldn't keep there (the review of 40124992), so the capture fails closed.
+        $account = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $name.AutomationAccountId -ApiVersion '2024-10-23')
+        if ($account.Missing) {
+            return $answer
+        }
+        $answer.Missing = $true
+        $answer.Error = if ($account.Ok) {
+            'it doesn''t exist, though {0} does' -f $name.AutomationAccount
+        }
+        else {
+            'it doesn''t exist, and whether {0} does couldn''t be read: {1}' -f $name.AutomationAccount, ([string]$account.Error).TrimEnd('.')
         }
         return $answer
     }

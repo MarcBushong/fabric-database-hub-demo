@@ -12,7 +12,7 @@
     "applicable": ["T3"],
     "default": ["T3"],
     "notes": {
-      "T3": "The runner signs in to T3 as the P6 group's member, a database owner, so it can recompile the lookup (sp_recompile), unforce an earlier run's forced plan (sp_query_store_unforce_plan), and, in the Database Agent beat, turn FORCE_LAST_GOOD_PLAN off and back on (ALTER DATABASE CURRENT SET AUTOMATIC_TUNING) and force the last good plan (sp_query_store_force_plan); it touches only demo.usp_visit_summary_lookup's plans and that one database option. SQL Server 2022 Standard on T1 and T2 has no automatic tuning, and the procedure refuses to run there."
+      "T3": "The runner signs in to T3 as the P6 group's member, a database owner, so it can recompile the lookup (sp_recompile), read its cached plan to check the switch (sys.dm_exec_procedure_stats and sys.dm_exec_text_query_plan, which need VIEW DATABASE STATE; 2026-11-21), unforce an earlier run's forced plan (sp_query_store_unforce_plan), and, in the Database Agent beat, turn FORCE_LAST_GOOD_PLAN off and back on (ALTER DATABASE CURRENT SET AUTOMATIC_TUNING) and force the last good plan (sp_query_store_force_plan); it touches only demo.usp_visit_summary_lookup's plans and that one database option. SQL Server 2022 Standard on T1 and T2 has no automatic tuning, and the procedure refuses to run there."
     }
   },
   "parameters": {
@@ -34,7 +34,8 @@
   ],
   "queryLevelEvidence": [
     "Query Store's Regressed Queries and Queries With Forced Plans reports (SSMS), and sys.query_store_plan.is_forced_plan",
-    "sys.dm_db_tuning_recommendations: the reason, the estimated CPU gain, and the state, with the plan IDs in its details"
+    "sys.dm_db_tuning_recommendations: the reason, the estimated CPU gain, and the state, with the plan IDs in its details",
+    "demo.scenario_run_events: plan-switch when session 1 saw the lookup's cached plan scan after the switch, plan-switch-retry when another compilation had put plan A back and it switched again (at most twice), and plan-switch-unverified when the regression didn't start or couldn't be checked (2026-11-21)"
   ],
   "reset": "The lookups only read. A forced plan stays after the run, so it can be shown; the next plan-regression run, or reset, unforces it (sp_query_store_unforce_plan, for demo.usp_visit_summary_lookup's queries only). A hold on FORCE_LAST_GOOD_PLAN goes back as the run found it at the response or the run's end, and otherwise at auto-cleanup, the next run's start, reset (auto-tuning-restored), or setup."
 }

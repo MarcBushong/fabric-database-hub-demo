@@ -154,6 +154,11 @@ function Invoke-DemoValidationInfrastructure {
                 $loader = New-DemoResult -CheckId $loader.checkId -Area $loader.area -Target $loader.target -Status 'Pass' -Message ('{0} runs the recorded bootstrap bundle {1} (generation {2}). deploy.ps1''s parallel tracks ran its loader in a Run Command and removed it afterward, so there''s no DbHubDemo-Bootstrap Run Command to read.' -f $vmName, $recorded.Substring(0, 12).ToLowerInvariant(), $generation) -Evidence ([ordered]@{ vmName = $vmName; bundle = $recorded.Substring(0, 12).ToLowerInvariant(); generation = $generation }) -DocUrl $loader.docUrl -EvaluationOnly:$evaluationOnly
             }
         }
+        elseif ($loader -and [string]$loader.status -eq 'Fail' -and [string]$loader.message -match 'has no bootstrap loader Run Command') {
+            # The health read didn't answer (F31, 2026-11-22: live on a running demo, a read the VM's Run Command handler
+            # skipped stayed Pending), so whether the loader ran isn't known; that's not a loader that's missing.
+            $loader = New-DemoResult -CheckId $loader.checkId -Area $loader.area -Target $loader.target -Status 'Warning' -Message ('Whether {0}''s bootstrap loader ran couldn''t be checked: there''s no DbHubDemo-Bootstrap Run Command to read, because deploy.ps1''s parallel tracks remove it after the loader runs, and health.json, which names the bundle the loader installed, couldn''t be read (INFRA.HEALTH.{1} says why).' -f $vmName, $suffix) -Evidence ([ordered]@{ vmName = $vmName; healthRead = $read.Error }) -Remediation 'Run validate.ps1 again in a few minutes.' -DocUrl $loader.docUrl -EvaluationOnly:$evaluationOnly
+        }
         $results.Add($loader)
         $healthDoc = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed'
         if ($null -eq $read.Health) {
@@ -183,6 +188,23 @@ function Invoke-DemoValidationInfrastructure {
             'Fail' { 'Read health.json and C:\ProgramData\DbHubDemo\logs on {0} (through Bastion), fix the cause, then run deploy.ps1 -Resume.' -f $vmName }
             'Warning' { 'The bootstrap is still working or waiting; run validate.ps1 again later.' }
             default { '' }
+        }
+        # A Ready bootstrap with warnings (F24, 2026-11-20): which step warned, and what to do, not "still working".
+        $warningNote = Get-DemoHealthWarningNote -Health $health -VmName $vmName
+        if ($null -ne $warningNote) {
+            $text = '{0} {1}' -f $text.TrimEnd(), $warningNote.Text
+            $remediation = $warningNote.Remediation
+            $healthEvidence['warningCount'] = $warningNote.Count
+            $healthEvidence['warnings'] = Get-DemoMemberList -InputObject $health -Name 'warnings'
+            # Every warning a one-off note that a new VM's bootstrap gives by design (F32).
+            $healthEvidence['warningsExpected'] = [bool]$warningNote.Expected
+        }
+        # The notes a new VM's bootstrap gives by design, as information, which leave it a Pass (2026-11-23).
+        $noteText = Get-DemoHealthNoteText -Health $health
+        if ($null -ne $noteText) {
+            $text = '{0} {1}' -f $text.TrimEnd(), $noteText.Text
+            $healthEvidence['noteCount'] = $noteText.Count
+            $healthEvidence['notes'] = Get-DemoMemberList -InputObject $health -Name 'notes'
         }
         $results.Add((New-DemoResult -CheckId ('INFRA.HEALTH.{0}' -f $suffix) -Area 'infra' -Target $target -Status $healthStatus -Message $text -Evidence $healthEvidence -Remediation $remediation -DocUrl $healthDoc -EvaluationOnly:$evaluationOnly))
 
@@ -264,8 +286,8 @@ function Invoke-DemoValidationT2 {
     try {
         $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/bootstrap/Invoke-DemoArcOnboard.ps1') -Raw
         # The probe waits for the host's own bootstrap pass (its lock, at most 5 minutes here) and runs again while the guest
-        # doesn't answer (dbhubfx, 2026-11-19), so the timeout leaves room for both.
-        $run = Invoke-DemoVmRunCommand -Config $Context.Config -VmName $arc.HostVmName -RunCommandName 'DbHubDemo-ValidateProbe' -Script $script -Parameter @{ Action = 'Probe'; MachineName = $arc.MachineName; Mode = $arc.T2Mode; LockMinutes = '5' } -TimeoutSeconds 900 -PollIntervalSeconds 15 -Confirm:$false
+        # doesn't answer (dbhubfx, 2026-11-19), so the timeout leaves room for both. A fresh name each time (F31, 2026-11-22).
+        $run = Invoke-DemoVmRunCommand -Config $Context.Config -VmName $arc.HostVmName -RunCommandName 'DbHubDemo-ValidateProbe' -Script $script -Parameter @{ Action = 'Probe'; MachineName = $arc.MachineName; Mode = $arc.T2Mode; LockMinutes = '5' } -TimeoutSeconds 900 -PollIntervalSeconds 15 -FreshName -Confirm:$false
         if ($run.Succeeded) {
             $probe = ConvertFrom-DemoRunCommandOutput -Text $run.Output
         }
@@ -317,7 +339,7 @@ function Invoke-DemoValidationT3 {
         [pscustomobject] $Context
     )
 
-    $parameters = @{ Config = $Context.Config; NetworkMode = (Get-DemoValidationNetworkMode -Context $Context) }
+    $parameters = @{ Config = $Context.Config; NetworkMode = (Get-DemoValidationNetworkMode -Context $Context); IncludeQueryStore = $true }
     if ($Context.DeploymentId) {
         $parameters['DeploymentId'] = $Context.DeploymentId
     }
@@ -350,7 +372,7 @@ function Invoke-DemoValidationT4 {
         [pscustomobject] $Context
     )
 
-    $parameters = @{ Config = $Context.Config; IncludeMetrics = $true }
+    $parameters = @{ Config = $Context.Config; IncludeMetrics = $true; IncludeQueryStore = $true }
     if ($Context.DeploymentId) {
         $parameters['DeploymentId'] = $Context.DeploymentId
     }
@@ -537,7 +559,9 @@ function Invoke-DemoValidationWorkload {
     .SYNOPSIS
     The Workload area: the runner's status on each selected target (Invoke-DemoWorkloadCommand status --json,
     read-only), the scenario bounds from it, and the profile host lane that serves the target (WORKLOAD.<target>.HOST,
-    Phase 25b). The session control's CONTROL.* checks (Test-DemoActivityControl, ADR 0020 and ADR 0026). T1 and T3 run on sqlvm01, and T2 through the host into the guest, so each needs that VM running; T2
+    Phase 25b). T1.QUERYSTORE and T2.QUERYSTORE (2026-11-23), from the same status read: Query Store's state in ContosoCare,
+    which the VM's relay keeps from the runner's whole output (Test-DemoValidationWorkloadQueryStore); a Warning whenever
+    the status wasn't read (the VM stopped, the host not Ready, the read failed), with areas t1 and t2. The session control's CONTROL.* checks (Test-DemoActivityControl, ADR 0020 and ADR 0026). T1 and T3 run on sqlvm01, and T2 through the host into the guest, so each needs that VM running; T2
     also needs the host's last step, after the setup wizard. A status read that fails the way load makes it fail (a
     time-out, a 409, a lock, or a resource limit) while one of business-day's incidents is due on the target (or on T1,
     whose sqlvm01 runs T3's and T4's commands), and a host lane that fails while the target's own status says it runs
@@ -556,8 +580,16 @@ function Invoke-DemoValidationWorkload {
     $docUrl = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command'
     foreach ($target in @('T1', 'T2', 'T3', 'T4', 'T5' | Where-Object { $_ -in $Context.Target })) {
         $checkId = 'WORKLOAD.{0}.COMMAND' -f $target
+        # T1.QUERYSTORE and T2.QUERYSTORE come with this status read (2026-11-23): a Warning whenever it isn't read.
+        $queryStoreUnread = {
+            param([string] $Why, [string] $Fix)
+            if ($target -in 'T1', 'T2') {
+                $results.Add((New-DemoQueryStoreUnreadResult -Target $target -Why $Why -Remediation $Fix))
+            }
+        }
         if ($target -eq 'T2' -and $Context.Arc.EvaluationOnly) {
             $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Not selected' -Message 'The evaluation-only T2 mode has no workload runner (risk R188).' -DocUrl $docUrl -EvaluationOnly))
+            $results.Add((New-DemoQueryStoreUnreadResult -Target 'T2' -Status 'Not selected' -Why 'the evaluation-only T2 mode has no workload runner to read it.'))
             continue
         }
         $vmName = if ($target -eq 'T2') { $Context.Arc.HostVmName } else { 'sqlvm01' }
@@ -566,6 +598,9 @@ function Invoke-DemoValidationWorkload {
         $state = Get-DemoValidationVmState -Context $Context -VmName $vmName
         if (-not $state.Running) {
             $results.Add((New-DemoValidationStoppedResult -CheckId $checkId -Area 'workload' -Target $target -VmState $state -Context $Context -Checks ('the {0} workload checks' -f $target)))
+            if ($target -in 'T1', 'T2') {
+                $results.Add((New-DemoValidationStoppedResult -CheckId ('{0}.QUERYSTORE' -f $target) -Area $target.ToLowerInvariant() -Target $target -VmState $state -Context $Context -Checks ('the read of Query Store''s state on {0}' -f $target)))
+            }
             continue
         }
         if ($target -eq 'T3') {
@@ -602,23 +637,27 @@ function Invoke-DemoValidationWorkload {
             $hostState = [string](Get-DemoMemberValue -InputObject $read.Health -Name 'state')
             if ($null -eq $read.Health) {
                 $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Warning' -Message ('The T2 runner wasn''t checked, because health.json on {0} couldn''t be read: {1}' -f $vmName, $read.Error) -Remediation 'Run validate.ps1 -Area Workload again in about 10 minutes.' -DocUrl $docUrl))
+                & $queryStoreUnread ('health.json on {0} couldn''t be read, so the runner wasn''t asked.' -f $vmName) 'Run ./scripts/validate.ps1 -Area Workload again in about 10 minutes.'
                 continue
             }
             if ($hostState -eq 'ManualActionRequired') {
                 $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Manual action required' -Message ('The T2 runner is installed in the host''s last step, after the manual step health.json reports: {0}' -f [string](Get-DemoMemberValue -InputObject $read.Health -Name 'message')) -Evidence @{ hostState = $hostState } -Remediation ('Follow the instructions in health.json (Get-DemoVmHealth -Config $config -VmName {0} -View Full); the host then configures SQL Server, seeds ContosoCare, and installs the runner.' -f $vmName) -DocUrl $docUrl))
+                & $queryStoreUnread 'the T2 host waits for a manual step (WORKLOAD.T2.COMMAND), so the runner wasn''t asked.' 'Follow WORKLOAD.T2.COMMAND''s fix, then run ./scripts/validate.ps1 -Area Workload again.'
                 continue
             }
             if ($hostState -ne 'Ready') {
                 $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Warning' -Message ('{0} is in state {1}; the T2 runner is installed in its last step (WorkloadRunner).' -f $vmName, $hostState) -Evidence @{ hostState = $hostState } -Remediation 'Wait for the host to report Ready, then run validate.ps1 -Area Workload again.' -DocUrl $docUrl))
+                & $queryStoreUnread ('{0} isn''t Ready yet, so the runner wasn''t asked.' -f $vmName) 'Wait for the host to report Ready, then run ./scripts/validate.ps1 -Area Workload again.'
                 continue
             }
         }
         try {
-            $run = Invoke-DemoWorkloadCommand -Config $Context.Config -Target $target -ArgumentList @('status', '--json', '--runs', '5') -TimeoutSeconds 180 -Confirm:$false
+            $run = Invoke-DemoWorkloadCommand -Config $Context.Config -Target $target -ArgumentList @('status', '--json', '--runs', '5') -TimeoutSeconds 180 -Bounds -Confirm:$false
         }
         catch {
             $message = Protect-DemoText -Text $_.Exception.Message
             $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Warning' -Message ('The runner''s status on {0} couldn''t be read: {1} {2}' -f $target, $message, (Get-DemoValidationRunCommandNote -ErrorText $message)) -Remediation 'Run validate.ps1 -Area Workload again in about 10 minutes.' -DocUrl $docUrl))
+            & $queryStoreUnread ('the runner''s status couldn''t be read (WORKLOAD.{0}.COMMAND).' -f $target) 'Run ./scripts/validate.ps1 -Area Workload again in about 10 minutes.'
             continue
         }
         $commandResult = $run.Result
@@ -627,11 +666,19 @@ function Invoke-DemoValidationWorkload {
         }
         $results.Add($commandResult)
         if ($run.Status -in 'Pass', 'Warning') {
-            $results.Add((Test-DemoValidationWorkloadBound -Target $target -StdOut $run.StdOut))
+            # The relay's evidence: the running runs' bounds and the profile, both read from the runner's whole output (F20).
+            $relayEvidence = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $run -Name 'Result') -Name 'evidence'
+            $results.Add((Test-DemoValidationWorkloadBound -Target $target -StdOut $run.StdOut -Bounds (Get-DemoMemberValue -InputObject $relayEvidence -Name 'bounds') -RunnerProfile (Get-DemoMemberValue -InputObject $relayEvidence -Name 'profile') -BoundsCut:([bool](Get-DemoMemberValue -InputObject $relayEvidence -Name 'boundsCut'))))
             # The relay reads the profile from the runner's whole output, which the cut stdout no longer shows once the status
             # lists two or more runs (re-review of PR 16, 2026-11-04).
             $runnerProfile = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $run -Name 'Result') -Name 'evidence') -Name 'profile'
             $results.Add((ConvertTo-DemoIncidentAwareResult -Result (Test-DemoValidationWorkloadHost -Target $target -StdOut $run.StdOut -VmName $vmName) -Config $Context.Config -IncidentTarget $incidentTargets -ValidationArea 'Workload' -Kind Host -RunnerStdOut $run.StdOut -RunnerProfile $runnerProfile))
+            if ($target -in 'T1', 'T2') {
+                $results.Add((Test-DemoValidationWorkloadQueryStore -Target $target -Result $run.Result -StdOut $run.StdOut))
+            }
+        }
+        else {
+            & $queryStoreUnread ('the runner''s status read failed (WORKLOAD.{0}.COMMAND).' -f $target) ('Fix what WORKLOAD.{0}.COMMAND names, then run ./scripts/validate.ps1 -Area Workload again.' -f $target)
         }
     }
     # The session control (ADR 0020, ADR 0026), part of every deployment since 2026-11-14: CONTROL.*, read-only.
@@ -681,6 +728,8 @@ function Invoke-DemoValidationCost {
         }
         # T5's free tier (ADR 0027): the account's own when it exists.
         $parameters['T5FreeTier'] = Get-DemoT5FreeTierStatus -Config $config -DeploymentId ([string]$Context.DeploymentId)
+        # T5's private endpoint and DNS zone (2026-11-21): priced only when the account has them, or when that can't be told.
+        $parameters['T5PrivateEndpoint'] = Get-DemoT5PrivateEndpointStatus -Config $config -NetworkMode ([string]$parameters['NetworkMode']) -DeploymentId ([string]$Context.DeploymentId)
         # T5's container lifecycle (2026-11-19): only the running hours, unless its container stays between sessions, and why
         # (the re-review of 0590bbe).
         $t5Cost = Get-DemoT5CostLifecycle -Config $config -Detail
@@ -734,6 +783,10 @@ function Invoke-DemoValidationCost {
     $problems = [System.Collections.Generic.List[string]]::new()
     $missing = [System.Collections.Generic.List[string]]::new()
     $checked = [System.Collections.Generic.List[string]]::new()
+    # A time that deploy.ps1 moved for a run the nightly stop waited for, recorded in DbHubAutoShutdownMoved (F25, F27):
+    # start-demo.ps1 and stop-demo.ps1 put it back, even after a Run all session cleared the busy marker.
+    $movedClocks = @(([string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $Context -Name 'Tags') -Name (Get-DemoDeploymentStateTagName)['AutoShutdownMoved'])) -split ',' | Where-Object { $_ })
+    $otherwise = $false
     foreach ($vmName in @($Context.VmNames.Values)) {
         # Named, not --ids: Invoke-DemoAz adds --subscription to every call (as Invoke-DemoArcMonitoringUpdate does).
         $schedule = Read-DemoValidationAzJson -SubscriptionId $Context.SubscriptionId -ArgumentList @('resource', 'show', '--resource-group', $group, '--name', ('shutdown-computevm-{0}' -f $vmName), '--resource-type', 'Microsoft.DevTestLab/schedules')
@@ -748,17 +801,26 @@ function Invoke-DemoValidationCost {
         $checked.Add(('{0} {1} {2} ({3})' -f $vmName, $scheduleTime, $scheduleZone, $scheduleStatus))
         if ($scheduleStatus -ne 'Enabled') {
             $problems.Add(('{0}''s schedule is {1}' -f $vmName, $scheduleStatus))
+            $otherwise = $true
         }
         elseif ($scheduleTime -ne $time -or $scheduleZone -ne $zone) {
-            $problems.Add(('{0} shuts down at {1} {2}, not {3} {4}' -f $vmName, $scheduleTime, $scheduleZone, $time, $zone))
+            $recorded = $scheduleZone -eq $zone -and $scheduleTime -in $movedClocks
+            $problems.Add(('{0} shuts down at {1} {2}, not {3} {4}{5}' -f $vmName, $scheduleTime, $scheduleZone, $time, $zone, $(if ($recorded) { ', where deploy.ps1 moved it for a run the nightly stop waited for' } else { '' })))
+            if (-not $recorded) {
+                $otherwise = $true
+            }
         }
     }
-    $evidence = [ordered]@{ schedules = $checked.ToArray(); configured = ('{0} {1}' -f $time, $zone) }
+    $evidence = [ordered]@{ schedules = $checked.ToArray(); configured = ('{0} {1}' -f $time, $zone); autoShutdownMoved = $movedClocks }
     if ($missing.Count -gt 0) {
         $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Fail' -Message ('No auto-shutdown schedule for {0}, so it runs until someone stops it.' -f ($missing -join ', ')) -Evidence $evidence -Remediation 'Deploy again (deploy.ps1 -Resume); the template creates the schedules (ADR 0016).' -DocUrl $scheduleDoc))
     }
     elseif ($problems.Count -gt 0) {
-        $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Warning' -Message ('The auto-shutdown schedules differ from the configuration: {0}.' -f ($problems -join '; ')) -Evidence $evidence -Remediation 'Deploy again (deploy.ps1 -Resume) to restore autoShutdownTime and autoShutdownTimeZone.' -DocUrl $scheduleDoc))
+        $fix = 'Deploy again (deploy.ps1 -Resume) to restore autoShutdownTime and autoShutdownTimeZone.'
+        if (-not $otherwise) {
+            $fix = 'Run ./scripts/stop-demo.ps1 or ./scripts/start-demo.ps1, which put it back at {0}, as the next ./scripts/deploy.ps1 does; until then, a Run all session ends before it (ADR 0024).' -f $time
+        }
+        $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Warning' -Message ('The auto-shutdown schedules differ from the configuration: {0}.' -f ($problems -join '; ')) -Evidence $evidence -Remediation $fix -DocUrl $scheduleDoc))
     }
     elseif ($checked.Count -gt 0) {
         $results.Add((New-DemoResult -CheckId 'COST.AUTOSHUTDOWN' -Area 'cost' -Target 'subscription' -Status 'Pass' -Message ('Auto-shutdown is enabled at {0} {1} for {2}.' -f $time, $zone, (@($Context.VmNames.Values) -join ' and ')) -Evidence $evidence -DocUrl $scheduleDoc))

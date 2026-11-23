@@ -107,6 +107,118 @@ Describe 'Fabric notebooks in the repo' {
     }
 }
 
+Describe 'The versions of the notebooks the demo published (fabric/notebooks/published-versions.json)' {
+    BeforeAll {
+        $script:versionsPath = Join-Path -Path $notebookFolder -ChildPath 'published-versions.json'
+        $script:names = @(Get-ChildItem -Path $notebookFolder -Filter '*.ipynb' -File | Sort-Object -Property Name | ForEach-Object BaseName)
+        $script:current = @{}
+        foreach ($name in $names) {
+            $text = [System.IO.File]::ReadAllText((Join-Path -Path $notebookFolder -ChildPath "$name.ipynb"))
+            $current[$name] = (InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }).Sha256
+        }
+
+        # DBHUB_WRITE_NOTEBOOK_VERSIONS=1 writes the file: what it lists, every version of each notebook in this checkout's
+        # git history (when git answers, with the day each first appeared), and the current one (today, when it's new),
+        # oldest first. CI never sets it; a change to a notebook needs it once, and the file committed with the change.
+        if ($env:DBHUB_WRITE_NOTEBOOK_VERSIONS -eq '1') {
+            $known = @{}
+            foreach ($name in $names) {
+                $known[$name] = @{}
+            }
+            if (Test-Path -LiteralPath $versionsPath) {
+                $existing = Get-Content -LiteralPath $versionsPath -Raw | ConvertFrom-Json -AsHashtable
+                foreach ($name in $names) {
+                    foreach ($entry in @($existing['notebooks'][$name])) {
+                        if ($entry) {
+                            $known[$name][[string]$entry['sha256']] = [string]$entry['since']
+                        }
+                    }
+                }
+            }
+            $git = Get-Command -Name 'git' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            # The notebooks hold non-ASCII text, and PowerShell decodes git's output with the console's encoding.
+            $consoleEncoding = [Console]::OutputEncoding
+            [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
+            try {
+                foreach ($name in $names) {
+                    $relative = "fabric/notebooks/$name.ipynb"
+                    $commits = if ($git) { @(& $git.Source -C $repoRoot log --full-history '--format=%H %as' HEAD -- $relative 2>$null) } else { @() }
+                    foreach ($line in $commits) {
+                        $commit, $day = ([string]$line).Split(' ', 2)
+                        $text = (& $git.Source -C $repoRoot show "${commit}:$relative" 2>$null) -join "`n"
+                        if ($LASTEXITCODE -ne 0 -or -not $text) {
+                            continue
+                        }
+                        $sha = (InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }).Sha256
+                        if ($sha -and (-not $known[$name].ContainsKey($sha) -or [string]::CompareOrdinal($day, $known[$name][$sha]) -lt 0)) {
+                            $known[$name][$sha] = $day
+                        }
+                    }
+                    if (-not $known[$name].ContainsKey($current[$name])) {
+                        $known[$name][$current[$name]] = [DateTime]::UtcNow.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+                    }
+                }
+            }
+            finally {
+                [Console]::OutputEncoding = $consoleEncoding
+            }
+            $document = [ordered]@{
+                about     = 'Every version of the demo''s notebooks in this repository''s history, oldest first, by fingerprint: each cell''s type and code, without outputs, metadata, line endings, trailing spaces, or the workspace, lakehouse, and GitHub values the import sets (Get-DemoNotebookFingerprint). deploy.ps1 brings a workspace''s copy that matches one of them up to date, since nobody edited it, and keeps one that matches none, while fabric.importNotebooks is false. Written by tests/unit/Fabric.Notebooks.Tests.ps1 with DBHUB_WRITE_NOTEBOOK_VERSIONS=1; don''t edit.'
+                notebooks = [ordered]@{}
+            }
+            foreach ($name in $names) {
+                $document['notebooks'][$name] = @($known[$name].GetEnumerator() | Sort-Object -Property @{ Expression = { $_.Value } }, @{ Expression = { $_.Key } } | ForEach-Object { [ordered]@{ sha256 = $_.Key; since = $_.Value } })
+            }
+            $json = (ConvertTo-Json -InputObject $document -Depth 5) -replace "`r`n", "`n"
+            [System.IO.File]::WriteAllText($versionsPath, $json + "`n", [System.Text.UTF8Encoding]::new($false))
+        }
+    }
+
+    It 'lists each notebook''s current version, so deploy.ps1 can tell an earlier one that nobody edited from an edited one' {
+        Test-Path -LiteralPath $versionsPath | Should -BeTrue -Because 'deploy.ps1 reads it while fabric.importNotebooks is false'
+        $document = Get-Content -LiteralPath $versionsPath -Raw | ConvertFrom-Json -AsHashtable
+        @($document['notebooks'].Keys | Sort-Object) | Should -Be $names
+        foreach ($name in $names) {
+            $entries = @($document['notebooks'][$name])
+            $entries.Count | Should -BeGreaterThan 0
+            foreach ($entry in $entries) {
+                [string]$entry['sha256'] | Should -Match '^[0-9a-f]{64}$'
+                [string]$entry['since'] | Should -Match '^\d{4}-\d{2}-\d{2}$'
+            }
+            @($entries | ForEach-Object { [string]$_['sha256'] } | Select-Object -Unique).Count | Should -Be $entries.Count -Because 'each version is listed once'
+            $days = @($entries | ForEach-Object { [string]$_['since'] })
+            ($days -join ' ') | Should -BeExactly ((@($days | Sort-Object -CaseSensitive) -join ' ')) -Because 'the versions go oldest first'
+            @($entries | ForEach-Object { [string]$_['sha256'] }) | Should -Contain $current[$name] -Because ('{0}''s current version must be listed, or deploy.ps1 counts a copy of it as edited: run this test with DBHUB_WRITE_NOTEBOOK_VERSIONS=1, and commit the file' -f $name)
+        }
+    }
+
+    It 'reads the same fingerprint from the file the import binds, and from a copy Fabric gives back as one string per cell with CRLF and outputs' {
+        foreach ($name in $names) {
+            $path = Join-Path -Path $notebookFolder -ChildPath "$name.ipynb"
+            $bound = Get-DemoFabricNotebookDefinition -Path $path -LakehouseId '66666666-6666-6666-6666-666666666666' -LakehouseName 'LH_Other' -LakehouseWorkspaceId '11111111-1111-1111-1111-111111111111' -GitHubRepository 'contoso/fork'
+            $boundText = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String([string]$bound.Definition['parts'][0]['payload']))
+            $notebook = $boundText | ConvertFrom-Json -AsHashtable
+            foreach ($cell in @($notebook['cells'])) {
+                $cell['source'] = ((@($cell['source']) -join '') -replace "`n", "`r`n") + "`r`n"
+                $cell['metadata'] = @{ microsoft = @{ language = 'python' } }
+                if ($cell['cell_type'] -eq 'code') {
+                    $cell['execution_count'] = 7
+                    $cell['outputs'] = @(@{ output_type = 'stream'; name = 'stdout'; text = @('ran') })
+                }
+            }
+            $notebook['metadata'] = @{ kernel_info = @{ name = 'synapse_pyspark' } }
+            $fabricText = ConvertTo-Json -InputObject $notebook -Depth 20
+            $fingerprints = InModuleScope -ModuleName DbHubDemo -Parameters @{ Bound = $boundText; Fabric = $fabricText } {
+                @((Get-DemoNotebookFingerprint -Text $Bound), (Get-DemoNotebookFingerprint -Text $Fabric))
+            }
+            $fingerprints[0].Sha256 | Should -Be $current[$name] -Because 'the values the import binds aren''t edits'
+            $fingerprints[1].Sha256 | Should -Be $current[$name] -Because 'outputs, metadata, line endings, and a cell''s last newline aren''t edits'
+            $fingerprints[1].Bindings['LAKEHOUSE_ID'] | Should -Be '66666666-6666-6666-6666-666666666666'
+            $fingerprints[1].Bindings['LAKEHOUSE_NAME'] | Should -Be 'LH_Other'
+        }
+    }
+}
+
 Describe 'Notebook <_>' -ForEach $notebookNames {
     BeforeAll {
         $name = $_
@@ -316,7 +428,16 @@ Describe 'Notebook <_>' -ForEach $notebookNames {
             if ($block -match 'SqlServerWaitStats|SqlServerStorageIO|CounterType == 272696576') {
                 $block | Should -Match 'prev\('
                 $block | Should -Match 'Keep = '
-                $block | Should -Not -Match 'sum\((WaitTimeMs|WaitingTasksCount|NumOfBytesRead|NumOfBytesWritten|IOStallReadMs|IOStallWriteMs|NumOfReads|NumOfWrites|CounterValue)\)'
+                foreach ($statement in @($block -split "`n(?=\|)")) {
+                    if ($statement -match '(?s)^\| summarize .*\bby [^\n]*, SampleTimeUTC$') {
+                        # F36: the files of a key added within one sample, by SampleTimeUTC itself, are a cumulative
+                        # counter again; the telemetry article's rule 2 forbids a sum across samples, never this one.
+                        $statement | Should -Not -Match '\b(avg|max|min)\('
+                    }
+                    else {
+                        $statement | Should -Not -Match 'sum\((WaitTimeMs|WaitingTasksCount|NumOfBytesRead|NumOfBytesWritten|IOStallReadMs|IOStallWriteMs|NumOfReads|NumOfWrites|CounterValue)\)'
+                    }
+                }
             }
             if ($block -match 'SqlServerWaitStats') {
                 $block | Should -Match "WaitCategory !in \('Idle', 'Unknown'\)"
@@ -1287,7 +1408,7 @@ print(json.dumps({"nov13": lag_finding(nov13), "late": lag_finding(late), "only"
         }
         # Five-minute values from 17:00 UTC; the 18:00 interval has no value yet.
         $script:pgPoints = @{
-            'pgflex01-abc123'    = @{ cpu_percent = @(43.27, 91.26, 50); memory_percent = @(30.15); active_connections = @(12, 34); physical_replication_delay_in_bytes = @(184); connections_failed = @(0, 3, 1) }
+            'pgflex01-abc123'    = @{ cpu_percent = @(43.27, 91.26, 50); memory_percent = @(30.15); active_connections = @(12, 37); physical_replication_delay_in_bytes = @(184); connections_failed = @(0, 3, 1) }
             'pgreplica01-abc123' = @{ physical_replication_delay_in_seconds = @(6, 241.37, 2); cpu_percent = @(10.26); active_connections = @(1) }
         }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAz -MockWith {
@@ -1361,10 +1482,22 @@ again = t4(full)
 partial = json.loads(document)
 partial["servers"] = [server for server in partial["servers"] if server["role"] == "primary"]
 partial["series"] = [series for series in partial["series"] if series["role"] == "primary"]
+# As live (F34, 2026-11-21): connection-surge at the limit, and Azure Monitor's failed connections at 0 in every interval.
+live = json.loads(document)
+for series in live["series"]:
+    if series["metric"] == "connections_failed":
+        series["points"] = [[point[0], 0] for point in series["points"]]
+# A capture whose connections stay under the slots clients can use.
+under = json.loads(document)
+for series in under["series"]:
+    if series["metric"] == "active_connections" and series["role"] == "primary":
+        series["points"] = [[point[0], min(point[1], 34)] for point in series["points"]]
 print(json.dumps({
     "full": summary(full, printed),
     "again": summary(full, again),
     "primaryOnly": summary(*run(json.dumps(partial))),
+    "live": summary(*run(json.dumps(live))),
+    "under": summary(*run(json.dumps(under))),
     "invalid": summary(*run('{"version": 2, "servers": [], "series": []}')),
     "empty": summary(*run("")),
 }))
@@ -1387,8 +1520,8 @@ print(json.dumps({
         $lag[0]['reportDate'] | Should -Be '2026-11-13'
         @($full['rows'] | Where-Object { $_['metric'] -eq 'connections_failed' } | ForEach-Object { '{0}:{1}:{2}' -f $_['target'], $_['unit'], [string]$_['value'] }) | Should -Be @('T4:connections:0', 'T4:connections:3', 'T4:connections:1')
         @($full['rows'] | Where-Object { $_['metric'] -eq 'cpu_percent' -and $_['target'] -eq 'T4' } | ForEach-Object { $_['value'] }) | Should -Be @(43.3, 91.3, 50)
-        $full['findings'].Count | Should -Be 4
-        foreach ($id in 'postgresql.T4.capture', 'postgresql.T4-replica.lag', 'postgresql.T4.cpu', 'postgresql.T4.connections_failed') {
+        $full['findings'].Count | Should -Be 5
+        foreach ($id in 'postgresql.T4.capture', 'postgresql.T4-replica.lag', 'postgresql.T4.cpu', 'postgresql.T4.connections', 'postgresql.T4.connections_failed') {
             $full['findings'].ContainsKey($id) | Should -BeTrue -Because $id
         }
         $full['findings']['postgresql.T4.capture']['status'] | Should -Be 'Pass'
@@ -1399,12 +1532,23 @@ print(json.dumps({
         $full['findings']['postgresql.T4.cpu']['finding'] | Should -Be 'T4''s CPU on pgflex01-abc123 peaked at 91.3% at 2026-11-13 17:05 UTC (a Warning at 80% or more).'
         $full['findings']['postgresql.T4.connections_failed']['status'] | Should -Be 'Warning'
         $full['findings']['postgresql.T4.connections_failed']['finding'] | Should -Match '^Failed connections on T4 \(pgflex01-abc123\): 4 from 2026-11-13 17:00 to 2026-11-13 17:15 UTC, at most 3 in one 5-minute interval'
+        # F34 (live, 2026-11-21): connection-surge's signal is T4's connections at the slots clients can use, never its failed
+        # connections, which leave out a client refused at the connection limit; they say so whatever their count.
+        $leaveOut = 'They leave out a client refused at the connection limit (too many connections), so T4''s active connections show a connection surge.'
+        $full['findings']['postgresql.T4.connections_failed']['finding'] | Should -BeLike ('* ' + $leaveOut)
+        $full['findings']['postgresql.T4.connections']['status'] | Should -Be 'Warning'
+        $full['findings']['postgresql.T4.connections']['finding'] | Should -Be 'T4''s active connections on pgflex01-abc123 peaked at 37 at 2026-11-13 17:05 UTC, at or above the 35 slots clients can use (max_connections 50, less 15 reserved; a Warning at 35 or more). At the limit, PostgreSQL refuses a new client (too many connections), and Azure Monitor''s failed connections don''t count that refusal.'
+        $result['live']['findings']['postgresql.T4.connections']['status'] | Should -Be 'Warning'
+        $result['live']['findings']['postgresql.T4.connections_failed']['status'] | Should -Be 'Pass'
+        $result['live']['findings']['postgresql.T4.connections_failed']['finding'] | Should -Be ('Azure Monitor counted no failed connections on T4 (pgflex01-abc123) from 2026-11-13 17:00 to 2026-11-13 17:15 UTC. ' + $leaveOut)
+        $result['under']['findings']['postgresql.T4.connections']['status'] | Should -Be 'Pass'
+        $result['under']['findings']['postgresql.T4.connections']['finding'] | Should -Be 'T4''s active connections on pgflex01-abc123 peaked at 34 at 2026-11-13 17:05 UTC, under the 35 slots clients can use (max_connections 50, less 15 reserved; a Warning at 35 or more).'
         $full['findings']['postgresql.T4.cpu']['reportDate'] | Should -Be '2026-11-13'
         $full['printed'] | Should -Contain 'T4''s metrics from 2026-11-13 17:00 to 2026-11-13 18:02 UTC, every 5 minutes:'
 
         # Running the cell again replaces its rows and findings instead of adding to them.
         $result['again']['rows'].Count | Should -Be 15
-        $result['again']['findings'].Count | Should -Be 4
+        $result['again']['findings'].Count | Should -Be 5
 
         $primaryOnly = $result['primaryOnly']
         @($primaryOnly['rows'] | Where-Object { $_['target'] -eq 'T4-replica' }).Count | Should -Be 0
@@ -2407,5 +2551,50 @@ print("ok")
 '@
         $output = & $python $script $live.Path 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+    }
+
+    It 'expects connection-surge''s connections, never IO by a keyword inside a word, and counts T4''s slots from the template''s max_connections (F34)' {
+        # Live (2026-11-21): the surge's refused attempts weren't in Azure Monitor's failed connections; its connections reached
+        # the slots clients can use. The notebook and the app count those slots the same way, from config/versions.json.
+        $postgres = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'config/versions.json') -Raw | ConvertFrom-Json -AsHashtable)['postgresql']
+        $liveCode | Should -Match ('(?m)^POSTGRES_MAX_CONNECTIONS = {0}$' -f $postgres['maxConnections'])
+        $liveCode | Should -Match '(?m)^POSTGRES_RESERVED_CONNECTIONS = 15$'
+        $insights = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/lib/insights.ts') -Raw
+        $insights | Should -Match ('export const POSTGRES_MAX_CONNECTIONS = {0};' -f $postgres['maxConnections'])
+        $insights | Should -Match 'export const POSTGRES_RESERVED_CONNECTIONS = 15;'
+        (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/lib/scoreboard.ts') -Raw) | Should -Match '"connection-surge": \["connections"\]'
+        $python = $pandasPython
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & $python -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for this Python'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'expected.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import json, sys, types
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"]]
+ns = {}
+for index, cell in enumerate(cells):
+    if cell.startswith(("# Parameters cell", "# Helpers, part")):
+        exec(compile(cell, "cell-%d" % index, "exec"), ns)
+signals = ns["expected_signals"]
+print(json.dumps({profile: list(signals("incident:" + profile)) for profile in ("connection-surge", "idle-in-transaction", "io-pressure", "session-locking", "index-io-mix", "ru-storm")}))
+'@
+        $output = & $python $script $live.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $expected = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+        @($expected['connection-surge']) | Should -Be @('connections')
+        # Before, "io" inside "connection", "transaction", and "session" read as IO pressure.
+        @($expected['idle-in-transaction']) | Should -Be @('activity')
+        @($expected['session-locking']) | Should -Be @('blocking')
+        @($expected['io-pressure']) | Should -Be @('io')
+        @($expected['index-io-mix']) | Should -Be @('cpu', 'io')
+        @($expected['ru-storm']) | Should -Be @('activity')
     }
 }

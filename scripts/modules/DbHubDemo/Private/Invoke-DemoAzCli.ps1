@@ -10,7 +10,10 @@ function Invoke-DemoAzCli {
     PowerShell's own quoting is pinned to Legacy so it passes those quotes through unchanged.
     Callers decide with ShouldProcess whether a command runs. Under a caller's -WhatIf, the inherited
     $WhatIfPreference would skip the stderr redirection and the temporary file's deletion (Phase 14
-    finding), so it's pinned to $false here, for both paths.
+    finding), so it's pinned to $false here, for both paths. Under a caller's -Confirm, the inherited
+    $ConfirmPreference 'Low' would ask at that redirection, which writes the file through Out-File ("Output to
+    File"), and again before the file goes; a non-interactive shell refuses both (2026-11-22), so it's pinned to
+    'None' too.
 
     With -TimeoutSeconds, the CLI runs as a child process with no console input, and the whole process
     tree is stopped when it doesn't finish in time: ExitCode is then -1 and StdErr says so. A token request
@@ -28,6 +31,7 @@ function Invoke-DemoAzCli {
     )
 
     $WhatIfPreference = $false
+    $ConfirmPreference = 'None'
     $az = Get-Command -Name 'az' -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $az) {
         throw 'The Azure CLI (az) was not found on PATH. Install it, or run from Azure Cloud Shell.'

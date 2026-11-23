@@ -96,6 +96,8 @@ BeforeAll {
         # ready for it, whether the identity may, and the minutes it takes), its deletion, its parameter, the second
         # auto-stop, the control vault's secrets as the runbook writes them, and whether the group's tags can be written.
         $script:replicaRefuse = @()
+        # Sizes Azure refuses over the subscription's vCore quota, with Learn's message (F37, 2026-11-22).
+        $script:replicaQuota = @()
         $script:replicaNotReady = 0
         $script:replicaForbidden = $false
         $script:replicaCreateMinutes = 9
@@ -507,6 +509,7 @@ BeforeAll {
                         return (New-Response 409 '{"error":{"code":"ReadReplicaServerInUnexpectedState","message":"Cannot perform operation on read replica because it''s in ''Restarting'' state."}}')
                     }
                     if ($sku -in $script:replicaRefuse) { return (New-Response 400 ('{{"error":{{"code":"SkuNotAvailable","message":"The requested SKU {0} isn''t available in westus3."}}}}' -f $sku)) }
+                    if ($sku -in $script:replicaQuota) { return (New-Response 400 '{"error":{"code":"QuotaExceeded","message":"Operation could not be completed as it results in exceeding approved standardDDSv5Family Cores quota. Additional details - Current Limit: 24, Current Usage: 24, Additional Required: 4, (Minimum) New Limit Required: 28."}}') }
                     $script:replica = 'Provisioning'
                     $script:replicaSku = $sku
                     $script:replicaReadyAt = $script:clock.AddMinutes($script:replicaCreateMinutes)
@@ -664,6 +667,33 @@ Describe 'DbHub-Control run planning (Get-DbHubRunPlan)' {
         $plan = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc ([datetime]::new(2026, 10, 27, 22, 55, 0, [System.DateTimeKind]::Utc))
         $plan.Valid | Should -BeFalse
         $plan.Reason | Should -Match 'auto-shutdown'
+    }
+
+    It 'ends before an earlier auto-shutdown that deploy.ps1 moved (DbHubAutoShutdownMoved, F25), and not before a later one' {
+        $request = Test-DbHubControlRequest -WebhookData (New-Webhook @{ action = 'run'; activities = @(@{ target = 'T1'; scenario = 'baseline' }); durationMinutes = 90 }) -Settings $script:settings
+        # 20:20 Eastern daylight time (00:20 UTC): the 19:00 auto-shutdown comes tomorrow, the one moved to 21:15 tonight.
+        $now = [datetime]::new(2026, 10, 28, 0, 20, 0, [System.DateTimeKind]::Utc)
+        $tonight = [datetime]::new(2026, 10, 28, 1, 15, 0, [System.DateTimeKind]::Utc)
+        $plan = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc $now -Tags @{ DbHubAutoShutdownMoved = '2115' }
+        $plan.Valid | Should -BeTrue
+        $plan.ShutdownMoved | Should -BeTrue
+        $plan.ShutdownUtc | Should -Be $tonight
+        $plan.NightlyUtc | Should -Be ([datetime]::new(2026, 10, 28, 23, 0, 0, [System.DateTimeKind]::Utc))
+        $plan.Activities[0].Minutes | Should -Be 53
+        (Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc $now -Tags @{ DbHubAutoShutdownMoved = '2230,2115,soon' }).ShutdownUtc | Should -Be $tonight -Because 'the earliest counts'
+        foreach ($tags in @($null, @{ DbHubAutoShutdownMoved = '' }, @{ DbHubAutoShutdownMoved = 'soon' }, @{ DbHubAutoShutdownMoved = '1915' })) {
+            # None, or one that comes after tomorrow's 19:00.
+            $other = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc $now -Tags $tags
+            $other.ShutdownMoved | Should -BeFalse
+            $other.Activities[0].Minutes | Should -Be 90
+        }
+        # Before 19:00, the nightly auto-shutdown comes first; a run too close to the moved one is refused, and says why.
+        $day = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc ([datetime]::new(2026, 10, 27, 22, 30, 0, [System.DateTimeKind]::Utc)) -Tags @{ DbHubAutoShutdownMoved = '2115' }
+        $day.ShutdownMoved | Should -BeFalse
+        $day.Activities[0].Minutes | Should -Be 28
+        $late = Get-DbHubRunPlan -Request $request -Settings $script:settings -NowUtc ([datetime]::new(2026, 10, 28, 1, 10, 0, [System.DateTimeKind]::Utc)) -Tags @{ DbHubAutoShutdownMoved = '2115' }
+        $late.Valid | Should -BeFalse
+        $late.Reason | Should -Be 'The VMs'' auto-shutdown is at 2026-10-28 01:15 UTC, where deploy.ps1 moved it for a run the nightly stop waited for, too soon for a run of at least 5 minutes.'
     }
 
     It 'gives the showcase its minutes up to its 120, off none, and ends the showcase with the run' {
@@ -1481,8 +1511,47 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         $status = Get-SessionStatus
         $status.replica.sizeUsed | Should -Be 'Standard_D4ads_v5'
         @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('SkuNotAvailable', 'Accepted')
-        $status.replica.note | Should -Match 'Azure refused T4''s size \(Standard_D4ds_v5\) for the replica, so it runs on Standard_D4ads_v5'
+        # Standard_D4ads_v5 has T4's 4 vCores, and no claim on its price, which can differ per vCore in a region (201a6666's
+        # Lows on b97bdcdb and 885a8d52, 2026-11-22).
+        $note = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs.'
+        $status.replica.note | Should -BeExactly $note
+        $replicaStep = @($status.steps | Where-Object step -EQ 'Replica')
+        $replicaStep.Count | Should -Be 1
+        $replicaStep[0].message | Should -BeExactly ('T4''s read replica (pgreplica01-abc123) is Ready. {0}' -f $note) -Because 'the notebook prints the Replica step''s message'
         $script:groupTags['DbHubT4ReplicaSize'] | Should -Be 'Standard_D4ads_v5@any'
+    }
+
+    It 'says the replica costs more only when the size it runs on has more vCores than T4''s' {
+        $script:t4Sku = 'Standard_D2ds_v5'
+        $script:replicaRefuse = @('Standard_D2ds_v5')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Started'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' } | ForEach-Object { $_.Body.sku.name }) | Should -Be @('Standard_D2ds_v5', 'Standard_D4ds_v5')
+        $status = Get-SessionStatus
+        $status.replica.note | Should -BeExactly 'Azure refused T4''s size (Standard_D2ds_v5) for the replica, so it runs on Standard_D4ds_v5, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.'
+    }
+
+    It 'moves to the next size when Azure refuses one over the subscription''s vCore quota, and says so (F37, 2026-11-22)' {
+        $script:replicaQuota = @('Standard_D4ds_v5')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Started'
+        @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' } | ForEach-Object { $_.Body.sku.name }) | Should -Be @('Standard_D4ds_v5', 'Standard_D4ads_v5')
+        $status = Get-SessionStatus
+        @($status.replica.attempts | ForEach-Object outcome) | Should -Be @('QuotaExceeded', 'Accepted')
+        $status.replica.note | Should -BeExactly 'Azure refused T4''s size (Standard_D4ds_v5) for the replica over the subscription''s vCore quota, so it runs on Standard_D4ads_v5, which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs.'
+    }
+
+    It 'names the quota and its ways out when Azure refuses every size, some over the quota' {
+        $script:replicaQuota = @('Standard_D4ds_v5')
+        $script:replicaRefuse = @('Standard_D2ds_v5', 'Standard_D4ads_v5')
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
+        $result.status | Should -Be 'Partial'
+        $status = Get-SessionStatus
+        $status.replica.state | Should -Be 'Refused'
+        $status.replica.note | Should -Match 'over the subscription''s vCore quota for Azure Database for PostgreSQL in westus3, so this session has none\.$'
+        $status.replica.fix | Should -Match '^Free vCores in westus3: \./scripts/destroy\.ps1 -ConfigPath <its configuration>'
+        $status.replica.fix | Should -Match 'request more quota for Azure Database for PostgreSQL flexible server in westus3 \(Learn: Request a quota increase\)\. For the sizes Azure refused as unavailable \(SkuNotAvailable\), ask for access with a Region access request \(Learn: Resolve capacity errors\)\. Then Run all again\.$'
+        $script:replica | Should -BeNullOrEmpty
     }
 
     It 'asks again while T4 restarts (ReadReplicaServerInUnexpectedState, live 2026-11-13), then creates the replica' {
@@ -1537,6 +1606,41 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @($script:calls | Where-Object { $_.Method -in 'POST', 'PATCH' }) | Should -BeNullOrEmpty -Because 'nothing starts and the demo isn''t marked busy'
     }
 
+    It 'ends before the VMs'' auto-shutdown that deploy.ps1 moved for a deferred nightly stop, runs in full once it has passed, and the deferred pass waits for the session (F25)' {
+        # Live, dbhubfr at bf010ed: deploy.ps1 ended at 20:10 Eastern after the nightly stop waited for it, so its deferred
+        # pass and the VMs' auto-shutdown are at 21:15 (01:15 UTC), and the session control can't move the auto-shutdown.
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubBusyUntilUtc = '2026-10-28T01:10:00Z'; DbHubBusyBy = 'deploy-grace'; DbHubAutoShutdownMoved = '2115' }
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 28, 0, 20, 0, [System.DateTimeKind]::Utc)))
+        $result.status | Should -BeIn @('Started', 'Partial')
+        $status = Get-SessionStatus
+        $status.plannedMinutes | Should -Be 30
+        ([datetime]$status.runEndUtc).ToUniversalTime() | Should -Be ([datetime]::new(2026, 10, 28, 0, 50, 0, [System.DateTimeKind]::Utc))
+        $plan = @($status.steps) | Where-Object step -EQ 'Plan'
+        $plan.state | Should -Be 'Warning'
+        $plan.message | Should -Be 'This session runs 30 of the 90 minutes asked: it ends at 20:50, before the VMs'' auto-shutdown at 21:15 (Eastern Standard Time), where deploy.ps1 moved it for a run the nightly stop waited for, and which a session can''t move. It ends after 1 whole 30-minute showcase cycle, so no beat is cut off.'
+        $plan.fix | Should -Be 'For a full session, Run all after 21:15, once that auto-shutdown has passed; or run ./scripts/stop-demo.ps1, which puts it back at 19:00, and then Run all.'
+        $script:groupTags['DbHubBusyBy'] | Should -Be 'session'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -Be '2115' -Because 'only the module, which can move the auto-shutdown back, clears it'
+        # From 21:15 on, a session runs in full: the moved auto-shutdown comes next tomorrow, after the nightly 19:00.
+        Reset-TestAzure
+        $script:groupTags = @{ DbHubT4Replica = 'Session'; DbHubAutoShutdownMoved = '2115' }
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 28, 1, 20, 0, [System.DateTimeKind]::Utc)))
+        $full = Get-SessionStatus
+        $full.plannedMinutes | Should -Be 90
+        (@($full.steps) | Where-Object step -EQ 'Plan').state | Should -Be 'Pass'
+        # The deferred pass, hourly until the morning, waits for the session's busy marker, and the session's own auto-stop
+        # stops everything at its end.
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:calls.Clear()
+        $deferred = Invoke-DbHubStop -Scope Nightly -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 28, 2, 15, 0, [System.DateTimeKind]::Utc)))
+        $deferred.status | Should -Be 'Deferred'
+        $deferred.busyBy | Should -Be 'session'
+        @($script:calls | Where-Object { $_.Path -match '/deallocate$' }) | Should -BeNullOrEmpty
+        $stopped = Invoke-DbHubStop -Scope All -Context (New-TestContext -NowUtc ([datetime]::new(2026, 10, 28, 3, 0, 0, [System.DateTimeKind]::Utc)))
+        $stopped.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Path -match '/(sqlvm01|archost01)/deallocate$' }).Count | Should -Be 2
+    }
+
     It 'refuses a session while another run is active, and says how to end it' {
         $script:autostop = '2026-10-27T15:40:00Z'
         $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId }) -Context (New-TestContext)
@@ -1584,6 +1688,114 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @($script:calls | Where-Object { $_.Path -match '/runCommands/' -and $_.Method -eq 'DELETE' -and $_.Path -notmatch '/runCommands/DbHubControl-rca-' }) | Should -BeNullOrEmpty
         @($script:rcaCommands | ForEach-Object { $_.Request.command }) | Should -Be @('export', 'export')
         @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+    }
+
+    It 'ends a session that a start-demo.ps1 session took over without stopping the demo at its planned end, and an explicit Stop now before it still stops everything (2026-11-20)' {
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $running = Get-SessionStatus
+        $running.phase | Should -Be 'running'
+        $runEnd = ([datetime]$running.runEndUtc).ToUniversalTime()
+        # start-demo.ps1 takes over: its own auto-stop replaces the session's, 4 hours after its start, and the session's
+        # backup auto-stop goes; the session's busy marker stays (Resolve-DemoBusyNightlyStop leaves a running session's).
+        $takeoverUtc = $runEnd.AddMinutes(-30)
+        $script:autostop = $takeoverUtc.AddHours(4).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start: the start-demo.ps1 session started at {0:yyyy-MM-ddTHH:mm:ssZ}.' -f $takeoverUtc
+        $script:backup = ''
+        $script:backupDescription = ''
+        $script:groupTags['DbHubBusyBy'] | Should -Be 'session'
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $script:calls.Clear()
+        $script:rcaCommands.Clear()
+
+        # The control notebook's stop at the session's planned end (WAIT_FOR_END): the newer session's auto-stop wins.
+        $script:clock = $runEnd.AddSeconds(30)
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = $script:sessionId }) -Context (New-TestContext -NowUtc $script:clock)
+        $result.status | Should -Be 'TakenOver'
+        $result.message | Should -Match ('a start-demo\.ps1 session took over from it, so nothing was stopped; that session''s auto-stop stops the demo at {0}' -f [regex]::Escape($script:autostop))
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate$' }) | Should -BeNullOrEmpty -Because 'the start-demo.ps1 session keeps the VMs'
+        @($script:calls | Where-Object { $_.Path -match '/flexibleServers/pgflex01-abc123/stop$' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/flexibleServers/pgreplica01-abc123$' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/containers/patient-events$' }) | Should -BeNullOrEmpty
+        @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/schedules/' }) | Should -BeNullOrEmpty -Because 'start-demo.ps1''s auto-stop stays'
+        $script:autostop | Should -Not -BeNullOrEmpty
+        $script:replica | Should -Be 'Ready'
+        $script:groupTags['DbHubBusyUntilUtc'] | Should -BeNullOrEmpty -Because 'the session ended, so the nightly stop goes on as usual'
+        $script:groupTags['DbHubBusyBy'] | Should -BeNullOrEmpty
+        $metrics = ($script:secrets['dbhub-session-metrics'][-1].Value | ConvertFrom-Json)
+        $metrics.sessionId | Should -Be $script:sessionId
+        $stopped = Get-SessionStatus
+        $stopped.phase | Should -Be 'stopped'
+        $stopped.stoppedBy | Should -Be 'session end'
+        $stopped.takenOver.by | Should -Be 'start-demo'
+        ([datetime]$stopped.takenOver.autoStopUtc).ToUniversalTime() | Should -Be ([datetime]$script:autostop).ToUniversalTime()
+        $stopped.planKept | Should -BeTrue -Because 'the notebook saves the session''s history with its beats'
+        @($stopped.done)[0] | Should -Match '^nothing stopped: a start-demo\.ps1 session took over from this one'
+        # The session's own part is a stop's (the RCA release's merge): its evidence's final export first, through Run Commands
+        # that only read, then the metrics' version that lists its bundles, which the notebook reads, and its lines.
+        @($script:rcaCommands | Where-Object { $_.Request.command -eq 'export' } | ForEach-Object { '{0}:{1}' -f $_.Request.sessionId, $_.Request.final } | Select-Object -Unique) | Should -Be @(('{0}:True' -f $script:sessionId))
+        @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+        $stopped.PSObject.Properties.Name | Should -Contain 'rca'
+        $stopped.PSObject.Properties.Name | Should -Contain 'rcaLines'
+        $stopped.metrics.version | Should -Be $script:secrets['dbhub-session-metrics'][-1].Version
+        $stopped.stoppedUtc | Should -Not -BeNullOrEmpty
+        $result.rca | Should -Not -BeNullOrEmpty
+
+        # Stop now again inside the window (the re-review of 2026-11-20): the notebook's stop then has no session ID, as
+        # after an explicit Stop now that came back taken over, and the runbook never takes that for a session's end.
+        $script:calls.Clear()
+        $script:rcaCommands.Clear()
+        $plain = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop' }) -Context (New-TestContext -NowUtc $runEnd.AddMinutes(1))
+        $plain.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate' }).Count | Should -Be 2
+        $script:autostop | Should -BeNullOrEmpty -Because 'start-demo.ps1''s auto-stop goes with the demo it stopped'
+        # The end did the session's part, so this stop exports nothing again, and the status says it stopped the demo,
+        # without takenOver, which the notebook's Stop now again waits for; the rest is the end's (the RCA release's merge).
+        @($script:rcaCommands) | Should -BeNullOrEmpty
+        $again = Get-SessionStatus
+        $again.PSObject.Properties.Name | Should -Not -Contain 'takenOver'
+        $again.phase | Should -Be 'stopped'
+        $again.stoppedBy | Should -Be 'Stop now'
+        $again.stoppedUtc | Should -Be $stopped.stoppedUtc
+        $again.metrics.version | Should -Be $stopped.metrics.version
+        $again.jobId | Should -Be $stopped.jobId
+        @($again.done) | Should -Contain 'sqlvm01 deallocating'
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+
+        # An explicit Stop now before a taken-over session's planned end (the notebook's or the Insights app's) stops
+        # everything, as the person asked.
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210' }) -Context (New-TestContext -NowUtc $script:clock)
+        $second = Get-SessionStatus
+        $second.phase | Should -Be 'running'
+        $script:autostop = ([datetime]$second.runEndUtc).ToUniversalTime().AddHours(2).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start.'
+        $script:clock = ([datetime]$second.runEndUtc).ToUniversalTime().AddMinutes(-40)
+        $script:calls.Clear()
+        $explicit = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = 'fedcba9876543210fedcba9876543210' }) -Context (New-TestContext -NowUtc $script:clock)
+        $explicit.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate' }).Count | Should -Be 2
+        $script:autostop | Should -BeNullOrEmpty -Because 'Stop now removes the pending auto-stop and stops the demo itself'
+        (Get-SessionStatus).PSObject.Properties.Name | Should -Not -Contain 'takenOver'
+
+        # So does one well after the planned end of a taken-over session whose end sent no stop (the notebook's Stop now
+        # sends the session's ID for 7 days after an unstopped end): only the end itself lets the newer session win.
+        $script:vm = @{ sqlvm01 = 'running'; archost01 = 'running' }
+        $script:t4 = 'Ready'
+        $script:replica = 'Ready'
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = '0123456789abcdef0123456789abcdef' }) -Context (New-TestContext -NowUtc $script:clock)
+        $third = Get-SessionStatus
+        $third.phase | Should -Be 'running'
+        $script:autostop = ([datetime]$third.runEndUtc).ToUniversalTime().AddHours(2).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+        $script:autostopDescription = '[start-demo.ps1] Stops the demo 4 hours after this start.'
+        $script:clock = ([datetime]$third.runEndUtc).ToUniversalTime().AddMinutes(45)
+        $script:calls.Clear()
+        $late = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'stop'; sessionId = '0123456789abcdef0123456789abcdef' }) -Context (New-TestContext -NowUtc $script:clock)
+        $late.status | Should -Be 'Stopped'
+        @($script:calls | Where-Object { $_.Method -eq 'POST' -and $_.Path -match '/deallocate' }).Count | Should -Be 2
+        $script:autostop | Should -BeNullOrEmpty
     }
 
     It 'the auto-stop does the same, and writes its stop to the session the group names' {
@@ -1937,6 +2149,18 @@ Describe 'The control session (ADR 0026, 2026-11-14): one Run all, its read repl
         @(Get-DbHubReplicaSizeOrder -T4SkuName $T4 -Record $Record -Sizes $sizes) | Should -Be $Expected
         $module = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ T4 = $T4; Record = $Record } { Get-DemoT4ReplicaSizeOrder -T4SkuName $T4 -Record $Record | ForEach-Object SkuName })
         $module | Should -Be $Expected -Because 'the runbook and the module follow the same order'
+    }
+
+    It 'says what the replica''s size costs from its vCores against T4''s: <Case>' -ForEach @(
+        @{ Case = 'the same vCores'; Asked = 'Standard_D4ds_v5'; Used = 'Standard_D4ads_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs.' }
+        @{ Case = 'the same vCores, the other way'; Asked = 'Standard_D4ads_v5'; Used = 'Standard_D4ds_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ads_v5) for the replica, so it runs on Standard_D4ds_v5, which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs.' }
+        @{ Case = 'more vCores'; Asked = 'Standard_D2ds_v5'; Used = 'Standard_D4ads_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D2ds_v5) for the replica, so it runs on Standard_D4ads_v5, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' }
+        @{ Case = 'over the quota'; Asked = 'Standard_D2ds_v5'; Used = 'Standard_D4ds_v5'; OverQuota = $true; Expected = 'Azure refused T4''s size (Standard_D2ds_v5) for the replica over the subscription''s vCore quota, so it runs on Standard_D4ds_v5, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' }
+        @{ Case = 'fewer vCores'; Asked = 'Standard_D4ds_v5'; Used = 'Standard_D2ds_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_D2ds_v5; ./scripts/estimate-cost.ps1 shows what it costs.' }
+        @{ Case = 'a size whose name gives no vCores'; Asked = 'Standard_D4ds_v5'; Used = 'Standard_Custom'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_D4ds_v5) for the replica, so it runs on Standard_Custom; ./scripts/estimate-cost.ps1 shows what it costs.' }
+        @{ Case = 'T4''s size gives no vCores'; Asked = 'Standard_Custom'; Used = 'Standard_D4ds_v5'; OverQuota = $false; Expected = 'Azure refused T4''s size (Standard_Custom) for the replica, so it runs on Standard_D4ds_v5; ./scripts/estimate-cost.ps1 shows what it costs.' }
+    ) {
+        Get-DbHubReplicaSizeNote -Asked $Asked -Used $Used -OverQuota:$OverQuota | Should -BeExactly $Expected
     }
 
     It 'combines metric points into intervals as the module does (shared cases)' {
@@ -3040,6 +3264,80 @@ Describe 'The session''s hosts (2026-11-16, live: a host''s start failed mid-ses
         @(Get-DbHubDispatchSetTime -Output '') | Should -BeNullOrEmpty
     }
 
+    It 'follows T2''s Run Command that hadn''t ended when the session started, and moves T2''s times to when it set T2''s activity (2026-11-20)' {
+        # After a cold start, T2's guest can keep its Run Command going for minutes after the session's start wrote
+        # "running", so T2's planned times came early: the start says T2 is pending, follows the Run Command, and writes
+        # the time it set T2's activity once it has.
+        $script:runCommandViews['DbHubControl-archost01-20261027150000'] = {
+            $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-' })[0]
+            if ($script:clock -lt $put.At.AddMinutes(20)) {
+                return @{ executionState = 'Running' }
+            }
+            $set = [ordered]@{ T2 = $put.At.AddMinutes(20).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+            return @{ executionState = 'Succeeded'; exitCode = 0; output = ("DBHUBDEMO-WORKLOAD {}`nDBHUB-SET " + (ConvertTo-Json -InputObject $set -Compress)) }
+        }
+        $context = New-TestContext
+        $result = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context $context
+        $result.status | Should -Be 'Started' -Because 'a target that''s still being set is no problem'
+        $writes = @($script:secrets['dbhub-session-status'] | ForEach-Object { $_.Value | ConvertFrom-Json })
+        $running = @($writes | Where-Object phase -EQ 'running')
+        $running.Count | Should -BeGreaterThan 1
+        @($running[0].dispatchPending) | Should -Be @('T2') -Because 'the notebook holds T2''s beats until its activity is set'
+        @($running[0].steps | Where-Object step -EQ 'Times' | ForEach-Object message) | Should -Be @('T2: its activity isn''t set on archost01 yet (a VM or guest that has just started can take minutes), so T2''s times count from when it is; the live view says when.')
+        $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-' })[0]
+        $text = { param($Value) ConvertTo-DbHubTimeText -Value (ConvertTo-DbHubUtc -Value $Value) }
+        (& $text $running[0].dispatchUtc.T2) | Should -Not -Be (& $text $put.At.AddMinutes(20))
+        $status = Get-SessionStatus
+        $status.phase | Should -Be 'running'
+        @($status.dispatchPending) | Should -BeNullOrEmpty
+        (& $text $status.dispatchUtc.T2) | Should -Be (& $text $put.At.AddMinutes(20))
+        (& $text $status.dispatchUtc.T1) | Should -Be (& $text $running[0].dispatchUtc.T1) -Because 'only T2 moved'
+        @($status.steps | Where-Object step -EQ 'Times' | ForEach-Object message)[-1] | Should -Match '^T2: its activity was set on archost01 \d+ minutes after Azure accepted the Run Command that sends it, so T2''s times count from then\.$'
+        @(Get-HostStep) | Should -BeNullOrEmpty
+        $script:automationVariables['DbHubSessionStatus'] | Should -BeExactly $script:secrets['dbhub-session-status'][-1].Value
+        @($context.Log | Where-Object { $_ -match 'Following DbHubControl-archost01-20261027150000, which hadn''t ended when the session started' }).Count | Should -Be 1
+    }
+
+    It 'leaves the start''s status as it was when every Run Command had ended, and DbHub-Monitor moves a time the start stopped following (2026-11-20)' {
+        $script:t2Done = $false
+        $script:runCommandViews['DbHubControl-archost01-20261027150000'] = {
+            if (-not $script:t2Done) {
+                return @{ executionState = 'Running' }
+            }
+            $put = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-' })[0]
+            $set = [ordered]@{ T2 = $put.At.AddMinutes(55).ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture) }
+            return @{ executionState = 'Succeeded'; exitCode = 0; output = ("DBHUBDEMO-WORKLOAD {}`nDBHUB-SET " + (ConvertTo-Json -InputObject $set -Compress)) }
+        }
+        $context = New-TestContext
+        # A session longer than the start's 51 minutes of following.
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter'; durationMinutes = 120 }) -Context $context
+        (Get-SessionStatus).durationMinutes | Should -Be 120
+        @($context.Log | Where-Object { $_ -match 'DbHubControl-archost01-20261027150000 hadn''t ended by \d\d:\d\d UTC; DbHub-Monitor''s re-checks look again\.$' }).Count | Should -Be 1
+        @((Get-SessionStatus).dispatchPending) | Should -Be @('T2')
+        $writes = $script:secrets['dbhub-session-status'].Count
+        $script:t2Done = $true
+        $script:clock = $script:clock.AddMinutes(5)
+        $result = Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock)
+        $result.session | Should -Be 'Moved'
+        $result.status | Should -Be 'Checked' -Because 'a time that moved is no problem'
+        $result.message | Should -Match 'The session''s times for T2 now count from when its activity was set\.$'
+        $script:secrets['dbhub-session-status'].Count | Should -Be ($writes + 1)
+        $status = Get-SessionStatus
+        @($status.dispatchPending) | Should -BeNullOrEmpty
+        @(Get-HostStep) | Should -BeNullOrEmpty
+        # The next check finds nothing new to write.
+        (Invoke-DbHubMonitor -Context (New-TestContext -NowUtc $script:clock.AddMinutes(30))).session | Should -Be 'Healthy'
+        $script:secrets['dbhub-session-status'].Count | Should -Be ($writes + 1)
+
+        # A session whose Run Commands had all ended by its start: no dispatchPending, no Times step, and no follow-up.
+        Reset-TestAzure
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $quiet = New-TestContext
+        $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:sessionId; requestedBy = 'presenter' }) -Context $quiet
+        (Get-SessionStatus).PSObject.Properties.Name | Should -Not -Contain 'dispatchPending'
+        @((Get-SessionStatus).steps | Where-Object step -EQ 'Times') | Should -BeNullOrEmpty
+        @($quiet.Log | Where-Object { $_ -match 'Following ' }) | Should -BeNullOrEmpty
+    }
     It 'adds a host that stopped mid-session to the running session''s status once, through DbHub-Monitor, and starts or stops nothing' {
         $null = Start-TestSession
         $before = Get-SessionStatus

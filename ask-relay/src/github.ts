@@ -9,6 +9,22 @@ const DEVICE_CODE_URL = "https://github.com/login/device/code";
 const TOKEN_URL = "https://github.com/login/oauth/access_token";
 const USER_URL = "https://api.github.com/user";
 const TIMEOUT_MS = 15000;
+// The page where a user enters the device flow's code (GitHub's docs, above). The app links only this page; the relay
+// passes on GitHub's verification_uri only when it's exactly this page, and otherwise this constant (defense in depth).
+export const VERIFICATION_URI = "https://github.com/login/device";
+
+/** GitHub's verification_uri when it's exactly the device page (https, origin https://github.com), else that page. */
+export function safeVerificationUri(value: string): string {
+    let url: URL;
+    try {
+        url = new URL(value);
+    } catch {
+        return VERIFICATION_URI;
+    }
+    const exact = url.protocol === "https:" && url.origin === "https://github.com" && url.username === "" && url.password === ""
+        && url.pathname === "/login/device" && url.search === "" && url.hash === "";
+    return exact ? url.href : VERIFICATION_URI;
+}
 
 export interface DeviceStart {
     deviceCode: string;
@@ -63,7 +79,7 @@ export async function startDeviceFlow(fetchImpl: FetchLike, clientId: string, sc
     return {
         deviceCode: value.device_code,
         userCode: value.user_code,
-        verificationUri: value.verification_uri,
+        verificationUri: safeVerificationUri(value.verification_uri),
         expiresIn: num(value.expires_in, 900),
         interval: num(value.interval, 5),
     };

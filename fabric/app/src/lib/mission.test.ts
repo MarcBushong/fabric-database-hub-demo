@@ -4,16 +4,18 @@
 import { describe, expect, it } from "vitest";
 
 import type { AgentBeat, Bin, CosmosCapture, Incident, PostgresCapture, SessionRun } from "@/data/model";
+import { latestPostgresCapture } from "@/data/model";
 import type { Row } from "@/data/query-client";
 import { postgresSeriesQuery, seriesQuery, sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
-import { postgresHealth } from "@/lib/health";
+import { cosmosHealth, postgresHealth } from "@/lib/health";
 import { buildPostmortem, causeWindow, nextSessionStart, postmortemAsk, postmortemFileName, postmortemTitle } from "@/lib/postmortem";
 import type { BlindCauses } from "@/rca/postmortem";
 import {
     aggregate,
     cosmosEpisodes,
     detectionBound,
+    episodesIn,
     expectedFamilies,
     howMeasured,
     minutesText,
@@ -148,21 +150,34 @@ describe("the business lens", () => {
             "Patient events: 100 % of requests throttled for 2 min",
         ]);
     });
+
+    it("writes T4's connection surge as its measured connections at the server's limit, never as refused attempts (F34)", () => {
+        // Live (2026-11-21): Azure Monitor's failed connections stayed 0 while the surge's attempts were refused, so the lens
+        // says what was measured, T4's connections against the 35 slots clients can use.
+        expect(impactOf({ target: "T4", family: "connections", durationMin: 10, peak: 39 }).sentence).toBe(
+            "Reporting: connections at the server's limit for 10 min (active connections peak 39, at or above the 35 slots clients can use)",
+        );
+        expect(impactOf({ target: "T4", family: "connections", durationMin: 5, peak: 34 }).sentence).toBe(
+            "Reporting: connections short of the server's limit for 5 min (active connections peak 34, under the 35 slots clients can use)",
+        );
+        for (const peak of [39, 34, null]) expect(impactOf({ target: "T4", family: "connections", durationMin: 5, peak }).sentence).not.toMatch(/refus|fail/i);
+    });
 });
 
 describe("the scoreboard", () => {
     // The review of 96abcf65: T4's connection surge read "Buffer IO (PAGEIOLATCH) waits" in the Signal column, the first
-    // family a keyword in its name gives ("connect-io-n"), as the notebook's own fallback does; T5's storm read its raw ID.
-    it("names T4's and T5's beats, which it doesn't measure, by their title in the Signal column", () => {
+    // family a keyword in its name gave ("connect-io-n"), as the notebook's own fallback did; T5's storm read its raw ID.
+    // Since the release's follow-ups (F34), the surge is graded by T4's connections, which name its signal.
+    it("names T4's and T5's beats, which it doesn't measure, by their title in the Signal column, and T4's connection surge by its connections (F34)", () => {
         const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T4", "incident:connection-surge", 10, 18), run(`${SESSION}:01`, "T5", "incident:ru-storm", 30, 40)];
         const scores = scorePlan(toPlans(runs)[0], { bins: [], beats: [], runs });
         expect(scores.map((s) => [s.status, s.signal])).toEqual([
-            ["Not supported", "Connection surge (capacity maxed)"],
+            ["Not supported", "active connections"],
             ["Not supported", scenarioTitle("ru-storm")],
         ]);
         expect(scenarioTitle("ru-storm")).not.toBe("ru-storm");
-        // The keyword fallback stays as the notebook has it: it scores nothing on T4, whose faults aren't measured.
-        expect(expectedFamilies("connection-surge")).toEqual(["io"]);
+        // The keyword fallback matches a keyword only at a word's start, as the notebook does since F34.
+        expect(expectedFamilies("connection-surge")).toEqual(["connections"]);
     });
 
     it("groups the faults under their session, newest first, and leaves out the baseline and failed requests", () => {
@@ -478,6 +493,118 @@ describe("the scoreboard", () => {
     });
 });
 
+describe("T4's connection surge (F34)", () => {
+    // Azure Monitor's active_connections, the highest value in each 5-minute interval, shaped as captured live (2026-11-21):
+    // the surge at 36 to 39, the rest at 28 or less, and its failed connections at 0 throughout.
+    const capture = (values: number[]): PostgresCapture => ({
+        capturedAt: at(120),
+        windowStart: at(0),
+        windowEnd: at(values.length * 5),
+        intervalMinutes: 5,
+        servers: { T4: "pgflex01-test" },
+        points: [
+            ...values.map((value, i) => ({ at: at(i * 5), target: "T4" as const, server: "pgflex01-test", metric: "active_connections", value })),
+            ...values.map((_, i) => ({ at: at(i * 5), target: "T4" as const, server: "pgflex01-test", metric: "connections_failed", value: 0 })),
+        ],
+    });
+    const surgeRuns = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T4", "incident:connection-surge", 8, 12), run(`${SESSION}:01`, "T4", "incident:idle-in-transaction", 22, 30)];
+    const score = (postgres: PostgresCapture | null) => scorePlan(toPlans(surgeRuns)[0], { bins: [], beats: [], runs: surgeRuns, postgres });
+
+    it("grades it by T4's connections at the slots clients can use, not by its failed connections, which stayed 0", () => {
+        const [surge] = score(capture([13, 39, 37, 28, 26, 18]));
+        expect(surge).toMatchObject({ status: "Pass", family: "connections", signal: "active connections", peak: 39, ttdMin: 0, ttrMin: 7, visibleMin: 10, ongoing: false });
+        expect(surge.visibleAt).toEqual(at(5));
+        expect(surge.recoveredAt).toEqual(at(15));
+        expect(howMeasured(surge)).toBe("at least 35 (the slots clients can use)");
+        expect(surge.note).toBe("Visible: active connections at least 35 (the slots clients can use: max_connections 50, less 15 reserved) in T4's Azure Monitor metrics.");
+        expect(surge.impact?.sentence).toBe("Reporting: connections at the server's limit for 10 min (active connections peak 39, at or above the 35 slots clients can use)");
+        // Still at the limit when the capture ends: at least its visible time, never a recovery.
+        const [held] = score(capture([13, 39, 37]));
+        expect(held).toMatchObject({ status: "Pass", recoveredAt: null, ongoing: true, recoveryWord: "Still visible" });
+    });
+
+    it("says how far its connections got when they stayed under the slots, and why it isn't measured without a capture that covers it", () => {
+        const [under] = score(capture([13, 28, 30, 27, 26, 18]));
+        expect(under).toMatchObject({ status: "Warning", signal: "active connections", peak: 30, visibleAt: null, impact: null });
+        expect(under.note).toBe("Not visible: active connections stayed under 35 in its window, until 13:42 UTC; its peak was 30 at 13:40 UTC.");
+        const later = capture([13, 39]);
+        const [elsewhere] = score({ ...later, points: later.points.map((p) => ({ ...p, at: new Date(p.at.getTime() + 3 * 3600000) })) });
+        expect(elsewhere).toMatchObject({ status: "Not supported", family: "connections", signal: "active connections" });
+        expect(elsewhere.note).toMatch(/^No capture of T4's Azure Monitor metrics in view covers it/);
+        expect(score(null)[0]).toMatchObject({ status: "Not supported", signal: "active connections" });
+    });
+
+    // The review of 3fe52edb: the session's 5-minute save and a later day-long one (15 minutes), with T4 stopped from 13:57
+    // to 15:00. The newest save's interval put the break-off 15 minutes before the run's end, at 13:42.
+    it("says its metrics break off after its last interval at the slots, whatever the newest save's interval (F35)", () => {
+        const session = { CapturedAt: "2026-11-17T14:10:00", WindowStart: "2026-11-17T13:30:00", WindowEnd: "2026-11-17T13:57:00" };
+        const day = { CapturedAt: "2026-11-17T18:30:00", WindowStart: "2026-11-16T18:30:00", WindowEnd: "2026-11-17T18:30:00" };
+        const row = (save: Record<string, string>) => ([minute, value]: readonly [number, number]): Row => ({ Bucket: at(minute).toISOString(), TargetKey: "T4", ResourceName: "pgflex01-test", Metric: "active_connections", Value: value, ...save });
+        const pg = latestPostgresCapture([
+            ...(
+                [
+                    [-30, 13],
+                    [-15, 13],
+                    [0, 39],
+                    [15, 39],
+                    [90, 13],
+                    [105, 13],
+                ] as const
+            ).map(row(day)),
+            ...(
+                [
+                    [0, 13],
+                    [5, 39],
+                    [10, 37],
+                    [15, 38],
+                    [20, 36],
+                    [25, 39],
+                ] as const
+            ).map(row(session)),
+        ]);
+        expect(pg).toMatchObject({ saves: 2, intervalMinutes: 15 });
+        const [surge] = score(pg);
+        expect(surge).toMatchObject({ status: "Pass", recoveredAt: null, ongoing: false, visibleMin: 22 });
+        expect(surge.recoveryNote).toBe("Its metrics break off after 13:55 UTC, its last interval at its bound, so its recovery isn't measured.");
+        // T4's measured episode says the same.
+        expect(postgresEpisodes(pg).find((e) => e.family === "connections")?.note).toBe("Its metrics break off after 13:55 UTC, so its recovery isn't in the capture.");
+    });
+
+    it("expects connection-surge's connections, and matches a keyword only at a word's start: never IO inside 'connection' or 'transaction'", () => {
+        expect(expectedFamilies("connection-surge")).toEqual(["connections"]);
+        expect(expectedFamilies("idle-in-transaction")).toEqual([]);
+        expect(expectedFamilies("session-locking")).toEqual(["blocking"]);
+        expect(expectedFamilies("io-pressure")).toEqual(["io"]);
+        expect(expectedFamilies("index-io-mix")).toEqual(["cpu", "io"]);
+        // T4's other beats stay unmeasured here, under their title (the RCA's Signal column), never under Buffer IO waits.
+        const idle = score(capture([13, 39, 37, 28, 26, 18, 14]))[1];
+        expect(idle).toMatchObject({ status: "Not supported", signal: scenarioTitle("idle-in-transaction") });
+    });
+
+    it("shows T4's connections at their peak on its card, against the slots clients can use, never its failed connections", () => {
+        const card = postgresHealth(capture([13, 39, 37, 28]), []);
+        expect(card.metrics.map((m) => m.label)).toEqual(["CPU peak", "Replica lag", "Conn. peak"]);
+        expect(card.metrics[2].value).toBe("39 / 35");
+        expect(card.note).toMatch(/; connections reached the server's limit$/);
+        const calm = postgresHealth(capture([13, 28]), []);
+        expect(calm.metrics[2].value).toBe("28 / 35");
+        expect(calm.note).not.toMatch(/limit/);
+    });
+
+    it("shows a session's surges as T4's measured episodes, by its connections at the slots clients can use, and a recorded surge once", () => {
+        // A session's T4 beats aren't in Scenario Runs (ADR 0030), so its surges show only here.
+        const pg = capture([13, 39, 37, 28, 26, 18]);
+        const [conn] = postgresEpisodes(pg).filter((e) => e.family === "connections");
+        expect(conn).toMatchObject({ target: "T4", signal: "active connections", peak: 39, visibleMin: 10, ongoing: false, note: "Back under 35 connections at 13:45 UTC." });
+        expect(conn.impact.sentence).toBe("Reporting: connections at the server's limit for 10 min (active connections peak 39, at or above the 35 slots clients can use)");
+        expect(postgresEpisodes(capture([13, 28, 30, 27])).filter((e) => e.family === "connections")).toEqual([]);
+        // A plan that records the surge as its fault scores it there, and doesn't list its episode again.
+        const session = toPlans([run(SESSION, "all", "session", 0, 90)])[0];
+        expect(episodesIn(postgresEpisodes(pg), session).map((e) => e.family)).toContain("connections");
+        expect(episodesIn(postgresEpisodes(pg), toPlans(surgeRuns)[0]).map((e) => e.family)).not.toContain("connections");
+    });
+});
+
 describe("the service map's nodes", () => {
     it("gives the DR copy its status from the capture's read replica lag, and No data without a lag series", () => {
         const capture = (lag: number[]): PostgresCapture => ({
@@ -495,6 +622,24 @@ describe("the service map's nodes", () => {
         expect(dr(capture([]))?.status).toBeNull();
         expect(dr(capture([6, 241.4, 80, 30, 2]))?.status).toBe("Warning");
         expect(dr(capture([2, 3, 4, 3, 2]))?.status).toBe("Pass");
+    });
+
+    it("writes T5's normalized RU peak and lowest availability just under 100 % as they are, never 100.0 % (2026-11-21)", () => {
+        // One decimal alone writes 99.96 % as 100.0 %, the throttling line, for a peak that didn't throttle.
+        const capture: CosmosCapture = {
+            account: "cosmos01-test",
+            capturedAt: at(10),
+            windowStart: at(0),
+            windowEnd: at(3),
+            intervalMinutes: 1,
+            points: [
+                ...[10, 99.96, 30].map((value, m) => ({ at: at(m), metric: "NormalizedRUConsumption", value })),
+                ...[100, 99.996, 100].map((value, m) => ({ at: at(m), metric: "ServiceAvailability", value })),
+            ],
+        };
+        const health = cosmosHealth(capture, []);
+        expect(health.metrics.map((m) => m.value)).toEqual(["99.96 %", "0", "99.996 %"]);
+        expect(mapNodes([health], [], [], null).find((n) => n.target === "T5")?.metric).toBe("Norm. RU peak 99.96 %");
     });
 });
 describe("the postmortem", () => {

@@ -13,10 +13,11 @@ function Reset-DemoWorkload {
 
     A reset of T3 connects to it, which resumes a paused serverless database; it pauses again
     t3AutoPauseMinutes after the reset when its profile is off. A target whose VM isn't running is Not
-    selected. -RebuildGuest (rebuilding the T2 guest from its image) is Not supported yet: the host's state
-    machine needs a reset of its guest steps first (a documented follow-up); use destroy.ps1 and deploy.ps1.
+    selected. -RebuildGuest (2026-11-21) does only that: it asks the T2 host to make its guest arcsql01 again from Arc
+    Jumpstart's image (Request-DemoT2GuestRebuild, RESET.GUEST), which the deploy.ps1 run that reset-demo.ps1 starts next
+    does; no target is reset then, since that run sets the activity up.
 
-    Returns RESET.<target> results, and RESET.GUEST with -RebuildGuest.
+    Returns RESET.<target> results, or RESET.GUEST with -RebuildGuest.
 
     .PARAMETER Config
     Configuration from Get-DemoConfig.
@@ -36,7 +37,7 @@ function Reset-DemoWorkload {
     Keep the activity profile; by default the reset sets it to off.
 
     .PARAMETER RebuildGuest
-    Rebuild the T2 guest (not supported yet).
+    Ask the T2 host to make its guest again from Arc Jumpstart's image (2026-11-21), and nothing else.
 
     .EXAMPLE
     Reset-DemoWorkload -Config $config -Target T1 -UndoRemediation
@@ -67,14 +68,16 @@ function Reset-DemoWorkload {
         $results.Add((New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Fail' -Message $_.Exception.Message -Remediation 'Nothing was reset. Sign in yourself and run reset-demo.ps1 again.'))
         return $results.ToArray()
     }
+    if ($RebuildGuest) {
+        # 2026-11-21: only the rebuild's request; the deploy.ps1 run that reset-demo.ps1 starts next does it, and sets the
+        # activity up, so no target is reset here.
+        $results.Add((Request-DemoT2GuestRebuild -Config $Config -WhatIf:$WhatIfPreference -Confirm:$false))
+        return $results.ToArray()
+    }
     $subscriptionId = [string]$Config['subscriptionId']
     $resourceGroupName = Get-DemoResourceGroupName -Config $Config
     $state = Get-DemoDeploymentState -Config $Config
     $hostVm = Get-DemoHostVmName -Config $Config
-
-    if ($RebuildGuest) {
-        $results.Add((New-DemoResult -CheckId 'RESET.GUEST' -Area 'workload' -Target 'T2' -Status 'Not supported' -Message 'Rebuilding the T2 guest isn''t supported yet: the host''s bootstrap state machine skips guest steps that succeeded, and resetting them safely is a follow-up.' -Remediation 'To start T2 over, run ./scripts/destroy.ps1 -KeepFabric, then ./scripts/deploy.ps1, which keeps the Fabric workspaces with their history. To return its data to a known state, run ./scripts/reset-demo.ps1 -Target T2 -Reseed.'))
-    }
 
     $targets = if ($Target -eq 'all') { @('T1', 'T3') + @(if (Test-DemoT4Enabled -Config $Config) { 'T4' }) + @(if (Test-DemoT5Enabled -Config $Config) { 'T5' }) + @('T2') } else { @($Target) }
     $power = @{}

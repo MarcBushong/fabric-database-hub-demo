@@ -31,7 +31,7 @@ The skills version of the [IO pressure](../../../scenarios/io-pressure/README.md
 ### 1. File-level IO from the telemetry
 
 ```text
-Using the telemetry agent instructions, write a KQL query on SqlServerStorageIO for {target} in resource group {resourceGroup} over {incidentWindow}. Follow the rule for cumulative counters, and for each ContosoCare file report the delta of reads, writes, bytes read and written, read and write stalls, and queued stalls. If {target} is an Azure SQL database, don't compute per-file latency. Don't change anything.
+Using the telemetry agent instructions, write a KQL query on SqlServerStorageIO for {target} in resource group {resourceGroup} over {incidentWindow}. Follow the rule for cumulative counters, and for each ContosoCare file report the delta of reads, writes, bytes read and written, read and write stalls, and queued stalls. On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed: an Azure SQL database can report two files under one FileID. If {target} is an Azure SQL database, don't compute per-file latency. Don't change anything.
 ```
 
 ### 2. IO waits and memory pressure

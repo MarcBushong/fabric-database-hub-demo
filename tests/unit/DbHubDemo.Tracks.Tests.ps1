@@ -1247,6 +1247,8 @@ Describe 'Invoke-DemoDeploymentTrack' {
         @($outcome.Results | Where-Object { $_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' } | ForEach-Object { [string]$_.status }) | Should -Be @('Pass')
         ($outcome.Results | Where-Object { $_.checkId -eq 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' }).status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { $HistoryRunWaitMinutes -eq 45 }
+        # The parallel track, too, brings a notebook that nobody edited up to date (follow-ups decision 2a, 2026-11-23).
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricStage -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['KeepEditedNotebooks'] -and -not $PesterBoundParameters.ContainsKey('NewNotebooksOnly') }
     }
 
     It 'records what the Fabric step published with the step once the notebooks, the model, and the Insights app are this version''s, and not while the app isn''t (2026-11-16)' {

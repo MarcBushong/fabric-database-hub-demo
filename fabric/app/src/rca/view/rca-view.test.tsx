@@ -17,6 +17,8 @@ import { episodeOf, ERRORS_AROUND_MINUTES } from "@/rca/view/facts";
 import { answerKeyInContext } from "@/test/blind";
 import { renderWithApp, type FakeQueryClient } from "@/test/render";
 import { STAGE_TOKENS } from "@/theme/stage";
+import { APP_TOKENS } from "@/theme/fluent";
+import type { RcaFilters } from "@/rca/facet-ids";
 
 // The Root cause view (ADR 0031, step 1.6) on the contract's fixtures, as the preview shows it: T1's blocking chain from
 // the fixture, and T4's from a real capture on a local PostgreSQL primary and standby.
@@ -27,7 +29,8 @@ function sampleClient(): FakeQueryClient {
     return Object.assign(client, { ran: [] as string[] });
 }
 
-const SLOW = 20000;
+// The page's tests mount the whole Root cause page, its facet bar's Fluent controls among them (as mission.test.tsx's do).
+const SLOW = 30000;
 
 afterEach(() => cleanup());
 
@@ -103,7 +106,7 @@ describe("the Root cause view (ADR 0031)", () => {
         expect(screen.queryByText(/Nothing abnormal in these minutes/)).toBeNull();
     });
 
-    it("colors with the stage's tokens only, each defined in every theme, and marks the current incident with the system's colors under forced colors (F22)", () => {
+    it("colors with theme tokens only, the stage's and the app's, each defined in every theme, and marks the current incident with the system's colors under forced colors (F22)", () => {
         const css = readFileSync(join(process.cwd(), "src", "rca", "view", "rca.css"), "utf8");
         const block = /@media \(forced-colors: active\) \{([\s\S]*?)\n\}/;
         const outside = css.replace(block, "");
@@ -111,8 +114,9 @@ describe("the Root cause view (ADR 0031)", () => {
         expect(outside.match(/#[0-9a-f]{3,8}\b|\brgba?\(|\bhsla?\(/gi)).toBeNull();
         const used = [...new Set([...outside.matchAll(/var\((--[a-z0-9-]+)\)/g)].map((m) => m[1]))];
         expect(used.length).toBeGreaterThan(5);
+        // The stage's own, and the app's status and target tokens, which the stage sets beside them (stageStyle).
         for (const id of ["light", "dark", "contrast"] as const) {
-            const tokens: Record<string, string> = { ...STAGE_TOKENS[id].surfaces, ...STAGE_TOKENS[id].text, ...STAGE_TOKENS[id].graphic, ...STAGE_TOKENS[id].decor };
+            const tokens: Record<string, string> = { ...STAGE_TOKENS[id].surfaces, ...STAGE_TOKENS[id].text, ...STAGE_TOKENS[id].graphic, ...STAGE_TOKENS[id].decor, ...APP_TOKENS[id].text, ...APP_TOKENS[id].graphic };
             for (const token of used) expect(tokens[token], `${id} ${token}`).toBeTruthy();
         }
         const forced = css.match(block)?.[1] ?? "";
@@ -127,13 +131,107 @@ describe("the Root cause view (ADR 0031)", () => {
     });
 });
 
+// The owner's feedback (2026-11-23): the list read as one big list. Facets with counts, grouping, sorting, and the filters in
+// the address, so a view can be shared; on the preview's sample session, 49 incidents.
+describe("the organized Root cause list", () => {
+    const facets = async () => screen.findByRole("region", { name: "Filter the incidents" }, { timeout: 10000 });
+    const DEFAULTS: RcaFilters = { categories: [], severities: [], targets: [], window: { newest: 90 }, group: "category", sort: "severity" };
+
+    it(
+        "counts each facet's values, names each server and database, and groups the incidents by category with each one's severity",
+        async () => {
+            renderWithApp(<RcaPage />, { rca: true, client: sampleClient(), view: { page: "rca" } });
+            const bar = await facets();
+            const counts = (name: string) => within(within(bar).getByRole("group", { name })).getAllByRole("button").map((b) => b.getAttribute("aria-label"));
+            expect(counts("Severity")).toEqual(["High: 31 incidents", "Medium: 15 incidents", "Low: 3 incidents"]);
+            expect(counts("Category")).toEqual(["Blocking: 7 incidents", "Deadlocks: 1 incident", "CPU: 14 incidents", "Waits: 7 incidents", "Errors: 0 incidents", "Connections: 0 incidents", "Replica lag: 1 incident", "Throttling: 13 incidents", "IO: 6 incidents"]);
+            // T1 to T3 as Database Hub's telemetry names them, T4, its replica, and T5 as Azure Monitor's do.
+            await waitFor(() => expect(counts("Server and database")[0]).toBe("T1 · sqlvm01 / ContosoCare: 9 incidents"));
+            expect(counts("Server and database")).toEqual([
+                "T1 · sqlvm01 / ContosoCare: 9 incidents",
+                "T2 · arcsql01 / ContosoCare: 13 incidents",
+                "T3 · azuresql01-sample / ContosoCare: 9 incidents",
+                "T4 · pgflex01-sample: 5 incidents",
+                "T4-replica · pgreplica01-sample: 1 incident",
+                "T5 · cosmos01-sample: 12 incidents",
+            ]);
+            expect(within(bar).getByRole("button", { name: "Errors: 0 incidents" })).toBeDisabled();
+            expect(within(bar).getByText("49 incidents.")).toBeInTheDocument();
+            const list = screen.getByRole("complementary", { name: "Incidents the detector found" });
+            expect(within(list).getAllByRole("heading", { level: 3 }).map((h) => h.textContent)).toEqual(["Blocking7", "Deadlocks1", "CPU14", "Waits7", "Replica lag1", "Throttling13", "IO6"]);
+            // Most severe first in each group, the capture's chain first among them, and each with its severity's reason.
+            const first = within(list).getAllByRole("button")[0];
+            expect(first).toHaveAttribute("aria-current", "true");
+            expect(first.textContent).toMatch(/^HighT1: blocked processes.*in the RCA capture.*High: peak 7 processes, four times its level or more .*, there for 6\.8 minutes in all; over its level for 9\.1 minutes, 5 or more; high confidence\.$/);
+            // The report says the same, where a keyboard reaches it too.
+            expect(await screen.findByText(/^Severity High: peak 7 processes, /, {}, { timeout: 10000 })).toBeInTheDocument();
+        },
+        SLOW,
+    );
+
+    it(
+        "writes the filters to the address, keeps an incident the list still shows, and starts over in other minutes",
+        async () => {
+            const { setView } = renderWithApp(<RcaPage />, { rca: true, client: sampleClient(), view: { page: "rca", incident: "T1-blocking-20261117T140230Z" } });
+            const bar = await facets();
+            fireEvent.click(within(bar).getByRole("button", { name: "High: 31 incidents" }));
+            expect(setView).toHaveBeenLastCalledWith({ rcaFilters: { ...DEFAULTS, severities: ["high"] } });
+            fireEvent.click(within(within(bar).getByRole("group", { name: "Group by" })).getByRole("button", { name: "Server" }));
+            expect(setView).toHaveBeenLastCalledWith({ rcaFilters: { ...DEFAULTS, group: "target" } });
+            // A filter that leaves the incident out, or other minutes, start over with the list's first incident.
+            fireEvent.click(within(bar).getByRole("button", { name: "Low: 3 incidents" }));
+            expect(setView).toHaveBeenLastCalledWith({ rcaFilters: { ...DEFAULTS, severities: ["low"] }, incident: null });
+            fireEvent.change(within(bar).getByRole("combobox", { name: "Minutes" }), { target: { value: "360" } });
+            expect(setView).toHaveBeenLastCalledWith({ rcaFilters: { ...DEFAULTS, window: { newest: 360 } }, incident: null });
+        },
+        SLOW,
+    );
+
+    it(
+        "shows only what the filters let through, grouped by server, and says how many of all",
+        async () => {
+            renderWithApp(<RcaPage />, { rca: true, client: sampleClient(), view: { page: "rca", rcaFilters: { ...DEFAULTS, severities: ["high"], targets: ["T1", "T3"], group: "target" } } });
+            const bar = await facets();
+            const shown = Number(/^Showing (\d+) of 49 incidents\.$/.exec(within(bar).getByText(/^Showing \d+ of 49 incidents\.$/).textContent ?? "")?.[1]);
+            expect(within(bar).getByRole("button", { name: `High: ${shown} incidents` })).toHaveAttribute("aria-pressed", "true");
+            const list = screen.getByRole("complementary", { name: "Incidents the detector found" });
+            await waitFor(() => expect(within(list).getAllByRole("heading", { level: 3 }).map((h) => h.textContent?.replace(/\d+$/, ""))).toEqual(["T1 · sqlvm01 / ContosoCare", "T3 · azuresql01-sample / ContosoCare"]));
+            const items = within(list).getAllByRole("button");
+            expect(items).toHaveLength(shown);
+            for (const item of items) expect(item.textContent).toMatch(/^HighT[13]: /);
+        },
+        SLOW,
+    );
+
+    it(
+        "reads an older link's window key as its target and minutes, and says when no incident matches, with a way to clear the filters",
+        async () => {
+            const { setView } = renderWithApp(<RcaPage />, { rca: true, client: sampleClient(), view: { page: "rca", incident: "T1.20261117T140000Z.20261117T143000Z" } });
+            const bar = await facets();
+            expect(within(bar).getByRole("button", { name: /^T1 · .*incidents?$/ })).toHaveAttribute("aria-pressed", "true");
+            expect((within(bar).getByRole("combobox", { name: "Minutes" }) as HTMLSelectElement).value).toBe("custom");
+            cleanup();
+            const cleared = renderWithApp(<RcaPage />, { rca: true, client: sampleClient(), view: { page: "rca", rcaFilters: { ...DEFAULTS, categories: ["connections"] } } });
+            expect(await screen.findByText(/^No incident in these minutes matches the filters\./, {}, { timeout: 10000 })).toBeInTheDocument();
+            fireEvent.click(screen.getAllByRole("button", { name: "Clear the filters" })[0]);
+            expect(cleared.setView).toHaveBeenLastCalledWith({ rcaFilters: DEFAULTS, incident: null });
+            expect(setView).not.toHaveBeenCalled();
+        },
+        SLOW,
+    );
+});
+
 describe("links into the Root cause view, one way (ADR 0031)", () => {
     it(
-        "links the selected incident's target and minutes, never its name, and only with the RCA tables",
+        "links the selected incident's target and minutes as the page's filters, never its name or its category, and only with the RCA tables",
         async () => {
             const { navigate } = renderWithApp(<IncidentsPage />, { rca: true });
             fireEvent.click(await screen.findByRole("button", { name: "Root cause" }, { timeout: 8000 }));
-            expect(navigate).toHaveBeenCalledWith("rca", { incident: expect.stringMatching(/^T[1-3]\.\d{8}T\d{6}Z\.\d{8}T\d{6}Z$/) });
+            expect(navigate).toHaveBeenCalledWith("rca", {
+                rcaFilters: { categories: [], severities: [], targets: [expect.stringMatching(/^T[1-3]$/)], window: { from: expect.any(Date), to: expect.any(Date) }, group: "category", sort: "severity" },
+            });
+            const { window } = vi.mocked(navigate).mock.calls[0][1]!.rcaFilters!;
+            expect("from" in window && window.to > window.from).toBe(true);
             cleanup();
             renderWithApp(<IncidentsPage />);
             await screen.findByRole("button", { name: "Ask the agent" }, { timeout: 8000 });

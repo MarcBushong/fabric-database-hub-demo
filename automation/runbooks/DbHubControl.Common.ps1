@@ -582,16 +582,22 @@ function Test-DbHubControlRequest {
 
 function Get-DbHubNextShutdownUtc {
     # The VMs' next auto-shutdown in UTC from autoShutdownTime (HHmm) and autoShutdownTimeZone (a Windows time zone
-    # ID): the same schedule as the VMs' DevTest Labs auto-shutdown and the module's Get-DemoNextShutdownUtc.
+    # ID): the same schedule as the VMs' DevTest Labs auto-shutdown and the module's Get-DemoNextShutdownUtc. -Time takes
+    # another daily time in the same zone instead (a moved auto-shutdown, Get-DbHubMovedShutdownUtc).
     param(
         [Parameter(Mandatory = $true)]
         [object] $Settings,
 
         [Parameter(Mandatory = $true)]
-        [datetime] $NowUtc
+        [datetime] $NowUtc,
+
+        [string] $Time = ''
     )
 
-    $time = [string]$Settings.autoShutdownTime
+    $time = $Time
+    if (-not $time) {
+        $time = [string]$Settings.autoShutdownTime
+    }
     if ($time -notmatch '^([01]\d|2[0-3])([0-5]\d)$') {
         throw ('autoShutdownTime ''{0}'' isn''t HHmm.' -f $time)
     }
@@ -609,6 +615,41 @@ function Get-DbHubNextShutdownUtc {
     return [System.TimeZoneInfo]::ConvertTimeToUtc($candidate, $zone)
 }
 
+function Get-DbHubMovedShutdownUtc {
+    <#
+    .SYNOPSIS
+    The VMs' next auto-shutdown that deploy.ps1 moved away from autoShutdownTime and nothing has put back yet (F25,
+    2026-11-21): the demo resource group's DbHubAutoShutdownMoved tag holds the times (HHmm in autoShutdownTimeZone,
+    comma-separated) the module last set on the VMs' DevTest Labs schedules, for a run the nightly stop waited for. The
+    control's role has no DevTest Labs action (the coordinator's decision of 2026-11-14), so a session can't move it, and
+    plans to end before it. Returns the earliest next one after NowUtc in UTC, or $null when the tag holds none. Pure,
+    apart from the time zone.
+    #>
+    param(
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Settings,
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $NowUtc
+    )
+
+    $earliest = $null
+    foreach ($part in @(([string](Get-DbHubMember -InputObject $Tags -Name 'DbHubAutoShutdownMoved')) -split ',')) {
+        $clock = $part.Trim()
+        if ($clock -notmatch '^([01]\d|2[0-3])[0-5]\d$') {
+            continue
+        }
+        $next = Get-DbHubNextShutdownUtc -Settings $Settings -NowUtc $NowUtc -Time $clock
+        if ($null -eq $earliest -or $next -lt $earliest) {
+            $earliest = $next
+        }
+    }
+    return $earliest
+}
+
 function Get-DbHubRunPlan {
     <#
     .SYNOPSIS
@@ -616,7 +657,12 @@ function Get-DbHubRunPlan {
     baseline, the profile's maxMinutes for a profile such as showcase) and so that it ends before the VMs' next
     auto-shutdown minus shutdownMarginMinutes; off takes no minutes and doesn't count toward the run's end. Returns
     Valid, Reason, Activities (with Minutes, and Tier, VCores, and NotAfterUtc for the dispatch to fill), RunEndUtc,
-    AutoStopUtc (the run's end plus autoStopBufferMinutes), and ShutdownUtc.
+    AutoStopUtc (the run's end plus autoStopBufferMinutes), ShutdownUtc, NightlyUtc, and ShutdownMoved.
+
+    .DESCRIPTION
+    The VMs' next auto-shutdown is autoShutdownTime's (NightlyUtc, when the nightly safety stop runs too), or, with -Tags,
+    an earlier one that deploy.ps1 moved for a run the nightly stop waited for (F25, 2026-11-21; Get-DbHubMovedShutdownUtc):
+    ShutdownUtc is the earlier, and ShutdownMoved says it's the moved one, which the session can't move.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -626,14 +672,28 @@ function Get-DbHubRunPlan {
         [object] $Settings,
 
         [Parameter(Mandatory = $true)]
-        [datetime] $NowUtc
+        [datetime] $NowUtc,
+
+        [AllowNull()]
+        [object] $Tags = $null
     )
 
-    $shutdown = Get-DbHubNextShutdownUtc -Settings $Settings -NowUtc $NowUtc
+    $nightly = Get-DbHubNextShutdownUtc -Settings $Settings -NowUtc $NowUtc
+    $shutdown = $nightly
+    $moved = $false
+    $movedUtc = Get-DbHubMovedShutdownUtc -Tags $Tags -Settings $Settings -NowUtc $NowUtc
+    if ($null -ne $movedUtc -and $movedUtc -lt $nightly) {
+        $shutdown = $movedUtc
+        $moved = $true
+    }
     $latestEnd = $shutdown.AddMinutes(-1 * [int]$Settings.shutdownMarginMinutes)
     $available = [int][System.Math]::Floor(($latestEnd - $NowUtc).TotalMinutes)
     if ($available -lt [int]$Settings.minDurationMinutes) {
-        return [pscustomobject]@{ Valid = $false; Reason = ('The VMs'' auto-shutdown is at {0:yyyy-MM-dd HH:mm} UTC, too soon for a run of at least {1} minutes.' -f $shutdown, [int]$Settings.minDurationMinutes); Activities = @(); RunEndUtc = $NowUtc; AutoStopUtc = $NowUtc; ShutdownUtc = $shutdown }
+        $where = ''
+        if ($moved) {
+            $where = ', where deploy.ps1 moved it for a run the nightly stop waited for'
+        }
+        return [pscustomobject]@{ Valid = $false; Reason = ('The VMs'' auto-shutdown is at {0:yyyy-MM-dd HH:mm} UTC{1}, too soon for a run of at least {2} minutes.' -f $shutdown, $where, [int]$Settings.minDurationMinutes); Activities = @(); RunEndUtc = $NowUtc; AutoStopUtc = $NowUtc; ShutdownUtc = $shutdown; NightlyUtc = $nightly; ShutdownMoved = $moved }
     }
     $profiles = Get-DbHubMember -InputObject $Settings -Name 'profiles'
     $planned = @()
@@ -664,7 +724,7 @@ function Get-DbHubRunPlan {
             $item.NotAfterUtc = $end.AddMinutes(2)
         }
     }
-    return [pscustomobject]@{ Valid = $true; Reason = ''; Activities = $planned; RunEndUtc = $end; AutoStopUtc = $end.AddMinutes([int]$Settings.autoStopBufferMinutes); ShutdownUtc = $shutdown }
+    return [pscustomobject]@{ Valid = $true; Reason = ''; Activities = $planned; RunEndUtc = $end; AutoStopUtc = $end.AddMinutes([int]$Settings.autoStopBufferMinutes); ShutdownUtc = $shutdown; NightlyUtc = $nightly; ShutdownMoved = $moved }
 }
 
 function Get-DbHubAccountPath {
@@ -3565,7 +3625,7 @@ function Start-DbHubActivityRun {
             $result.message = $active.Reason
             return [pscustomobject]$result
         }
-        $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc
+        $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc -Tags $Tags
     }
     if (-not $plan.Valid) {
         $result.message = $plan.Reason
@@ -4516,6 +4576,9 @@ function Get-DbHubSessionHealth {
     on it. Returns one finding (Message and Fix) per problem, in words that stay the same while the problem does, so a
     check that finds it again adds nothing. It also moves each target's dispatchUtc in -Status to when its Run Command's
     script set the target's activity (its DBHUB-SET line, Get-DbHubDispatchSetTime; 2026-11-19), which the caller writes.
+    With -Moved, each move is added there (Target, Vm, SetUtc, Seconds), and with -Unfinished, each dispatch Run Command
+    that Azure says is still Pending, Running, or Unknown (Vm, Name, Targets), so the caller can say which targets'
+    activity isn't set yet and follow it (2026-11-20).
     https://learn.microsoft.com/rest/api/compute/virtual-machines/instance-view
     https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/get-by-virtual-machine
     #>
@@ -4524,7 +4587,13 @@ function Get-DbHubSessionHealth {
         [object] $Context,
 
         [Parameter(Mandatory = $true)]
-        [System.Collections.IDictionary] $Status
+        [System.Collections.IDictionary] $Status,
+
+        [AllowNull()]
+        [System.Collections.Generic.List[object]] $Unfinished = $null,
+
+        [AllowNull()]
+        [System.Collections.Generic.List[object]] $Moved = $null
     )
 
     $settings = $Context.Settings
@@ -4672,9 +4741,17 @@ function Get-DbHubSessionHealth {
                     }
                     $anchors[$set.Target] = ConvertTo-DbHubTimeText -Value $set.SetUtc
                     Write-DbHubLog -Context $Context -Message ('{0}: its activity was set on {1} at {2} UTC, {3} s after Azure accepted the Run Command; the session''s times for {0} count from then.' -f $set.Target, $vm, $set.SetUtc.ToString('HH:mm:ss', [System.Globalization.CultureInfo]::InvariantCulture), [int]($set.SetUtc - $accepted).TotalSeconds)
+                    if ($null -ne $Moved) {
+                        $Moved.Add([pscustomobject]@{ Target = $set.Target; Vm = $vm; SetUtc = $set.SetUtc; Seconds = [int]($set.SetUtc - $accepted).TotalSeconds })
+                    }
                 }
             }
             $state = [string](Get-DbHubMember -InputObject $instance -Name 'executionState')
+            # A Run Command that hasn't ended hasn't set its targets' activity yet (2026-11-20: T2's, while a guest that has
+            # just started comes up), so their times can't count from it yet.
+            if ($null -ne $Unfinished -and $state -in 'Pending', 'Running', 'Unknown') {
+                $Unfinished.Add([pscustomobject]@{ Vm = $vm; Name = $command.Name; Targets = @($command.Targets) })
+            }
             $exit = Get-DbHubMember -InputObject $instance -Name 'exitCode'
             # "A nonzero ExitCode indicates an unsuccessful execution" (Learn, managed Run Commands), whatever the state says.
             $exitFailed = $state -eq 'Succeeded' -and $null -ne $exit -and [int]$exit -ne 0
@@ -4746,10 +4823,13 @@ function Update-DbHubSessionHealth {
     .SYNOPSIS
     DbHub-Monitor's look at a running session's hosts (2026-11-16): the session's last status from its copy (the
     variable DbHubSessionStatus), the checks of Get-DbHubSessionHealth, and the status written again, to the vault and
-    the copy, only when a problem is new, and only while the session runs: before its end, and while its copy is still the
-    one it read, untouched since, right before the write, so a newer status, such as the session's end, is never
-    overwritten. Never throws. Returns Outcome (NoSession, NoStatus, Ended, Healthy, Known, Changed, Warned) and Note, a
-    sentence for the monitor's result.
+    the copy, only when a problem is new, or when a target's activity was set since (2026-11-20: its dispatchUtc moved, or
+    dispatchPending changed, Set-DbHubDispatchPending, with a Times step, Add-DbHubDispatchSetStep), and only while the
+    session runs: before its end, and while its copy is still the one it read, untouched since, right before the write,
+    so a newer status, such as the session's end, is never overwritten. Never throws. Returns Outcome (NoSession,
+    NoStatus, Ended, Healthy, Known, Changed, Moved, Warned) and Note, a sentence for the monitor's result. -SessionId
+    names the session when the caller knows it (the session's start, Wait-DbHubSessionDispatch); otherwise the group's
+    DbHubSessionId tag does.
     #>
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Writes only the running session''s own status, from DbHub-Monitor''s scheduled re-check, which starts or stops nothing.')]
     param(
@@ -4757,10 +4837,16 @@ function Update-DbHubSessionHealth {
         [object] $Context,
 
         [AllowNull()]
-        [object] $Tags
+        [object] $Tags,
+
+        [AllowEmptyString()]
+        [string] $SessionId = ''
     )
 
-    $session = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId')
+    $session = $SessionId
+    if (-not $session) {
+        $session = [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId')
+    }
     if ($session -notmatch '^[0-9a-f]{32}$') {
         return [pscustomobject]@{ Outcome = 'NoSession'; Note = '' }
     }
@@ -4779,12 +4865,17 @@ function Update-DbHubSessionHealth {
         if ($null -ne $end -and (Get-DbHubUtcNow) -ge $end) {
             return [pscustomobject]@{ Outcome = 'Ended'; Note = '' }
         }
-        $findings = @(Get-DbHubSessionHealth -Context $Context -Status $status)
-        if ($findings.Count -eq 0) {
-            return [pscustomobject]@{ Outcome = 'Healthy'; Note = ' The session''s hosts run.' }
-        }
+        $unfinished = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $moved = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $findings = @(Get-DbHubSessionHealth -Context $Context -Status $status -Unfinished $unfinished -Moved $moved)
         $added = Add-DbHubSessionHealthStep -Status $status -Finding $findings
-        if ($added -eq 0) {
+        # A target whose activity was set since (2026-11-20): its times count from then, which the notebook reads.
+        $pendingChanged = Set-DbHubDispatchPending -Status $status -Unfinished $unfinished.ToArray()
+        $timed = Add-DbHubDispatchSetStep -Status $status -Moved $moved.ToArray()
+        if ($added -eq 0 -and $timed -eq 0 -and -not $pendingChanged) {
+            if ($findings.Count -eq 0) {
+                return [pscustomobject]@{ Outcome = 'Healthy'; Note = ' The session''s hosts run.' }
+            }
             return [pscustomobject]@{ Outcome = 'Known'; Note = ' The session''s status already says what doesn''t run.' }
         }
         # Never over a newer status (the coordinator's guard, 2026-11-16): the copy must be the one read above, of a
@@ -4795,13 +4886,166 @@ function Update-DbHubSessionHealth {
             return [pscustomobject]@{ Outcome = 'Changed'; Note = '' }
         }
         $null = Write-DbHubSessionStatus -Context $Context -Status $status
-        $texts = @(@($status['steps']) | Select-Object -Last $added | ForEach-Object { [string](Get-DbHubMember -InputObject $_ -Name 'message') })
-        return [pscustomobject]@{ Outcome = 'Warned'; Note = (' The session''s status now says: {0}' -f ($texts -join ' ')) }
+        if ($added -gt 0) {
+            $texts = @(@($status['steps']) | Where-Object { [string](Get-DbHubMember -InputObject $_ -Name 'step') -eq 'Host' } | Select-Object -Last $added | ForEach-Object { [string](Get-DbHubMember -InputObject $_ -Name 'message') })
+            return [pscustomobject]@{ Outcome = 'Warned'; Note = (' The session''s status now says: {0}' -f ($texts -join ' ')) }
+        }
+        $note = ''
+        if ($timed -gt 0) {
+            $note = ' The session''s times for {0} now count from when its activity was set.' -f ((@($moved.ToArray() | ForEach-Object { [string]$_.Target }) | Sort-Object -Unique) -join ' and ')
+        }
+        return [pscustomobject]@{ Outcome = 'Moved'; Note = $note }
     }
     catch {
         Write-DbHubLog -Context $Context -Message ('The session''s hosts weren''t checked: {0}' -f $_.Exception.Message)
         return [pscustomobject]@{ Outcome = 'NoStatus'; Note = '' }
     }
+}
+
+function Set-DbHubDispatchPending {
+    # Which targets' activity isn't set yet (2026-11-20): the targets of the dispatch Run Commands that Azure says haven't
+    # ended (Get-DbHubSessionHealth -Unfinished), in the status's dispatchPending, so the control notebook marks their times
+    # in its guide and announces none of their beats until their activity is set. Returns whether it changed; a status
+    # without dispatchPending gets one only when a target is pending.
+    [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Changes the in-memory status only; its caller writes it.')]
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [AllowEmptyCollection()]
+        [object[]] $Unfinished = @()
+    )
+
+    $targets = @(@($Unfinished | Where-Object { $null -ne $_ } | ForEach-Object { @($_.Targets) }) | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^T[1-5]$' } | Sort-Object -Unique)
+    $before = @(@(Get-DbHubMember -InputObject $Status -Name 'dispatchPending') | ForEach-Object { [string]$_ } | Where-Object { $_ -match '^T[1-5]$' } | Sort-Object -Unique)
+    if (($targets -join ',') -eq ($before -join ',')) {
+        return $false
+    }
+    $Status['dispatchPending'] = @($targets)
+    return $true
+}
+
+function Add-DbHubDispatchSetStep {
+    # After the session's start (2026-11-20): a Times step (Info) for each target whose showcase anchor moved since, because
+    # its dispatch Run Command set its activity later (Get-DbHubSessionHealth -Moved), so the control notebook's live view
+    # prints it and counts that target's beats from then. Returns how many it added.
+    param(
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Status,
+
+        [AllowEmptyCollection()]
+        [object[]] $Moved = @()
+    )
+
+    $added = 0
+    foreach ($item in @($Moved | Where-Object { $null -ne $_ })) {
+        $seconds = [int]$item.Seconds
+        $after = '{0} minutes' -f [int][System.Math]::Round($seconds / 60.0)
+        if ($seconds -lt 90) {
+            $after = '{0} seconds' -f $seconds
+        }
+        Add-DbHubSessionStep -Status $Status -Step 'Times' -State 'Info' -Message ('{0}: its activity was set on {1} {2} after Azure accepted the Run Command that sends it, so {0}''s times count from then.' -f $item.Target, $item.Vm, $after)
+        $added++
+    }
+    return $added
+}
+
+function Wait-DbHubSessionDispatch {
+    <#
+    .SYNOPSIS
+    The session's start, after it wrote "running" (2026-11-20, the owner's follow-up; ADR 0026's 2026-11-19 amendment left
+    it out): a dispatch Run Command that hadn't ended by the start's check, T2's when a cold start keeps its guest coming
+    up for minutes, sets its targets' activity later than the status says, so their showcase times came early. The job
+    follows each such Run Command, reading its instance view every PollSeconds, until it ends: at most WaitMinutes (the
+    longest dispatch timeout, Get-DbHubRunCommandTimeout, and a minute), never past the session's end, and while the
+    session goes on (Test-DbHubSessionOpen). When one ends, Update-DbHubSessionHealth moves its targets' dispatchUtc to
+    when their activity was set, takes them out of dispatchPending, adds a Times step, or a Host Warning when it failed,
+    and writes the status, never over a newer one; the control notebook's live view reads it within a minute. Reads only:
+    one instance view per Run Command per poll. Returns how many of them ended.
+    https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/get-by-virtual-machine
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [Parameter(Mandatory = $true)]
+        [string] $SessionId,
+
+        [AllowEmptyCollection()]
+        [object[]] $Command = @(),
+
+        [Parameter(Mandatory = $true)]
+        [datetime] $RunEndUtc,
+
+        [int] $PollSeconds = 20,
+
+        [int] $WaitMinutes = 51
+    )
+
+    $settings = $Context.Settings
+    $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Compute/virtualMachines/runCommands'
+    # By name: [pscustomobject]s all compare equal, so a list can't remove one of them.
+    $pending = [ordered]@{}
+    foreach ($item in @($Command | Where-Object { $null -ne $_ })) {
+        $pending[[string]$item.Name] = $item
+    }
+    if ($pending.Count -eq 0) {
+        return 0
+    }
+    $deadline = (Get-DbHubUtcNow).AddMinutes($WaitMinutes)
+    if ($RunEndUtc -lt $deadline) {
+        $deadline = $RunEndUtc
+    }
+    # Bounded by its polls too, so a clock that doesn't move can't keep the job here.
+    $polls = [int][System.Math]::Ceiling($WaitMinutes * 60 / [double][System.Math]::Max(20, $PollSeconds))
+    Write-DbHubLog -Context $Context -Message ('Following {0}, which hadn''t ended when the session started, until it sets its targets'' activity.' -f (@($pending.Keys) -join ', '))
+    $ended = 0
+    while ($pending.Count -gt 0) {
+        if ($polls -le 0 -or (Get-DbHubUtcNow) -ge $deadline) {
+            Write-DbHubLog -Context $Context -Message ('{0} hadn''t ended by {1} UTC; DbHub-Monitor''s re-checks look again.' -f (@($pending.Keys) -join ', '), $deadline.ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture))
+            break
+        }
+        $polls--
+        Start-Sleep -Seconds $PollSeconds
+        if (-not (Test-DbHubSessionOpen -Context $Context)) {
+            Write-DbHubLog -Context $Context -Message 'The session was stopped, so its Run Commands aren''t followed any more.'
+            break
+        }
+        $done = 0
+        foreach ($name in @($pending.Keys)) {
+            $item = $pending[$name]
+            $read = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/providers/Microsoft.Compute/virtualMachines/{1}/runCommands/{2}?$expand=instanceView' -f (Get-DbHubDemoPath -Settings $settings), $item.Vm, $name) -ApiVersion $version
+            if ($read.StatusCode -eq 404) {
+                $pending.Remove($name)
+                continue
+            }
+            if ($read.StatusCode -ne 200) {
+                continue
+            }
+            $state = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $read.Body -Name 'properties') -Name 'instanceView') -Name 'executionState')
+            if ($state -notin 'Pending', 'Running', 'Unknown') {
+                $pending.Remove($name)
+                $done++
+            }
+        }
+        if ($done -eq 0) {
+            continue
+        }
+        $ended += $done
+        # DbHub-Monitor's re-check can write the status at the same time: the update reads it again each try.
+        $update = $null
+        for ($attempt = 1; $attempt -le 3; $attempt++) {
+            $update = Update-DbHubSessionHealth -Context $Context -Tags $null -SessionId $SessionId
+            if ($update.Outcome -ne 'Changed') {
+                break
+            }
+        }
+        Write-DbHubLog -Context $Context -Message ('A dispatch Run Command ended; the session''s status: {0}.{1}' -f $update.Outcome, $update.Note)
+        if ($update.Outcome -in 'NoSession', 'Ended') {
+            break
+        }
+    }
+    return $ended
 }
 
 function Get-DbHubT4Server {
@@ -4885,15 +5129,51 @@ function Get-DbHubReplicaSizeOrder {
     return $order.ToArray()
 }
 
+function Get-DbHubReplicaSizeNote {
+    <#
+    .SYNOPSIS
+    The status's note when a session's read replica runs on another size (Used) than T4's (Asked), from their vCores
+    (Get-DbHubT4VCore): only a size with more vCores is said to cost more. One with T4's vCores, which the order tries
+    next when the documented sizes have one (Get-DbHubReplicaSizeOrder), makes no claim on its price: a series can cost
+    another price per vCore in a region (the Azure Retail Prices API, 2026-11-22: Standard_D4ds_v5 and Standard_D4ads_v5
+    in Norway West). OverQuota: Azure refused a size over the subscription's vCore quota (F37). Pure.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $Asked,
+
+        [Parameter(Mandatory = $true)]
+        [string] $Used,
+
+        [switch] $OverQuota
+    )
+
+    $why = if ($OverQuota) { ' over the subscription''s vCore quota' } else { '' }
+    $askedVCores = Get-DbHubT4VCore -SkuName $Asked
+    $usedVCores = Get-DbHubT4VCore -SkuName $Used
+    # A size whose vCores its name doesn't give, or fewer than T4's (which the order never asks for): no claim on its cost.
+    $what = '; ./scripts/estimate-cost.ps1 shows what it costs'
+    if ($askedVCores -gt 0 -and $usedVCores -gt $askedVCores) {
+        $what = ', which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference'
+    }
+    elseif ($askedVCores -gt 0 -and $usedVCores -eq $askedVCores) {
+        $what = ', which has T4''s vCores; ./scripts/estimate-cost.ps1 shows what it costs'
+    }
+    return ('Azure refused T4''s size ({0}) for the replica{1}, so it runs on {2}{3}.' -f $Asked, $why, $Used, $what)
+}
+
 function Send-DbHubT4ReplicaCreate {
     <#
     .SYNOPSIS
     Asks Azure for T4's read replica at SkuName (Servers - Create, createMode Replica), as infra/replica/pgreplica01.bicep
     makes it: T4's location, delegated subnet, private DNS zone, and storage, General Purpose, no public network access,
     and storage auto-grow off, with the demo's tags and component t4-replica. Returns once Azure answered: Accepted,
-    StatusCode, Code (SkuNotAvailable, SourceNotReady, AlreadyExists, NotGranted, or Other), and Error.
+    StatusCode, Code (SkuNotAvailable, QuotaExceeded, SourceNotReady, AlreadyExists, NotGranted, or Other), and Error.
+    QuotaExceeded is Learn's refusal over the subscription's vCore quota ("exceeding approved {0} Cores quota"; F37,
+    2026-11-22), which moves the session's size fallback on as SkuNotAvailable does.
     https://learn.microsoft.com/rest/api/postgresql/flexibleserver/servers/create
     https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica
+    https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors#exceeded-quota
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -4956,6 +5236,9 @@ function Send-DbHubT4ReplicaCreate {
     }
     elseif ($text -match 'SkuNotAvailable') {
         $code = 'SkuNotAvailable'
+    }
+    elseif ($text -match '(?is)exceeding\s+approved\s+[^"\\\r\n]{0,80}?\s*Cores\s+quota') {
+        $code = 'QuotaExceeded'
     }
     elseif ($text -match 'ReadReplicaServerInUnexpectedState') {
         $code = 'SourceNotReady'
@@ -5263,7 +5546,8 @@ function Start-DbHubSessionReplica {
 function Send-DbHubSessionReplicaAttempt {
     <#
     .SYNOPSIS
-    Asks for the session's read replica at the work's next size: SkuNotAvailable moves to the next size, a T4 that's
+    Asks for the session's read replica at the work's next size: SkuNotAvailable, or Azure's refusal over the
+    subscription's vCore quota (QuotaExceeded, F37), moves to the next size, a T4 that's
     restarting or updating (ReadReplicaServerInUnexpectedState) is asked again every PollSeconds for up to RaceMinutes (live,
     2026-11-13: T4's restart refused the replica), and any other refusal ends it, with the fix in the status. Returns the
     work.
@@ -5327,7 +5611,7 @@ function Send-DbHubSessionReplicaAttempt {
             $Work.AcceptedUtc = Get-DbHubUtcNow
             return $Work
         }
-        if ($sent.Code -eq 'SkuNotAvailable') {
+        if ($sent.Code -in 'SkuNotAvailable', 'QuotaExceeded') {
             $Work.Index++
             continue
         }
@@ -5344,6 +5628,16 @@ function Send-DbHubSessionReplicaAttempt {
         return (& $finish 'Failed' ('T4''s read replica couldn''t be created: {0}' -f $sent.Error) 'Fix the cause (a policy denial names its policy), then Run all again; ./scripts/start-demo.ps1 creates it too, with more detail.')
     }
     $tried = @($Work.Attempts | ForEach-Object { [string]$_['size'] } | Select-Object -Unique) -join ', '
+    # Over the subscription's vCore quota (F37, 2026-11-22): the fix is room in it, more of it, or another region.
+    $overQuota = @($Work.Attempts | Where-Object { [string]$_['outcome'] -eq 'QuotaExceeded' }).Count -gt 0
+    if ($overQuota) {
+        $where = [string](Get-DbHubMember -InputObject $Work.Source -Name 'location')
+        if (-not $where) {
+            $where = 'the region'
+        }
+        $unavailable = if (@($Work.Attempts | Where-Object { [string]$_['outcome'] -eq 'SkuNotAvailable' }).Count -gt 0) { ' For the sizes Azure refused as unavailable (SkuNotAvailable), ask for access with a Region access request (Learn: Resolve capacity errors).' } else { '' }
+        return (& $finish 'Refused' ('Azure refused every size for T4''s read replica ({0}), some or all over the subscription''s vCore quota for Azure Database for PostgreSQL in {1}, so this session has none.' -f $tried, $where) ('Free vCores in {0}: ./scripts/destroy.ps1 -ConfigPath <its configuration> deletes a demo environment you no longer use, with its T4 and read replica (a stopped server still counts against the quota). Or request more quota for Azure Database for PostgreSQL flexible server in {0} (Learn: Request a quota increase).{1} Then Run all again.' -f $where, $unavailable))
+    }
     return (& $finish 'Refused' ('Azure refused every size for T4''s read replica ({0}), so this session has none.' -f $tried) 'Ask for the size in the region (a Region access request), or set t4SkuName in config/demo.config.json and run ./scripts/deploy.ps1.')
 }
 
@@ -5439,7 +5733,9 @@ function Complete-DbHubSessionReplica {
     }
     $part['sizeUsed'] = $used
     if ($used -and $part['sizeAsked'] -and $used -cne [string]$part['sizeAsked']) {
-        $part['note'] = 'Azure refused T4''s size ({0}) for the replica, so it runs on {1}, which has more vCores and costs more while the session lasts; ./scripts/estimate-cost.ps1 shows the difference.' -f $part['sizeAsked'], $used
+        # A refusal over the subscription's vCore quota says so (F37, 2026-11-22).
+        $overQuota = @($Work.Attempts | Where-Object { [string]$_['outcome'] -eq 'QuotaExceeded' }).Count -gt 0
+        $part['note'] = Get-DbHubReplicaSizeNote -Asked ([string]$part['sizeAsked']) -Used $used -OverQuota:$overQuota
     }
     $parameter = Set-DbHubT4ReplicaParameter -Context $Context -Name $Work.Name -Milliseconds $setting.StreamingDelayMs
     if (-not $parameter.Ok) {
@@ -9255,7 +9551,11 @@ function Start-DbHubSession {
     2. The plan (Get-DbHubRunPlan): the showcase on every target for the session's minutes, ending before the VMs' next
        auto-shutdown, as a run does: the profile hosts on the VMs end their activity there. A shorter session than asked
        ends after its last whole showcase cycle (cycleMinutes), so no beat is cut off, and says so, with when it ends and
-       why; one with less than minSessionMinutes left is refused.
+       why; one with less than minSessionMinutes left is refused. An auto-shutdown that deploy.ps1 moved for a run the
+       nightly stop waited for (the group's DbHubAutoShutdownMoved, F25, 2026-11-21) counts too, since the session can't
+       move it back: the Plan step says so, and that a full session runs once it has passed, or after
+       ./scripts/stop-demo.ps1 has put it back. The deferred nightly pass that stands with it needs nothing: it honors the
+       session's busy marker (3.), as every nightly pass does.
     3. The busy marker (DbHubBusyUntilUtc, DbHubBusyBy session) until busyMarginMinutes after the auto-stop, with the
        session's ID and start (DbHubSessionId, DbHubSessionStartUtc): the nightly stop's passes and the control's T4 stop
        leave the session to its own auto-stop, which saves the metrics and deletes the replica.
@@ -9343,15 +9643,28 @@ function Start-DbHubSession {
         param([datetime] $Utc)
         [System.TimeZoneInfo]::ConvertTimeFromUtc([DateTime]::SpecifyKind($Utc, [System.DateTimeKind]::Utc), $zone).ToString('HH:mm', [System.Globalization.CultureInfo]::InvariantCulture)
     }
-    $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc
+    $plan = Get-DbHubRunPlan -Request $Request -Settings $settings -NowUtc $Context.NowUtc -Tags $Tags
     $minimum = [int](Get-DbHubMember -InputObject $settings -Name 'minSessionMinutes')
     if ($minimum -le 0) {
         $minimum = 30
     }
     $planned = [int][System.Math]::Floor(($plan.RunEndUtc - $Context.NowUtc).TotalMinutes)
     $status['autoShutdownUtc'] = ConvertTo-DbHubTimeText -Value $plan.ShutdownUtc
+    # An auto-shutdown that deploy.ps1 moved for a run the nightly stop waited for (F25, 2026-11-21): the session can't move
+    # it back, since the control's role has no DevTest Labs action, so it ends before it, says why, and says how to get a
+    # full session: once that time has passed, or after ./scripts/stop-demo.ps1 has put it back.
+    $movedWhere = ''
+    $movedFix = ''
+    if ($plan.ShutdownMoved) {
+        $movedWhere = ', where deploy.ps1 moved it for a run the nightly stop waited for, and which a session can''t move'
+        $movedFix = 'Run all after {0}, once that auto-shutdown has passed; or run ./scripts/stop-demo.ps1, which puts it back at {1}, and then Run all.' -f (& $clock $plan.ShutdownUtc), (& $clock $plan.NightlyUtc)
+    }
     if (-not $plan.Valid -or $planned -lt $minimum) {
-        return (& $refuse ('The VMs shut down at {0} ({1}), too soon for a session of at least {2} minutes, so nothing was started.' -f (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $minimum) 'Run all again earlier in the day, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.')
+        $refuseFix = 'Run all again earlier in the day, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.'
+        if ($movedFix) {
+            $refuseFix = $movedFix
+        }
+        return (& $refuse ('The VMs shut down at {0} ({1}){2}, too soon for a session of at least {3} minutes, so nothing was started.' -f (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $movedWhere, $minimum) $refuseFix)
     }
     # A session that the auto-shutdown cuts short ends after its last whole showcase cycle (2026-11-14), so no beat stops
     # midway when the VMs' activity ends.
@@ -9361,7 +9674,7 @@ function Start-DbHubSession {
         if (($planned % $cycle) -ne 0) {
             $shorter = $Request.PSObject.Copy()
             $shorter.DurationMinutes = [int]([System.Math]::Floor($planned / $cycle) * $cycle)
-            $plan = Get-DbHubRunPlan -Request $shorter -Settings $settings -NowUtc $Context.NowUtc
+            $plan = Get-DbHubRunPlan -Request $shorter -Settings $settings -NowUtc $Context.NowUtc -Tags $Tags
             $planned = [int][System.Math]::Floor(($plan.RunEndUtc - $Context.NowUtc).TotalMinutes)
         }
         $wholeCycles = $true
@@ -9377,7 +9690,13 @@ function Start-DbHubSession {
             }
             $cycleText = ' It ends after {0} whole {1}-minute showcase {2}, so no beat is cut off.' -f $count, $cycle, $noun
         }
-        Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Warning' -Message ('This session runs {0} of the {1} minutes asked: it ends at {2}, before the VMs'' auto-shutdown at {3} ({4}), when the activity on the VMs ends.{5}' -f $planned, $Request.DurationMinutes, (& $clock $plan.RunEndUtc), (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $cycleText) -Fix 'For a full session, Run all earlier, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.'
+        $why = ', when the activity on the VMs ends'
+        $planFix = 'For a full session, Run all earlier, or change autoShutdownTime in config/demo.config.json and run ./scripts/deploy.ps1.'
+        if ($movedWhere) {
+            $why = $movedWhere
+            $planFix = 'For a full session, {0}' -f $movedFix
+        }
+        Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Warning' -Message ('This session runs {0} of the {1} minutes asked: it ends at {2}, before the VMs'' auto-shutdown at {3} ({4}){5}.{6}' -f $planned, $Request.DurationMinutes, (& $clock $plan.RunEndUtc), (& $clock $plan.ShutdownUtc), $settings.autoShutdownTimeZone, $why, $cycleText) -Fix $planFix
     }
     else {
         Add-DbHubSessionStep -Status $status -Step 'Plan' -State 'Pass' -Message ('The showcase runs {0} minutes on every target, until {1} ({2}).' -f $planned, (& $clock $plan.RunEndUtc), $settings.autoShutdownTimeZone)
@@ -9394,9 +9713,10 @@ function Start-DbHubSession {
         $status['busy']['marked'] = $true
         $status['busy']['untilUtc'] = ConvertTo-DbHubTimeText -Value $busyUntil
         $text = 'The demo is marked busy until {0} ({1}).' -f (& $clock $busyUntil), $settings.autoShutdownTimeZone
-        if ($plan.ShutdownUtc -le $busyUntil) {
-            $status['busy']['nightlyStopUtc'] = ConvertTo-DbHubTimeText -Value $plan.ShutdownUtc
-            $text = '{0} The nightly stop at {1} waits for it: the session''s own auto-stop at {2} saves its metrics, deletes T4''s read replica, and stops everything.' -f $text, (& $clock $plan.ShutdownUtc), (& $clock $plan.AutoStopUtc)
+        # The nightly safety stop runs at autoShutdownTime, whether or not deploy.ps1 moved the VMs' own auto-shutdown (F25).
+        if ($plan.NightlyUtc -le $busyUntil) {
+            $status['busy']['nightlyStopUtc'] = ConvertTo-DbHubTimeText -Value $plan.NightlyUtc
+            $text = '{0} The nightly stop at {1} waits for it: the session''s own auto-stop at {2} saves its metrics, deletes T4''s read replica, and stops everything.' -f $text, (& $clock $plan.NightlyUtc), (& $clock $plan.AutoStopUtc)
         }
         $status['busy']['note'] = $text
         Add-DbHubSessionStep -Status $status -Step 'Busy' -State 'Pass' -Message $text
@@ -9593,7 +9913,15 @@ function Start-DbHubSession {
 
     # The session's hosts as its start ends (2026-11-16): a VM whose start failed or that stopped, or a dispatch Run
     # Command that failed, is a Warning now; DbHub-Monitor's re-checks look again while the session runs.
-    $null = Add-DbHubSessionHealthStep -Status $status -Finding @(Get-DbHubSessionHealth -Context $Context -Status $status)
+    $unfinished = New-Object -TypeName 'System.Collections.Generic.List[object]'
+    $null = Add-DbHubSessionHealthStep -Status $status -Finding @(Get-DbHubSessionHealth -Context $Context -Status $status -Unfinished $unfinished)
+    # A dispatch Run Command that hasn't ended yet (2026-11-20): its targets' times count from when it sets their activity,
+    # which this job follows after "running" (Wait-DbHubSessionDispatch), so the notebook holds their beats until then.
+    if (Set-DbHubDispatchPending -Status $status -Unfinished $unfinished.ToArray()) {
+        foreach ($item in $unfinished) {
+            Add-DbHubSessionStep -Status $status -Step 'Times' -State 'Info' -Message ('{0}: its activity isn''t set on {1} yet (a VM or guest that has just started can take minutes), so {0}''s times count from when it is; the live view says when.' -f ((@($item.Targets) | Sort-Object) -join ' and '), $item.Vm)
+        }
+    }
 
     # The earlier sessions' evidence (ADR 0031): the exports sent right before this session's activity went out read, one
     # session's documents fetched into the vault, and its bundle index into this status (rcaEarlier), which Run all saves
@@ -9608,6 +9936,9 @@ function Start-DbHubSession {
     $result.message = 'The session runs until {0} UTC, and its auto-stop at {1} saves the metrics, deletes the replica, and stops everything. {2}' -f $result.runEndUtc, $result.autoStopUtc, $replicaText
     $status['message'] = $result.message
     $null = Write-DbHubSessionStatus -Context $Context -Status $status -Phase 'running'
+    if ($unfinished.Count -gt 0) {
+        $null = Wait-DbHubSessionDispatch -Context $Context -SessionId ([string]$status['sessionId']) -Command $unfinished.ToArray() -RunEndUtc $plan.RunEndUtc -PollSeconds $PollSeconds
+    }
     return [pscustomobject]$result
 }
 
@@ -9737,6 +10068,186 @@ function Get-DbHubRcaStopLineList {
     return $lines
 }
 
+# How long after a session's planned end its stop still counts as that end when a start-demo.ps1 session took over from it
+# (Get-DbHubSessionTakeover): the notebook sends it within a minute or two of the end, and its job starts minutes later.
+$script:DbHubTakeoverEndMinutes = 30
+
+function Get-DbHubSessionTakeover {
+    <#
+    .SYNOPSIS
+    Whether a session's own end finds a start-demo.ps1 session that took over from it (2026-11-20, the owner's follow-up):
+    start-demo.ps1 replaces a running session's auto-stop with its own ($script:DbHubStartDemoMarker in the schedule's
+    description) and leaves the session's busy marker, so at the session's planned end, the control notebook's stop with the
+    session's ID stopped the demo under the newer session. Returns AutoStopUtc and RunEndUtc when the stop is for
+    SessionId, at that session's planned end (from two minutes before its runEndUtc in the status copy, for the clocks, to
+    $script:DbHubTakeoverEndMinutes after it, for a job that starts late), and the pending auto-stop is start-demo.ps1's,
+    later than now; $null otherwise, and the stop goes on as before. The notebook's end and its Stop now send the same
+    request, so an explicit Stop now before or well after the planned end, from the notebook or the Insights app, still
+    stops everything, and so does Stop now again after a taken-over end, whose status says it stopped.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowEmptyString()]
+        [string] $SessionId = ''
+    )
+
+    if ($SessionId -notmatch '^[0-9a-f]{32}$') {
+        return $null
+    }
+    $status = Read-DbHubSessionStatusCopy -Context $Context
+    if ($null -eq $status -or [string]$status['sessionId'] -ne $SessionId) {
+        return $null
+    }
+    $runEnd = ConvertTo-DbHubUtc -Value $status['runEndUtc']
+    if ($null -eq $runEnd -or $Context.NowUtc -lt $runEnd.AddMinutes(-2) -or $Context.NowUtc -gt $runEnd.AddMinutes($script:DbHubTakeoverEndMinutes)) {
+        return $null
+    }
+    $settings = $Context.Settings
+    $version = Get-DbHubApiVersion -Settings $settings -Type 'Microsoft.Automation/automationAccounts'
+    $schedule = Invoke-DbHubArm -Context $Context -Method GET -Path ('{0}/schedules/{1}' -f (Get-DbHubAccountPath -Settings $settings), $settings.autoStopSchedule) -ApiVersion $version
+    if ($schedule.StatusCode -ne 200) {
+        return $null
+    }
+    $properties = Get-DbHubMember -InputObject $schedule.Body -Name 'properties'
+    if (-not ([string](Get-DbHubMember -InputObject $properties -Name 'description')).StartsWith($script:DbHubStartDemoMarker, [System.StringComparison]::Ordinal)) {
+        return $null
+    }
+    $autoStop = ConvertTo-DbHubUtc -Value (Get-DbHubMember -InputObject $properties -Name 'startTime')
+    if ($null -eq $autoStop -or $autoStop -le $Context.NowUtc) {
+        return $null
+    }
+    return [pscustomobject]@{ AutoStopUtc = $autoStop; RunEndUtc = $runEnd }
+}
+
+function Complete-DbHubTakenOverSession {
+    <#
+    .SYNOPSIS
+    A session's own end after a start-demo.ps1 session took over from it (Get-DbHubSessionTakeover, 2026-11-20): the newer
+    session's auto-stop wins, so nothing is stopped. The session still ends, and its own part is a stop's (the RCA
+    release's merge): its evidence for the Incident RCA is exported first (Invoke-DbHubRcaStop, ADR 0031), through Run
+    Commands that only read, so the VMs the start-demo.ps1 session uses keep running; then T4's, its replica's, and T5's
+    metrics are saved for its history with the export's bundle index (Save-DbHubSessionMetric), which the control
+    notebook reads the session's evidence from. Another stop of the session that began, or ran, keeps that part
+    (Resolve-DbHubStopClaim). Its busy marker is cleared when it's still this session's, so the nightly stop goes on as
+    usual for the start-demo.ps1 session, and its status says it stopped, with takenOver (who, and the auto-stop's time),
+    its plan, its metrics' version, and its evidence's lines (Write-DbHubStopStatus), so the notebook saves its history.
+    The VMs, T4, its read replica, T5's container, and start-demo.ps1's auto-stop stay as they are. Returns the stop's
+    result, status TakenOver.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Tags,
+
+        [Parameter(Mandatory = $true)]
+        [string] $SessionId,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Takeover
+    )
+
+    $settings = $Context.Settings
+    $until = $Takeover.AutoStopUtc.ToString('yyyy-MM-ddTHH:mm:ssZ', [System.Globalization.CultureInfo]::InvariantCulture)
+    $done = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    $done.Add(('nothing stopped: a start-demo.ps1 session took over from this one, and its auto-stop stops the demo at {0}' -f $until))
+    $metricsStatus = ''
+    $metricsMessage = ''
+    $metricsVersion = ''
+    $rca = $null
+    $yielded = $null
+    if (Test-DbHubSessionCapable -Settings $settings) {
+        $yielded = Resolve-DbHubStopClaim -Context $Context -SessionId $SessionId
+        if ($null -ne $yielded) {
+            $done.Add((Get-DbHubStopYieldText -Yielded $yielded))
+        }
+        else {
+            $rca = Invoke-DbHubRcaStop -Context $Context -Tags $Tags -SessionId $SessionId
+            $rcaIndex = $null
+            if ($null -ne $rca) {
+                $rcaIndex = $rca.Index
+            }
+            $saved = Save-DbHubSessionMetric -Context $Context -Tags $Tags -SessionId $SessionId -Rca $rcaIndex
+            $metricsStatus = [string]$saved.Status
+            $metricsMessage = [string]$saved.Message
+            $metricsVersion = [string](Get-DbHubMember -InputObject $saved -Name 'Version')
+            if ($saved.Status -in 'Pass', 'Warning') {
+                $done.Add('the history''s metrics saved to the control vault')
+            }
+            else {
+                $done.Add(('the history''s metrics not saved ({0})' -f $saved.Message))
+            }
+        }
+    }
+    $busy = Get-DbHubBusyMarker -Tags $Tags -Settings $settings -NowUtc $Context.NowUtc
+    if ($busy.By -eq 'session' -and [string](Get-DbHubMember -InputObject $Tags -Name 'DbHubSessionId') -eq $SessionId) {
+        $cleared = Set-DbHubResourceGroupTag -Context $Context -Tags @{ DbHubBusyUntilUtc = ''; DbHubBusyBy = '' }
+        if ($cleared.Ok) {
+            $done.Add('busy marker cleared')
+        }
+        else {
+            Write-DbHubLog -Context $Context -Message ('The session''s busy marker wasn''t cleared ({0}); it expires by itself at {1:yyyy-MM-dd HH:mm} UTC.' -f $cleared.Error, $busy.UntilUtc)
+        }
+    }
+    $message = 'The session''s end: a start-demo.ps1 session took over from it, so nothing was stopped; that session''s auto-stop stops the demo at {0}, and Stop now again, or ./scripts/stop-demo.ps1, stops it sooner.' -f $until
+    Write-DbHubLog -Context $Context -Message $message
+    $stopped = [pscustomobject]@{ Done = $done.ToArray(); Failed = @(); MetricsStatus = $metricsStatus; MetricsMessage = $metricsMessage; MetricsVersion = $metricsVersion; T5Status = ''; Rca = $rca; Yielded = $yielded }
+    # A stop of the session that began first keeps its status (Resolve-DbHubStopClaim).
+    if ($null -eq $yielded) {
+        Write-DbHubStopStatus -Context $Context -Tags $Tags -SessionId $SessionId -Stopped $stopped -By 'session end' -TakenOver ([ordered]@{ by = 'start-demo'; autoStopUtc = $until })
+    }
+    return [pscustomobject]@{ action = 'stop'; status = 'TakenOver'; message = $message; done = $stopped.Done; failed = @(); t5Status = ''; autoStopUtc = $until; rca = (Get-DbHubRcaResult -Rca $rca) }
+}
+
+function Complete-DbHubTakenOverStatus {
+    <#
+    .SYNOPSIS
+    A whole stop after a taken-over session's end (Complete-DbHubTakenOverSession): that end did the session's own part,
+    its evidence, its metrics, and its stopped status, so this stop left it (Resolve-DbHubStopClaim, State Stopped) and
+    stopped the rest, the start-demo.ps1 session's demo. The status says so (the RCA release's merge): that end's, with
+    takenOver gone, and this stop's done, failed, and stoppedBy, so the control notebook's Stop now again, which waits for
+    a stopped status without takenOver (the re-review of 2026-11-20), sees the demo stopped. The rest stays that end's: its
+    stoppedUtc, which tells the session's capture apart (review of 02d398a), its jobId, its metrics' version, its plan,
+    and its RCA lines. Only when the status's copy is the yielded-to session's, stopped, with takenOver. Returns whether it
+    was written. Never throws.
+    #>
+    param(
+        [Parameter(Mandatory = $true)]
+        [object] $Context,
+
+        [AllowNull()]
+        [object] $Yielded,
+
+        [Parameter(Mandatory = $true)]
+        [object] $Stopped,
+
+        [Parameter(Mandatory = $true)]
+        [string] $By
+    )
+
+    if ($null -eq $Yielded -or [string](Get-DbHubMember -InputObject $Yielded -Name 'State') -ne 'Stopped') {
+        return $false
+    }
+    try {
+        $copy = Read-DbHubSessionStatusCopy -Context $Context
+        if ($null -eq $copy -or [string]$copy['sessionId'] -ne [string](Get-DbHubMember -InputObject $Yielded -Name 'SessionId') -or [string]$copy['phase'] -ne 'stopped' -or -not $copy.Contains('takenOver')) {
+            return $false
+        }
+        $copy.Remove('takenOver')
+        $copy['stoppedBy'] = $By
+        $copy['done'] = @($Stopped.Done)
+        $copy['failed'] = @($Stopped.Failed)
+        return (Write-DbHubSessionStatus -Context $Context -Status $copy)
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The taken-over session''s status doesn''t say this stop stopped the demo: {0}' -f $_.Exception.Message)
+        return $false
+    }
+}
+
 function Write-DbHubStopStatus {
     # After Stop now or an auto-stop of a session (2026-11-14): the session's status says it stopped, what was done, and
     # what failed, for the control notebook. Only when a session is known (the request's or the group's DbHubSessionId).
@@ -9760,7 +10271,10 @@ function Write-DbHubStopStatus {
         [object] $Stopped,
 
         [Parameter(Mandatory = $true)]
-        [string] $By
+        [string] $By,
+
+        [AllowNull()]
+        [System.Collections.IDictionary] $TakenOver = $null
     )
 
     if (-not (Test-DbHubSessionCapable -Settings $Context.Settings)) {
@@ -9779,6 +10293,10 @@ function Write-DbHubStopStatus {
     $metricsVersion = [string](Get-DbHubMember -InputObject $Stopped -Name 'MetricsVersion')
     if ($metricsVersion -cmatch '^[0-9a-f]{32}$') {
         $status['metrics']['version'] = $metricsVersion
+    }
+    # A session whose end found a start-demo.ps1 session that took over (2026-11-20): who, and when that one stops.
+    if ($null -ne $TakenOver) {
+        $status['takenOver'] = $TakenOver
     }
     $earlier = Read-DbHubSessionStatusCopy -Context $Context
     if ($null -ne $earlier -and [string]$earlier['sessionId'] -eq $session) {
@@ -9869,6 +10387,12 @@ function Invoke-DbHubControl {
         return [pscustomobject]@{ action = $request.Action; status = 'NoEnvironment'; message = ('Nothing was done: {0}.' -f $why) }
     }
     if ($request.Action -eq 'stop') {
+        # A session's own end after a start-demo.ps1 session took over from it (2026-11-20): the newer session's auto-stop
+        # wins, so nothing is stopped, and the session ends with its metrics saved and its busy marker cleared.
+        $takeover = Get-DbHubSessionTakeover -Context $Context -SessionId $request.SessionId
+        if ($null -ne $takeover) {
+            return (Complete-DbHubTakenOverSession -Context $Context -Tags $group.Tags -SessionId $request.SessionId -Takeover $takeover)
+        }
         $stopped = Stop-DbHubDemo -Context $Context -Tags $group.Tags -SessionId $request.SessionId
         $status = 'Stopped'
         $failedText = ''
@@ -9876,9 +10400,14 @@ function Invoke-DbHubControl {
             $status = 'Partial'
             $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
         }
-        # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status.
-        if ($null -eq (Get-DbHubMember -InputObject $stopped -Name 'Yielded')) {
+        # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status, and
+        # after a taken-over end, says this stop stopped the demo (Complete-DbHubTakenOverStatus).
+        $yielded = Get-DbHubMember -InputObject $stopped -Name 'Yielded'
+        if ($null -eq $yielded) {
             Write-DbHubStopStatus -Context $Context -Tags $group.Tags -SessionId $request.SessionId -Stopped $stopped -By 'Stop now'
+        }
+        else {
+            $null = Complete-DbHubTakenOverStatus -Context $Context -Yielded $yielded -Stopped $stopped -By 'Stop now'
         }
         return [pscustomobject]@{ action = 'stop'; status = $status; message = ('Stop now: {0}{1}.' -f (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
     }
@@ -10042,10 +10571,14 @@ function Invoke-DbHubStop {
         $status = 'Partial'
         $failedText = '; failed: ' + (@($stopped.Failed) -join ', ')
     }
-    # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status.
+    # A stop that left the session's own part to another stop of it (review of f5972d2d) keeps that stop's status, and
+    # after a taken-over end, says this stop stopped the demo (Complete-DbHubTakenOverStatus).
     $yielded = Get-DbHubMember -InputObject $stopped -Name 'Yielded'
     if ($null -eq $yielded) {
         Write-DbHubStopStatus -Context $Context -Tags $group.Tags -Stopped $stopped -By $RequestedBy
+    }
+    else {
+        $null = Complete-DbHubTakenOverStatus -Context $Context -Yielded $yielded -Stopped $stopped -By $RequestedBy
     }
     $result = [pscustomobject]@{ action = $label; status = $status; message = ('{0}: {1}{2}.' -f $RequestedBy, (@($stopped.Done) -join ', '), $failedText); done = $stopped.Done; failed = $stopped.Failed; t5Status = $stopped.T5Status; rca = (Get-DbHubRcaResult -Rca $stopped.Rca) }
     if ($RequestedBy -eq 'stop-demo.ps1') {

@@ -548,7 +548,7 @@ function Save-DemoFabricHistory {
             return (& $answer 'Manual action required' ('The session''s history wasn''t saved: the workspace''s capacity is paused or inactive, so notebooks can''t run{0}.' -f $(if ($listError) { ' ({0})' -f $listError } else { '' })) @{ capacityInactive = $true } $capacityFix)
         }
         $why = (@($resolution.Results | Where-Object { $_.status -ne 'Pass' -and $_.status -ne 'Not selected' } | ForEach-Object { '{0}: {1}' -f $_.checkId, $_.message }) -join ' ')
-        return (& $answer 'Manual action required' ('The session''s history wasn''t saved: the Fabric workspace or lakehouse isn''t resolved. {0}' -f $why).Trim() @{} 'Run ./scripts/configure-fabric.ps1 (it creates what''s missing), then the notebook.')
+        return (& $answer 'Manual action required' ('The session''s history wasn''t saved: the Fabric workspace or lakehouse isn''t resolved. {0}' -f $why).Trim() @{} 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity (it creates what''s missing, and imports that notebook alone), then the notebook.')
     }
     $resolved = $resolution.Config
     $capacity = @(Test-DemoFabricWorkspace -Config $resolved -Token $token | Where-Object { $_.checkId -eq 'FABRIC.P5.CAPACITY' }) | Select-Object -First 1
@@ -611,17 +611,16 @@ function Save-DemoFabricHistory {
     }
     $cosmosNote = if ($cosmosWithheld) { ' T5''s metrics weren''t sent: {0}.' -f $cosmosWithheld } else { '' }
     $rcaNote = if ($rcaWithheld) { ' The RCA evidence wasn''t sent: {0}; it stays on the VMs for the next save (STOP.RCA.PENDING).' -f $rcaWithheld } elseif ($rcaUnwritten) { ' The RCA evidence went with it, but {0}; it stays on the VMs for the next save (STOP.RCA.PENDING).' -f $rcaUnwritten } else { '' }
-    # deploy.ps1 updates an existing notebook only with fabric.importNotebooks true (init.ps1 writes it); with false, it
-    # keeps the workspace's copy and the edits in it, and configure-fabric.ps1 is the explicit update.
-    $importing = [bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')
     if ($run.status -eq 'Pass' -and $postgresWithheld) {
-        $updateFix = if ($importing) { 'Run ./scripts/deploy.ps1, which updates the notebook.' } else { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy).' }
+        # deploy.ps1 updates the notebook when nobody edited it (follow-ups decision 2a, 2026-11-23), and always with
+        # fabric.importNotebooks true; configure-fabric.ps1 -Notebook updates the activity notebook alone, edited or not.
+        $updateFix = '{0}.' -f (Get-DemoLiveNotebookUpdateFix -Config $Config)
         return (& $answer 'Warning' ('Saved the session''s history of the SQL targets: NB_DatabaseHub_LiveActivity ran on demand over the last {0} minutes. T4''s metrics weren''t sent: {1}.{2}{3}' -f $WindowMinutes, $postgresWithheld, $cosmosNote, $rcaNote) $evidence ('{0} T4''s metrics are kept in out/history-pending, with the command that adds them after that (STOP.T4.HISTORY.PENDING).' -f $updateFix))
     }
     if ($run.status -eq 'Pass' -and ($cosmosWithheld -or $rcaWithheld -or $rcaUnwritten)) {
-        # T5's case keeps the release's text, for the owner's decision; the Incident RCA's own updates the activity notebook
-        # alone, leaving NB_DatabaseHub_Deployment as the person left it (the review of e716ff8).
-        $updateFix = if ($importing) { 'Run ./scripts/deploy.ps1, which updates the notebook' } elseif ($cosmosWithheld) { 'Run ./scripts/configure-fabric.ps1, which updates the notebook (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copy)' } else { 'Run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which updates that notebook alone (fabric.importNotebooks is false, so deploy.ps1 keeps the workspace''s copies)' }
+        # One fix brings the activity notebook up to date (follow-ups decision 2a): deploy.ps1 when nobody edited it, and
+        # configure-fabric.ps1 -Notebook for that notebook alone, leaving NB_DatabaseHub_Deployment as the person left it.
+        $updateFix = Get-DemoLiveNotebookUpdateFix -Config $Config
         $oldNotebook = $cosmosWithheld -or $rcaWithheld -match 'from before the Incident RCA'
         $steps = [System.Collections.Generic.List[string]]::new()
         if ($oldNotebook) {

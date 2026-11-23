@@ -1,4 +1,4 @@
-/// One wait type's delta over one phase of a capture episode: the episode itself, or the baseline just before it. The Incident RCA's evidence (ADR 0031): what the observer beside the workload captured, which NB_DatabaseHub_LiveActivity writes from its evidence documents (rca/history-tables.json).
+/// Not written yet: the capture doesn't diff the wait statistics yet, so this table is empty, and its emptiness says nothing about the targets' waits or their Query Store; Telemetry Snapshots holds T1 to T3's waits by category. Its grain, once a later release writes it: one wait type's delta over one phase of a capture episode: the episode itself, or the baseline just before it. The Incident RCA's evidence (ADR 0031), which NB_DatabaseHub_LiveActivity writes from the observer's evidence documents (rca/history-tables.json).
 table 'RCA Waits'
 
     /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.

@@ -11,8 +11,14 @@ profile to off unless -KeepProfile. -Reseed restores the seed data; -UndoRemedia
 missing-index remediation, so that scenario starts again from 'before'. It acts only inside ContosoCare.
 
 Resetting T3 connects to it, which resumes a paused serverless database; with its profile off it pauses
-again t3AutoPauseMinutes later. -RebuildGuest reports Not supported for now (destroy.ps1 -KeepFabric, then deploy.ps1,
-rebuilds everything and keeps the Fabric workspaces with their history).
+again t3AutoPauseMinutes later.
+
+-RebuildGuest (2026-11-21) makes the T2 guest arcsql01 again from Arc Jumpstart's image, and does nothing else: it asks
+archost01 for the rebuild (RESET.GUEST: only while archost01 runs, in JumpstartImage mode, the default, and while no
+golden capture holds the guest), then runs ./scripts/deploy.ps1 -FromStage Artifacts, which deletes the guest with its disk
+and records, makes a new one (about 27 minutes), onboards it to Azure Arc (about 33), sets its database and activity up,
+and ends DONE or NOT DONE. Its exit code is deploy.ps1's. To start everything over instead: ./scripts/destroy.ps1
+-KeepFabric, then ./scripts/deploy.ps1, which keeps the Fabric workspaces with their history.
 
 It never signs in: sign in first with 'az login --tenant <tenantId>'. You don't need to change the Azure CLI's default subscription.
 
@@ -33,7 +39,8 @@ Drop the missing-index remediation indexes.
 Keep the activity profile; by default it's set to off.
 
 .PARAMETER RebuildGuest
-Rebuild the T2 guest (not supported yet).
+Make the T2 guest again from Arc Jumpstart's image, then run deploy.ps1 -FromStage Artifacts (above); the other switches
+don't apply.
 
 .PARAMETER OutputPath
 Where to write the results as JSON lines.
@@ -46,6 +53,9 @@ Exit with code 2 when a result is Manual action required.
 
 .EXAMPLE
 ./scripts/reset-demo.ps1 -Target T1 -UndoRemediation
+
+.EXAMPLE
+./scripts/reset-demo.ps1 -RebuildGuest
 #>
 [CmdletBinding(SupportsShouldProcess)]
 param(
@@ -88,4 +98,10 @@ $results = @(Reset-DemoWorkload -Config $config -Target $Target -Reseed:$Reseed 
 
 Write-DemoResultReport -Result $results -Title 'reset-demo.ps1'
 Export-DemoResult -Result $results -Path $OutputPath
+# -RebuildGuest (2026-11-21): once archost01 has the request, deploy.ps1 does the rebuild and finishes T2, in this command.
+$rebuild = @($results | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'RESET.GUEST' }) | Select-Object -First 1
+if ($RebuildGuest -and -not $WhatIfPreference -and $null -ne $rebuild -and [string]$rebuild.status -eq 'Pass') {
+    Write-DemoLog -Message 'reset-demo.ps1: archost01 has the request; ./scripts/deploy.ps1 -FromStage Artifacts now makes T2''s guest again and finishes T2.'
+    exit (Invoke-DemoDeployScript -ConfigPath $ConfigPath -FromStage Artifacts)
+}
 exit (Get-DemoExitCode -Result $results -TreatManualAsError:$TreatManualAsError)

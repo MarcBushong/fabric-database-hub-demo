@@ -161,6 +161,15 @@ function Remove-DemoEnvironment {
     )
 
     $results = [System.Collections.Generic.List[object]]::new()
+    # One question, with the plan, below (2026-11-22, the final tests' destroy of an environment): until then every step
+    # only reads, so it runs under -WhatIf too, and nothing nested asks. Under -WhatIf with -Confirm, which destroy.ps1
+    # passes without -Force, the subscription guard didn't record its context, which the plan's reads need, and the Azure
+    # CLI's temporary file asked to be deleted, which a non-interactive shell refuses ("PowerShell is in NonInteractive
+    # mode"). The caller's -WhatIf and -Confirm decide that one question, and nothing asks again after it.
+    $whatIfAsked = $WhatIfPreference
+    $confirmAsked = $ConfirmPreference
+    $WhatIfPreference = $false
+    $ConfirmPreference = 'None'
     try {
         $results.Add((Assert-DemoAzContext -SubscriptionId ([string]$Config['subscriptionId']) -TenantId ([string]$Config['tenantId']) -Account ([string]$Config['azureAccount'])))
     }
@@ -267,7 +276,12 @@ function Remove-DemoEnvironment {
     if ($null -ne $agentNote) {
         Write-DemoLog -Level Warning -Message ('{0} DESTROY.HUB.AGENT.T3 at the end says how ({1}).' -f $agentNote.message, $agentNote.docUrl)
     }
-    if (-not $PSCmdlet.ShouldProcess($resourceGroupName, ('Delete {0}. Keep {1}' -f ($deleteText -join '; '), ($keepText -join '; ')))) {
+    $WhatIfPreference = $whatIfAsked
+    $ConfirmPreference = $confirmAsked
+    $proceed = $PSCmdlet.ShouldProcess($resourceGroupName, ('Delete {0}. Keep {1}' -f ($deleteText -join '; '), ($keepText -join '; ')))
+    $WhatIfPreference = $false
+    $ConfirmPreference = 'None'
+    if (-not $proceed) {
         $results.Add((New-DemoResult -CheckId 'DESTROY.RESOURCEGROUP' -Area 'teardown' -Target 'subscription' -Status 'Not selected' -Message ('What if: {0} wasn''t deleted, and nothing else was. destroy.ps1 would delete {1}; and keep {2}.{3}' -f $resourceGroupName, ($deleteText -join '; '), ($keepText -join '; '), $(if ($goldenMissing) { ' ' + $goldenNote } else { '' }))))
         return $results.ToArray()
     }

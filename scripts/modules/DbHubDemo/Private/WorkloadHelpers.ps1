@@ -8,6 +8,10 @@ function Invoke-DemoDotNet {
     The working directory matters: the SDK reads workload-generator/global.json from it, which pins the SDK
     version (config/versions.json tools.dotnetSdk). Output is returned redacted. -DotNetPath runs that dotnet instead
     of the first one on PATH (Get-DemoDotNetPath), as the .NET SDK check does for other well-known folders.
+    Callers decide with ShouldProcess whether dotnet runs. Under a caller's -WhatIf or -Confirm, the inherited
+    $WhatIfPreference or $ConfirmPreference 'Low' would skip or ask at the stderr redirection, which writes the temporary
+    file through Out-File, and at the file's deletion; a non-interactive shell refuses the questions (2026-11-22, as
+    Invoke-DemoAzCli), so both are pinned here.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -21,6 +25,8 @@ function Invoke-DemoDotNet {
         [string] $DotNetPath = ''
     )
 
+    $WhatIfPreference = $false
+    $ConfirmPreference = 'None'
     if (-not $DotNetPath) {
         $DotNetPath = Get-DemoDotNetPath
     }

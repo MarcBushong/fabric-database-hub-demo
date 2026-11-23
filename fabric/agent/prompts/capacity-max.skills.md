@@ -38,7 +38,7 @@ Using the telemetry agent instructions, adapt sample query 3 to resource group {
 ### 2. One target, CPU and storage
 
 ```text
-For {incidentWindow} on {target}, adapt sample query 4 for CPU in 1-minute bins and sample query 5 for the top waits with their signal-wait share. Then write a KQL query on SqlServerStorageIO, following the rule for cumulative counters, for the ContosoCare data file's read and write deltas, stalls, and queued read stalls. If {target} is an Azure SQL database, don't compute per-file latency. Don't change anything.
+For {incidentWindow} on {target}, adapt sample query 4 for CPU in 1-minute bins and sample query 5 for the top waits with their signal-wait share. Then write a KQL query on SqlServerStorageIO, following the rule for cumulative counters, for the ContosoCare data file's read and write deltas, stalls, and queued read stalls. On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed: an Azure SQL database can report two files under one FileID. If {target} is an Azure SQL database, don't compute per-file latency. Don't change anything.
 ```
 
 ### 3. Baseline compared with the incident

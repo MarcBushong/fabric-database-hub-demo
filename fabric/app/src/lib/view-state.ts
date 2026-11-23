@@ -2,6 +2,7 @@
 // Inside the Fabric portal the app runs in a frame without its own address bar, so the state lives in the app (and in
 // the frame's hash for reloads), and the last view is remembered per browser.
 
+import { DEFAULT_RCA_FILTERS, RCA_CATEGORY_IDS, RCA_FACET_TARGETS, RCA_GROUPS, RCA_NEWEST_MINUTES, RCA_SEVERITY_IDS, RCA_SORTS, type RcaFilters, type RcaNewest, type RcaWindow } from "../rca/facet-ids";
 import type { DateWindow } from "./dax";
 
 export type PageId = "mission" | "overview" | "estate" | "performance" | "incidents" | "rca" | "scoreboard" | "replay" | "findings" | "readiness" | "trends" | "manage" | "links" | "kiosk";
@@ -33,6 +34,8 @@ export interface ViewState {
     category: FindingsTab | null;
     /** The session (or lone incident request) Mission Control, the scoreboard, the replay, and the kiosk are about, by its Scenario Runs request ID; null for the latest. */
     session: string | null;
+    /** The Root cause page's filters (ADR 0031, section 7): its facets, the minutes it reads, and its grouping and order; null for its defaults. */
+    rcaFilters: RcaFilters | null;
 }
 
 export interface PageInfo {
@@ -75,6 +78,7 @@ export const DEFAULT_VIEW: ViewState = {
     replay: null,
     category: null,
     session: null,
+    rcaFilters: null,
 };
 
 const PAGE_IDS = new Set<PageId>([...PAGES.map((p) => p.id), "kiosk"]);
@@ -103,6 +107,65 @@ function decode(text: string): string {
     }
 }
 
+const STAMP = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/;
+const stamp = (d: Date) => d.toISOString().replace(/[-:]/g, "").replace(/\.\d{3}Z$/, "Z");
+const fromStamp = (text: string): Date | null => {
+    const m = STAMP.exec(text);
+    if (!m) return null;
+    const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +m[6]));
+    return Number.isFinite(d.getTime()) ? d : null;
+};
+/** The Root cause page's windows in its address: the newest minutes ("90m", "6h", "24h"), or two times ("20261117T140000Z.20261117T153000Z"). */
+const NEWEST_PARAM: Record<RcaNewest, string> = { 90: "90m", 360: "6h", 1440: "24h" };
+
+function windowParam(w: RcaWindow): string {
+    return "newest" in w ? NEWEST_PARAM[w.newest] : `${stamp(w.from)}.${stamp(w.to)}`;
+}
+
+function parseWindow(text: string | null): RcaWindow | undefined {
+    if (!text) return undefined;
+    const newest = RCA_NEWEST_MINUTES.find((n) => NEWEST_PARAM[n] === text);
+    if (newest) return { newest };
+    const [a, b, rest] = text.split(".");
+    const from = a ? fromStamp(a) : null;
+    const to = b ? fromStamp(b) : null;
+    return rest === undefined && from && to && to > from ? { from, to } : undefined;
+}
+
+/** Reads the Root cause page's filters from its address's query (cat, sev, tg, win, group, sort), or null without any. */
+function parseRcaFilters(params: URLSearchParams): RcaFilters | null {
+    const list = <T extends string>(key: string, allowed: readonly T[]): T[] | undefined => {
+        if (!params.has(key)) return undefined;
+        const given = (params.get(key) ?? "").split(",");
+        return allowed.filter((v) => given.includes(v));
+    };
+    const parsed: Partial<RcaFilters> = {};
+    const categories = list("cat", RCA_CATEGORY_IDS);
+    if (categories) parsed.categories = categories;
+    const severities = list("sev", RCA_SEVERITY_IDS);
+    if (severities) parsed.severities = severities;
+    const targets = list("tg", RCA_FACET_TARGETS);
+    if (targets) parsed.targets = targets;
+    const window = parseWindow(params.get("win"));
+    if (window) parsed.window = window;
+    const group = pick(params.get("group"), new Set(RCA_GROUPS));
+    if (group) parsed.group = group;
+    const sort = pick(params.get("sort"), new Set(RCA_SORTS));
+    if (sort) parsed.sort = sort;
+    return Object.keys(parsed).length ? { ...DEFAULT_RCA_FILTERS, ...parsed } : null;
+}
+
+/** Writes the Root cause page's filters that aren't its defaults. */
+function writeRcaFilters(params: URLSearchParams, f: RcaFilters): void {
+    if (f.categories.length) params.set("cat", f.categories.join(","));
+    if (f.severities.length) params.set("sev", f.severities.join(","));
+    if (f.targets.length) params.set("tg", f.targets.join(","));
+    const window = windowParam(f.window);
+    if (window !== windowParam(DEFAULT_RCA_FILTERS.window)) params.set("win", window);
+    if (f.group !== DEFAULT_RCA_FILTERS.group) params.set("group", f.group);
+    if (f.sort !== DEFAULT_RCA_FILTERS.sort) params.set("sort", f.sort);
+}
+
 /** Reads `#/estate/T3?t=T1,T3&w=30d` or `#/incidents/<key>?r=4`. Unknown or invalid values are dropped. */
 export function parseHash(hash: string): Partial<ViewState> {
     const text = hash.replace(/^#\/?/, "");
@@ -128,6 +191,10 @@ export function parseHash(hash: string): Partial<ViewState> {
     if (session && INCIDENT_KEY.test(session)) out.session = session;
     const replay = Number(params.get("r"));
     if (params.has("r") && Number.isInteger(replay) && replay >= 0 && replay < 10000) out.replay = replay;
+    if (page === "rca") {
+        const rcaFilters = parseRcaFilters(params);
+        if (rcaFilters) out.rcaFilters = rcaFilters;
+    }
     return out;
 }
 
@@ -142,6 +209,7 @@ export function toHash(state: ViewState): string {
     else if (state.incident) params.set("i", state.incident);
     if (state.session) params.set("s", state.session);
     if (state.replay !== null) params.set("r", String(state.replay));
+    if (state.page === "rca" && state.rcaFilters) writeRcaFilters(params, state.rcaFilters);
     const query = params.toString();
     return `#/${path}${query ? `?${query}` : ""}`;
 }
