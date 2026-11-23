@@ -2,7 +2,7 @@ import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
-import { webDarkTheme, webLightTheme } from "@fluentui/react-components";
+import { teamsHighContrastTheme, webDarkTheme, webLightTheme } from "@fluentui/react-components";
 
 import { DBHUB_BASE, LIVE_NO_SCOPE, LIVE_REFUSED, readEstate } from "../../rayfin/functions/src/estate-core";
 import { MAX_CONTEXT_ROWS } from "@/copilot/contract";
@@ -17,11 +17,20 @@ import { parameterCellText } from "@/lib/manage-client";
 import { profileLabel, SCENARIOS } from "@/lib/scenarios";
 import { weekOverWeek } from "@/lib/trends";
 import { DEFAULT_VIEW, mergeView, parseHash, replaceAddress, toHash } from "@/lib/view-state";
-import { APP_TOKENS, contrastRatio, FABRIC_BRAND, FLUENT_THEMES, loadThemeChoice, resolveTheme, type ThemeId } from "@/theme/fluent";
-import { APP_BRAND, MICROSOFT_ACCENTS, MICROSOFT_BRAND, MICROSOFT_LOGO } from "@/theme/identity";
+import { closestPair, VISIONS } from "@/test/color-vision";
+import { APP_TOKENS, applyAppTokens, contrastRatio, FABRIC_BRAND, FLUENT_THEMES, loadThemeChoice, luminance, resolveTheme, type ThemeId } from "@/theme/fluent";
+import { APP_BRAND, EARTH_ACCENTS, MICROSOFT_BRAND, TERRACOTTA_BRAND } from "@/theme/identity";
 import { STAGE_TOKENS, stageStyle, stageTheme } from "@/theme/stage";
 
 describe("themes", () => {
+    const warm = { light: FLUENT_THEMES.light, dark: FLUENT_THEMES.dark };
+    // The solid colors text and controls sit on: cards, navigation, the page, and the darker panels (a stage panel in light).
+    const SURFACES = {
+        light: [warm.light.colorNeutralBackground1, warm.light.colorNeutralBackground2, warm.light.colorNeutralBackground3, warm.light.colorNeutralBackground4],
+        dark: [warm.dark.colorNeutralBackground1, warm.dark.colorNeutralBackground2, warm.dark.colorNeutralBackground3, warm.dark.colorNeutralBackground6],
+    };
+    const token = (id: "light" | "dark", name: string) => (warm[id] as unknown as Record<string, string>)[name] ?? `no ${name}`;
+
     it("keeps every status color readable (4.5:1) and every target and chart color visible (3:1) on each surface", () => {
         for (const [id, tokens] of Object.entries(APP_TOKENS)) {
             for (const surface of tokens.surfaces) {
@@ -31,13 +40,91 @@ describe("themes", () => {
         }
     });
 
-    it("keeps the brand's links readable on the light and dark themes' surfaces", () => {
-        expect(contrastRatio(FLUENT_THEMES.light.colorBrandForeground1, "#FFFFFF")).toBeGreaterThanOrEqual(4.5);
-        expect(contrastRatio(FLUENT_THEMES.light.colorBrandForegroundLink, "#FFFFFF")).toBeGreaterThanOrEqual(4.5);
-        expect(contrastRatio(FLUENT_THEMES.dark.colorBrandForeground1, "#292929")).toBeGreaterThanOrEqual(4.5);
-        expect(contrastRatio(FLUENT_THEMES.dark.colorBrandForegroundLink, "#292929")).toBeGreaterThanOrEqual(4.5);
-        expect(contrastRatio("#FFFFFF", FLUENT_THEMES.light.colorBrandBackground)).toBeGreaterThanOrEqual(4.5);
-        expect(contrastRatio("#FFFFFF", FLUENT_THEMES.dark.colorBrandBackground)).toBeGreaterThanOrEqual(4.5);
+    it("keeps Fluent's text, links, buttons, inputs, and focus ring at WCAG 2.2 AA on the warm surfaces", () => {
+        for (const id of ["light", "dark"] as const) {
+            const all = SURFACES[id];
+            for (const name of ["colorNeutralForeground1", "colorNeutralForeground2", "colorNeutralForeground3", "colorBrandForeground1", "colorBrandForegroundLink", "colorBrandForegroundLinkHover"]) {
+                for (const surface of all) expect(contrastRatio(token(id, name), surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(4.5);
+            }
+            // Hints and placeholders sit on cards, the navigation, and the page.
+            for (const surface of all.slice(0, 3)) expect(contrastRatio(token(id, "colorNeutralForeground4"), surface), `${id} foreground 4 on ${surface}`).toBeGreaterThanOrEqual(4.5);
+            for (const name of ["colorNeutralStrokeAccessible", "colorStrokeFocus2", "colorCompoundBrandForeground1", "colorCompoundBrandStroke"]) {
+                for (const surface of all) expect(contrastRatio(token(id, name), surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(3);
+            }
+            for (const fill of ["colorBrandBackground", "colorBrandBackgroundHover", "colorBrandBackgroundPressed", "colorBrandBackgroundSelected"]) {
+                expect(contrastRatio(token(id, "colorNeutralForegroundOnBrand"), token(id, fill)), `${id} button text on ${fill}`).toBeGreaterThanOrEqual(4.5);
+            }
+        }
+    });
+
+    it("puts cream and ivory where white was, and espresso where near-black was, with softer but AAA body text (the owner, 2026-11-23)", () => {
+        const PURE_GRAY = /^#([0-9a-f]{2})\1\1$/i;
+        const GRAY_RGBA = /rgba\((\d{1,3}),\s*\1,\s*\1,/;
+        const warmish = (hex: string) => parseInt(hex.slice(1, 3), 16) > parseInt(hex.slice(5, 7), 16);
+        for (const id of ["light", "dark"] as const) {
+            // Every gray Fluent uses, its hover, pressed, selected, and disabled states included, takes a warm color.
+            const grays = Object.entries(warm[id]).filter(([, value]) => typeof value === "string" && (PURE_GRAY.test(value) || GRAY_RGBA.test(value) || /rgba\(0,\s*0,\s*0,/.test(value)));
+            expect(grays, `${id}: Fluent grays left`).toEqual([]);
+            for (const name of ["colorNeutralBackground1", "colorNeutralBackground3", "colorNeutralForeground1", "colorNeutralStroke2"]) expect(warmish(token(id, name)), `${id} ${name} is warm`).toBe(true);
+        }
+        expect(warm.light.colorNeutralBackground1.toUpperCase()).not.toBe("#FFFFFF");
+        expect(warm.dark.colorNeutralForeground1.toUpperCase()).not.toBe("#FFFFFF");
+        // Softer: body text stays above AAA's 7:1 but well under Fluent's 15.5:1 (light) and 14.5:1 (dark) on a card.
+        for (const id of ["light", "dark"] as const) {
+            const body = contrastRatio(token(id, "colorNeutralForeground1"), token(id, "colorNeutralBackground1"));
+            expect(body, `${id} body text on a card`).toBeGreaterThanOrEqual(7);
+            expect(body, `${id} body text on a card`).toBeLessThanOrEqual(12.5);
+        }
+        // Dark surfaces a step lighter than Fluent's near-black.
+        expect(luminance(warm.dark.colorNeutralBackground3)).toBeGreaterThan(luminance(webDarkTheme.colorNeutralBackground3));
+        expect(luminance(warm.dark.colorNeutralBackground1)).toBeGreaterThan(luminance(webDarkTheme.colorNeutralBackground1));
+    });
+
+    it("colors message bars and badges in the same earth tones, each readable on its own fill", () => {
+        for (const id of ["light", "dark"] as const) {
+            for (const family of ["Danger", "Warning", "Success"]) {
+                const fill = token(id, `colorStatus${family}Background1`);
+                expect(contrastRatio(token(id, "colorNeutralForeground1"), fill), `${id} ${family} message text`).toBeGreaterThanOrEqual(4.5);
+                expect(contrastRatio(token(id, `colorStatus${family}Foreground1`), fill), `${id} ${family} foreground 1`).toBeGreaterThanOrEqual(4.5);
+                expect(contrastRatio(token(id, `colorStatus${family}Foreground3`), fill), `${id} ${family} icon`).toBeGreaterThanOrEqual(3);
+                expect(token(id, `colorStatus${family}Background3`).toLowerCase(), `${id} ${family} is the app's`).not.toBe((id === "light" ? webLightTheme : webDarkTheme)[`colorStatus${family}Background3` as "colorStatusDangerBackground3"].toLowerCase());
+            }
+            // Fluent's badges (useBadgeStyles): tint, filled, and outline, in red, dark orange, green, and yellow.
+            for (const color of ["Red", "DarkOrange", "Green", "Yellow"]) {
+                expect(contrastRatio(token(id, `colorPalette${color}Foreground1`), token(id, `colorPalette${color}Background1`)), `${id} ${color} tint badge`).toBeGreaterThanOrEqual(4.5);
+                const filledText = color === "Yellow" ? "colorNeutralForeground1Static" : "colorNeutralForegroundOnBrand";
+                expect(contrastRatio(token(id, filledText), token(id, `colorPalette${color}Background3`)), `${id} ${color} filled badge`).toBeGreaterThanOrEqual(4.5);
+                const outline = color === "Yellow" ? "colorPaletteYellowForeground2" : `colorPalette${color}Foreground3`;
+                for (const surface of SURFACES[id]) expect(contrastRatio(token(id, outline), surface), `${id} ${color} outline badge on ${surface}`).toBeGreaterThanOrEqual(4.5);
+            }
+        }
+    });
+
+    it("tells the four statuses apart under protanopia, deuteranopia, and tritanopia too, by lightness as well as hue", () => {
+        for (const id of ["light", "dark"] as const) {
+            const text = APP_TOKENS[id].text;
+            const statuses = { Fail: text["--status-fail"], Warning: text["--status-warning"], Pass: text["--status-pass"], Manual: text["--status-manual"] };
+            for (const vision of VISIONS) {
+                const { pair, distance } = closestPair(statuses, vision);
+                expect(distance, `${id}, ${vision}: ${pair}`).toBeGreaterThanOrEqual(vision === "normal" ? 0.12 : 0.09);
+            }
+        }
+    });
+
+    it("keeps each target's mark its own under every color vision, and the charts' eight categories apart", () => {
+        for (const id of ["light", "dark"] as const) {
+            const graphic = APP_TOKENS[id].graphic;
+            const targets = Object.fromEntries(Object.entries(graphic).filter(([name]) => name.startsWith("--target-")));
+            expect(Object.keys(targets)).toHaveLength(6);
+            for (const vision of VISIONS) {
+                const { pair, distance } = closestPair(targets, vision);
+                expect(distance, `${id}, ${vision}: ${pair}`).toBeGreaterThanOrEqual(vision === "normal" ? 0.1 : 0.07);
+            }
+            const charts = Object.fromEntries(Object.entries(graphic).filter(([name]) => name.startsWith("--chart-")));
+            expect(Object.keys(charts)).toHaveLength(8);
+            const { pair, distance } = closestPair(charts, "normal");
+            expect(distance, `${id} charts: ${pair}`).toBeGreaterThanOrEqual(0.06);
+        }
     });
 
     it("keeps the navigation's hovered and selected page readable in every theme, high contrast included", () => {
@@ -90,40 +177,36 @@ describe("themes", () => {
         expect([value("forced-color-adjust"), value("box-shadow"), value("outline-color")]).toEqual(["none", "none", "CanvasText"]);
     });
 
-    it("uses Fluent 2's Microsoft blue as the brand, not Fabric's teal, from one set of tokens (ADR 0030, the owner's choice)", () => {
-        expect(APP_BRAND).toBe(MICROSOFT_BRAND);
-        // The same ramp Fluent's own web themes are made from: their brand tokens come out the same.
-        for (const token of ["colorBrandBackground", "colorBrandBackgroundHover", "colorBrandForeground1", "colorBrandForegroundLink", "colorBrandStroke1"] as const) {
-            expect(FLUENT_THEMES.light[token].toLowerCase(), token).toBe(webLightTheme[token].toLowerCase());
-        }
-        expect(FLUENT_THEMES.dark.colorBrandBackground.toLowerCase()).toBe(webDarkTheme.colorBrandBackground.toLowerCase());
-        expect(FLUENT_THEMES.light.colorBrandBackground).not.toBe(FABRIC_BRAND[80]);
+    it("uses terracotta as the brand, not Microsoft blue or Fabric's teal, from one set of tokens, and leaves high contrast Fluent's own (the owner's choice, 2026-11-23)", () => {
+        expect(APP_BRAND).toBe(TERRACOTTA_BRAND);
+        expect(FLUENT_THEMES.light.colorBrandBackground).toBe(TERRACOTTA_BRAND[80]);
+        expect(FLUENT_THEMES.light.colorBrandForegroundLink).toBe(TERRACOTTA_BRAND[70]);
+        expect(FLUENT_THEMES.dark.colorBrandBackground).toBe(TERRACOTTA_BRAND[70]);
+        expect(FLUENT_THEMES.dark.colorBrandForegroundLink).toBe(TERRACOTTA_BRAND[120]);
+        for (const other of [MICROSOFT_BRAND[80], FABRIC_BRAND[80]]) expect(FLUENT_THEMES.light.colorBrandBackground).not.toBe(other);
+        // Neither the warm grays nor the earth-toned statuses reach high contrast.
+        expect(FLUENT_THEMES.contrast).toBe(teamsHighContrastTheme);
     });
 
-    it("marks T1 to T4 and the charts' first four categories with the Microsoft logo's colors, as they are on dark surfaces", () => {
-        expect(MICROSOFT_ACCENTS.dark).toMatchObject(MICROSOFT_LOGO);
+    it("marks each target and the charts' categories with the earth accents: slate, moss, ochre, and clay first", () => {
         for (const id of ["light", "dark"] as const) {
-            const accents = MICROSOFT_ACCENTS[id];
+            const a = EARTH_ACCENTS[id];
             const graphic = APP_TOKENS[id].graphic;
-            const logo = [accents.blue, accents.green, accents.yellow, accents.red];
-            expect(["--target-t1", "--target-t2", "--target-t3", "--target-t4"].map((t) => graphic[t]), `${id} targets`).toEqual(logo);
-            expect(["--chart-1", "--chart-2", "--chart-3", "--chart-4"].map((t) => graphic[t]), `${id} charts`).toEqual(logo);
-            // Each target and category its own color, so no two series share one.
-            const targets = Object.entries(graphic).filter(([name]) => name.startsWith("--target-"));
-            expect(new Set(targets.map(([, color]) => color.toLowerCase())).size, `${id} targets`).toBe(targets.length);
+            expect(["--target-t1", "--target-t2", "--target-t3", "--target-t4", "--target-t5", "--target-t4r"].map((t) => graphic[t]), `${id} targets`).toEqual([a.slate, a.moss, a.ochre, a.clay, a.plum, a.verdigris]);
+            expect(Array.from({ length: 8 }, (_, i) => graphic[`--chart-${i + 1}`]), `${id} charts`).toEqual([a.slate, a.moss, a.ochre, a.clay, a.plum, a.verdigris, a.stone, a.rose]);
         }
     });
 
-    it("layers the stage on Fluent's own neutrals and shadows: a panel a layer above the stage, with Fluent's shadow under it", () => {
-        const lower = (tokens: Record<string, string>) => Object.fromEntries(Object.entries(tokens).map(([k, v]) => [k, v.toLowerCase()]));
-        expect(lower(STAGE_TOKENS.dark.surfaces)).toEqual({ "--stage-bg": webDarkTheme.colorNeutralBackground3, "--stage-panel": webDarkTheme.colorNeutralBackground2, "--stage-panel-2": webDarkTheme.colorNeutralBackground1 });
-        expect(lower(STAGE_TOKENS.light.surfaces)).toEqual({ "--stage-bg": webLightTheme.colorNeutralBackground3, "--stage-panel": webLightTheme.colorNeutralBackground1, "--stage-panel-2": webLightTheme.colorNeutralBackground4 });
-        expect(STAGE_TOKENS.dark.decor["--stage-shadow"]).toBe(webDarkTheme.shadow8);
-        expect(STAGE_TOKENS.light.decor["--stage-shadow"]).toBe(webLightTheme.shadow8);
+    it("layers the stage on the app's warm neutrals and shadows: a panel a layer above the stage, with the theme's shadow under it", () => {
+        const { light, dark } = FLUENT_THEMES;
+        expect(STAGE_TOKENS.dark.surfaces).toEqual({ "--stage-bg": dark.colorNeutralBackground3, "--stage-panel": dark.colorNeutralBackground2, "--stage-panel-2": dark.colorNeutralBackground1 });
+        expect(STAGE_TOKENS.light.surfaces).toEqual({ "--stage-bg": light.colorNeutralBackground3, "--stage-panel": light.colorNeutralBackground1, "--stage-panel-2": light.colorNeutralBackground4 });
+        expect(STAGE_TOKENS.dark.decor["--stage-shadow"]).toBe(dark.shadow8);
+        expect(STAGE_TOKENS.light.decor["--stage-shadow"]).toBe(light.shadow8);
         expect(STAGE_TOKENS.contrast.decor["--stage-shadow"]).toBe("none");
-        // The stage's accent is the brand's own blue, the one buttons and links use.
-        expect(STAGE_TOKENS.light.text["--stage-accent-ink"]).toBe(MICROSOFT_BRAND[80]);
-        expect(STAGE_TOKENS.dark.graphic["--stage-accent"]).toBe(MICROSOFT_BRAND[100]);
+        // The stage's ink is the theme's own text.
+        expect(STAGE_TOKENS.light.text["--stage-ink"]).toBe(light.colorNeutralForeground1);
+        expect(STAGE_TOKENS.dark.text["--stage-ink"]).toBe(dark.colorNeutralForeground1);
     });
 
     it("keeps the stage's text readable (4.5:1) and its marks visible (3:1), with the app's own tokens on it, in every theme", () => {
@@ -136,6 +219,50 @@ describe("themes", () => {
                 for (const [name, color] of Object.entries(graphic)) expect(contrastRatio(color, surface), `${id} ${name} on ${surface}`).toBeGreaterThanOrEqual(3);
             }
         }
+    });
+
+    it("keeps the stage's calm accent and its alert apart, for every color vision", () => {
+        for (const id of ["light", "dark"] as const) {
+            const g = STAGE_TOKENS[id].graphic;
+            for (const vision of VISIONS) {
+                const { distance } = closestPair({ accent: g["--stage-accent"], alert: g["--stage-alert"] }, vision);
+                expect(distance, `${id}, ${vision}`).toBeGreaterThanOrEqual(0.08);
+            }
+        }
+    });
+
+    it("keeps the Copilot mark's glyph visible on both ends of its fill, and high contrast's mark as it was", () => {
+        for (const [id, tokens] of Object.entries(APP_TOKENS)) {
+            const stops = tokens.decor["--copilot-mark"].match(/#[0-9a-f]{6}/gi) ?? [];
+            expect(stops, `${id} stops`).toHaveLength(2);
+            for (const stop of stops) expect(contrastRatio(tokens.decor["--copilot-mark-ink"], stop), `${id} glyph on ${stop}`).toBeGreaterThanOrEqual(3);
+        }
+        expect(APP_TOKENS.contrast.decor["--copilot-mark"]).toBe("linear-gradient(135deg, #8A3FFC 0%, #0F6CBD 100%)");
+    });
+
+    it("colors every stylesheet from the theme only: no literal color outside forced colors, and every app and stage token defined in every theme", () => {
+        const files = [["styles", "app.css"], ["mission", "mission.css"], ["rca", "view", "rca.css"], ["copilot", "copilot-dock.css"], ["visuals", "chart-view.css"]];
+        for (const parts of files) {
+            const css = readFileSync(join(process.cwd(), "src", ...parts), "utf8").replace(/@media \(forced-colors: active\) \{[\s\S]*?\n\}/g, "");
+            expect(css.match(/#[0-9a-f]{3,8}\b|\brgba?\(|\bhsla?\(/gi), parts.join("/")).toBeNull();
+            const used = [...new Set([...css.matchAll(/var\((--(?:status|target|chart|copilot|stage)-[a-z0-9-]+)\)/g)].map((m) => m[1]))];
+            for (const id of ["light", "dark", "contrast"] as const) {
+                const app = { ...APP_TOKENS[id].text, ...APP_TOKENS[id].graphic, ...APP_TOKENS[id].decor };
+                const stage = STAGE_TOKENS[id];
+                const defined = { ...app, ...stage.surfaces, ...stage.text, ...stage.graphic, ...stage.decor };
+                for (const name of used) expect(defined[name], `${parts.join("/")}: ${name} in ${id}`).toBeTruthy();
+            }
+        }
+    });
+
+    it("sets the app's tokens, the chart band and the Copilot mark included, on <html> and on a stage", () => {
+        const root = document.createElement("div");
+        applyAppTokens("dark", root);
+        expect(root.dataset.theme).toBe("dark");
+        for (const [name, value] of Object.entries({ ...APP_TOKENS.dark.text, ...APP_TOKENS.dark.graphic, ...APP_TOKENS.dark.decor })) expect(root.style.getPropertyValue(name), name).toBe(value);
+        const style = stageStyle("light", APP_TOKENS.light) as Record<string, string>;
+        expect(style["--chart-band"]).toBe(APP_TOKENS.light.decor["--chart-band"]);
+        expect(style["--chart-band-ink"]).toBe(APP_TOKENS.light.text["--chart-band-ink"]);
     });
 
     it("makes the stage dark until the viewer picks a theme, and keeps a picked theme and high contrast", () => {
@@ -162,7 +289,6 @@ describe("themes", () => {
         expect(Object.keys(FLUENT_THEMES).sort()).toEqual([...ids].sort());
     });
 });
-
 describe("view state", () => {
     it("round-trips drill-downs and the filter through the hash", () => {
         const view = mergeView({ page: "estate", target: "T3", targets: ["T1", "T3"], window: "30d" });
