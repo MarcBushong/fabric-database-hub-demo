@@ -3,7 +3,7 @@
   "id": "replica-lag",
   "title": "Read replica lag",
   "service": "reporting-jobs",
-  "summary": "A reporting query on T4's read replica (ContosoCare.Demo/replica-lag/<run>) reads demo.replica_lag_marks and holds its lock for holdSeconds, while T4 takes an ACCESS EXCLUSIVE lock on that table once, in a short transaction, and keeps committing small marks. Replaying that lock on the replica waits for the report, up to max_standby_streaming_delay, so Read Replica Lag climbs to about holdSeconds, then drops when the report ends. It repeats in cycles until the run ends. PostgreSQL (T4) with its read replica only.",
+  "summary": "A reporting query on T4's read replica (ContosoCare.Demo/reporting-jobs/<run>) reads demo.replica_lag_marks and holds its lock for holdSeconds, while T4 takes an ACCESS EXCLUSIVE lock on that table once, in a short transaction, and keeps committing small marks. Replaying that lock on the replica waits for the report, up to max_standby_streaming_delay, so Read Replica Lag climbs to about holdSeconds, then drops when the report ends. It repeats in cycles until the run ends. PostgreSQL (T4) with its read replica only.",
   "orchestration": "workers",
   "procedure": "reporting.usp_publish_feed_checkpoint",
   "duration": { "defaultSeconds": 600, "maxSeconds": 900 },
@@ -27,7 +27,7 @@
   ],
   "expectedSymptoms": [
     "The replica stops replaying while the report runs: the time since its last replayed transaction grows by a second every second",
-    "The replica's startup process waits on a relation lock (Lock:relation) that the ContosoCare.Demo/replica-lag report holds",
+    "The replica's startup process waits on a relation lock (Lock:relation) that the ContosoCare.Demo/reporting-jobs report holds",
     "T4 keeps committing marks, so the WAL the replica has received but not replayed grows",
     "When the report ends, or recovery cancels it at max_standby_streaming_delay (SQLSTATE 40001), replay catches up within seconds and the lag drops"
   ],

@@ -33,7 +33,7 @@
   ],
   "queryLevelEvidence": [
     "sys.dm_io_virtual_file_stats for the log file: writes and write stall (needs VIEW SERVER STATE)",
-    "sys.dm_exec_requests: wait_type WRITELOG on the ContosoCare.Demo/log-flush-waits sessions"
+    "sys.dm_exec_requests: wait_type WRITELOG on the ContosoCare.Demo/checkin-kiosk sessions"
   ],
   "reset": "Each session deletes its rows when it ends; auto-cleanup and reset truncate demo.commit_scratch. Business data is never touched."
 }

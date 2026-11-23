@@ -24,7 +24,7 @@
   "expectedHubSignals": [
     { "signal": "SqlServerWaitStats: Network IO wait category (ASYNC_NETWORK_IO), one long wait per session", "surface": "Performance" },
     { "signal": "SqlServerPerformanceCountersCommon: SQL Attention rate above 0 when the runner cancels a query", "surface": "Performance" },
-    { "signal": "SqlServerActiveSessions: the ContosoCare.Demo/slow-consumer sessions running for minutes", "surface": "Performance" }
+    { "signal": "SqlServerActiveSessions: the ContosoCare.Demo/records-archive sessions running for minutes", "surface": "Performance" }
   ],
   "expectedSymptoms": [
     "ASYNC_NETWORK_IO dominating the waits while the server itself is mostly idle",
@@ -32,7 +32,7 @@
     "An attention per cancelled query"
   ],
   "queryLevelEvidence": [
-    "sys.dm_exec_requests: wait_type ASYNC_NETWORK_IO on the ContosoCare.Demo/slow-consumer sessions (needs VIEW SERVER STATE or VIEW DATABASE STATE)",
+    "sys.dm_exec_requests: wait_type ASYNC_NETWORK_IO on the ContosoCare.Demo/records-archive sessions (needs VIEW SERVER STATE or VIEW DATABASE STATE)",
     "The runner's run outcome: rows read, queries, and cancellations per session"
   ],
   "reset": "Read-only: nothing to undo. The runner cancels its queries and closes its sessions; reset kills any that remain."

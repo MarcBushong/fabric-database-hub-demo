@@ -22,7 +22,7 @@
   "expectedHubSignals": [
     { "signal": "SqlServerPerformanceCountersCommon: Batch Requests/sec and Transactions/sec steady", "surface": "Performance" },
     { "signal": "SqlServerCPUUtilization low and flat", "surface": "Performance" },
-    { "signal": "SqlServerActiveSessions: a few ContosoCare.Demo/healthy-baseline sessions, none blocked", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: a few ContosoCare.Demo/careportal-api sessions, none blocked", "surface": "Performance" },
     { "signal": "No Database Agent finding for the target", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." },
     { "signal": "T4: CPU (cpu_percent) and Connections (active_connections) low and flat", "surface": "Performance", "note": "Database Hub's PostgreSQL dashboard (Azure Monitor metrics; Hub has no query-level data for PostgreSQL)." },
     { "signal": "T5: Normalized RU consumption low and flat; Total requests steady, with no 429s", "surface": "Performance", "note": "Database Hub's Cosmos DB view shows Azure Monitor metrics: NormalizedRUConsumption, and TotalRequests split by StatusCode." }

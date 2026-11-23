@@ -82,8 +82,8 @@ public sealed class RcaObserverTests
         Assert.Equal("X", head.Get("lock_mode_held"));
         Assert.Null(head.Get("lock_mode_wanted"));
         Assert.Equal(1, head.Get("open_transactions"));
-        Assert.Equal("demo.usp_scenario_chain_acquire;1", head.Get("input_buffer"));
-        Assert.Equal("[demo].[usp_scenario_chain_acquire]", head.Get("module_name"));
+        Assert.Equal("scheduling.usp_assign_work_item;1", head.Get("input_buffer"));
+        Assert.Equal("[scheduling].[usp_assign_work_item]", head.Get("module_name"));
         Assert.Equal("NT AUTHORITY\\SYSTEM", head.Get("login_name"));
         Assert.Equal("SQLVM01", head.Get("host_name"));
         Assert.Equal("ContosoCare.Demo", head.Get("program_name"));
@@ -120,7 +120,7 @@ public sealed class RcaObserverTests
             Assert.Equal("[care].[appointments]", e.Get("object_name"));
             Assert.Equal("X", e.Get("lock_mode"));
             Assert.Equal(71L, e.Get("session_id"));
-            Assert.Equal("[demo].[usp_scenario_chain_escalate]", e.Get("module_name"));
+            Assert.Equal("[scheduling].[usp_bulk_reschedule]", e.Get("module_name"));
             Assert.Equal("Lock threshold: 6,248 locks escalated to an X lock on the table.", e.Get("detail"));
         });
 
@@ -131,7 +131,7 @@ public sealed class RcaObserverTests
             Assert.Equal("1222", e.Get("code"));
             Assert.Equal(16, e.Get("severity"));
             Assert.Equal(true, e.Get("intercepted"));
-            Assert.Equal("[demo].[usp_scenario_chain_link]", e.Get("module_name"));
+            Assert.Equal("[scheduling].[usp_route_work_item]", e.Get("module_name"));
             Assert.Equal("Lock request time out period exceeded.", e.Get("detail"));
             Assert.Equal("ContosoCare.Demo", e.Get("program_name"));
         });
@@ -367,7 +367,7 @@ public sealed class RcaObserverTests
         var clock = new ManualTime(T1From);
         static string Graph(string database, string app) =>
             "<deadlock><victim-list><victimProcess id=\"p2\"/></victim-list><process-list>" +
-            $"<process id=\"p1\" spid=\"81\" lockMode=\"U\" waitresource=\"KEY: 5:72057594045071360 (aa11)\" clientapp=\"{app}\" hostname=\"SQLVM01\" loginname=\"NT AUTHORITY\\SYSTEM\" currentdb=\"5\" currentdbname=\"{database}\"><executionStack><frame procname=\"ContosoCare.demo.usp_transfer\" line=\"12\">UPDATE care.inventory SET qty = qty - 1 WHERE id = 42</frame></executionStack><inputbuf>Proc [Database Id = 5 Object Id = 1]</inputbuf></process>" +
+            $"<process id=\"p1\" spid=\"81\" lockMode=\"U\" waitresource=\"KEY: 5:72057594045071360 (aa11)\" clientapp=\"{app}\" hostname=\"SQLVM01\" loginname=\"NT AUTHORITY\\SYSTEM\" currentdb=\"5\" currentdbname=\"{database}\"><executionStack><frame procname=\"ContosoCare.supply.usp_transfer_stock\" line=\"12\">UPDATE care.inventory SET qty = qty - 1 WHERE id = 42</frame></executionStack><inputbuf>Proc [Database Id = 5 Object Id = 1]</inputbuf></process>" +
             $"<process id=\"p2\" spid=\"82\" lockMode=\"U\" waitresource=\"KEY: 5:72057594045071360 (bb22)\" clientapp=\"SomeTool\" hostname=\"OTHERHOST\" loginname=\"someone\" currentdb=\"5\" currentdbname=\"{database}\"><executionStack><frame procname=\"adhoc\" line=\"1\">UPDATE care.inventory SET qty = 0 WHERE id = 43</frame></executionStack><inputbuf>UPDATE care.inventory SET qty = 0 WHERE id = 43</inputbuf></process>" +
             "</process-list><resource-list>" +
             "<keylock hobtid=\"1\" dbid=\"5\" objectname=\"ContosoCare.care.inventory\" indexname=\"pk_inventory\" mode=\"X\"><owner-list><owner id=\"p1\" mode=\"X\"/></owner-list><waiter-list><waiter id=\"p2\" mode=\"U\" requestType=\"wait\"/></waiter-list></keylock>" +
@@ -395,7 +395,7 @@ public sealed class RcaObserverTests
         var processes = root.GetProperty("processes").EnumerateArray().ToList();
         Assert.Equal("ContosoCare.Demo", processes[0].GetProperty("program").GetString());
         Assert.Equal("de845fccbaba", processes[0].GetProperty("runToken").GetString());
-        Assert.Equal("[demo].[usp_transfer]", processes[0].GetProperty("module").GetString());
+        Assert.Equal("[supply].[usp_transfer_stock]", processes[0].GetProperty("module").GetString());
         Assert.Equal("UPDATE care.inventory SET qty = qty - ? WHERE id = ?", processes[0].GetProperty("statement").GetString());
         Assert.Equal("X", processes[0].GetProperty("holds").GetString());
         Assert.Equal("U", processes[0].GetProperty("wants").GetString());
@@ -487,7 +487,7 @@ public sealed class RcaObserverTests
             Assert.Equal("transactionid", r.Get("lock_resource_type"));
             Assert.Equal("care.work_queues", r.Get("lock_object"));
             Assert.Equal("ExclusiveLock", r.Get("lock_mode_held"));
-            Assert.Equal("demo.usp_scenario_locking_acquire", r.Get("module_name"));
+            Assert.Equal("billing.usp_reprioritize_queue", r.Get("module_name"));
             Assert.Equal("contosocare_runner", r.Get("login_name"));
             Assert.Equal("aefe56d6d1e0", r.Get("run_token"));
         });

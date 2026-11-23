@@ -22,7 +22,7 @@
   "expectedHubSignals": [
     { "signal": "SqlServerCPUUtilization rising toward 100% (problem variant)", "surface": "Performance" },
     { "signal": "SqlServerWaitStats: CPU wait category (SOS_SCHEDULER_YIELD)", "surface": "Performance" },
-    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/cpu-pressure sessions running", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/scheduling-service sessions running", "surface": "Performance" },
     { "signal": "An expensive-query or CPU finding for the target", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." },
     { "signal": "T4: CPU (cpu_percent) at 100%, CPU Credits Remaining (cpu_credits_remaining) falling", "surface": "Performance", "note": "Hub's PostgreSQL dashboard shows CPU; the credits are an Azure Monitor metric (Burstable tier)." }
   ],

@@ -20,7 +20,7 @@
   "parameters": {},
   "expectedHubSignals": [
     { "signal": "SqlServerCPUUtilization and logical reads higher than the baseline", "surface": "Performance" },
-    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/missing-index sessions", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/reporting-jobs sessions", "surface": "Performance" },
     { "signal": "A missing-index or query-tuning finding with the index as the recommended action", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
   ],
   "expectedSymptoms": [

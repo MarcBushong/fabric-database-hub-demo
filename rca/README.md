@@ -59,10 +59,10 @@ T5 has no sentinel in the observer: its 429s and normalized RU are Azure Monitor
 
 What the observer records about who ran a session, so the evidence names nothing the workload planned:
 
-- **`program_name`:** a workload session's application name today is `ContosoCare.Demo/<scenario>/<run>`. The observer keeps only `ContosoCare.Demo`, and keeps any other session's name out entirely (it isn't the workload's). If the workload later uses per-service names ([ADR 0031, Names](../docs/adr/0031-incident-rca.md)), the observer keeps the service name and drops only the run segment. A scenario ID never reaches the evidence.
+- **`program_name`:** a workload session's application name is `ContosoCare.Demo/<service>/<run>`: a client service that several scenarios share, and an opaque run ID that `demo.scenario_runs` maps back (2026-11-23, [ADR 0031, decision 6](../docs/adr/0031-incident-rca.md#2-names); before, the middle segment was the scenario's ID, and an older runner's names still have it). The observer keeps only `ContosoCare.Demo`, and keeps any other session's name out entirely (it isn't the workload's). It drops the service with the run segment, so both forms reduce alike; keeping the service, which names a client app and not a fault, is left for later. A scenario ID never reaches the evidence.
 - **`run_token`:** the first 12 lowercase hex characters of SHA-256 over the UTF-8 bytes of `ContosoCare.RcaRunToken:<run>`, where `<run>` is the run segment. It groups one run's sessions and names nothing; the answer key carries the same token next to the run ID, so grading can check that a blind finding names the injected run's sessions.
 - **`is_demo`:** true for the workload's own sessions, the baseline's and every fault's alike. It decides only whether text, login, and host are kept; rules never use it to tell a fault from the baseline.
-- **Modules and statements** are what the DMVs return (a DBA sees them too). Rules never branch on a name; the blind-detection test checks that detection code contains no procedure-name pattern.
+- **Modules and statements** are what the DMVs return (a DBA sees them too). Since 2026-11-23 the workload's modules are named as a real application's (`[scheduling].[usp_assign_work_item]`), and only the answer key maps them to scenarios (`answerKey.workloadNames` in [blind-detection.json](blind-detection.json)). Rules never branch on a name; the blind-detection test checks that detection code contains no procedure-name pattern and none of those names.
 - **One helper:** in the runner, only `Rca/Observer/ApplicationNames.cs` may know the workload's application-name prefix ([blind-detection.json](blind-detection.json)).
 
 ## The evidence document
@@ -117,7 +117,7 @@ An `rca_events` row of kind `deadlock` from an Extended Events graph carries `de
 
 ```json
 { "victim": 82,
-  "processes": [ { "session": 81, "program": "ContosoCare.Demo", "runToken": "de845fccbaba", "module": "[demo].[usp_x]", "statement": "UPDATE ...", "holds": "X", "wants": "U", "waitResource": "KEY: ..." } ],
+  "processes": [ { "session": 81, "program": "ContosoCare.Demo", "runToken": "de845fccbaba", "module": "[supply].[usp_transfer_stock]", "statement": "UPDATE ...", "holds": "X", "wants": "U", "waitResource": "KEY: ..." } ],
   "resources": [ { "type": "KEY", "object": "[care].[inventory]", "index": "pk_inventory", "mode": "X", "holder": 81, "waiter": 82 } ] }
 ```
 

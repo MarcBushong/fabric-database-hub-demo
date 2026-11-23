@@ -97,7 +97,7 @@ Only Azure's `SkuNotAvailable` for the size an attempt sent, read from the deplo
 
 ### The lag scenario: `replica-lag`
 
-- A bounded T4 scenario (default 10 minutes, at most 15): a `ContosoCare.Demo/replica-lag/<run>` reporting query on the replica reads `demo.replica_lag_marks` and holds its lock for `holdSeconds` (default 240, at most 540); the primary takes an `ACCESS EXCLUSIVE` lock on that table once, in a short transaction, and keeps committing small marks. Replaying the lock waits for the replica's query, up to `max_standby_streaming_delay`, so Read replica lag climbs to about `holdSeconds`, then drops when the query ends ([handling query conflicts](https://www.postgresql.org/docs/current/hot-standby.html#HOT-STANDBY-CONFLICT)).
+- A bounded T4 scenario (default 10 minutes, at most 15): a reporting query on the replica (`ContosoCare.Demo/reporting-jobs/<run>` since 2026-11-23, `ContosoCare.Demo/replica-lag/<run>` before: [ADR 0031, decision 6](0031-incident-rca.md#2-names)) reads `demo.replica_lag_marks` and holds its lock for `holdSeconds` (default 240, at most 540); the primary takes an `ACCESS EXCLUSIVE` lock on that table once, in a short transaction, and keeps committing small marks. Replaying the lock waits for the replica's query, up to `max_standby_streaming_delay`, so Read replica lag climbs to about `holdSeconds`, then drops when the query ends ([handling query conflicts](https://www.postgresql.org/docs/current/hot-standby.html#HOT-STANDBY-CONFLICT)).
 - Only the demo's own table and sessions: the query has a `statement_timeout` before the run's hard deadline, and `stop` and `reset` end the replica's `ContosoCare.Demo/` sessions only. Without a replica, the run is refused with the fix.
 
 ### Cost

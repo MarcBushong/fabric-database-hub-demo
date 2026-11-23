@@ -35,7 +35,7 @@
   ],
   "queryLevelEvidence": [
     "sys.dm_db_resource_stats avg_log_write_percent near 100 on T3",
-    "sys.dm_exec_requests wait_type LOG_RATE_GOVERNOR or WRITELOG for ContosoCare.Demo/log-rate-pressure sessions"
+    "sys.dm_exec_requests wait_type LOG_RATE_GOVERNOR or WRITELOG for ContosoCare.Demo/billing-worker sessions"
   ],
   "reset": "Auto-cleanup and reset truncate demo.log_rate_scratch; business data is never touched."
 }
