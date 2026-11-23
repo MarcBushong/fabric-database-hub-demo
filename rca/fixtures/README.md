@@ -14,7 +14,7 @@ Two evidence documents from one control session of the 2026-11-20 Run all (times
 | [t3-plan-regression.sidecar.json](t3-plan-regression.sidecar.json) | sqlvm01's sidecar 1: T3's Query Store, 16:50 to 17:20. A lookup's plan regressed, and automatic plan correction forced its last good plan |
 | [t4-query-store.sidecar.json](t4-query-store.sidecar.json) | sqlvm01's sidecar 2: T4's Query Store, 17:00 to 17:20, beside t4-replica-lag's chain; 17:15 to 17:20 pending publication |
 | [t4-connection-surge.sidecar.json](t4-connection-surge.sidecar.json) | A save's sidecar outside a control session (no session ID), 2026-11-21 10:00 to 10:20: who held T4's connections during a surge |
-| `*.sidecar-parts.txt` | Each sidecar as the runner prints it: `DBHUBDEMO-RCAS` part lines of its gzip |
+| `*.sidecar-parts.txt` | Each sidecar in `DBHUBDEMO-RCAS` part lines of its gzip, the form the runner prints. The parts are illustrative: the runner's gzip level and number forms (`1980` where these have `1980.0`) give other bytes for the same document. So a test compares decoded documents, never parts' bytes, and the SHA-256s in sidecar-index.json and rca-sidecar.parameter.json are these parts' |
 | [sidecar-index.json](sidecar-index.json) | What `rca sidecar-export` printed after `DBHUBDEMO-RCAS-INDEX` at a save on 2026-11-21 10:25: the surge's sidecar new, the session's two pending |
 | [rca-sidecar.parameter.json](rca-sidecar.parameter.json) | The `RCA_SIDECAR_FILE` document that save staged: every part line of the three |
 | [rca-ack.json](rca-ack.json) | The notebook's acknowledgement of that file: the first sidecar already written by an earlier run, the other two written |

@@ -12,13 +12,13 @@
   "exportedUtc": "2026-11-20T17:22:06.740Z",
   "sequence": 2,
   "final": true,
-  "windowStartUtc": "2026-11-20T17:00:00Z",
-  "windowEndUtc": "2026-11-20T17:20:00Z",
+  "windowStartUtc": "2026-11-20T17:00:00.000Z",
+  "windowEndUtc": "2026-11-20T17:20:00.000Z",
   "targets": [
     "T4",
     "T4-replica"
   ],
-  "epochUtc": "2026-11-20T17:00:00Z",
+  "epochUtc": "2026-11-20T17:00:00.000Z",
   "strings": [
     "T4",
     "contosocare_runner",

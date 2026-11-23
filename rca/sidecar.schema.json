@@ -568,8 +568,9 @@
   },
   "$defs": {
     "utc": {
+      "description": "ISO 8601 UTC with milliseconds, as the runner writes the header's times: 2026-11-20T16:50:00.000Z (rca/README.md).",
       "type": "string",
-      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,7})?Z$"
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\\.[0-9]{3}Z$"
     },
     "documentId": {
       "type": "string",
