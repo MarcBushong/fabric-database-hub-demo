@@ -459,17 +459,27 @@ if scenario in ("leftoverqs", "stoppedqs", "earlierqs"):
     if scenario != "leftoverqs":
         pin_metrics("5" * 32)
 # Run all's acknowledgements from earlier saves ("qsacks"), which the next start carries as rcaAcks: one whose sidecars
-# the start sends, one with a sidecar the start's runbook leaves for the next (T2's), the scripts' own, which Run all
-# never reads, and one naming another payload, which counts as missing.
+# the start sends, one with only a skipped sidecar, one with a sidecar the start's runbook leaves for the next (T2's), one
+# more than 30 days old, the scripts' own, which Run all never reads, and one naming another payload, which counts as
+# missing.
 QS_IDS = ["20261113T140000Z-sqlvm01-0001-sidecar", "20261113T141500Z-sqlvm01-0002-sidecar", "20261113T143000Z-sqlvm01-0003-sidecar",
           "20261113T144500Z-arcsql01-0001-sidecar", "20261113T150000Z-sqlvm01-0004-sidecar"]
 if scenario == "qsacks":
     acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a1b2c3d.json", [(QS_IDS[0], "written"), (QS_IDS[1], "already"), (QS_IDS[2], "skipped")])
     acknowledge("Files/rca/inbox/sidecar-20261113T155000Z-runall-6c7d8e9f.json", [(QS_IDS[2], "skipped")])
     acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-4e5f6a7b.json", [(QS_IDS[1], "already"), (QS_IDS[3], "written")])
+    # More than 30 days old by the time in its name: the runner kept its sidecar no longer, so it goes unsent.
+    acknowledge("Files/rca/inbox/sidecar-20261001T120000Z-runall-1a2b3c4d.json", [("20261001T110000Z-sqlvm01-0009-sidecar", "written")])
     acknowledge("Files/rca/inbox/sidecar-20261113T170000Z-script-8c9d0e1f.json", [(QS_IDS[4], "written")])
     other = acknowledge("Files/rca/inbox/sidecar-20261113T180000Z-runall-2a3b4c5d.json", [(QS_IDS[4], "written")])
     FILES[BASE + other] = FILES[BASE + other].replace("2a3b4c5d", "99999999")
+# Whole acknowledgements, the oldest first ("qsackswhole"): 40 sidecars, then 30, which would pass the 64 a start takes,
+# then 1, which waits behind them.
+WHOLE_IDS = ["20261113T%02d%02d00Z-sqlvm01-%04d-sidecar" % (10 + n // 60, n % 60, n) for n in range(71)]
+if scenario == "qsackswhole":
+    acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a0a0a0a.json", [(item, "written") for item in WHOLE_IDS[:40]])
+    acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-0b0b0b0b.json", [(item, "written") for item in WHOLE_IDS[40:70]])
+    acknowledge("Files/rca/inbox/sidecar-20261113T170000Z-runall-0c0c0c0c.json", [(WHOLE_IDS[70], "written")])
 
 
 # The status a session's start writes when it exported an earlier session's evidence (its rcaEarlier; ADR 0031).
@@ -495,9 +505,10 @@ def vault_read(name):
             if RUNBOOK.get("acks"):
                 # A runbook with Run all's sidecar path acknowledges them on their VMs before its exports: T2's didn't answer.
                 documents = RUNBOOK["acks"]["documents"]
-                status["rcaAcks"] = {"kind": "ContosoCare.RcaAckResult", "version": 1, "sent": [item for item in documents if "-arcsql01-" not in item],
-                                     "left": [item for item in documents if "-arcsql01-" in item], "status": "Warning",
-                                     "message": "2 sidecars acknowledged on sqlvm01, before the start's exports; 1 left: arcsql01 didn't answer."}
+                sent, left = [item for item in documents if "-arcsql01-" not in item], [item for item in documents if "-arcsql01-" in item]
+                status["rcaAcks"] = {"kind": "ContosoCare.RcaAckResult", "version": 1, "sent": sent, "left": left, "status": "Warning" if left else "Pass",
+                                     "message": "%d sidecars acknowledged on sqlvm01, before the start's exports%s" % (
+                                         len(sent), ("; %d left: arcsql01 didn't answer." % len(left)) if left else ".")}
             VAULT[name] = json.dumps(status)
         elif scenario == "hostfail" and current.get("phase") == "running" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=40) \
                 and not any(step.get("step") == "Host" for step in current.get("steps") or []):
@@ -1842,10 +1853,28 @@ print(json.dumps(out))
         # only a skipped sidecar, which has none to send; the rest stay.
         $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Warning: 2 sidecars acknowledged on sqlvm01, before the start''s exports; 1 left: arcsql01 didn''t answer\.\s+Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept for the next start\.'
         @([regex]::Matches($report.printed, '(?m)^RCA\.SIDECAR\.ACK ')).Count | Should -Be 1
+        # The one more than 30 days old is gone too, unsent.
         @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
             'Files/rca/acks/sidecar-20261113T160000Z-runall-4e5f6a7b.ack.json'
             'Files/rca/acks/sidecar-20261113T170000Z-script-8c9d0e1f.ack.json'
             'Files/rca/acks/sidecar-20261113T180000Z-runall-2a3b4c5d.ack.json'
+        )
+    }
+
+    It 'sends whole acknowledgements, the oldest first, at most 64 sidecars on a start, and the rest wait in order (2026-11-23)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # Acknowledgements of 40, 30, and 1 sidecars: the 30 would pass 64, and the 1 waits behind them.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'qsackswhole' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $ids = @(0..39 | ForEach-Object { '20261113T10{0:d2}00Z-sqlvm01-{0:d4}-sidecar' -f $_ })
+        @($report.sent[0].rcaAcks.documents) | Should -Be $ids
+        $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Pass: 40 sidecars acknowledged on sqlvm01, before the start''s exports\.\s+Run all''s sidecar acknowledgements: 1 done and deleted, 2 kept for the next start\.'
+        @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
+            'Files/rca/acks/sidecar-20261113T160000Z-runall-0b0b0b0b.ack.json'
+            'Files/rca/acks/sidecar-20261113T170000Z-runall-0c0c0c0c.ack.json'
         )
     }
 
@@ -1867,7 +1896,7 @@ print(json.dumps(out))
         @($report.puts) | Should -BeNullOrEmpty
     }
 
-    It 'builds the start''s rcaAcks within the request''s limits: distinct sidecar IDs, at most 64, and within 4,096 bytes (2026-11-23)' {
+    It 'builds the start''s rcaAcks within the request''s limits: whole acknowledgements, the oldest first, distinct sidecar IDs, at most 64, and within 4,096 bytes (2026-11-23)' {
         if (-not $script:python) {
             Set-ItResult -Skipped -Because 'Python 3 is not installed'
             return
@@ -1886,7 +1915,13 @@ ids = ["20261120T%02d%02d00Z-sqlvm01-%04d-sidecar" % (10 + n // 60, n % 60, n) f
 long_ids = ["20261120T%02d%02d00Z-%s-%04d-sidecar" % (10 + n // 60, n % 60, "x" * 40, n) for n in range(64)]
 out = []
 for kwargs in (dict(rca_acks=[ids[0], ids[1], ids[0]]), dict(rca_acks=ids), dict(rca_acks=long_ids), dict(rca_acks=[]),
-               dict(rca_acks=["20261120T100000Z-sqlvm01-0001"]), dict(rca_acks=json.dumps(ids[:2]))):
+               dict(rca_acks=["20261120T100000Z-sqlvm01-0001"]), dict(rca_acks=json.dumps(ids[:2])),
+               # Acknowledgements go whole, the oldest first: 40, then 30, which would pass 64, so it and the 1 after it wait.
+               dict(rca_acks=[ids[:40], ids[40:70], [ids[70]]]),
+               # One whose sidecars an earlier one already carries adds only the others.
+               dict(rca_acks=[[ids[0], ids[1]], [ids[1], ids[2]]]),
+               # The contract's anchors: a trailing line feed isn't a sidecar ID.
+               dict(rca_acks=[ids[0] + "\n"])):
     try:
         body = build_request("session", catalog=catalog, session_id=sid, duration_minutes=90, **kwargs)
         out.append({"ok": True, "body": body, "bytes": len(json.dumps(body, separators=(",", ":")).encode("utf-8"))})
@@ -1897,8 +1932,8 @@ try:
     out.append({"ok": True})
 except ValueError as error:
     out.append({"ok": False, "error": str(error)})
-# Run all's part 2 hands the start its pending acknowledgements when it's given none.
-pending_rca_acks = lambda: [ids[5], ids[6]]
+# Run all's part 2 hands the start its pending acknowledgements, each whole, when it's given none.
+pending_rca_acks = lambda: [[ids[5], ids[6]], [ids[7]]]
 out.append({"ok": True, "body": build_request("session", catalog=catalog, session_id=sid, duration_minutes=90)})
 out.append({"ok": True, "body": build_request("stop", catalog=catalog)})
 print(json.dumps(out))
@@ -1907,20 +1942,24 @@ print(json.dumps(out))
         $output = & $script:python $driver $helpers $catalogFile 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
         $results = ($output | Select-Object -Last 1) | ConvertFrom-Json
-        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $false, $true, $false, $true, $true)
-        @($results[0].body.rcaAcks.documents) | Should -Be @('20261120T100000Z-sqlvm01-0000-sidecar', '20261120T100100Z-sqlvm01-0001-sidecar')
+        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $false, $true, $true, $true, $false, $false, $true, $true)
+        $id = { param([int] $Number) '20261120T{0:d2}{1:d2}00Z-sqlvm01-{2:d4}-sidecar' -f (10 + [int][math]::Floor($Number / 60)), ($Number % 60), $Number }
+        @($results[0].body.rcaAcks.documents) | Should -Be @((& $id 0), (& $id 1))
         @($results[1].body.rcaAcks.documents).Count | Should -Be 64
-        @($results[1].body.rcaAcks.documents)[63] | Should -Be '20261120T110300Z-sqlvm01-0063-sidecar'
+        @($results[1].body.rcaAcks.documents)[63] | Should -Be (& $id 63)
         # Long host names: as many as 4,096 bytes hold, the rest for a later start.
         $results[2].bytes | Should -BeLessOrEqual 4096
         @($results[2].body.rcaAcks.documents).Count | Should -BeGreaterThan 40
         @($results[2].body.rcaAcks.documents).Count | Should -BeLessThan 64
         $results[3].body.PSObject.Properties.Name | Should -Not -Contain 'rcaAcks'
         $results[4].error | Should -Match 'rca_acks takes sidecar IDs only'
-        @($results[5].body.rcaAcks.documents) | Should -Be @('20261120T100000Z-sqlvm01-0000-sidecar', '20261120T100100Z-sqlvm01-0001-sidecar')
-        $results[6].error | Should -Match 'Only a session''s start acknowledges sidecars'
-        @($results[7].body.rcaAcks.documents) | Should -Be @('20261120T100500Z-sqlvm01-0005-sidecar', '20261120T100600Z-sqlvm01-0006-sidecar')
-        $results[8].body.PSObject.Properties.Name | Should -Not -Contain 'rcaAcks'
+        @($results[5].body.rcaAcks.documents) | Should -Be @((& $id 0), (& $id 1))
+        @($results[6].body.rcaAcks.documents) | Should -Be @(0..39 | ForEach-Object { & $id $_ })
+        @($results[7].body.rcaAcks.documents) | Should -Be @((& $id 0), (& $id 1), (& $id 2))
+        $results[8].error | Should -Match 'rca_acks takes sidecar IDs only'
+        $results[9].error | Should -Match 'Only a session''s start acknowledges sidecars'
+        @($results[10].body.rcaAcks.documents) | Should -Be @((& $id 5), (& $id 6), (& $id 7))
+        $results[11].body.PSObject.Properties.Name | Should -Not -Contain 'rcaAcks'
         foreach ($result in @($results | Where-Object { $_.ok -and $_.body -and $_.body.PSObject.Properties.Name -contains 'rcaAcks' })) {
             Test-Json -Json ($result.body.rcaAcks | ConvertTo-Json -Depth 4 -Compress) -SchemaFile (Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json') | Should -BeTrue
         }
