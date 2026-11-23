@@ -7833,6 +7833,42 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **What its live check needs.** Nothing of its own: the fixtures and tests are offline. A's and B's live round shows what the docs describe: Database Hub's sessions as `ContosoCare.Demo/<service>/<run>`, Query Store's modules in the application schemas, and the cheat sheet's services matching what Database Hub shows.
 
+### Realistic names, unit C: the review of 25df4696 (2026-11-23)
+
+**Why.** The review of 25df4696 and 2c1d2411 was **ship with fixes**. 2c1d2411 had already fixed the four doc contradictions it found, and its High concerns the merge into the release, which unit A resolves. The coordinator asked for the other three fixes on 2c1d2411, in one commit.
+
+- **Medium: the rename tool half-renamed the forms it didn't know, and succeeded.** Its bare-name fallback renamed an old name inside a qualified one and kept `demo` as the schema:
+  - `\\[demo\\]\\.\\[usp_scenario_chain_acquire\\]`, the evaluation set's form, became `\\[demo\\]\\.\\[usp_assign_work_item\\]`;
+  - `"demo"."usp_scenario_cpu_pressure"` became `"demo"."usp_find_double_bookings"`;
+  - and it didn't see an old name in upper case.
+  - **Now one form renames every name that `demo` qualifies,** whatever quotes, brackets, backticks, backslashes, or spaces stand around its dot, to its new schema and name. The bare form takes only a name that nothing qualifies, and both match in any case.
+  - **And it stops, before writing anything,** naming the file and the text, when an old name is left, qualified some other way, or a new name is still qualified by `demo`, half renamed by hand.
+- **Low: a run that stopped left a state the tool couldn't repair.** It wrote each document's parts as it went, so when a later document's part count changed, the earlier documents' parts were already written while their indexes and parameters kept the old lines and SHA-256, and a rerun found those documents unchanged. Now it plans every rename, part, and reference in memory, and checks every document: its part count, and that its new parts decode to it. Only then does it write.
+- **Low: the contract test** scans all of `fabric/app/src`, not only `rca` and `preview`, and matches in any case. It's clean today.
+- **Tests:** `tests/unit/Rca.UpdateFixtures.Tests.ps1`, new, runs the tool on copies of the fixtures under `TestDrive`, through its new `-RepositoryRoot`:
+  - the two forms the review found, with eight more, in any case;
+  - five ways it stops, each writing nothing, though a fixture and another file held names it would have renamed;
+  - a scenario.json's procedure line, left as it is;
+  - `-Path` without `-RenameWorkloadModules`, which it refuses;
+  - and a part count that would change. That run writes nothing; once the change is undone, the next run writes every part, index, and parameter, and a run after it changes nothing.
+
+**Changed files.** `tests/Update-RcaFixtures.ps1`; `tests/unit/Rca.UpdateFixtures.Tests.ps1`, new; `tests/unit/Rca.Contract.Tests.ps1`; `rca/fixtures/README.md`; and this entry.
+
+**Validation.** On 2c1d2411 with this commit:
+
+- **Pester,** under strict mode, with the Azure CLI guard: `Rca.UpdateFixtures` and `Rca.Contract`, 40 passed, none failed.
+- **Each new test fails without its fix:** four mutations of the tool each fail the tests aimed at them:
+  - without the two checks for what's left, the five tests of where it stops;
+  - matching only in lower case, the forms test and the upper-case stop;
+  - the earlier bare form, the stop for an old name that another schema qualifies;
+  - writing each document's parts as it goes, the part-count test.
+- **The widened contract test** fails on an upper-case old name in `fabric/app/src/lib`, outside the two folders it scanned before.
+- **On this branch,** the tool changes nothing.
+- **On the Query Store branch's aafee3e2,** it renamed 42 names: 10 in its 3 fixture documents, 18 in 7 app files, and 14 in 2 runner tests. It wrote the parts of the T1, T4, and T3 sidecar documents again, and put the new lines and SHA-256s in its indexes and parameters. No old name was left there in any case, a second run changed nothing, and that branch's own `Rca.Contract` passed: 63 tests.
+- **Static checks:** `Repo.Conventions` and `Repo.NeutralWording`, under strict mode with the Azure CLI guard, passed: 126 tests. PSScriptAnalyzer, with the repo's settings, found nothing in the three PowerShell files, which are ASCII-only, and markdownlint found no issue. The leak check prints nothing.
+
+**Risks.** None new. Unchanged: a part count that would change still needs its indexes, parameters, and messages edited by hand, which the tool now refuses before it writes anything.
+
 ### Realistic names: merged with the RCA release, and plan-regression's stored text (2026-11-23)
 
 **Why.** Wednesday's release takes the names as one branch, `marcbushong-microsoft-names-integration`: units A, B, and C merged onto the RCA release. The release's checked switch for plan-regression (F26) came with the old names and wording, after unit A had made every stored module neutral.
@@ -7841,6 +7877,7 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
   - **`120-scenario-procedures.sql`:** the release's checked switch, without `@quiet_until`, under unit A's names. Its retry block, which merged with no conflict marker, ran the dropped `demo.usp_visit_summary_lookup`; it runs `frontdesk.usp_visit_summary` now.
   - **The release's test,** `SqlScriptTests.PlanRegressionsSwitchIsQuietCheckedAndTriedAgainBounded`, reads `frontdesk.usp_refresh_visit_summaries`.
   - **Eight docs** keep the release's text with the renames, and the walkthrough's cheat sheet keeps its service column. `Agent.PromptPack.Tests.ps1` keeps both sides.
+- **Unit C's review fixes** (517db85c, re-checked ship) merged with a conflict only at this report's end, where both entries stay. Their contract test, which now reads all of `fabric/app/src`, passes with the release's app files: none names a retired module.
 - **The stored text no longer narrates the fault** (the resolution re-check's one Low). SQL Server stores the procedure's whole body, where a DBA or Database Agents reads it in `sys.sql_modules`, and the release's comments and event details there said "plan A", "plan B", "the regression runs", "ran and was corrected", and "didn't start". The RCA strips comments and literals, so its evidence wasn't affected.
   - **The comments:** their explanations moved to the header above the `GO`, which isn't stored. The body's comments say "attempt", "the seek plan", and "the scan plan".
   - **The event details say what the check read:** "The lookup's cached plan scans care.appointments (attempt 1 of 3).", "... still seeks ix_appointments_patient after 3 attempts. The next run tries again.", or "... couldn't be read: ...".
@@ -7852,6 +7889,7 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 **Validation.** Before 2 PM, targeted, one suite at a time, as the coordinator asked:
 
 - **The runner's tests that read the script:** `SqlScriptTests`, 33 passed, with ScriptDom's parse of every script; `CatalogTests`, 160 passed; `RcaBlindTests`, 4 passed. `SqlIntegrationTests`' 19 were skipped: they need a disposable SQL Server.
+- **After unit C's fixes merged,** Pester under strict mode with the Azure CLI guard: `Rca.Contract`, 31 passed, and `Rca.UpdateFixtures`, 9 passed. PSScriptAnalyzer, with the repo's settings for each file, found nothing in their three scripts.
 - **markdownlint** found no issue in this report, and the leak check prints nothing.
 
 **Risks.** The details' new words reach `demo.scenario_run_events` only, and nothing parses them: the control notebook reads the event's name, and the plan-regression README and the troubleshooting page say what the events mean, not their words.
