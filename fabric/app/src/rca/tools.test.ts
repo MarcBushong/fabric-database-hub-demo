@@ -9,6 +9,7 @@ import { LAG_METRIC } from "./replica";
 import { monitorTelemetry } from "./sources";
 import { emptyListNote } from "./view/facts";
 import { INVESTIGATION_PLAYBOOK } from "./playbook";
+import { QUERY_STORE_RETENTION_DAYS, queryStoreQuery, type QueryStoreQuery } from "./query-store";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { live, liveSources } from "./testdata/live-rb-2233e0ae";
 import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
@@ -790,16 +791,20 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         servers: {},
         points: (["T4", "T4-replica"] as const).flatMap((target) => Array.from({ length: 60 }, (_, m) => ({ at: minute("15:00:00", m), target, server: target === "T4" ? "pgflex01" : "pgreplica01", metric: "cpu_percent", value: busy(m) }))),
     };
-    const deps = createInvestigationTools({
-        load: async () => emptyEvidence(),
-        telemetry: async (from, to) => ({ bins: bins.filter((b) => b.at >= from && b.at <= to), postgres }),
-        timeZone: "America/New_York",
-        latestDay: at("00:00:00"),
-    });
-    async function incidentOn(target: RcaTarget, family: string): Promise<InvestigationResult> {
-        const [episode] = (await deps.episodes(at("15:30:00"), at("16:00:00"), [target])).filter((e) => e.family === family);
+    // The viewer's clock: the same day, within every target's Query Store retention, unless a test moves it.
+    const toolsAt = (now: Date) =>
+        createInvestigationTools({
+            load: async () => emptyEvidence(),
+            telemetry: async (from, to) => ({ bins: bins.filter((b) => b.at >= from && b.at <= to), postgres }),
+            timeZone: "America/New_York",
+            latestDay: at("00:00:00"),
+            now: () => now,
+        });
+    const deps = toolsAt(at("18:00:00"));
+    async function incidentOn(target: RcaTarget, family: string, tools = deps): Promise<InvestigationResult> {
+        const [episode] = (await tools.episodes(at("15:30:00"), at("16:00:00"), [target])).filter((e) => e.family === family);
         expect(episode, `${target} ${family}`).toBeDefined();
-        return ask("explain_incident", { episodeKey: episode.key }, deps);
+        return ask("explain_incident", { episodeKey: episode.key }, tools);
     }
     const SQL_LEARN = "https://learn.microsoft.com/sql/relational-databases/performance/monitoring-performance-by-using-the-query-store";
     const PG_LEARN = "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store";
@@ -809,23 +814,110 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
             const r = await incidentOn(target, "cpu");
             expect(r.rootCause?.ruleIds).toEqual(["TELEMETRY-ONLY"]);
             expect(r.rootCause?.statement).toMatch(new RegExp(`UTC\\b.*Which queries drove it isn't in this history: the capture doesn't collect Query Store's per-query statistics yet, a limit of the capture, not of ${target}\\.$`));
-            expect(r.notCaptured).toContain(`${target}: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not ${target}'s: Query Store on ${target} keeps those minutes' plans and per-query CPU, duration, and waits, and validate.ps1's ${target}.QUERYSTORE says whether it's on.`);
+            expect(r.notCaptured).toContain(`${target}: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not ${target}'s: Query Store on ${target} keeps those minutes' plans and per-query CPU, duration, and waits for 14 days (less when it fills up), and validate.ps1's ${target}.QUERYSTORE says whether it's on.`);
             expect(r.nextSteps).toContain(`Read Query Store on ${target} for the queries and plans that used the CPU from 15:40:00 to 15:50:00 UTC: its Top Resource Consuming Queries and Regressed Queries reports on ContosoCare in SQL Server Management Studio, or sys.query_store_runtime_stats for the intervals that hold those minutes (${SQL_LEARN}).`);
         }
         const latch = await incidentOn("T2", "latch");
-        expect(latch.notCaptured).toContain("T2: which queries drove the buffer latch waits isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T2's: Query Store on T2 keeps those minutes' plans and per-query CPU, duration, and waits, and validate.ps1's T2.QUERYSTORE says whether it's on.");
+        expect(latch.notCaptured).toContain("T2: which queries drove the buffer latch waits isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T2's: Query Store on T2 keeps those minutes' plans and per-query CPU, duration, and waits for 14 days (less when it fills up), and validate.ps1's T2.QUERYSTORE says whether it's on.");
         expect(latch.nextSteps).toContain(`Read Query Store on T2 for the queries that waited on Buffer Latch from 15:40:00 to 15:50:00 UTC: its Query Wait Statistics report on ContosoCare in SQL Server Management Studio, or sys.query_store_wait_stats and sys.query_store_runtime_stats for the intervals that hold those minutes (${SQL_LEARN}).`);
     });
 
     it("says the same on T4, in its azure_sys database at every size but Burstable, and that a read replica's queries are in neither", async () => {
         const t4 = await incidentOn("T4", "cpu");
         expect(t4.rootCause?.statement).toMatch(/Which queries drove it isn't in this history: the capture doesn't collect Query Store's per-query statistics yet, a limit of the capture, not of T4\.$/);
-        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T4's: at every size but Burstable, where Learn advises against it, Query Store on T4 keeps those minutes' per-query statistics and wait samples in its azure_sys database, and validate.ps1's T4.QUERYSTORE says whether it's on.");
+        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T4's: at every size but Burstable, where Learn advises against it, Query Store on T4 keeps those minutes' per-query statistics and wait samples in its azure_sys database for 7 days, and validate.ps1's T4.QUERYSTORE says whether it's on.");
         expect(t4.nextSteps).toContain(`Read Query Store on T4 for the queries that took the most time from 15:40:00 to 15:50:00 UTC, at every size but Burstable: query_store.qs_view in its azure_sys database, and query_store.pgms_wait_sampling_view for what they waited on, for the intervals that hold those minutes (${PG_LEARN}).`);
         const replica = await incidentOn("T4-replica", "cpu");
         expect(replica.rootCause?.statement).toMatch(/Which queries drove it is in neither this history nor Query Store, which doesn't record a read replica's queries\.$/);
         expect(replica.notCaptured).toContain(`T4-replica: which queries drove the CPU is in neither this history nor Query Store: Query Store doesn't record the queries a read replica runs (${PG_LEARN}), and the capture samples the replica's sessions only while its replay stands still.`);
         expect(replica.nextSteps.join(" ")).not.toMatch(/Query Store/);
+    });
+
+    // The review of 319b3ae1: past a target's retention, "keeps those minutes" was false, and the next step sent the owner to
+    // an empty view, which reads as "Query Store is off". 14 days on T1 to T3, 7 on T4, counted on the viewer's clock.
+    it("says when the target's Query Store no longer keeps those minutes, and gives no next step then", async () => {
+        // 8 days later: T4 keeps 7, T1 14.
+        const week = toolsAt(new Date("2026-11-28T16:00:00Z"));
+        const t4 = await incidentOn("T4", "cpu", week);
+        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T4's: Query Store on T4 no longer keeps those minutes either: it keeps 7 days, and they're more than 7 days old. validate.ps1's T4.QUERYSTORE says whether it's on.");
+        expect(t4.nextSteps.join(" ")).not.toMatch(/Query Store/);
+        const t1 = await incidentOn("T1", "cpu", week);
+        expect(t1.nextSteps).toEqual(expect.arrayContaining([expect.stringMatching(/^Read Query Store on T1 for the queries and plans that used the CPU from 15:40:00 to 15:50:00 UTC/)]));
+        // 15 days later: past T1's too.
+        const later = await incidentOn("T1", "cpu", toolsAt(new Date("2026-12-05T16:00:00Z")));
+        expect(later.notCaptured).toContain("T1: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T1's: Query Store on T1 no longer keeps those minutes either: it keeps 14 days (less when it fills up), and they're more than 14 days old. validate.ps1's T1.QUERYSTORE says whether it's on.");
+        expect(later.nextSteps.join(" ")).not.toMatch(/Query Store/);
+    });
+
+    // The re-review of bbdcd05c: the whole day after a retention ran out, the note said "they're 7 days old" beside "no longer
+    // keeps", from the age rounded down.
+    it("says the minutes are more than the retention old, the whole day after it ran out, and keeps them up to its last minute", async () => {
+        // The incident ends at 15:50:00 UTC on 2026-11-20.
+        const lastMinute = await incidentOn("T4", "cpu", toolsAt(new Date("2026-11-27T15:50:00Z")));
+        expect(lastMinute.nextSteps).toEqual(expect.arrayContaining([expect.stringMatching(/^Read Query Store on T4 /)]));
+        const t4 = await incidentOn("T4", "cpu", toolsAt(new Date("2026-11-28T09:50:00Z")));
+        expect(t4.notCaptured.join(" ")).toContain("it keeps 7 days, and they're more than 7 days old.");
+        expect(t4.notCaptured.join(" ")).not.toMatch(/they're 7 days old/);
+        expect(t4.nextSteps.join(" ")).not.toMatch(/Query Store/);
+        for (const target of ["T1", "T3"] as const) {
+            const kept = await incidentOn(target, "cpu", toolsAt(new Date("2026-12-04T15:50:00Z")));
+            expect(kept.nextSteps, target).toEqual(expect.arrayContaining([expect.stringMatching(new RegExp(`^Read Query Store on ${target} `))]));
+            const r = await incidentOn(target, "cpu", toolsAt(new Date("2026-12-04T15:51:00Z")));
+            expect(r.notCaptured.join(" "), target).toContain("it keeps 14 days (less when it fills up), and they're more than 14 days old.");
+            expect(r.nextSteps.join(" "), target).not.toMatch(/Query Store/);
+        }
+    });
+
+    it("counts T1 to T3's 14 days from their configure scripts, and leaves T4's retention at Learn's 7-day default", () => {
+        for (const target of ["sqlvm01", "arcsql01", "azuresql"]) {
+            const script = readFileSync(resolve(import.meta.dirname, `../../../../database/${target}/030-configure.sql`), "utf8");
+            expect(script, target).toMatch(new RegExp(`STALE_QUERY_THRESHOLD_DAYS = ${QUERY_STORE_RETENTION_DAYS.sql}\\b`));
+        }
+        expect(QUERY_STORE_RETENTION_DAYS.postgresql).toBe(7);
+        expect(readFileSync(resolve(import.meta.dirname, "../../../../infra/modules/pgflex01.bicep"), "utf8")).not.toMatch(/retention_period_in_days/);
+    });
+
+    // Wednesday's release: the next step's ready-to-run, read-only query, built from the incident's measured target, family,
+    // and times only, which the view copies and the chat gives as is.
+    it("gives each next step a read-only query of the target's own Query Store for the incident's exact minutes", async () => {
+        const queries = async (target: RcaTarget, family: string, tools = deps) => ((await incidentOn(target, family, tools)).details?.queryStoreQueries ?? []) as QueryStoreQuery[];
+        const [t1] = await queries("T1", "cpu");
+        expect(t1).toMatchObject({ target: "T1", language: "tsql", database: "ContosoCare", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" });
+        expect(t1.text).toContain("-- Read-only: Query Store's top plans on T1 from 15:40:00 to 15:50:00 UTC, by CPU, then duration, with their plan IDs.");
+        expect(t1.text).toContain("DECLARE @from datetimeoffset = '2026-11-20T15:40:00+00:00', @to datetimeoffset = '2026-11-20T15:50:00+00:00';");
+        expect(t1.text).toContain("ORDER BY cpu_ms DESC, duration_ms DESC;");
+        expect(t1.text).toMatch(/\bp\.plan_id\b/);
+        expect(t1.text).not.toMatch(/wait_category_desc/);
+        const [t2] = await queries("T2", "latch");
+        expect(t2).toMatchObject({ target: "T2", database: "ContosoCare" });
+        expect(t2.text).toContain("AND ws.wait_category_desc = N'Buffer Latch'");
+        const [t4] = await queries("T4", "cpu");
+        expect(t4).toMatchObject({ target: "T4", language: "postgresql", database: "azure_sys", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" });
+        expect(t4.text).toContain("WHERE q.end_time > '2026-11-20 15:40:00' AND q.start_time <= '2026-11-20 15:50:00'");
+        expect(t4.text).toContain("WHERE w.end_time > '2026-11-20 15:40:00' AND w.start_time <= '2026-11-20 15:50:00'");
+        expect(t4.text).toContain("FROM query_store.qs_view AS q");
+        expect(t4.text).toContain("FROM query_store.pgms_wait_sampling_view AS w");
+        expect(t4.text).not.toMatch(/query_parameters/);
+        // None where Query Store doesn't record the queries, and none past its retention, as for the next step.
+        expect(await queries("T4-replica", "cpu")).toEqual([]);
+        expect(await queries("T4", "cpu", toolsAt(new Date("2026-11-28T16:00:00Z")))).toEqual([]);
+        for (const q of [t1, t2, t4]) {
+            // Read-only, and blind: it names no scenario and nothing the demo planned.
+            expect(q.text).not.toMatch(/\b(INSERT|UPDATE|DELETE|MERGE|ALTER|CREATE|DROP|EXEC|EXECUTE|TRUNCATE|GRANT|SET\s+QUERY_STORE)\b/i);
+            expect(namesAScenario(q.text)).toEqual([]);
+            expect(namesAScenario(q.text.toLowerCase())).toEqual([]);
+            expect(q.text).not.toMatch(/scenario|inject|demo\./i);
+        }
+    });
+
+    it("reads an incident across UTC midnight with both dates, and one instant from its interval", () => {
+        const across = queryStoreQuery({ target: "T3", family: "cpu", start: new Date("2026-11-19T23:52:00Z"), end: new Date("2026-11-20T00:07:30Z"), last: new Date("2026-11-20T00:07:00Z") }, new Date("2026-11-20T01:00:00Z"));
+        expect(across?.text).toContain("DECLARE @from datetimeoffset = '2026-11-19T23:52:00+00:00', @to datetimeoffset = '2026-11-20T00:07:30+00:00';");
+        expect(across?.text).toContain("on T3 from 2026-11-19 23:52:00 to 2026-11-20 00:07:30 UTC");
+        const instant = queryStoreQuery({ target: "T4", family: "cpu", start: new Date("2026-11-20T15:45:00Z"), end: null, last: new Date("2026-11-20T15:45:00Z") }, new Date("2026-11-20T16:00:00Z"));
+        // An interval that starts at the instant holds it: start_time <= the instant.
+        expect(instant?.text).toContain("WHERE q.end_time > '2026-11-20 15:45:00' AND q.start_time <= '2026-11-20 15:45:00'");
+        expect(instant?.text).toContain("on T4 at 15:45:00 UTC");
     });
 
     it("never says that a target has no Query Store, in any tool's result or in the playbook, and drops the old words", async () => {

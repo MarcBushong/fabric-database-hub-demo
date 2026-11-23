@@ -679,6 +679,27 @@ Describe 'Validation during business-day''s incidents (2026-11-03)' {
         (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Warning'
     }
 
+    # 2026-11-23: T2.QUERYSTORE (and T1's) from the same status read, which the relay keeps from the whole output, since the
+    # kept tail of a status with runs loses it (the review of the Query Store design, finding 6).
+    It 'adds T2.QUERYSTORE from the relay''s Query Store state, with area t2, and a Warning when the status read fails' {
+        $script:tail = Get-RelayTail (New-RunnerStatus -Runs 5)
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $evidence = [ordered]@{ exitCode = 0; stdout = $script:tail; queryStore = [ordered]@{ actualState = 'READ_WRITE'; desiredState = 'READ_WRITE'; readonlyReason = 0; captureMode = 'AUTO'; intervalMinutes = 15; storageMb = 3; maxStorageMb = 512 } }
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:tail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status' -Evidence $evidence) }
+        }
+        $context = New-TestContext -Target T2
+        $check = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'T2.QUERYSTORE' }
+        @($check).Count | Should -Be 1
+        $check.area | Should -Be 't2'
+        $check.status | Should -Be 'Pass'
+        $check.message | Should -Match '^Query Store is on in ContosoCare on T2: READ_WRITE'
+
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { throw 'Run Command timed out.' }
+        $check = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'T2.QUERYSTORE' }
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Be 'Query Store''s state on T2 wasn''t read: the runner''s status couldn''t be read (WORKLOAD.T2.COMMAND).'
+    }
+
     It 'turns a T3.PROPERTY check that couldn''t run during an incident into a Warning, and keeps a property that''s read and wrong a Fail' {
         $script:incidentTarget = 'T3'
         $script:property = New-DemoResult -CheckId 'T3.PROPERTY' -Area 't3' -Target 'T3' -Status 'Fail' -Message 'The extended property couldn''t be checked: the T-SQL timed out.' -Evidence @{ reason = 'Failed' }

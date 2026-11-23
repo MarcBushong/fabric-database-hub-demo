@@ -493,7 +493,7 @@ function Get-DemoT4Tuning {
     elseif ($fits) {
         $result.Enabled = $true
         $result.Status = 'Pass'
-        $result.Message = 'T4 gets autonomous tuning at {0}: Query Store captures the top queries, and index tuning runs in REPORT mode every 60 minutes, so its index and table recommendations show in the Azure portal (the server''s Intelligent Performance > Autonomous tuning), not in Database Hub.' -f $sized
+        $result.Message = 'T4 gets autonomous tuning at {0}: index tuning runs in REPORT mode every 60 minutes on what Query Store records, every statement, top-level and nested (pg_qs.query_capture_mode all), so its index and table recommendations show in the Azure portal (the server''s Intelligent Performance > Autonomous tuning), not in Database Hub. {1}.' -f $sized, $queryStore
     }
     elseif ($switchValue -eq $true -and (Test-DemoT4SkuExplicit -Config $Config) -and $size -ceq [string]$Config['t4SkuName']) {
         $result.Status = 'Fail'

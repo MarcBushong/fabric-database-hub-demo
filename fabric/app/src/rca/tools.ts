@@ -12,7 +12,7 @@ import { RCA_CATEGORY_IDS, RCA_SEVERITY_IDS, type RcaCategory, type RcaSeverity 
 import { categoryOf, facetArgs, FAR_PERCENT, FAR_TIMES, LONG_MINUTES, matches, severityOf } from "./facets";
 import { isPagedTable, MONITOR_PAGES, MONITOR_ROW_LIMIT, RcaReadError } from "./loader";
 import { analyzeLocking, type ChainNode } from "./locking";
-import { queryStoreNextStep, queryStoreNote, unexplainedByQuery } from "./query-store";
+import { queryStoreNextStep, queryStoreNote, queryStoreQuery, unexplainedByQuery, type QueryStoreQuery } from "./query-store";
 import { analyzeReplicaLag, LAG_METRIC } from "./replica";
 import { RCA_SPEC } from "./spec";
 import { analyzeThroughput } from "./throughput";
@@ -135,6 +135,11 @@ export interface InvestigationDeps {
     latestDay: Date;
     /** The history's newest telemetry time: without a time, a window is the NEWEST_MINUTES before it. */
     latest?: Date;
+    /**
+     * The viewer's clock, for how old an incident's minutes are now, which is what a target's Query Store retention counts
+     * (query-store.ts); the current time by default. Not the history's newest time, which stays put while the demo is stopped.
+     */
+    now?: () => Date;
 }
 
 const RESULT_CHARS = 60_000;
@@ -755,7 +760,10 @@ export function createInvestigationTools(deps: InvestigationDeps) {
         // capture" note again with other times: two such lines for one T5 storm (the coordinator's note on 803f2b1a). The
         // incident's own note says it once.
         const partNotes = parts.flatMap((p) => p.notCaptured).filter((line) => !RCA_TARGETS.some((t) => isNoCaptureNote(t, line) && base.notCaptured.some((b) => isNoCaptureNote(t, b))));
-        const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map(queryStoreNote)])];
+        // Whether the target's Query Store still keeps those minutes is judged now, by the viewer's clock (the review of 319b3ae1).
+        const now = (deps.now ?? (() => new Date()))();
+        const queryStoreQueries = telemetryOnly.map((e) => queryStoreQuery(e, now)).filter((q): q is QueryStoreQuery => q !== null);
+        const notCaptured = [...new Set([...readNote, ...base.notCaptured, ...partNotes, ...telemetryOnly.map((e) => queryStoreNote(e, now))])];
         // Never a blank cause: with none found and nothing else to say, say which episode the evidence doesn't explain.
         if (!rootCause && notCaptured.length === 0) notCaptured.push(...chosen.map((e) => `${e.target}: nothing the capture or the telemetry recorded ${fromTo(e.start, e.end ?? e.last)} UTC explains the ${e.signal}.`));
         return {
@@ -763,11 +771,14 @@ export function createInvestigationTools(deps: InvestigationDeps) {
             findings: parts.flatMap((p) => p.findings),
             rootCause: rootCause ?? null,
             recommendations: [...new Map(parts.flatMap((p) => p.recommendations).map((r) => [r.id, r])).values()],
-            nextSteps: [...new Set([...parts.flatMap((p) => p.nextSteps), ...telemetryOnly.map(queryStoreNextStep).filter((s): s is string => s !== null)])],
+            nextSteps: [...new Set([...parts.flatMap((p) => p.nextSteps), ...telemetryOnly.map((e) => queryStoreNextStep(e, now)).filter((s): s is string => s !== null)])],
             notCaptured,
             details: {
                 episodes: chosen.map((e) => ({ ...episodeView(e), text: describeEpisode(e) })),
                 ...(readAs.length ? { readAs: { key, as: readAs.map((e) => e.key) } } : {}),
+                // Each next step's ready-to-run, read-only query of the target's own Query Store for those minutes, while it keeps
+                // them (query-store.ts): built from the episode's target, family, and times only.
+                ...(queryStoreQueries.length ? { queryStoreQueries } : {}),
                 alsoInTheseMinutes: others.map((c) => c.statement),
                 parts: parts.map((p) => ({ tool: p.tool, details: p.details })),
             },

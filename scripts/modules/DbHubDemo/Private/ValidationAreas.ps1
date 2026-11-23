@@ -317,7 +317,7 @@ function Invoke-DemoValidationT3 {
         [pscustomobject] $Context
     )
 
-    $parameters = @{ Config = $Context.Config; NetworkMode = (Get-DemoValidationNetworkMode -Context $Context) }
+    $parameters = @{ Config = $Context.Config; NetworkMode = (Get-DemoValidationNetworkMode -Context $Context); IncludeQueryStore = $true }
     if ($Context.DeploymentId) {
         $parameters['DeploymentId'] = $Context.DeploymentId
     }
@@ -350,7 +350,7 @@ function Invoke-DemoValidationT4 {
         [pscustomobject] $Context
     )
 
-    $parameters = @{ Config = $Context.Config; IncludeMetrics = $true }
+    $parameters = @{ Config = $Context.Config; IncludeMetrics = $true; IncludeQueryStore = $true }
     if ($Context.DeploymentId) {
         $parameters['DeploymentId'] = $Context.DeploymentId
     }
@@ -537,7 +537,9 @@ function Invoke-DemoValidationWorkload {
     .SYNOPSIS
     The Workload area: the runner's status on each selected target (Invoke-DemoWorkloadCommand status --json,
     read-only), the scenario bounds from it, and the profile host lane that serves the target (WORKLOAD.<target>.HOST,
-    Phase 25b). The session control's CONTROL.* checks (Test-DemoActivityControl, ADR 0020 and ADR 0026). T1 and T3 run on sqlvm01, and T2 through the host into the guest, so each needs that VM running; T2
+    Phase 25b). T1.QUERYSTORE and T2.QUERYSTORE (2026-11-23), from the same status read: Query Store's state in ContosoCare,
+    which the VM's relay keeps from the runner's whole output (Test-DemoValidationWorkloadQueryStore); a Warning whenever
+    the status wasn't read (the VM stopped, the host not Ready, the read failed), with areas t1 and t2. The session control's CONTROL.* checks (Test-DemoActivityControl, ADR 0020 and ADR 0026). T1 and T3 run on sqlvm01, and T2 through the host into the guest, so each needs that VM running; T2
     also needs the host's last step, after the setup wizard. A status read that fails the way load makes it fail (a
     time-out, a 409, a lock, or a resource limit) while one of business-day's incidents is due on the target (or on T1,
     whose sqlvm01 runs T3's and T4's commands), and a host lane that fails while the target's own status says it runs
@@ -556,8 +558,16 @@ function Invoke-DemoValidationWorkload {
     $docUrl = 'https://learn.microsoft.com/azure/virtual-machines/windows/run-command'
     foreach ($target in @('T1', 'T2', 'T3', 'T4', 'T5' | Where-Object { $_ -in $Context.Target })) {
         $checkId = 'WORKLOAD.{0}.COMMAND' -f $target
+        # T1.QUERYSTORE and T2.QUERYSTORE come with this status read (2026-11-23): a Warning whenever it isn't read.
+        $queryStoreUnread = {
+            param([string] $Why, [string] $Fix)
+            if ($target -in 'T1', 'T2') {
+                $results.Add((New-DemoQueryStoreUnreadResult -Target $target -Why $Why -Remediation $Fix))
+            }
+        }
         if ($target -eq 'T2' -and $Context.Arc.EvaluationOnly) {
             $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Not selected' -Message 'The evaluation-only T2 mode has no workload runner (risk R188).' -DocUrl $docUrl -EvaluationOnly))
+            $results.Add((New-DemoQueryStoreUnreadResult -Target 'T2' -Status 'Not selected' -Why 'the evaluation-only T2 mode has no workload runner to read it.'))
             continue
         }
         $vmName = if ($target -eq 'T2') { $Context.Arc.HostVmName } else { 'sqlvm01' }
@@ -566,6 +576,9 @@ function Invoke-DemoValidationWorkload {
         $state = Get-DemoValidationVmState -Context $Context -VmName $vmName
         if (-not $state.Running) {
             $results.Add((New-DemoValidationStoppedResult -CheckId $checkId -Area 'workload' -Target $target -VmState $state -Context $Context -Checks ('the {0} workload checks' -f $target)))
+            if ($target -in 'T1', 'T2') {
+                $results.Add((New-DemoValidationStoppedResult -CheckId ('{0}.QUERYSTORE' -f $target) -Area $target.ToLowerInvariant() -Target $target -VmState $state -Context $Context -Checks ('the read of Query Store''s state on {0}' -f $target)))
+            }
             continue
         }
         if ($target -eq 'T3') {
@@ -602,14 +615,17 @@ function Invoke-DemoValidationWorkload {
             $hostState = [string](Get-DemoMemberValue -InputObject $read.Health -Name 'state')
             if ($null -eq $read.Health) {
                 $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Warning' -Message ('The T2 runner wasn''t checked, because health.json on {0} couldn''t be read: {1}' -f $vmName, $read.Error) -Remediation 'Run validate.ps1 -Area Workload again in about 10 minutes.' -DocUrl $docUrl))
+                & $queryStoreUnread ('health.json on {0} couldn''t be read, so the runner wasn''t asked.' -f $vmName) 'Run ./scripts/validate.ps1 -Area Workload again in about 10 minutes.'
                 continue
             }
             if ($hostState -eq 'ManualActionRequired') {
                 $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Manual action required' -Message ('The T2 runner is installed in the host''s last step, after the manual step health.json reports: {0}' -f [string](Get-DemoMemberValue -InputObject $read.Health -Name 'message')) -Evidence @{ hostState = $hostState } -Remediation ('Follow the instructions in health.json (Get-DemoVmHealth -Config $config -VmName {0} -View Full); the host then configures SQL Server, seeds ContosoCare, and installs the runner.' -f $vmName) -DocUrl $docUrl))
+                & $queryStoreUnread 'the T2 host waits for a manual step (WORKLOAD.T2.COMMAND), so the runner wasn''t asked.' 'Follow WORKLOAD.T2.COMMAND''s fix, then run ./scripts/validate.ps1 -Area Workload again.'
                 continue
             }
             if ($hostState -ne 'Ready') {
                 $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target 'T2' -Status 'Warning' -Message ('{0} is in state {1}; the T2 runner is installed in its last step (WorkloadRunner).' -f $vmName, $hostState) -Evidence @{ hostState = $hostState } -Remediation 'Wait for the host to report Ready, then run validate.ps1 -Area Workload again.' -DocUrl $docUrl))
+                & $queryStoreUnread ('{0} isn''t Ready yet, so the runner wasn''t asked.' -f $vmName) 'Wait for the host to report Ready, then run ./scripts/validate.ps1 -Area Workload again.'
                 continue
             }
         }
@@ -619,6 +635,7 @@ function Invoke-DemoValidationWorkload {
         catch {
             $message = Protect-DemoText -Text $_.Exception.Message
             $results.Add((New-DemoResult -CheckId $checkId -Area 'workload' -Target $target -Status 'Warning' -Message ('The runner''s status on {0} couldn''t be read: {1} {2}' -f $target, $message, (Get-DemoValidationRunCommandNote -ErrorText $message)) -Remediation 'Run validate.ps1 -Area Workload again in about 10 minutes.' -DocUrl $docUrl))
+            & $queryStoreUnread ('the runner''s status couldn''t be read (WORKLOAD.{0}.COMMAND).' -f $target) 'Run ./scripts/validate.ps1 -Area Workload again in about 10 minutes.'
             continue
         }
         $commandResult = $run.Result
@@ -632,6 +649,12 @@ function Invoke-DemoValidationWorkload {
             # lists two or more runs (re-review of PR 16, 2026-11-04).
             $runnerProfile = Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $run -Name 'Result') -Name 'evidence') -Name 'profile'
             $results.Add((ConvertTo-DemoIncidentAwareResult -Result (Test-DemoValidationWorkloadHost -Target $target -StdOut $run.StdOut -VmName $vmName) -Config $Context.Config -IncidentTarget $incidentTargets -ValidationArea 'Workload' -Kind Host -RunnerStdOut $run.StdOut -RunnerProfile $runnerProfile))
+            if ($target -in 'T1', 'T2') {
+                $results.Add((Test-DemoValidationWorkloadQueryStore -Target $target -Result $run.Result -StdOut $run.StdOut))
+            }
+        }
+        else {
+            & $queryStoreUnread ('the runner''s status read failed (WORKLOAD.{0}.COMMAND).' -f $target) ('Fix what WORKLOAD.{0}.COMMAND names, then run ./scripts/validate.ps1 -Area Workload again.' -f $target)
         }
     }
     # The session control (ADR 0020, ADR 0026), part of every deployment since 2026-11-14: CONTROL.*, read-only.
