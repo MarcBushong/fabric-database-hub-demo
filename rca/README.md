@@ -214,13 +214,14 @@ PostgreSQL shows an interval only once it ends and is persisted ("Data that the 
 
 ### Acknowledgement
 
-The notebook acknowledges every sidecar payload it reads, by document ID, in `Files/rca/acks/<payload's name>.ack.json` (transport.schema.json, `ack`). Each document is `written` (by this run), `already` (an earlier run wrote it), or `skipped`, with the reason.
+The notebook acknowledges every sidecar payload it reads, by document ID, in `Files/rca/acks/<the payload's name without .json>.ack.json` (transport.schema.json, `ack`; for the payload `Files/rca/inbox/sidecar-20261121T102531Z.json`, `Files/rca/acks/sidecar-20261121T102531Z.ack.json`). Each document is `written` (by this run), `already` (an earlier run wrote it), or `skipped`, with the reason.
 
 - **Exactly once:**
   - the notebook writes a sidecar's rows table by table, replacing any rows of its `document_id` that an earlier run wrote, and its `rca_query_coverage` rows last;
   - a document is `already` only when its coverage rows are there, so a run that stopped halfway through a document is completed by the next, never skipped;
   - `written` and `already` both mean every table holds the document's rows.
 - **The acknowledgement file** names its payload and lists exactly that payload's documents. The notebook writes it once every one of them is committed. A reader treats one whose payload or documents differ from what it staged as missing.
+- **No acknowledgement** when the run doesn't save its results (`SAVE_RESULTS` false, outside `RCA_ONLY`), or can't read the payload: a missing acknowledgement, so everything in the payload stays pending.
 - **It deletes a payload** only when every document in it is `written` or `already`. A payload that holds a skipped document stays until its documents are acknowledged, or for 30 days.
 - **The scripts read the acknowledgement,** never the payload's disappearance. They run `rca ack` for the written documents on the VMs that hold them, and keep the rest pending with the reason.
 - **When the VMs are already stopped:** `stop-demo.ps1 -SaveHistory` runs the notebook after the VMs deallocate. So it keeps the written IDs per VM in `out/history-pending/`, and the next export with that VM running sends `rca ack` first. `deploy.ps1`'s snapshot and `configure-fabric.ps1 -RunLiveActivity` run the notebook while the VMs run, and acknowledge at once.
@@ -283,9 +284,9 @@ The notebook's other parameter, for any session: a path in the demo's lakehouse,
 
 ### `RCA_SIDECAR_FILE`
 
-`NB_DatabaseHub_LiveActivity`'s parameter for sidecars: a path in the demo's lakehouse, `Files/rca/inbox/<name>.json` (transport.schema.json, `sidecarFile`), to a file that holds exactly one `ContosoCare.RcaSidecarParts` document (`sidecarParameter`): every part line of the sidecars a save fetched, at most 64.
+`NB_DatabaseHub_LiveActivity`'s parameter for sidecars: a path in the demo's lakehouse, `Files/rca/inbox/sidecar-<yyyyMMddTHHmmssZ>[-<name>].json` (transport.schema.json, `sidecarFile`), to a file that holds exactly one `ContosoCare.RcaSidecarParts` document (`sidecarParameter`): every part line of the sidecars a save fetched, at most 64.
 
-- **Staging:** the scripts write it as they write `RCA_EVIDENCE_FILE`, and only when the workspace's notebook declares the parameter (`Test-DemoFabricNotebookParameter`). For an older or edited notebook they stage none, leave the sidecars pending, and say so in a Warning with the fix.
+- **Staging:** the scripts write it as they write `RCA_EVIDENCE_FILE`, and only when the workspace's notebook declares the parameter (`Test-DemoFabricNotebookParameter`). For an older or edited notebook they stage none, leave the sidecars pending, and say so in a Warning with the fix. Its name starts with `sidecar-`, which the sweep of evidence files staged more than a day ago never matches: a sidecar payload goes by [acknowledgement](#acknowledgement).
 - **Reading:** as `RCA_EVIDENCE_FILE` (`notebookutils.fs.head`, 262,144 bytes). It writes each sidecar once, by `documentId`, replacing that document's earlier rows, under its session's run ([the sidecar](#the-sidecar)), acknowledges the payload ([acknowledgement](#acknowledgement)), and reports `RCA.SIDECAR` with ADR 0012's statuses, as `RCA_EVIDENCE` reports `RCA.EVIDENCE`.
 - **The deployment notebook's purge** removes the sidecar's six tables with the others, and `Files/rca/acks` with `Files/rca/inbox` (history-tables.json, `purge` and `purgeFiles`).
 
