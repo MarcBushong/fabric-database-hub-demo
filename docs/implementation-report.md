@@ -5542,7 +5542,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **Pester,** under strict mode with the Azure CLI guard, one suite at a time:
   - `Agent.PromptPack`: 472 passed, none failed.
   - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
-  - `Fabric.Notebooks`, for the deployment notebook: 121 passed, 1 failed, 8 skipped, the same counts as at 59d9dfb7 without this commit. The failure is `NB_DatabaseHub_LiveActivity`'s staged evidence case (`stagedOtherSession`), which this commit doesn't touch.
+  - `Fabric.Notebooks`, for the deployment notebook: 121 passed, 1 failed, 8 skipped, as at 59d9dfb7 without this commit. The failure is a date bomb in `NB_DatabaseHub_LiveActivity`'s staged evidence case (`stagedOtherSession`): the test stages a file named for 2026-11-20 17:25 UTC, and the notebook's inbox sweep deletes a file staged more than 24 hours earlier, so the test has failed on every branch since 2026-11-21 17:25 UTC. The RCA release's integration fixes the test in 5633c574, with no notebook change. With 5633c574 applied, the suite passes: 122, with 8 skipped.
   - The guard saw no Azure CLI call in any of them.
 - markdownlint found no issue in 152 files. The notebook parses, 31 cells, with one line changed.
 - No PowerShell changed, so PSScriptAnalyzer has nothing new to read.
