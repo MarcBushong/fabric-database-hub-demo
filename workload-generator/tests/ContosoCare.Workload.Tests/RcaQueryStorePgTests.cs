@@ -1537,8 +1537,9 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
 
     /// <summary>
     /// Drives one observer as ObserverLane does, by a clock a slow block moves: begins it at <paramref name="from"/>, ticks it
-    /// when it says, 50 ms to 1 s after its last tick ended, and ends it at <paramref name="to"/>. The span's end is the
-    /// time EndAsync's hook ran, when the evidence's own end was done, as the lane takes it. Returns that time.
+    /// when it says, 50 ms to 1 s after its last tick ended, and ends it at <paramref name="to"/>, with its clock. The span's
+    /// end is the time EndAsync's hook gets: the clock's when the evidence's own end was done, as the lane takes it. Returns
+    /// that time.
     /// </summary>
     private static async Task<DateTimeOffset> LaneAsync(TargetObserver observer, ICaptureSpan span, ManualTime clock, DateTimeOffset from, DateTimeOffset to)
     {
@@ -1556,7 +1557,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         }
 
         DateTimeOffset? ended = null;
-        await observer.EndAsync(to, token, () => ended = clock.Now);
+        await observer.EndAsync(to, token, end => ended = end, clock);
         Assert.NotNull(ended);
         span.Ended(observer.Target, ended.Value);
         return ended.Value;
