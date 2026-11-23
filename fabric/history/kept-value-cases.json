@@ -1,5 +1,5 @@
 {
-  "about": "F35 design (i)'s shared cases, written from snapshotValues by fabric/app/src/data/kept-value-cases.test.ts: don't edit. Times are seconds after base. A case's series are target, analysis, metric; its saves are capture, window start, window end; a row is a series' index, a bin, a save's index, and a value; a bin is a series' index, a bin, and the rule's value.",
+  "about": "F35 design (i)'s shared cases, written from snapshotValues by fabric/app/src/data/kept-value-cases.test.ts: don't edit. Times are seconds after base. A case's series are target, analysis, metric; its saves are capture, window start, window end, and the grain in minutes that it declares (grain_minutes), when it does; a row is a series' index, a bin, a save's index, and a value; a bin is a series' index, a bin, and the rule's value.",
   "base": "2026-11-21T00:00:00.000Z",
   "lists": {"additiveAnalyses":["counter_deltas","storage_io","wait_deltas"],"additiveMetrics":["ThrottledRequests","TotalRequestUnits","TotalRequests","connections_failed"],"hourlyMetrics":["ProvisionedThroughput","ServiceAvailability"],"offGridAnalyses":["database_growth","estate_pulse","memory_clerks","telemetry_coverage","wait_profile"]},
   "cases": [
@@ -1091,7 +1091,7 @@
       ]
     },
     {
-      "name": "a known difference: a quiet minute in a finer row that a coarser save's window cuts through",
+      "name": "a quiet minute in a finer row that a coarser save's window cuts through",
       "series": [
         ["T1","wait_deltas","Lock"]
       ],
@@ -1117,13 +1117,13 @@
         [0,55080,10],
         [0,55140,10],
         [0,55260,10],
-        [0,54900,28],
+        [0,54900,31],
         [0,55200,8],
         [0,55800,60]
       ]
     },
     {
-      "name": "a known difference: what's left of a finer row on both sides of a coarser save's window cut",
+      "name": "what's left of a finer row on both sides of a coarser save's window cut",
       "series": [
         ["T1","counter_deltas","Batch Requests/sec"]
       ],
@@ -1143,9 +1143,59 @@
       "bins": [
         [0,55260,10],
         [0,55320,10],
-        [0,54900,40],
+        [0,54900,44],
         [0,55200,8],
         [0,55800,60]
+      ]
+    },
+    {
+      "name": "declared grains: a hand-set 5-minute bin, which the window alone reads as 1",
+      "series": [
+        ["T1","counter_deltas","Batch Requests/sec"]
+      ],
+      "saves": [
+        [57900,54000,57600,5],
+        [77400,-9240,77160,15]
+      ],
+      "rows": [
+        [0,54000,0,50],
+        [0,54300,0,50],
+        [0,54600,0,50],
+        [0,54900,0,40],
+        [0,54000,1,200],
+        [0,54900,1,160]
+      ],
+      "bins": [
+        [0,54000,50],
+        [0,54300,50],
+        [0,54600,50],
+        [0,54900,160]
+      ]
+    },
+    {
+      "name": "declared grains: a save whose bins don't show its step",
+      "series": [
+        ["T2","sessions","MaxSessions"]
+      ],
+      "saves": [
+        [59400,5400,59400,15],
+        [61200,7200,61200,15]
+      ],
+      "rows": [
+        [0,54000,0,5],
+        [0,54900,0,7],
+        [0,55800,0,6],
+        [0,56700,0,4],
+        [0,54000,1,10],
+        [0,55800,1,43],
+        [0,57600,1,8]
+      ],
+      "bins": [
+        [0,54000,10],
+        [0,54900,7],
+        [0,55800,43],
+        [0,56700,4],
+        [0,57600,8]
       ]
     },
     {

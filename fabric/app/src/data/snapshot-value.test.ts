@@ -300,46 +300,65 @@ describe("F35's per-bin rule in TypeScript, the reference for a fix of the histo
     });
 });
 
-// The review of 67f08e7d: known differences from finestPerInterval, older than 67f08e7d, which design (i)'s build aligns.
-// A finer row straddles a coarser point's window cut, and part of what's left of it is in the part cut off.
-// finestPerInterval splits what's left across the row's uncovered stretches by length, and the coarser point takes only
-// the stretches that overlap the part its window keeps; this rule takes all of it there. Neither is always the data's
-// answer, so each case pins both rules' and names the closer. Background load is 4 a minute; stop-demo.ps1 -SaveHistory
-// at 15:24 cuts its 15:20 bin to 15:20 to 15:24; and the next day's update at 15:22 cuts its day save's 15:15 bin to 15:22
-// to 15:30.
-describe("known differences from finestPerInterval, where a window cuts through what's left of a finer row", () => {
+// The review of 67f08e7d: a finer row straddles a coarser point's window cut, and part of what's left of it is in the
+// part cut off. Both rules split what's left across the row's uncovered stretches by length, and the coarser point takes
+// only the stretches that overlap the part its window keeps: design (i)'s build aligned this rule with finestPerInterval,
+// which before it took all of what was left there. Neither is always the data's answer, so each case names it. Background
+// load is 4 a minute; stop-demo.ps1 -SaveHistory at 15:24 cuts its 15:20 bin to 15:20 to 15:24; and the next day's update
+// at 15:22 cuts its day save's 15:15 bin to 15:22 to 15:30.
+describe("a finer row that a coarser save's window cuts through, split as finestPerInterval splits it", () => {
     const STOP = save("2026-11-21T15:24:30", "2026-11-21T03:24:00", "2026-11-21T15:24:00");
     const NEXT_DAY = save("2026-11-22T15:33:00", "2026-11-21T15:22:00", "2026-11-22T15:22:00");
 
-    it("with a quiet minute in the straddling row, the data hold 86 from 15:15 to 15:30: this rule's answer, where finestPerInterval gives 89", () => {
+    it("with a quiet minute in the straddling row, gives 89 from 15:15 to 15:30, where the data hold 86", () => {
         // A session from 15:16 to 15:22 with 10 a minute of Lock waits, and none at 15:20, a bin WAITS_KQL leaves out
-        // (WaitMs > 0). The stop save's 15:20 holds 18: 10 at 15:21, beside the session's, and 8 from 15:22 to 15:24.
-        // finestPerInterval gives the quiet 15:20 3 of the 8, by length, so the day keeps 27 for 15:24 to 15:30, where 24
-        // is right; this rule takes all 8 from the day's part, as the data do. 76 before 67f08e7d.
+        // (WaitMs > 0). The stop save's 15:20 holds 18: 10 at 15:21, beside the session's, and 8 from 15:22 to 15:24. The
+        // split gives the quiet 15:20 3 of the 8, by length, so the day keeps 27 for 15:24 to 15:30, where 24 is right;
+        // taking all 8 from the day's part, as this rule did before, gave the data's 86.
         const lock = (s: Record<string, string>) => row(s, "T1", "wait_deltas", "Lock");
         const rows = [
             ...([["15:16", 10], ["15:17", 10], ["15:18", 10], ["15:19", 10], ["15:21", 10]] as const).map(lock(save("2026-11-21T15:23:00", "2026-11-21T15:16:00", "2026-11-21T15:22:00"))),
             ...every("15:15", 5, [44, 18]).map(lock(STOP)),
             ...every("15:15", 15, [32, 60]).map(lock(NEXT_DAY)),
         ];
-        expect(snapshotValues(rows).get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(28);
+        expect(snapshotValues(rows).get(key("T1", "wait_deltas", "Lock", "15:15"))).toBe(31);
         const { model, finest } = f35Check(rows, at("15:15"), at("15:30")).measures.T1.LockWaitS;
-        expect(model).toBeCloseTo(0.086, 9);
+        expect(model).toBeCloseTo(0.089, 9);
         expect(finest).toBeCloseTo(0.089, 9);
     });
 
-    it("with what's left of the straddling row on both sides of the cut, the data hold 72 from 15:15 to 15:30: finestPerInterval's answer, where this rule gives 68", () => {
+    it("with what's left of the straddling row on both sides of the cut, gives 72 from 15:15 to 15:30, the data's answer", () => {
         // A session from 15:21 to 15:23 with 10 a minute. The stop save's 15:20 holds 28, 8 of it beside the session's
-        // minutes: 4 at 15:20, which the day's window cuts off, and 4 at 15:23. finestPerInterval gives each 4, so the day
-        // keeps 24 of its 38, as the data do; this rule takes all 8 from the day's part, which keeps 20. The same before
-        // 67f08e7d.
+        // minutes: 4 at 15:20, which the day's window cuts off, and 4 at 15:23. The split gives each 4, so the day keeps 24
+        // of its 38, as the data do; taking all 8 from the day's part, as this rule did before, kept 20, and 68.
         const batch = (s: Record<string, string>) => row(s, "T1", "counter_deltas", "Batch Requests/sec");
         const rows = [
             ...minutes("15:21", [10, 10]).map(batch(save("2026-11-21T15:23:30", "2026-11-21T15:21:00", "2026-11-21T15:23:00"))),
             ...every("15:15", 5, [20, 28]).map(batch(STOP)),
             ...every("15:15", 15, [38, 60]).map(batch(NEXT_DAY)),
         ];
-        expect(snapshotValues(rows).get(key("T1", "counter_deltas", "Batch Requests/sec", "15:15"))).toBe(40);
-        expect(f35Check(rows, at("15:15"), at("15:30")).measures.T1.Batch).toEqual({ model: 68, finest: 72 });
+        expect(snapshotValues(rows).get(key("T1", "counter_deltas", "Batch Requests/sec", "15:15"))).toBe(44);
+        expect(f35Check(rows, at("15:15"), at("15:30")).measures.T1.Batch).toEqual({ model: 72, finest: 72 });
+    });
+});
+
+// F35's declared grain: since design (i)'s build, the notebook writes each save's step with its rows (grain_minutes), and
+// both rules read it; a save written before keeps today's reading. random 11's shape: a newer 900-minute save of T2's
+// sessions has three rows 30 minutes apart, and an older one a row every 15 minutes.
+describe("a save's declared grain", () => {
+    const older = save("2026-11-21T16:30:00", "2026-11-21T01:30:00", "2026-11-21T16:30:00");
+    const newer = save("2026-11-21T17:00:00", "2026-11-21T02:00:00", "2026-11-21T17:00:00");
+    const sessions = (s: Record<string, string>, grain?: unknown) => (point: readonly [string, number]): Row => ({ ...row(s, "T2", "sessions", "MaxSessions")(point), ...(grain === undefined ? {} : { GrainMinutes: grain }) });
+    const rows = (grain?: unknown) => [...every("15:00", 15, [5, 7, 6, 4]).map(sessions(older, grain)), ...every("15:00", 30, [10, 43, 8]).map(sessions(newer, grain))];
+
+    it("sets each save's step in both rules, so a save whose bins don't show its step is the finer one in both", () => {
+        // Declared, both take the newer save as the finer: its 43 is 15:00 to 16:00's peak.
+        expect(f35Check(rows(15), at("15:00"), at("16:00")).measures.T2.SessionsPeak).toEqual({ model: 43, finest: 43 });
+        expect(f35Check(rows("15"), at("15:00"), at("16:00")).measures.T2.SessionsPeak).toEqual({ model: 43, finest: 43 });
+        // Without one, as an older save, finestPerInterval reads the newer save's step from its bins, 30 minutes, and keeps
+        // the older save's 7; the window's reading, 15, keeps the 43.
+        for (const grain of [undefined, null, 0, 2.5, 1441]) {
+            expect(f35Check(rows(grain), at("15:00"), at("16:00")).measures.T2.SessionsPeak).toEqual({ model: 43, finest: 7 });
+        }
     });
 });
