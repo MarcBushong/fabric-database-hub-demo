@@ -342,18 +342,21 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
     // The median, so a short burst (the primary taking its lock) doesn't stand for the rate the replica received.
     const avgWal = walRate.length ? Math.round([...walRate].sort((a, b) => a - b)[Math.floor(walRate.length / 2)]) : null;
     // The queries recovery cancelled: pg_stat_database_conflicts' deltas since the reading before, so they add up. A stall's
-    // cancel ends it, so the capture records it at or after the stall's recovery, and the next stall's only after it has
-    // read that one at its level. So this stall's are those recorded after its own first reading at its level, which is
-    // after its last replay too, through its recovery, up to the next rise's first point at its level, and within the
-    // minutes read: never an earlier stall's, nor the next one's (the review of fb144473: a cancel recorded 20 s before
-    // this stall's last replay read as this one's). From its last replay alone, B's blip at 16:19:37 would share the first
-    // stall's reading at 16:19:32.827, since its own last replay was at 16:19:32.69.
+    // cancel ends its wait, after max_standby_streaming_delay, so the capture records it after the stall's first reading at
+    // its level: during its catch-up, when replay takes more than a reading to catch up (B's first stall was still 154.1 s
+    // and 88,809,688 bytes behind at 16:19:22.703, its lock gone; the review of 6eaed9aa), or at or after its recovery. The
+    // next stall's comes only after the capture has read that one at its level. So this stall's are those recorded after
+    // its own first reading at its level, which is after its last replay too, through its recovery, up to the next rise's
+    // first point at its level, and within the minutes read: never an earlier stall's, nor the next one's (the review of
+    // fb144473: a cancel recorded 20 s before this stall's last replay read as this one's). From its last replay alone, B's
+    // blip at 16:19:37 would share the first stall's reading at 16:19:32.827, since its own last replay was at 16:19:32.69.
     const nextRise = rise.recovered ? series.points.find((p) => p.at > rise.end && p.value >= 5) : undefined;
     const cancelsTo = nextRise ? Math.min(nextRise.at.getTime(), to) : rise.recovered ? to : rise.end.getTime();
     const cancelsAfter = Math.max(stoodFrom, rise.start.getTime());
     const cancelReadings = replica.filter((s) => s.conflictsCancelled !== undefined && s.at.getTime() > cancelsAfter && s.at.getTime() <= cancelsTo);
     const cancels = cancelReadings.reduce((n, s) => n + (s.conflictsCancelled ?? 0), 0);
-    // Whether recovery cancelled the query is known only from a reading at or after the recovery, where that cancel is recorded.
+    // A cancel the capture recorded is said wherever it was recorded. With none, that none was is known only from a reading at
+    // or after the recovery: one before it can precede the cancel that ended the stall.
     const cancelRead = !!rise.recovered && cancelReadings.some((s) => s.at >= rise.end);
     const delay = replica.find((s) => s.maxStandbyStreamingDelayS !== undefined)?.maxStandbyStreamingDelayS;
     // The capture's own episode for the stall, as evidence of when it watched closely; it never names a cause. Its own:
@@ -383,17 +386,19 @@ export function analyzeReplicaLag(input: { at: Date; metrics: readonly MetricPoi
             figuresPrimary.length > 0
                 ? `The primary shipped normally (write and flush lag at most ${maxWriteLag} s${avgWal !== null ? `, WAL about ${avgWal} bytes/s` : ""}), so neither the network nor the write volume caused it. `
                 : "The primary's side wasn't sampled during the stall, so whether it shipped normally isn't known. ";
-        // How it ended, only as far as the capture's readings show it: a stall that hadn't recovered may still have its
-        // query cancelled, and one the capture didn't read from its recovery on says nothing either way.
+        // How it ended, only as far as the capture's readings show it: a cancel they recorded is said, during the stall, its
+        // catch-up, or after its recovery (the review of 6eaed9aa: one recorded during the catch-up, with no reading after
+        // the recovery, read as not known). With none, a stall that hadn't recovered, or one the capture didn't read from its
+        // recovery on, says nothing either way.
         const cancelled = plural(cancels, "replica query", "replica queries");
         const ended = !rise.recovered
             ? cancels > 0
                 ? `recovery cancelled ${cancelled} (SQLSTATE 40001) during it, and replay hadn't caught up by the end of the minutes read`
                 : "replay hadn't caught up by the end of the minutes read, so whether the query ended or recovery cancelled it isn't known"
-            : !cancelRead
-              ? "the capture has no reading of the replica's cancels from its recovery on, so whether recovery cancelled the query isn't known, and replay caught up"
-              : cancels > 0
-                ? `recovery cancelled ${cancelled} (SQLSTATE 40001), and replay caught up`
+            : cancels > 0
+              ? `recovery cancelled ${cancelled} (SQLSTATE 40001), and replay caught up`
+              : !cancelRead
+                ? "the capture has no reading of the replica's cancels from its recovery on, so whether recovery cancelled the query isn't known, and replay caught up"
                 : "the query ended before that, so nothing was cancelled, and replay caught up";
         statement =
             `${shape}: replay stood still. The replica kept receiving WAL (${backlog} bytes received but not replayed) while its startup process waited for ${conflict.conflictWantedMode ?? "a lock"} on ${conflict.conflictRelation}${since}, which a query on the replica held (${conflict.conflictHolderMode ?? "a lock"}; ${holder}). ` +

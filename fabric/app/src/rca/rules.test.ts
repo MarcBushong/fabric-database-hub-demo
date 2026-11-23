@@ -311,6 +311,22 @@ describe("read replica lag (INV-15) on T4's replica", () => {
             expect(statementAt(samples, "16:01:00", metrics)).toMatch(/; the capture has no reading of the replica's cancels from its recovery on, so whether recovery cancelled the query isn't known, and replay caught up\.$/);
         });
 
+        // The review of 6eaed9aa: a cancel ends a stall's wait, and replay can take more than a reading to catch up after it, as
+        // B's first stall did, so the capture can record the cancel before the recovery. With no reading after the recovery,
+        // it read as not known; fb144473 said it.
+        it("states a cancel recorded during the stall's catch-up, though the capture didn't read the replica from its recovery on: the review's probe", () => {
+            const samples = [
+                ...every5("16:00:05", "16:01:30").map((t) => reading(t, "16:00:00", { behind: 4096, holder: 111 })),
+                // Recovery cancelled session 111's query: replay resumed, still 60 s and 2048 bytes behind, and the capture ends.
+                reading("16:01:35", "16:00:35", { behind: 2048, cancelled: 1 }),
+            ];
+            const metrics: MetricPoint[] = [{ target: "T4-replica", at: at("16:05:00"), metric: LAG_METRIC, value: 0.5, intervalMs: 60_000, grainMs: 60_000 }];
+            const a = analyzeReplicaLag({ at: at("16:01:00"), metrics, samples, events: [] });
+            expect(a.rise?.recovered).toMatchObject({ source: "Telemetry Snapshots", value: 0.5 });
+            expect(a.rootCause?.statement).toMatch(/\(AccessShareLock; session 111\)\. .*; recovery cancelled 1 replica query \(SQLSTATE 40001\), and replay caught up\.$/);
+            expect(a.rootCause?.statement).not.toMatch(/whether recovery cancelled the query isn't known/);
+        });
+
         // Each reading's count is the cancels since the reading before (pg_stat_database_conflicts' deltas), so they add up.
         it("adds the cancels each reading recorded since the one before", () => {
             const samples = [
