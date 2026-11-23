@@ -255,6 +255,9 @@ class FileSystem:
         return FILES[path][:max_bytes]
 
     def rm(self, path, recurse=False):
+        if scenario == "qsacksrmfail" and path.endswith("/sidecar-20261001T120000Z-runall-1a2b3c4d.ack.json"):
+            # OneLake refuses to delete the acknowledgement more than 30 days old.
+            raise OSError("OneLake refused the delete")
         FILES.pop(path, None)
         return True
 
@@ -479,7 +482,7 @@ if scenario in ("leftoverqs", "stoppedqs", "earlierqs"):
 # missing.
 QS_IDS = ["20261113T140000Z-sqlvm01-0001-sidecar", "20261113T141500Z-sqlvm01-0002-sidecar", "20261113T143000Z-sqlvm01-0003-sidecar",
           "20261113T144500Z-arcsql01-0001-sidecar", "20261113T150000Z-sqlvm01-0004-sidecar"]
-if scenario in ("qsacks", "qsacksearly"):
+if scenario in ("qsacks", "qsacksearly", "qsacksrmfail"):
     acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a1b2c3d.json", [(QS_IDS[0], "written"), (QS_IDS[1], "already"), (QS_IDS[2], "skipped")])
     acknowledge("Files/rca/inbox/sidecar-20261113T155000Z-runall-6c7d8e9f.json", [(QS_IDS[2], "skipped")])
     acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-4e5f6a7b.json", [(QS_IDS[1], "already"), (QS_IDS[3], "written")])
@@ -489,9 +492,12 @@ if scenario in ("qsacks", "qsacksearly"):
     other = acknowledge("Files/rca/inbox/sidecar-20261113T180000Z-runall-2a3b4c5d.json", [(QS_IDS[4], "written")])
     FILES[BASE + other] = FILES[BASE + other].replace("2a3b4c5d", "99999999")
 # Whole acknowledgements, the oldest first ("qsackswhole"): 40 sidecars, then 30, which would pass the 64 a start takes,
-# then 1, which waits behind them.
+# then 1, which waits behind them. Older than all of them, one that lists 65, more than the contract's 64, of which 3 are
+# written: it doesn't follow the contract, so none of it rides, and it holds nothing back.
 WHOLE_IDS = ["20261113T%02d%02d00Z-sqlvm01-%04d-sidecar" % (10 + n // 60, n % 60, n) for n in range(71)]
+OVER_IDS = ["20261112T%02d%02d00Z-sqlvm01-%04d-sidecar" % (10 + n // 60, n % 60, n) for n in range(65)]
 if scenario == "qsackswhole":
+    acknowledge("Files/rca/inbox/sidecar-20261113T140000Z-runall-0f0f0f0f.json", [(item, "written" if n < 3 else "skipped") for n, item in enumerate(OVER_IDS)])
     acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a0a0a0a.json", [(item, "written") for item in WHOLE_IDS[:40]])
     acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-0b0b0b0b.json", [(item, "written") for item in WHOLE_IDS[40:70]])
     acknowledge("Files/rca/inbox/sidecar-20261113T170000Z-runall-0c0c0c0c.json", [(WHOLE_IDS[70], "written")])
@@ -1893,10 +1899,27 @@ print(json.dumps(out))
         $ids = @(0..39 | ForEach-Object { '20261113T10{0:d2}00Z-sqlvm01-{0:d4}-sidecar' -f $_ })
         @($report.sent[0].rcaAcks.documents) | Should -Be $ids
         $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Pass: 40 sidecars acknowledged on sqlvm01, before the start''s exports\.\s+Run all''s sidecar acknowledgements: 1 done and deleted, 2 kept for the next start\.'
+        # The one that lists more than 64 sidecars doesn't follow the contract: none of it rides, it holds nothing back,
+        # and it stays for the activity notebook's sweep.
         @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
+            'Files/rca/acks/sidecar-20261113T140000Z-runall-0f0f0f0f.ack.json'
             'Files/rca/acks/sidecar-20261113T160000Z-runall-0b0b0b0b.ack.json'
             'Files/rca/acks/sidecar-20261113T170000Z-runall-0c0c0c0c.ack.json'
         )
+    }
+
+    It 'sends the start''s acknowledgements when one more than 30 days old can''t be deleted (2026-11-23)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'qsacksrmfail' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent[0].rcaAcks.documents) | Should -Be @('20261113T140000Z-sqlvm01-0001-sidecar', '20261113T141500Z-sqlvm01-0002-sidecar', '20261113T144500Z-arcsql01-0001-sidecar')
+        $report.printed | Should -Not -Match 'couldn''t be read|weren''t all settled'
+        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept for the next start\.'
+        # It stays, unsent, for a later read or the activity notebook's sweep.
+        @($report.acks.PSObject.Properties.Name) | Should -Contain 'Files/rca/acks/sidecar-20261001T120000Z-runall-1a2b3c4d.ack.json'
     }
 
     It 'waits for the start''s final acknowledgement result: an early one that sent nothing yet says nothing and deletes nothing (review of 90b4718c)' {
@@ -1987,7 +2010,10 @@ for kwargs in (dict(rca_acks=[ids[0], ids[1], ids[0]]), dict(rca_acks=ids), dict
                # One whose sidecars an earlier one already carries adds only the others.
                dict(rca_acks=[[ids[0], ids[1]], [ids[1], ids[2]]]),
                # The contract's anchors: a trailing line feed isn't a sidecar ID.
-               dict(rca_acks=[ids[0] + "\n"])):
+               dict(rca_acks=[ids[0] + "\n"]),
+               # One too big to fit on its own, by count or by bytes, is skipped, so it holds back none after it.
+               dict(rca_acks=[ids[:70], ids[70:72]]),
+               dict(rca_acks=[long_ids, [ids[0]]])):
     try:
         body = build_request("session", catalog=catalog, session_id=sid, duration_minutes=90, **kwargs)
         out.append({"ok": True, "body": body, "bytes": len(json.dumps(body, separators=(",", ":")).encode("utf-8"))})
@@ -2008,7 +2034,7 @@ print(json.dumps(out))
         $output = & $script:python $driver $helpers $catalogFile 2>&1
         $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
         $results = ($output | Select-Object -Last 1) | ConvertFrom-Json
-        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $false, $true, $true, $true, $false, $false, $true, $true)
+        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $false, $true, $true, $true, $false, $true, $true, $false, $true, $true)
         $id = { param([int] $Number) '20261120T{0:d2}{1:d2}00Z-sqlvm01-{2:d4}-sidecar' -f (10 + [int][math]::Floor($Number / 60)), ($Number % 60), $Number }
         @($results[0].body.rcaAcks.documents) | Should -Be @((& $id 0), (& $id 1))
         @($results[1].body.rcaAcks.documents).Count | Should -Be 64
@@ -2023,9 +2049,11 @@ print(json.dumps(out))
         @($results[6].body.rcaAcks.documents) | Should -Be @(0..39 | ForEach-Object { & $id $_ })
         @($results[7].body.rcaAcks.documents) | Should -Be @((& $id 0), (& $id 1), (& $id 2))
         $results[8].error | Should -Match 'rca_acks takes sidecar IDs only'
-        $results[9].error | Should -Match 'Only a session''s start acknowledges sidecars'
-        @($results[10].body.rcaAcks.documents) | Should -Be @((& $id 5), (& $id 6), (& $id 7))
-        $results[11].body.PSObject.Properties.Name | Should -Not -Contain 'rcaAcks'
+        @($results[9].body.rcaAcks.documents) | Should -Be @((& $id 70), (& $id 71))
+        @($results[10].body.rcaAcks.documents) | Should -Be @((& $id 0))
+        $results[11].error | Should -Match 'Only a session''s start acknowledges sidecars'
+        @($results[12].body.rcaAcks.documents) | Should -Be @((& $id 5), (& $id 6), (& $id 7))
+        $results[13].body.PSObject.Properties.Name | Should -Not -Contain 'rcaAcks'
         foreach ($result in @($results | Where-Object { $_.ok -and $_.body -and $_.body.PSObject.Properties.Name -contains 'rcaAcks' })) {
             Test-Json -Json ($result.body.rcaAcks | ConvertTo-Json -Depth 4 -Compress) -SchemaFile (Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json') | Should -BeTrue
         }

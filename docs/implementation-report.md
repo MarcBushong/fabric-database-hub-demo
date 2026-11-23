@@ -5909,3 +5909,12 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 **Changed files.** `fabric/control/NB_DatabaseHub_Control.ipynb` (cell 5), `tests/unit/Fabric.ControlNotebook.Tests.ps1`, and this report.
 
 **Validation.** `Fabric.ControlNotebook`: 91 passed, none failed or skipped. The 4 new cases: an early result with nothing sent, then the real one with its step, as T2c-1's runbook writes them; and a pointer of another version, one whose index has a trailing line feed, and one with a null index. Mutations, each alone, each failing its test: the result printed before it's final; the first result latched; a result with nothing sent deleting acknowledgements; a malformed pointer silent; and a null index warned about. PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
+
+### The re-check of 399c8804 (2026-11-23)
+
+**Why.** The re-check said **SHIP**, and asked for two small hardening items, as one commit, each with a test that fails without it:
+
+- **No stall:** an acknowledgement that lists more than 64 sidecars doesn't follow the contract (`ack`, at most 64), so it counts as missing, and none of it rides. The selection skips an acknowledgement too big to fit a start on its own, by count or by bytes, so it can't hold back every later one; one that fits on its own still waits behind those before it.
+- **The expiry's delete:** a failed delete of an acknowledgement more than 30 days old leaves it for a later read, and the start still carries the others. Before, the failure ended the read, and the start went with no `rcaAcks`.
+
+**Validation.** `Fabric.ControlNotebook`: 92 passed, none failed or skipped. The new case: a start whose delete of an expired acknowledgement fails. Two cases grew: the whole acknowledgements, with an older one listing 65 sidecars, of which 3 are written; and `build_request`'s limits, with one too big on its own by count, and one by bytes. Mutations, each alone, each failing its test: an acknowledgement of more than 64 accepted; one too big on its own holding back the rest; the delete unwrapped; and, again, a later one let ahead of an older one that doesn't fit. PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
