@@ -5024,7 +5024,7 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The session control's status kept through updates** ([its entry](#the-session-controls-status-kept-through-updates-2026-11-23)): every update wrote the variable `DbHubSessionStatus` again, empty, so the next start no longer had what the last stop listed of the evidence still on the VMs. The template now creates it only when it's missing, and an update keeps it, encrypted or not.
 - **O1: the capture ends at a session's stop** ([its entry](#o1-the-capture-ends-at-a-sessions-stop-2026-11-23)): the control's stop stops nothing on the VMs before they deallocate, so the observer captured on past the stop's export, and the session's last minutes stayed on the VMs, listed nowhere. The stop's export now ends the capture first, in its own Run Command, and takes it whole; a VM where it didn't end is named.
 - **The golden capture reads an encrypted status through the control's job** ([its entry](#the-golden-capture-reads-an-encrypted-status-through-the-controls-job-2026-11-23)): when Azure Resource Manager can't give the status's value, `capture-t2-golden.ps1` starts `DbHub-Control`'s new read-only `pending` action as a job, which reads it with `Get-AutomationVariable`, so the capture no longer needs the variable deleted to check it.
-- **The reviews' fixes,** in each entry ([the latest](#the-review-of-1ca916a9-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
+- **The reviews' fixes,** in each entry ([the latest](#the-re-check-of-9440acf2-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
 
 **What still needs live proof.** All of it but the evaluation set, which reads recorded rows. Each change is unit-tested, and the RCA's answers are checked on B's and A's recorded rows, but none has run on a live environment. Its live check waits for the owner: dbhubrc stays at dbee7d53 for the owner's testing on Monday, 2026-11-23. On an environment deployed or updated from this branch, after a Run all session:
 
@@ -5664,3 +5664,55 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - A session that begins while a span is held closes it, and the stopped session's answer-key rows that come after go into the new session's span, as a run's rows always go to the span that's open.
 
 **What its live check needs.** O1's ([above](#o1-the-capture-ends-at-a-sessions-stop-2026-11-23)), and a stop right after a fault run ended: that run in the stop's history, with its answer key, and `rca.span-held`, then `rca.span-closed`, in that VM's runner log, seconds apart. And no capture after the stop: the history's last windows end at the stop's export, though the workload ran on.
+
+### The review of 8ca2b39c (2026-11-23)
+
+**Why.** A fresh reviewer read 8ca2b39c, [the golden capture's read of an encrypted status through the control's job](#the-golden-capture-reads-an-encrypted-status-through-the-controls-job-2026-11-23), and said **SHIP, as long as O1 ships with it**, with two Lows. The coupling: the capture's fallback fix line no longer asks to run each session to its planned end, because O1's stop names a VM whose capture didn't end in `RCA.PENDING`. The coordinator asked for both Lows in the O1 fix commit or a second one; this is the second, on top of [the review of 1ca916a9](#the-review-of-1ca916a9-2026-11-23).
+
+- **Low 1: a `Read` result without its lists didn't fail closed.** `{"status":"Read","message":"x"}` read as **Read**, with no documents and no error, so the capture would have gone on as if the status listed nothing. The runbook always writes the lists, but the capture mustn't rely on that. `Invoke-DemoGoldenControlPendingJob` now takes a `Read` only with its lists as an object; otherwise it's **Unread**, "couldn't either: its job ... said Read without its lists", and the capture captures nothing, with the capture again as the fix.
+- **Low 2: the refusals that the capture's job causes suggested Stop now.** While the job runs, a Run all is refused as another `DbHub-Control` job's, and a capture run again after the job's 10 minutes ran out meets it in `GOLDEN.CAPTURE.CONTROL`, whose fix suggests Stop now. Stop now doesn't end the job, which only reads, and it deallocates `archost01`, which the capture uses.
+  - The job's timeout now says that it only reads, and to wait for it to end before running the capture again.
+  - `docs/troubleshooting.md`'s row for the Run all refusal adds: if `./scripts/capture-t2-golden.ps1` is running, this is its read-only job, a minute or two, so wait, then Run all again, and don't Stop now. The rows for `GOLDEN.CAPTURE.CONTROL` and for `GOLDEN.CAPTURE.RCA` say the same for that job.
+- **Left for the live check, as the review says:** whether the tenant's nightly re-creation keeps the value, two nights in a row. And what a `DbHub-Control` from before the action answers when Azure Automation passes it the job's `WebhookData`, which the capture reads as an older runbook only when it refuses the action. If it answers "The webhook request has no body", which 8ca2b39c's tests read as a refusal of the request, it's an older runbook too, and `./scripts/deploy.ps1` is the fix.
+- **Docs:** three rows of `docs/troubleshooting.md`, the CHANGELOG's entry for the job, and this report: this entry and the stacked branch's summary.
+
+**Changed files.** `scripts/modules/DbHubDemo/Private/GoldenHelpers.ps1`, with `tests/unit/DbHubDemo.Golden.Tests.ps1`; `docs/troubleshooting.md`, `CHANGELOG.md`, and this report. They're in one commit with [the re-check of 9440acf2](#the-re-check-of-9440acf2-2026-11-23)'s fixes.
+
+**Validation.** On 9440acf2 with this commit, with only targeted tests while this PC was at full load:
+
+- **The golden suite:** under strict mode, with the Azure CLI guard, `DbHubDemo.Golden` passed: 134 passed, none failed, and the guard saw no unmocked Azure CLI call. Its 2 new cases of "says what kept it from the status": a `Read` with no lists, and one whose lists are a list rather than an object. The timeout's test now expects the new wording. With 8ca2b39c's `GoldenHelpers.ps1`, those 3 fail.
+- **The suites that read the docs:** under strict mode, with the Azure CLI guard, `Repo.Conventions`, `Repo.NeutralWording`, `Docs.Walkthrough`, and `Rca.Contract` passed: 224 passed, none failed.
+- PSScriptAnalyzer, with the repo's settings, found nothing in the two PowerShell files this commit changes, which are ASCII-only; markdownlint found no issue; every link this commit adds resolves, each relative one to one heading; and the leak check finds no identifier in it.
+- No app code changed, so `npm run verify` stands as it was at edd01c86.
+
+**What its live check needs.** The entry's above, and, while the capture's job runs, a Run all refused, then started once the job has ended.
+
+### The re-check of 9440acf2 (2026-11-23)
+
+**Why.** The re-check of [the review of 1ca916a9](#the-review-of-1ca916a9-2026-11-23) said **SHIP**: the blindness channel and all five Lows are closed. It found two new Lows, which the coordinator asked for in the same commit as [the review of 8ca2b39c](#the-review-of-8ca2b39c-2026-11-23)'s.
+
+- **Low 1: a held span's close that failed ended the loop that closes it.** An `IOException` from `span.Close`, which writes `span.json`, ended `CloseHeldAsync` for good, and at the lane's stop `Task.WhenAll` threw it through the host's stop, which catches only a timeout.
+  - The closer now logs such a failure (`rca.close-failed`) and tries again a second later. At the lane's stop it tries 3 times, a second apart, then leaves the span as it was (`rca.span-left-open`): once the runner has ended, the next export takes it as finished, as it does a span that a runner left open.
+  - The retry needed the store's part too: `SpanWriter.Close` marked the span closed before it wrote `span.json`, so a second close returned at once, and the lane would have logged the span closed while the file still said it was open. A close whose write failed now writes it when called again.
+  - `Acquire`'s close of a held span, when a session begins during the hold, could fail the same way, and the note loop, which has no catch of its own, ended with it. It's caught there too, and the next tick tries again.
+- **Low 2: two close paths were untested.** A lane stopped during a hold closes the span at its last end, and a profile set after the end during a hold closes the held span at its last end and opens a new one. Two lane tests now hold them.
+- **Docs:** `rca/README.md`'s runner, and this report: this entry and the stacked branch's summary.
+
+**Changed files.** In `workload-generator/src/ContosoCare.Workload/`: `Rca/Observer/ObserverLane.cs` and `Rca/Store/SpanWriter.cs`, with `RcaLaneTests.cs`, `RcaExportTests.cs`, and `RcaTestKit.cs`, whose span's close fails on demand; `rca/README.md`, and this report.
+
+**Validation.** On 9440acf2 with this commit, with only targeted tests while this PC was at full load:
+
+- **The runner:** `dotnet build` with warnings as errors, then the lane's and the export's test classes: 43 passed, none failed. Its 5 new tests:
+  - a held span's close that fails twice closes on the third try, at its last end;
+  - a lane stopped during a hold closes the span at its last end, after a write that failed once;
+  - a profile set after the end during a hold closes the held span at its last end and opens a new one, with that target only;
+  - a noted target's new session during a hold tries the held span's close again after it failed;
+  - and a span whose close couldn't be written writes it when closed again.
+- **The runner's mutations,** each alone, built, with those two classes, then restored, and the runner built again:
+  - C1, the closer's loop without its catch, fails the closer's retry test;
+  - C2, the stop's close without its catch, and C3, no close at the lane's stop, each fail the stop's test;
+  - C4, `Acquire` that never closes a held span, fails both tests of a session that begins during a hold;
+  - C5, `Acquire`'s close without its catch, fails the noted target's test;
+  - and C6, a span's close never written again, fails the store's test.
+
+**What its live check needs.** Nothing more than O1's: these paths take a failed write of the store.
