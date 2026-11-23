@@ -2992,9 +2992,21 @@ others = encode(DOCUMENTS[T4]) + encode(DOCUMENTS[SURGE])
 newer = copy.deepcopy(DOCUMENTS[T3])
 newer["version"] = 2
 evidence_line = open(repo + "/rca/fixtures/t1-blocking-chain.parts.txt", encoding="utf-8").read().splitlines()[0]
+
+
+def retimed(**times):
+    """T3's sidecar with other header times."""
+    return dict(copy.deepcopy(DOCUMENTS[T3]), **times)
+
+
+# Header times the contract's utc doesn't take, or the notebook can't parse (review of 87e01af5): a fourth fractional digit
+# in epochUtc moves every row off the millisecond grid, and a date that doesn't exist failed the run (as one past 2262 does
+# on pandas 1.x, whose OutOfBoundsDatetime is the same ValueError; pandas 2.x reads it).
 for case, parts in (("missing", [part for part in t3_parts if " 2/" not in part] + others),
                     ("corrupt", [re.sub(r" ([0-9a-f]{64}) ", " " + "0" * 64 + " ", part) for part in t3_parts] + others),
                     ("newerDocument", encode(newer) + others), ("newerFormat", encode(DOCUMENTS[T3], marker="DBHUBDEMO-RCAS 2") + others),
+                    ("epochMicros", encode(retimed(epochUtc="2026-11-20T16:50:00.0001Z")) + others),
+                    ("impossibleStart", encode(retimed(windowStartUtc="2026-02-30T16:50:00.000Z")) + others),
                     ("evidenceLine", PARAMETER["parts"] + [evidence_line])):
     files = Files()
     name = stage(files, parameter(parts))
@@ -3038,14 +3050,18 @@ names = {"ancient": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta
          "written": stage(files, json.dumps(PARAMETER), delta=dt.timedelta(hours=2), suffix="-written"),
          "pending": stage(files, parameter(encode(T3_LATER)), delta=dt.timedelta(hours=3), suffix="-pending"),
          "dayOld": stage(files, parameter(encode(T4_LATER)), delta=dt.timedelta(days=2), suffix="-dayold"),
-         "evidence": "Files/rca/inbox/%s-script-1234abcd.json" % stamp(dt.timedelta(days=2)), "notes": "Files/rca/inbox/notes.txt"}
+         "evidence": "Files/rca/inbox/%s-script-1234abcd.json" % stamp(dt.timedelta(days=2)), "notes": "Files/rca/inbox/notes.txt",
+         # A name whose time doesn't exist, which sorts before the others (review of 87e01af5): left for the purge, and the
+         # sweep goes past it.
+         "badTime": "Files/rca/inbox/sidecar-20260230T000000Z-badtime.json"}
 acks = {"gone": "Files/rca/acks/sidecar-%s-gone.ack.json" % stamp(dt.timedelta(days=2)),
         "kept": "Files/rca/acks/sidecar-%s-dayold.ack.json" % stamp(dt.timedelta(days=2)),
         "ancient": "Files/rca/acks/sidecar-%s-old.ack.json" % stamp(dt.timedelta(days=31)),
         "fresh": "Files/rca/acks/sidecar-%s-fresh.ack.json" % stamp(dt.timedelta(hours=1)), "other": "Files/rca/acks/notes.json",
         "runallWaiting": "Files/rca/acks/sidecar-%s-runall-1a2b3c4d.ack.json" % stamp(dt.timedelta(days=2)),
-        "runallAncient": "Files/rca/acks/sidecar-%s-runall-5e6f7a8b.ack.json" % stamp(dt.timedelta(days=31))}
-for name in [names["evidence"], names["notes"]] + list(acks.values()):
+        "runallAncient": "Files/rca/acks/sidecar-%s-runall-5e6f7a8b.ack.json" % stamp(dt.timedelta(days=31)),
+        "badTime": "Files/rca/acks/sidecar-20260230T000000Z-runall-9f8e7d6c.ack.json"}
+for name in [names["evidence"], names["notes"], names["badTime"]] + list(acks.values()):
     files.add(name, "{}")
 report["sweep"] = dict(run(lake, files)[0], names=names, acks=acks)
 
@@ -3386,6 +3402,8 @@ print(json.dumps(report, default=str))
         @{ Case = 'corrupt'; Why = 'its SHA-256 doesn''t match its parts' }
         @{ Case = 'newerDocument'; Why = 'its version 2 is newer than this notebook''s 1 \(\./scripts/deploy\.ps1 updates the notebook\)' }
         @{ Case = 'newerFormat'; Why = 'its part lines are in a part format this notebook doesn''t read' }
+        @{ Case = 'epochMicros'; Why = 'its epochUtc isn''t a UTC time with milliseconds' }
+        @{ Case = 'impossibleStart'; Why = 'its windowStartUtc isn''t a time this notebook can read' }
     ) {
         if ($sidecarSkip) {
             Set-ItResult -Skipped -Because $sidecarSkip
@@ -3496,6 +3514,11 @@ print(json.dumps(report, default=str))
         # control notebook deletes it then; only 30 days take it here (rca/README.md, Acknowledgement).
         $left | Should -Contain $sweep['acks']['runallWaiting'] -Because 'its file is gone, but the next Run all start still has to send its IDs'
         $left | Should -Not -Contain $sweep['acks']['runallAncient']
+        # A 30th of February in a name, sorted first: the sweep leaves those files for the purge and deletes the others
+        # above, with no cleanup warning.
+        $left | Should -Contain $sweep['names']['badTime']
+        $left | Should -Contain $sweep['acks']['badTime']
+        @($sweep['cleanup']) | Should -BeNullOrEmpty
     }
 
     It 'redacts a value that looks like a secret' {
