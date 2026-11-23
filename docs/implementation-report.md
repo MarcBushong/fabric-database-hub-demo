@@ -5560,3 +5560,27 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - The leak check finds nothing in what this commit adds.
 
 **What its live check needs.** `./scripts/deploy.ps1` on an existing environment with T4 at `Standard_D4ds_v5`: both parameters `all` afterwards (`az postgres flexible-server parameter show`, read-only), no restart for them (the server's `isConfigPendingRestart` false for both), and `query_store.qs_view` in `azure_sys` listing statements from inside the workload's functions after a session.
+
+### The review of 319b3ae1 and a2f776db (2026-11-23)
+
+**Why.** A fresh reviewer found parts 1 and 2 correct, their Learn quotes verbatim, and their tests real, and said **SHIP WITH FIXES**: two Medium and two Low. The coordinator asked for the fixes in one commit, beside part 3. One commit, after a2f776db.
+
+- **Medium: the notes name `T1.QUERYSTORE` to `T4.QUERYSTORE`, which only part 3 adds.** Part 3 ships with parts 1 and 2 today (its entry follows this one), so the names stay; without it they'd have to point at `sys.database_query_store_options` and `az postgres flexible-server parameter show` instead.
+- **Medium: "keeps those minutes" ignored retention.** T1 to T3 keep 14 days (`STALE_QUERY_THRESHOLD_DAYS`, less when size-based cleanup runs first) and T4 7 (`pg_qs.retention_period_in_days`' default), and T4 runs only during demos, so its newest incident can already be older. The note was then false, and the next step sent the owner to an empty view, which reads as "Query Store is off".
+  - **Now** (`rca/query-store.ts`): within the retention, the note says it ("for 14 days (less when it fills up)", "for 7 days"); past it, the note says Query Store no longer keeps those minutes either, how old they are, and that validate.ps1 says whether it's on, and there's no next step. The playbook's step 3 says "while it keeps those minutes".
+  - **Counted on the viewer's clock** (`InvestigationDeps.now`, which `rca/client.ts` passes from its own clock), not on `deps.latest`, as the review suggested: `latest` is the history's newest telemetry, which stays put while the demo is stopped, so a 10-day-old incident from the last session would read as fresh against it, the review's own case.
+  - **Tests:** 8 days later, T4's note says its 7 days are past, with no next step, while T1's still has one; 15 days later, T1's says its 14 are past. A test pins the 14 days to each `030-configure.sql`, and that the template leaves T4's retention at Learn's default.
+- **Low: the tuning check's Pass still said "Query Store captures the top queries"** and left out Query Store's state, which every other message of `Get-DemoT4Tuning` says. It now says that index tuning runs on what Query Store records, every statement, top-level and nested (`all`), and ends with Query Store's state, with a Pass case in the test that fails before it. `scenarios/missing-index/README.md` no longer says Query Store is `TOP`.
+- **Low: the playbook's step 3 contradicted the replica's exception:** it now says "except T4-replica, whose queries Query Store doesn't record", and that the next step is given "when it has one".
+- **Docs:** ADR 0031's section 8 and the CHANGELOG say the retention.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts`, `rca/tools.ts`, `rca/client.ts`, `rca/playbook.ts`, and `rca/tools.test.ts`; `scripts/modules/DbHubDemo/Private/T4Helpers.ps1` with `tests/unit/DbHubDemo.T4.Tests.ps1`; `scenarios/missing-index/README.md`; ADR 0031, `CHANGELOG.md`, and this report.
+
+**Validation.** On a2f776db with this commit:
+
+- **The app:** `npm run verify` passed: type check, lint, 684 tests in 36 files, the licenses, and the build. The two new tests, retention in the notes and the next steps, and its 14 days pinned to the scripts, fail at a2f776db, whose notes say neither.
+- **The T4 suite:** under strict mode, with the Azure CLI guard, `DbHubDemo.T4` passed with the tuning check's Pass case, which fails at a2f776db on its "top queries", beside the docs' suites (`Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, `Rca.Contract`): 345 passed, 3 skipped because this PC lacks gitleaks, with part 3's commit, whose T4 tests run in the same file.
+- PSScriptAnalyzer, with the repo's settings, found nothing in the two PowerShell files this commit changes, which are ASCII-only; markdownlint found no issue; every link this commit adds resolves, each relative one to one heading.
+- The leak check finds nothing in what this commit adds.
+
+**What its live check needs.** The Insights app's **Explain this incident** on a CPU incident on T4 more than 7 days old: the note says Query Store no longer keeps those minutes, and there's no next step; on one within 7 days, the next step's `qs_view` holds those minutes.

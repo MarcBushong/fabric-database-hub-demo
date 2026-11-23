@@ -1049,6 +1049,7 @@ Describe 'T4 autonomous tuning (2026-11-04)' {
     }
 
     It 'says Query Store''s state in the tuning check''s words, whatever the tuning: on at General Purpose, off at Burstable' -ForEach @(
+        @{ Switch = 'unset'; Sku = ''; Pattern = '^T4 gets autonomous tuning at Standard_D4ds_v5 \(General Purpose, 4 vCores\): index tuning runs in REPORT mode every 60 minutes on what Query Store records, every statement, top-level and nested \(pg_qs\.query_capture_mode all\), .* Query Store and its wait sampling stay on, as at every size but Burstable\.$' }
         @{ Switch = 'false'; Sku = ''; Pattern = 'Query Store and its wait sampling stay on, as at every size but Burstable\.$' }
         @{ Switch = 'false'; Sku = 'Standard_B1ms'; Pattern = 'Query Store stays off at this size, where Learn advises against it\.$' }
         @{ Switch = 'unset'; Sku = 'Standard_D2ds_v5'; Pattern = 'Query Store and its wait sampling stay on, as at every size but Burstable\.$' }
@@ -1064,6 +1065,7 @@ Describe 'T4 autonomous tuning (2026-11-04)' {
         $tuning = InModuleScope DbHubDemo -Parameters @{ Config = $config } { Get-DemoT4Tuning -Config $Config }
         $tuning.Message | Should -Match $Pattern
         $tuning.Message | Should -Not -Match 'Query Store and index-tuning parameters are left as they are'
+        $tuning.Message | Should -Not -Match 'top queries' -Because 'Query Store records every statement since 2026-11-23'
     }
 
     It 'reads the zones the region lists for a General Purpose size, and nothing when it can''t' {
