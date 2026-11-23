@@ -855,6 +855,37 @@ Describe 'Invoke-DemoWorkloadControl.ps1' {
         Get-DemoControlRunnerQueryStore -Text '{"target":"T1","host":{"status":"Pass"}}' | Should -BeNullOrEmpty -Because 'a runner from before it writes none'
     }
 
+    # The RCA release (2026-11-23): validate.ps1's one status read carries both the running runs' bounds (F20) and Query
+    # Store's state (part 3) in the same line. Query Store's node, under 400 characters, always stays (T1.QUERYSTORE would
+    # otherwise blame a runner from before it); the bounds go first when the line wouldn't fit, and boundsCut says so.
+    It 'Runner keeps a session''s running runs'' bounds and Query Store''s state in one line, and leaves the bounds out first when it wouldn''t fit (the RCA release)' {
+        $root = New-ControlRoot
+        $queryStore = [ordered]@{ actualState = 'READ_ONLY'; desiredState = 'READ_WRITE'; readonlyReason = 65536; captureMode = 'AUTO'; intervalMinutes = 15; storageMb = 1024; maxStorageMb = 1024 }
+        # During a session: five runs, two of them still Running, as validate.ps1 reads them.
+        $script:status = (New-RunnerStatus -Runs 5 -QueryStore $queryStore) -replace '("runId": "20261103T133500-io-pressure",\s+"scenario": "io-pressure",\s+"target": "T1",\s+"status": )"Completed"', '$1"Running"'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = '' } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5'); bounds = $true }) -StateRoot $root
+        $script:lines[0].Length | Should -BeLessThan 3900 -Because 'the line fits the 4,096 bytes a Run Command keeps'
+        $result = Get-ControlResult
+        @($result.evidence.bounds.running).Count | Should -Be 2
+        $result.evidence.PSObject.Properties['boundsCut'] | Should -BeNullOrEmpty
+        $result.evidence.queryStore.actualState | Should -Be 'READ_ONLY'
+        $result.evidence.queryStore.readonlyReason | Should -Be 65536
+
+        # The longest: every run Running, a long error output, the longest message, and Query Store's longest node (its error
+        # cut to 200 characters). The bounds go, Query Store's state stays, and the line still fits.
+        $script:lines.Clear()
+        $script:status = (New-RunnerStatus -Runs 5 -QueryStore ([ordered]@{ error = ("300: permission denied in database 'ContosoCare' <&> " * 20) })) -replace '"status": "Completed"', '"status": "Running"'
+        Mock -CommandName Invoke-DemoVmRunnerProcess -MockWith { [pscustomobject]@{ ExitCode = 0; StdOut = $script:status; StdErr = ('warn: the profile host''s lane polled late. ' * 20) } }
+        Mock -CommandName Get-DemoVmRunnerOutcome -MockWith { [pscustomobject]@{ Status = 'Pass'; Message = ('The guest''s PowerShell Direct channel broke, and its restart cleared it. ' * 12) } }
+        Invoke-DemoWorkloadControl -ActionName 'Runner' -Request (ConvertTo-Request @{ target = 'T1'; arguments = @('status', '--json', '--runs', '5'); bounds = $true }) -StateRoot $root
+        [System.Text.Encoding]::UTF8.GetByteCount($script:lines[0]) | Should -BeLessThan 4096
+        $result = Get-ControlResult
+        $result.evidence.PSObject.Properties['bounds'] | Should -BeNullOrEmpty
+        $result.evidence.boundsCut | Should -BeTrue
+        $result.evidence.queryStore.error | Should -Match '^300: permission denied in database'
+    }
+
     It 'EnableT4: sets T4 up as the P6 group''s role, records the marker, sets the profile, and restarts the host' {
         $root = New-ControlRoot
         Mock -CommandName Test-DemoVmNameResolve -MockWith { $true }

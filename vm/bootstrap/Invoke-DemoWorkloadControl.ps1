@@ -1494,7 +1494,8 @@ function Invoke-DemoControlRunner {
         }
     }
     # The bounds only while the line still fits what a Run Command returns (4,096 bytes): otherwise they're left out, and the
-    # check says the status was too long to carry them (boundsCut).
+    # check says the status was too long to carry them (boundsCut). Query Store's node, under 400 characters, stays: without
+    # it T1.QUERYSTORE and T2.QUERYSTORE would blame a runner from before it (the RCA release, 2026-11-23).
     if ($evidence.Contains('bounds') -and (Get-DemoControlResultLine -ActionName 'Runner' -Status $status -Message $message -Evidence $evidence).Length -gt $script:ControlLineBudget) {
         $evidence.Remove('bounds')
         $evidence['boundsCut'] = $true
