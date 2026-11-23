@@ -1955,13 +1955,17 @@ report["otherSession"] = run(Lake(), Files(), session_id="f" * 32, evidence=evid
 report["unreadable"] = run(Lake(), Files(), evidence=evidence(parts + ["DBHUBDEMO-RCA 2 something else"]))[0]
 
 # A staged file nothing was written from stays, so a deleted file means written (review of 37a546bc): every document
-# another session's, or a file that can't be used; the control notebook and the scripts then find it left.
+# another session's, or a file that can't be used; the control notebook and the scripts then find it left. Each is staged
+# now, as Run all stages it: the inbox sweep deletes a file staged more than a day ago, whatever its run wrote.
+fresh = "Files/rca/inbox/%s-5f1c0e7a-0001.json" % dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 files = Files()
-files.add(staged, json.dumps(PARAMETER))
-report["stagedOtherSession"] = run(Lake(), files, session_id="f" * 32, evidence_file=staged)[0]
+files.add(fresh, json.dumps(PARAMETER))
+report["stagedOtherSession"] = run(Lake(), files, session_id="f" * 32, evidence_file=fresh)[0]
+report["stagedOtherSession"]["staged"] = fresh
 files = Files()
-files.add(staged, evidence(parts, version=2))
-report["stagedUnusable"] = run(Lake(), files, evidence_file=staged)[0]
+files.add(fresh, evidence(parts, version=2))
+report["stagedUnusable"] = run(Lake(), files, evidence_file=fresh)[0]
+report["stagedUnusable"]["staged"] = fresh
 
 # A secret-looking string in a document is redacted before it's written; a document passed inline is read the same way.
 leaky = copy.deepcopy(DOCUMENTS["20261120T165000Z-sqlvm01-0001"])
@@ -2191,7 +2195,7 @@ print(json.dumps(report, default=str))
             $result = $rcaReport[$case]
             $result['status'] | Should -Be 'Warning' -Because $case
             @($result['documents']) | Should -BeNullOrEmpty -Because $case
-            @($result['left']) | Should -Contain 'Files/rca/inbox/20261120T172500Z-5f1c0e7a-0001.json' -Because ('{0}: the control notebook and the scripts read a deleted file as written' -f $case)
+            @($result['left']) | Should -Contain $result['staged'] -Because ('{0}: the control notebook and the scripts read a deleted file as written' -f $case)
         }
         # One it wrote from goes: the fixtures' run above.
         @($rcaReport['fixtures']['left']) | Should -BeNullOrEmpty
