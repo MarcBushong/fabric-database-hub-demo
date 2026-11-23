@@ -408,12 +408,14 @@ describe("F35 design (i)'s shared cases", () => {
             }
         }
         // One difference, which isn't about ranks: random 11's newer 900-minute save holds 3 rows of T2's sessions, 30 minutes
-        // apart at their closest, and no other series. finestPerInterval reads a save's step from its bins, 30 minutes here,
+        // apart at their closest, and no other series. finestPerInterval reads a capture's step from its bins, 30 minutes here,
         // so the save is coarser than the older one and left out at 15:30, where the older save's 7 is kept; snapshotValues
-        // reads the notebook's 15 from its window, so the newer save is the finer and its 43 is kept. A save of the
-        // notebook's holds every series of its targets, MaxCPU in each bin they ran, which shows its step. With the fourth
-        // and later saves against the first three, the five saves' case differed too: 3,548 and 3,600 from 15:00 to 16:00;
-        // with finer saves chosen by the part of an interval that a window keeps, the window-cut case did: 136 and 156.
+        // reads the notebook's 15 from its window, so the newer save is the finer and its 43 is kept. Each of the notebook's
+        // analyses is its own capture and shows its step through its own series, and sessions and wait_deltas hold only bins
+        // with activity, so a save with scattered activity can read coarser, as this one does. Until the save's declared
+        // grain lands, this affects f35Check, not the app's views. With the fourth and later saves against the first three,
+        // the five saves' case differed too: 3,548 and 3,600 from 15:00 to 16:00; with finer saves chosen by the part of an
+        // interval that a window keeps, the window-cut case did: 136 and 156.
         expect(differ).toEqual(["random 11, T2|sessions|MaxSessions|2026-11-21T15:00:00.000Z: 43 and 29"]);
         expect(compared).toBeGreaterThan(CASES.length);
     });

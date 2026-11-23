@@ -5937,7 +5937,7 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 - **The shared cases,** written again from the TypeScript rule: only the named case changes, its name and its 15:15 bin, from 728 to 780, so 15:15 to 15:30 totals 900. The other 44 are unchanged, the 10 random cases with 5 saves included: none of them has the double loss.
 - **Parity with `finestPerInterval`,** a new test: each series' total or peak, hour by hour, from `snapshotValues`' bins and from `finestPerInterval`'s kept points, given the rows as `f35Check` gives them. That's 105 hours (76 of totals, 29 of peaks) in 44 cases; the 45th is off the bin grid, which `finestPerInterval` never sees.
   - The two agree on all but one hour, and that difference isn't about ranks. In `random 11`, the newer of two 900-minute saves holds 3 rows of T2's sessions, 30 minutes apart at their closest, and no other series. `finestPerInterval` reads a save's step from its bins, 30 minutes here, where `snapshotValues` reads the notebook's 15 from its window, so 15:00 to 16:00 peaks at 29 by one and 43 by the other. The test pins that one difference, so any other fails it.
-  - A save of the notebook's holds every series of its targets, MaxCPU in each bin they ran, which shows its step; each random case holds one series.
+  - Each of the notebook's analyses is its own capture and shows its step through its own series only. `sessions` and `wait_deltas` hold only bins with activity, so a save with scattered activity can read coarser, as `random 11` does. Until the save's declared grain lands, this affects `f35Check`, not the app's views ([a later section](#f35-design-i-groundwork-what-random-11s-step-difference-comes-from-2026-11-22)).
   - With the fourth and later saves against the first three, the named case differed too: 3,548 and 3,600 from 15:00 to 16:00.
 - **Docs:** this report, where the section above's named-case bullet now says what each rule does; and the design note's rank paragraph, in the coordinator's material for decision 3.
 
@@ -5961,11 +5961,11 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 **Risks.**
 
 - None for existing deployments: nothing runs this code yet.
-- Where a save's bins don't show its step, as in `random 11`, this rule and `finestPerInterval` read the save differently. The notebook's saves show it through their other series.
+- Where a save's bins don't show its step, as in `random 11`, this rule and `finestPerInterval` read the save differently. Each of the notebook's analyses is its own capture and shows its step through its own series, and `sessions` and `wait_deltas` hold only bins with activity, so a save with scattered activity can read coarser. Until the save's declared grain lands, this affects `f35Check`, not the app's views.
 
 ### F35 design (i) groundwork: a finer save where a window cuts the interval off (2026-11-22)
 
-**Why.** The review of 4944e22d and of the section above's change found taking each rank against every earlier one correct in both rules, with two Lows. The first is in both rules, and older than that change: a coarser point ranked only the finer saves whose rows reach the part of its interval that its save's window keeps. So a finer point that straddles the window's cut kept all it held, and the coarser remainder lost the minutes they share twice. [The follow-ups' section](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) has the reviewer's case and when it happens; 67f08e7d changed `snapshotValues` there, and this makes the same change here. The second Low, the explanation of the step difference that the parity test pins, has a commit of its own.
+**Why.** The review of 4944e22d and of the section above's change found taking each rank against every earlier one correct in both rules, with two Lows. The first is in both rules, and older than that change: a coarser point ranked only the finer saves whose rows reach the part of its interval that its save's window keeps. So a finer point that straddles the window's cut kept all it held, and the coarser remainder lost the minutes they share twice. [The follow-ups' section](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) has the reviewer's case and when it happens; 67f08e7d changed `snapshotValues` there, and this makes the same change here. The second Low is [the next section's](#f35-design-i-groundwork-what-random-11s-step-difference-comes-from-2026-11-22).
 
 **Work summary.**
 
@@ -5990,3 +5990,22 @@ So with the demo's prices then, the two sizes cost the same everywhere but Indon
 
 - None for existing deployments: nothing runs this code yet.
 - As in `snapshotValues`, more finer saves are ranked where a window cuts a coarser interval: those whose rows reach the part it cuts off. An answer changes only where one of their rows straddles the cut.
+
+### F35 design (i) groundwork: what random 11's step difference comes from (2026-11-22)
+
+**Why.** The same review's second Low: the parity test's pin of `random 11`'s hour, and [the section on every rank](#f35-design-i-groundwork-every-finer-save-against-every-earlier-one-2026-11-22), said that a save of the notebook's shows its step through its other series, MaxCPU in each bin its targets ran. It doesn't, and the pin's numbers were right: 30 minutes against 15, and 43 against 29.
+
+- `finestPerInterval` reads a step for each capture, the smallest gap in that capture's series, keyed by its capture time and family (`finest-per-interval.ts`). The notebook stamps each analysis with its own capture time: `add_snapshot` reads the clock at each call (`NB_DatabaseHub_LiveActivity.ipynb`). So `cpu`, `sessions`, `wait_deltas`, `gauges`, `counter_deltas`, and `storage_io` are six captures of one run, and MaxCPU sets no other analysis's step.
+- `sessions` keeps only the demo database's active sessions, and `wait_deltas` only the bins with waits (`WaitMs > 0`). So a save whose activity is scattered, like a day save with no session in it, can read coarser, as `random 11` does.
+- The coordinator's decision: reword the three places, change no rule, and keep the pin.
+
+**Work summary.**
+
+- **The pin's comment,** the every-rank section's parity bullet and its risk, and the design note's sentence now say that each analysis is its own capture and shows its step through its own series; that `sessions` and `wait_deltas` hold only bins with activity, so a save with scattered activity can read coarser, as `random 11` does; and that until the save's declared grain lands, this affects `f35Check`, not the app's views.
+- **No rule or test changes:** the pin still holds that one hour, so any other difference fails it.
+
+**Changed files.** `fabric/app/src/data/kept-value-cases.test.ts` (a comment) and this report.
+
+**Validation.** vitest: the cases file's 9 tests pass; typecheck and eslint clean; markdownlint clean; the test file is ASCII, with LF line endings.
+
+**Risks.** None: a comment and this report.
