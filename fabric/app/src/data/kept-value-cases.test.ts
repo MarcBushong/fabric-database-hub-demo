@@ -4,17 +4,19 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 
 import { ADDITIVE_ANALYSES, ADDITIVE_METRICS, addsUp, finestPerInterval, HOURLY_METRICS, OFF_GRID_ANALYSES } from "./finest-per-interval";
-import { snapshotValues } from "./snapshot-value";
+import { monitorGrain, snapshotValues, sqlGrain } from "./snapshot-value";
 
 // F35 design (i)'s shared cases (fabric/history/kept-value-cases.json): rows of the history, and each bin's value by
 // snapshotValues, the TypeScript rule. fabric/history/kept_value.py's kept values, read per bin as the model would read
 // them, must give the same values (tests/unit/Fabric.History.Tests.ps1). This test builds the file from the cases below
 // and the rule, and fails while the committed file differs: after a change to either, run it with
-// DBHUB_WRITE_KEPT_VALUE_CASES=1 to write the file, and review the difference.
+// DBHUB_WRITE_KEPT_VALUE_CASES=1 to write the file, and review the difference. Most saves are written as before F35's
+// declared grain, so the rules read their step as today; the cases named "declared grains" declare it, as the notebook
+// now does with each save.
 
 type Row = Record<string, unknown>;
-/** target, analysis, metric, bin, capture, window start, window end, value; times in seconds after the cases' base. */
-type CaseRow = [string, string, string, number | null, number, number, number, number | null];
+/** target, analysis, metric, bin, capture, window start, window end, value, and the save's declared grain (minutes) if any; times in seconds after the cases' base. */
+type CaseRow = [string, string, string, number | null, number, number, number, number | null, number?];
 /** target, analysis, metric, bin (seconds after the base, or null), value. */
 type CaseBin = [string, string, string, number | null, number];
 interface Case {
@@ -36,13 +38,19 @@ interface Save {
     captured: number;
     start: number;
     end: number;
+    /** The grain it declares, in minutes, as the notebook writes it in grain_minutes since F35; none for an older save. */
+    grain?: number;
 }
-const save = (captured: string, start: string, end: string, startDay = 0): Save => ({ captured: s(captured), start: s(start, startDay), end: s(end) });
+const save = (captured: string, start: string, end: string, startDay = 0, grain?: number): Save => ({ captured: s(captured), start: s(start, startDay), end: s(end), grain });
 /** A day-long save, as deploy.ps1's history snapshot writes it at the end of an update. */
 const daySave = (captured = "21:33:44") => save(captured, "21:26", "21:26", -1);
 /** A save's rows of one series, every `step` minutes from `from`; a null skips that bin. */
 const series = (sv: Save, target: string, analysis: string, metric: string, from: string, step: number, values: ReadonlyArray<number | null>): CaseRow[] =>
-    values.flatMap((v, i): CaseRow[] => (v === null ? [] : [[target, analysis, metric, s(from) + i * step * 60, sv.captured, sv.start, sv.end, v]]));
+    values.flatMap((v, i): CaseRow[] => {
+        if (v === null) return [];
+        const at = s(from) + i * step * 60;
+        return [sv.grain === undefined ? [target, analysis, metric, at, sv.captured, sv.start, sv.end, v] : [target, analysis, metric, at, sv.captured, sv.start, sv.end, v, sv.grain]];
+    });
 const repeat = (value: number, count: number) => Array.from({ length: count }, () => value);
 
 const NAMED: Case[] = [
@@ -179,13 +187,13 @@ const NAMED: Case[] = [
         ],
     },
     {
-        // The review of 67f08e7d: a known difference from finestPerInterval, which design (i)'s build aligns. A finer row
-        // straddles a coarser save's window cut, and part of what's left of it is in the part cut off: finestPerInterval
-        // splits that across the row's uncovered stretches by length, and the rule counts all of it against the part the
-        // window keeps. As the case above, but the session's Lock waits are quiet at 15:20, a bin WAITS_KQL leaves out
-        // (WaitMs > 0): the stop save's 15:20 holds 18, 10 at 15:21 and 8 from 15:22 to 15:24. The data hold 86 from 15:15
-        // to 15:30, the rule's answer; finestPerInterval gives the quiet 15:20 3 of the 8, and 89.
-        name: "a known difference: a quiet minute in a finer row that a coarser save's window cuts through",
+        // The review of 67f08e7d: a finer row straddles a coarser save's window cut, and part of what's left of it is in the
+        // part cut off. Both rules split it across the row's uncovered stretches by length, as finestPerInterval does, and
+        // the coarser point takes only the stretches that overlap the part its window keeps (design (i)'s build; before it,
+        // this rule counted all of it there). As the case above, but the session's Lock waits are quiet at 15:20, a bin
+        // WAITS_KQL leaves out (WaitMs > 0): the stop save's 15:20 holds 18, 10 at 15:21 and 8 from 15:22 to 15:24. The
+        // split gives the quiet 15:20 3 of the 8, by length, so 15:15 to 15:30 totals 89 where the data hold 86.
+        name: "a quiet minute in a finer row that a coarser save's window cuts through",
         rows: [
             ...series(save("15:23", "15:16", "15:22"), "T1", "wait_deltas", "Lock", "15:16", 1, [10, 10, 10, 10, null, 10]),
             ...series(save("15:24:30", "03:24", "15:24"), "T1", "wait_deltas", "Lock", "15:15", 5, [44, 18]),
@@ -193,14 +201,35 @@ const NAMED: Case[] = [
         ],
     },
     {
-        // The same difference the other way: a session from 15:21 to 15:23 at 10 a minute. The stop save's 15:20 holds 28,
-        // 8 of it beside the session's minutes: 4 at 15:20, which the day's window cuts off, and 4 at 15:23. The data hold
-        // 72 from 15:15 to 15:30, finestPerInterval's answer; the rule counts all 8 against the day's part: 68.
-        name: "a known difference: what's left of a finer row on both sides of a coarser save's window cut",
+        // The same cut the other way: a session from 15:21 to 15:23 at 10 a minute. The stop save's 15:20 holds 28, 8 of
+        // it beside the session's minutes: 4 at 15:20, which the day's window cuts off, and 4 at 15:23. The split gives each
+        // 4, so 15:15 to 15:30 totals 72, the data's answer; counting all 8 against the day's part gave 68.
+        name: "what's left of a finer row on both sides of a coarser save's window cut",
         rows: [
             ...series(save("15:23:30", "15:21", "15:23"), "T1", "counter_deltas", "Batch Requests/sec", "15:21", 1, [10, 10]),
             ...series(save("15:24:30", "03:24", "15:24"), "T1", "counter_deltas", "Batch Requests/sec", "15:15", 5, [20, 28]),
             ...series({ captured: s("15:33", 1), start: s("15:22"), end: s("15:22", 1) }, "T1", "counter_deltas", "Batch Requests/sec", "15:15", 15, [38, 60]),
+        ],
+    },
+    {
+        // F35's declared grain: a save's step is the grain its rows declare. A notebook run with a hand-set BIN_MINUTES of 5
+        // over an hour, which its window alone reads as 1-minute bins, holds all of the day save's 15:00 interval, 150 of
+        // its 200: declared, the day's point is left out there, where read as 1-minute bins its rows left gaps and the day
+        // kept 50 more.
+        name: "declared grains: a hand-set 5-minute bin, which the window alone reads as 1",
+        rows: [
+            ...series(save("16:05", "15:00", "16:00", 0, 5), "T1", "counter_deltas", "Batch Requests/sec", "15:00", 5, [50, 50, 50, 40]),
+            ...series({ ...daySave("21:30"), grain: 15 }, "T1", "counter_deltas", "Batch Requests/sec", "15:00", 15, [200, 160]),
+        ],
+    },
+    {
+        // random 11's shape, declared: a newer save of 900 minutes holds three rows of T2's sessions, 30 minutes apart, and
+        // no other series. Its bins don't show its 15-minute step, so finestPerInterval read it as 30 and left its 43 out
+        // at 15:30; declared, both rules take it as the finer save, and its 43 is the hour's peak.
+        name: "declared grains: a save whose bins don't show its step",
+        rows: [
+            ...series(save("16:30", "01:30", "16:30", 0, 15), "T2", "sessions", "MaxSessions", "15:00", 15, [5, 7, 6, 4]),
+            ...series(save("17:00", "02:00", "17:00", 0, 15), "T2", "sessions", "MaxSessions", "15:00", 30, [10, 43, 8]),
         ],
     },
 ];
@@ -260,7 +289,7 @@ function randomCases(count: number, seed: number, saveCount: readonly [number, n
 // The first 20 as before; 10 more with 5 saves each, so random shapes reach rank 4 and later (201a6666's review of 88ece0f9).
 const CASES: Case[] = [...NAMED, ...randomCases(20, 20_261_122), ...randomCases(10, 20_261_123, [5, 5], "random with 5 saves")];
 
-const toRow = ([target, analysis, metric, bucket, captured, start, end, value]: CaseRow): Row => ({
+const toRow = ([target, analysis, metric, bucket, captured, start, end, value, grain]: CaseRow): Row => ({
     TargetKey: target,
     AnalysisKey: analysis,
     Metric: metric,
@@ -269,7 +298,31 @@ const toRow = ([target, analysis, metric, bucket, captured, start, end, value]: 
     WindowStart: BASE + Math.round(start * 1000),
     WindowEnd: BASE + Math.round(end * 1000),
     Value: value,
+    ...(grain === undefined ? {} : { GrainMinutes: grain }),
 });
+
+const MONITOR_ANALYSES = new Set(["postgresql", "cosmosdb"]);
+
+/**
+ * The rows as their saves would be written since F35, each declaring its grain: the one the rule reads today, the
+ * notebook's from a SQL save's window and Azure Monitor's from a save's window and bins (an hourly metric's at least an
+ * hour), which is what the notebook and the history helpers declare. A row off the bin grid declares none.
+ */
+function withDeclaredGrains(rows: readonly CaseRow[]): CaseRow[] {
+    const ms = (seconds: number) => BASE + Math.round(seconds * 1000);
+    const bins = new Map<string, number[]>();
+    for (const [target, analysis, metric, bin, captured] of rows) {
+        if (bin === null || HOURLY_METRICS.has(metric)) continue;
+        const key = `${target}|${analysis}|${captured}`;
+        bins.set(key, [...(bins.get(key) ?? []), ms(bin)]);
+    }
+    return rows.map((r): CaseRow => {
+        const [target, analysis, metric, bin, captured, start, end, value, grain] = r;
+        if (grain !== undefined || bin === null || OFF_GRID_ANALYSES.has(analysis)) return r;
+        const step = MONITOR_ANALYSES.has(analysis) ? monitorGrain(ms(start), ms(end), bins.get(`${target}|${analysis}|${captured}`) ?? []) : sqlGrain(ms(start), ms(end));
+        return [target, analysis, metric, bin, captured, start, end, value, HOURLY_METRICS.has(metric) ? Math.max(60, step) : step];
+    });
+}
 
 /** Each bin's value by snapshotValues, in the rule's own order. */
 function binsOf(rows: readonly CaseRow[]): CaseBin[] {
@@ -318,8 +371,8 @@ function hourlyWindows(rows: readonly CaseRow[]): { model: Map<string, number>; 
 
 /**
  * The file, one row or bin a line, so a change reads as a diff. Each case lists its series (target, analysis, metric)
- * and its saves (capture, window start, window end) once; a row is a series' index, a bin, a save's index, and a value,
- * and a bin is a series' index, a bin, and the rule's value.
+ * and its saves (capture, window start, window end, and the grain it declares, when it does) once; a row is a series'
+ * index, a bin, a save's index, and a value, and a bin is a series' index, a bin, and the rule's value.
  */
 function fileText(): string {
     const lists = {
@@ -330,7 +383,7 @@ function fileText(): string {
     };
     const lines = [
         "{",
-        `  "about": ${JSON.stringify("F35 design (i)'s shared cases, written from snapshotValues by fabric/app/src/data/kept-value-cases.test.ts: don't edit. Times are seconds after base. A case's series are target, analysis, metric; its saves are capture, window start, window end; a row is a series' index, a bin, a save's index, and a value; a bin is a series' index, a bin, and the rule's value.")},`,
+        `  "about": ${JSON.stringify("F35 design (i)'s shared cases, written from snapshotValues by fabric/app/src/data/kept-value-cases.test.ts: don't edit. Times are seconds after base. A case's series are target, analysis, metric; its saves are capture, window start, window end, and the grain in minutes that it declares (grain_minutes), when it does; a row is a series' index, a bin, a save's index, and a value; a bin is a series' index, a bin, and the rule's value.")},`,
         `  "base": ${JSON.stringify(new Date(BASE).toISOString())},`,
         `  "lists": ${JSON.stringify(lists)},`,
         '  "cases": [',
@@ -347,10 +400,10 @@ function fileText(): string {
             if (!keys.includes(key)) keys.push(key);
             return keys.indexOf(key);
         };
-        const rows = c.rows.map(([target, analysis, metric, bin, captured, start, end, value]) => [
+        const rows = c.rows.map(([target, analysis, metric, bin, captured, start, end, value, grain]) => [
             indexOf(seriesKeys, JSON.stringify([target, analysis, metric])),
             bin,
-            indexOf(saveKeys, JSON.stringify([captured, start, end])),
+            indexOf(saveKeys, JSON.stringify(grain === undefined ? [captured, start, end] : [captured, start, end, grain])),
             value,
         ]);
         const bins = binsOf(c.rows).map(([target, analysis, metric, bin, value]) => [indexOf(seriesKeys, JSON.stringify([target, analysis, metric])), bin, value]);
@@ -420,26 +473,38 @@ describe("F35 design (i)'s shared cases", () => {
         expect(totalOf("a finer save only where", "15:15", "15:30")).toBe(96);
     });
 
-    it("pins a known difference, a quiet minute in a finer row that a window cuts through: 86, the data's, from 15:15 to 15:30", () => {
-        // The stop save's 15:20 keeps 8, all of it from 15:22 to 15:24, so the day's 15:15 keeps 24 for 15:24 to 15:30:
-        // with the stop save's 15:15, 4, its bin is 28. finestPerInterval gives the quiet 15:20 3 of the 8, by length, so
-        // the day keeps 27 where 24 is right, and it gives 89: the parity test pins that hour.
-        expect(valueAt("a known difference: a quiet minute", "15:15")).toBe(28);
-        expect(totalOf("a known difference: a quiet minute", "15:15", "15:30")).toBe(86);
+    it("splits a finer row that a window cuts through as finestPerInterval does, with a quiet minute in it: 89 from 15:15 to 15:30", () => {
+        // The stop save's 15:20 keeps 8 beside the session's minutes, split by length across what they leave uncovered: 3
+        // for the quiet 15:20 and 5 for 15:22 to 15:24. The day's part from 15:22 overlaps only the 5, so its 15:15 keeps 27
+        // for 15:24 to 15:30: with the stop save's 15:15, 4, its bin is 31. The data hold 86, where the day keeps 24;
+        // counting all 8 against the day's part gave that, before design (i)'s build aligned the split.
+        expect(valueAt("a quiet minute in a finer row", "15:15")).toBe(31);
+        expect(totalOf("a quiet minute in a finer row", "15:15", "15:30")).toBe(89);
     });
 
-    it("pins a known difference, what's left of a finer row on both sides of a window's cut: 68, where the data hold 72", () => {
-        // The stop save's 15:20 keeps 8, 4 of it at 15:20, which the day's window cuts off; the rule counts all 8 against
-        // the day's part, which keeps 20 of its 38, beside the stop save's 15:15, 20: 40. finestPerInterval gives the day
-        // 24, and 72, the data's answer: the parity test pins that hour.
-        expect(valueAt("a known difference: what's left", "15:15")).toBe(40);
-        expect(totalOf("a known difference: what's left", "15:15", "15:30")).toBe(68);
+    it("splits what's left of a finer row on both sides of a window's cut: 72 from 15:15 to 15:30, the data's answer", () => {
+        // The stop save's 15:20 keeps 8 beside the session's minutes: 4 at 15:20, which the day's window cuts off, and 4 at
+        // 15:23, which the day's part from 15:22 overlaps. So the day keeps 24 of its 38, beside the stop save's 15:15, 20:
+        // 44. Counting all 8 against the day's part gave 40, and 68.
+        expect(valueAt("what's left of a finer row", "15:15")).toBe(44);
+        expect(totalOf("what's left of a finer row", "15:15", "15:30")).toBe(72);
     });
 
-    it("gives every series the same totals and peaks, hour by hour, as finestPerInterval, but for three known differences", () => {
+    it("reads a save's step from the grain it declares: a hand-set 5-minute bin holds the day's interval, and a sparse save is the finer", () => {
+        // Declared at 5 minutes, the session's four rows hold 15:00 to 15:20, so the day's 15:00 is left out and its 15:15
+        // keeps 120 for 15:20 to 15:30. Read from its one-hour window, as before F35's declared grain, they're 1-minute bins
+        // that leave gaps, and the day's 15:00 keeps the 50 they don't hold.
+        expect(totalOf("declared grains: a hand-set", "15:00", "15:30")).toBe(310);
+        const older = NAMED.find((x) => x.name.startsWith("declared grains: a hand-set"))?.rows.map((r) => r.slice(0, 8) as CaseRow) ?? [];
+        expect(binsOf(older).filter((b) => b[3] !== null && b[3] < s("15:30")).reduce((a, b) => a + b[4], 0)).toBe(360);
+        expect(valueAt("declared grains: a save whose bins", "15:30")).toBe(43);
+    });
+
+    // Each series' total or peak, hour by hour, by both rules: what differs, as "case, key: model and finest".
+    const parity = (cases: readonly Case[]) => {
         const differ: string[] = [];
         let compared = 0;
-        for (const c of CASES) {
+        for (const c of cases) {
             const { model, finest } = hourlyWindows(c.rows);
             for (const key of new Set([...model.keys(), ...finest.keys()])) {
                 const a = model.get(key);
@@ -448,23 +513,31 @@ describe("F35 design (i)'s shared cases", () => {
                 if (a === undefined || b === undefined || Math.abs(a - b) > 1e-9 * Math.max(1, Math.abs(a), Math.abs(b))) differ.push(`${c.name}, ${key}: ${a} and ${b}`);
             }
         }
-        // Three known differences, none about ranks, which design (i)'s build aligns. First, random 11's newer 900-minute
-        // save holds 3 rows of T2's sessions, 30 minutes apart at their closest, and no other series. finestPerInterval reads
-        // a capture's step from its bins, 30 minutes here, so the save is coarser than the older one and left out at 15:30,
-        // where the older save's 7 is kept; snapshotValues reads the notebook's 15 from its window, so the newer save is the
-        // finer and its 43 is kept. Each of the notebook's analyses is its own capture and shows its step through its own
-        // series, and sessions and wait_deltas hold only bins with activity, so a save with scattered activity can read
-        // coarser, as this one does. Until the save's declared grain lands, this affects f35Check, not the app's views.
-        // Then the review of 67f08e7d's two cases: a finer row that a coarser save's window cuts through, with part of
-        // what's left of it in the part cut off: finestPerInterval splits that by length, and the rule counts all of it
-        // against the window's part. Their pins give the data's answers, one each way. With the fourth and later saves
-        // against the first three, the five saves' case differed too: 3,548 and 3,600 from 15:00 to 16:00; with finer saves
-        // chosen by the part of an interval that a window keeps, the window-cut case did: 136 and 156.
-        expect(differ).toEqual([
-            "a known difference: a quiet minute in a finer row that a coarser save's window cuts through, T1|wait_deltas|Lock|2026-11-21T15:00:00.000Z: 146 and 149",
-            "a known difference: what's left of a finer row on both sides of a coarser save's window cut, T1|counter_deltas|Batch Requests/sec|2026-11-21T15:00:00.000Z: 128 and 132",
-            "random 11, T2|sessions|MaxSessions|2026-11-21T15:00:00.000Z: 43 and 29",
-        ]);
+        return { differ, compared };
+    };
+
+    it("gives every series the same totals and peaks, hour by hour, as finestPerInterval, but for an older save's step", () => {
+        const { differ, compared } = parity(CASES);
+        // One known difference, in a save written before F35's declared grain. random 11's newer 900-minute save holds 3
+        // rows of T2's sessions, 30 minutes apart at their closest, and no other series. finestPerInterval reads a capture's
+        // step from its bins, 30 minutes here, so the save is coarser than the older one and left out at 15:30, where the
+        // older save's 7 is kept; snapshotValues reads the notebook's 15 from its window, so the newer save is the finer and
+        // its 43 is kept. Each of the notebook's analyses is its own capture and shows its step through its own series, and
+        // sessions and wait_deltas hold only bins with activity, so a save with scattered activity can read coarser, as this
+        // one does. A save that declares its grain reads the same in both (the next test). Before design (i)'s build, the
+        // two cases of a finer row that a window cuts through differed too: 146 and 149, and 128 and 132, from 15:00 to
+        // 16:00; with the fourth and later saves against the first three, the five saves' case did: 3,548 and 3,600; and
+        // with finer saves chosen by the part of an interval that a window keeps, the window-cut case did: 136 and 156.
+        expect(differ).toEqual(["random 11, T2|sessions|MaxSessions|2026-11-21T15:00:00.000Z: 43 and 29"]);
         expect(compared).toBeGreaterThan(CASES.length);
+    });
+
+    it("gives every series the same totals and peaks as finestPerInterval when every save declares its grain, as the notebook's now do", () => {
+        const declared = CASES.map((c) => ({ ...c, rows: withDeclaredGrains(c.rows) }));
+        const { differ, compared } = parity(declared);
+        expect(differ).toEqual([]);
+        expect(compared).toBeGreaterThan(CASES.length);
+        // The grains that the rule read are the ones declared, so its own values don't change.
+        expect(declared.map((c) => binsOf(c.rows))).toEqual(CASES.map((c) => binsOf(c.rows)));
     });
 });
