@@ -86,7 +86,7 @@ BeforeAll {
                     $state.Offered[$item.Sidecar.Id] = $true
                     [ordered]@{ documentId = $item.Sidecar.Id; sessionId = $item.Sidecar.SessionId; parts = $item.Sidecar.Lines.Count; sha256 = $item.Sidecar.Sha; state = $offered }
                 })
-            $index = ConvertTo-Json -InputObject ([ordered]@{ kind = 'ContosoCare.RcaSidecarIndex'; version = 1; page = $page; pages = [int][System.Math]::Ceiling($waiting.Count / 8.0); documents = $documents; status = 'Pass'; message = 'sidecars' }) -Depth 5 -Compress
+            $index = ConvertTo-Json -InputObject ([ordered]@{ kind = 'ContosoCare.RcaSidecarIndex'; version = 1; page = $page; pages = [int][System.Math]::Ceiling($waiting.Count / 8.0); documents = $documents; status = $state.IndexStatus; message = $state.IndexMessage }) -Depth 5 -Compress
             return ((Get-TestControlLine 'RcaSidecarExport' 'Pass' 'runner rca sidecar-export: its line follows.') + "`n" + 'DBHUBDEMO-RCAS-INDEX ' + $index)
         }
         $id = [string]$Request['documentId']
@@ -100,8 +100,8 @@ BeforeAll {
     # delete. A delete on the T2 host takes one more read, or one more list, before the Run Command is gone, as Azure's do.
     function Initialize-TestSidecarAzure {
         $script:vms = @{
-            sqlvm01   = [pscustomobject]@{ Sidecars = [ordered]@{}; Offered = @{}; ExportOutput = ''; AckOutput = '' }
-            archost01 = [pscustomobject]@{ Sidecars = [ordered]@{}; Offered = @{}; ExportOutput = ''; AckOutput = '' }
+            sqlvm01   = [pscustomobject]@{ Sidecars = [ordered]@{}; Offered = @{}; ExportOutput = ''; AckOutput = ''; IndexStatus = 'Pass'; IndexMessage = 'sidecars' }
+            archost01 = [pscustomobject]@{ Sidecars = [ordered]@{}; Offered = @{}; ExportOutput = ''; AckOutput = ''; IndexStatus = 'Pass'; IndexMessage = 'sidecars' }
         }
         $script:fake = @{
             Commands    = @{ sqlvm01 = [ordered]@{}; archost01 = [ordered]@{} }
@@ -358,6 +358,58 @@ Describe 'The Incident RCA''s sidecars from the scripts (2026-11-23, rca/README.
         $save.Line.status | Should -Be 'Warning'
         $save.Line.message | Should -Match ([regex]::Escape($Said))
         $save.Line.remediation | Should -Match ([regex]::Escape('Run ./scripts/deploy.ps1, which updates the runner and its bootstrap bundle on the VMs.'))
+    }
+
+    # 8afcca24: 'rca sidecar-export' exits 2 only when nothing is offerable, and prints its index line either way, whose
+    # status stands: a Warning counts sidecars the runner let expire unread.
+    It 'takes the index line''s Warning on exit code 2 as its VM''s own, and reads that VM whole (8afcca24: <Case>)' -ForEach @(
+        @{ Case = 'today''s control script, Not selected'; Result = 'Not selected'; Said = 'runner rca sidecar-export: there is no sidecar to fetch.' }
+        @{ Case = 'T2b''s next, the line''s Warning'; Result = 'Warning'; Said = '3 sidecar(s) expired unread: sealed more than 30 days ago and never acknowledged.' }
+    ) {
+        Add-TestSidecar -Vm 'sqlvm01' -Sidecar (New-TestSidecar -DocumentId '20261120T170000Z-sqlvm01-0001-sidecar' -SessionId $script:sessionA)
+        $index = 'DBHUBDEMO-RCAS-INDEX {"kind":"ContosoCare.RcaSidecarIndex","version":1,"page":1,"pages":0,"documents":[],"status":"Warning","message":"3 sidecar(s) expired unread: sealed more than 30 days ago and never acknowledged."}'
+        $script:vms['archost01'].ExportOutput = (Get-TestControlLine 'RcaSidecarExport' $Result $Said '{"exitCode":2}') + "`n" + $index
+        $save = Invoke-TestSave -Now
+        @($save.Sidecar.Fetched.Keys) | Should -Be @('20261120T170000Z-sqlvm01-0001-sidecar')
+        $archost = @($save.Sidecar.Hosts | Where-Object { $_.Vm -eq 'archost01' })[0]
+        $archost.Outcome | Should -BeNullOrEmpty -Because 'nothing was offerable there, and that''s no failure'
+        $archost.IndexComplete | Should -BeTrue
+        $save.Line.status | Should -Be 'Warning'
+        $save.Line.message | Should -Match ([regex]::Escape('archost01''s runner says: 3 sidecar(s) expired unread: sealed more than 30 days ago and never acknowledged.'))
+        @($save.Line.evidence.runner) | Should -Be @('archost01: 3 sidecar(s) expired unread: sealed more than 30 days ago and never acknowledged.')
+        $save.Line.remediation | Should -Match ([regex]::Escape('after Run all sessions, which leave theirs on the VMs until Run all takes them itself (a later release), ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.'))
+        $script:vms['sqlvm01'].Sidecars['20261120T170000Z-sqlvm01-0001-sidecar'].Acked | Should -BeTrue
+    }
+
+    It 'fetches what an index offers on exit code 0 and says what its Warning counts, once for its VM (8afcca24)' {
+        foreach ($n in 1..9) {
+            Add-TestSidecar -Vm 'sqlvm01' -Sidecar (New-TestSidecar -DocumentId ('20261120T1700{0:d2}Z-sqlvm01-{0:d4}-sidecar' -f $n) -SessionId $script:sessionA)
+        }
+        $script:vms['sqlvm01'].IndexStatus = 'Warning'
+        $script:vms['sqlvm01'].IndexMessage = '1 sidecar(s) expired unread: sealed more than 30 days ago and never acknowledged.'
+        $save = Invoke-TestSave -Now
+        @(Get-TestRequest -Vm 'sqlvm01' -Action 'RcaSidecarExport').Count | Should -Be 2 -Because 'both pages carry the Warning'
+        @($save.Sidecar.Fetched.Keys).Count | Should -Be 9
+        $save.Line.status | Should -Be 'Warning'
+        ([regex]::Matches($save.Line.message, [regex]::Escape('sqlvm01''s runner says: 1 sidecar(s) expired unread'))).Count | Should -Be 1
+        $save.Line.message | Should -Match '9 acknowledged on sqlvm01'
+    }
+
+    It 'keeps a VM''s pending sidecars when its Warning comes without an index line, since its index isn''t known whole (8afcca24)' {
+        $null = New-Item -ItemType Directory -Path $script:pendingDirectory -Force
+        $list = [ordered]@{
+            kind     = 'DbHubDemo.RcaSidecarPending'; version = 1
+            sidecars = @([ordered]@{ documentId = '20261121T170000Z-arcsql01-0002-sidecar'; vm = 'archost01'; sessionId = $null; parts = 1; sha256 = ('c' * 64); reason = 'not acknowledged'; firstSeenUtc = '2026-11-21T18:00:00Z'; expiresUtc = '2026-12-21T17:00:00Z' })
+        }
+        Set-Content -LiteralPath (Join-Path -Path $script:pendingDirectory -ChildPath 'rca-sidecar-pending-rg-dbhub-demo.json') -Value (ConvertTo-Json -InputObject $list -Depth 5) -Encoding utf8NoBOM
+        $script:vms['archost01'].ExportOutput = Get-TestControlLine 'RcaSidecarExport' 'Warning' '2 sidecar(s) expired unread.' '{"exitCode":2}'
+        $save = Invoke-TestSave -Now
+        $archost = @($save.Sidecar.Hosts | Where-Object { $_.Vm -eq 'archost01' })[0]
+        $archost.Outcome | Should -BeNullOrEmpty
+        $archost.IndexComplete | Should -BeFalse
+        @((Read-TestList 'pending')['sidecars'] | ForEach-Object { $_['documentId'] }) | Should -Be @('20261121T170000Z-arcsql01-0002-sidecar') -Because 'a VM not read whole may still offer it'
+        $save.Line.message | Should -Match ([regex]::Escape('archost01''s runner says: 2 sidecar(s) expired unread.'))
+        $save.Line.evidence.expired | Should -Be 0
     }
 
     It 'tells a bundle from before the sidecar by its answer to <Action>, recorded from today''s control script, which names Rca (T2b)' -ForEach @(@{ Action = 'RcaSidecarExport' }, @{ Action = 'RcaAck' }) {

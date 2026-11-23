@@ -2239,7 +2239,7 @@ function Invoke-DemoRcaSidecarFetch {
             }
         }
         foreach ($entry in @(Get-DemoRcaExportHost -Config $Config -State $State -Power $Power)) {
-            $sidecar.Hosts.Add([pscustomobject]@{ Vm = [string]$entry.Vm; OneAtATime = [bool]$entry.OneAtATime; Outcome = [string]$entry.Outcome; Message = [string]$entry.Message; IndexComplete = $false; AckError = '' })
+            $sidecar.Hosts.Add([pscustomobject]@{ Vm = [string]$entry.Vm; OneAtATime = [bool]$entry.OneAtATime; Outcome = [string]$entry.Outcome; Message = [string]$entry.Message; IndexComplete = $false; AckError = ''; RunnerWarning = '' })
         }
         $engine = @{ Config = $Config; Deadline = $startedUtc.AddMinutes($Minutes); PollSeconds = $PollSeconds; HostDeleteWaitSeconds = $HostDeleteWaitSeconds }
         $stamp = $startedUtc.ToString('yyyyMMddHHmmss', [System.Globalization.CultureInfo]::InvariantCulture)
@@ -2306,6 +2306,14 @@ function Invoke-DemoRcaSidecarFetch {
                         $hostState.Message = $read.Message
                         $complete = $false
                         break
+                    }
+                    # The index's own Warning (8afcca24), sidecars the runner let expire unread: once per VM, as each page
+                    # repeats it.
+                    if ($read.Warning -and -not $hostState.RunnerWarning) {
+                        $hostState.RunnerWarning = $read.Warning
+                    }
+                    if (-not $read.Complete) {
+                        $complete = $false
                     }
                     if ($round -eq 1) {
                         $pages[$hostState.Vm] = $read.Pages
@@ -2492,7 +2500,11 @@ function Get-DemoRcaSidecarAckAnswer {
 function Get-DemoRcaSidecarIndexAnswer {
     # What one page of 'rca sidecar-export' said on a VM (Invoke-DemoRcaSidecarRunCommand's result): Pages and Documents,
     # or Outcome and Message when the VM's sidecars can't be fetched now (OldBundle, OldRunner, Failed, TimedOut); a VM
-    # with nothing to fetch (exit code 2, Not selected) has none. Pure. Internal.
+    # with nothing to fetch (exit code 2, Not selected) has none. The index line's own status stands, with exit code 2 too
+    # (rca/README.md, The runner's commands, since 8afcca24): Warning is its message when it isn't Pass or Not selected,
+    # a count of sidecars the runner let expire unread, whether the control script's result says Not selected (exit code
+    # 2) or Warning. A Warning with no line it can read has the result's message, and Complete false, since the VM's
+    # index isn't known whole then. Pure. Internal.
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
@@ -2503,7 +2515,7 @@ function Get-DemoRcaSidecarIndexAnswer {
         [object] $Result
     )
 
-    $answer = [pscustomobject]@{ Pages = 0; Documents = @(); Outcome = ''; Message = '' }
+    $answer = [pscustomobject]@{ Pages = 0; Documents = @(); Outcome = ''; Message = ''; Warning = ''; Complete = $true }
     $state = [string](Get-DemoMemberValue -InputObject $Result -Name 'State')
     $out = Get-DemoMemberValue -InputObject $Result -Name 'Out'
     if ($state -ne 'Read') {
@@ -2525,22 +2537,34 @@ function Get-DemoRcaSidecarIndexAnswer {
         $answer.Message = '{0}''s workload runner predates the RCA sidecar, so no sidecar was fetched from it; ./scripts/deploy.ps1 updates it.' -f $Vm
         return $answer
     }
-    if ([string]$out.Status -eq 'Not selected') {
-        return $answer
-    }
-    if ([string]$out.Status -ne 'Pass') {
+    $status = [string]$out.Status
+    if ($status -notin 'Pass', 'Warning', 'Not selected') {
         $answer.Outcome = 'Failed'
         $answer.Message = '{0}''s sidecar export failed: {1}' -f $Vm, $(if ([string]$out.Message) { [string]$out.Message } else { 'its Run Command printed no result line' })
         return $answer
     }
-    $index = ConvertFrom-DemoRcaSidecarIndex -Line ([string]$out.Line) -Vm $Vm
+    $bound = { param([string] $Text) if ($Text.Length -gt 300) { $Text.Substring(0, 297) + '...' } else { $Text } }
+    $line = [string]$out.Line
+    $index = ConvertFrom-DemoRcaSidecarIndex -Line $line -Vm $Vm
     if (-not $index.Valid) {
+        if ($status -eq 'Not selected') {
+            # Nothing to fetch, with no line, or one that adds nothing it can read.
+            return $answer
+        }
+        if ($status -eq 'Warning') {
+            $answer.Warning = & $bound $(if ([string]$out.Message) { [string]$out.Message } else { 'its sidecar export ended with a Warning, and no index line' })
+            $answer.Complete = $false
+            return $answer
+        }
         $answer.Outcome = 'Failed'
         $answer.Message = '{0}''s sidecar export ran, but {1}.' -f $Vm, $index.Why
         return $answer
     }
     $answer.Pages = $index.Pages
     $answer.Documents = $index.Documents
+    if ([string]$index.Status -notin 'Pass', 'Not selected') {
+        $answer.Warning = & $bound $(if ([string]$index.Message) { [string]$index.Message } else { 'its sidecar index''s status is {0}' -f $index.Status })
+    }
     return $answer
 }
 
@@ -2866,7 +2890,8 @@ function Complete-DemoRcaSidecarSave {
       the runner keeps it expired unread (F11).
     - The line: Pass when nothing is left pending; a Warning when something is, with the command that takes it, or when a
       VM's runner or bundle predates the sidecar (./scripts/deploy.ps1), a list couldn't be read or written, or a sidecar
-      expired unread; Not selected when there was nothing to fetch and nothing waits.
+      expired unread, by the PC's list or by a VM's runner, whose index says so itself (8afcca24); Not selected when there
+      was nothing to fetch and nothing waits.
     #>
     [CmdletBinding()]
     [OutputType([object])]
@@ -3098,6 +3123,11 @@ function Complete-DemoRcaSidecarSave {
         elseif ($hostState.AckError -and -not $hostState.Outcome) {
             $sentences.Add(('The acknowledgements an earlier save deferred didn''t all reach {0} ({1}); they go first at the next export there.' -f $hostState.Vm, $hostState.AckError.TrimEnd('.')))
         }
+        # What its runner's index said itself (8afcca24): sidecars it let expire unread, which no save can take now.
+        $runnerWarning = [string](Get-DemoMemberValue -InputObject $hostState -Name 'RunnerWarning')
+        if ($runnerWarning) {
+            $sentences.Add(('{0}''s runner says: {1}.' -f $hostState.Vm, $runnerWarning.TrimEnd('.')))
+        }
     }
     if ($pending.Count -gt 0) {
         $groups = @($pending | Group-Object -Property { [string]$_['reason'] } | Sort-Object -Property Count -Descending)
@@ -3118,7 +3148,8 @@ function Complete-DemoRcaSidecarSave {
     }
     $status = 'Pass'
     $ackFailed = $ackTrouble.Count -gt 0 -or @($Sidecar.Hosts | Where-Object { $_.AckError }).Count -gt 0
-    if ($pending.Count -gt 0 -or $expired.Count -gt 0 -or $troubled.Count -gt 0 -or $notes.Count -gt 0 -or $Sidecar.Error -or $ackFailed) {
+    $runnerWarned = @($Sidecar.Hosts | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'RunnerWarning') })
+    if ($pending.Count -gt 0 -or $expired.Count -gt 0 -or $troubled.Count -gt 0 -or $notes.Count -gt 0 -or $Sidecar.Error -or $ackFailed -or $runnerWarned.Count -gt 0) {
         $status = 'Warning'
     }
     elseif ($fetched.Count -eq 0 -and $Sidecar.Delivered.Count -eq 0 -and $deferred.Count -eq 0 -and @($Sidecar.Offered.Keys).Count -eq 0) {
@@ -3148,8 +3179,8 @@ function Complete-DemoRcaSidecarSave {
         if ($pending.Count -gt 0 -or $ackFailed -or @($troubled | Where-Object { [string]$_.Outcome -notin 'OldBundle', 'OldRunner' }).Count -gt 0) {
             $fixes.Add($(if ($Sidecar.CheckPrefix -eq 'STOP') { 'The next history save takes what waits: {0} while the VMs run, again while this line says sidecars wait, or ./scripts/stop-demo.ps1 -SaveHistory at the end of the next session.' -f $script:RcaRunAgain } else { 'The next history save takes what waits: {0} while the VMs run, again while this line says sidecars wait.' -f $script:RcaRunAgain }))
         }
-        if ($expired.Count -gt 0) {
-            $fixes.Add('A history save at the end of each session takes the sidecars before the runner deletes them: ./scripts/stop-demo.ps1 -SaveHistory.')
+        if ($expired.Count -gt 0 -or $runnerWarned.Count -gt 0) {
+            $fixes.Add('Save the history from the scripts within 30 days of each session, before the runner deletes its sidecars: ./scripts/stop-demo.ps1 -SaveHistory at the end of a session from the scripts; after Run all sessions, which leave theirs on the VMs until Run all takes them itself (a later release), ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.')
         }
     }
     $evidence = [ordered]@{
@@ -3164,6 +3195,7 @@ function Complete-DemoRcaSidecarSave {
         delivered    = $Sidecar.Delivered.Count
         pending      = $pending.Count
         expired      = $expired.Count
+        runner       = @($runnerWarned | ForEach-Object { '{0}: {1}' -f $_.Vm, [string]$_.RunnerWarning })
         hosts        = @($Sidecar.Hosts | ForEach-Object { '{0}: {1}' -f $_.Vm, $(if ($_.Outcome) { $_.Outcome } elseif ($_.IndexComplete) { 'Read' } else { 'Partial' }) })
         payloads     = @($Sidecar.Batches | Where-Object { $_.Path } | ForEach-Object { [string]$_.Path })
     }
