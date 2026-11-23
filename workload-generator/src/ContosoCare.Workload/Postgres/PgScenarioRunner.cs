@@ -91,7 +91,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         NpgsqlConnection control;
         try
         {
-            control = await opener.OpenAsync(SessionNames.ForControl(runId), cancellationToken, silent: PgCaptureConnector.Startup).ConfigureAwait(false);
+            control = await opener.OpenAsync(SessionNames.ForControl(runId), cancellationToken, silent: PgCaptureConnector.Startup, plainIfRefused: true).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or ScenarioRequestException or ArgumentException or Azure.Identity.AuthenticationFailedException or Azure.Identity.CredentialUnavailableException)
         {
@@ -144,7 +144,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
     public async Task<IReadOnlyList<CheckRecord>> ResetAsync(ResetOptions options, CancellationToken cancellationToken)
     {
         List<CheckRecord> checks;
-        await using (var connection = await opener.OpenAsync(SessionNames.ForControl("reset"), cancellationToken, silent: PgCaptureConnector.Startup).ConfigureAwait(false))
+        await using (var connection = await opener.OpenAsync(SessionNames.ForControl("reset"), cancellationToken, silent: PgCaptureConnector.Startup, plainIfRefused: true).ConfigureAwait(false))
         {
             checks = [.. await new PgDemoDatabase(connection).ResetAsync(options, time, cancellationToken).ConfigureAwait(false)];
         }

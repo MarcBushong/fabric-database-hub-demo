@@ -3,6 +3,7 @@ using Azure.Core;
 using Azure.Identity;
 using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
+using ContosoCare.Workload.Sql;
 using Npgsql;
 
 namespace ContosoCare.Workload.Postgres;
@@ -214,9 +215,37 @@ internal sealed class PgConnectionOpener(PgEndpoint endpoint, RunnerLog log)
     /// <summary>
     /// Opens a connection, retrying transient errors unless <paramref name="retry"/> is false. Session limits are applied
     /// right after it opens, or, for a <paramref name="silent"/> connection, in its startup packet, so it sends no
-    /// statement of its own.
+    /// statement of its own. A run's own sessions never open silently: the observer's marker would have RCA-PG-14 leave
+    /// the workload's statements out of Query Store's evidence. With <paramref name="plainIfRefused"/>, which only the
+    /// harness's control connections pass, a server that refuses the silent startup (a PostgreSQL error at open that the
+    /// startup options can cause: not a transient one, an authorization error, or a missing database, which a plain open
+    /// would get too) gets one Warning and then one plain open, so the harness's runs, resets, stops, and status don't
+    /// depend on the startup options; the observer's and the answer key's connections have no such fallback.
     /// </summary>
-    public async Task<NpgsqlConnection> OpenAsync(string applicationName, CancellationToken cancellationToken, PgSessionLimits? limits = null, bool retry = true, PgSilentStartup? silent = null)
+    public async Task<NpgsqlConnection> OpenAsync(string applicationName, CancellationToken cancellationToken, PgSessionLimits? limits = null, bool retry = true, PgSilentStartup? silent = null, bool plainIfRefused = false)
+    {
+        if (silent is not null && SessionNames.IsScenarioSession(applicationName))
+        {
+            throw new ArgumentException("A run's own session never opens with the observer's marker: RCA-PG-14 would leave the workload's statements out of Query Store's evidence.", nameof(silent));
+        }
+
+        try
+        {
+            return await ConnectAsync(applicationName, limits, retry, silent, cancellationToken).ConfigureAwait(false);
+        }
+        catch (PostgresException refused) when (silent is not null && plainIfRefused && RefusesStartupOptions(refused) && !cancellationToken.IsCancellationRequested)
+        {
+            log.Warn(
+                "rca.marker-refused",
+                "The server refused the observer's marker and limits in this control connection's startup packet, so it opens once more without them: Query Store's evidence can then keep its statements.",
+                ("target", Target),
+                ("application", applicationName),
+                ("error", Describe(refused)));
+            return await ConnectAsync(applicationName, limits, retry, silent: null, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    private async Task<NpgsqlConnection> ConnectAsync(string applicationName, PgSessionLimits? limits, bool retry, PgSilentStartup? silent, CancellationToken cancellationToken)
     {
         var started = DateTimeOffset.UtcNow;
         var delay = TimeSpan.FromSeconds(2);
@@ -268,6 +297,16 @@ internal sealed class PgConnectionOpener(PgEndpoint endpoint, RunnerLog log)
         NpgsqlException npgsql => npgsql.IsTransient,
         _ => false,
     };
+
+    /// <summary>
+    /// Whether an error at open could be the server refusing the startup packet's options: not a transient state, not an
+    /// authorization error (class 28), and not a missing database (3D000), which a plain open would get too
+    /// (https://www.postgresql.org/docs/18/errcodes-appendix.html).
+    /// </summary>
+    internal static bool RefusesStartupOptions(PostgresException exception) =>
+        !TransientStates.Contains(exception.SqlState)
+        && !exception.SqlState.StartsWith("28", StringComparison.Ordinal)
+        && exception.SqlState != "3D000";
 
     /// <summary>The SQLSTATE of a PostgreSQL error, or null for any other failure.</summary>
     internal static string? SqlState(Exception exception) => exception is PostgresException postgres ? postgres.SqlState : null;

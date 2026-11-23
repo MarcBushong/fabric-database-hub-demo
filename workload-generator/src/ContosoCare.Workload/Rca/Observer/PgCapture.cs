@@ -41,7 +41,11 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgS
     /// </summary>
     internal const string SearchPathOption = """-c search_path="$user",\ public,\ """ + ObserverSchema;
 
-    /// <summary>How every observer connection, and the runner's T4 control connections, open: <see cref="SearchPathOption"/> and their limits in the startup packet, and no type loading.</summary>
+    /// <summary>
+    /// How every observer connection, and the runner's T4 control connections, open: <see cref="SearchPathOption"/> and their
+    /// limits in the startup packet, and no type loading. A control connection whose startup the server refuses opens once
+    /// more without them, after a Warning (rca.marker-refused); the observer's and the answer key's never do.
+    /// </summary>
     internal static readonly PgSilentStartup Startup = new(SearchPathOption);
 
     /// <summary>What every block runs after, in the same round trip, so no statistics view repeats an earlier snapshot.</summary>

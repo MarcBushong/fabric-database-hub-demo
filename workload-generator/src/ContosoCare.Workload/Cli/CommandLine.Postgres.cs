@@ -26,7 +26,7 @@ internal static partial class CommandLine
     /// </summary>
     private static async Task<int> StatusT4Async(ParseResult parseResult, PgEndpoint endpoint, PgEndpoint? replica, int runCount, string? profileFile, string? hostStateFile, bool json, RunnerLog log, CancellationToken cancellationToken)
     {
-        await using var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("status"), cancellationToken, silent: PgCaptureConnector.Startup).ConfigureAwait(false);
+        await using var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("status"), cancellationToken, silent: PgCaptureConnector.Startup, plainIfRefused: true).ConfigureAwait(false);
         var database = new PgDemoDatabase(connection);
         var profile = await new FileProfileStore(profileFile ?? FileProfileStore.DefaultPathFor(DemoTarget.T4)).GetAsync(cancellationToken).ConfigureAwait(false);
         var runs = await database.GetRunsAsync(runCount, runningOnly: false, cancellationToken).ConfigureAwait(false);
@@ -107,7 +107,7 @@ internal static partial class CommandLine
     private static async Task<int> WarmupT4Async(ParseResult parseResult, PgEndpoint endpoint, bool json, RunnerLog log, CancellationToken cancellationToken)
     {
         var started = DateTimeOffset.UtcNow;
-        await using var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("warmup"), cancellationToken, silent: PgCaptureConnector.Startup).ConfigureAwait(false);
+        await using var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("warmup"), cancellationToken, silent: PgCaptureConnector.Startup, plainIfRefused: true).ConfigureAwait(false);
         await using (var command = connection.CreateCommand())
         {
             command.CommandText = "SELECT count(*) FROM care.facilities; SELECT count(*) FROM demo.fn_scenario_catalog();";
