@@ -312,8 +312,10 @@ export function analyzeConnections(input: { target: RcaTarget; from: Date; to: D
     // The peak's sample as evidence: its states only when the capture counted them (the review of ebd1c6c3: "0 active, 0
     // idle, …" where they weren't), and a total past the limit as such, never "36 of 35 (103 %)".
     const ofLimit = limit === null ? "" : peak.total > limit ? `, over the ${limit} usable` : ` of ${limit} (${share} %)`;
+    // RCA-PG-10 counts a client waiting on a lock as active too, so those are some of the active, never beside them (Final
+    // tests' live round at d7df4f9f, O2: "29 active, …, 20 waiting on a lock" read as if they added up).
     const peakText = states
-        ? `${peak.total} client connections${ofLimit}: ${active} active, ${idle} idle, ${idleInTx} idle in a transaction, ${waiting} waiting on a lock, and the capture's own`
+        ? `${peak.total} client connections${ofLimit}: ${active} active${waiting ? ` (${waiting} of them waiting on a lock)` : ""}, ${idle} idle, ${idleInTx} idle in a transaction, and the capture's own`
         : `${peak.total} client connections${ofLimit}, the capture's own among them; their states weren't captured, only the total`;
     const evidence: EvidenceRef[] = [
         ref(peak, peakText),

@@ -1770,6 +1770,9 @@ Describe 'stop-demo.ps1, start-demo.ps1, and a pending auto-stop (Clear-DemoActi
         $result = Invoke-Clear -Purpose Stop
         $result.checkId | Should -Be 'STOP.CONTROL.AUTOSTOP'
         $result.status | Should -Be 'Pass'
+        # The handoff of a Run all session's stop words it for the control's job once that job stopped the session
+        # (Invoke-DemoStopHandoff, DbHubDemo.Lifecycle.Tests.ps1); here, and on every other path, stop-demo.ps1 stops it.
+        $result.message | Should -Be 'The pending on-demand auto-stop was removed; stop-demo.ps1 stops the demo itself.'
         Get-Deleted | Should -Be @('ffffffff-0000-0000-0000-000000000007', 'dbhub-autostop')
     }
 

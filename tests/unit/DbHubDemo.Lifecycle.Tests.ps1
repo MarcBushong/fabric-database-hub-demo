@@ -2386,6 +2386,35 @@ Describe 'Stop-DemoEnvironment' {
             $script:order | Should -Contain 'Deallocate:archost01'
         }
 
+        # Final tests' live round at d7df4f9f (O3): the auto-stop's removal right before the job said "stop-demo.ps1 stops the
+        # demo itself", though the control's job stopped the session.
+        It 'says the control''s job stops the demo once that job stopped the session, and stop-demo.ps1 whenever the stop stays with it' {
+            # Its removal as Clear-DemoActivityControlAutoStop words it (DbHubDemo.ActivityControl.Tests.ps1), with the backup's.
+            Mock -ModuleName DbHubDemo -CommandName Clear-DemoActivityControlAutoStop -MockWith {
+                $script:order.Add('AutoStopClear')
+                New-DemoResult -CheckId 'STOP.CONTROL.AUTOSTOP' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'The pending on-demand auto-stop was removed; stop-demo.ps1 stops the demo itself. The session''s backup auto-stop dbhub-autostop-backup was removed too.'
+            }
+            $autoStop = { param([object[]] $Results) @($Results | Where-Object { $_.checkId -eq 'STOP.CONTROL.AUTOSTOP' } | ForEach-Object { '{0}: {1}' -f $_.status, $_.message }) }
+            $byControl = 'Pass: The pending on-demand auto-stop was removed right before the session''s stop went to the session control, so it can''t start a second stop: the control''s DbHub-Stop job stops the demo, as Stop now''s does. The session''s backup auto-stop dbhub-autostop-backup was removed too.'
+            $itself = 'Pass: The pending on-demand auto-stop was removed; stop-demo.ps1 stops the demo itself. The session''s backup auto-stop dbhub-autostop-backup was removed too.'
+            $running = @{ sqlvm01 = 'PowerState/running'; archost01 = 'PowerState/running' }
+            & $autoStop @(Stop-DemoEnvironment -Config $config -Confirm:$false) | Should -Be @($byControl)
+            # A job that completed without a readable result is the control's stop all the same.
+            $script:power = $running.Clone()
+            Mock -ModuleName DbHubDemo -CommandName Get-DemoSafetyStopJobResult -MockWith { $null }
+            & $autoStop @(Stop-DemoEnvironment -Config $config -Confirm:$false) | Should -Be @($byControl)
+            # The control couldn't take it, so stop-demo.ps1 stops the demo itself.
+            $script:power = $running.Clone()
+            $script:jobPutFails = $true
+            & $autoStop @(Stop-DemoEnvironment -Config $config -Confirm:$false) | Should -Be @($itself)
+            # No Run all session: stop-demo.ps1 removes the auto-stop itself, as before.
+            $script:order.Clear()
+            $script:power = $running.Clone()
+            $script:state = New-TestState @{ RunnerSha256 = $script:runnerSha; RunnerSentTo = @('sqlvm01', 'archost01') }
+            & $autoStop @(Stop-DemoEnvironment -Config $config -Confirm:$false) | Should -Be @($itself)
+            $script:order | Should -Not -Contain 'Handoff'
+        }
+
         It 'waits for the host password''s Run Command on the T2 host before the job, and goes on with a Warning at its bound (review of f5972d2d)' {
             # Azure still deletes the rotation's DbHubDemo-HostPassword for two reads, then it's gone.
             $script:hostReads = 0

@@ -346,7 +346,8 @@ function Invoke-DemoStopHandoff {
     state, read again after the control's stop), PostgresHistory (T4's and its replica's metrics, read with -SaveHistory
     before the stop deletes the replica), T3, TuningRelease (the Database Agent beat's hold, released through T3 from T1
     before the stop deallocates it), and AutoStop (STOP.CONTROL.AUTOSTOP, once this removed the session's auto-stop, which
-    stop-demo.ps1 then reports instead of removing it again). Internal.
+    stop-demo.ps1 then reports instead of removing it again; once the control's job stopped the session, it names that job
+    as what stops the demo). Internal.
 
     .DESCRIPTION
     - None: no Run all session runs (Get-DemoStopHandoffSession), or its own stop began or ran; stop-demo.ps1 stops the demo
@@ -425,6 +426,15 @@ function Invoke-DemoStopHandoff {
         Write-DemoLog -Level Warning -Message $message
         $answer.Results = @($notes.ToArray()) + @(New-DemoResult -CheckId $script:StopHandoffCheckId -Area 'workload' -Target 'subscription' -Status 'Warning' -Message $message -Evidence $evidence -Remediation ('Run ./scripts/stop-demo.ps1 again once it has finished (the Automation account {0}, Process Automation > Jobs): it does the rest.' -f $name.AutomationAccount) -DocUrl 'https://learn.microsoft.com/rest/api/automation/job/get')
         return $answer
+    }
+    # The auto-stop's removal right before the job (STOP.CONTROL.AUTOSTOP) says stop-demo.ps1 stops the demo itself, which
+    # stays true only while the stop stays with it: once the control's job stopped the session, it names that job (Final
+    # tests' live round at d7df4f9f, O3).
+    $byControl = {
+        $removed = $answer.AutoStop
+        if ($null -ne $removed -and ([string]$removed.message).Contains($script:ActivityControlAutoStopRemovedBy.Script)) {
+            $removed.message = ([string]$removed.message).Replace($script:ActivityControlAutoStopRemovedBy.Script, $script:ActivityControlAutoStopRemovedBy.Control)
+        }
     }
     if ($session.Reason -eq 'Unknown') {
         return (& $fallback ('whether the session still runs couldn''t be read there: {0}' -f $session.Error))
@@ -541,6 +551,7 @@ function Invoke-DemoStopHandoff {
     if ($null -eq $line -and $status -eq 'Completed') {
         # It ran to its end, so it's the control's stop all the same: what it did is confirmed below.
         $answer.Outcome = 'Stopped'
+        & $byControl
         $took = if ($seconds -lt 90) { 'about a minute' } else { 'about {0} minutes' -f [int][Math]::Round($seconds / 60.0, [System.MidpointRounding]::AwayFromZero) }
         $message = '{0} was running, so its stop went to the session control, as Stop now''s does: its DbHub-Stop job {1} completed after {2}, but ended without a readable result, so what it stopped isn''t known here: stop-demo.ps1 confirms each stop below.' -f (& $who), $jobId, $took
         Write-DemoLog -Level Warning -Message $message
@@ -554,6 +565,7 @@ function Invoke-DemoStopHandoff {
         return (& $fallback $why)
     }
     $answer.Outcome = 'Stopped'
+    & $byControl
     $answer.Results = @($notes.ToArray()) + @(ConvertTo-DemoStopHandoffResult -Line $line -SessionId $session.SessionId -JobId $jobId -Seconds $seconds -Current ($runbook.Current -eq $true) -RunbookError $(if ($null -eq $runbook.Current) { [string]$runbook.Error } else { '' }))
     $answer.State = Get-DemoDeploymentState -Config $Config
     return $answer

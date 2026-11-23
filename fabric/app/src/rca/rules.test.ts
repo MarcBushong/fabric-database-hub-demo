@@ -409,7 +409,14 @@ describe("T4's connections against the limit, by what held them", () => {
         expect(a.rootCause?.statement).toContain("Most of them sat idle: 34 of the 36 at the peak, and at least 34 in every sample (1 ran a query, none sat idle in a transaction, none waited on a lock).");
         expect(a.rootCause?.statement).toContain("(up to 36 connections, over the 35), so a client connecting then would have been refused");
         // The review of ebd1c6c3: its evidence read "36 client connections of 35 (103 %)".
-        expect(a.rootCause?.evidence[0].text).toBe("36 client connections, over the 35 usable: 1 active, 34 idle, 0 idle in a transaction, 0 waiting on a lock, and the capture's own");
+        expect(a.rootCause?.evidence[0].text).toBe("36 client connections, over the 35 usable: 1 active, 34 idle, 0 idle in a transaction, and the capture's own");
+    });
+
+    // Final tests' live round at d7df4f9f (O2): the evidence listed "20 waiting on a lock" beside the states, though RCA-PG-10
+    // counts a client waiting on a lock as active too, so the line read as if they added up.
+    it("gives the clients waiting on a lock as some of the active, never beside them", () => {
+        expect(ask(surge(29, 2, 3, 20)).rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %): 29 active (20 of them waiting on a lock), 2 idle, 3 idle in a transaction, and the capture's own");
+        expect(ask(surge(2, 32, 0, 0)).rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %): 2 active, 32 idle, 0 idle in a transaction, and the capture's own");
     });
 
     // Before 3732317d, the capture's own query was one of the active in every sample: a row whose states add up to its total.
@@ -421,7 +428,7 @@ describe("T4's connections against the limit, by what held them", () => {
         );
         const a = ask(old);
         expect(a.rootCause?.statement).toContain("Most of them sat idle: 34 of the 35 at the peak, and at least 34 in every sample (none ran a query, none sat idle in a transaction, none waited on a lock).");
-        expect(a.rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %): 0 active, 34 idle, 0 idle in a transaction, 0 waiting on a lock, and the capture's own");
+        expect(a.rootCause?.evidence[0].text).toBe("35 client connections of 35 (100 %): 0 active, 34 idle, 0 idle in a transaction, and the capture's own");
     });
 
     it("says exactly what isn't captured: who held the connections, how many were refused, and the states when only the total was counted", () => {
