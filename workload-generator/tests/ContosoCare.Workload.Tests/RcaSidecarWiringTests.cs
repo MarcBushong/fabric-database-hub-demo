@@ -1,3 +1,5 @@
+using System.Runtime.CompilerServices;
+using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Rca;
 using ContosoCare.Workload.Rca.Export;
@@ -8,10 +10,12 @@ using Xunit;
 namespace ContosoCare.Workload.Tests;
 
 /// <summary>
-/// The sidecar's wiring into the evidence export and its store (T1b; the review of 1ca916a9's three seams): the export
-/// seals at one commit point that every path past its lock reaches, before retention, with its output unchanged;
-/// retention never deletes a span whose sidecar rows wait unsealed, at a span's opening too; and the final wait and the
-/// span's evidence end are the store's, for the sidecar's export to share.
+/// The sidecar's wiring into the evidence export, its store, and the observer lane (T1b; the review of 1ca916a9's three
+/// seams, and A1's evidence end): the export seals at one commit point that every path past its lock reaches, before
+/// retention, with its output unchanged; retention never deletes a span whose sidecar rows wait unsealed, at a span's
+/// opening too; the final wait and the span's evidence end are the store's, for the sidecar's export to share; and the
+/// lane releases a target where its evidence's own end was done, so slow Query Store end reads change nothing in the span
+/// or the export.
 /// </summary>
 public sealed class RcaSidecarWiringTests : IDisposable
 {
@@ -106,6 +110,25 @@ public sealed class RcaSidecarWiringTests : IDisposable
         Assert.False(Directory.Exists(unexported));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task SlowQueryStoreEndReadsLeaveTheSpanAndTheExportAsWithoutASidecar(bool hostStops)
+    {
+        // The lane releases a target where its evidence's own end was done (TargetObserver.EndAsync's hook), not once the
+        // sidecar's end reads have returned, whether its session ends or its host stops: on the lane's clock those reads
+        // take 4 s a block here.
+        var without = await RunLaneAsync(Path.Combine(root, "without"), sidecar: false, hostStops);
+        var with = await RunLaneAsync(Path.Combine(root, "with"), sidecar: true, hostStops);
+
+        Assert.Equal(0, without.EndReads);
+        Assert.InRange(with.EndReads, 1, 100);
+        Assert.True(with.ClockAfterEnd > with.ClockAtEnd, "The Query Store end reads took no time on the lane's clock.");
+        Assert.Equal(without.ClockAtEnd, with.ClockAtEnd);
+        Assert.Equal(without.Span, with.Span);
+        Assert.Equal(without.Export, with.Export);
+    }
+
     [Fact]
     public void TheFinalWaitAndTheSpansEvidenceEndAreTheStores()
     {
@@ -137,6 +160,75 @@ public sealed class RcaSidecarWiringTests : IDisposable
         }, new SpanExport());
         Assert.True(orphan.Orphaned);
         Assert.Equal(From.AddMinutes(9), orphan.EvidenceEndUtc);
+    }
+
+    /// <summary>
+    /// T1 observed by the real lane, on a clock only the test and a slow Query Store block move: begun at 16:50, ticked at
+    /// 16:52, then out of its session, or its host stopping (the lane cancelled). Returns its span record, its final export
+    /// as printed, how many Query Store blocks ran at its end, and the clock when its end began and once the span closed.
+    /// </summary>
+    private static async Task<(string Span, string Export, int EndReads, DateTimeOffset ClockAtEnd, DateTimeOffset ClockAfterEnd)> RunLaneAsync(string storeRoot, bool sidecar, bool hostStops)
+    {
+        var clock = new ManualTime(RcaSimulation.T1From);
+        var connector = new TimedConnector(clock, RcaSimulation.T1(clock));
+        var ending = new StrongBox<bool>();
+        connector.Cost = _ => Volatile.Read(ref ending.Value) ? TimeSpan.FromSeconds(4) : TimeSpan.Zero;
+        var store = new EvidenceStore(storeRoot, clock, host: "sqlvm01");
+        var gate = new Gate();
+        var observer = new SqlTargetObserver("T1", DemoTarget.T1, connector, RcaV1PinTests.PinOptions, RunnerLog.Null, sidecar ? new MemorySidecarSink() : null);
+        var lane = new ObserverLane([observer], [], gate, store, RunnerLog.Null, clock);
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        int before;
+        DateTimeOffset atEnd;
+        try
+        {
+            gate.Active = true;
+            await Until(() => store.Spans().Count == 1 && connector.Calls.ToArray().Any(c => c.BlockId == "RCA-SQL-09"));
+            var tick = RcaSimulation.T1From.AddMinutes(2);
+            clock.Set(tick);
+            await Until(() => connector.Calls.ToArray().Any(c => c.At == tick && c.BlockId == "RCA-SQL-09"));
+            before = Calls(connector);
+            atEnd = clock.Now;
+            Volatile.Write(ref ending.Value, true);
+            if (hostStops)
+            {
+                await stop.CancelAsync();
+                await running.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+            }
+            else
+            {
+                gate.Active = false;
+            }
+
+            await Until(() => store.Spans().Single().Span.ClosedUtc is not null);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        }
+
+        var afterEnd = clock.Now;
+        var span = File.ReadAllText(Path.Combine(store.Spans().Single().Directory, "span.json"));
+        clock.Set(RcaSimulation.T1From.AddMinutes(10));
+        var exporter = new Exporter(store, RunnerLog.Null, "1.0.0");
+        var result = exporter.Export(Session, final: true, TimeSpan.Zero);
+        var export = result.IndexLine() + string.Concat(result.Documents.SelectMany(d => Enumerable.Range(1, d.Parts).Select(i => "\n" + exporter.Part(d.DocumentId, i))));
+        return (span, export, Calls(connector) - before, atEnd, afterEnd);
+
+        // The lane adds calls while the test reads them: a copy, never the list itself.
+        static int Calls(TimedConnector connector) => connector.Calls.ToArray().Count(c => c.BlockId is { } block && TimedConnector.QueryStoreBlocks.Contains(block));
+    }
+
+    private static async Task Until(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(30);
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "The condition wasn't met in time.");
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+        }
     }
 
     /// <summary>A closed span of T1 that an export took all of at <see cref="From"/> plus 4 minutes; its folder.</summary>
@@ -189,5 +281,23 @@ public sealed class RcaSidecarWiringTests : IDisposable
         }
 
         return printed;
+    }
+
+    /// <summary>T1 in a session from long before, until the test takes it out.</summary>
+    private sealed class Gate : IObservationGate
+    {
+        private volatile bool active;
+
+        public bool Active
+        {
+            get => active;
+            set => active = value;
+        }
+
+        public bool IsActive(DemoTarget target) => active && target == DemoTarget.T1;
+
+        public bool IsActiveAfter(DemoTarget target, DateTimeOffset end) => false;
+
+        public bool HoldsAfter(DemoTarget target, DateTimeOffset end) => false;
     }
 }

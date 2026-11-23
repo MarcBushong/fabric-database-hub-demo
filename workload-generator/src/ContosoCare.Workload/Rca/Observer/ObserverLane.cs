@@ -83,9 +83,10 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                     // the host stops, so a target that doesn't answer can't hold the span open past the export's wait.
                     using var bound = end is null ? null : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                     bound?.CancelAfter(settings.EndTimeout);
+                    var ended = new EvidenceEnd(time);
                     try
                     {
-                        await observer.EndAsync(now, bound?.Token ?? cancellationToken).ConfigureAwait(false);
+                        await observer.EndAsync(now, bound?.Token ?? cancellationToken, ended.Mark).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) when (bound?.IsCancellationRequested == true && !cancellationToken.IsCancellationRequested)
                     {
@@ -93,7 +94,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                     }
                     finally
                     {
-                        Release(observer.Target, time.GetUtcNow(), end);
+                        Release(observer.Target, ended.At, end);
                     }
                 }
                 else if (!wanted && observer.BeginsOnConnect)
@@ -134,9 +135,10 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
         {
             // The host is stopping: the last reads and the event session's drop, bounded.
             using var bound = new CancellationTokenSource(settings.EndTimeout);
+            var ended = new EvidenceEnd(time);
             try
             {
-                await observer.EndAsync(time.GetUtcNow(), bound.Token).ConfigureAwait(false);
+                await observer.EndAsync(time.GetUtcNow(), bound.Token, ended.Mark).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
@@ -144,7 +146,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
             }
             finally
             {
-                Release(observer.Target, time.GetUtcNow());
+                Release(observer.Target, ended.At);
             }
         }
     }
@@ -427,5 +429,20 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                 span = null;
             }
         }
+    }
+
+    /// <summary>
+    /// Where a target's capture ends (TargetObserver.EndAsync's hook): the lane's clock when the evidence's own end was done,
+    /// before a sidecar reader's end reads, so the span's end, its watermark, and RCA Coverage's window stay the evidence's
+    /// own, as without a sidecar. When the hook never ran (the evidence's last watermark threw, which skips those reads
+    /// too), the clock once EndAsync returns.
+    /// </summary>
+    private sealed class EvidenceEnd(TimeProvider time)
+    {
+        private DateTimeOffset? marked;
+
+        public DateTimeOffset At => marked ?? time.GetUtcNow();
+
+        public void Mark() => marked = time.GetUtcNow();
     }
 }
