@@ -23,8 +23,9 @@ function New-DemoT2GoldenSnapshot {
        captures nothing; one that's encrypted (a tenant's policy can re-create the variable so, and Resource Manager then
        returns no value) gets the fix for a governed tenant: Run all sessions, each to its planned end, until one has no
        RCA.EARLIER line at its start about evidence still left, no RCA.EXPORT line about another session's documents, and
-       no RCA.PENDING line at its end; then, the same day, deploy.ps1, which re-creates it unencrypted and empty, and the
-       capture, before it's encrypted again (2026-11-23; the review of a57539ed).
+       no RCA.PENDING line at its end; then, the same day, the variable deleted, deploy.ps1, which creates it again
+       unencrypted and empty (since 2026-11-23 it keeps an existing one as it is, so an update no longer loses what it
+       lists), and the capture, before it's encrypted again (2026-11-23; the review of a57539ed).
     3. Starts archost01 when it's deallocated, and releases an air gap that an interrupted capture left (the
        host's Azure VM ID matches the capture record, so only the guest's network and start action return).
     4. Inspects the host and guest (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Inspect, read-only) and
@@ -224,13 +225,16 @@ function New-DemoT2GoldenSnapshot {
         $readFix = 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
         $readEvidence = [ordered]@{ status = $controlPending.Variable }
         if ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Encrypted')) {
-            # A tenant's policy can re-create the variable encrypted (2026-11-23): then only the runbooks read it, and
-            # deploy.ps1's control.bicep makes it readable again only by re-creating it empty, which loses what it lists.
-            # Run all prints what's left from the vault's copy of the status: RCA.EARLIER at a start, RCA.EXPORT's note of
-            # another session's documents, which the status then carries for that session, and RCA.PENDING at the end. A
-            # stop before the session's planned end can leave capture that none of them names (O1; the review of a57539ed).
+            # A tenant's policy can re-create the variable encrypted (2026-11-23): then only the runbooks read it, and since
+            # 2026-11-23 deploy.ps1 keeps an existing variable as it is, so that an update no longer loses what it lists; it
+            # creates one only when there's none. So it reads again only once deleted and created again, empty, which loses
+            # what it lists. Run all prints what's left from the vault's copy of the status: RCA.EARLIER at a start,
+            # RCA.EXPORT's note of another session's documents, which the status then carries for that session, and
+            # RCA.PENDING at the end. A stop before the session's planned end can leave capture that none of them names (O1;
+            # the review of a57539ed).
             $readEvidence['encrypted'] = $true
-            $readFix = 'Running the capture again won''t help by itself: only the control''s runbooks read an encrypted variable. To save what it may list first, run sessions with Run all in {0}, each to its planned end, by Run all''s own end or its auto-stop (a stop before it, by STOP_NOW, the Insights app''s Stop now, or ./scripts/stop-demo.ps1, can leave capture that the stop''s lines don''t name), until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, run ./scripts/deploy.ps1, which re-creates it unencrypted but empty, and then ./scripts/capture-t2-golden.ps1.' -f $controlPending.Notebook
+            $controlName = Get-DemoActivityControlName -Config $Config
+            $readFix = 'Running the capture again won''t help by itself: only the control''s runbooks read an encrypted variable, and ./scripts/deploy.ps1 keeps an existing one as it is. To save what it may list first, run sessions with Run all in {0}, each to its planned end, by Run all''s own end or its auto-stop (a stop before it, by STOP_NOW, the Insights app''s Stop now, or ./scripts/stop-demo.ps1, can leave capture that the stop''s lines don''t name), until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, delete it (az rest --method delete --url "https://management.azure.com{1}/variables/DbHubSessionStatus?api-version=2024-10-23", or {2}''s Variables in the Azure portal), run ./scripts/deploy.ps1, which creates it again, unencrypted and empty, and then ./scripts/capture-t2-golden.ps1.' -f $controlPending.Notebook, $controlName.AutomationAccountId, $controlName.AutomationAccount
         }
         & $add 'GOLDEN.CAPTURE.RCA' 'Fail' ('The session control''s status ({0}) couldn''t be read ({1}), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.' -f $controlPending.Variable, $controlPending.Error) $readEvidence $readFix
         return $results.ToArray()

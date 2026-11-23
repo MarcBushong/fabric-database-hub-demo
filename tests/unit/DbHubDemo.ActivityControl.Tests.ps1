@@ -188,6 +188,16 @@ BeforeAll {
                 }
                 return (New-AzResult -StdOut '{"name":"aa-dbhub-control"}')
             }
+            '/automationAccounts/aa-dbhub-control/variables/DbHubSessionStatus$' {
+                # The session's status variable (2026-11-23): '' when there's none, Plain or Encrypted as Variable - Get
+                # answers (an encrypted one without its value), or Forbidden.
+                switch ($script:statusVariable) {
+                    'Plain' { return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ name = 'DbHubSessionStatus'; properties = @{ isEncrypted = $false; value = (ConvertTo-Json -InputObject '{"sessionId":"5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21","phase":"stopped"}') } } -Depth 4)) }
+                    'Encrypted' { return (New-AzResult -StdOut '{"name":"DbHubSessionStatus","properties":{"isEncrypted":true}}') }
+                    'Forbidden' { return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (AuthorizationFailed) The client has no access to read the variable.') }
+                    default { return (Get-NotFound 'DbHubSessionStatus') }
+                }
+            }
             '/runbooks/DbHub-Control/content$' {
                 # The published DbHub-Control's content (Runbook - Get Content, 2026-11-19): with the start-demo.ps1 marker
                 # unless $script:controlRunbookOld (published before 2026-11-19), or missing.
@@ -385,6 +395,7 @@ BeforeAll {
         $script:safetyStopLinked = $true
         $script:safetyStopReadFails = $false
         $script:connections = [System.Collections.Generic.List[object]]::new()
+        $script:statusVariable = ''
     }
 
     function Register-FakeAzure {
@@ -1235,6 +1246,56 @@ Describe 'Setting up the control (setup-activity-control.ps1)' {
         $results = @(Invoke-DemoActivityControlSetup -Config (New-ControlConfig -Mode 'public') -Confirm:$false)
         ($results | Where-Object checkId -EQ 'CONTROL.MODE').status | Should -Be 'Fail'
         $script:azCalls.Count | Should -Be 0
+    }
+
+    It 'creates the session''s status variable only when Azure has none, so an update keeps a stopped session''s lists, encrypted or not (2026-11-23)' {
+        # Every update deployed control.bicep, which wrote DbHubSessionStatus again empty: a start after it no longer had what
+        # the stop's status listed of the Incident RCA's evidence still on the VMs (ADR 0031).
+        $deploy = {
+            $script:deployments.Clear()
+            $answer = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = (New-ControlConfig) } { Invoke-DemoActivityControlTemplate -Config $Config -Name (Get-DemoActivityControlName -Config $Config) -Mode 'public' -Confirm:$false }
+            $script:deployments.Count | Should -Be 1
+            $script:deployments[0].Text | Should -Match 'control\.bicep'
+            $script:deployments[0].Text | Should -Not -Match '--mode' -Because 'only an incremental deployment, the default, leaves a variable the template doesn''t deploy as it is'
+            return [pscustomobject]@{ Result = $answer.Result; Create = ($script:deployments[0].Parameters | ConvertFrom-Json -AsHashtable)['parameters']['createSessionStatus']['value'] }
+        }
+        $script:statusVariable = ''
+        $new = & $deploy
+        $new.Create | Should -BeTrue
+        $new.Result.status | Should -Be 'Pass'
+        $new.Result.evidence.sessionStatus | Should -Be 'created'
+        $new.Result.message | Should -Not -Match 'DbHubSessionStatus'
+
+        $script:statusVariable = 'Plain'
+        $kept = & $deploy
+        $kept.Create | Should -BeFalse
+        $kept.Result.status | Should -Be 'Pass'
+        $kept.Result.evidence.sessionStatus | Should -Be 'kept'
+        $kept.Result.message | Should -Match 'Its variable DbHubSessionStatus was kept as it was: the last session''s status, which the next session''s start reads\.$'
+
+        $script:statusVariable = 'Encrypted'
+        $encrypted = & $deploy
+        $encrypted.Create | Should -BeFalse
+        $encrypted.Result.evidence.sessionStatus | Should -Be 'kept, encrypted'
+        $encrypted.Result.message | Should -Match 'was kept as it was, encrypted:'
+        @($script:rest | Where-Object { $_.Url -match '/variables/' } | ForEach-Object Method | Select-Object -Unique) | Should -Be @('get') -Because 'the variable is only read: the template creates it'
+
+        # One that can't be read, read twice, is left as it is, never emptied, and says so.
+        $script:statusVariable = 'Forbidden'
+        $script:rest.Clear()
+        $unread = & $deploy
+        $unread.Create | Should -BeFalse
+        $unread.Result.status | Should -Be 'Warning'
+        $unread.Result.evidence.sessionStatus | Should -Be 'unread, left as it is'
+        $unread.Result.message | Should -Match 'Its variable DbHubSessionStatus couldn''t be read \(ERROR: \(AuthorizationFailed\) The client has no access to read the variable\), so it was left as it was, never emptied'
+        $unread.Result.remediation | Should -Be 'Run ./scripts/deploy.ps1 again.'
+        @($script:rest | Where-Object { $_.Url -match '/variables/DbHubSessionStatus\?api-version=2024-10-23$' }).Count | Should -Be 2
+    }
+
+    It 'makes the template create the variable only when asked' {
+        $template = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'infra/control/control.bicep') -Raw
+        $template | Should -Match 'param createSessionStatus bool = true'
+        $template | Should -Match "resource sessionStatus 'Microsoft\.Automation/automationAccounts/variables@[0-9-]+' = if \(createSessionStatus\) \{"
     }
 
     It 'stores the webhook URL only through the secure template parameter, never in a result or the log' {
