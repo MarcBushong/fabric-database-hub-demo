@@ -447,23 +447,25 @@ function Format-DemoT4ZoneText {
 function Get-DemoT4Tuning {
     <#
     .SYNOPSIS
-    Whether T4 gets autonomous tuning (2026-11-04, user-directed; ADR 0019): Query Store and index tuning in REPORT mode,
-    which the template sets only when Enabled. Returns Enabled, Status, Message, Remediation, SkuName, Tier, VCores, and
-    Switch (t4AutonomousTuning as the file sets it, or $null). Pure. Internal.
+    Whether T4 gets autonomous tuning (2026-11-04, user-directed; ADR 0019): index tuning in REPORT mode, which the template
+    sets only when Enabled. Returns Enabled, Status, Message, Remediation, SkuName, Tier, VCores, and Switch
+    (t4AutonomousTuning as the file sets it, or $null). Pure. Internal.
 
     .DESCRIPTION
     Autonomous tuning works on "any currently supported compute SKU with at least 4 vCores", and the Query Store it needs
     shouldn't run on Burstable ("Don't enable query store on the Burstable pricing tier as it causes performance
     problems"), so the size must be General Purpose or Memory Optimized with at least 4 vCores
-    (config/versions.json postgresql.autonomousTuning.minVCores). t4AutonomousTuning, unset meaning on:
+    (config/versions.json postgresql.autonomousTuning.minVCores). Query Store and its wait sampling don't depend on this:
+    the template turns them on at every size but Burstable (2026-11-23, postgresql.queryStore). t4AutonomousTuning, unset
+    meaning on:
     - unset or true, with a size that fits: Enabled, Pass.
     - unset, with a size that doesn't (a t4SkuName you set, or the fallback's Standard_D2ds_v5): off, Warning, with why.
     - true, with a t4SkuName you set that doesn't: off, Fail, with the exact fix (preflight stops the run).
     - true, with the fallback's size that doesn't: off, Warning (2026-11-09: tuning never leaves T4 out).
-    - false: off, Not selected; the template leaves the parameters as they are.
+    - false: off, Not selected; the template leaves the index-tuning parameters as they are.
     -SkuName is the size to judge (the fallback's step); by default, the configuration's.
-    Sources (checked 2026-11-04): https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning (updated
-    2026-07-16), https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store
+    Sources (checked 2026-11-04; Query Store 2026-11-23): https://learn.microsoft.com/azure/postgresql/monitor/concepts-autonomous-tuning
+    (updated 2026-07-16), https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -483,8 +485,10 @@ function Get-DemoT4Tuning {
     $sized = '{0} ({1}, {2} vCore{3})' -f $size, $tierText, $spec.VCores, $(if ($spec.VCores -eq 1) { '' } else { 's' })
     $result = [ordered]@{ Enabled = $false; Status = 'Not selected'; Message = ''; Remediation = ''; SkuName = $size; Tier = $spec.Tier; VCores = $spec.VCores; Switch = $switchValue }
     $needs = 'it needs a General Purpose or Memory Optimized size with at least {0} vCores, because it runs only on {0} vCores or more and Query Store shouldn''t run on Burstable' -f $minVCores
+    # Query Store's own state, which every message says the same way: it doesn't depend on tuning (2026-11-23).
+    $queryStore = if ($spec.Tier -eq 'Burstable') { 'Query Store stays off at this size, where Learn advises against it' } else { 'Query Store and its wait sampling stay on, as at every size but Burstable' }
     if ($switchValue -eq $false) {
-        $result.Message = 't4AutonomousTuning is false, so T4 gets no autonomous tuning; its Query Store and index-tuning parameters are left as they are.'
+        $result.Message = 't4AutonomousTuning is false, so T4 gets no autonomous tuning; its index-tuning parameters are left as they are. {0}.' -f $queryStore
     }
     elseif ($fits) {
         $result.Enabled = $true
@@ -500,12 +504,12 @@ function Get-DemoT4Tuning {
         # 2026-11-09 (user-directed): T4 is part of every deployment, so a size its fallback chose never leaves it out for
         # autonomous tuning; T4 gets the size with tuning off, and says so.
         $result.Status = 'Warning'
-        $result.Message = 't4AutonomousTuning is true, but T4 gets {0} from its fallback, because Azure refused the size it asks for here, and that size can''t run autonomous tuning: {1}. T4 is part of every deployment, so it''s created with autonomous tuning off.' -f $sized, $needs
+        $result.Message = 't4AutonomousTuning is true, but T4 gets {0} from its fallback, because Azure refused the size it asks for here, and that size can''t run autonomous tuning: {1}. T4 is part of every deployment, so it''s created with autonomous tuning off. {2}.' -f $sized, $needs, $queryStore
         $result.Remediation = 'To have autonomous tuning, ask for access to Standard_D4ds_v5 or Standard_D4ads_v5 with a Region access request (Learn: Resolve capacity errors), then set t4SkuName to that size and run ./scripts/deploy.ps1.'
     }
     else {
         $result.Status = 'Warning'
-        $result.Message = 'Autonomous tuning is off for T4 at {0}: {1}. Database Hub''s PostgreSQL visuals don''t need it.' -f $sized, $needs
+        $result.Message = 'Autonomous tuning is off for T4 at {0}: {1}. Database Hub''s PostgreSQL visuals don''t need it. {2}.' -f $sized, $needs, $queryStore
         $result.Remediation = 'Nothing to do for the demo. To have it, remove t4SkuName (the default is Standard_D4ds_v5) or set it to Standard_D4ds_v5 or Standard_D4ads_v5; to say you don''t want it, set t4AutonomousTuning to false.'
     }
     return [pscustomobject]$result
