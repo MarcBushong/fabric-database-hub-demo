@@ -3144,7 +3144,8 @@ print(json.dumps(report, default=str))
         @($decode['documents']) | Should -Be $fixtureIds
         @($decode['skipped']) | Should -BeNullOrEmpty
         @($decode['evidenceDocuments']) | Should -BeNullOrEmpty
-        $decode['evidenceSkipped'][0][1] | Should -Match '^3 part line\(s\) that part format 1 doesn''t describe'
+        # The fixtures' sidecar part lines: T3's sidecar is two parts since 27c14daa (plan 40's row, the recommendation's appearance).
+        $decode['evidenceSkipped'][0][1] | Should -Match '^4 part line\(s\) that part format 1 doesn''t describe'
     }
 
     It 'writes the fixtures'' rows once to the six tables, each sidecar under its own session''s run, acknowledges each by its ID, and deletes the file' {
@@ -3187,6 +3188,7 @@ print(json.dumps(report, default=str))
             'T3 412/58 at 17:00: 524 executions to 17:09:40.215 at 176 ms of CPU each (92224 ms), 4100 logical reads each, DOP 4, 31440 ms of waits: Buffer IO 920, CPU 18900, Parallelism 11620'
             'T3 at 17:00: 412/31 ran 668 times (1403 ms); 412/58 used 92224 of 95644 ms of CPU'
             'T3 412/58: cost 38.6, parallel, compiled 17:03:11.870; 412/31: cost 0.0331, forced AUTO, last compiled 17:09:41.120'
+            'T3 17:06:00.000 tuning 412/31: None to Active, from 17:05:30.000'
             'T3 17:09:30.000 tuning 412/31: Active to Executing, from 17:09:00.000'
             'T3 17:10:00.000 forced AUTO 412/31: not forced to forced, from 17:09:00.000'
             'T3 17:10:30.000 tuning 412/31: Executing to Verifying, from 17:10:00.000'
