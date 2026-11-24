@@ -9162,6 +9162,11 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
   - the contract review's fixes (83c87de2): the acknowledgements' routing, the anchors, the five line-feed cases, and the pointer's bytes, each on the previous schema, fixtures, or README; the harness exceptions' one file, with a second file added.
 - **The schemas:** `evidence.schema.json` is byte-identical to edd01c86's, and both schemas regenerate byte for byte.
 - **Lint and checks:** PSScriptAnalyzer found nothing; markdownlint 0.23.3 found no issue; the leak check prints nothing.
+- **The full validation at 58d64779** (2026-11-24, after Tuesday's release, H, T2b, T2c-1, and T2c-2), at below-normal priority with the PC's traps handled (OneDrive out of `PSModulePath`, Python on `PATH`, which `Fabric.ControlNotebook` needs or it skips 93 tests, and Pester on its own):
+  - **Pester:** 6,092 tests, 6,087 passed and 4 skipped; the one failure is `DbHubDemo.Teardown`'s "skips every live teardown test without -Live or DBHUB_TEARDOWN_TESTS and a configuration", which fails on this PC only, as before. No unit test reached the Azure CLI.
+  - **The rest of the static validation:** PSScriptAnalyzer found nothing in 414 files; PSRule's 302 rules passed; DotNet passed (the runner's suite, 1,181 tests, 1,151 passed and 30 skipped, unchanged since H's merge); FabricApp passed (typecheck, lint, tests, licenses, build); markdownlint found nothing.
+  - **Bicep:** `STATIC.BICEP` fails only because it builds with the Azure CLI's Bicep 0.49.2; the pinned 0.47.16 builds `infra/main.bicep` into `azuredeploy.json` byte for byte.
+  - **The leak check** prints nothing, on the integration and on the contract branch.
 
 **Risks and what its live check needs.**
 
@@ -9174,7 +9179,7 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - **The answer-key recorder's markers** are merged on every engine: A1's for T1 to T3 and A2's for T4. S7's `recorder` set and its name check prove them live.
 - **`rca.marker-refused`:** a harness control connection that T4 refuses the marked startup keeps its statements as evidence. L0c shows whether T4 accepts the startup's `options`, and its result names the fix.
 - **RCA-XE-00, Phase 1's (outside this unit):** its join took 8 to 48 s of CPU at an observer start on SQL Server 2022 CU25, enough to miss the event session's 8-second check. The fix reads `sys.dm_xe_object_columns` alone (f16b9cb9, on the RCA release's 963c802f), with the same 40 rows. `RcaIntegrationTests`' blind-capture test expected a module that an idle head blocker can't have; f78458d6 fixes the test. It goes into Tuesday's release, or into tonight's if fc's run shows the event session missing; the integration takes it with main.
-- **Still to run on the integration:** the full runner suite, the static validation, and the app's `npm run verify` after C's merge, which wait for the evening's CPU window.
+- **Run on the integration since:** the full runner suite, the static validation, and the app's `npm run verify`, at 58d64779 (the validation above). Final tests' rehearsal is what's left.
 - **A Run all session's Query Store evidence** comes through Run all's own path (T2c), which joins this release by the coordinator's decision. If it isn't reviewed by 2026-11-24 18:00, it reaches the history with the next scripts' save until Run all's path ships as its own release.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
 
