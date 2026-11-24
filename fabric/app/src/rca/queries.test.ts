@@ -107,7 +107,7 @@ describe("Query Store's rules: T3's plan regression (t3-plan-regression)", () =>
         const a = analyzeQueries({ target: "T3", from: at("20T17:03:00"), to: at("20T17:10:00"), sidecar: fixtureSidecar("t3"), now: NOW, incident: { family: "parallelism", start: at("20T17:04:00"), end: at("20T17:10:00"), last: at("20T17:10:00") } });
         const waits = a.findings.find((f) => f.ruleId === "QS-WAITS")!;
         expect(waits.detail).toBe(
-            "In Query Store's 15-minute interval from 17:00 to 17:15 UTC, the queries by Parallelism waits: query 412 ([demo].[usp_visit_summary_lookup]) 11,620 ms; and by the highest degree of parallelism: query 412 ([demo].[usp_visit_summary_lookup]) 4; query 377 (\"SELECT TOP (?) p.patient_id, p.last_name, p.first_name FROM care.patient…\") 1; query 902 (\"SELECT r.session_id, r.status, r.wait_type, r.wait_time, r.cpu_time FROM…\") 1.",
+            "In Query Store's 15-minute interval from 17:00 to 17:15 UTC, the queries by Parallelism waits: query 412 ([frontdesk].[usp_visit_summary]) 11,620 ms; and by the highest degree of parallelism: query 412 ([frontdesk].[usp_visit_summary]) 4; query 377 (\"SELECT TOP (?) p.patient_id, p.last_name, p.first_name FROM care.patient…\") 1; query 902 (\"SELECT r.session_id, r.status, r.wait_type, r.wait_time, r.cpu_time FROM…\") 1.",
         );
         expect(a.recommendations.map((r) => r.id)).toContain("PAR-MAXDOP");
     });

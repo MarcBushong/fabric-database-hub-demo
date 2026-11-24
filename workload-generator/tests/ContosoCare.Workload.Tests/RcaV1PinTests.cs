@@ -16,10 +16,12 @@ namespace ContosoCare.Workload.Tests;
 /// one that is. The sidecar's store, its sealing, and Query Store's reads must never change them.
 /// </summary>
 /// <remarks>
-/// The expected values were taken at edd01c86, the last commit before the sidecar's contract, by building and running this
-/// file in a temporary worktree there. A gzip header's OS byte is zlib's OS_CODE for the platform that wrote it (0x0A on
-/// Windows, 0x03 on Linux), so the pin holds Windows' bytes and sets that one byte before comparing elsewhere; every other
-/// header byte is checked. Each document's JSON SHA-256 is pinned too, which no platform or compression library changes.
+/// The expected values were taken at ddc0a356, main with the release of 2026-11-24, by building and running this file in a
+/// temporary worktree there. That release changed them from edd01c86's, the last commit before the sidecar's contract,
+/// where they were first taken: among its changes, the simulation's sessions carry its realistic names. A gzip header's OS
+/// byte is zlib's OS_CODE for the platform that wrote it (0x0A on Windows, 0x03 on Linux), so the pin holds Windows' bytes
+/// and sets that one byte before comparing elsewhere; every other header byte is checked. Each document's JSON SHA-256 is
+/// pinned too, which no platform or compression library changes.
 /// </remarks>
 public sealed class RcaV1PinTests : IDisposable
 {
@@ -34,41 +36,41 @@ public sealed class RcaV1PinTests : IDisposable
     /// </summary>
     internal static readonly ObserverOptions PinOptions = Options() with { SlowSample = TimeSpan.FromHours(1) };
 
-    // Taken at edd01c86, the last commit before the sidecar's contract, on Windows (arm64) with .NET SDK 10.0.403.
+    // Taken at ddc0a356, main with the release of 2026-11-24, on Windows (arm64) with .NET SDK 10.0.403.
     private static readonly string[] SessionPin =
     [
-        """export 1 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T165000Z-sqlvm01-0001","parts":2,"sha256":"88227ad9103103ae4e9c78a611979eaf54df7edfd11b4ae7bc708fabe04a1d79"}],"status":"Pass","message":"1 evidence document, 2 parts, for session 5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21."}""",
-        """export 1 20261120T165000Z-sqlvm01-0001 json 874975c5fc5450044400f6e8e3e25ea80489331e51992903fd635c6673637dab""",
-        """export 1 20261120T165000Z-sqlvm01-0001 gzip 88227ad9103103ae4e9c78a611979eaf54df7edfd11b4ae7bc708fabe04a1d79 3062 bytes 2 parts""",
-        """export 1 20261120T165000Z-sqlvm01-0001 part 1 7afc122a05baf4361dd61ef28942fc592513fec1f89bcfbfd1832262ac2c4480""",
-        """export 1 20261120T165000Z-sqlvm01-0001 part 2 22754de8176f7a78d9943f72185771e393d79fb43892a334eea8f53c5fb5e178""",
-        """export 2 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T170000Z-sqlvm01-0002","parts":1,"sha256":"f84685feb45b073320f1e07c3f5afe43538327e5af8f7fc2b9d3c8ae18dcc172"}],"status":"Pass","message":"1 evidence document, 1 parts, for session 5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21."}""",
-        """export 2 20261120T170000Z-sqlvm01-0002 json e5c95db4ef883e51ceb4e14b780f7c67c969b22e9a8263795cfa8eddc3439c7d""",
-        """export 2 20261120T170000Z-sqlvm01-0002 gzip f84685feb45b073320f1e07c3f5afe43538327e5af8f7fc2b9d3c8ae18dcc172 1842 bytes 1 parts""",
-        """export 2 20261120T170000Z-sqlvm01-0002 part 1 083e8c2b65de0743e50475f3419e450db97eb3b79ac55713ca9c9b8ab7732338""",
-        """export 3 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T170952Z-sqlvm01-0003","parts":2,"sha256":"70e3be0649bfda478d3bb83325e0a6d418768b8555ee285ebcae049a23a7eb25"}],"status":"Pass","message":"1 evidence document, 2 parts, for session 5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21."}""",
-        """export 3 20261120T170952Z-sqlvm01-0003 json 0bbebad725b5abd861ea0c62aaeff3820e47566d2c0786db7906a344369477c9""",
-        """export 3 20261120T170952Z-sqlvm01-0003 gzip 70e3be0649bfda478d3bb83325e0a6d418768b8555ee285ebcae049a23a7eb25 2629 bytes 2 parts""",
-        """export 3 20261120T170952Z-sqlvm01-0003 part 1 b2e1b0bc55c8856d19a6a55fea63daf3d18df5300231191687f43be5088d4ce1""",
-        """export 3 20261120T170952Z-sqlvm01-0003 part 2 f6e197f07ce88294783663bb208a50815a732fd29223991209b7fc9cf27b0051""",
+        """export 1 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T165000Z-sqlvm01-0001","parts":2,"sha256":"4a3dc977f5bc615d63f0383946ff5e2114214569f2f9724bc32063834c507657"}],"status":"Pass","message":"1 evidence document, 2 parts, for session 5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21."}""",
+        """export 1 20261120T165000Z-sqlvm01-0001 json b23358a2783b4f38e16af911c060d395e381d86cef14e4f2f67e7658f59015a9""",
+        """export 1 20261120T165000Z-sqlvm01-0001 gzip 4a3dc977f5bc615d63f0383946ff5e2114214569f2f9724bc32063834c507657 3063 bytes 2 parts""",
+        """export 1 20261120T165000Z-sqlvm01-0001 part 1 6f05118804b95dde42fcd24e28dbb822155e01b3d425c2ebd0abb77c14de5f23""",
+        """export 1 20261120T165000Z-sqlvm01-0001 part 2 452d4c9af2a3323882866e614baebf5d1d1b855071aa5010bd1a011fe5012790""",
+        """export 2 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T170000Z-sqlvm01-0002","parts":1,"sha256":"456d4f1853c12e8c703fe898b75cafc35ca1cf4d1ccade867800a6133f916645"}],"status":"Pass","message":"1 evidence document, 1 parts, for session 5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21."}""",
+        """export 2 20261120T170000Z-sqlvm01-0002 json 167c965bb6ec661bcbbcf058d5717d91c3a03cffe91f0471482c2ba51ad2f8f2""",
+        """export 2 20261120T170000Z-sqlvm01-0002 gzip 456d4f1853c12e8c703fe898b75cafc35ca1cf4d1ccade867800a6133f916645 1848 bytes 1 parts""",
+        """export 2 20261120T170000Z-sqlvm01-0002 part 1 75aab202c9ff7f9a08d9cf78611fa5ea502096f1b1a108ea0a4f45344f5ad009""",
+        """export 3 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T170952Z-sqlvm01-0003","parts":2,"sha256":"29f0280e018ba6f1604a92cfa317d0b7db47350d03b3f266ec62cf6ec0c6b7ae"}],"status":"Pass","message":"1 evidence document, 2 parts, for session 5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21."}""",
+        """export 3 20261120T170952Z-sqlvm01-0003 json 3663b65e6633242a4b02f3751df0a04908e1ff84f78bdc2cd33a5b4665d00e07""",
+        """export 3 20261120T170952Z-sqlvm01-0003 gzip 29f0280e018ba6f1604a92cfa317d0b7db47350d03b3f266ec62cf6ec0c6b7ae 2636 bytes 2 parts""",
+        """export 3 20261120T170952Z-sqlvm01-0003 part 1 2486268a1cf30c4ed2ac885ada7d6a1a100d89d57cab9b908f235622a92cad6b""",
+        """export 3 20261120T170952Z-sqlvm01-0003 part 2 60754336f67da3c93478a94dc343020100bc4973af58d7e696096dd10d6b0641""",
     ];
 
     private static readonly string[] SessionlessPin =
     [
-        """export 1 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T165000Z-sqlvm01-0001","parts":2,"sha256":"7d67e8307a0224f2ad8221aeda0e42a6533e7f2bf543fc797ef6941df1543656"}],"status":"Pass","message":"1 evidence document, 2 parts, for no control session."}""",
-        """export 1 20261120T165000Z-sqlvm01-0001 json c1265761986275204b1b8aeb9150b3cd5de0b4eb93baa6b4468a979868b1bda1""",
-        """export 1 20261120T165000Z-sqlvm01-0001 gzip 7d67e8307a0224f2ad8221aeda0e42a6533e7f2bf543fc797ef6941df1543656 3041 bytes 2 parts""",
-        """export 1 20261120T165000Z-sqlvm01-0001 part 1 d2ec7519ed14b6a64706113da7b2cc4379a698f050ec5586610d975655d3d158""",
-        """export 1 20261120T165000Z-sqlvm01-0001 part 2 e102d7d41fef2bcccc12f6daafe5ac03a268f8430e73ea5f74f422f3e7ce1d10""",
-        """export 2 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T170000Z-sqlvm01-0002","parts":1,"sha256":"a330406e9aa7a3a1685e76da8fd18264a2fe897f1e998f06beb6c4062e0f6417"}],"status":"Pass","message":"1 evidence document, 1 parts, for no control session."}""",
-        """export 2 20261120T170000Z-sqlvm01-0002 json 0f676ccf71ec66ab565d4a64e4e1ac132af284ef81fb321a6b7a2a2d2aa8baa9""",
-        """export 2 20261120T170000Z-sqlvm01-0002 gzip a330406e9aa7a3a1685e76da8fd18264a2fe897f1e998f06beb6c4062e0f6417 1820 bytes 1 parts""",
-        """export 2 20261120T170000Z-sqlvm01-0002 part 1 b68830de3183782cff89c8d98058bd8c3b5620b9ce79ae37eec860940ebdef66""",
-        """export 3 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T170952Z-sqlvm01-0003","parts":2,"sha256":"5f562e7c00bd320f0f667bd0ee088f08cf41088ad5e4deb9751c92e060535590"}],"status":"Pass","message":"1 evidence document, 2 parts, for no control session."}""",
-        """export 3 20261120T170952Z-sqlvm01-0003 json 6943f72b33e739f0e3f5ee8058ef206e3584d408741fe7bf8a22ae6a34f913bb""",
-        """export 3 20261120T170952Z-sqlvm01-0003 gzip 5f562e7c00bd320f0f667bd0ee088f08cf41088ad5e4deb9751c92e060535590 2607 bytes 2 parts""",
-        """export 3 20261120T170952Z-sqlvm01-0003 part 1 5d5cb6f0eec3f2634d9ba0bff7f58d4b6be2d9c2f12e00d8a7a64f598fae3699""",
-        """export 3 20261120T170952Z-sqlvm01-0003 part 2 d8329e30b3de529bb1f3889c12404a271f24cb1f9a0961c59bdc65c036decb28""",
+        """export 1 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T165000Z-sqlvm01-0001","parts":2,"sha256":"9d7f7c4e5628f83efc54473bf8fe3e9bd608eb81897c480e3dfedf7afc12818c"}],"status":"Pass","message":"1 evidence document, 2 parts, for no control session."}""",
+        """export 1 20261120T165000Z-sqlvm01-0001 json 78f5eedbd7cbe8dac31bcd571b975df20fb62e22b64bce22eac9037028734f74""",
+        """export 1 20261120T165000Z-sqlvm01-0001 gzip 9d7f7c4e5628f83efc54473bf8fe3e9bd608eb81897c480e3dfedf7afc12818c 3042 bytes 2 parts""",
+        """export 1 20261120T165000Z-sqlvm01-0001 part 1 976b016eb7017a9a1f05939ec273f4d2a15b228448cafd6f7f3c934f780f833f""",
+        """export 1 20261120T165000Z-sqlvm01-0001 part 2 f9b739c4d9335ef588d64efc5f44a70b25b5191789a101320742fa974e150e34""",
+        """export 2 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T170000Z-sqlvm01-0002","parts":1,"sha256":"9c462c6dc7802f14b75885eee281301850c86cda8b5d2c250b685a33cbf1bfd8"}],"status":"Pass","message":"1 evidence document, 1 parts, for no control session."}""",
+        """export 2 20261120T170000Z-sqlvm01-0002 json c31069a7aea0c1e1084c63e68c394ab29c6b9d699bbeda48a4402f22a4b839d7""",
+        """export 2 20261120T170000Z-sqlvm01-0002 gzip 9c462c6dc7802f14b75885eee281301850c86cda8b5d2c250b685a33cbf1bfd8 1826 bytes 1 parts""",
+        """export 2 20261120T170000Z-sqlvm01-0002 part 1 7b3e5038057392643fe316ecfb7546ce06490871566f2dd073142aafbc3630ac""",
+        """export 3 DBHUBDEMO-RCA-INDEX {"kind":"ContosoCare.RcaExportIndex","version":1,"documents":[{"documentId":"20261120T170952Z-sqlvm01-0003","parts":2,"sha256":"a812e1e984bd493509b2b43bc856856cf732cdb910a8c366eb630041b59a9ccb"}],"status":"Pass","message":"1 evidence document, 2 parts, for no control session."}""",
+        """export 3 20261120T170952Z-sqlvm01-0003 json cecf76cc8655aa788f43e628c61dca6702fe9785ae51521b83e139e442191e86""",
+        """export 3 20261120T170952Z-sqlvm01-0003 gzip a812e1e984bd493509b2b43bc856856cf732cdb910a8c366eb630041b59a9ccb 2613 bytes 2 parts""",
+        """export 3 20261120T170952Z-sqlvm01-0003 part 1 6b09370a47f43217edd0ee830917b862c4e03ea2885a93aa640fdcc5e09965f5""",
+        """export 3 20261120T170952Z-sqlvm01-0003 part 2 59b74594c187329fc4674fd4cf0247bef1f9b42b2301c0a331212ee975df76cd""",
     ];
 
     private readonly string root = Path.Combine(Path.GetTempPath(), "rca-pin-" + Guid.NewGuid().ToString("N"));

@@ -27,7 +27,7 @@
     "0x0F1E2D3C4B5A6978",
     "0x7E9C1A3B5D7F9102",
     "0x44E2A90B17C3D5F6",
-    "[demo].[usp_visit_summary_lookup]",
+    "[frontdesk].[usp_visit_summary]",
     "SELECT @visits = COUNT(*), @minutes = SUM(a.duration_minutes) FROM care.appointments AS a WHERE a.patient_id BETWEEN @first_patient AND @last_patient AND a.status <> ?",
     "SELECT TOP (?) p.patient_id, p.last_name, p.first_name FROM care.patients AS p WHERE p.facility_id = @facility_id ORDER BY p.last_name, p.first_name",
     "SELECT r.session_id, r.status, r.wait_type, r.wait_time, r.cpu_time FROM sys.dm_exec_requests AS r WHERE r.session_id <> @@SPID",

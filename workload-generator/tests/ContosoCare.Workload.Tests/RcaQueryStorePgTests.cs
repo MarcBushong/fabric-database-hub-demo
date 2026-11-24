@@ -2089,6 +2089,13 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             PendingSites,
             new SortedSet<string>(opens.Where(o => ClassifyOpen(o) == "pending").Select(o => o.File + " " + o.Member).Concat(sites.Where(s => Classify(s, opens, databaseMarked) == "pending").Select(s => s.File + " " + s.Member)), StringComparer.Ordinal));
         Assert.True(databaseMarked, "A PgDemoDatabase is built on a connection that doesn't open with the observer's marker.");
+
+        // The step functions' checks (ADR 0031, decision 6), as Classify takes them: CallableSql goes only through
+        // FunctionCallableAsync, on a run's control connection, and ExistsSql only through FunctionExistsAsync, in setup's check.
+        Assert.Equal(["Postgres/PgScripts.cs FunctionCallableAsync"], References(root, "CallableSql"));
+        Assert.Equal(["Postgres/PgScenarioRunner.cs RunAsync control"], ScriptCallers(root, "FunctionCallableAsync"));
+        Assert.Equal(["Postgres/PgScripts.cs FunctionExistsAsync"], References(root, "ExistsSql"));
+        Assert.Equal(["Postgres/PgScripts.cs VerifyScenarioFunctionsAsync connection"], ScriptCallers(root, "FunctionExistsAsync"));
         Assert.All(sites.Where(s => s.File is "Postgres/PgDemoDatabase.cs" or "Rca/Observer/PgCapture.cs" || s.Member is "ReadPgAsync" or "WarmupT4Async"), s => Assert.Equal("marked", Classify(s, opens, databaseMarked)));
     }
 
@@ -2147,9 +2154,9 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         "Cli/CommandLine.Postgres.cs SetupT4Async",
         "Postgres/PgScripts.cs ApplyAsync",
         "Postgres/PgScripts.cs EnsureEntraRoleAsync",
+        "Postgres/PgScripts.cs ExistsSql",
         "Postgres/PgScripts.cs GrantRunnerAsync",
         "Postgres/PgScripts.cs RoleExistsAsync",
-        "Postgres/PgScripts.cs VerifyScenarioFunctionsAsync",
     };
 
     /// <summary>A PostgreSQL text in the runner's code: where it is, and whether it's a literal (else the expression a command text is set from).</summary>
@@ -2402,6 +2409,14 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             return "marked";
         }
 
+        // A run's check that it can call its step function (ADR 0031, decision 6) goes only through FunctionCallableAsync,
+        // which only PgScenarioRunner's RunAsync calls, on its control connection (the test checks both): marked when
+        // RunAsync's connections are. Setup's check that each step exists, ExistsSql, is pending with the rest of setup.
+        if (site.File == "Postgres/PgScripts.cs" && site.Member == "CallableSql")
+        {
+            return Opens("Postgres/PgScenarioRunner.cs", "RunAsync") is { Count: > 0 } run && run.All(o => ClassifyOpen(o) == "marked") ? "marked" : null;
+        }
+
         if (site.Literal)
         {
             var statements = site.Text.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
@@ -2418,6 +2433,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         else if ((site.File, site.Member, site.Text) switch
                  {
                      ("Postgres/PgScenarioRunner.cs", "QueryRowAsync", "sql") => "helper",
+                     ("Postgres/PgScripts.cs", "FunctionCheckAsync", "sql") => "helper",
                      ("Postgres/PgConnection.cs", "ApplyLimitsAsync", "LimitsCommand(limits)") => "workload",
                      _ => null,
                  } is { } known)
@@ -2691,6 +2707,48 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     /// <summary>The PgScripts members PgDemoDatabase calls on its own connection: the reseed's seed.</summary>
     private static HashSet<string> DemoDatabaseScripts(string root) =>
         new(ScriptCall().Matches(CodeOnly(File.ReadAllText(Path.Combine(root, "Postgres", "PgDemoDatabase.cs")))).Select(m => m.Groups["member"].Value), StringComparer.Ordinal);
+
+    /// <summary>Each member of the runner's code that names <paramref name="name"/>, but its own declaration, as "file member".</summary>
+    private static List<string> References(string root, string name)
+    {
+        var reference = new Regex($@"\b{Regex.Escape(name)}\b", RegexOptions.CultureInvariant);
+        var found = new SortedSet<string>(StringComparer.Ordinal);
+        foreach (var (file, source) in RunnerSources(root))
+        {
+            var members = SourceMembers(source);
+            foreach (Match match in reference.Matches(CodeOnly(source)))
+            {
+                var member = Member(members, match.Index, source).Name;
+                if (member != name)
+                {
+                    found.Add($"{file} {member}");
+                }
+            }
+        }
+
+        return [.. found];
+    }
+
+    /// <summary>Each call of PgScripts' <paramref name="method"/> in the runner's code, as "file member connection": the member it's in, and its first argument.</summary>
+    private static List<string> ScriptCallers(string root, string method)
+    {
+        var call = new Regex($@"\b(?:PgScripts\.)?{Regex.Escape(method)}\s*\(\s*(?<connection>\w+)\s*,", RegexOptions.CultureInvariant);
+        var found = new List<string>();
+        foreach (var (file, source) in RunnerSources(root))
+        {
+            var members = SourceMembers(source);
+            foreach (Match match in call.Matches(CodeOnly(source)))
+            {
+                var member = Member(members, match.Index, source).Name;
+                if (member != method)
+                {
+                    found.Add($"{file} {member} {match.Groups["connection"].Value}");
+                }
+            }
+        }
+
+        return [.. found.Order(StringComparer.Ordinal)];
+    }
 
     /// <summary>
     /// The statements a PL/pgSQL or SQL function's body runs through the executor, which Query Store records: each SQL
@@ -3014,8 +3072,19 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [GeneratedRegex(@"^\s*//.*$", RegexOptions.Multiline)]
     private static partial Regex CommentLine();
 
-    [GeneratedRegex(@"\bdemo\.[a-z_][a-z0-9_]*\s*\(")]
-    private static partial Regex DemoCall();
+    /// <summary>
+    /// The workload database's function schemas: demo, the harness's, and the application schemas the workload's functions
+    /// moved to with the realistic names (ADR 0031, decision 6), as setup creates them.
+    /// </summary>
+    private static readonly string FunctionSchemas = string.Join('|', new[] { "demo" }.Concat(Postgres.PgScripts.ApplicationSchemas).Select(Regex.Escape));
+
+    private static readonly Regex DemoCallPattern = new($@"\b(?:{FunctionSchemas})\.[a-z_][a-z0-9_]*\s*\(", RegexOptions.CultureInvariant);
+
+    private static readonly Regex FunctionCallPattern = new($@"\b(?<name>(?:{FunctionSchemas}|care)\.[a-z_]\w*)\s*\(", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    private static readonly Regex TouchesTheDemoPattern = new($@"\b(?:from|join|into|update|delete|truncate)\b|\b(?:{FunctionSchemas}|care)\.", RegexOptions.CultureInvariant);
+
+    private static Regex DemoCall() => DemoCallPattern;
 
     [GeneratedRegex(@"\b(?:FROM|JOIN)\s+(?<target>[^\s,]+)")]
     private static partial Regex FromTargets();
@@ -3036,8 +3105,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     private static partial Regex Subquery();
 
     /// <summary>A call of a function in the demo's schemas, by its schema-qualified name.</summary>
-    [GeneratedRegex(@"\b(?<name>(?:demo|care)\.[a-z_]\w*)\s*\(", RegexOptions.IgnoreCase)]
-    private static partial Regex FunctionCall();
+    private static Regex FunctionCall() => FunctionCallPattern;
 
     [GeneratedRegex(@"\bPgScripts\.(?<member>\w+)\s*\(\s*connection\b")]
     private static partial Regex ScriptCall();
@@ -3071,8 +3139,7 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     private static partial Regex PunctuationSpace();
 
     /// <summary>A shape that reads or writes a table, or calls a function of the demo's schemas.</summary>
-    [GeneratedRegex(@"\b(?:from|join|into|update|delete|truncate)\b|\b(?:demo|care)\.")]
-    private static partial Regex TouchesTheDemo();
+    private static Regex TouchesTheDemo() => TouchesTheDemoPattern;
 
     private QueryWatermark Watermark() => new(root, "T4");
 

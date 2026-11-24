@@ -58,7 +58,7 @@ The sidecars name no scenario: their statements are the procedures' own, normali
 
 **T3 (t3-plan-regression):**
 
-- Query 412 is `[demo].[usp_visit_summary_lookup]`'s count of a patient range's appointments.
+- Query 412 is `[frontdesk].[usp_visit_summary]`'s count of a patient range's appointments.
   - **Plan 31:** an Index Seek on `ix_appointments_patient` with a Key Lookup, estimated cost 0.0331. It ran 1,180 to 1,204 times per 15-minute interval from 16:15 to 17:00, at 2.1 ms of CPU each.
   - **Plan 58:** a parallel Clustered Index Scan of `pk_appointments` at DOP 4, estimated cost 38.6, compiled at 17:03:11; its first execution ended at 17:03:12.6. It ran 524 times, to 17:09:40.2, at 176 ms of CPU each (92,224 ms), with 4,100 logical reads each and 31,440 ms of waits: CPU 18,900, Parallelism 11,620, and Buffer IO 920.
 - **The 17:00 interval is mixed:** plan 31 also ran 668 times in it (1,403 ms). Plan 58 used 96 % of the captured top queries' CPU in that interval (92,224 of 95,644 ms).

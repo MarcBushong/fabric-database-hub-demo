@@ -12,7 +12,7 @@ describe("the sidecar documents (the contract's fixtures)", () => {
         const s = fixtureSidecar("t3");
         expect(s.stats).toHaveLength(12);
         const plan58 = s.stats.find((r) => r.queryId === "412" && r.planId === "58")!;
-        expect(plan58).toMatchObject({ target: "T3", module: "[demo].[usp_visit_summary_lookup]", executions: 524, cpuMs: 92_224, logicalReads: 2_148_400, maxDop: 4, waitMs: 31_440 });
+        expect(plan58).toMatchObject({ target: "T3", module: "[frontdesk].[usp_visit_summary]", executions: 524, cpuMs: 92_224, logicalReads: 2_148_400, maxDop: 4, waitMs: 31_440 });
         expect(plan58.intervalStart).toEqual(at("20T17:00:00"));
         expect(plan58.intervalEnd).toEqual(at("20T17:15:00"));
         expect(plan58.firstExecution).toEqual(at("20T17:03:12.640"));
