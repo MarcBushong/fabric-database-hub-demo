@@ -512,25 +512,32 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
     [InlineData(false, 0)]
     [InlineData(true, 300)]
     [InlineData(false, 300)]
-    public async Task WindowsAnchoredAtT4sStartAreEachTakenOnceAndSettleAcrossARestartThatMovesThem(bool observerEnded, int earlyMs)
+    [InlineData(true, 0, true)]
+    [InlineData(false, 0, true)]
+    public async Task WindowsAnchoredAtT4sStartAreEachTakenOnceAndSettleAcrossARestartThatMovesThem(bool observerEnded, int earlyMs, bool live = false)
     {
         // T4's windows run from its start, not the quarter hours, and a stop and start moves them (the live check L0c,
         // 2026-11-23: a start at 02:40:15.8 UTC gave windows from 02:55:16, 03:10:16, and 03:25:17). Here T4 starts at
-        // 16:40:15.8. It stops at 17:06:50 with its window from 16:55:16 still in memory, which it never shows, and starts
-        // again at 17:07:42.3, its windows running from then. Query Store gives a window's start to the second, so the new
-        // lifetime's first can show a fraction of a second before T4's start (earlyMs: from 17:07:42.0), and it's still the
-        // new lifetime's. A window runs up to a second past its 15 minutes, as the live ones did, and Query Store shows it 4
-        // minutes after it ends. The reads come 2 minutes past the quarter hours, so each comes 6 to 10 minutes after one of
-        // T4's windows ends.
+        // 16:40:15.8. It stops at 17:06:50 with its next window still in memory, which it never shows, and starts again at
+        // 17:07:42.3, its windows running from then. Query Store gives a window's start to the second, so the new lifetime's
+        // first can show a fraction of a second before T4's start (earlyMs: from 17:07:42.0), and it's still the new
+        // lifetime's. Either each window runs on from the one before, up to a second past its 15 minutes, or (live) each
+        // starts on a whole second, runs exactly 15 minutes, and the next starts then or a second later, as the live check
+        // L0a found them (2026-11-24: 11:41:10, 11:56:10, then 12:11:11): the second between lies in no window. Query Store
+        // shows a window 4 minutes after it ends. The reads come 2 minutes past the quarter hours, so each comes 6 to 10
+        // minutes after one of T4's windows ends.
         var cancellationToken = TestContext.Current.CancellationToken;
         var started = At(16, 40, 15_800);
         var restarted = At(17, 7, 42_300);
-        var before = AnchoredWindows(started, 0.2, 0);
-        var lost = before[1];
-        List<(DateTimeOffset Start, DateTimeOffset End)> windows = [before[0], .. AnchoredWindows(restarted.AddMilliseconds(-earlyMs), 0.2, 0, 1, 0, 0.2, 0, 1, 0)];
+        List<(DateTimeOffset Start, DateTimeOffset End)> windows = live
+            ? [LiveWindows(started, 1)[0], .. LiveWindows(restarted, 0, 1, 0, 1, 0, 1, 0, 0)]
+            : [AnchoredWindows(started, 0.2)[0], .. AnchoredWindows(restarted.AddMilliseconds(-earlyMs), 0.2, 0, 1, 0, 0.2, 0, 1, 0)];
+
+        // What T4 lost runs from the end of the old lifetime's newest window Query Store shows: 16:55:16, or (live) 16:55:15.
+        var oldEnd = windows[0].End;
         var store = new T4QueryStore([.. windows.SelectMany(WindowStatistics)], [.. windows.SelectMany(WindowWaits)]) { PublishedAfter = TimeSpan.FromMinutes(4), ServerStarted = started };
 
-        // Session A observes from 16:47. At 17:02 the window that ended at 16:55:16 shows, but it hasn't settled. Then A's
+        // Session A observes from 16:47. At 17:02 the window that ended at 16:55 shows, but it hasn't settled. Then A's
         // observer either ends at 17:06:30, before T4 stops, or its process is gone with no read at its end.
         var (first, sessionA, watermark) = Capture(store, SpanA);
         await ReadAtAsync(first, store, At(16, 47));
@@ -558,10 +565,10 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         {
             var row = backfilled.Table(RcaContract.QueryCoverage)[^1];
             Assert.True(row.Get("backfill") is true);
-            Assert.Equal(pendingTo is null ? (DateTimeOffset?)null : lost.Start, (DateTimeOffset?)row.Get("pending_from_utc"));
+            Assert.Equal(pendingTo is null ? (DateTimeOffset?)null : oldEnd, (DateTimeOffset?)row.Get("pending_from_utc"));
             Assert.Equal(pendingTo, (DateTimeOffset?)row.Get("pending_to_utc"));
             Assert.Equal(
-                pendingTo is { } to ? PgQueryStoreRows.PendingGap("T4", lost.Start, to) : $"Lost when T4 stopped: Query Store shows nothing of 2026-11-20 16:55 to 2026-11-20 {lostTo} UTC, which it still held in memory when T4 stopped, and T4 has started again since, so none of it will show.",
+                pendingTo is { } to ? PgQueryStoreRows.PendingGap("T4", oldEnd, to) : $"Lost when T4 stopped: Query Store shows nothing of 2026-11-20 16:55 to 2026-11-20 {lostTo} UTC, which it still held in memory when T4 stopped, and T4 has started again since, so none of it will show.",
                 row.Get("gaps"));
             Assert.Equal(pendingTo is not null, watermark.Read().Pending.Any(p => p.SpanId == SpanA));
         }
@@ -630,6 +637,44 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.Equal((SpanB, At(18, 46, 30_000), (DateTimeOffset?)At(19, 6, 30_000), (DateTimeOffset?)restarted), (own.SpanId, own.FromUtc, own.ToUtc, own.ServerStartedUtc));
         Assert.Equal(windows[^2].End, state.ThroughUtc);
         Assert.Equal(restarted, state.ServerStartedUtc);
+    }
+
+    [Theory]
+    [InlineData(500, false)]
+    [InlineData(3_000, true)]
+    public async Task OnlyWhatAWindowHeldIsCalledLostNeverTheSecondBetweenTwoWindows(int endMs, bool lost)
+    {
+        // T4's windows as the live check L0a found them: on whole seconds, exactly 15 minutes long, and the next at times a
+        // second after the one before ends, so that second lies in no window. T4 starts at 16:40:15.8: its window from
+        // 16:40:15 ends at 16:55:15, and the next starts at 16:55:16. Session A observes from 16:47 and ends either 0.5 s after
+        // 16:55:15, in the second between, or 3 s after, 2 s into the next window. T4 stops at 17:06:50 with that window in
+        // memory, which it never shows, and starts again at 17:07:42.3. Session B's backfill at 17:47, once the range is
+        // decided, splits A's range at the restart: ending in the second between, the range lost nothing; 2 s into the next
+        // window, it lost those, which the coverage says from the end of the window before.
+        var started = At(16, 40, 15_800);
+        var windows = LiveWindows(started, 1);
+        var store = new T4QueryStore([.. windows.SelectMany(WindowStatistics)], [.. windows.SelectMany(WindowWaits)]) { PublishedAfter = TimeSpan.FromMinutes(4), ServerStarted = started };
+        var (first, _, watermark) = Capture(store, SpanA);
+        await ReadAtAsync(first, store, At(16, 47));
+        var end = windows[0].End.AddMilliseconds(endMs);
+        store.Clock = end;
+        await first.EndAsync(end, TestContext.Current.CancellationToken);
+        Assert.Equal(end, Assert.Single(watermark.Read().Pending).ToUtc);
+
+        store.ServerStarted = At(17, 7, 42_300);
+        var spans = new MemorySpans { CurrentSpan = SpanB };
+        var backfilled = spans.Add(SpanA);
+        var second = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
+        await ReadAtAsync(second, store, At(17, 47));
+
+        var coverage = Assert.Single(backfilled.Table(RcaContract.QueryCoverage));
+        Assert.True(coverage.Get("backfill") is true);
+        Assert.Null(coverage.Get("pending_from_utc"));
+        Assert.Equal(
+            lost ? "Lost when T4 stopped: Query Store shows nothing of 2026-11-20 16:55 to 2026-11-20 16:55 UTC, which it still held in memory when T4 stopped, and T4 has started again since, so none of it will show." : null,
+            coverage.Get("gaps"));
+        Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
+        AssertTakenOnce(backfilled, windows);
     }
 
     [Theory]
@@ -3180,6 +3225,26 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
             var end = start + TimeSpan.FromMinutes(15) + TimeSpan.FromSeconds(drift);
             windows.Add((start, end));
             start = end;
+        }
+
+        return windows;
+    }
+
+    /// <summary>
+    /// T4's Query Store windows from a start as the live check L0a found them (2026-11-24): each starts on a whole second and
+    /// runs exactly 15 minutes, and the next starts at its end or the gap given, in seconds, later, so the time between lies
+    /// in no window. The first starts on the second the start falls in, a fraction of a second before it (live: 11:41:10.000
+    /// for a start at 11:41:10.051; other starts' first windows began on the next second).
+    /// </summary>
+    private static List<(DateTimeOffset Start, DateTimeOffset End)> LiveWindows(DateTimeOffset start, params int[] gapSeconds)
+    {
+        var windows = new List<(DateTimeOffset Start, DateTimeOffset End)>();
+        var begin = new DateTimeOffset(start.UtcTicks - (start.UtcTicks % TimeSpan.TicksPerSecond), TimeSpan.Zero);
+        foreach (var gap in gapSeconds)
+        {
+            var end = begin + TimeSpan.FromMinutes(15);
+            windows.Add((begin, end));
+            begin = end + TimeSpan.FromSeconds(gap);
         }
 
         return windows;
