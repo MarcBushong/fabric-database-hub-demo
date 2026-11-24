@@ -40,6 +40,14 @@ sorted AS (
                -- The answer-key recorder's reads from before they carried the marker (rca/README.md, What the capture
                -- leaves out, 1): item 3 matches them by hash. A marked read is in the observer set above.
                WHEN q.object_id = 0 AND t.query_sql_text LIKE N'%scenario[_]run[_]events%' THEN 'recorder'
+               -- The observer's statements from before its marker (rca/README.md, What the capture leaves out, 1): the
+               -- release's runner sent its catalog unmarked, and the first read after an update looks back 2 hours. By names
+               -- only that catalog uses, a cross-check independent of the capture's match.
+               WHEN q.object_id = 0 AND (t.query_sql_text LIKE N'%captured[_]at[_]utc%'
+                                      OR t.query_sql_text LIKE N'%ContosoCare[_]RCA%'
+                                      OR t.query_sql_text LIKE N'%dm[_]xe[_]object[_]columns%'
+                                      OR t.query_sql_text LIKE N'%event[_]xml%system[_]health%'
+                                      OR (t.query_sql_text LIKE N'%dm[_]db[_]resource[_]stats%' AND t.query_sql_text LIKE N'%(minute, -35,%')) THEN 'observer-catalog'
                -- The runner's own ad hoc statements (rca/README.md, What the capture leaves out, 3), by their names:
                -- the probe may know them; the capture matches their normalized texts instead.
                WHEN q.object_id = 0 AND (t.query_sql_text LIKE N'%fn[_]run[_]stop[_]requested%'
@@ -67,6 +75,8 @@ GROUP BY category;
 ```
 
 The probe's own text carries the marker, so it counts itself as `observer`. That's harmless: it ran outside the capture.
+
+The `observer-catalog` set holds the observer's statements as the release's runner sent them, without the marker: RCA-SQL-01, 02, 09, and 12, RCA-AZ-01, and RCA-XE-00 to 05, by the names only those use (fc's T1 kept RCA-XE-00's join form there, 2026-11-23). It's exercised only when the first read's look-back reaches windows where that runner ran: an update within 2 hours of its last session or boot.
 
 ### PostgreSQL: T4
 
@@ -243,7 +253,8 @@ SUMMARIZECOLUMNS(
 12. **One connection to T4 and one to its replica,** before the rehearsal's first session, with the runner's own connection code: each accepts the startup packet's `options` with `NoTypeLoading`, and `current_setting` of `statement_timeout`, `lock_timeout`, and `idle_in_transaction_session_timeout` equals what that code sends (`PgConnection.LimitsOptions`).
     - **`current_setting('search_path')`** ends in `dbhubdemo_rca_observer` on every runner connection that isn't a workload session: the observer's, the answer-key recorder's, and the harness's control connections (a run's control and reset, status, warmup, and stop; A2's e8558a9a and dc485240). It never does on a workload session's.
     - **The stop path** now needs T4 to accept `options` too: a run's stop, with the startup packet's options, reaches T4. Final tests runs it at L0c.
-    - **No `rca.marker-refused`** (A2's 9ac571ed) in the runner's log on sqlvm01 after the rehearsal's sessions. If there is one, T4 refused the marked startup: report which connection, and the S7 sets its statements fell in. The fix is named from what L0c shows.
+    - **Live on fc, 2026-11-23 (before the rehearsal):** T4's primary (the control, observer, and Query Store connections, the last in `azure_sys`) and its read replica (observer and control) accepted all 5 marked connections. On each one, `search_path` ended in `dbhubdemo_rca_observer`, the three limits equaled A2's, and it opened with `NoTypeLoading` on port 5432, straight to the server, not through PgBouncer. So the fallback stays only as a safety net.
+    - **No `rca.marker-refused`** (A2's 9ac571ed) in the runner's log on sqlvm01 after the rehearsal's sessions. If there is one, it's a **Fail**: T4 refused the marked startup it accepted on fc. Report which connection, and the S7 sets its statements fell in.
 
 ## The scripts' transport's live checks (S12)
 
