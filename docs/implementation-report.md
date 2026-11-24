@@ -9775,3 +9775,192 @@ It asked for two fixes, each with a test, and corrected one claim.
 The four acknowledgement cases from before now expect the summary's new words. Mutations, each alone, each failing its tests: the first result latching the session (3 of 3); no settling of a stopped status (2 of 2); a stopped status settled aloud (2 of 2); a start's step standing for a later result (1 of 3); and "for the next start" while the session runs (3 of 3). `Rca.Contract` passed: 79. PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
 
 **What its live check needs.** A session whose T2 host is busy through the start: the live view's `RCA.SIDECAR.ACK` line after the re-check that sends T2's acknowledgement, or the stop's, and the acknowledgement file gone after it.
+
+### Run all's readiness on a cold start: no false Fail for a first sample on its way (2026-11-24)
+
+**Why.** Found live overnight on dbhubfb: a cold-start Run all printed `Fail HUB.TELEMETRY.T2`, "No telemetry from T2 arcsql01 in the last 60 minutes".
+
+- The readiness checks ran 6.5 minutes after the session's own start brought the deallocated VMs up, before T2's nested guest sent its first sample; `validate.ps1` read T2 fresh 16 minutes after the start.
+- Earlier cold starts ran these checks 9 to 11 minutes in, after the replica step, and passed; that night the replica was **Ready** in 4 minutes, not about 9.
+- It isn't a regression (the check and the notebook are unchanged since 66cc5326), but a presenter saw a false **Fail** in the demo's main flow, on its normal daily path. A fix-forward for Wednesday's release, on bdd1da89.
+
+**What changed.** `NB_DatabaseHub_Deployment`, which Run all calls for its readiness, decides these results, so the fix is in both notebooks.
+
+- **The validator's new parameters,** which Run all fills in and which stay empty when a person runs the notebook:
+  - `COLD_START_UTC`: JSON of when the session's own start brought each target up, `"{}"` on a warm start. Empty, outside a session's readiness, keeps today's checks word for word; so does a value it can't read, with a line that says so.
+  - `TELEMETRY_WAIT_UNTIL_UTC`: how long it may wait.
+  - `TELEMETRY_FIRST_SAMPLE_MINUTES`, 15: how long a first sample after a start usually takes, as the repo's 3–15 minutes.
+- **The per-target cell (section 10):**
+  - **The wait:** a target that the session's start brought up less than 15 minutes ago, with no performance sample since that start, is awaited: the coverage query runs again every 30 seconds until the deadline. A failed look ends the wait, and the earlier answer stands.
+  - **The Warning:** still without a sample, it's a **Warning** that names the cold start: how many minutes ago the session started it, that its first sample (T2's nested guest's) usually comes within about 15 minutes, and how long the check waited. Its remediation: nothing to do yet, and when to check again (`NB_DatabaseHub_Deployment`, or `./scripts/validate.ps1 -Area Telemetry -Target T2`).
+  - **A target that reported** gets the usual checks: a sample that arrives in the wait is a **Pass**.
+  - **A session's Fail** also says why it isn't the cold start's delay: the session didn't start that VM, or started it longer than 15 minutes ago.
+- **The same rule for T1 and T3,** which a cold start can trip too: T1 from `sqlvm01`'s start; T3 from its activity's dispatch, which resumes it, when the session started `sqlvm01`, which runs that activity. A sample from before the start doesn't count, so a cold-started VM's stale sample is the cold start's **Warning** too, within its 15 minutes.
+- **The control notebook's readiness (cell 10)** reads the cold start from the session's status:
+  - its **Start** steps, `<vm> is starting.` (the runbook's `vm-start` progress: one for each VM that its start brought up), with `names.sqlVm`, `names.hostVm`, and `dispatchUtc.T3`;
+  - it passes `COLD_START_UTC` on every session's readiness, and on a cold start `TELEMETRY_WAIT_UNTIL_UTC`, 2 minutes after its call (`READINESS_TELEMETRY_WAIT_SECONDS`), within the validator's 5 minutes, which its other checks and its save share;
+  - a warm start passes `"{}"` and no deadline, so nothing waits, and a target without telemetry stays a **Fail**. A status it can't read is a warm start.
+- **Where it shows:** the reference run's lines, and `validation_results`, which the Insights app's **Readiness** page shows as written, so both show the same **Warning**. The control notebook prints no readiness result itself, and no other page shows them.
+- **Docs:** the validator's section 10 and troubleshooting, `fabric/control/README.md` (Readiness), and a row in `docs/troubleshooting.md` (Database Hub and telemetry).
+
+**Changed files.**
+
+- `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`: cells 2, 7, 16, 17, and 25.
+- `fabric/control/NB_DatabaseHub_Control.ipynb`: cell 10.
+- `fabric/control/README.md`, `docs/troubleshooting.md`, `tests/unit/Fabric.ControlNotebook.Tests.ps1`, and this report.
+
+**Validation.** All at below-normal priority.
+
+- **`Fabric.ControlNotebook`:** 100 passed, none failed or skipped.
+  - The readiness case now pins the two new arguments: a warm start's are `"{}"` and empty.
+  - The 3 new cases share one run:
+    - Run all's arguments on a cold start (a `coldstart` simulation, whose runbook's start brings `sqlvm01` and T2's host up, and starts T4, which isn't a VM);
+    - the validator's own parameters, helpers, and per-target cells, against a clock and a telemetry endpoint: a cold start's Warning, or a Pass when the sample comes within the wait, T1's stale sample, a failed look, and what Run all passed;
+    - a warm start's Fail, one started 21 minutes before, a run by hand, and a value it can't read.
+- **Without the change, each fails:**
+  - with the validator from bdd1da89, the cold-start case and the warm-start case;
+  - with the control notebook from bdd1da89, 4 of 7 of the readiness cases.
+- **Mutations, each alone, each failing a case:**
+  - in the validator: no wait; every start warm; no 15-minute window; a sample from before the start counting; a failed look wiping the answer; a wait past its deadline, or one sleeping past it; and no note on a warm Fail;
+  - in the control notebook: no cold start passed; no deadline; no T3; and no T2 host.
+- **Other suites:**
+  - `Fabric.Notebooks`: 128 passed and 2 failed, the same 2 as at bdd1da89 (the cleanup's table count, and the activity notebook's RCA tables): the contract's sidecar tables, which these notebooks don't have yet on this branch; untouched here.
+  - `Repo.Conventions`: 123 passed. `DbHubDemo.Fabric`: 42 passed. `DbHubDemo.HubReadiness`: 18 passed.
+  - PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
+
+**Risks.**
+
+- **The wait** adds at most 2 minutes to Run all, and only on a cold start with a target that hasn't reported; the validator's earlier cells count toward them.
+- **The cold start comes from the Start steps' words.** If they change, every start reads as warm, and a missing target is a **Fail**, as before.
+- **T3 on a warm start,** auto-paused and resumed by the session's activity, keeps today's **Fail** while its first sample is on its way: the brief keeps a warm start's Fail.
+- **`fabric/notebooks/published-versions.json`** is on the integration only. The validator changed, so the integration runs the versions' writer again after the merge (`DBHUB_WRITE_NOTEBOOK_VERSIONS=1`, `Fabric.Notebooks`), so updating notebooks nobody edited keeps working.
+
+**What its live check needs.**
+
+- A cold start whose readiness comes before T2's first sample: the **Warning** in the reference run and on the Readiness page, or a **Pass** after the wait.
+- A warm start with T2's guest off: still a **Fail**.
+- How long Run all's readiness takes on a cold start.
+
+### Readiness on a cold start: the review's fixes (40ff59bb, 2026-11-24)
+
+**Why.** The review of bdd1da89..40ff59bb, **SHIP WITH FIXES**:
+
+- **High: a real failure could hide on the daily cold start.** Readiness runs 6.5 to 11 minutes after the start, plus at most 2 minutes of wait, so it always lands inside the 15-minute window. A T2 with broken monitoring was then a **Warning** saying "Nothing to do yet", and nothing in Run all checked it again.
+- **Medium: the warm note claimed a fact it only inferred.** "It was already running" printed whenever there was no Start step, which a refused start, a missing VM, a skipped T3, other wording, or an unreadable status also give; T3 resumes from auto-pause on a VM that already ran too.
+- **Low: a look could overrun.** `_post_kql`'s 180-second timeout let a look started near the deadline pass `notebook.run`'s 300 seconds, and then no readiness row is saved.
+- **The test runner:** `Fabric.ControlNotebook` found Python only on PATH, so with `DBHUB_TEST_PYTHON` alone it skipped most of its cases silently.
+
+**What changed.**
+
+- **The Warning says the result can't be known yet:** "No telemetry from T2 arcsql01 since this session's cold start yet, so whether it reports can't be known yet: ...". Its remediation says when Run all checks it again, and what to run if Run all doesn't get there; "Nothing to do" is gone.
+- **Run all checks it again in the same session.**
+  - The validator answers Run all at the end of its summary (`notebookutils.notebook.exit`, only in a reference run with `COLD_START_UTC`, as the activity notebook's `RCA.EVIDENCE` does): each target's telemetry result, and `recheckUtc`, when each target it gave that **Warning** reaches 15 minutes after its start. A run by hand goes on to its end, as before.
+  - The control notebook's readiness line says which targets aren't known yet, and when Run all checks them again.
+  - The live view (cell 12) runs the validator again once that time has passed, with the same parameters and no wait, and prints "Readiness again, ...", with each such target's **Pass** or **Fail**. That run saves its results to `validation_results` like the first, so the Readiness page's latest run is the final one, and a target that never reports is a **Fail** in the same session.
+  - It runs once. A live view that ends first (`WAIT_FOR_END` off), a validator that fails that time, or an answer of another kind is said plainly: a **Warning** with the fix, or nothing to check again.
+  - It reads the session's status right before: a session that the app or its auto-stop ended first gets no check again, since its targets' result can't be known then, and a line says so. A status it can't read doesn't stop it, so no failure hides behind a vault that didn't answer.
+- **The edition's Warning stays:** a cold-started target has reported once it has sent any telemetry since its start, so a T1 that sends only client connections gets its edition's **Warning**, as before, not the cold start's.
+- **"Already running" only when the status says so.**
+  - Run all passes `WARM_START_TARGETS`: the targets whose activity the session sent (`dispatchUtc`) to a VM with no Start step. Every Start step must read as `<vm> is starting.`, or no target is warm.
+  - The validator's **Fail** says "This session didn't start T2's host VM: it was already running, so this isn't a cold start's delay" only for those. T3's says only that T1's VM was already running.
+  - A refused start, a skipped T3, wording it can't read, or an unreadable status gives no note: today's message, word for word.
+  - The note for a target started longer ago now says it's "past a cold start's usual delay".
+- **Each look ends by the deadline:** `_post_kql` takes a timeout, and each look in the wait gets the seconds left before `TELEMETRY_WAIT_UNTIL_UTC`. None starts in its last 10 seconds, so the wait looks at 30, 60, 90, and 110 seconds and ends by 120.
+- **The test runner:** `Fabric.ControlNotebook` uses `DBHUB_TEST_PYTHON` when it's set, and Python on PATH otherwise.
+
+**Changed files.**
+
+- `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`: cells 2, 7, 16, 17, 23, 24, and 25.
+- `fabric/control/NB_DatabaseHub_Control.ipynb`: cells 0, 6, 10, and 12.
+- `fabric/control/README.md`, `docs/troubleshooting.md`, `tests/unit/Fabric.ControlNotebook.Tests.ps1`, and this report.
+
+**Validation.** All at below-normal priority, with `DBHUB_TEST_PYTHON` set and no working Python on PATH (only the Store's alias).
+
+- **`Fabric.ControlNotebook`:** 103 passed, none failed or skipped. At 40ff59bb the same way: 16 passed and 84 skipped, of 100.
+  - The cold-start Context has 6 cases over 9 simulations and one run of the validator's own cells:
+    - Run all's arguments;
+    - the first look: the **Warning**, not known yet, or a **Pass** within the wait, T1's stale sample, the edition's **Warning**, and a failed look;
+    - the check again: T2 never reports, so a **Warning** at readiness and a **Fail** 15 minutes after the start, from both sides, also when the status can't be read then; and only Run all's reference run answers;
+    - when it can't check again: a live view that ends first, a session the app stopped first, a validator that fails, and an answer of another kind;
+    - the warm note: a warm start, a refused start with a skipped T3, wording it can't read, and `WARM_START_TARGETS` it can't read;
+    - the looks' timeouts, and `_post_kql`'s own.
+  - The warm session's readiness case pins `WARM_START_TARGETS` too.
+- **Without the change, each fails:** with the validator from 40ff59bb, 6 of the 10 readiness cases; with the control notebook from 40ff59bb, 5 of them.
+- **Mutations, each alone: all 35 make a case fail.**
+  - The validator (19): no wait; every start warm; no 15-minute window; a sample from before the start counting; a failed look wiping the answer; a wait past its deadline, or one sleeping past it; no note on a warm Fail; performance tables only; the old Warning; "Nothing to do"; no `recheckUtc`; an answer outside a reference run, or from a run by hand; no timeout cap; `_post_kql` ignoring its timeout; "already running" without a dispatch; T3's note concluding; and any `WARM_START_TARGETS`.
+  - The control notebook (16): no cold start passed; no deadline; no T3; no T2 host; warm without a dispatch; a Start step it can't read counting; no check again; one right away; one that keeps the wait; one for a session that ended; none when the status can't be read; no **Warning** when the live view ends first; a failed check again raising; an answer of any kind; no "Not known yet"; and no result printed.
+- **Other suites:**
+  - `Fabric.Notebooks`: 128 passed and 2 failed, the same 2 as at bdd1da89. It finds Python only on PATH too: with `DBHUB_TEST_PYTHON` alone, 8 cases are skipped.
+  - `Repo.Conventions` 123, `DbHubDemo.Fabric` 42, and `DbHubDemo.HubReadiness` 18 passed.
+  - PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
+
+**Risks.**
+
+- **The check again adds one validator run, about a minute,** inside the live view, only when a target was a **Warning** at readiness; a beat's announcement can come up to a minute late then.
+- **A session stopped before then** keeps the **Warning** on the Readiness page, as its result can't be known; Run all's line says so, and the next session's readiness checks it.
+- **`published-versions.json`:** the validator changed again, so the integration runs the versions' writer after the merge, as before.
+
+**What its live check needs.**
+
+- A cold start whose T2 reports late: the **Warning** at readiness, then "Readiness again" with a **Pass**, and the Readiness page's latest run.
+- One whose T2 doesn't report: a **Fail** in the same session.
+- How long the check again takes in the live view.
+
+### Readiness on a cold start: when Run all decides (the review of d6d69832, 2026-11-24)
+
+**Why.** The re-check of 40ff59bb..d6d69832, **SHIP WITH FIXES**:
+
+- **Medium: the check again could Fail a healthy T2, for good.** It ran 15 minutes after Azure accepted the host's start, the top of the docs' 3–15 minutes, with no margin, and the night's only data point was "nothing at 6.5 minutes, fresh at 16". A first sample at minute 16 would have been the session's final **Fail**: last night's false Fail, only later.
+- **Low: the warm Fail claimed more than it knew.** "So this isn't a cold start's delay": a VM that `./scripts/start-demo.ps1` started minutes before Run all counts as already running.
+- **Low: beats were lost.** A check again holds the live view up to 5 minutes, then the loop still slept a whole refresh, and a beat printed only within two refreshes of its start.
+- **Low: the promises.** Each **Warning** named its own target's time, while Run all checked at the latest one; and when the first answer couldn't be read, the **Warning**'s promise stood, with no check again.
+
+**What changed.**
+
+- **The anchor, and a margin, with the numbers in one place.** The control notebook's `FIRST_SAMPLE_MINUTES = {"grace": 20, "limit": 30}`: minutes after each cold-started target's anchor, the later of its VM's start and its activity's dispatch (`dispatchUtc`; T2's goes out once its host runs), T1 and T3 with their own.
+  - The live view checks a target that hadn't reported again at the latest anchor's grace, and at its limit, which decides: a **Pass** as soon as it has reported, and a **Fail** only at the limit, so a late but healthy T2 ends as a **Pass**.
+  - In a session whose live view ends sooner, as a 30-minute one's does, the check at its end decides, but never before the grace; when the live view ends before the grace, there's no check again, and a **Warning** says so, with when to check by hand.
+  - The validator has no minutes of its own any more: Run all passes the times it uses, `TELEMETRY_RECHECK_UTC` (its checks again, the last deciding) and `TELEMETRY_DECIDE_UTC` (from when a target without telemetry is a **Fail**). They replace `TELEMETRY_FIRST_SAMPLE_MINUTES`; times it can't read give the usual checks.
+  - The live view wakes at each time, to the second, and past its end goes on only for a time that came due during a check again, so the one that decides runs even when the check before it ends past the live view's end.
+- **Each Warning names Run all's times:** "its first sample is due by 10:34 UTC", and "Run all in NB_DatabaseHub_Control checks it again at 10:24 UTC, and at 10:34 UTC if it hasn't reported by then, which decides". At the first check again, it names the one left. Run all's readiness line names the same times, and the validator's answer lists the targets still not known (`pending`), replacing its own times.
+- **No promise without a check again:** when the validator's first answer can't be read, "Warning: no check again is scheduled", with the fix; a later answer that can't be read says no further check is scheduled. A check again whose validator fails says so, and when the next one is, or the fix.
+- **The warm Fail says what it knows:** "This session didn't start T2's host VM: it was already running.", the same for T1; T3's was already so. A cold-started target's **Fail** says "its first sample was due by" the time that decided.
+- **Beats:** after the live view's first pass, every beat that began since the pass before is announced, however long a check again held it up, and there's no sleep after a check again, so the next pass comes at once.
+
+**Changed files.**
+
+- `fabric/control/NB_DatabaseHub_Control.ipynb`: cells 0, 6, 10, and 12.
+- `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`: cells 2, 7, 16, 17, 23, 24, and 25.
+- `fabric/control/README.md`, `docs/troubleshooting.md`, `tests/unit/Fabric.ControlNotebook.Tests.ps1`, and this report.
+
+**Validation.** All at below-normal priority, with `DBHUB_TEST_PYTHON` set and no working Python on PATH.
+
+- **`Fabric.ControlNotebook`:** 106 passed, none failed or skipped.
+  - The cold-start Context has 9 cases over 14 simulations and one run of the validator's own cells. The simulator's validator answers as of its start, as the real one decides in its per-target cell, and its output carries the simulated time of each line about a beat or readiness.
+  - New in it:
+    - Run all's times: T2's from its dispatch (14:30 and 14:40 for a session from 14:00); T1's own, when only T1 is cold (14:24 and 14:34); a 30-minute session's one, at 14:30; none for a live view that ends at 14:06.
+    - Each **Warning** names those times, for two targets alike, and Run all checks at them, to the second.
+    - A **Pass** at the first check, a late but healthy T2's **Pass** at the second, and a silent T2's **Fail** only there.
+    - A 33-minute session whose first check runs past its end: the one that decides still runs.
+    - An unreadable first answer's **Warning**, and the warm **Fail**'s note with no conclusion.
+    - The beats that began during a 290-second check again, announced the second it ends.
+- **Without the change, each fails:** with the validator from d6d69832, 4 of the 13 readiness cases; with the control notebook from d6d69832, 7.
+- **Mutations, each alone: all 46 make a case fail.**
+  - In the validator (20), among them: a target pending past the decide time, the warm clause back, each **Warning** naming its own time, the answer listing nothing pending, and the decide time missing from the **Fail**.
+  - In the control notebook (26), among them: the anchor without the dispatch, the times from the earliest anchor, no cap at the live view's end, none for a live view that ends too soon, no line for an unreadable answer, a sleep after a check again, only recent beats after one, no pass at a check again's time, and a stop while one is due. The live view's loop also has a one-second floor on its nap, so it can't spin in place.
+- **Other suites:**
+  - `Fabric.Notebooks`: 128 passed, and the same 2 failures as at bdd1da89.
+  - `Repo.Conventions` 123, `DbHubDemo.Fabric` 42, and `DbHubDemo.HubReadiness` 18 passed.
+  - PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
+
+**Risks.**
+
+- **The checks again:** at most two more validator runs, about a minute each, held in the live view; one when the first check finds the target.
+- **The anchor comes from `dispatchUtc`:** a target whose activity wasn't sent keeps its VM's start.
+- **`published-versions.json`:** the validator changed again, so the integration runs the versions' writer after the merge.
+
+**What its live check needs.**
+
+- T2's real first-sample minutes after its dispatch, against `FIRST_SAMPLE_MINUTES` (20 and 30).
+- A late T2 ending as a **Pass** at a check again, and a silent one as a **Fail** at the last.
+- The beats around a check again, in the live view.
