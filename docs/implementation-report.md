@@ -6023,3 +6023,68 @@ The four acknowledgement cases from before now expect the summary's new words. M
 - A cold start whose readiness comes before T2's first sample: the **Warning** in the reference run and on the Readiness page, or a **Pass** after the wait.
 - A warm start with T2's guest off: still a **Fail**.
 - How long Run all's readiness takes on a cold start.
+
+### Readiness on a cold start: the review's fixes (40ff59bb, 2026-11-24)
+
+**Why.** The review of bdd1da89..40ff59bb, **SHIP WITH FIXES**:
+
+- **High: a real failure could hide on the daily cold start.** Readiness runs 6.5 to 11 minutes after the start, plus at most 2 minutes of wait, so it always lands inside the 15-minute window. A T2 with broken monitoring was then a **Warning** saying "Nothing to do yet", and nothing in Run all checked it again.
+- **Medium: the warm note claimed a fact it only inferred.** "It was already running" printed whenever there was no Start step, which a refused start, a missing VM, a skipped T3, other wording, or an unreadable status also give; T3 resumes from auto-pause on a VM that already ran too.
+- **Low: a look could overrun.** `_post_kql`'s 180-second timeout let a look started near the deadline pass `notebook.run`'s 300 seconds, and then no readiness row is saved.
+- **The test runner:** `Fabric.ControlNotebook` found Python only on PATH, so with `DBHUB_TEST_PYTHON` alone it skipped most of its cases silently.
+
+**What changed.**
+
+- **The Warning says the result can't be known yet:** "No telemetry from T2 arcsql01 since this session's cold start yet, so whether it reports can't be known yet: ...". Its remediation says when Run all checks it again, and what to run if Run all doesn't get there; "Nothing to do" is gone.
+- **Run all checks it again in the same session.**
+  - The validator answers Run all at the end of its summary (`notebookutils.notebook.exit`, only in a reference run with `COLD_START_UTC`, as the activity notebook's `RCA.EVIDENCE` does): each target's telemetry result, and `recheckUtc`, when each target it gave that **Warning** reaches 15 minutes after its start. A run by hand goes on to its end, as before.
+  - The control notebook's readiness line says which targets aren't known yet, and when Run all checks them again.
+  - The live view (cell 12) runs the validator again once that time has passed, with the same parameters and no wait, and prints "Readiness again, ...", with each such target's **Pass** or **Fail**. That run saves its results to `validation_results` like the first, so the Readiness page's latest run is the final one, and a target that never reports is a **Fail** in the same session.
+  - It runs once. A live view that ends first (`WAIT_FOR_END` off), a validator that fails that time, or an answer of another kind is said plainly: a **Warning** with the fix, or nothing to check again.
+  - It reads the session's status right before: a session that the app or its auto-stop ended first gets no check again, since its targets' result can't be known then, and a line says so. A status it can't read doesn't stop it, so no failure hides behind a vault that didn't answer.
+- **The edition's Warning stays:** a cold-started target has reported once it has sent any telemetry since its start, so a T1 that sends only client connections gets its edition's **Warning**, as before, not the cold start's.
+- **"Already running" only when the status says so.**
+  - Run all passes `WARM_START_TARGETS`: the targets whose activity the session sent (`dispatchUtc`) to a VM with no Start step. Every Start step must read as `<vm> is starting.`, or no target is warm.
+  - The validator's **Fail** says "This session didn't start T2's host VM: it was already running, so this isn't a cold start's delay" only for those. T3's says only that T1's VM was already running.
+  - A refused start, a skipped T3, wording it can't read, or an unreadable status gives no note: today's message, word for word.
+  - The note for a target started longer ago now says it's "past a cold start's usual delay".
+- **Each look ends by the deadline:** `_post_kql` takes a timeout, and each look in the wait gets the seconds left before `TELEMETRY_WAIT_UNTIL_UTC`. None starts in its last 10 seconds, so the wait looks at 30, 60, 90, and 110 seconds and ends by 120.
+- **The test runner:** `Fabric.ControlNotebook` uses `DBHUB_TEST_PYTHON` when it's set, and Python on PATH otherwise.
+
+**Changed files.**
+
+- `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`: cells 2, 7, 16, 17, 23, 24, and 25.
+- `fabric/control/NB_DatabaseHub_Control.ipynb`: cells 0, 6, 10, and 12.
+- `fabric/control/README.md`, `docs/troubleshooting.md`, `tests/unit/Fabric.ControlNotebook.Tests.ps1`, and this report.
+
+**Validation.** All at below-normal priority, with `DBHUB_TEST_PYTHON` set and no working Python on PATH (only the Store's alias).
+
+- **`Fabric.ControlNotebook`:** 103 passed, none failed or skipped. At 40ff59bb the same way: 16 passed and 84 skipped, of 100.
+  - The cold-start Context has 6 cases over 9 simulations and one run of the validator's own cells:
+    - Run all's arguments;
+    - the first look: the **Warning**, not known yet, or a **Pass** within the wait, T1's stale sample, the edition's **Warning**, and a failed look;
+    - the check again: T2 never reports, so a **Warning** at readiness and a **Fail** 15 minutes after the start, from both sides, also when the status can't be read then; and only Run all's reference run answers;
+    - when it can't check again: a live view that ends first, a session the app stopped first, a validator that fails, and an answer of another kind;
+    - the warm note: a warm start, a refused start with a skipped T3, wording it can't read, and `WARM_START_TARGETS` it can't read;
+    - the looks' timeouts, and `_post_kql`'s own.
+  - The warm session's readiness case pins `WARM_START_TARGETS` too.
+- **Without the change, each fails:** with the validator from 40ff59bb, 6 of the 10 readiness cases; with the control notebook from 40ff59bb, 5 of them.
+- **Mutations, each alone: all 35 make a case fail.**
+  - The validator (19): no wait; every start warm; no 15-minute window; a sample from before the start counting; a failed look wiping the answer; a wait past its deadline, or one sleeping past it; no note on a warm Fail; performance tables only; the old Warning; "Nothing to do"; no `recheckUtc`; an answer outside a reference run, or from a run by hand; no timeout cap; `_post_kql` ignoring its timeout; "already running" without a dispatch; T3's note concluding; and any `WARM_START_TARGETS`.
+  - The control notebook (16): no cold start passed; no deadline; no T3; no T2 host; warm without a dispatch; a Start step it can't read counting; no check again; one right away; one that keeps the wait; one for a session that ended; none when the status can't be read; no **Warning** when the live view ends first; a failed check again raising; an answer of any kind; no "Not known yet"; and no result printed.
+- **Other suites:**
+  - `Fabric.Notebooks`: 128 passed and 2 failed, the same 2 as at bdd1da89. It finds Python only on PATH too: with `DBHUB_TEST_PYTHON` alone, 8 cases are skipped.
+  - `Repo.Conventions` 123, `DbHubDemo.Fabric` 42, and `DbHubDemo.HubReadiness` 18 passed.
+  - PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
+
+**Risks.**
+
+- **The check again adds one validator run, about a minute,** inside the live view, only when a target was a **Warning** at readiness; a beat's announcement can come up to a minute late then.
+- **A session stopped before then** keeps the **Warning** on the Readiness page, as its result can't be known; Run all's line says so, and the next session's readiness checks it.
+- **`published-versions.json`:** the validator changed again, so the integration runs the versions' writer after the merge, as before.
+
+**What its live check needs.**
+
+- A cold start whose T2 reports late: the **Warning** at readiness, then "Readiness again" with a **Pass**, and the Readiness page's latest run.
+- One whose T2 doesn't report: a **Fail** in the same session.
+- How long the check again takes in the live view.
