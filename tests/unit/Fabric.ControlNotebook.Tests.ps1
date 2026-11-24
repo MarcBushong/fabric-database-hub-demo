@@ -276,7 +276,7 @@ def running_status(session_id, accepted, minutes):
     dispatch = accepted + real_dt.timedelta(minutes=4)
     return {"schemaVersion": 1, "sessionId": session_id, "phase": "running", "acceptedUtc": iso(accepted), "runEndUtc": iso(end),
             "autoStopUtc": iso(end + real_dt.timedelta(minutes=10)), "durationMinutes": minutes, "plannedMinutes": minutes,
-            "names": {"resourceGroup": "rg-dbhub-demo", "deploymentId": "abc123", "sqlVm": "sqlvm01", "t2Guest": "arcsql01",
+            "names": {"resourceGroup": "rg-dbhub-demo", "deploymentId": "abc123", "sqlVm": "sqlvm01", "hostVm": "archost01", "t2Guest": "arcsql01",
                       "t3Server": "azuresql01-abc123", "t3Database": "ContosoCare", "t4Server": "pgflex01-abc123", "t4Replica": "pgreplica01-abc123"},
             "dispatchUtc": {"T1": iso(dispatch), "T3": iso(dispatch), "T2": iso(dispatch + real_dt.timedelta(minutes=6)), "T4": iso(dispatch + real_dt.timedelta(minutes=5))},
             "t4": {"state": "Ready", "sku": "Standard_D4ds_v5", "tier": "GeneralPurpose"},
@@ -285,6 +285,16 @@ def running_status(session_id, accepted, minutes):
             "steps": [{"step": "Plan", "state": "Pass", "atUtc": iso(accepted), "message": "The showcase runs %d minutes on every target." % minutes, "fix": ""},
                       {"step": "Activity", "state": "Pass", "atUtc": iso(dispatch), "message": "T1: showcase for %d minutes" % minutes, "fix": ""}],
             "message": "The session runs until %s UTC." % iso(end)}
+
+
+def cold_start_steps(status, accepted):
+    """A cold start (2026-11-24): the session's start brought sqlvm01 and T2's host up (the runbook's vm-start progress,
+    "<vm> is starting."), and started T4, which isn't a VM. Returns what the validator must hear: when each target came up,
+    T3 at its activity's dispatch, which resumes it."""
+    status["steps"][1:1] = [{"step": "Start", "state": "Info", "atUtc": iso(accepted + real_dt.timedelta(seconds=5)), "message": "sqlvm01 is starting.", "fix": ""},
+                            {"step": "Start", "state": "Info", "atUtc": iso(accepted + real_dt.timedelta(seconds=20)), "message": "archost01 is starting.", "fix": ""},
+                            {"step": "T4", "state": "Info", "atUtc": iso(accepted + real_dt.timedelta(seconds=30)), "message": "T4 (pgflex01-abc123) is starting.", "fix": ""}]
+    return json.dumps({"T1": iso(accepted + real_dt.timedelta(seconds=5)), "T2": iso(accepted + real_dt.timedelta(seconds=20)), "T3": status["dispatchUtc"]["T3"]}, sort_keys=True)
 
 
 def with_t5(status, dispatch, minutes=75):
@@ -538,6 +548,8 @@ if scenario in ("stoppedqsacks", "qsacksprecheck"):
 
 # The status a session's start writes when it exported an earlier session's evidence (its rcaEarlier; ADR 0031).
 RUNNING_EARLIER = [None]
+# "coldstart": when the runbook's start brought each target up, as the validator must hear it (COLD_START_UTC).
+COLD_START = [""]
 
 
 HOST_WARNING = {"step": "Host", "state": "Warning", "message": "T2: archost01 is deallocated, so T2 has no activity now.",
@@ -551,6 +563,8 @@ def vault_read(name):
         current = json.loads(VAULT[name])
         if current.get("phase") == "starting" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(seconds=60):
             status = running_status(RUNBOOK["session"], RUNBOOK["accepted"], RUNBOOK["minutes"])
+            if scenario == "coldstart":
+                COLD_START[0] = cold_start_steps(status, RUNBOOK["accepted"])
             if scenario == "sessioncosmos":
                 status = with_t5(status, RUNBOOK["accepted"] + real_dt.timedelta(minutes=4))
             if scenario == "earlierrca":
@@ -599,7 +613,7 @@ class Notebook:
     def run(self, path, timeout_seconds=90, arguments=None, workspace=""):
         arguments = dict(arguments or {})
         if path == "NB_DatabaseHub_Deployment":
-            VALIDATORS.append({"path": path, "timeout": timeout_seconds, "workspace": workspace, "args": arguments})
+            VALIDATORS.append({"path": path, "timeout": timeout_seconds, "workspace": workspace, "args": arguments, "at": iso(Clock.now)})
             ORDER.append("validator")
             if scenario == "valfail":
                 raise RuntimeError("Notebook execution failed in cell 12: the telemetry endpoint didn't answer.")
@@ -758,7 +772,7 @@ with contextlib.redirect_stdout(buffer):
         error = "%s: %s" % (type(failure).__name__, failure)
 printed = buffer.getvalue()
 print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "validators": VALIDATORS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "statusReads": STATUSREADS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed,
-                  "staged": STAGED, "files": sorted(FILES), "vaultReads": VAULTREADS, "sidecars": SIDECARS, "defReads": DEFREADS, "puts": PUTS,
+                  "staged": STAGED, "files": sorted(FILES), "vaultReads": VAULTREADS, "sidecars": SIDECARS, "defReads": DEFREADS, "puts": PUTS, "coldStart": COLD_START[0],
                   "acks": {name[len(BASE):]: json.loads(text) for name, text in FILES.items() if name.startswith(BASE + "Files/rca/acks/")}}))
 '@
 
@@ -1347,13 +1361,17 @@ print(json.dumps(out))
         $run.workspace | Should -Be 'bbbbbbbb-0000-0000-0000-000000000002'
         $run.timeout | Should -Be 300
         # Read-only: its results saved, its cleanup off, and this environment's names rather than the validator's defaults.
-        @($run.args.PSObject.Properties.Name | Sort-Object) | Should -Be @('CONFIRM', 'LAKEHOUSE_ID', 'PURGE_DEMO_TABLES', 'RESOURCE_GROUP', 'SAVE_RESULTS', 'T1_VM_NAME', 'T2_MACHINE_NAME', 'T3_SERVER_PREFIX', 'WORKSPACE_ID')
+        @($run.args.PSObject.Properties.Name | Sort-Object) | Should -Be @('COLD_START_UTC', 'CONFIRM', 'LAKEHOUSE_ID', 'PURGE_DEMO_TABLES', 'RESOURCE_GROUP', 'SAVE_RESULTS', 'T1_VM_NAME', 'T2_MACHINE_NAME', 'T3_SERVER_PREFIX', 'TELEMETRY_WAIT_UNTIL_UTC', 'WORKSPACE_ID')
         $run.args.SAVE_RESULTS | Should -BeTrue
         $run.args.CONFIRM | Should -BeFalse
         $run.args.PURGE_DEMO_TABLES | Should -BeFalse
         $run.args.WORKSPACE_ID | Should -Be 'bbbbbbbb-0000-0000-0000-000000000002'
         $run.args.LAKEHOUSE_ID | Should -Be 'cccccccc-0000-0000-0000-000000000003'
         $run.args.RESOURCE_GROUP | Should -Be 'rg-contoso-demo'
+        # A warm start (2026-11-24): the session's start brought no VM up, so the validator waits for nothing, and a target
+        # without telemetry stays a Fail.
+        $run.args.COLD_START_UTC | Should -BeExactly '{}'
+        $run.args.TELEMETRY_WAIT_UNTIL_UTC | Should -BeExactly ''
         $line = 'Readiness: NB_DatabaseHub_Deployment ran its read-only checks in 1 minute; the Insights app''s Readiness page shows each one, worst first, after its next refresh.'
         $report.printed | Should -Match ([regex]::Escape($line))
         $report.printed.IndexOf('Pass: the session runs until') | Should -BeLessThan $report.printed.IndexOf($line)
@@ -1389,6 +1407,203 @@ print(json.dumps(out))
         @($report.validators).Count | Should -Be 0
         $report.printed | Should -Match ([regex]::Escape('Readiness: not checked in this Run all, because this notebook''s default lakehouse isn''t the demo''s (none is attached; ./scripts/deploy.ps1 attaches it). Fix: run NB_DatabaseHub_Deployment in the demo workspace while the session runs; the Insights app''s Readiness page shows its checks.'))
         @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+    }
+
+    Context 'Readiness on a cold start (2026-11-24)' {
+        BeforeAll {
+            # Live, 2026-11-24 on dbhubfb: a cold start's readiness ran 6.5 minutes after the session started the VMs, before
+            # T2's nested guest sent its first sample, and printed Fail HUB.TELEMETRY.T2. Here the runbook's start brings
+            # sqlvm01 and T2's host up (its Start steps) and starts T4, which isn't a VM; T3 resumes at its activity's dispatch.
+            $script:coldRun, $script:coldChecks, $script:coldSkip = $null, $null, 'Python 3 is not installed'
+            if (-not $script:python) {
+                return
+            }
+            $script:coldRun = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'coldstart' -Start '2026-11-14T14:00:00Z'
+            $script:coldSkip = 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            $PSNativeCommandUseErrorActionPreference = $false
+            $null = & $script:pandasPython -c 'import pandas' 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                return
+            }
+            # NB_DatabaseHub_Deployment's own parameters, helpers, and per-target cells, with a clock and a telemetry endpoint
+            # whose rows each target's model gives for the time of the query (Kusto v1, through the notebook's kusto_frame).
+            # Unless a case says otherwise, the session started T1 at 10:00:00, T2's host at 10:00:10, and T3 at 10:04:00, and
+            # the checks start at 10:06:30. The last case is what Run all passed above.
+            $hcontrol = Join-Path -Path $TestDrive -ChildPath 'cold-start.json'
+            [System.IO.File]::WriteAllText($hcontrol, [string]$script:coldRun.validators[0].args.COLD_START_UTC, [System.Text.UTF8Encoding]::new($false))
+            $harness = Join-Path -Path $TestDrive -ChildPath 'cold_start_validator.py'
+            Set-Content -LiteralPath $harness -Encoding utf8NoBOM -Value @'
+import contextlib, datetime as real_dt, io, json, sys, types
+
+UTC = real_dt.timezone.utc
+cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+PARAMS = next(cell for cell in cells if cell.startswith("# Parameters cell"))
+HELPERS = next(cell for cell in cells if cell.startswith("# Helpers:"))
+PER_TARGET = next(cell for cell in cells if cell.startswith("# Per-target validation"))
+FROM_CONTROL = open(sys.argv[2], encoding="utf-8").read().strip()
+NAMES = {"T1": ("virtualMachines", "sqlvm01"), "T2": ("machines", "arcsql01"), "T3": ("servers/databases", "azuresql01-abc123/ContosoCare")}
+CPU = "SqlServerCPUUtilization"
+
+
+def at(text):
+    return real_dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def iso(value):
+    return value.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def steady(now):
+    return [(CPU, now - real_dt.timedelta(seconds=60))]
+
+
+def never(now):
+    return []
+
+
+def arrives(when):
+    return lambda now: [(CPU, at(when) - real_dt.timedelta(seconds=10))] if now >= at(when) else []
+
+
+def only(when):
+    return lambda now: [(CPU, at(when))]
+
+
+def run(cold, wait_seconds, samples, now="2026-11-24T10:06:30Z", fail_after=None):
+    clock, slept, queries = [at(now)], [0.0], []
+    ns = {}
+    exec(PARAMS, ns)
+    ns.update(COLD_START_UTC=cold, TELEMETRY_WAIT_UNTIL_UTC="" if wait_seconds is None else iso(clock[0] + real_dt.timedelta(seconds=wait_seconds)),
+              SAVE_RESULTS=False, T3_SERVER_PREFIX="azuresql01-")
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        exec(HELPERS, ns)
+
+        def sleep(seconds):
+            assert seconds >= 0, seconds
+            clock[0] += real_dt.timedelta(seconds=seconds)
+            slept[0] += seconds
+
+        def post(kql):
+            queries.append(iso(clock[0]))
+            assert len(queries) <= 40, "the wait doesn't end"
+            if fail_after is not None and len(queries) > fail_after:
+                return 503, None, "HTTP 503."
+            rows = [[target, NAMES[target][0], NAMES[target][1], table, 10, iso(last), 1]
+                    for target, model in sorted(samples.items()) for table, last in model(clock[0])]
+            columns = [("Target", "string"), ("ResourceType", "string"), ("ResourceName", "string"), ("TableName", "string"), ("Rows", "long"),
+                       ("LastSampleUTC", "datetime"), ("Instances", "long")]
+            return 200, ns["kusto_frame"]({"Tables": [{"Columns": [{"ColumnName": name, "ColumnType": kind} for name, kind in columns], "Rows": rows}]}), ""
+
+        ns.update(utc_now=lambda: clock[0], time=types.SimpleNamespace(sleep=sleep), _post_kql=post)
+        exec(PER_TARGET, ns)
+    results = {item["check_id"][-2:]: {"status": item["status"], "message": item["message"], "evidence": item["evidence"], "remediation": item["remediation"]}
+               for item in ns["RESULTS"] if item["check_id"].startswith("HUB.TELEMETRY.T")}
+    return {"results": results, "slept": slept[0], "queries": len(queries), "printed": buffer.getvalue()}
+
+
+COLD = json.dumps({"T1": "2026-11-24T10:00:00Z", "T2": "2026-11-24T10:00:10Z", "T3": "2026-11-24T10:04:00Z"})
+latest = max(at(value) for value in json.loads(FROM_CONTROL).values())
+print(json.dumps({
+    "arrives": run(COLD, 120, {"T1": steady, "T2": arrives("2026-11-24T10:07:30Z"), "T3": steady}),
+    "late": run(COLD, 100, {"T1": steady, "T2": never, "T3": steady}),
+    "warm": run("{}", None, {"T1": steady, "T2": never, "T3": steady}),
+    "expired": run(json.dumps({"T2": "2026-11-24T09:45:00Z"}), 120, {"T1": steady, "T2": never, "T3": steady}),
+    "manual": run("", None, {"T1": steady, "T2": never, "T3": steady}),
+    "t1stale": run(json.dumps({"T1": "2026-11-24T10:00:00Z", "T2": "2026-11-24T10:00:10Z"}), None, {"T1": only("2026-11-24T09:20:00Z"), "T2": steady, "T3": steady}),
+    "flaky": run(COLD, 120, {"T1": steady, "T2": never, "T3": steady}, fail_after=1),
+    "garbage": run("T2 at ten", 120, {"T1": steady, "T2": never, "T3": steady}),
+    "control": run(FROM_CONTROL, None, {"T1": steady, "T2": never, "T3": steady}, now=iso(latest + real_dt.timedelta(minutes=2))),
+}))
+'@
+            $output = & $script:pandasPython $harness (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_Deployment.ipynb') $hcontrol 2>&1
+            if ($LASTEXITCODE -ne 0) {
+                throw ($output -join "`n")
+            }
+            $script:coldChecks = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        }
+
+        It 'tells the validator when the session''s own start brought each target up, and gives it 2 minutes to wait for their first sample' {
+            if (-not $script:coldRun) {
+                Set-ItResult -Skipped -Because $script:coldSkip
+                return
+            }
+            $report = $script:coldRun
+            $report.error | Should -BeNullOrEmpty
+            @($report.validators).Count | Should -Be 1
+            $run = $report.validators[0]
+            $report.coldStart | Should -Match '^\{"T1": "2026-11-14T14:00:05Z", "T2": "2026-11-14T14:00:20Z", "T3": "2026-11-14T14:04:00Z"\}$'
+            $run.args.COLD_START_UTC | Should -BeExactly $report.coldStart
+            # Within the validator's 5 minutes: its other checks and its save come after the wait.
+            (([datetime]$run.args.TELEMETRY_WAIT_UNTIL_UTC) - ([datetime]$run.at)).TotalSeconds | Should -Be 120
+            $run.timeout | Should -Be 300
+            $report.printed | Should -Match ([regex]::Escape('Readiness: NB_DatabaseHub_Deployment ran its read-only checks in 1 minute; the Insights app''s Readiness page shows each one'))
+            @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+        }
+
+        It 'makes a cold-started target''s missing first sample a Warning that names the cold start, or a Pass when it comes within the wait (needs pandas)' {
+            if (-not $script:coldChecks) {
+                Set-ItResult -Skipped -Because $script:coldSkip
+                return
+            }
+            $hv = $script:coldChecks
+            # T2's first sample comes a minute into the wait: the wait looks every 30 seconds and ends there, a Pass.
+            $hv.arrives.results.T2.status | Should -Be 'Pass'
+            $hv.arrives.slept | Should -Be 60
+            $hv.arrives.queries | Should -Be 3
+            $hv.arrives.printed | Should -Match ([regex]::Escape('Waiting at most 120 seconds for the first telemetry sample since this session''s cold start: T2 arcsql01.'))
+            # It doesn't come before the wait's end (here 100 seconds, so the last look is 10 seconds after the one before): a
+            # Warning that names the cold start, when, and the 15 minutes.
+            $hv.late.slept | Should -Be 100
+            $hv.late.queries | Should -Be 5
+            $hv.late.results.T2.status | Should -Be 'Warning'
+            $hv.late.results.T2.message | Should -BeExactly 'No telemetry from T2 arcsql01 yet since this session''s cold start: the session started T2''s host VM 8 minutes ago, and T2''s nested guest usually sends its first sample within about 15 minutes. This check waited 100 seconds for it.'
+            $hv.late.results.T2.remediation | Should -BeExactly 'Nothing to do yet: it''s the cold start''s delay, not missing telemetry. To confirm it, check again after 10:15 UTC, by running this notebook or ./scripts/validate.ps1 -Area Telemetry -Target T2; a Fail then is missing telemetry.'
+            $hv.late.results.T2.evidence | Should -BeExactly '{"coldStartUtc": "2026-11-24T10:00:10+00:00", "firstSampleMinutes": 15, "minutesSinceColdStart": 8, "waitedSeconds": 100}'
+            foreach ($case in 'arrives', 'late') {
+                $hv.$case.results.T1.status | Should -Be 'Pass'
+                $hv.$case.results.T3.status | Should -Be 'Pass'
+            }
+            # T1 too: a sample from before the session started its VM, and none since, is the cold start's Warning, not a stale VM's.
+            $hv.t1stale.results.T1.status | Should -Be 'Warning'
+            $hv.t1stale.results.T1.message | Should -BeExactly 'No telemetry from T1 sqlvm01 yet since this session''s cold start: the session started T1''s VM 6 minutes ago, and T1 usually sends its first sample within about 15 minutes.'
+            $hv.t1stale.results.T2.status | Should -Be 'Pass'
+            # The endpoint fails the wait's first look: the first answer stands for every target, and the wait ends.
+            $hv.flaky.slept | Should -Be 30
+            $hv.flaky.queries | Should -Be 2
+            $hv.flaky.results.T1.status | Should -Be 'Pass'
+            $hv.flaky.results.T2.message | Should -Match 'This check waited 30 seconds for it\.$'
+            # What Run all passes on its cold start reads as one: T2's host, which it started 5 minutes before, isn't a Fail.
+            $hv.control.results.T2.status | Should -Be 'Warning'
+            $hv.control.results.T2.message | Should -Match '^No telemetry from T2 arcsql01 yet since this session''s cold start: the session started T2''s host VM 5 minutes ago'
+            $hv.control.results.T1.status | Should -Be 'Pass'
+            $hv.control.results.T3.status | Should -Be 'Pass'
+        }
+
+        It 'keeps a warm start''s Fail for missing telemetry, and says why it isn''t a cold start''s delay (needs pandas)' {
+            if (-not $script:coldChecks) {
+                Set-ItResult -Skipped -Because $script:coldSkip
+                return
+            }
+            $hv = $script:coldChecks
+            $missing = 'No telemetry from T2 arcsql01 in the last 60 minutes.'
+            # A warm start: nothing waits, and missing telemetry is still a Fail, which says the session didn't start the VM.
+            $hv.warm.slept | Should -Be 0
+            $hv.warm.queries | Should -Be 1
+            $hv.warm.results.T2.status | Should -Be 'Fail'
+            $hv.warm.results.T2.message | Should -BeExactly ($missing + ' This session didn''t start T2''s host VM: it was already running, so this isn''t a cold start''s delay.')
+            # Started longer ago than its first sample takes: a Fail, without waiting.
+            $hv.expired.slept | Should -Be 0
+            $hv.expired.results.T2.status | Should -Be 'Fail'
+            $hv.expired.results.T2.message | Should -BeExactly ($missing + ' This session started T2''s host VM 21 minutes ago, longer than the 15 minutes T2''s nested guest usually takes to send its first sample, so this isn''t the cold start''s delay.')
+            # The notebook run by hand, or with a COLD_START_UTC it can't read: today's Fail, word for word.
+            foreach ($case in 'manual', 'garbage') {
+                $hv.$case.slept | Should -Be 0
+                $hv.$case.results.T2.status | Should -Be 'Fail'
+                $hv.$case.results.T2.message | Should -BeExactly $missing
+            }
+            $hv.garbage.printed | Should -Match 'COLD_START_UTC isn''t JSON of targets and UTC times, so telemetry is checked as usual\.'
+        }
     }
 
     It 'shows T5 in the guide and the live view, ends its ru-storms by its own end, and hands its metrics to the history as COSMOS_METRICS (2026-11-18)' {
