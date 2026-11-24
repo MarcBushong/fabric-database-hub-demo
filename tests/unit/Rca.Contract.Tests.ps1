@@ -413,7 +413,11 @@ Describe 'The Incident RCA contract: transport fixtures (ADR 0031)' {
         $runAll | Should -Match ([regex]::Escape('the session''s next export that reaches that VM sends'))
         $runAll | Should -Match ([regex]::Escape('only by moving IDs from `left` to `sent`'))
         $runAll | Should -Match ([regex]::Escape('the stopped status''s `rcaAcks` is final'))
-        $runAll | Should -Match ([regex]::Escape('or the session''s stopped status does'))
+        # The control notebook settles at every read of the status (_settle_rca_acks), so an acknowledgement goes after the
+        # export that sent its last ID: the start's, a re-check's, or the stop's (Final tests' S13.1 question, 2026-11-24).
+        $runAll | Should -Match ([regex]::Escape('at every read of the session''s status, the control notebook deletes each `-runall-` acknowledgement whose every `written` or `already` ID the status''s `rcaAcks` lists as sent'))
+        $runAll | Should -Match ([regex]::Escape('the start''s result, a re-check''s that sent the rest, or the stopped status''s'))
+        $runAll | Should -Not -Match ([regex]::Escape('once the start that carried it lists every'))
         $defs = $transportSchema['$defs']
         foreach ($name in 'ackRequest', 'ackResult') {
             $defs[$name]['description'] | Should -Not -Match 'step for the earlier sessions' -Because $name
