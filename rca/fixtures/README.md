@@ -18,6 +18,11 @@ Two evidence documents from one control session of the 2026-11-20 Run all (times
 | [sidecar-index.json](sidecar-index.json) | What `rca sidecar-export` printed after `DBHUBDEMO-RCAS-INDEX` at a save on 2026-11-21 10:25: the surge's sidecar new, the session's two pending |
 | [rca-sidecar.parameter.json](rca-sidecar.parameter.json) | The `RCA_SIDECAR_FILE` document that save staged: every part line of the three |
 | [rca-ack.json](rca-ack.json) | The notebook's acknowledgement of that file: the first sidecar already written by an earlier run, the other two written |
+| [sidecar-bundle.json](sidecar-bundle.json) | Run all's path: the stop's sidecar bundle for the 2026-11-20 session, an earlier version of `dbhub-session-metrics` holding T3's and T4's Query Store sidecars, three `DBHUBDEMO-RCAS` lines ([Run all's path](../README.md#run-alls-path-for-the-sidecars)) |
+| [sidecar-bundle-index.json](sidecar-bundle-index.json) | Its sidecar bundle index, a version of its own: the bundle, and the two sidecars it holds whole |
+| [metrics-rca-sidecars-member.json](metrics-rca-sidecars-member.json) | The metrics document's `rcaSidecars` pointer to that index, in the session's final version |
+| [rca-ack-request.json](rca-ack-request.json) | The next start's `rcaAcks`: an earlier session's T2 sidecar first, whose acknowledgement is the older one, then this session's two, once the saves' `-runall-` acknowledgements say they're written |
+| [rca-ack-result.json](rca-ack-result.json) | That start's status, `rcaAcks`: all three acknowledged before its sidecar fetch, this session's two on sqlvm01 and T2's guest's through the T2 host, archost01 |
 
 **Provenance.** The values are the scenarios' shapes, not a measurement: their parameters (the showcase's defaults), their procedures' own statements, and the 10-second, 5-second, and 30-second cadences of [the triggers](../README.md#capture-triggers). Where the owner measured the live session, the documents agree: T4's replica's Azure Monitor lag was 45, 106, and 166 s at 17:12, 17:13, and 17:14 UTC and 1 s at 17:15, and the replica's `since_last_replayed_s` here is 45.4, 105.4, and 165.4 s at those minutes and 0.4 s at 17:15. The session ID, the run IDs, and the secret version IDs are fakes.
 

@@ -9,7 +9,7 @@ BeforeDiscovery {
         @(Get-ChildItem -Path $fixtureRoot -Filter '*.sidecar.json' -File -ErrorAction SilentlyContinue | Sort-Object -Property Name |
                 ForEach-Object { @{ Name = $_.Name; Path = $_.FullName; Parts = $_.FullName -replace '\.sidecar\.json$', '.sidecar-parts.txt'; Kind = 'sidecar' } })
     )
-    $transportFixtures = @('rca-evidence.parameter.json', 'metrics-bundle.json', 'metrics-rca-member.json', 'export-index.json', 'rca-sidecar.parameter.json', 'sidecar-index.json', 'rca-ack.json') |
+    $transportFixtures = @('rca-evidence.parameter.json', 'metrics-bundle.json', 'metrics-rca-member.json', 'export-index.json', 'rca-sidecar.parameter.json', 'sidecar-index.json', 'rca-ack.json', 'sidecar-bundle.json', 'sidecar-bundle-index.json', 'metrics-rca-sidecars-member.json', 'rca-ack-request.json', 'rca-ack-result.json') |
         ForEach-Object { @{ Name = $_; Path = (Join-Path -Path $repoRootForDiscovery -ChildPath "rca/fixtures/$_") } }
 }
 
@@ -344,6 +344,144 @@ Describe 'The Incident RCA contract: transport fixtures (ADR 0031)' {
         $valid | Should -BeTrue -Because ($schemaErrors | Out-String)
     }
 
+    It 'carries Run all''s sidecars whole: the bundle, its index, the metrics'' pointer, and the next start''s acknowledgements agree' {
+        $read = { param($Name) Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath "fixtures/$Name") -Raw | ConvertFrom-Json }
+        $bytes = { param($Name) [System.Text.Encoding]::UTF8.GetByteCount((& $read $Name | ConvertTo-Json -Depth 10 -Compress)) }
+        $bundle = & $read 'sidecar-bundle.json'
+        $index = & $read 'sidecar-bundle-index.json'
+        $pointer = & $read 'metrics-rca-sidecars-member.json'
+        $request = & $read 'rca-ack-request.json'
+        $result = & $read 'rca-ack-result.json'
+        (& $bytes 'sidecar-bundle.json') | Should -BeLessOrEqual 24000
+        (& $bytes 'sidecar-bundle-index.json') | Should -BeLessOrEqual 24000
+        (& $bytes 'metrics-rca-sidecars-member.json') | Should -BeLessOrEqual 300 -Because 'the pointer comes out of T5''s share of the metrics document'
+        # Whole sidecars: every part of every listed document is in the bundles, with the index's SHA-256, and nothing else.
+        $lines = @($bundle.parts)
+        @($index.documents | Measure-Object -Property parts -Sum).Sum | Should -BeLessOrEqual 64 -Because 'RCA_SIDECAR_FILE takes at most 64 parts'
+        foreach ($document in $index.documents) {
+            $mine = @($lines | Where-Object { ($_ -split ' ')[2] -eq $document.documentId })
+            $mine.Count | Should -Be $document.parts -Because $document.documentId
+            @($mine | ForEach-Object { ($_ -split ' ')[4] } | Select-Object -Unique) | Should -Be @($document.sha256)
+            @($mine | ForEach-Object { [int](($_ -split ' ')[3] -split '/')[0] } | Sort-Object) | Should -Be @(1..$document.parts)
+        }
+        @($lines | ForEach-Object { ($_ -split ' ')[2] } | Select-Object -Unique | Sort-Object) | Should -Be @($index.documents.documentId | Sort-Object)
+        # An evidence reader takes only lines that start with DBHUBDEMO-RCA and a space: none of these.
+        @($lines | Where-Object { $_.StartsWith('DBHUBDEMO-RCA ', [System.StringComparison]::Ordinal) }) | Should -BeNullOrEmpty
+        $pointer.documents | Should -Be @($index.documents).Count
+        $pointer.index | Should -Match '^[0-9a-f]{32}$'
+        @($index.bundles) | Should -Not -Contain $pointer.index -Because 'the index is a version of its own'
+        # The next start acknowledges what the history holds: this session's sidecars, and an earlier session's that its
+        # acknowledgement still carries (README, Run all's path for the sidecars). It accounts for every ID it was given.
+        @($index.documents.documentId | Where-Object { $_ -notin @($request.documents) }) | Should -BeNullOrEmpty
+        @(@($result.sent) + @($result.left) | Sort-Object) | Should -Be @($request.documents | Sort-Object)
+    }
+
+    It 'routes each acknowledgement to the VM that keeps its sidecar: T1''s VM by its name, T2''s guest through the T2 host, and any other host nowhere' {
+        # A default deployment's control settings (ActivityControlHelpers.ps1): sqlVmName sqlvm01, hostVmName archost01 in the
+        # nested mode, and t2GuestName from vm/dsc/guest.psd1.
+        $settings = @{ sqlVmName = 'sqlvm01'; hostVmName = 'archost01'; t2GuestName = (Import-PowerShellDataFile -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'vm/dsc/guest.psd1')).Name }
+        # The host segment is the runner's machine name as the evidence's producer.host carries it (Hosts.Normalize).
+        $normalize = { param([string] $Name) ($Name.ToLowerInvariant() -replace '[^a-z0-9]+', '-').Trim('-') }
+        $vmFor = {
+            param([string] $DocumentId)
+            $segment = [regex]::Match($DocumentId, '^[0-9]{8}T[0-9]{6}Z-(?<segment>[a-z0-9]+(?:-[a-z0-9]+)*)-[0-9]{4}-sidecar$').Groups['segment'].Value
+            if ($segment -eq (& $normalize $settings.sqlVmName)) { return $settings.sqlVmName }
+            if ($segment -eq (& $normalize $settings.t2GuestName)) { return $settings.hostVmName }
+            return $null
+        }
+        $read = { param($Name) Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath "fixtures/$Name") -Raw | ConvertFrom-Json }
+        $request = & $read 'rca-ack-request.json'
+        $result = & $read 'rca-ack-result.json'
+        $vms = @($request.documents | ForEach-Object { & $vmFor $_ })
+        $vms | Should -Contain $settings.hostVmName -Because 'the fixtures carry a sidecar of T2''s guest, whose Run Commands go to the T2 host'
+        $vms | Should -Contain $settings.sqlVmName
+        foreach ($id in @($result.sent)) { & $vmFor $id | Should -Not -BeNullOrEmpty -Because "$id is sent only to the VM that keeps it" }
+        & $vmFor '20261119T143000Z-oldsql02-0001-sidecar' | Should -BeNullOrEmpty -Because 'a host no VM has goes in left, never elsewhere'
+        $readme = Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'README.md') -Raw
+        $readme | Should -Match ([regex]::Escape('The normalized `t2GuestName` is T2''s runner, whose Run Commands go to `hostVmName`'))
+        $readme | Should -Match ([regex]::Escape('Only the mapped VM''s answer counts.'))
+    }
+
+    It 'acknowledges per VM in the start''s sidecar step, leaves the rest to the session''s next export, and only ever moves an ID from left to sent' {
+        # T2c's option 2 (2026-11-23): a held T2 host keeps neither sqlvm01's acknowledgements nor the start from their time,
+        # and what the start leaves isn't lost until the next session. The README and the schema say the same.
+        $readme = Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'README.md') -Raw
+        $runAll = [regex]::Match($readme, '(?s)### Run all''s path for the sidecars.*?(?=\r?\n### )').Value
+        $runAll | Should -Not -BeNullOrEmpty
+        $runAll | Should -Not -Match 'Invoke-DbHubRcaEarlier' -Because 'the start acknowledges in its sidecar step, per VM, not in its step for the earlier sessions'' evidence'
+        $runAll | Should -Match ([regex]::Escape('the T2 host last, with what''s left of the bound'))
+        $runAll | Should -Match ([regex]::Escape('the session''s next export that reaches that VM sends'))
+        $runAll | Should -Match ([regex]::Escape('only by moving IDs from `left` to `sent`'))
+        $runAll | Should -Match ([regex]::Escape('the stopped status''s `rcaAcks` is final'))
+        $runAll | Should -Match ([regex]::Escape('or the session''s stopped status does'))
+        $defs = $transportSchema['$defs']
+        foreach ($name in 'ackRequest', 'ackResult') {
+            $defs[$name]['description'] | Should -Not -Match 'step for the earlier sessions' -Because $name
+        }
+        $defs['ackRequest']['description'] | Should -Match ([regex]::Escape('the session''s next export that reaches the VM'))
+        $defs['ackResult']['description'] | Should -Match ([regex]::Escape('only moving IDs from left to sent'))
+        $defs['ackResult']['description'] | Should -Match ([regex]::Escape('the stopped status''s is final'))
+    }
+
+    It 'anchors every pattern of the sidecar''s kinds with (?![\s\S]), never $, which lets a trailing line feed through in .NET and Python' {
+        $defs = $transportSchema['$defs']
+        $sidecarDefs = 'sidecarSessionId', 'sidecarId', 'sidecarPartLine', 'sidecarRef', 'sidecarIndex', 'sidecarParameter', 'sidecarFile', 'ack', 'sidecarBundle', 'sidecarBundleIndex', 'sidecarPointer', 'ackRequest', 'ackResult'
+        $patterns = [System.Collections.Generic.List[string]]::new()
+        $refs = [System.Collections.Generic.List[string]]::new()
+        $walk = {
+            param($Node)
+            if ($Node -is [System.Collections.IDictionary]) {
+                foreach ($key in $Node.Keys) {
+                    if ($key -eq 'pattern') { $patterns.Add([string]$Node[$key]) }
+                    elseif ($key -eq '$ref') { $refs.Add([string]$Node[$key]) }
+                    else { & $walk $Node[$key] }
+                }
+            }
+            elseif ($Node -is [System.Collections.IList]) {
+                foreach ($item in $Node) { & $walk $item }
+            }
+        }
+        foreach ($name in $sidecarDefs) {
+            $defs.ContainsKey($name) | Should -BeTrue -Because $name
+            & $walk $defs[$name]
+        }
+        $patterns.Count | Should -BeGreaterOrEqual 8
+        @($patterns | Where-Object { -not $_.EndsWith('(?![\s\S])', [System.StringComparison]::Ordinal) }) | Should -BeNullOrEmpty
+        # The sidecar's kinds refer only to their own definitions and the statuses, never to the evidence's, which keep $.
+        $own = @($sidecarDefs | ForEach-Object { '#/$defs/' + $_ }) + '#/$defs/status'
+        @($refs | Where-Object { $_ -notin $own }) | Should -BeNullOrEmpty
+    }
+
+    It 'refuses a trailing line feed in <Kind>''s <Field>' -ForEach @(
+        @{ Kind = 'ContosoCare.RcaSidecarBundle'; Field = 'bundle line'; Fixture = 'sidecar-bundle.json'; Mutate = { param($Document) $Document['parts'][0] += "`n" } }
+        @{ Kind = 'ContosoCare.RcaSidecarBundleIndex'; Field = 'documentId'; Fixture = 'sidecar-bundle-index.json'; Mutate = { param($Document) $Document['documents'][0]['documentId'] += "`n" } }
+        @{ Kind = 'ContosoCare.RcaSidecarPointer'; Field = 'index'; Fixture = 'metrics-rca-sidecars-member.json'; Mutate = { param($Document) $Document['index'] += "`n" } }
+        @{ Kind = 'ContosoCare.RcaAckRequest'; Field = 'rcaAcks document'; Fixture = 'rca-ack-request.json'; Mutate = { param($Document) $Document['documents'][0] += "`n" } }
+        @{ Kind = 'ContosoCare.RcaAckResult'; Field = 'sent ID'; Fixture = 'rca-ack-result.json'; Mutate = { param($Document) $Document['sent'][0] += "`n" } }
+    ) {
+        $document = Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath "fixtures/$Fixture") -Raw | ConvertFrom-Json -AsHashtable
+        $document['kind'] | Should -Be $Kind
+        Test-Json -Json ($document | ConvertTo-Json -Depth 10 -Compress) -SchemaFile $transportSchemaPath | Should -BeTrue
+        & $Mutate $document
+        Test-Json -Json ($document | ConvertTo-Json -Depth 10 -Compress) -SchemaFile $transportSchemaPath -ErrorAction SilentlyContinue | Should -BeFalse
+    }
+
+    It 'counts the sidecar pointer''s 300 bytes as written, Windows PowerShell 5.1''s escapes included, and fits its worst case by shortening its message' {
+        $pointer = $transportSchema['$defs'].sidecarPointer
+        $pointer.description | Should -Match '300 bytes as written'
+        $pointer.description | Should -Match ([regex]::Escape('\u0027'))
+        # What Windows PowerShell 5.1's ConvertTo-Json (JavaScriptSerializer) writes for these characters.
+        $asWritten = { param([string] $Json) $Json.Replace('''', '\u0027').Replace('<', '\u003c').Replace('>', '\u003e').Replace('&', '\u0026') }
+        $bytes = { param($Member) [System.Text.Encoding]::UTF8.GetByteCount((& $asWritten ($Member | ConvertTo-Json -Depth 5 -Compress))) }
+        $worst = [ordered]@{ kind = 'ContosoCare.RcaSidecarPointer'; version = 1; index = ('f' * 32); documents = 64; status = 'Manual action required'; message = '' }
+        (& $bytes $worst) | Should -BeLessOrEqual 157 -Because 'the README and the schema say the rest takes at most 157 bytes'
+        # A message the schema allows passes 300 bytes as written: 120 apostrophes.
+        $worst.message = '''' * $pointer.properties.message.maxLength
+        (& $bytes $worst) | Should -BeGreaterThan 300
+        while ((& $bytes $worst) -gt 300) { $worst.message = $worst.message.Substring(0, [int][System.Math]::Floor($worst.message.Length / 2)) }
+        Test-Json -Json ($worst | ConvertTo-Json -Compress) -SchemaFile $transportSchemaPath | Should -BeTrue
+        (& $bytes (Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures/metrics-rca-sidecars-member.json') -Raw | ConvertFrom-Json)) | Should -BeLessOrEqual 300
+    }
     It 'keeps a bundle within 24,000 bytes and the bundle index within 4,000' {
         [System.Text.Encoding]::UTF8.GetByteCount((Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures/metrics-bundle.json') -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10 -Compress)) | Should -BeLessOrEqual 24000
         [System.Text.Encoding]::UTF8.GetByteCount((Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures/metrics-rca-member.json') -Raw | ConvertFrom-Json | ConvertTo-Json -Depth 10 -Compress)) | Should -BeLessOrEqual 4000
@@ -456,7 +594,7 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
         @($violations) | Should -BeNullOrEmpty
     }
 
-    It 'lets the list of the runner''s own statements name exactly the forbidden names those statements use (What the capture leaves out, 3)' {
+    It 'lets the list of the runner''s own statements name exactly the forbidden names those statements use, and only in that file (What the capture leaves out, 3)' {
         $list = 'workload-generator/src/ContosoCare.Workload/Rca/QueryStore/HarnessStatements.cs'
         $harnessCode = 'Sql/DemoDatabase.cs', 'Sql/SqlScripts.cs', 'Cli/CommandLine.cs'
         # The SQL the runner's harness code sends as text: Text("...") and CommandText = "...", raw string literals included.
@@ -469,6 +607,10 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
         $named = @($blind.forbiddenInDetectionCode.identifiers | Where-Object { $identifier = $_; @($statements | Where-Object { $_.Contains($identifier) }).Count -gt 0 })
         $excepted = @($blind.detectionCode.exceptions | Where-Object { $list -in $_.files } | ForEach-Object { $_.identifier })
         @($excepted | Sort-Object) | Should -Be @($named | Sort-Object) -Because 'the list holds every such statement, and nothing else may name what blind-detection.json forbids'
+        # Those names are excepted in that one file only, and the list's exceptions name no other file.
+        foreach ($exception in @($blind.detectionCode.exceptions | Where-Object { $_.identifier -in $named -or $list -in $_.files })) {
+            @($exception.files) | Should -Be @($list) -Because ('{0} may be named only in the list of the runner''s own statements' -f $exception.identifier)
+        }
     }
 
     It 'scans every folder of the runner''s RCA code for answer-key names, or says why one is exempt' {
@@ -576,5 +718,35 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
             }
         }
         @($unmarked) | Should -BeNullOrEmpty
+    }
+
+    It 'leaves out on T1 to T3 the observer''s statements from before its marker by their text, as T4''s catalog rule does there' {
+        # The first read after an update looks back 2 hours, into windows where the release's runner sent its catalog
+        # unmarked; T1's Query Store kept RCA-XE-00's join form there, at about 30 s of CPU a run (fc, 2026-11-23).
+        $readme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'README.md'))
+        $rule = [regex]::Match($readme, '(?m)^   - \*\*The observer before 2026-11-23, on T1 to T3:\*\*.*$').Value
+        $rule | Should -Not -BeNullOrEmpty -Because 'item 1 says how T1 to T3 leave out the observer''s unmarked statements'
+        $sent = [regex]::Match($rule, 'SQL Server blocks that runner sends \(([^)]*)\)').Groups[1].Value
+        $sent | Should -Be 'RCA-SQL-01, 02, 09, and 12, RCA-AZ-01, and RCA-XE-00 to 05'
+        foreach ($id in 'RCA-SQL-01', 'RCA-SQL-02', 'RCA-SQL-09', 'RCA-SQL-12', 'RCA-AZ-01', 'RCA-XE-00', 'RCA-XE-01', 'RCA-XE-02', 'RCA-XE-03', 'RCA-XE-04', 'RCA-XE-05') {
+            $id | Should -BeIn $blocks -Because 'the rule matches the earlier forms of blocks today''s catalog still has'
+        }
+        $rule | Should -Match ([regex]::Escape('edd01c86''s join to `sys.dm_xe_objects`'))
+        $rule | Should -Match ([regex]::Escape('f16b9cb9''s form'))
+        $rule | Should -Match 'Item 3 matches them too, by their normalized text, which drops comments'
+        $readme | Should -Match ([regex]::Escape('the observer''s own SQL Server statements as it sent them before its marker'))
+        $adr = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'docs/adr/0031-incident-rca.md'))
+        $adr | Should -Match ([regex]::Escape('on SQL Server, a marker in each catalog statement''s text, and, for the first update''s look-back, the earlier runner''s statements without it'))
+    }
+
+    It 'says T4''s windows run from the server''s start, not the quarter hours, and that a window keeps its own search_path (L0c)' {
+        # Live on fc (2026-11-23): T4 started at 02:40:15.8 UTC and its windows began at 02:55:16, 03:10:16, and 03:25:17; and
+        # a query on the default path in one window and on the observer's in the next had a row in each.
+        $readme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'README.md'))
+        $readme | Should -Not -Match 'which the live check L0c measures' -Because 'L0c has measured it'
+        $readme | Should -Match ([regex]::Escape('Query Store keeps each window''s own `search_path`'))
+        $readme | Should -Match ([regex]::Escape('One query on both paths in one window, as in an update''s own window, wasn''t measured'))
+        $readme | Should -Match ([regex]::Escape('T4''s windows don''t end on the quarter hours: they run from the server''s start (`pg_postmaster_start_time()`), and a stop and start moves them'))
+        $readme | Should -Match ([regex]::Escape('That changes only when a read comes, never what it takes, which follows the intervals'' own times'))
     }
 }

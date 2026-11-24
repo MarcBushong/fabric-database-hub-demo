@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/rca/transport.schema.json",
   "title": "Incident RCA transport, version 1 (ADR 0031)",
-  "description": "How evidence documents travel from the VMs into the history: the part lines the runner prints, the bundles the control's runbook writes as earlier versions of dbhub-session-metrics, the rca member of that secret's final version, and the RCA_EVIDENCE document NB_DatabaseHub_LiveActivity reads, inline or from the lakehouse file RCA_EVIDENCE_FILE names. Beside them, the sidecar's own kinds, which a consumer that knows only the evidence document never meets: its index (rca sidecar-export), its part lines (DBHUBDEMO-RCAS), the RCA_SIDECAR_FILE document, and the notebook's acknowledgement by document ID. rca/README.md, Transport and The sidecar, give the encoding and the size limits.",
+  "description": "How evidence documents travel from the VMs into the history: the part lines the runner prints, the bundles the control's runbook writes as earlier versions of dbhub-session-metrics, the rca member of that secret's final version, and the RCA_EVIDENCE document NB_DatabaseHub_LiveActivity reads, inline or from the lakehouse file RCA_EVIDENCE_FILE names. Beside them, the sidecar's own kinds, which a consumer that knows only the evidence document never meets: its index (rca sidecar-export), its part lines (DBHUBDEMO-RCAS), the RCA_SIDECAR_FILE document, and the notebook's acknowledgement by document ID; and on Run all's path, its bundles, their index, the final metrics' pointer to it, and the next start's acknowledgements. rca/README.md, Transport and The sidecar, give the encoding and the size limits.",
   "oneOf": [
     { "$ref": "#/$defs/bundle" },
     { "$ref": "#/$defs/bundleIndex" },
@@ -10,10 +10,20 @@
     { "$ref": "#/$defs/exportIndex" },
     { "$ref": "#/$defs/sidecarIndex" },
     { "$ref": "#/$defs/sidecarParameter" },
-    { "$ref": "#/$defs/ack" }
+    { "$ref": "#/$defs/ack" },
+    { "$ref": "#/$defs/sidecarBundle" },
+    { "$ref": "#/$defs/sidecarBundleIndex" },
+    { "$ref": "#/$defs/sidecarPointer" },
+    { "$ref": "#/$defs/ackRequest" },
+    { "$ref": "#/$defs/ackResult" }
   ],
   "$defs": {
     "sessionId": { "type": ["string", "null"], "pattern": "^[0-9a-f]{32}$" },
+    "sidecarSessionId": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{32}(?![\\s\\S])",
+      "description": "A session ID in the sidecar's kinds: #/$defs/sessionId, anchored with (?![\\s\\S]) as every pattern of the sidecar's kinds is, because $ lets a trailing line feed through in .NET's and Python's regular expressions. The evidence's kinds keep #/$defs/sessionId as released."
+    },
     "status": { "enum": ["Pass", "Fail", "Warning", "Manual action required", "Not supported", "Not selected"] },
     "documentRef": {
       "type": "object",
@@ -92,13 +102,13 @@
     },
     "sidecarId": {
       "type": "string",
-      "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar$",
+      "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar(?![\\s\\S])",
       "description": "A sidecar's documentId: an evidence document's form with -sidecar after it, so the two kinds' IDs never meet."
     },
     "sidecarPartLine": {
       "type": "string",
       "maxLength": 3400,
-      "pattern": "^DBHUBDEMO-RCAS 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}$",
+      "pattern": "^DBHUBDEMO-RCAS 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}(?![\\s\\S])",
       "description": "A sidecar's part line: DBHUBDEMO-RCAS, then the fields of #/$defs/partLine. The marker differs, so a consumer that reads only DBHUBDEMO-RCA part lines never takes one."
     },
     "sidecarRef": {
@@ -107,9 +117,9 @@
       "required": ["documentId", "sessionId", "parts", "sha256", "state"],
       "properties": {
         "documentId": { "$ref": "#/$defs/sidecarId" },
-        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "sessionId": { "$ref": "#/$defs/sidecarSessionId" },
         "parts": { "type": "integer", "minimum": 1, "maximum": 99 },
-        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}(?![\\s\\S])" },
         "state": { "enum": ["new", "pending"], "description": "new: made by this call; pending: made earlier and not acknowledged yet, offered again." }
       }
     },
@@ -136,7 +146,7 @@
       "properties": {
         "kind": { "const": "ContosoCare.RcaSidecarParts" },
         "version": { "const": 1 },
-        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "sessionId": { "$ref": "#/$defs/sidecarSessionId" },
         "parts": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "$ref": "#/$defs/sidecarPartLine" } },
         "status": { "$ref": "#/$defs/status" },
         "message": { "type": "string", "maxLength": 500 }
@@ -144,7 +154,7 @@
     },
     "sidecarFile": {
       "type": "string",
-      "pattern": "^Files/rca/inbox/sidecar-[0-9]{8}T[0-9]{6}Z(-[A-Za-z0-9][A-Za-z0-9._-]{0,63})?\\.json$",
+      "pattern": "^Files/rca/inbox/sidecar-[0-9]{8}T[0-9]{6}Z(-[A-Za-z0-9][A-Za-z0-9._-]{0,63})?\\.json(?![\\s\\S])",
       "description": "RCA_SIDECAR_FILE, NB_DatabaseHub_LiveActivity's parameter for sidecars: a path in the demo's lakehouse, Files/rca/inbox/sidecar-<yyyyMMddTHHmmssZ>[-<name>].json, to a file holding exactly one #/$defs/sidecarParameter document, read as RCA_EVIDENCE_FILE is. The sweep of evidence files staged more than a day ago never matches the name. The notebook deletes it only when its acknowledgement says every document in it is written or already written."
     },
     "ack": {
@@ -165,13 +175,79 @@
             "additionalProperties": false,
             "required": ["documentId", "kind", "status"],
             "properties": {
-              "documentId": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}(-sidecar)?$" },
+              "documentId": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}(-sidecar)?(?![\\s\\S])" },
               "kind": { "enum": ["ContosoCare.RcaEvidence", "ContosoCare.RcaSidecar"] },
               "status": { "enum": ["written", "already", "skipped"], "description": "written: by this run; already: an earlier run wrote it; skipped: not written, with the reason." },
               "reason": { "type": "string", "maxLength": 500 }
             }
           }
         }
+      }
+    },
+    "sidecarBundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "sessionId", "parts"],
+      "description": "Run all's path: one earlier version of dbhub-session-metrics that carries sidecars, at most 6 DBHUBDEMO-RCAS part lines and 24,000 bytes of UTF-8, never an evidence line, so a reader of the evidence bundles never takes one.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaSidecarBundle" },
+        "version": { "const": 1 },
+        "sessionId": { "$ref": "#/$defs/sidecarSessionId" },
+        "parts": { "type": "array", "minItems": 1, "maxItems": 6, "items": { "$ref": "#/$defs/sidecarPartLine" } }
+      }
+    },
+    "sidecarBundleIndex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "sessionId", "bundles", "documents", "status", "message"],
+      "description": "Run all's path: a version of dbhub-session-metrics of its own, which the stop writes after the session's last sidecar bundle and before the metrics' final version. The versions that hold every sidecar bundle the session's exports wrote, and the whole sidecars they add up to: at most 64 parts, RCA_SIDECAR_FILE's limit, and 24,000 bytes of UTF-8.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaSidecarBundleIndex" },
+        "version": { "const": 1 },
+        "sessionId": { "$ref": "#/$defs/sidecarSessionId" },
+        "bundles": { "type": "array", "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "pattern": "^[0-9a-f]{32}(?![\\s\\S])" } },
+        "documents": { "type": "array", "maxItems": 64, "items": { "$ref": "#/$defs/sidecarRef" } },
+        "status": { "$ref": "#/$defs/status" },
+        "message": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "sidecarPointer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "index", "documents", "status", "message"],
+      "description": "Run all's path: the rcaSidecars member of the metrics document in dbhub-session-metrics' final version, out of T5's share: the sidecar bundle index's version, or null when the session's exports fetched no sidecar. At most 300 bytes as written: the UTF-8 bytes of the member as the runbook serializes it, because Windows PowerShell 5.1's ConvertTo-Json writes ' as \\u0027, so maxLength alone doesn't bound it. The runbook shortens message until the member fits, to nothing if it must; the rest takes at most 157 bytes.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaSidecarPointer" },
+        "version": { "const": 1 },
+        "index": { "type": ["string", "null"], "pattern": "^[0-9a-f]{32}(?![\\s\\S])" },
+        "documents": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "status": { "$ref": "#/$defs/status" },
+        "message": { "type": "string", "maxLength": 120 }
+      }
+    },
+    "ackRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "documents"],
+      "description": "Run all's path: the rcaAcks member of a start's request. The sidecars the -runall- acknowledgements say are written or already written, the oldest acknowledgements first and only whole ones. Each goes to the VM its host segment maps to (the normalized sqlVmName to that VM, and the normalized t2GuestName to hostVmName), in one RcaAck Run Command per VM: in the start's sidecar step, after the earlier sessions' evidence and right before that VM's sidecar fetch, the T2 host last. What the start leaves, the session's next export that reaches the VM sends (a re-check's, else the stop's), after that export's evidence and before its sidecar fetch.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaAckRequest" },
+        "version": { "const": 1 },
+        "documents": { "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/sidecarId" } }
+      }
+    },
+    "ackResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "sent", "left", "status", "message"],
+      "description": "Run all's path: the rcaAcks member of a session's status. sent: the IDs acknowledged on the VM each maps to (acknowledged, acknowledged before, or no longer kept, as that VM answered); left: those no export of the session sent (a VM none reached or that didn't answer, an older bundle, or a host no VM has), which a later start's request carries again. The start writes it once its acknowledgements ran or were cut short; a later export of the session may write it again, only moving IDs from left to sent, and the stopped status's is final.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaAckResult" },
+        "version": { "const": 1 },
+        "sent": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/sidecarId" } },
+        "left": { "type": "array", "maxItems": 64, "uniqueItems": true, "items": { "$ref": "#/$defs/sidecarId" } },
+        "status": { "$ref": "#/$defs/status" },
+        "message": { "type": "string", "maxLength": 500 }
       }
     }
   }

@@ -1,0 +1,12 @@
+{
+  "kind": "ContosoCare.RcaAckResult",
+  "version": 1,
+  "sent": [
+    "20261119T143000Z-arcsql01-0004-sidecar",
+    "20261120T165000Z-sqlvm01-0001-sidecar",
+    "20261120T170000Z-sqlvm01-0002-sidecar"
+  ],
+  "left": [],
+  "status": "Pass",
+  "message": "3 sidecars acknowledged before the start's sidecar fetch: 2 on sqlvm01, and 1 of T2's guest arcsql01 through archost01."
+}
