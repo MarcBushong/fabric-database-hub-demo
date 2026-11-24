@@ -13,7 +13,8 @@ namespace ContosoCare.Workload.Rca.QueryStore;
 /// code names those objects. Three of them name a table or function that blind-detection.json forbids in detection
 /// code; its exceptions allow those two names in this file only. A runner test fails when a statement in those files
 /// isn't listed here. Beside them, by their hash only (<see cref="Hashed"/>), are the answer key's reads from before
-/// 2026-11-23.
+/// 2026-11-23; and beside those, the observer's own SQL Server statements as the runner sent them before its marker
+/// (<see cref="SqlObserverStatements"/>, rca/README.md, What the capture leaves out, 1).
 /// </summary>
 internal static class HarnessStatements
 {
@@ -87,12 +88,13 @@ internal static class HarnessStatements
         "efcc15e2a82dc2560ca5e748fbd318f0335b324c3c190471b285c6facdd5e6c5",
     ];
 
-    private static readonly HashSet<string> Normalized = Statements.Select(HarnessText.Normalize).ToHashSet(StringComparer.Ordinal);
+    private static readonly HashSet<string> Normalized = Statements.Concat(SqlObserverStatements.All).Select(HarnessText.Normalize).ToHashSet(StringComparer.Ordinal);
 
     private static readonly HashSet<string> Hashes = Hashed.ToHashSet(StringComparer.Ordinal);
 
     /// <summary>
-    /// Whether a text Query Store keeps is one of the runner's statements: equal to a listed one once both are in
+    /// Whether a text Query Store keeps is one of the runner's statements: equal to a listed one, or to one of the
+    /// observer's from before its marker (<see cref="SqlObserverStatements"/>), once both are in
     /// <see cref="HarnessText.Normalize"/>'s form, or a listed hash's.
     /// </summary>
     public static bool IsRunners(string queryText)
