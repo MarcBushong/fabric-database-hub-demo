@@ -229,7 +229,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "version", "documents"],
-      "description": "Run all's path: the rcaAcks member of a start's request. The sidecars the -runall- acknowledgements say are written or already written, the oldest acknowledgements first and only whole ones. The start acknowledges them in its step for the earlier sessions' evidence, after the evidence parts and before the sidecar fetch, each on the VM its host segment maps to: the normalized sqlVmName to that VM, and the normalized t2GuestName to hostVmName.",
+      "description": "Run all's path: the rcaAcks member of a start's request. The sidecars the -runall- acknowledgements say are written or already written, the oldest acknowledgements first and only whole ones. Each goes to the VM its host segment maps to (the normalized sqlVmName to that VM, and the normalized t2GuestName to hostVmName), in one RcaAck Run Command per VM: in the start's sidecar step, after the earlier sessions' evidence and right before that VM's sidecar fetch, the T2 host last. What the start leaves, the session's next export that reaches the VM sends (a re-check's, else the stop's), after that export's evidence and before its sidecar fetch.",
       "properties": {
         "kind": { "const": "ContosoCare.RcaAckRequest" },
         "version": { "const": 1 },
@@ -240,7 +240,7 @@
       "type": "object",
       "additionalProperties": false,
       "required": ["kind", "version", "sent", "left", "status", "message"],
-      "description": "Run all's path: the rcaAcks member of the start's status. The IDs it acknowledged on the VM each maps to (sent: acknowledged, acknowledged before, or no longer kept, as that VM answered), and those it couldn't (left: a VM that didn't answer, an older bundle, or a host no VM has), which a later start's request carries again.",
+      "description": "Run all's path: the rcaAcks member of a session's status. sent: the IDs acknowledged on the VM each maps to (acknowledged, acknowledged before, or no longer kept, as that VM answered); left: those no export of the session sent (a VM none reached or that didn't answer, an older bundle, or a host no VM has), which a later start's request carries again. The start writes it once its acknowledgements ran or were cut short; a later export of the session may write it again, only moving IDs from left to sent, and the stopped status's is final.",
       "properties": {
         "kind": { "const": "ContosoCare.RcaAckResult" },
         "version": { "const": 1 },

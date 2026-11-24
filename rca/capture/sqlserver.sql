@@ -608,14 +608,16 @@ FROM sys.database_query_store_options AS o;
 -- name: RCA-SQL-16
 -- The ad hoc statements (object_id 0) that ran in the intervals RCA-SQL-10 is about to read, with their text, so that the
 -- runner leaves out its own (rca/README.md, What the capture leaves out, 3): it compares each text, normalized, with its
--- list of the statements it sends outside a module (Rca/QueryStore/HarnessStatements.cs), and passes the query_ids that
--- match to RCA-SQL-10 and 14 as @left_out. Read before each RCA-SQL-10 read, with its @since and @final. Not returned: a
--- text over 4,000 characters (the runner's are much shorter), a query the engine generated itself (is_internal_query,
--- such as an automatic statistics update), and the capture's own statements, which carry the marker. At most 2,000
--- rows, the most executed first: the stop check every run polls is always near the top, and the read's coverage says
--- when the bound was hit. A statement of the runner's that this block doesn't return, past the bound or in an interval
--- that ended between this read and RCA-SQL-10's, is matched by the text RCA-SQL-10 and 14 return: the runner drops its
--- rows and reads RCA-SQL-10's page again without it. The texts are only compared, never kept. T1, T2, T3.
+-- list of the statements it sends outside a module (Rca/QueryStore/HarnessStatements.cs) and of the observer's own as
+-- earlier runners sent them, before the marker (Rca/QueryStore/SqlObserverStatements.cs; item 1), and passes the
+-- query_ids that match to RCA-SQL-10 and 14 as @left_out. Read before each RCA-SQL-10 read, with its @since and @final.
+-- Not returned: a text over 4,000 characters (the runner's are much shorter), a query the engine generated itself
+-- (is_internal_query, such as an automatic statistics update), and the capture's own statements, which carry the
+-- marker. At most 2,000 rows, the most executed first: the stop check every run polls is always near the top, and the
+-- read's coverage says when the bound was hit. A statement of the runner's that this block doesn't return, past the
+-- bound or in an interval that ended between this read and RCA-SQL-10's, is matched by the text RCA-SQL-10 and 14
+-- return: the runner drops its rows and reads RCA-SQL-10's page again without it. The texts are only compared, never
+-- kept. T1, T2, T3.
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 1000;

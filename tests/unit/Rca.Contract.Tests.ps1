@@ -402,6 +402,27 @@ Describe 'The Incident RCA contract: transport fixtures (ADR 0031)' {
         $readme | Should -Match ([regex]::Escape('Only the mapped VM''s answer counts.'))
     }
 
+    It 'acknowledges per VM in the start''s sidecar step, leaves the rest to the session''s next export, and only ever moves an ID from left to sent' {
+        # T2c's option 2 (2026-11-23): a held T2 host keeps neither sqlvm01's acknowledgements nor the start from their time,
+        # and what the start leaves isn't lost until the next session. The README and the schema say the same.
+        $readme = Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'README.md') -Raw
+        $runAll = [regex]::Match($readme, '(?s)### Run all''s path for the sidecars.*?(?=\r?\n### )').Value
+        $runAll | Should -Not -BeNullOrEmpty
+        $runAll | Should -Not -Match 'Invoke-DbHubRcaEarlier' -Because 'the start acknowledges in its sidecar step, per VM, not in its step for the earlier sessions'' evidence'
+        $runAll | Should -Match ([regex]::Escape('the T2 host last, with what''s left of the bound'))
+        $runAll | Should -Match ([regex]::Escape('the session''s next export that reaches that VM sends'))
+        $runAll | Should -Match ([regex]::Escape('only by moving IDs from `left` to `sent`'))
+        $runAll | Should -Match ([regex]::Escape('the stopped status''s `rcaAcks` is final'))
+        $runAll | Should -Match ([regex]::Escape('or the session''s stopped status does'))
+        $defs = $transportSchema['$defs']
+        foreach ($name in 'ackRequest', 'ackResult') {
+            $defs[$name]['description'] | Should -Not -Match 'step for the earlier sessions' -Because $name
+        }
+        $defs['ackRequest']['description'] | Should -Match ([regex]::Escape('the session''s next export that reaches the VM'))
+        $defs['ackResult']['description'] | Should -Match ([regex]::Escape('only moving IDs from left to sent'))
+        $defs['ackResult']['description'] | Should -Match ([regex]::Escape('the stopped status''s is final'))
+    }
+
     It 'anchors every pattern of the sidecar''s kinds with (?![\s\S]), never $, which lets a trailing line feed through in .NET and Python' {
         $defs = $transportSchema['$defs']
         $sidecarDefs = 'sidecarSessionId', 'sidecarId', 'sidecarPartLine', 'sidecarRef', 'sidecarIndex', 'sidecarParameter', 'sidecarFile', 'ack', 'sidecarBundle', 'sidecarBundleIndex', 'sidecarPointer', 'ackRequest', 'ackResult'
@@ -697,5 +718,24 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
             }
         }
         @($unmarked) | Should -BeNullOrEmpty
+    }
+
+    It 'leaves out on T1 to T3 the observer''s statements from before its marker by their text, as T4''s catalog rule does there' {
+        # The first read after an update looks back 2 hours, into windows where the release's runner sent its catalog
+        # unmarked; T1's Query Store kept RCA-XE-00's join form there, at about 30 s of CPU a run (fc, 2026-11-23).
+        $readme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'README.md'))
+        $rule = [regex]::Match($readme, '(?m)^   - \*\*The observer before 2026-11-23, on T1 to T3:\*\*.*$').Value
+        $rule | Should -Not -BeNullOrEmpty -Because 'item 1 says how T1 to T3 leave out the observer''s unmarked statements'
+        $sent = [regex]::Match($rule, 'SQL Server blocks that runner sends \(([^)]*)\)').Groups[1].Value
+        $sent | Should -Be 'RCA-SQL-01, 02, 09, and 12, RCA-AZ-01, and RCA-XE-00 to 05'
+        foreach ($id in 'RCA-SQL-01', 'RCA-SQL-02', 'RCA-SQL-09', 'RCA-SQL-12', 'RCA-AZ-01', 'RCA-XE-00', 'RCA-XE-01', 'RCA-XE-02', 'RCA-XE-03', 'RCA-XE-04', 'RCA-XE-05') {
+            $id | Should -BeIn $blocks -Because 'the rule matches the earlier forms of blocks today''s catalog still has'
+        }
+        $rule | Should -Match ([regex]::Escape('edd01c86''s join to `sys.dm_xe_objects`'))
+        $rule | Should -Match ([regex]::Escape('f16b9cb9''s form'))
+        $rule | Should -Match 'Item 3 matches them too, by their normalized text, which drops comments'
+        $readme | Should -Match ([regex]::Escape('the observer''s own SQL Server statements as it sent them before its marker'))
+        $adr = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'docs/adr/0031-incident-rca.md'))
+        $adr | Should -Match ([regex]::Escape('on SQL Server, a marker in each catalog statement''s text, and, for the first update''s look-back, the earlier runner''s statements without it'))
     }
 }

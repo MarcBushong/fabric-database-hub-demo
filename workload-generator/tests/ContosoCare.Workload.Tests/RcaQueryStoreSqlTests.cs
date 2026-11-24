@@ -697,6 +697,65 @@ public sealed class RcaQueryStoreSqlTests
     }
 
     [Fact]
+    public async Task TheObserversOwnStatementsFromBeforeItsMarkerNeverReachTheSidecar()
+    {
+        // What T1's Query Store kept of the release's observer, which sent its blocks without the marker: edd01c86's RCA-XE-00,
+        // its join to sys.dm_xe_objects, the interval's top query by CPU (5 runs, each aborted at 30 s with 29.7 s of CPU);
+        // f16b9cb9's form; and RCA-XE-01's check for its event session. Eleven of the workload's own ad hoc statements
+        // follow. Each query has one plan, its query_id times 10.
+        const long Join = 116, Check = 117, Columns = 153;
+        var join = CaptureCatalog.Parse(RcaSqlCatalogHistory.Edd01c86)["RCA-XE-00"];
+        var columns = CaptureCatalog.Parse(RcaSqlCatalogHistory.F16b9cb9RcaXe00)["RCA-XE-00"];
+        var start = RcaSimulation.At(16, 50, 0);
+        var interval = RcaSimulation.At(16, 30, 0);
+        var texts = new Dictionary<long, string>
+        {
+            [Join] = join[join.IndexOf("SELECT", StringComparison.Ordinal)..],
+            [Check] = "IF NOT EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'ContosoCare_RCA')",
+            [Columns] = columns[columns.IndexOf("SELECT", StringComparison.Ordinal)..],
+        };
+        for (var n = 1; n <= 11; n++)
+        {
+            texts[600 + n] = string.Create(CultureInfo.InvariantCulture, $"(@p int)SELECT a.appointment_id FROM care.appointments AS a WHERE a.clinic_id = @p AND a.slot = {n}");
+        }
+
+        double Cpu(long query) => query switch { Join => 29_700, Columns => 250, Check => 150, _ => 100 - (query - 600) };
+        CaptureValues Stat(long query) => Row(
+            ("captured_at_utc", start.UtcDateTime),
+            ("interval_start_utc", interval),
+            ("interval_end_utc", interval.AddMinutes(15)),
+            ("query_id", query),
+            ("plan_id", query * 10),
+            ("query_sql_text", texts[query]),
+            ("executions", query < 600 ? 5L : 10L),
+            ("cpu_ms", Cpu(query)));
+        var access = new FakeSidecarAccess("T1", (block, parameters) => block switch
+        {
+            "RCA-SQL-16" => [.. texts.Select(t => Row(("query_id", t.Key), ("query_sql_text", t.Value)))],
+            "RCA-SQL-10" => (DateTimeOffset)parameters.Value("@since")! >= interval.AddMinutes(15) ? [] :
+                [.. texts.Keys.Except(T3QueryStore.LeftOut(parameters)).OrderByDescending(Cpu).ThenBy(q => q).Take(10).Select(Stat)],
+            "RCA-SQL-14" => [.. ParameterIds(parameters, "@queries").Concat(ParameterIds(parameters, "@plans").Select(p => p / 10)).Distinct()
+                .Except(T3QueryStore.LeftOut(parameters))
+                .Select(q => Row(("captured_at_utc", start.UtcDateTime), ("query_id", q), ("plan_id", q * 10), ("query_sql_text", texts[q]), ("is_forced_plan", false), ("is_parallel", false), ("query_plan", ParameterIds(parameters, "@with_plan").Contains(q * 10) ? Showplans.WithWarnings() : null)))],
+            "RCA-SQL-15" => [StateRow(start, "READ_WRITE", 0, null)],
+            _ => [],
+        });
+        var sink = new MemorySidecarSink();
+        var reader = new SqlQueryStoreReader(access, automaticTuning: false, sink);
+
+        reader.Begin(start);
+        await TickAsync(reader, start, TimeSpan.FromMinutes(2));
+        await reader.EndAsync(start.AddMinutes(2), TestContext.Current.CancellationToken);
+
+        // None of them is in the sidecar, and the interval's top 10 by CPU are the workload's ten, left out before ranking.
+        Assert.DoesNotContain(sink.Rows, r => r.Get("query_id") is Join or Check or Columns);
+        Assert.DoesNotContain(sink.Rows, r => r.Get("statement_text") is string text && text.Contains("dm_xe_", StringComparison.Ordinal));
+        Assert.Equal(Enumerable.Range(601, 10).Select(q => (long)q), sink.Table(RcaContract.QueryStats).Select(r => (long)r.Get("query_id")!).Order());
+        Assert.All(access.Calls.Where(c => c.BlockId is "RCA-SQL-10" or "RCA-SQL-14"), c => Assert.Equal("[116,117,153]", c.Parameters.Value("@left_out")));
+        Assert.All(sink.Table(RcaContract.QueryCoverage), c => Assert.Null(c.Get("gaps")));
+    }
+
+    [Fact]
     public async Task AnEventAboutAQueryNotMatchedYetWaitsForTheFirstMatchAndTheRunnersIsDropped()
     {
         // The observer starts slowed, so no interval read, and no RCA-SQL-16, runs at first. Automatic tuning's second read,
