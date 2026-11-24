@@ -852,4 +852,19 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         $catalog = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'capture/postgresql.sql'))
         $catalog | Should -Match ([regex]::Escape('ON w.start_time = s.start_time AND w.query_id = s.query_id'))
     }
+
+    It 'names a plan regression only from 2 whole intervals of the earlier plans, which the showcase''s own regression doesn''t give in a Run all session (R3)' {
+        # The coordinator's R3 (2026-11-24): R1, which measures the earlier plans from their own rows in the switch's interval,
+        # is deferred, so the contract says what the rules do. The showcase's agent beat runs plan A for about 3 minutes before
+        # the switch, and its third cycle's plan B ran in the second, so neither is compared, and a forcing is in a
+        # regression's cause or in the details.
+        $readme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'README.md'))
+        $claims = [regex]::Match($readme, '(?s)- \*\*What a reader may claim,\*\*.*?(?=\r?\n- \*\*Plans:\*\*)').Value
+        $claims | Should -Not -BeNullOrEmpty
+        $claims | Should -Match ([regex]::Escape('**a plan regression is named** (QS-PLAN-REGRESSION) only when its query''s earlier plans ran in 2 or more whole intervals before the new plan''s first execution'))
+        $claims | Should -Match ([regex]::Escape('a forcing (QS-PLAN-FORCED) is in the cause of such a regression of its query, and otherwise only in the details'' forcings'))
+        $claims | Should -Match ([regex]::Escape('So the demo''s own Run all session doesn''t compare T3''s showcase regression'))
+        $claims | Should -Match ([regex]::Escape('Its incident''s cause names the top queries by CPU (QS-TOP-CPU'))
+        $claims | Should -Not -Match ([regex]::Escape('**a plan that comes back** is a change')) -Because 'R1''s claims come with its code'
+    }
 }
