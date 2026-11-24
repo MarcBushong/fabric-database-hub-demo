@@ -400,7 +400,7 @@ A first design put Query Store's tables into a version 2 of the evidence documen
 6. **Ownership:** parallel builders by file. The runner's and the VM control script's wiring waits for the stop tail's changes; the app and its report wait for the Root cause page's facets.
 7. **The estimate, rebaselined:** about 23 builder-days. The scripts' path first (`stop-demo.ps1 -SaveHistory`, `deploy.ps1`'s snapshot, `configure-fabric.ps1 -RunLiveActivity`); Run all's path in a later release. One release, with T1 to T3's evidence shipping alone, and T4's right after, if T4's part isn't proven by the cut-off.
    - **Revised the same day:** Run all's path joins this release (rca/README.md, Run all's path for the sidecars), because demos run only through Run all.
-   - **How:** the runbooks fetch the sidecars at each export, within the evidence's bounds, and write them as their own bundles with an index of their own. The final metrics carry only a pointer. The control notebook stages them, and the next start acknowledges them.
+   - **How:** the runbooks fetch the sidecars at each export, within the evidence's bounds, and write them as their own bundles with an index of their own. The final metrics carry only a pointer. The control notebook stages them, and the next session acknowledges them: at its start, per VM, and what the start leaves at that session's next export that reaches the VM.
    - **Cost:** two builders, about 16 to 20 builder-hours, and about 6 to 10 more job minutes a session.
    - **The cut line:** if it isn't reviewed by 2026-11-24 18:00, the scripts' path ships first, and Run all's path follows as its own release.
 

@@ -5595,6 +5595,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **f15381c5:** the fixtures', the builders', and RCA-SQL-16's rows match the day's rules; sqlserver.sql has 27 blocks.
 - **f18c0635, T2c-2's re-check:** the activity notebook's sweep leaves a `-runall-` acknowledgement to the control notebook, and deletes it only after 30 days, so a sweep between two sessions doesn't make the next one fetch its sidecars again.
 - **e68b4a2b and 4bb08cfa, A2's 9ac571ed:** after `rca.marker-refused`, a harness control connection that opened without the marker keeps its statements as evidence, except what item 2's rule leaves out.
+- **T2c's option 2** (the coordinator's decision, 2026-11-23 evening): the start acknowledges per VM in its sidecar step, sqlvm01 first and the T2 host last, so a held T2 host keeps nothing else from its time. What it leaves, the session's next export that reaches the VM sends, after that export's evidence and before its sidecar fetch: a re-check's, else the stop's. `rcaAcks` then only moves IDs from `left` to `sent`, the stopped status's is final, and the control notebook deletes an acknowledgement by it too. The kinds, schemas, fixtures, routing, and 64-ID limit don't change; only the README's rule and the two kinds' descriptions do, which a new contract test pins.
 
 **The integration,** `marcbushong-microsoft-qs-evidence-integration`, takes only reviewed heads:
 
