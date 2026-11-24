@@ -1845,6 +1845,23 @@ print(json.dumps(out))
             Set-Content -LiteralPath $harness -Encoding utf8NoBOM -Value @'
 import contextlib, datetime as real_dt, io, json, sys, types
 
+# A stand-in for requests, as the file's other harnesses use (the integration's note on f4066637): the validator's helpers
+# import it, and every call through it is replaced below (_post_kql in run, requests.post in post_timeouts), so the cases
+# run, and no network call leaves them, in a Python that has pandas but not requests.
+fake_requests = types.ModuleType("requests")
+
+
+class RequestException(Exception):
+    pass
+
+
+def no_network(*args, **kwargs):
+    raise RequestException("no network call leaves this test")
+
+
+fake_requests.RequestException, fake_requests.get, fake_requests.post = RequestException, no_network, no_network
+sys.modules["requests"] = fake_requests
+
 UTC = real_dt.timezone.utc
 cells = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
 PARAMS = next(cell for cell in cells if cell.startswith("# Parameters cell"))
