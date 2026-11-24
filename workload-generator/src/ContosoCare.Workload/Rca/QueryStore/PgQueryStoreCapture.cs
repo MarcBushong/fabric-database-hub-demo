@@ -65,7 +65,10 @@ internal sealed record PgSidecarOptions
 /// counts or waits that Query Store published late still reach the sidecar (the latest read of an interval wins). The time
 /// still unsettled at the observer's end is kept in the watermark for this span, and the coverage says what Query Store
 /// hadn't published yet, never that it wasn't captured. A later read that finds T4 started since then splits that time at
-/// T4's start: what Query Store doesn't show before it is lost, and the rest waits as before.
+/// T4's start: what Query Store doesn't show before it is lost, and the rest waits as before. A restart while the observer
+/// runs is told the same way: the read that finds T4 started since the previous read closes what the observation hadn't
+/// settled of the old lifetime as a range of its span, the next read's backfill splits it, and the observation's own reads
+/// go on from the new start, so each interval is taken once.
 /// </para>
 /// Without the harness's list, nothing is read: its bookkeeping would be in it.
 /// </summary>
@@ -76,6 +79,13 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     /// batch of data to persist" (https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store).
     /// </summary>
     public static readonly TimeSpan PublishedAfter = TimeSpan.FromMinutes(20);
+
+    /// <summary>
+    /// How close to T4's start a window can begin and still be the new lifetime's: Query Store gives a window's start to the
+    /// second (the live check L0c), so the new lifetime's first can show a fraction of a second before the start, while the
+    /// old lifetime's all began before its stop, which comes before the start by the time T4 was down.
+    /// </summary>
+    public static readonly TimeSpan StartTolerance = TimeSpan.FromSeconds(2);
 
     /// <summary>At most this many earlier ranges are backfilled in one read, so a read stays short.</summary>
     public const int BackfillsPerRead = 4;
@@ -88,6 +98,9 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     // again only when a later read found it changed.
     private readonly Dictionary<string, Dictionary<string, Written>> written = new(StringComparer.Ordinal);
 
+    // The ranges this observation closed at T4's start, by key: their rows go to its own sidecar.
+    private readonly HashSet<string> closed = new(StringComparer.Ordinal);
+
     // What another sidecar read of T4 (RCA-PG-17), a read that waited, or one that didn't finish leaves for the next row.
     private readonly SortedSet<string> carriedSources = new(StringComparer.Ordinal);
     private readonly List<string> carriedGaps = [];
@@ -96,6 +109,12 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     private DateTimeOffset lastRead;
     private DateTimeOffset? through;
     private DateTimeOffset? settled;
+
+    // What had settled when a read last found T4's start, where a restart that a later read finds closes its range from.
+    private DateTimeOffset? confirmed;
+
+    // T4's start when a read found it started again while the observer ran: its own reads take the intervals from then on.
+    private DateTimeOffset? lifetime;
     private PgQueryStoreSettings? settings;
     private PgHarness? harness;
     private Cycle? cycle;
@@ -116,7 +135,10 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     /// <summary>The end of the newest interval this observation's reads found published.</summary>
     public DateTimeOffset? Through => through;
 
-    /// <summary>Every interval that ends by this time is settled: a read took it once Query Store had surely published it.</summary>
+    /// <summary>
+    /// Every interval that ends by this time is settled: a read took it once Query Store had surely published it, or a
+    /// range that T4's restart closed took it over.
+    /// </summary>
     public DateTimeOffset? Settled => settled;
 
     /// <summary>True while a read is under way: it runs a block a tick until it's done.</summary>
@@ -134,11 +156,14 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         lastRead = now;
         through = null;
         settled = null;
+        confirmed = null;
+        lifetime = null;
         settings = null;
         harness = null;
         cycle = null;
         held = false;
         written.Clear();
+        closed.Clear();
         carriedSources.Clear();
         carriedGaps.Clear();
         NextRead = now;
@@ -429,6 +454,11 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
             sidecar.Write(change);
         }
 
+        if (settings is { ServerStarted: { } before } earlier && read.ServerStarted is { } start && start > before)
+        {
+            Restarted(current, earlier, start, now);
+        }
+
         settings = read;
         coverage.Gaps.AddRange(read.Gaps(Target));
         if (read.Interval is { } interval && interval != schedule.Interval)
@@ -439,6 +469,58 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
                 NextRead = schedule.NextRead(current.At);
             }
         }
+    }
+
+    /// <summary>
+    /// T4 started again since the previous read found its start (rca/README.md, A restart while the observer runs): what
+    /// this observation hadn't settled of the old lifetime, from its last settled point to the new start, becomes a pending
+    /// range of its span with the earlier start, which the next read's backfill splits as at a stop. What the observation
+    /// wrote of those intervals goes with the range, so the backfill writes a row again only when it changed, and its own
+    /// reads go on from the new start: each interval is taken once. Without a span, or a watermark to keep the range in,
+    /// nothing changes: the reads take both lifetimes' intervals, as before.
+    /// </summary>
+    private void Restarted(Cycle current, PgQueryStoreSettings earlier, DateTimeOffset start, DateTimeOffset now)
+    {
+        var span = source.Spans?.CurrentSpan;
+        var from = confirmed ?? settled ?? schedule.FirstSince(observingSince);
+        var recorded = earlier.InRecovery != true && !string.Equals(earlier.CaptureMode, "none", StringComparison.Ordinal);
+        if (span is null || !recorded || from >= start)
+        {
+            return;
+        }
+
+        var range = new PendingRange { SpanId = span, ObservedFromUtc = start, FromUtc = from, ToUtc = start, RecordedUtc = now, ServerStartedUtc = earlier.ServerStarted, RestartedUtc = start };
+        try
+        {
+            source.Watermark.Update(state =>
+            {
+                state.Pending.RemoveAll(p => Same(p, range));
+                state.Pending.Add(range);
+            });
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            current.Coverage.Gaps.Add(string.Create(CultureInfo.InvariantCulture, $"{Target} started again at {start:HH:mm:ss} UTC, but the Query Store watermark couldn't be written on this host, so what T4 held in memory at its stop isn't told apart: {Redactor.Redact(ex.Message)}"));
+            log.Warn("rca.querystore-watermark", "The Query Store watermark couldn't be written.", ("target", Target), ("error", Redactor.Redact(ex.Message)));
+            return;
+        }
+
+        var key = RangeKey(range);
+        var moved = new Dictionary<string, Written>(StringComparer.Ordinal);
+        if (written.TryGetValue(string.Empty, out var own))
+        {
+            foreach (var (id, row) in own.Where(w => w.Value.Start < start - StartTolerance && w.Value.End > from).ToList())
+            {
+                moved[id] = row;
+                own.Remove(id);
+            }
+        }
+
+        written[key] = moved;
+        closed.Add(key);
+        current.Closed = key;
+        lifetime = start;
+        settled = settled is { } past && past > start ? past : start;
     }
 
     private void TakeHarness(Cycle current, QuietResult result)
@@ -472,7 +554,10 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     private void FinishCurrent(Cycle current, DateTimeOffset now)
     {
         var reader = current.Reader!;
-        var read = reader.Result;
+
+        // After T4 started again while the observer ran, its own reads take the new lifetime's intervals alone: the old one's
+        // are the range the restart closed, even one that ends after the start (a window a stop kept, if Query Store shows it).
+        var read = lifetime is { } start ? Began(reader.Result, start - StartTolerance, null) : reader.Result;
         Take(read, string.Empty, sidecar, current.Coverage, now);
         if (read.Failure is { } failure)
         {
@@ -486,13 +571,14 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
             through = newest;
         }
 
-        // Every interval that ended PublishedAfter before this read was published, and this read took it.
+        // Every interval that ended PublishedAfter before this read was published, and this read took it. What was written of
+        // the intervals after the last read that found T4's start is kept, so a range a restart closes from there has it.
         var surely = current.At - PublishedAfter;
         var reached = read.Complete ? surely : Earlier(surely, read.Through ?? reader.From);
         if (settled is null || reached > settled)
         {
             settled = reached;
-            Forget(string.Empty, reached);
+            Forget(string.Empty, confirmed is { } known && known < reached ? known : reached);
         }
     }
 
@@ -524,6 +610,12 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
                 coverage.Pending = (pending, current.At);
                 coverage.Gaps.Add(PgQueryStoreRows.PendingGap(Target, pending, current.At));
             }
+        }
+
+        // What had settled when this read found T4's start: a restart that a later read finds closes its range from there.
+        if (current.ServerStarted is not null)
+        {
+            confirmed = settled ?? schedule.FirstSince(observingSince);
         }
 
         Record(current.At, unsettled, current.Final, recording, coverage);
@@ -571,7 +663,10 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         FinishCycle(current);
     }
 
-    /// <summary>Earlier observations' unsettled time, oldest first, at most <see cref="BackfillsPerRead"/> ranges.</summary>
+    /// <summary>
+    /// Earlier observations' unsettled time, and the ranges this observation's restarts closed but the one this read closed
+    /// (the next read backfills it), oldest first, at most <see cref="BackfillsPerRead"/> ranges.
+    /// </summary>
     private Queue<PendingRange> PendingRanges(Cycle current)
     {
         var currentSpan = source.Spans?.CurrentSpan;
@@ -579,6 +674,7 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         {
             return new Queue<PendingRange>(source.Watermark.Read().Pending
                 .Where(p => !(string.Equals(p.SpanId, currentSpan, StringComparison.Ordinal) && p.ObservedFromUtc == observingSince))
+                .Where(p => !string.Equals(RangeKey(p), current.Closed, StringComparison.Ordinal))
                 .OrderBy(p => p.FromUtc)
                 .Take(BackfillsPerRead));
         }
@@ -592,12 +688,13 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     /// <summary>
     /// Starts reading an earlier range again into the sidecar of the span it belongs to (backfill true), until the interval
     /// that holds its end has surely been published and a read took it then; a range older than Query Store's retention
-    /// expires as a gap that says so, and one whose span the store no longer has is dropped.
+    /// expires as a gap that says so, and one whose span the store no longer has is dropped. A range this observation closed
+    /// at T4's start goes to its own sidecar.
     /// </summary>
     private void StartBackfill(Cycle current, PendingRange range, DateTimeOffset now)
     {
-        var key = range.SpanId + "|" + range.ObservedFromUtc.UtcTicks.ToString(CultureInfo.InvariantCulture);
-        if (source.Spans!.ForSpan(range.SpanId) is not { } sink)
+        var key = RangeKey(range);
+        if ((closed.Contains(key) ? sidecar : source.Spans!.ForSpan(range.SpanId)) is not { } sink)
         {
             log.Info("rca.querystore-forgotten", "An earlier span's pending Query Store time can't be backfilled: the store no longer has the span.", ("target", Target), ("span", range.SpanId));
             Remove(range, key);
@@ -642,28 +739,38 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
             return false;
         }
 
+        // T4's start as this read found it, against the range's (rca/README.md, A stop in the window). T4 started since the
+        // range was recorded, so the range splits at that start: before it, what Query Store held in memory at the stop
+        // shows by now or never will, so what this read doesn't show of it is lost, never pending; from it on, T4's new
+        // lifetime recorded it, so it waits for publication as any range does. Neither part is decided until an interval
+        // and the publication delay have passed after the start too, in case Query Store publishes a stopped window late
+        // (the live check L0a). A range with a recorded start waits while this read couldn't read T4's. The split stays at
+        // the first start a read found after the range's, which the range keeps: one a restart closed while the observer ran
+        // has it from the start, and a later restart before the range is decided doesn't move it.
+        var started = current.ServerStarted;
+        var restart = range.RestartedUtc ?? (started is { } start && range.ServerStartedUtc is { } before && start > before ? start : null);
+
+        // A range that ends by T4's start holds the old lifetime's intervals alone: the new lifetime's first window, which
+        // Query Store can date a fraction of a second before the start, is a later range's, or the observation's own.
+        if (restart is { } boundary && to <= boundary)
+        {
+            read = Began(read, null, boundary - StartTolerance);
+        }
+
         Take(read, key, sink, coverage, now);
         if (read.Failure is { } partial)
         {
             Failed(coverage, read.FailedBlock ?? PgQueryStoreRows.Statistics, partial);
         }
 
-        // T4's start as this read found it, against the range's (rca/README.md, A stop in the window). T4 started since the
-        // range was recorded, so the range splits at that start: before it, what Query Store held in memory at the stop
-        // shows by now or never will, so what this read doesn't show of it is lost, never pending; from it on, T4's new
-        // lifetime recorded it, so it waits for publication as any range does. Neither part is decided until an interval
-        // and the publication delay have passed after the start too, in case Query Store publishes a stopped window late
-        // (the live check L0a). A range with a recorded start waits while this read couldn't read T4's.
-        var started = current.ServerStarted;
-        DateTimeOffset? restart = started is { } start && range.ServerStartedUtc is { } before && start > before ? start : null;
         var settledAt = (restart is { } after && after > to ? after : to) + schedule.Interval + PublishedAfter;
         var done = read.Failure is null && read.Complete && (started is not null || range.ServerStartedUtc is null) && now >= settledAt;
 
-        // What Query Store shows: of the old lifetime, to the newest interval that began before T4's start; of the range, to
-        // the newest interval of all. T4's windows run from its start (the live check L0c): the new lifetime's first window
-        // begins at the start, so what it shows never covers the old lifetime's last minutes.
+        // What Query Store shows: of the old lifetime, to the newest interval that began before T4's start, by more than
+        // StartTolerance; of the range, to the newest interval of all. T4's windows run from its start (the live check L0c):
+        // the new lifetime's first window begins at the start, so what it shows never covers the old lifetime's last minutes.
         var shown = Newest(read.Statistics, reader.From, null);
-        var lostFrom = restart is { } begun ? Newest(read.Statistics, reader.From, begun) : shown;
+        var lostFrom = restart is { } begun ? Newest(read.Statistics, reader.From, begun - StartTolerance) : shown;
         var lostUntil = restart is { } stop && stop < to ? stop : to;
         var unshownBefore = restart is not null && lostFrom < lostUntil;
         if (done && unshownBefore)
@@ -689,6 +796,10 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         {
             Remove(range, key);
         }
+        else if (restart is { } first && range.RestartedUtc is null)
+        {
+            KeepRestart(range, first);
+        }
 
         return true;
     }
@@ -712,6 +823,41 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     }
 
     /// <summary>
+    /// A read with only the rows of the intervals that began at <paramref name="since"/> or after and before
+    /// <paramref name="until"/>, a bound that's null left open, and the newest end of those: one lifetime's at a restart.
+    /// </summary>
+    private static PgQueryStoreRead Began(PgQueryStoreRead read, DateTimeOffset? since, DateTimeOffset? until)
+    {
+        bool Within(CaptureValues row) => row.Time("interval_start_utc") is not { } start || ((since is null || start >= since) && (until is null || start < until));
+        var statistics = read.Statistics.Where(Within).ToList();
+        return read with { Statistics = statistics, Waits = [.. read.Waits.Where(Within)], Through = statistics.Count == 0 ? null : statistics.Max(r => r.Time("interval_end_utc")) };
+    }
+
+    /// <summary>A pending range's key: its span and the time it's known by, which what's written of it is kept under.</summary>
+    private static string RangeKey(PendingRange range) => range.SpanId + "|" + range.ObservedFromUtc.UtcTicks.ToString(CultureInfo.InvariantCulture);
+
+    private static bool Same(PendingRange a, PendingRange b) => string.Equals(a.SpanId, b.SpanId, StringComparison.Ordinal) && a.ObservedFromUtc == b.ObservedFromUtc;
+
+    /// <summary>Keeps on a range the first start of T4's a read found after the range's own, where the range splits.</summary>
+    private void KeepRestart(PendingRange range, DateTimeOffset restart)
+    {
+        try
+        {
+            source.Watermark.Update(state =>
+            {
+                foreach (var kept in state.Pending.Where(p => Same(p, range)))
+                {
+                    kept.RestartedUtc ??= restart;
+                }
+            });
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            log.Warn("rca.querystore-watermark", "The Query Store watermark couldn't be written.", ("target", Target), ("error", Redactor.Redact(ex.Message)));
+        }
+    }
+
+    /// <summary>
     /// Writes a read's statistics and waits to <paramref name="sink"/>: a row it wrote before for the same interval only
     /// when it changed, since a later read of an interval holds the same counts or more. The coverage takes every row read.
     /// </summary>
@@ -731,14 +877,15 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
             }
 
             var end = (DateTimeOffset)stats.Get("interval_end_utc")!;
-            coverage.Took((DateTimeOffset)stats.Get("interval_start_utc")!, end);
+            var begun = (DateTimeOffset)stats.Get("interval_start_utc")!;
+            coverage.Took(begun, end);
             coverage.Sources.Add(PgQueryStoreRows.Statistics);
             var id = Key("s", stats, plan: true);
             var signature = Signature(stats, StatsColumns);
             if (!seen.TryGetValue(id, out var before) || !string.Equals(before.Signature, signature, StringComparison.Ordinal))
             {
                 sink.Write(stats);
-                seen[id] = new Written(end, signature);
+                seen[id] = new Written(begun, end, signature);
             }
         }
 
@@ -755,7 +902,7 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
                     sink.Write(row);
                 }
 
-                seen[group.Key] = new Written((DateTimeOffset)rows[0].Get("interval_end_utc")!, signature);
+                seen[group.Key] = new Written((DateTimeOffset)rows[0].Get("interval_start_utc")!, (DateTimeOffset)rows[0].Get("interval_end_utc")!, signature);
             }
         }
     }
@@ -831,9 +978,10 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     private void Remove(PendingRange range, string key)
     {
         written.Remove(key);
+        closed.Remove(key);
         try
         {
-            source.Watermark.Update(state => state.Pending.RemoveAll(p => string.Equals(p.SpanId, range.SpanId, StringComparison.Ordinal) && p.ObservedFromUtc == range.ObservedFromUtc));
+            source.Watermark.Update(state => state.Pending.RemoveAll(p => Same(p, range)));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
         {
@@ -860,8 +1008,8 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     private string Lost(DateTimeOffset from, DateTimeOffset to) =>
         string.Create(CultureInfo.InvariantCulture, $"Lost when {Target} stopped: Query Store shows nothing of {from:yyyy-MM-dd HH:mm} to {to:yyyy-MM-dd HH:mm} UTC, which it still held in memory when {Target} stopped, and {Target} has started again since, so none of it will show.");
 
-    /// <summary>What was written of one row or wait group: its interval's end, and its values.</summary>
-    private sealed record Written(DateTimeOffset End, string Signature);
+    /// <summary>What was written of one row or wait group: its interval's start and end, and its values.</summary>
+    private sealed record Written(DateTimeOffset Start, DateTimeOffset End, string Signature);
 
     /// <summary>An earlier range under way: where its rows and coverage go, and where it ends.</summary>
     private sealed record BackfillRead(PendingRange Range, string Key, ISidecarSink Sink, QueryCoverage Coverage, DateTimeOffset To);
@@ -881,6 +1029,9 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
 
         /// <summary>T4's start, as this read's RCA-PG-13 found it; null when it couldn't read it.</summary>
         public DateTimeOffset? ServerStarted { get; set; }
+
+        /// <summary>The key of the range this read closed at T4's start, which the next read backfills.</summary>
+        public string? Closed { get; set; }
 
         public BackfillRead? Backfill { get; set; }
 

@@ -28,7 +28,10 @@ internal sealed class PendingRange
 {
     public string SpanId { get; set; } = string.Empty;
 
-    /// <summary>When the observation that recorded the range began: a span can observe T4 more than once.</summary>
+    /// <summary>
+    /// When the observation that recorded the range began: a span can observe T4 more than once. For a range that a restart
+    /// closed while the observer ran, T4's new start (rca/README.md, A restart while the observer runs).
+    /// </summary>
     public DateTimeOffset ObservedFromUtc { get; set; }
 
     /// <summary>The control session, once something knows it; the span's own binding (export.json) is what counts.</summary>
@@ -46,6 +49,13 @@ internal sealed class PendingRange
     /// since knows the window Query Store held in memory at the stop shows by now or never will.
     /// </summary>
     public DateTimeOffset? ServerStartedUtc { get; set; }
+
+    /// <summary>
+    /// The first start of T4's that a read found after <see cref="ServerStartedUtc"/>: the range splits there, and a later
+    /// restart before the range is decided doesn't move the split. A range that a restart closed while the observer ran
+    /// has it from the start.
+    /// </summary>
+    public DateTimeOffset? RestartedUtc { get; set; }
 }
 
 /// <summary>What <c>rca\query-watermark\&lt;target&gt;.json</c> holds.</summary>
