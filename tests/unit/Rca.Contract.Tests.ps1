@@ -789,4 +789,19 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         $adr = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'docs/adr/0031-incident-rca.md'))
         $adr | Should -Match ([regex]::Escape('A restart while the observer runs, such as maintenance or a scale, is reported the same way from the observer''s next read'))
     }
+
+    It 'states T4''s windows as L0a measured them, and calls no stretch of 2 seconds or less lost' {
+        # L0a, live on fc (2026-11-24): T4 stopped and started inside a window lost that window and kept the one before it,
+        # which Query Store had persisted about 30 s after its end; windows start on whole seconds, run exactly 15 minutes,
+        # and the next can start a second after the previous one ends. A2's 2fb849dc: that second lies in no window, so a
+        # range that ends inside it isn't reported "Lost when T4 stopped".
+        $readme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'README.md'))
+        $queryStore = [regex]::Match($readme, '(?s)### Query Store\r?\n.*?(?=\r?\n### )').Value
+        $queryStore | Should -Match ([regex]::Escape('L0a, 2026-11-24: each window starts on a whole second and runs exactly 15 minutes, and the next starts at its end or a second later, so a second can lie in no window'))
+        $pending = [regex]::Match($readme, '(?s)### Pending publication.*?(?=\r?\n### )').Value
+        $pending | Should -Match ([regex]::Escape('live, a window was persisted about 30 seconds after its end (L0a, 2026-11-24)'))
+        $pending | Should -Match ([regex]::Escape('A window can start a second after the one before it ends (L0a), and that second lies in no window, so a stretch of no more than 2 seconds after the old lifetime''s newest interval isn''t called lost'))
+        $pending | Should -Match ([regex]::Escape('The live check L0a (2026-11-24) found that a stop loses the window still in memory, and keeps the one before it'))
+        $pending | Should -Not -Match ([regex]::Escape('The live check L0a measures whether a stop keeps the window'))
+    }
 }
