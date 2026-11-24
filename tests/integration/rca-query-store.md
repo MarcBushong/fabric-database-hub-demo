@@ -233,6 +233,8 @@ SUMMARIZECOLUMNS(
    - `SqlIntegrationTests.SetupMarksExactlyTheHarnessModulesAsTheRcaReadsThem`, H's first run on a real SQL Server;
    - `RcaIntegrationTests`' SQL Server test, at the integration's head: with A1 merged, the observer runs the Query Store blocks (RCA-SQL-10, 11, 14, and 15, and 16 once A1 builds item 3) on an engine for the first time, so the report gives each read's time from the runner's log;
    - A1's real-engine test for the runner's own statements, once it's built (item 3): every statement Query Store records from DemoDatabase's methods matches the list.
+   - `RcaSqlObserverStatementsTests.OnSqlServerEveryStatementTheEarlierObserverSentIsMatched` (A1's c5d8e74b): the observer's statements as the release's runner sent them, without the marker. It runs serially with `RcaIntegrationTests`, since both create the server's event session. **Passed on SQL Server 2022 CU25 (2026-11-24):** every text Query Store kept had parameterization None and matched a catalog statement, and RCA-SQL-16 left out all 11. Query Store keeps an `IF` as its condition alone, so the list's other forms of one are a harmless superset. Run it again at the integration's head.
+     - **T3's read** of fc's Query Store texts, in L0a's window: whether Azure SQL Database's simple parameterization keeps any of those statements in another form. If it does, A1 lists that form, and S7's `observer-catalog` set takes it too.
 
 ## T4's live checks (S11)
 
