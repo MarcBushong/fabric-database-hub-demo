@@ -710,6 +710,70 @@ public sealed partial class RcaQueryStorePgTests : IDisposable
         Assert.Equal((At(16, 47), At(18, 1, 30_000), (DateTimeOffset?)At(18, 21, 30_000), (DateTimeOffset?)restarted), (last.ObservedFromUtc, last.FromUtc, last.ToUtc, last.ServerStartedUtc));
     }
 
+    [Theory]
+    [InlineData(false)]
+    [InlineData(true)]
+    public async Task ARestartIsLostFromWhereTheLastReadThatFoundT4sStartHadSettled(bool observerGone)
+    {
+        // As above, but the 17:17 read can't read T4's start: its RCA-PG-13 fails, as it can while the evidence reconnects
+        // after the restart, and its reads on azure_sys don't. They settle the time to 16:57, past the start of the window T4
+        // held in memory at its stop, 16:55:16, though nothing has told the observation that T4 started again. What T4 lost
+        // runs from where the last read that found T4's start, at 17:02, had settled: 16:42. Either the observer runs on, and
+        // the next read closes the old lifetime's time from there at the restart; or its process is gone first, and the range
+        // it keeps for its span starts there, which the next session's backfill reads. Span A has one sidecar, as in the store.
+        var cancellationToken = TestContext.Current.CancellationToken;
+        var started = At(16, 40, 15_800);
+        var restarted = At(17, 7, 42_300);
+        List<(DateTimeOffset Start, DateTimeOffset End)> windows = [AnchoredWindows(started, 0.2)[0], .. AnchoredWindows(At(17, 7, 42_000), 0.2, 0, 1, 0)];
+        var store = new T4QueryStore([.. windows.SelectMany(WindowStatistics)], [.. windows.SelectMany(WindowWaits)]) { PublishedAfter = TimeSpan.FromMinutes(4), ServerStarted = started };
+        var watermark = Watermark();
+        var spans = new MemorySpans { CurrentSpan = SpanA };
+        var sidecar = spans.Add(SpanA);
+        var capture = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), sidecar, new PgSidecarOptions(), RunnerLog.Null);
+        await ReadAtAsync(capture, store, At(16, 47));
+        await ReadAtAsync(capture, store, At(17, 2));
+        store.ServerStarted = restarted;
+        store.Access.Failure = b => b == "RCA-PG-13" ? QuietResult.Failed(CaptureFailureKind.Connection, "Exception while reading from stream (a test's).") : null;
+        await ReadAtAsync(capture, store, At(17, 17));
+        store.Access.Failure = null;
+
+        Assert.Equal(At(16, 57), capture.Settled);
+        var kept = Assert.Single(watermark.Read().Pending);
+        Assert.Equal((At(16, 42), (DateTimeOffset?)null, (DateTimeOffset?)started), (kept.FromUtc, kept.ToUtc, kept.ServerStartedUtc));
+        var lostGap = "Lost when T4 stopped: Query Store shows nothing of 2026-11-20 16:55 to 2026-11-20 17:07 UTC, which it still held in memory when T4 stopped, and T4 has started again since, so none of it will show.";
+        if (observerGone)
+        {
+            // Session B's observer starts at 18:17 with T4 up. Its backfill reads span A's range to one interval after it was
+            // last recorded, 17:32, finds that T4 started since, and the range has settled after the start.
+            spans.CurrentSpan = SpanB;
+            var next = new PgQueryStoreCapture(store.Access, new PgQueryStoreSource(store.Connector, watermark, spans), new MemorySidecar(), new PgSidecarOptions(), RunnerLog.Null);
+            await ReadAtAsync(next, store, At(18, 17));
+            var backfill = sidecar.Table(RcaContract.QueryCoverage)[^1];
+            Assert.True(backfill.Get("backfill") is true);
+            Assert.Equal((At(16, 42), At(17, 32)), ((DateTimeOffset)backfill.Get("window_start_utc")!, (DateTimeOffset)backfill.Get("window_end_utc")!));
+            Assert.Null(backfill.Get("pending_from_utc"));
+            Assert.Equal(lostGap, backfill.Get("gaps"));
+            Assert.DoesNotContain(watermark.Read().Pending, p => p.SpanId == SpanA);
+        }
+        else
+        {
+            // The observer runs on. The 17:32 read finds T4's start and closes the old lifetime's time from 16:42, and the
+            // 17:47 read's backfill finds the window T4 held in memory lost from 16:55:16. Each interval is taken once.
+            await ReadAtAsync(capture, store, At(17, 32));
+            var closed = Assert.Single(watermark.Read().Pending, p => p.ObservedFromUtc == restarted);
+            Assert.Equal((At(16, 42), (DateTimeOffset?)restarted, (DateTimeOffset?)started), (closed.FromUtc, closed.ToUtc, closed.ServerStartedUtc));
+            foreach (var at in new[] { At(17, 47), At(18, 2), At(18, 17) })
+            {
+                await ReadAtAsync(capture, store, at);
+            }
+
+            store.Clock = At(18, 21, 30_000);
+            await capture.EndAsync(store.Clock, cancellationToken);
+            Assert.Equal(lostGap, Assert.Single(Gaps(sidecar), g => g.StartsWith("Lost", StringComparison.Ordinal)));
+            AssertTakenOnce(sidecar, windows);
+        }
+    }
+
     [Fact]
     public async Task ARangeSplitsAtTheFirstRestartABackfillFindsAndALaterOneDoesNotMoveIt()
     {

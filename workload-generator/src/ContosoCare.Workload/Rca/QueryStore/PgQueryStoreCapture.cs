@@ -618,7 +618,10 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
             confirmed = settled ?? schedule.FirstSince(observingSince);
         }
 
-        Record(current.At, unsettled, current.Final, recording, coverage);
+        // The range this observation keeps starts there too. A read that couldn't read T4's start may have settled past the
+        // start of the window T4 held in memory at a stop that no read found yet, and the next session's backfill, which
+        // finds it, splits the range from where it starts.
+        Record(current.At, confirmed is { } known ? Earlier(unsettled, known) : unsettled, current.Final, recording, coverage);
         sidecar.Write(PgQueryStoreRows.Coverage(Target, coverage));
         lastRead = current.At;
     }
@@ -919,7 +922,7 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         }
     }
 
-    /// <summary>Keeps this observation's unsettled time in the watermark: open while it runs, closed at its end.</summary>
+    /// <summary>Keeps this observation's unsettled time, from <paramref name="unsettled"/>, in the watermark: open while it runs, closed at its end.</summary>
     private void Record(DateTimeOffset now, DateTimeOffset unsettled, bool final, bool recording, QueryCoverage coverage)
     {
         var span = source.Spans?.CurrentSpan;
