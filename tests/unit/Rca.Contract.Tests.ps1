@@ -749,4 +749,20 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         $readme | Should -Match ([regex]::Escape('T4''s windows don''t end on the quarter hours: they run from the server''s start (`pg_postmaster_start_time()`), and a stop and start moves them'))
         $readme | Should -Match ([regex]::Escape('That changes only when a read comes, never what it takes, which follows the intervals'' own times'))
     }
+
+    It 'reports a restart while the observer runs as a stop, from its next read, and takes each interval once' {
+        # Moved into this release after the review of A2's a9c3c5e1 (2026-11-24): maintenance or a scale restarts T4 between
+        # two reads, and the window it held in memory is lost, as at a demo stop.
+        $readme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'README.md'))
+        $pending = [regex]::Match($readme, '(?s)### Pending publication.*?(?=\r?\n### )').Value
+        $pending | Should -Not -BeNullOrEmpty
+        $pending | Should -Match ([regex]::Escape('- **A restart while the observer runs**'))
+        $pending | Should -Match ([regex]::Escape('closes what the observation hadn''t settled as a pending range of its span and session, from its last settled point to the new start, with the earlier start'))
+        $pending | Should -Match ([regex]::Escape('the window T4 held in memory is "Lost when T4 stopped"'))
+        $pending | Should -Match ([regex]::Escape('The observation''s own reads go on from the new start, so each interval is taken once'))
+        $pending | Should -Match ([regex]::Escape('or at its next read for a range that a restart closed while it ran'))
+        $pending | Should -Match ([regex]::Escape('the new lifetime''s first window can show a fraction of a second before the start: it''s still the new lifetime''s'))
+        $adr = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'docs/adr/0031-incident-rca.md'))
+        $adr | Should -Match ([regex]::Escape('A restart while the observer runs, such as maintenance or a scale, is reported the same way from the observer''s next read'))
+    }
 }
