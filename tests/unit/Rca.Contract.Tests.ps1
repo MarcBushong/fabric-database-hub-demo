@@ -804,4 +804,15 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         $pending | Should -Match ([regex]::Escape('The live check L0a (2026-11-24) found that a stop loses the window still in memory, and keeps the one before it'))
         $pending | Should -Not -Match ([regex]::Escape('The live check L0a measures whether a stop keeps the window'))
     }
+
+    It 'matches T4''s sampled waits to its statistics by interval start, which L0b found the two views share' {
+        # L0b, live on fc (2026-11-24): pgms_wait_sampling_view's and qs_view's distinct window starts were identical, 12 of
+        # 12, to the microsecond, the 1-second gap and 5-minute windows included. RCA-PG-14 joins the waits on start_time,
+        # and the reader keeps RCA-PG-15's rows by interval start, role, and query.
+        $readme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'README.md'))
+        $queryStore = [regex]::Match($readme, '(?s)### Query Store\r?\n.*?(?=\r?\n### )').Value
+        $queryStore | Should -Match ([regex]::Escape('on T4, a role''s query''s sampled waits (RCA-PG-15, from `pgms_wait_sampling_view`) go with its statistics by the interval''s start, which the two views share (L0b, 2026-11-24: 12 windows of 12, to the microsecond, the 1-second gap and 5-minute windows included)'))
+        $catalog = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'capture/postgresql.sql'))
+        $catalog | Should -Match ([regex]::Escape('ON w.start_time = s.start_time AND w.query_id = s.query_id'))
+    }
 }
