@@ -34,6 +34,10 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - **The ready-to-run Query Store query in the RCA's next step** (added in Kept values and realistic names) now goes only with minutes this history holds no Query Store evidence for. Where it holds them, the rules' next steps take its place, and the incident's details carry the evidence as `explain_queries` gives it.
 - **The control vault's metrics secret** gains `rcaSidecars`, a pointer of at most 300 bytes to the session's sidecar index, out of T5's share; the `rca` member keeps its 4,000 bytes.
 
+### Fixed
+
+- **Run all's readiness no longer shows a false Fail while a cold-started target's first sample is on its way** (2026-11-24, [troubleshooting](docs/troubleshooting.md#database-hub-and-telemetry)). When the session's own start brought the VMs up, readiness could run before T2's nested guest sent its first sample, so a presenter saw `HUB.TELEMETRY.T2` **Fail**, "No telemetry from T2 arcsql01 in the last 60 minutes", in the demo's main flow; live, T2's first sample came 7.4 minutes after Azure accepted its host's start, and T1's 3.1. Now such a target is a **Warning** that says whether it reports can't be known yet, and when Run all checks it again: its live view runs the checks again 20 minutes after the later of the target's VM start and its activity's dispatch (with several such targets, the latest), and at 30 minutes if it hasn't reported by then, which decides: a **Pass** as soon as it has reported, and a **Fail** only then, or at the live view's end when that comes first, never before the 20 minutes. Each run saves its results, so the Readiness page shows the latest. A warm start's target without telemetry stays a **Fail**.
+
 ### Security
 
 - **No new permission, resource, or secret:** the observer reads Query Store with the access it already has (SYSTEM on T1 and in T2's guest, T3's administrator group, and on T4 `pg_read_all_stats`, which the runner's setup grants), Run all's path uses the session control's existing secret and Run Commands, and the scripts your existing roles.
