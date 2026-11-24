@@ -308,6 +308,7 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
     /// <summary>
     /// What a span has for this export: each target's window and rows, the new answer-key rows, and how far each file was
     /// read. No window starts before <paramref name="boundary"/>: rows before it are left out, and not counted as late.
+    /// Nor does the answer key take a run that began before it (<see cref="BeforeBoundary"/>).
     /// </summary>
     private static SpanPlan Read(SpanInfo span, DateTimeOffset now, DateTimeOffset? boundary)
     {
@@ -376,7 +377,33 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
             }
         }
 
+        if (boundary is { } mark)
+        {
+            BeforeBoundary(plan.AnswerKey, mark);
+        }
+
         return plan;
+    }
+
+    /// <summary>
+    /// Leaves out of a control session's answer key the runs that began before its boundary, with their events: the recorder
+    /// writes a run when it ends, timed at its start (AnswerKeyRecorder), so a run the session's start found running, such as
+    /// deploy.ps1's activity profile until the session's activity replaced it, comes after the boundary, and the scoreboard
+    /// would grade it as the session's. A row goes by its run's start when its run's row is in this read, otherwise by its own
+    /// time.
+    /// </summary>
+    private static void BeforeBoundary(List<CaptureRow> answerKey, DateTimeOffset cut)
+    {
+        var started = new Dictionary<string, DateTimeOffset>(StringComparer.Ordinal);
+        foreach (var row in answerKey)
+        {
+            if (row.Get("kind") is "run" && row.Get("scenario_run_id") is string run)
+            {
+                started.TryAdd(run, row.At);
+            }
+        }
+
+        answerKey.RemoveAll(row => (row.Get("scenario_run_id") is string run && started.TryGetValue(run, out var at) ? at : row.At) < cut);
     }
 
     /// <summary>What one span's export made: its document, what it took of a sessionless budget, and what the index's message counts.</summary>

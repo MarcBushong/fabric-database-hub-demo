@@ -32,6 +32,9 @@ public sealed class RcaExportTests : IDisposable
 
     private static readonly DateTimeOffset SessionlessExport = At(16, 25, 20);
 
+    /// <summary>One run in the answer key: its run row, then the events it reported.</summary>
+    private static readonly string[] OneRunsKinds = ["run", "run-event", "run-event"];
+
     private readonly string root = Path.Combine(Path.GetTempPath(), "rca-store-" + Guid.NewGuid().ToString("N"));
 
     public void Dispose()
@@ -349,6 +352,49 @@ public sealed class RcaExportTests : IDisposable
 
         Assert.Equal(At(16, 0, 0), WindowStart(save));
         Assert.Equal(Every(At(16, 0, 15), At(16, 29, 45), 15), ResourceTimes(save, "T3"));
+    }
+
+    [Fact]
+    public void ATargetsRowsFromBeforeTheExportWithNoSessionThatItReadsLaterArentLate()
+    {
+        // T3's resource stats were read at 16:05, so the start's export with no session took T3 to there. Its next read, at
+        // 16:35, brings the rows from 16:05 on: those before the start's export aren't the session's, and they aren't late
+        // either, since no window took them.
+        var (store, clock, span, exporter) = StartWithTheVmRunning(t3ReadTo: At(16, 5, 0));
+        ReadT3(span, clock, At(16, 5, 15), At(16, 35, 0));
+        WriteSentinel(span, At(16, 25, 30), At(16, 56, 0));
+        Mark(span, clock, "T1", At(16, 56, 0), At(16, 56, 5));
+        clock.Set(At(16, 56, 10));
+
+        var recheck = exporter.Export(Session, final: false, TimeSpan.Zero);
+
+        Assert.Equal("Pass", recheck.Status);
+        Assert.DoesNotContain("arrived after their window", recheck.Message, StringComparison.Ordinal);
+        var view = Decode(store, Assert.Single(recheck.Documents));
+        Assert.Equal(Every(At(16, 25, 30), At(16, 34, 45), 15), ResourceTimes(view, "T3"));
+        Assert.DoesNotContain(view.Table("rca_coverage"), r => r.GetValueOrDefault("gaps") is string gaps && gaps.Contains("arrived after", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void ASessionsAnswerKeyLeavesOutARunThatBeganBeforeTheExportWithNoSessionWithItsEvents()
+    {
+        // fc's start found deploy.ps1's activity profile running a fault, which the session's activity stopped after the
+        // start's export with no session. The recorder writes a run when it ends, timed at its start, so the session's first
+        // document took it, and the scoreboard would have graded a fault the session didn't inject.
+        var (store, clock, span, exporter) = StartWithTheVmRunning();
+        RecordRun(store, "20261120162000-t1-0d0e0f", At(16, 20, 0), At(16, 25, 40), "Cancelled", new(At(16, 22, 0), "lock-escalation", 71, "Table lock: yes."), new(At(16, 25, 40), "run-end", 63, "Cancelled"));
+        RecordRun(store, "20261120163000-t1-a1b2c3", At(16, 30, 0), At(16, 40, 0), "Completed", new(At(16, 35, 0), "lock-escalation", 71, "Table lock: yes."), new(At(16, 40, 0), "run-end", 63, "Completed"));
+        WriteSentinel(span, At(16, 25, 30), At(16, 56, 0));
+        Mark(span, clock, "T1", At(16, 56, 0), At(16, 56, 5));
+        clock.Set(At(16, 56, 10));
+
+        var view = Decode(store, Assert.Single(exporter.Export(Session, final: false, TimeSpan.Zero).Documents));
+
+        var key = view.AnswerKey();
+        Assert.Equal(OneRunsKinds, key.Select(r => (string)r["kind"]!));
+        Assert.All(key, r => Assert.Equal("20261120163000-t1-a1b2c3", r["scenario_run_id"]));
+        // The run's last event came after the start's export, but it's the earlier run's.
+        Assert.DoesNotContain(key, r => (DateTimeOffset)r["event_time_utc"]! == At(16, 25, 40));
     }
 
     [Fact]
@@ -930,16 +976,22 @@ public sealed class RcaExportTests : IDisposable
 
     /// <summary>
     /// fc's start: the observer has captured T1 and T3 since 16:00 for activity outside a Run all session, and T3, whose
-    /// resource stats it reads every 30 minutes, is complete only to 16:00. The session is accepted at 16:24:29, and its
-    /// start's export, with no session because the VM ran before it, takes T1 to its watermark at 16:25:20.
+    /// resource stats it reads every 30 minutes, is complete only to 16:00, or to <paramref name="t3ReadTo"/> when one more
+    /// read came before the start. The session is accepted at 16:24:29, and its start's export, with no session because
+    /// the VM ran before it, takes T1 to its watermark at 16:25:20.
     /// </summary>
-    private (EvidenceStore Store, ManualTime Clock, SpanWriter Span, Exporter Exporter) StartWithTheVmRunning()
+    private (EvidenceStore Store, ManualTime Clock, SpanWriter Span, Exporter Exporter) StartWithTheVmRunning(DateTimeOffset? t3ReadTo = null)
     {
         var store = Store(At(16, 0, 0), out var clock);
         var span = store.Open(At(16, 0, 0));
         span.Began("T1", At(16, 0, 0));
         span.Began("T3", At(16, 0, 0));
         Mark(span, clock, "T3", At(16, 0, 0), At(16, 0, 22));
+        if (t3ReadTo is { } readTo)
+        {
+            ReadT3(span, clock, At(16, 0, 15), readTo);
+        }
+
         WriteSentinel(span, At(16, 0, 0), At(16, 25, 10));
         Mark(span, clock, "T1", At(16, 25, 10), At(16, 25, 15));
         clock.Set(SessionlessExport);
@@ -953,6 +1005,29 @@ public sealed class RcaExportTests : IDisposable
     {
         clock.Set(now);
         span.Watermark(target, complete);
+    }
+
+    /// <summary>One fault run of T1's in the answer key, as the recorder writes it when the run ends.</summary>
+    private static void RecordRun(EvidenceStore store, string runId, DateTimeOffset started, DateTimeOffset ended, string status, params Sql.RunEvent[] events)
+    {
+        var result = new Runs.RunResult
+        {
+            RunId = runId,
+            ScenarioId = "blocking-chain",
+            Target = DemoTarget.T1,
+            Status = status,
+            Result = "Pass",
+            Outcome = status,
+            StartedAt = started,
+            EndedAt = ended,
+            Concurrency = 8,
+            Intensity = 8,
+            Parameters = new Dictionary<string, string>(StringComparer.Ordinal),
+        };
+        foreach (var row in Rca.AnswerKey.AnswerKeyRecorder.Rows(DemoTarget.T1, result, events))
+        {
+            Assert.True(store.AppendAnswerKey(row));
+        }
     }
 
     /// <summary>One read of T3's resource stats: a row every 15 s from <paramref name="from"/> to <paramref name="to"/>, and T3 complete to <paramref name="to"/> 22 s later.</summary>

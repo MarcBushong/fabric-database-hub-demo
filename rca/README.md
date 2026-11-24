@@ -26,7 +26,7 @@ What the runner's observer captures, how it reaches the history, and what the In
 The product is blind: the rules, the investigation tools, the RCA view, and the chat use only what a real DBA's tools would show: the observer's capture, Azure Monitor's metrics, and Database Hub's telemetry. Grading against what the workload injected exists for the tests and the evaluation set, and for the scoreboard's "Did we catch it?" trust moment, and nowhere else ([ADR 0031](../docs/adr/0031-incident-rca.md)).
 
 - **The capture is blind:** the observer never reads the workload's plan, the scenario catalog, `demo.scenario_runs`, or `demo.scenario_run_events`, and its cadence follows what it sees, not what's scheduled. It records names only as [Names](#names) says.
-- **The answer key is separate:** the runner adds its own runs and their events to each document's `answerKey` section, with its own string dictionary. The notebook writes them only to `rca_answer_key`. No detection table carries a scenario name, a run ID, or a workload-reported event.
+- **The answer key is separate:** the runner adds its own runs and their events to each document's `answerKey` section, with its own string dictionary. The notebook writes them only to `rca_answer_key`. No detection table carries a scenario name, a run ID, or a workload-reported event. A control session's export leaves out a run that began before the host's last export with no session, with the run's events (since 2026-11-23): the runner records a run when it ends, timed at its start, so a run that a session's start found running, such as a fault of `deploy.ps1`'s activity profile, would otherwise be graded as the session's.
 - **Enforced:** [blind-detection.json](blind-detection.json) lists the model tables and telemetry analyses detection may read, the answer key's tables, and the identifiers detection code must never contain (every scenario ID among them). The app's and the runner's tests fail when detection code names one; the dock's `run_dax` refuses DAX that names an answer-key table.
 
 ## Capture triggers
@@ -75,7 +75,7 @@ One JSON document per host and export, UTF-8, no byte order mark. The schema say
 | `documentId` | `<windowStartUtc as yyyyMMddTHHmmssZ>-<host>-<sequence, 4 digits>`, for example `20261120T165000Z-sqlvm01-0001`. Unique; the notebook writes a document once |
 | `sessionId` | The control's session ID (32 lowercase hex, the resource group's `DbHubSessionId`), or null outside a control session |
 | `producer` | `ContosoCare.Workload`, its version, the host (`sqlvm01` or `arcsql01`), lane `observer` |
-| `windowStartUtc`, `windowEndUtc` | The slice of capture this document holds, start inclusive, end exclusive. One host's documents never overlap for a target: each export starts where the previous one ended. Like `epochUtc`, ISO 8601 UTC with milliseconds: `2026-11-20T16:50:00.000Z` |
+| `windowStartUtc`, `windowEndUtc` | The slice of capture this document holds, start inclusive, end exclusive. One host's documents never overlap for a target: each export starts where the previous one ended, or, for a control session's export, at the host's last export with no session when that's later ([the runner's commands](#the-runners-commands)). Like `epochUtc`, ISO 8601 UTC with milliseconds: `2026-11-20T16:50:00.000Z` |
 | `sequence`, `final` | The export's number for the host and session, from 1; `final` on the session's last |
 | `targets` | The targets covered; each has an `rca_coverage` row |
 | `epochUtc` | The base of every time in the document |
