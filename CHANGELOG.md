@@ -2,7 +2,7 @@
 
 All notable changes to this project are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and each release is a dated merge to `main`.
 
-## [Unreleased]
+## [2026-11-24] - Kept values and realistic names
 
 **The history counts a minute once** (F35, design (i), approved by the owner on 2026-11-23): where the notebook's saves overlap, each minute counts from its finest save, in the history report, the Insights app's views, and Ask ([ADR 0014](docs/adr/0014-notebook-role-and-capacity.md#amendment-2026-11-23-overlapping-saves-resolved-when-history-is-saved-f35-design-i)). **How to update:** run `./scripts/deploy.ps1`, which adds three columns to the lakehouse's history and works them out, then deploys the history model that reads them; there's nothing to set.
 
