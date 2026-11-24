@@ -223,6 +223,19 @@ BeforeAll {
         return (& $script:rcaRunner $Command)
     }
 
+    # A Run Command list as Azure returns it when it wasn't asked for instance views (review of e058e5fe): each entry
+    # without properties.instanceView, which only '?$expand=instanceView' adds.
+    function Remove-TestInstanceView([string] $Json) {
+        $parsed = ConvertFrom-Json -InputObject $Json
+        foreach ($item in @($parsed.value)) {
+            $properties = $item.PSObject.Properties['properties']
+            if ($null -ne $properties -and $null -ne $properties.Value -and $null -ne $properties.Value.PSObject.Properties['instanceView']) {
+                $properties.Value.PSObject.Properties.Remove('instanceView')
+            }
+        }
+        return (ConvertTo-Json -InputObject $parsed -Depth 8)
+    }
+
     # The Automation sandbox's internal cmdlets for an existing variable, as the runbooks call them.
     function Set-AutomationVariable([string] $Name, [object] $Value) {
         if ($script:variableMissing) {
@@ -483,6 +496,8 @@ BeforeAll {
             }
             '/virtualMachines/(\w+)/runCommands(\?\$expand=instanceView)?$' {
                 $listed = $Matches[1]
+                # Instance views only when the list asks for them, as Azure does.
+                $expand = -not [string]::IsNullOrEmpty([string]$Matches[2])
                 $open = @()
                 if ($script:rcaListOpen) {
                     $open = @($script:rcaCommands | Where-Object { $_.Vm -eq $listed -and $script:rcaDeleted -notcontains $_.Name } | ForEach-Object {
@@ -501,10 +516,18 @@ BeforeAll {
                 if ($script:runCommands.ContainsKey($listed)) {
                     # An entry can be a scriptblock, run at each list: a Run Command Azure lists only for a while.
                     $raw = @($script:runCommands[$listed] | ForEach-Object { if ($_ -is [scriptblock]) { & $_ } else { $_ } })
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @($raw + $open) } -Depth 8))
+                    $json = ConvertTo-Json -InputObject @{ value = @($raw + $open) } -Depth 8
+                    if (-not $expand) {
+                        $json = Remove-TestInstanceView -Json $json
+                    }
+                    return (New-Response 200 $json)
                 }
                 if ($open.Count -gt 0) {
-                    return (New-Response 200 (ConvertTo-Json -InputObject @{ value = @(@(@{ name = ('DbHubControl-{0}-20261026000000' -f $listed) }, @{ name = 'DbHubDemo-Other' }) + $open) } -Depth 8))
+                    $json = ConvertTo-Json -InputObject @{ value = @(@(@{ name = ('DbHubControl-{0}-20261026000000' -f $listed) }, @{ name = 'DbHubDemo-Other' }) + $open) } -Depth 8
+                    if (-not $expand) {
+                        $json = Remove-TestInstanceView -Json $json
+                    }
+                    return (New-Response 200 $json)
                 }
                 return (New-Response 200 ('{{"value":[{{"name":"DbHubControl-{0}-20261026000000"}},{{"name":"DbHubDemo-Other"}}]}}' -f $listed))
             }
@@ -4467,6 +4490,52 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         $messages | Should -Match 'archost01 takes one Run Command at a time \(R871\), and another Run Command was still there when this export''s time was up, so this export sent nothing there'
     }
 
+    It 'waits for another Run Command Azure lists as being deleted on the T2 host only as long as for an hour-old one of the export''s (review of e058e5fe; R871, 2026-11-17)' {
+        $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; steps = @(); rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @('0123456789abcdef0123456789abcdef'); documents = @(); pending = @(); leftVms = @(); final = $false; status = 'Pass'; message = '' } }
+        $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+        $script:vm = @{ sqlvm01 = 'deallocated'; archost01 = 'deallocated' }
+        $script:t4 = 'Stopped'
+        $script:replica = ''
+        $script:autostop = ''
+        $script:groupTags = @{ DbHubT4Replica = 'Session' }
+        $script:t4ReadyAt = $script:clock.AddMinutes(4)
+        $id = '20261027T142000Z-archost01-0001'
+        Set-ServedRunner -Case @(@{ Id = $id; Session = $script:fixtureSession }) -Vm @('archost01')
+        $script:rcaListOpen = $true
+        # One of the scripts' Run Commands, with no time in its name, that Azure goes on listing as being deleted, with the
+        # instance view it had when its delete began.
+        $script:runCommands['archost01'] = @(@{ name = 'DbHubDemo-Bootstrap'; properties = @{ provisioningState = 'Deleting'; instanceView = @{ executionState = 'Running' } } })
+        $started = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = 'fedcba9876543210fedcba9876543210'; requestedBy = 'presenter' }) -Context (New-TestContext)
+        $started.status | Should -BeIn 'Started', 'Partial'
+        # The export's read is its first Run Command step at the start's fetch, so its time is the fetch's start.
+        $read = @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-rca-archost01-x-\d{14}$' })[0]
+        $parts = @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'part' })
+        $parts.Count | Should -Be @($script:servedParts[$id]).Count -Because 'the evidence is fetched whole within the start''s bound'
+        $wait = ($parts[0].At - $read.At).TotalSeconds
+        $wait | Should -BeGreaterOrEqual 90 -Because 'its delete goes first for DbHubRcaStaleWaitSeconds'
+        $wait | Should -BeLessOrEqual 100 -Because 'and then it goes beside one that''s stuck'
+        @((Get-SessionStatus).rcaEarlier.documents.documentId) | Should -Contain $id
+    }
+
+    It 'lists the T2 host''s Run Commands with their instance views for a busy host, as Azure gives them only when asked (review of e058e5fe)' {
+        $listPath = '/subscriptions/00000000-0000-0000-0000-000000000000/resourceGroups/rg-dbhubdemo-demo/providers/Microsoft.Compute/virtualMachines/archost01/runCommands'
+        $script:runCommands['archost01'] = @(
+            @{ name = 'DbHubControl-archost01-20261027145900'; properties = @{ provisioningState = 'Succeeded'; instanceView = @{ executionState = 'Running' } } }
+            @{ name = 'DbHubDemo-Profile'; properties = @{ provisioningState = 'Succeeded'; instanceView = @{ executionState = 'Succeeded' } } }
+            @{ name = 'DbHubDemo-Bootstrap'; properties = @{ provisioningState = 'Deleting'; instanceView = @{ executionState = 'Running' } } }
+        )
+        # The test's Azure gives no instance view to a list that doesn't ask for them, as Azure doesn't.
+        $plain = (Invoke-TestAzure -Method GET -Path $listPath).Body
+        @($plain.value | Where-Object { $null -ne $_.properties.PSObject.Properties['instanceView'] }) | Should -BeNullOrEmpty
+        $expanded = (Invoke-TestAzure -Method GET -Path ($listPath + '?$expand=instanceView')).Body
+        @($expanded.value | Where-Object { $null -ne $_.properties.PSObject.Properties['instanceView'] }).Count | Should -Be 3
+        $listed = Get-DbHubRcaListed -Context (New-TestContext) -VmName 'archost01' -AnyBusy
+        $listed.Ok | Should -BeTrue
+        @($listed.Busy) | Should -Be @('DbHubControl-archost01-20261027145900') -Because 'a dispatch that runs is busy only by its instance view'
+        @($listed.Stale) | Should -Be @('DbHubDemo-Bootstrap') -Because 'one being deleted waits a bounded time, whatever its instance view says'
+        (Test-DbHubRcaHostFree -Context (New-TestContext) -VmName 'archost01').Free | Should -BeFalse
+    }
+
     It 'fetches at the next start an earlier session''s pending document on a VM whose final export ran, not only on the VMs it left (review of 15ad76d)' {
         # Its stop's export didn't run on sqlvm01, and left one document on archost01 that it didn't fetch whole.
         $reference = @(($script:fixtureIndex | ConvertFrom-Json).documents | Where-Object documentId -EQ $script:fixtureIds[1])[0]
@@ -5660,32 +5729,35 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
         }
 
         It 'sends the acknowledgements within the start''s bound, which the earlier session''s evidence and the sidecars share' {
-            # The session before it left sidecars on the VMs, so the start fetches them, after its acknowledgements.
+            # The session before it left sidecars on the VMs, so the start fetches them, each VM after its acknowledgements.
             $previous = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $true; finalRan = $true; status = 'Pass'; message = '' }; rcaSidecar = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); offered = 3; fetched = 0; left = 3; waiting = $true; status = 'Warning'; message = 'cut'; index = '' } }
             $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
             Set-TestSessionStart
             # sqlvm01's acknowledgement takes 100 seconds.
             Set-SidecarRunner -AckSeconds 100
-            $script:fetch = $null
-            Mock Invoke-DbHubRcaSidecarSession { $script:fetch = [pscustomobject]@{ At = $script:clock; DeadlineUtc = $DeadlineUtc }; return [pscustomobject]@{ State = (ConvertTo-DbHubRcaSidecarState -State $null -SessionId $SessionId); Lines = @() } }
+            # Each pass of the sidecar fetch: when it began, its deadline, and its VMs.
+            $script:fetches = [System.Collections.Generic.List[object]]::new()
+            Mock Invoke-DbHubRcaSidecarExport { $script:fetches.Add([pscustomobject]@{ At = $script:clock; DeadlineUtc = $DeadlineUtc; OnlyVm = @($OnlyVm) }); return [pscustomobject]@{ Hosts = @(); Fetched = [ordered]@{}; Left = [ordered]@{}; Fenced = $false } }
             $request = @{ action = 'session'; sessionId = $script:nextSession; requestedBy = 'presenter'; rcaAcks = [ordered]@{ kind = 'ContosoCare.RcaAckRequest'; version = 1; documents = @('20261120T165000Z-sqlvm01-0001-sidecar') } }
             $started = Invoke-DbHubControl -WebhookData (New-Webhook $request) -Context (New-TestContext)
             $started.status | Should -BeIn 'Started', 'Partial'
             (Get-SessionStatus).rcaAcks.status | Should -Be 'Pass'
             (Get-SessionStatus).rcaAcks.message | Should -Be '1 sidecar acknowledgement(s) sent before the start''s sidecar fetch: 1 on sqlvm01.'
             $ack = @(Get-SidecarCommand -Kind 'ack')[0]
-            ($script:fetch.DeadlineUtc - $ack.At).TotalSeconds | Should -BeLessOrEqual 360 -Because 'the bound began before the acknowledgement'
-            $left = ($script:fetch.DeadlineUtc - $script:fetch.At).TotalSeconds
+            @($script:fetches | ForEach-Object { $_.OnlyVm -join ',' }) | Should -Be @('sqlvm01', 'archost01') -Because 'the VMs that take Run Commands in parallel first, the T2 host last (review of e058e5fe)'
+            $fetch = $script:fetches[0]
+            ($fetch.DeadlineUtc - $ack.At).TotalSeconds | Should -BeLessOrEqual 360 -Because 'the bound began before the acknowledgement'
+            $left = ($fetch.DeadlineUtc - $fetch.At).TotalSeconds
             $left | Should -BeLessOrEqual 260 -Because 'the acknowledgement''s 100 seconds or more come out of the start''s 360'
             $left | Should -BeGreaterOrEqual 240
 
-            # One that doesn't end is cut at the bound, where the fetch begins with no time left; the next VM's get none, and
-            # their IDs wait for the next start.
+            # One that doesn't end is cut at the bound, after which no sidecar is asked for; the next VM's get none, and their
+            # IDs wait for the next start.
             Reset-TestAzure
             $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
             Set-TestSessionStart
             Set-SidecarRunner -AckSeconds 1000
-            $script:fetch = $null
+            $script:fetches.Clear()
             $request.rcaAcks.documents = @('20261120T165000Z-sqlvm01-0001-sidecar', '20261120T165500Z-arcsql01-0001-sidecar')
             $null = Invoke-DbHubControl -WebhookData (New-Webhook $request) -Context (New-TestContext)
             $status = Get-SessionStatus
@@ -5695,7 +5767,11 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             $status.rcaAcks.message | Should -Be 'None of the 2 sidecar acknowledgement(s) was sent: sqlvm01''s acknowledgements didn''t end in the time the start had for them; no time was left for archost01''s in the start''s bound.'
             @(Get-SidecarCommand -Kind 'ack' -Vm 'archost01') | Should -BeNullOrEmpty
             @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty -Because 'what still ran was deleted'
-            $over = ($script:fetch.At - $script:fetch.DeadlineUtc).TotalSeconds
+            @($script:fetches) | Should -BeNullOrEmpty -Because 'the bound was spent, so the sidecar fetch asked for nothing'
+            # The acknowledgement went at the bound's start, with nothing before it.
+            $ack = @(Get-SidecarCommand -Kind 'ack')[0]
+            $deleted = @($script:calls | Where-Object { $_.Method -eq 'DELETE' -and $_.Path -match ('/runCommands/{0}$' -f $ack.Name) })[0]
+            $over = ($deleted.At - $ack.At.AddSeconds(360)).TotalSeconds
             $over | Should -BeGreaterOrEqual 0
             $over | Should -BeLessOrEqual 10 -Because 'nothing runs past the bound but the poll that finds it'
         }
@@ -5779,6 +5855,152 @@ Describe 'The Incident RCA''s evidence (ADR 0031): the export through managed Ru
             else {
                 @($status.rcaSidecar.documents.documentId) | Should -Contain $t2.documentId
             }
+        }
+
+        It 'gives sqlvm01''s evidence, acknowledgements, and sidecars their time at a cold start whose T2 dispatch runs past the bound (review of e058e5fe)' {
+            # The session before it: the nightly stop ended it, so the start exports it on each VM right before that VM's
+            # activity. Each VM holds a document of its evidence and sidecars.
+            $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; steps = @(); rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $false; status = 'Pass'; message = '' } }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+            Set-TestSessionStart
+            $t2Document = '20261027T142000Z-archost01-0001'
+            Set-ServedRunner -Case @(@{ Id = $t2Document; Session = $script:fixtureSession }) -Vm @('archost01')
+            $script:hostEvidenceRunner = $script:rcaRunner
+            Set-FixtureRunner
+            $script:sqlEvidenceRunner = $script:rcaRunner
+            $script:rcaRunner = {
+                param($Command)
+                if ($Command.Vm -eq 'archost01') {
+                    return (& $script:hostEvidenceRunner $Command)
+                }
+                return (& $script:sqlEvidenceRunner $Command)
+            }
+            $sidecars = @(Get-FixtureSidecar)
+            $t2 = New-TestSidecar -Id '20261027T140000Z-arcsql01-0001-sidecar'
+            Set-SidecarRunner -Offer @{ sqlvm01 = $sidecars; archost01 = @($t2) }
+            $script:rcaListOpen = $true
+            # T2's dispatch, named as the control's, still runs at the bound's end: a cold guest that's slow to start.
+            $script:runCommands['archost01'] = @({
+                    $dispatch = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' }) | Select-Object -First 1
+                    if ($null -ne $dispatch) {
+                        @{ name = ($dispatch.Path -replace '^.*/runCommands/', ''); properties = @{ provisioningState = 'Succeeded'; instanceView = @{ executionState = 'Running' } } }
+                    }
+                })
+            # The T2 host's acknowledgement first in the request.
+            $ids = @($t2.documentId, $sidecars[0].documentId)
+            $request = @{ action = 'session'; sessionId = $script:nextSession; requestedBy = 'presenter'; rcaAcks = [ordered]@{ kind = 'ContosoCare.RcaAckRequest'; version = 1; documents = $ids } }
+            $started = Invoke-DbHubControl -WebhookData (New-Webhook $request) -Context (New-TestContext)
+            $started.status | Should -BeIn 'Started', 'Partial'
+            $status = Get-SessionStatus
+            @($status.rcaEarlier.documents.documentId) | Should -Be $script:fixtureIds -Because 'sqlvm01''s evidence is fetched'
+            @($status.rcaAcks.sent) | Should -Be @($sidecars[0].documentId) -Because 'sqlvm01''s acknowledgement doesn''t wait behind the T2 host'
+            @($status.rcaAcks.left) | Should -Be @($t2.documentId)
+            $status.rcaAcks.message | Should -Match 'archost01 takes one Run Command at a time \(R871\), and another Run Command was still there in the time the start had for its acknowledgements'
+            @($status.rcaSidecar.documents.documentId) | Should -Be @($sidecars[1..2].documentId) -Because 'sqlvm01''s sidecars are fetched, after its acknowledgement'
+            # T2's evidence and sidecars stay on the VM for later exports, as RCA.EXPORT says, and nothing went to the T2 host
+            # beside its dispatch.
+            @($status.rcaEarlierPending | ForEach-Object { $_.pending } | ForEach-Object { $_.documentId }) | Should -Contain $t2Document
+            $messages = @($status.steps | Where-Object { $_.step -eq 'RCA.EXPORT' } | ForEach-Object { $_.message }) -join ' '
+            $messages | Should -Match 'archost01: 0 document\(s\) in 0 part\(s\)\. 1 document\(s\) weren''t fetched whole in time; they stay on archost01 for the next export\. Another Run Command was on archost01 when this export''s time was up'
+            $status.rcaSidecar.waiting | Should -BeTrue
+            $dispatchAt = $script:calls.IndexOf(@($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' })[0])
+            $dispatchAt | Should -BeGreaterThan -1
+            @($script:calls | Select-Object -Skip ($dispatchAt + 1) | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-rca-' }) | Should -BeNullOrEmpty
+            @($script:rcaCommands | Where-Object { $script:rcaDeleted -notcontains $_.Name }) | Should -BeNullOrEmpty
+
+            # sqlvm01's evidence still being fetched when the reserve begins: the T2 host waits on until it's done, so it's
+            # fetched whole, and what's left of the bound still takes sqlvm01's acknowledgement and sidecars.
+            Reset-TestAzure
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+            Set-TestSessionStart
+            Set-ServedRunner -Case @(@{ Id = $t2Document; Session = $script:fixtureSession }) -Vm @('archost01')
+            $script:hostEvidenceRunner = $script:rcaRunner
+            Set-FixtureRunner
+            $script:sqlEvidenceRunner = $script:rcaRunner
+            $script:rcaRunner = {
+                param($Command)
+                if ($Command.Vm -eq 'archost01') {
+                    return (& $script:hostEvidenceRunner $Command)
+                }
+                # Each of sqlvm01's parts takes 200 seconds.
+                if ($Command.Request.command -eq 'part' -and ($script:clock - $Command.At).TotalSeconds -lt 200) {
+                    return $null
+                }
+                return (& $script:sqlEvidenceRunner $Command)
+            }
+            Set-SidecarRunner -Offer @{ sqlvm01 = $sidecars; archost01 = @($t2) }
+            $script:rcaListOpen = $true
+            $script:runCommands['archost01'] = @({
+                    $dispatch = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' }) | Select-Object -First 1
+                    if ($null -ne $dispatch) {
+                        @{ name = ($dispatch.Path -replace '^.*/runCommands/', ''); properties = @{ provisioningState = 'Succeeded'; instanceView = @{ executionState = 'Running' } } }
+                    }
+                })
+            $null = Invoke-DbHubControl -WebhookData (New-Webhook $request) -Context (New-TestContext)
+            $status = Get-SessionStatus
+            @($status.rcaEarlier.documents.documentId) | Should -Be $script:fixtureIds -Because 'a host still fetching isn''t cut for the reserve'
+            @($status.rcaAcks.sent) | Should -Be @($sidecars[0].documentId)
+            @($status.rcaSidecar.documents.documentId) | Should -Be @($sidecars[1..2].documentId)
+            @($status.rcaEarlierPending | ForEach-Object { $_.pending } | ForEach-Object { $_.documentId }) | Should -Contain $t2Document
+
+            # With no sidecar to fetch, the acknowledgements go on their own, sqlvm01's still before the T2 host's.
+            Reset-TestAzure
+            Set-TestSessionStart
+            Set-SidecarRunner
+            $script:rcaListOpen = $true
+            $script:runCommands['archost01'] = @({
+                    $dispatch = @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' }) | Select-Object -First 1
+                    if ($null -ne $dispatch) {
+                        @{ name = ($dispatch.Path -replace '^.*/runCommands/', ''); properties = @{ provisioningState = 'Succeeded'; instanceView = @{ executionState = 'Running' } } }
+                    }
+                })
+            $request.rcaAcks.documents = @('20261120T165500Z-arcsql01-0001-sidecar', '20261120T165000Z-sqlvm01-0001-sidecar')
+            $null = Invoke-DbHubControl -WebhookData (New-Webhook $request) -Context (New-TestContext)
+            $status = Get-SessionStatus
+            @($status.rcaAcks.sent) | Should -Be @('20261120T165000Z-sqlvm01-0001-sidecar')
+            @($status.rcaAcks.left) | Should -Be @('20261120T165500Z-arcsql01-0001-sidecar')
+            @(Get-SidecarCommand -Kind 'ack' | ForEach-Object Vm) | Should -Be @('sqlvm01')
+        }
+
+        It 'says the T2 host''s Run Commands couldn''t be listed, not that another Run Command was there, when its list fails between Run Commands (review of e058e5fe)' {
+            # The list of the T2 host's Run Commands fails once the start's dispatch has gone there.
+            $script:realListed = ${function:Get-DbHubRcaListed}
+            $script:listFails = { @($script:calls | Where-Object { $_.Method -eq 'PUT' -and $_.Path -match '/virtualMachines/archost01/runCommands/DbHubControl-archost01-\d{14}$' }).Count -gt 0 }
+            Mock Get-DbHubRcaListed -ParameterFilter { $VmName -eq 'archost01' -and $AnyBusy } {
+                if (& $script:listFails) {
+                    return [pscustomobject]@{ Ok = $false; Names = @(); Stale = @(); Busy = @() }
+                }
+                return (& $script:realListed -Context $Context -VmName $VmName -AnyBusy)
+            }
+            # An earlier session's evidence on the T2 host, whose parts it lists for.
+            $earlier = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'running'; updatedUtc = '2026-10-27T13:00:00Z'; steps = @(); rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $false; status = 'Pass'; message = '' } }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $earlier -Depth 8 -Compress
+            Set-TestSessionStart
+            $id = '20261027T142000Z-archost01-0001'
+            Set-ServedRunner -Case @(@{ Id = $id; Session = $script:fixtureSession }) -Vm @('archost01')
+            $script:rcaListOpen = $true
+            $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:nextSession; requestedBy = 'presenter' }) -Context (New-TestContext)
+            @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'part' }) | Should -BeNullOrEmpty -Because 'a list that fails holds the host'
+            $messages = @((Get-SessionStatus).steps | Where-Object { $_.step -eq 'RCA.EXPORT' } | ForEach-Object { $_.message }) -join ' '
+            $messages | Should -Match 'archost01''s Run Commands couldn''t be listed when this export''s time was up, so it got no more parts in this export \(R871\)\.'
+            $messages | Should -Not -Match 'Another Run Command was on archost01'
+
+            # The sidecars the session before it left there: the list fails after the first page.
+            Reset-TestAzure
+            $script:listFails = { @($script:rcaCommands | Where-Object { $_.Vm -eq 'archost01' -and $_.Request.command -eq 'sidecar-export' }).Count -gt 0 }
+            $previous = [ordered]@{ schemaVersion = 1; sessionId = $script:fixtureSession; phase = 'stopped'; updatedUtc = '2026-10-27T13:00:00Z'; rca = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); pending = @(); leftVms = @(); final = $true; finalRan = $true; status = 'Pass'; message = '' }; rcaSidecar = [ordered]@{ sessionId = $script:fixtureSession; bundles = @(); documents = @(); offered = 1; fetched = 0; left = 1; waiting = $true; status = 'Warning'; message = 'cut'; index = '' } }
+            $script:automationVariables['DbHubSessionStatus'] = ConvertTo-Json -InputObject $previous -Depth 8 -Compress
+            Set-TestSessionStart
+            $t2 = New-TestSidecar -Id '20261027T140000Z-arcsql01-0001-sidecar'
+            Set-SidecarRunner -Offer @{ archost01 = @($t2) }
+            $script:rcaListOpen = $true
+            $null = Invoke-DbHubControl -WebhookData (New-Webhook @{ action = 'session'; sessionId = $script:nextSession; requestedBy = 'presenter' }) -Context (New-TestContext)
+            @(Get-SidecarCommand -Kind 'page' -Vm 'archost01').Count | Should -Be 1
+            @(Get-SidecarCommand -Kind 'part' -Vm 'archost01') | Should -BeNullOrEmpty
+            $line = @((Get-SessionStatus).steps | Where-Object { $_.step -eq 'RCA.SIDECAR.EXPORT' })[0]
+            $line.state | Should -Be 'Warning'
+            $line.message | Should -Match 'archost01''s Run Commands couldn''t be listed when this export''s time was up, so it got no more sidecar Run Commands in this export \(R871\)\.'
+            $line.message | Should -Not -Match 'Another Run Command was on archost01'
         }
 
         It 'starts a session whose rcaAcks doesn''t follow the contract, sends none of it, and says why with the fix' {

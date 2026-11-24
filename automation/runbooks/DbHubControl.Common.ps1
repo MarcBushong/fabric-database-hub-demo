@@ -6247,6 +6247,11 @@ $script:DbHubRcaStopHostDelaySeconds = 60
 # Get-DbHubRcaRoom has just asked for (re-review of e55e000b): a finished leftover goes in seconds, so the export doesn't run
 # beside its delete (R871); one Azure still lists after this is stuck in Deleting (F31), and the export goes beside it.
 $script:DbHubRcaStaleWaitSeconds = 90
+# The share of a start's bound (rca.startMinutes) its earlier sessions' evidence leaves to the request's acknowledgements
+# and the sidecar fetch when only the T2 host is left of that evidence, held by another Run Command there, such as the
+# start's own dispatch to T2's guest (review of e058e5fe): its parts stay pending for a later start, and sqlvm01's
+# acknowledgements and sidecars get this much of the bound.
+$script:DbHubRcaStartReserveShare = 0.5
 # The runner's note in a final export's index when its wait for the observer ran out (Exporter.StillCapturing, which the
 # runner's tests hold to this text): what the observer captured after its last complete time stays on that VM. A session's
 # stop asks the runner to end the capture first (O1, 2026-11-23), so it names the VM's tail only when that didn't happen.
@@ -6451,9 +6456,12 @@ function Get-DbHubRcaListed {
     up for every later export. No export runs that long: its deadline is at most 30 minutes, and a Run Command's time-out
     at most 1,020 s. With -AnyBusy (the Query Store sidecar's and the acknowledgements' Run Commands; review of 9d094b70),
     it lists them with their instance views, and Busy names every other Run Command there, whatever its name, that's in
-    flight (provisioningState Creating or Updating, or executionState Pending or Running) or being deleted: a session's
-    own dispatch Run Command on the T2 host still runs while its start's acknowledgements and sidecars could go, and the
-    host takes one at a time. A name whose time is more than an hour old isn't Busy, as above. It deletes nothing.
+    flight (provisioningState Creating or Updating, or executionState Pending or Running): a session's own dispatch Run
+    Command on the T2 host still runs while its start's acknowledgements and sidecars could go, and the host takes one at
+    a time. One being deleted is in Stale instead, which those wait for only a bounded time, DbHubRcaStaleWaitSeconds
+    (review of e058e5fe): Azure has listed the scripts' unstamped DbHubDemo-* Run Commands in Deleting for hours there
+    (2026-11-17, R871), which held every check until its deadline. A name whose time is more than an hour old isn't Busy,
+    as above. It deletes nothing.
     https://learn.microsoft.com/rest/api/compute/virtual-machine-run-commands/list-by-virtual-machine
     #>
     param(
@@ -6497,7 +6505,12 @@ function Get-DbHubRcaListed {
             $properties = Get-DbHubMember -InputObject $item -Name 'properties'
             $provisioning = [string](Get-DbHubMember -InputObject $properties -Name 'provisioningState')
             $execution = [string](Get-DbHubMember -InputObject (Get-DbHubMember -InputObject $properties -Name 'instanceView') -Name 'executionState')
-            if ($provisioning -in 'Creating', 'Updating', 'Deleting' -or $execution -in 'Pending', 'Running') {
+            if ($provisioning -eq 'Deleting') {
+                # Another Run Command being deleted, whatever its instance view still says, waits as an hour-old one of the
+                # export's does (review of e058e5fe): the scripts' unstamped ones have stayed in Deleting for hours there.
+                $stale.Add($name)
+            }
+            elseif ($provisioning -in 'Creating', 'Updating' -or $execution -in 'Pending', 'Running') {
                 $busy.Add($name)
             }
         }
@@ -6508,8 +6521,8 @@ function Get-DbHubRcaListed {
 function Test-DbHubRcaHostFree {
     # Whether a sidecar's or an acknowledgement's Run Command may go to a VM that takes one at a time (R871; review of
     # 9d094b70): Azure lists none of the export's Run Commands there, and no other Run Command, whatever its name, in
-    # flight or being deleted (Get-DbHubRcaListed -AnyBusy), nor, until -StaleUntilUtc, an hour-old one of the export's
-    # being deleted. Returns Free, and Failed when the VM's Run Commands couldn't be listed.
+    # flight (Get-DbHubRcaListed -AnyBusy), nor, until -StaleUntilUtc, an hour-old one of the export's, or any other, being
+    # deleted (review of e058e5fe). Returns Free, and Failed when the VM's Run Commands couldn't be listed.
     param(
         [Parameter(Mandatory = $true)]
         [object] $Context,
@@ -6725,9 +6738,13 @@ function Invoke-DbHubRcaExport {
     begun (Test-DbHubRcaRecheckOpen, before each one): what it's still running ends and is read, and what it didn't fetch
     stays in Pending, which the stop takes (Add-DbHubRcaHandoff). Fenced says that happened. With -AnyBusy (an earlier
     session's evidence at a session's start; review of 9d094b70), the T2 host's first Run Command and each part there
-    wait while Azure lists any other Run Command there, whatever its name, in flight or being deleted
-    (Test-DbHubRcaHostFree): the start's own dispatch to T2's guest runs then, after the export the start sent there. At
-    the deadline, what wasn't fetched stays in Pending, and the host's message says another Run Command held it.
+    wait while Azure lists any other Run Command there, whatever its name, in flight, or, for at most
+    DbHubRcaStaleWaitSeconds from this export's start, being deleted (Test-DbHubRcaHostFree; review of e058e5fe): the
+    start's own dispatch to T2's guest runs then, after the export the start sent there. At
+    the deadline, what wasn't fetched stays in Pending, and the host's message says another Run Command held it, or that
+    its Run Commands couldn't be listed. -HeldUntilUtc (a start's; review of e058e5fe) ends that wait earlier: once every
+    other host is done and only a host held that way is left, the export stops then, as at the deadline, so the rest of
+    the bound goes to the start's acknowledgements and sidecars.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -6782,7 +6799,10 @@ function Invoke-DbHubRcaExport {
 
         [switch] $EndCapture,
 
-        [switch] $AnyBusy
+        [switch] $AnyBusy,
+
+        [AllowNull()]
+        [object] $HeldUntilUtc = $null
     )
 
     $settings = $Context.Settings
@@ -6860,13 +6880,15 @@ function Invoke-DbHubRcaExport {
             }
             $listed = Get-DbHubRcaListed -Context $Context -VmName $State.Vm -AnyBusy:$anyBusy
             $State.ListFailed = -not $listed.Ok
-            # With -AnyBusy, any other Run Command there in flight or being deleted holds it too (review of 9d094b70).
+            # With -AnyBusy, any other Run Command there in flight holds it too (review of 9d094b70); one being deleted waits
+            # as below (review of e058e5fe).
             if (-not $listed.Ok -or @($listed.Names).Count -gt 0 -or @(Get-DbHubMember -InputObject $listed -Name 'Busy' | Where-Object { $_ }).Count -gt 0) {
                 $State.Waiting = $true
                 return
             }
-            # The hour-old ones Get-DbHubRcaRoom has just asked Azure to delete: their deletes first, for a bounded time from
-            # this export's start, then beside one that's stuck (re-review of e55e000b).
+            # The hour-old ones Get-DbHubRcaRoom has just asked Azure to delete, and with -AnyBusy any other being deleted:
+            # their deletes first, for a bounded time from this export's start, then beside one that's stuck (re-review of
+            # e55e000b).
             if (@($listed.Stale).Count -gt 0 -and (Get-DbHubUtcNow) -lt $startedUtc.AddSeconds($script:DbHubRcaStaleWaitSeconds)) {
                 $State.Waiting = $true
                 return
@@ -7027,7 +7049,7 @@ function Invoke-DbHubRcaExport {
             }
         }
         $held = -not $sentName -and $entry.Vm -in @($SkipVm)
-        $state = [pscustomobject]@{ Vm = $entry.Vm; Targets = $entry.Targets; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Export = ''; ExportDone = $true; ForSession = $forSession; ExportRead = $false; Unread = $false; Held = $held; Others = 0; Outside = 0; Consumed = 0; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Sequence = 0; Listed = 0; Waiting = $false; ListFailed = $false; WantExport = $false; Capturing = $false; OldEndCapture = $false; EndCaptureSent = $false; HostHeld = $false }
+        $state = [pscustomobject]@{ Vm = $entry.Vm; Targets = $entry.Targets; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Export = ''; ExportDone = $true; ForSession = $forSession; ExportRead = $false; Unread = $false; Held = $held; Others = 0; Outside = 0; Consumed = 0; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Sequence = 0; Listed = 0; Waiting = $false; ListFailed = $false; WantExport = $false; Capturing = $false; OldEndCapture = $false; EndCaptureSent = $false; HostHeld = $false; HostListFailed = $false }
         if (($NoNewExport -or $held) -and -not $sentName -and $earlier.Count -eq 0) {
             if ($held) {
                 $state.Outcome = 'Held'
@@ -7112,6 +7134,27 @@ function Invoke-DbHubRcaExport {
     while ($true) {
         $busy = $false
         $late = (Get-DbHubUtcNow) -ge $DeadlineUtc
+        # A host that takes one Run Command at a time, held by another Run Command there (-AnyBusy), waits only until
+        # -HeldUntilUtc once every other host is done (review of e058e5fe): it stops then as at the deadline, and the rest of
+        # the bound goes to what comes after it. A host still sending or reading, its own deletes included, isn't held. Its
+        # Outcome doesn't say: a fetch of pending parts (-NoNewExport) is Exported before its first part goes.
+        if (-not $late -and $HeldUntilUtc -is [datetime] -and (Get-DbHubUtcNow) -ge [datetime]$HeldUntilUtc) {
+            $heldHosts = 0
+            $activeHosts = 0
+            foreach ($state in $work) {
+                $idle = $state.ExportDone -and $state.InFlight.Count -eq 0 -and $state.Deleting.Count -eq 0
+                $queued = $state.Queue.Count -gt 0 -and -not $state.Blocked
+                if ($state.OneAtATime -and $idle -and ($state.Waiting -or ($state.HostHeld -and $queued))) {
+                    $heldHosts++
+                }
+                elseif (-not $idle -or $state.Waiting -or $queued) {
+                    $activeHosts++
+                }
+            }
+            if ($heldHosts -gt 0 -and $activeHosts -eq 0) {
+                $late = $true
+            }
+        }
         foreach ($state in $work) {
             if ($state.Waiting) {
                 if (-not $late) {
@@ -7220,9 +7263,11 @@ function Invoke-DbHubRcaExport {
                     if (-not $clear.Free) {
                         $state.Queue.Insert(0, $item)
                         $state.HostHeld = $true
+                        $state.HostListFailed = [bool]$clear.Failed
                         break
                     }
                     $state.HostHeld = $false
+                    $state.HostListFailed = $false
                 }
                 $name = '{0}rca-{1}-{2:d2}{3:d2}-{4}' -f $prefix, $state.Vm, $document.Sequence, $item.Part, $stamp
                 $request = [ordered]@{ command = 'part'; documentId = $item.DocumentId; part = $item.Part; timeoutSeconds = $bounds.PartSeconds }
@@ -7287,7 +7332,11 @@ function Invoke-DbHubRcaExport {
             if ($state.Blocked) {
                 $message = '{0} Azure didn''t delete a Run Command on {1} twice, so it got no more parts in this export (R871).' -f $message, $state.Vm
             }
-            if ($state.HostHeld) {
+            if ($state.HostHeld -and $state.HostListFailed) {
+                # Held because the host's Run Commands couldn't be listed, which fails closed (review of e058e5fe).
+                $message = '{0} {1}''s Run Commands couldn''t be listed when this export''s time was up, so it got no more parts in this export (R871).' -f $message, $state.Vm
+            }
+            elseif ($state.HostHeld) {
                 $message = '{0} Another Run Command was on {1} when this export''s time was up, so it got no more parts in this export (R871).' -f $message, $state.Vm
             }
         }
@@ -7622,7 +7671,8 @@ function Invoke-DbHubRcaSessionExport {
     -EndCapture (a session's stop; O1, 2026-11-23) is Invoke-DbHubRcaExport's: each runner ends the capture first. A VM
     whose observer still captured when its final export's wait ran out goes into leftVms, which RCA.PENDING names, and
     RCA.EXPORT is a Warning that says why. So is -AnyBusy (an earlier session's evidence at a start; review of 9d094b70):
-    on the T2 host, nothing goes beside any other Run Command there, such as the start's own dispatch.
+    on the T2 host, nothing goes beside any other Run Command there, such as the start's own dispatch; and -HeldUntilUtc
+    (review of e058e5fe): such a host, held once every other host is done, stops waiting then.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -7679,7 +7729,10 @@ function Invoke-DbHubRcaSessionExport {
         [AllowNull()]
         [object] $DeadlineUtc = $null,
 
-        [switch] $AnyBusy
+        [switch] $AnyBusy,
+
+        [AllowNull()]
+        [object] $HeldUntilUtc = $null
     )
 
     $state = ConvertTo-DbHubRcaState -State $Earlier -SessionId $SessionId
@@ -7696,7 +7749,7 @@ function Invoke-DbHubRcaSessionExport {
     if ($DeadlineUtc -is [datetime]) {
         $deadline = [datetime]$DeadlineUtc
     }
-    $run = Invoke-DbHubRcaExport -Context $Context -SessionId $SessionId -Final:$Final -DeadlineUtc $deadline -Pending @($state['pending']) -Sent $Sent -SentSession $SentSession -ClearFinished:$ClearFinished -OnlyVm $OnlyVm -SkipVm $SkipVm -SessionWindow $SessionWindow -OutsideFromUtc $OutsideFromUtc -OutsideToUtc $OutsideToUtc -HeldBy $HeldBy -NoNewExport:$NoNewExport -WhileRunning:$WhileRunning -PollSeconds $PollSeconds -HostNotBeforeUtc $HostNotBeforeUtc -EndCapture:$EndCapture -AnyBusy:$AnyBusy
+    $run = Invoke-DbHubRcaExport -Context $Context -SessionId $SessionId -Final:$Final -DeadlineUtc $deadline -Pending @($state['pending']) -Sent $Sent -SentSession $SentSession -ClearFinished:$ClearFinished -OnlyVm $OnlyVm -SkipVm $SkipVm -SessionWindow $SessionWindow -OutsideFromUtc $OutsideFromUtc -OutsideToUtc $OutsideToUtc -HeldBy $HeldBy -NoNewExport:$NoNewExport -WhileRunning:$WhileRunning -PollSeconds $PollSeconds -HostNotBeforeUtc $HostNotBeforeUtc -EndCapture:$EndCapture -AnyBusy:$AnyBusy -HeldUntilUtc $HeldUntilUtc
     $pending = New-Object -TypeName 'System.Collections.Generic.List[object]'
     foreach ($item in @($run.Pending)) {
         $pending.Add($item)
@@ -8718,9 +8771,10 @@ function Invoke-DbHubRcaEarlier {
     holder's end isn't known, has lost its capture the same way. What an earlier session's export lists from outside that
     session's activity (its startUtc to endUtc) isn't fetched. On the T2 host, which takes one Run Command at a time (R871),
     each part waits while Azure lists any other Run Command there, the start's own dispatch to T2's guest included
-    (-AnyBusy, review of 9d094b70), within the same bound; what it doesn't fetch stays for a later start. Then the
-    request's acknowledgements (-AckWork, 2026-11-23; Invoke-DbHubRcaAck), after that evidence's parts and before the
-    start's own sidecar fetch, within the same bound.
+    (-AnyBusy, review of 9d094b70), within the same bound; what it doesn't fetch stays for a later start. Once every
+    other VM is done and only the T2 host is left, held that way, it waits only until the bound's end less its reserve
+    (DbHubRcaStartReserveShare of rca.startMinutes; review of e058e5fe), which goes to the start's acknowledgements and
+    sidecars after it (Invoke-DbHubRcaSidecarSession -AckWork -OneAtATimeLast).
     Never throws: on an error, the entries stay as the start wrote them.
     #>
     param(
@@ -8743,28 +8797,26 @@ function Invoke-DbHubRcaEarlier {
         [int] $PollSeconds = 10,
 
         [AllowNull()]
-        [object] $DeadlineUtc = $null,
-
-        [AllowNull()]
-        [object] $AckWork = $null
+        [object] $DeadlineUtc = $null
     )
 
-    # The start's bound (rca.startMinutes), or the one the start gives (-DeadlineUtc, 2026-11-23): the earlier sessions'
-    # evidence first, then the request's acknowledgements (-AckWork, Invoke-DbHubRcaAck), which the start's own sidecar
-    # fetch follows, all within it.
+    # The start's bound (rca.startMinutes), or the one the start gives (-DeadlineUtc, 2026-11-23), which the request's
+    # acknowledgements and the start's sidecar fetch share after this evidence.
     $deadline = $DeadlineUtc
     if ($deadline -isnot [datetime]) {
         $deadline = (Get-DbHubUtcNow).AddMinutes((Get-DbHubRcaSetting -Settings $Context.Settings).StartMinutes)
     }
     $entries = @(@($Entry) | Where-Object { $null -ne $_ })
     if ($entries.Count -eq 0 -and ($null -eq $Sent -or $Sent.Count -eq 0)) {
-        Invoke-DbHubRcaAck -Context $Context -Work $AckWork -DeadlineUtc $deadline -PollSeconds $PollSeconds
         return
     }
     try {
         $settings = $Context.Settings
         $bounds = Get-DbHubRcaSetting -Settings $settings
         $now = Get-DbHubUtcNow
+        # A T2 host held by another Run Command waits at most until the bound's end less its reserve, once nothing else is
+        # left (review of e058e5fe).
+        $heldUntil = $deadline.AddSeconds(-1 * $bounds.StartMinutes * 60 * $script:DbHubRcaStartReserveShare)
         $week = $now.AddDays($script:DbHubRcaCarryDays)
         $current = [string]$Status['sessionId']
         $time = { param([datetime] $Utc) '{0} UTC' -f $Utc.ToString('yyyy-MM-dd HH:mm', [System.Globalization.CultureInfo]::InvariantCulture) }
@@ -8828,7 +8880,7 @@ function Invoke-DbHubRcaEarlier {
             $fetchState = ConvertTo-DbHubRcaState -State $fetch['rca'] -SessionId ([string]$fetch['sessionId'])
             $fetchState['pending'] = @($fetch['pending'])
             $fetchState['leftVms'] = @($fetch['leftVms'])
-            $done = Invoke-DbHubRcaSessionExport -Context $Context -SessionId ([string]$fetch['sessionId']) -Final -Minutes $bounds.StartMinutes -DeadlineUtc $deadline -Earlier $fetchState -Sent $Sent -SentSession $SentSession -OnlyVm $vms -SessionWindow $sessionWindow -HeldBy $heldBy -NoNewExport -AnyBusy -PollSeconds $PollSeconds
+            $done = Invoke-DbHubRcaSessionExport -Context $Context -SessionId ([string]$fetch['sessionId']) -Final -Minutes $bounds.StartMinutes -DeadlineUtc $deadline -Earlier $fetchState -Sent $Sent -SentSession $SentSession -OnlyVm $vms -SessionWindow $sessionWindow -HeldBy $heldBy -NoNewExport -AnyBusy -HeldUntilUtc $heldUntil -PollSeconds $PollSeconds
             if ($null -ne $done.Index) {
                 $Status['rcaEarlier'] = $done.Index
             }
@@ -9073,7 +9125,6 @@ function Invoke-DbHubRcaEarlier {
     catch {
         Write-DbHubLog -Context $Context -Message ('The earlier sessions'' evidence wasn''t exported: {0}' -f $_.Exception.Message)
     }
-    Invoke-DbHubRcaAck -Context $Context -Work $AckWork -DeadlineUtc $deadline -PollSeconds $PollSeconds
 }
 
 function Set-DbHubStopBegun {
@@ -10068,9 +10119,9 @@ function Invoke-DbHubRcaSidecarExport {
         return (-not $fence.Closed)
     }
     # A VM's first Run Command: none once the session's stop has begun, and on the T2 host none while Azure lists another
-    # Run Command there (Test-DbHubRcaHostFree: the export's, or any other in flight or being deleted, such as a session's
-    # own dispatch; review of 9d094b70), or, up to DbHubRcaStaleWaitSeconds from this export's start, hour-old ones of the
-    # export's being deleted.
+    # Run Command there (Test-DbHubRcaHostFree: the export's, or any other in flight, such as a session's own dispatch;
+    # review of 9d094b70), or, up to DbHubRcaStaleWaitSeconds from this export's start, hour-old ones of the export's, or
+    # any other, being deleted (review of e058e5fe).
     $start = {
         param([object] $State)
         $State.Waiting = $false
@@ -10190,7 +10241,7 @@ function Invoke-DbHubRcaSidecarExport {
         if (@($OnlyVm).Count -gt 0 -and $entry.Vm -notin $OnlyVm) {
             continue
         }
-        $state = [pscustomobject]@{ Vm = $entry.Vm; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Waiting = $false; ListFailed = $false; Started = $false; AllPages = 1; Read = 0; Unread = 0; Full = $false; Sequence = 0; Offered = 0; Seen = (New-Object -TypeName 'System.Collections.Generic.HashSet[string]'); Warning = ''; Sends = 0; Interrupted = $false }
+        $state = [pscustomobject]@{ Vm = $entry.Vm; OneAtATime = [bool]$entry.OneAtATime; Outcome = ''; Message = ''; Queue = (New-Object -TypeName 'System.Collections.Generic.List[object]'); InFlight = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Deleting = (New-Object -TypeName 'System.Collections.Generic.List[object]'); Blocked = $false; Free = 0; Waiting = $false; ListFailed = $false; Started = $false; AllPages = 1; Read = 0; Unread = 0; Full = $false; Sequence = 0; Offered = 0; Seen = (New-Object -TypeName 'System.Collections.Generic.HashSet[string]'); Warning = ''; Sends = 0; Interrupted = $false; InterruptListFailed = $false }
         $hosts.Add($state)
         if ($entry.Vm -in @($SkipVm)) {
             $state.Outcome = 'Held'
@@ -10317,9 +10368,11 @@ function Invoke-DbHubRcaSidecarExport {
                     if (-not $clear.Free) {
                         $state.Queue.Insert(0, $item)
                         $state.Interrupted = $true
+                        $state.InterruptListFailed = [bool]$clear.Failed
                         break
                     }
                     $state.Interrupted = $false
+                    $state.InterruptListFailed = $false
                 }
                 if ($item.Kind -eq 'page') {
                     $name = '{0}rca-{1}-i{2:d2}-{3}' -f $prefix, $state.Vm, $item.Page, $stamp
@@ -10400,6 +10453,10 @@ function Invoke-DbHubRcaSidecarExport {
         if ($state.Blocked) {
             $note = 'Azure didn''t delete a Run Command on {0} twice, so it got no more sidecar Run Commands in this export (R871).' -f $state.Vm
         }
+        elseif ($state.Interrupted -and $state.InterruptListFailed) {
+            # Held because the host's Run Commands couldn't be listed, which fails closed (review of e058e5fe).
+            $note = '{0}''s Run Commands couldn''t be listed when this export''s time was up, so it got no more sidecar Run Commands in this export (R871).' -f $state.Vm
+        }
         elseif ($state.Interrupted) {
             $note = 'Another Run Command was on {0} when this export''s time was up, so it got no more sidecar Run Commands in this export (R871).' -f $state.Vm
         }
@@ -10430,6 +10487,12 @@ function Invoke-DbHubRcaSidecarSession {
     goes after it. A re-check's or a start's line says only what's new or wrong. The stop's (-Final) says what the session
     holds too, and is a Warning when sidecars stay on the VMs, which the next session's exports fetch, or when the bound was
     spent before any sidecar was asked for.
+    -OneAtATimeLast (a start's; review of e058e5fe) fetches in passes: the VMs that take Run Commands in parallel first,
+    then the T2 host, which takes one at a time (R871), each with what's left of the bound and of the session's index, so
+    a Run Command still busy there, such as the start's own dispatch to T2's guest, never keeps the others' sidecars from
+    their time. -AckWork (a start's) sends each pass's VMs the request's acknowledgements first (Invoke-DbHubRcaAck), so
+    their fetch doesn't offer those sidecars again. A pass the bound leaves no time for fetches nothing, and its sidecars
+    wait on its VMs.
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -10457,6 +10520,11 @@ function Invoke-DbHubRcaSidecarSession {
 
         [AllowNull()]
         [object] $HostNotBeforeUtc = $null,
+
+        [switch] $OneAtATimeLast,
+
+        [AllowNull()]
+        [object] $AckWork = $null,
 
         [int] $PollSeconds = 10
     )
@@ -10487,31 +10555,80 @@ function Invoke-DbHubRcaSidecarSession {
         $waiting = $false
         $deploy = $false
         $problem = $false
-        if ((Get-DbHubUtcNow) -ge $DeadlineUtc) {
-            # The evidence took the whole bound: no sidecar was asked for.
+        # Each pass's VMs (review of e058e5fe): with -OneAtATimeLast, those that take Run Commands in parallel, then those that
+        # take one at a time (the T2 host); otherwise one pass, as -OnlyVm says.
+        $passes = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        if ($OneAtATimeLast) {
+            $sidecarHosts = @(Get-DbHubRcaHost -Settings $Context.Settings | Where-Object { @($OnlyVm).Count -eq 0 -or [string]$_.Vm -in @($OnlyVm) })
+            foreach ($serial in @($false, $true)) {
+                $passVms = @($sidecarHosts | Where-Object { [bool]$_.OneAtATime -eq $serial } | ForEach-Object { [string]$_.Vm })
+                if ($passVms.Count -gt 0) {
+                    $passes.Add($passVms)
+                }
+            }
+        }
+        else {
+            $passes.Add(@($OnlyVm))
+        }
+        $fetched = [ordered]@{}
+        $leftOut = [ordered]@{}
+        $hostList = New-Object -TypeName 'System.Collections.Generic.List[object]'
+        $ran = $false
+        $timeUp = $false
+        $indexFull = $false
+        foreach ($pass in $passes) {
+            $passVms = [string[]]@($pass)
+            if ($null -ne $AckWork) {
+                # The request's acknowledgements on this pass's VMs, right before their fetch (rca/README.md).
+                Invoke-DbHubRcaAck -Context $Context -Work $AckWork -DeadlineUtc $DeadlineUtc -OnlyVm $passVms -PollSeconds $PollSeconds
+            }
+            if ((Get-DbHubUtcNow) -ge $DeadlineUtc) {
+                # The bound was spent, by the evidence or the passes before this one: no sidecar was asked for here.
+                $timeUp = $true
+                continue
+            }
+            if ($partsRoom -le 0 -or $bytesRoom -le 0 -or $earlierBundles -ge $script:DbHubRcaSidecarMostBundles) {
+                # The session's index is full: the rest wait for the next session's exports.
+                $indexFull = $true
+                continue
+            }
+            $known = @(@(@($state['documents']) | ForEach-Object { [string]$_['documentId'] }) + @($fetched.Keys))
+            $run = Invoke-DbHubRcaSidecarExport -Context $Context -SessionId $SessionId -Final:$Final -DeadlineUtc $DeadlineUtc -Known $known -Parts $partsRoom -Bytes $bytesRoom -OnlyVm $passVms -SkipVm $SkipVm -WhileRunning:$WhileRunning -HostNotBeforeUtc $HostNotBeforeUtc -PollSeconds $PollSeconds
+            $ran = $true
+            foreach ($item in @($run.Hosts)) {
+                $hostList.Add($item)
+            }
+            # What this pass fetched comes out of the room the next pass has.
+            foreach ($id in @($run.Fetched.Keys)) {
+                $fetched[$id] = $run.Fetched[$id]
+                $partsRoom -= [int]$run.Fetched[$id].Reference['parts']
+                $bytesRoom -= Get-DbHubRcaSidecarSize -Reference $run.Fetched[$id].Reference
+            }
+            foreach ($id in @($run.Left.Keys)) {
+                $leftOut[$id] = $run.Left[$id]
+            }
+        }
+        if ($timeUp) {
             $waiting = $true
-            if ($Final) {
+            if ($Final -and -not $ran) {
                 $extra.Add('The stop''s time (rca.stopMinutes) ran out with the evidence, so no sidecar was fetched: any the VMs hold wait there.')
                 $problem = $true
             }
         }
-        elseif ($partsRoom -le 0 -or $bytesRoom -le 0 -or $earlierBundles -ge $script:DbHubRcaSidecarMostBundles) {
-            # The session's index is full: the rest wait for the next session's exports.
+        if ($indexFull) {
             $waiting = $true
-            if ($Final) {
+            if ($Final -and -not $ran) {
                 $extra.Add('The session''s sidecar index is full, so the stop fetched no more: any the VMs still hold wait there.')
                 $problem = $true
             }
         }
-        else {
-            $known = @(@($state['documents']) | ForEach-Object { [string]$_['documentId'] })
-            $run = Invoke-DbHubRcaSidecarExport -Context $Context -SessionId $SessionId -Final:$Final -DeadlineUtc $DeadlineUtc -Known $known -Parts $partsRoom -Bytes $bytesRoom -OnlyVm $OnlyVm -SkipVm $SkipVm -WhileRunning:$WhileRunning -HostNotBeforeUtc $HostNotBeforeUtc -PollSeconds $PollSeconds
-            $hosts = @($run.Hosts)
+        if ($ran) {
+            $hosts = $hostList.ToArray()
             $answer.Hosts = $hosts
             # Each sidecar fetched whole, checked: its SHA-256, and that it's a sidecar of version 1 with its own ID.
             $good = New-Object -TypeName 'System.Collections.Generic.List[object]'
-            foreach ($id in @($run.Fetched.Keys)) {
-                $sidecar = $run.Fetched[$id]
+            foreach ($id in @($fetched.Keys)) {
+                $sidecar = $fetched[$id]
                 $expanded = Expand-DbHubRcaDocument -Line ([string[]]$sidecar.Lines) -Sidecar
                 if (-not $expanded.Ok) {
                     $extra.Add(('{0} was skipped: {1}; it stays on {2}.' -f $id, $expanded.Why, $sidecar.Vm))
@@ -10578,8 +10695,8 @@ function Invoke-DbHubRcaSidecarSession {
             }
             $leftCount += $back.Count
             # What the VMs offered that this export didn't fetch, which they offer again.
-            $timed = @($run.Left.Values | Where-Object { $_.Why -eq 'time' })
-            $full = @($run.Left.Values | Where-Object { $_.Why -eq 'index' })
+            $timed = @($leftOut.Values | Where-Object { $_.Why -eq 'time' })
+            $full = @($leftOut.Values | Where-Object { $_.Why -eq 'index' })
             if ($timed.Count -gt 0) {
                 $extra.Add(('{0} sidecar(s) weren''t fetched whole in time; they stay on {1} for the next export.' -f $timed.Count, (@($timed | ForEach-Object { $_.Vm } | Select-Object -Unique) -join ' and ')))
                 $problem = $true
@@ -11042,11 +11159,14 @@ function Send-DbHubRcaAck {
 }
 
 function Invoke-DbHubRcaAck {
-    # A start's acknowledgements (Send-DbHubRcaAck; rca/README.md, Run all's path for the sidecars; 2026-11-23), from
-    # Invoke-DbHubRcaEarlier once the earlier sessions' evidence is fetched and before the start's own sidecar fetch: each
-    # VM's IDs in one Run Command, one VM after the other, until -DeadlineUtc, the start's bound (rca.startMinutes), which
-    # they share with that evidence and those sidecars. A VM that isn't running gets none: its IDs stay for the next start.
-    # Once per VM. Never throws.
+    # A start's acknowledgements (Send-DbHubRcaAck; rca/README.md, Run all's path for the sidecars; 2026-11-23), once the
+    # earlier sessions' evidence is fetched and before the start's own sidecar fetch on the same VM
+    # (Invoke-DbHubRcaSidecarSession -AckWork): each VM's IDs in one Run Command, one VM after the other, until -DeadlineUtc,
+    # the start's bound (rca.startMinutes), which they share with that evidence and those sidecars. The VMs that take Run
+    # Commands in parallel go first, the T2 host, which takes one at a time (R871), last, so a Run Command still busy
+    # there, such as the start's own dispatch to T2's guest, never keeps the others' from their time (review of e058e5fe).
+    # -OnlyVm limits it to those VMs. A VM that isn't running gets none: its IDs stay for the next start. Once per VM.
+    # Never throws.
     [Diagnostics.CodeAnalysis.SuppressMessageAttribute('PSUseShouldProcessForStateChangingFunctions', '', Justification = 'Acknowledges only what the session request names, from Start-DbHubSession, which asks ShouldProcess.')]
     param(
         [Parameter(Mandatory = $true)]
@@ -11058,15 +11178,37 @@ function Invoke-DbHubRcaAck {
         [Parameter(Mandatory = $true)]
         [datetime] $DeadlineUtc,
 
+        [AllowEmptyCollection()]
+        [string[]] $OnlyVm = @(),
+
         [int] $PollSeconds = 10
     )
 
     if ($null -eq $Work) {
         return
     }
+    $order = New-Object -TypeName 'System.Collections.Generic.List[string]'
+    try {
+        $ackHosts = @(Get-DbHubRcaHost -Settings $Context.Settings)
+        foreach ($serial in @($false, $true)) {
+            foreach ($entry in @($ackHosts | Where-Object { [bool]$_.OneAtATime -eq $serial })) {
+                $order.Add([string]$entry.Vm)
+            }
+        }
+    }
+    catch {
+        Write-DbHubLog -Context $Context -Message ('The demo''s VMs weren''t read for the acknowledgements'' order: {0}' -f $_.Exception.Message)
+    }
     foreach ($key in @($Work.ByVm.Keys)) {
-        $vmName = [string]$key
-        if ($Work.Done.Contains($vmName)) {
+        if (-not $order.Contains([string]$key)) {
+            $order.Add([string]$key)
+        }
+    }
+    foreach ($vmName in $order) {
+        if (-not $Work.ByVm.Contains($vmName) -or $Work.Done.Contains($vmName)) {
+            continue
+        }
+        if (@($OnlyVm).Count -gt 0 -and $vmName -notin @($OnlyVm)) {
             continue
         }
         try {
@@ -11197,10 +11339,11 @@ function Start-DbHubSession {
        the session out), and it runs the whole session; a T5 step says when T5 is back at its baseline after its last
        ru-storm (risk R896).
     7. The Query Store sidecars (2026-11-23, rca/README.md, Run all's path for the sidecars): after the earlier session's
-       evidence (Invoke-DbHubRcaEarlier), the request's rcaAcks are acknowledged on the VM each ID names
-       (Invoke-DbHubRcaAck) and recorded in the status's rcaAcks, which the control notebook prints as RCA.SIDECAR.ACK;
-       then the sidecars the session before it left are fetched (Invoke-DbHubRcaSidecarSession). All within the start's
-       rca.startMinutes, which they share with that evidence.
+       evidence (Invoke-DbHubRcaEarlier), per VM, the request's rcaAcks are acknowledged on the VM each ID names
+       (Invoke-DbHubRcaAck), then the sidecars the session before it left there are fetched
+       (Invoke-DbHubRcaSidecarSession -OneAtATimeLast -AckWork): sqlvm01 first, the T2 host last with what's left (review
+       of e058e5fe). The status's rcaAcks records what they sent, which the control notebook prints as RCA.SIDECAR.ACK.
+       All within the start's rca.startMinutes, which they share with that evidence.
     The job ends with the session going on; its auto-stop ends it.
     #>
     [CmdletBinding(SupportsShouldProcess = $true)]
@@ -11444,9 +11587,11 @@ function Start-DbHubSession {
             Add-DbHubSessionStep -Status $status -Step 'Stop' -State 'Warning' -Message $left -Fix $leftFix
         }
         # An earlier session's export that went out before the run failed is still read, so its evidence isn't left behind;
-        # then the request's acknowledgements on a VM still running, and what they sent, so the control notebook can
-        # delete their files (rcaAcks, its RCA.SIDECAR.ACK line).
-        Invoke-DbHubRcaEarlier -Context $Context -Status $status -Entry $rcaEntries -Sent $rcaSent -SentSession $rcaSentSession -PollSeconds ([System.Math]::Min(10, $PollSeconds)) -DeadlineUtc ((Get-DbHubUtcNow).AddSeconds($rcaSeconds)) -AckWork $ackWork
+        # then the request's acknowledgements on a VM still running, the T2 host last, and what they sent, so the control
+        # notebook can delete their files (rcaAcks, its RCA.SIDECAR.ACK line).
+        $failedDeadline = (Get-DbHubUtcNow).AddSeconds($rcaSeconds)
+        Invoke-DbHubRcaEarlier -Context $Context -Status $status -Entry $rcaEntries -Sent $rcaSent -SentSession $rcaSentSession -PollSeconds ([System.Math]::Min(10, $PollSeconds)) -DeadlineUtc $failedDeadline
+        Invoke-DbHubRcaAck -Context $Context -Work $ackWork -DeadlineUtc $failedDeadline -PollSeconds ([System.Math]::Min(10, $PollSeconds))
         Complete-DbHubRcaAck -Status $status -Work $ackWork
         $status['message'] = [string]$run.message
         $phase = 'failed'
@@ -11547,18 +11692,19 @@ function Start-DbHubSession {
 
     # The earlier sessions' evidence (ADR 0031): the exports sent right before this session's activity went out read, one
     # session's documents fetched into the vault, and its bundle index into this status (rcaEarlier), which Run all saves
-    # with that session's history. Then the request's acknowledgements (2026-11-23), so the runner stops offering what the
-    # history holds, and what they sent into the status (rcaAcks), so the control notebook can delete their files. Then the
-    # Query Store sidecars an earlier session left on the VMs, within what that evidence and those acknowledgements leave
-    # of the same bound, into this session's own sidecar state: its stop's index lists them, and the history writes each
-    # under its own session. Only when this start ran an earlier session's export, or the session before it says its
-    # sidecars wait on the VMs, and never on a VM an earlier session still holds, since a sidecar export binds a span to
-    # its session as an export does.
+    # with that session's history. Then, per VM, the request's acknowledgements (2026-11-23), so the runner stops offering
+    # what the history holds, and right after them the Query Store sidecars an earlier session left there, into this
+    # session's own sidecar state: its stop's index lists them, and the history writes each under its own session. The VMs
+    # that take Run Commands in parallel go first and the T2 host last, with what's left of the bound (review of e058e5fe):
+    # a dispatch to T2's guest that still runs never keeps sqlvm01's from their time, and the T2 host's evidence waits for
+    # it only until the bound's end less their reserve. The sidecars only when this start ran an earlier session's export,
+    # or the session before it says its sidecars wait on the VMs, and never on a VM an earlier session still holds, since a
+    # sidecar export binds a span to its session as an export does. What the acknowledgements sent goes into the status
+    # (rcaAcks), so the control notebook can delete their files.
     $rcaDeadline = (Get-DbHubUtcNow).AddSeconds($rcaSeconds)
-    Invoke-DbHubRcaEarlier -Context $Context -Status $status -Entry $rcaEntries -Sent $rcaSent -SentSession $rcaSentSession -PollSeconds ([System.Math]::Min(10, $PollSeconds)) -DeadlineUtc $rcaDeadline -AckWork $ackWork
-    Complete-DbHubRcaAck -Status $status -Work $ackWork
+    Invoke-DbHubRcaEarlier -Context $Context -Status $status -Entry $rcaEntries -Sent $rcaSent -SentSession $rcaSentSession -PollSeconds ([System.Math]::Min(10, $PollSeconds)) -DeadlineUtc $rcaDeadline
     if ($rcaEntries.Count -gt 0 -or $rcaSent.Count -gt 0 -or $sidecarsWait) {
-        $sidecar = Invoke-DbHubRcaSidecarSession -Context $Context -SessionId ([string]$Request.SessionId) -Earlier $status['rcaSidecar'] -DeadlineUtc $rcaDeadline -SkipVm @(Get-DbHubRcaHeldByEarlier -Status $status) -PollSeconds ([System.Math]::Min(10, $PollSeconds))
+        $sidecar = Invoke-DbHubRcaSidecarSession -Context $Context -SessionId ([string]$Request.SessionId) -Earlier $status['rcaSidecar'] -DeadlineUtc $rcaDeadline -SkipVm @(Get-DbHubRcaHeldByEarlier -Status $status) -OneAtATimeLast -AckWork $ackWork -PollSeconds ([System.Math]::Min(10, $PollSeconds))
         $status['rcaSidecar'] = $sidecar.State
         foreach ($line in @($sidecar.Lines)) {
             $level = 'Pass'
@@ -11568,6 +11714,9 @@ function Start-DbHubSession {
             Add-DbHubSessionStep -Status $status -Step $line.Step -State $level -Message $line.Message -Fix $line.Fix
         }
     }
+    # The acknowledgements no sidecar fetch sent (none ran, or it didn't reach a VM), the T2 host last.
+    Invoke-DbHubRcaAck -Context $Context -Work $ackWork -DeadlineUtc $rcaDeadline -PollSeconds ([System.Math]::Min(10, $PollSeconds))
+    Complete-DbHubRcaAck -Status $status -Work $ackWork
 
     $warnings = @(@($status['steps']) | Where-Object { $_['state'] -in 'Warning', 'Fail' }).Count
     $result.status = 'Started'
