@@ -416,8 +416,11 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
         $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
         $rca.status | Should -Be 'Fail'
-        $rca.message | Should -Be 'T2''s guest holds Incident RCA sidecars that aren''t in the history yet (1 sealed sidecar(s) its runner hasn''t been told are in the history), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
-        $rca.remediation | Should -Be 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches them from T2 and has its runner acknowledge them, again while its RCA.SIDECAR line says sidecars wait. Run all sessions leave their sidecars in T2''s guest until Run all takes them itself (a later release), so a scripts'' save brings them in. Then run ./scripts/capture-t2-golden.ps1 again.'
+        $rca.message | Should -Be 'T2''s guest holds Incident RCA sidecars its runner keeps until it''s told the history has them (1 sealed sidecar(s) its runner hasn''t been told are in the history), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+        $rca.remediation | Should -Be 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches them from T2 and has its runner acknowledge them, again while its RCA.SIDECAR line says sidecars wait. After a Run all session, T2''s guest keeps the sidecars Run all saved until the next Run all''s start acknowledges them, so a scripts'' save, which finds them in the history already, clears them sooner. Then run ./scripts/capture-t2-golden.ps1 again.'
+        # Since T2c's merge (b215df02), Run all saves its sessions' sidecars: a sealed one the runner wasn't told about can be
+        # in the history already, so neither line may say it isn't, or that Run all's path is still to come.
+        "$($rca.message) $($rca.remediation)" | Should -Not -Match 'aren''t in the history yet|later release|takes them itself'
         @($rca.evidence.sidecars) | Should -Be @('20261123T100000Z-arcsql01-0001-sidecar')
         @($script:calls | Where-Object { $_ -in 'power Start', 'profile off', 'guest RcaSidecars' }) | Should -Be @('power Start', 'profile off', 'guest RcaSidecars') -Because 'the guest is asked with its activity off'
         foreach ($step in 'password', 'guest Prepare', 'power Deallocate') {

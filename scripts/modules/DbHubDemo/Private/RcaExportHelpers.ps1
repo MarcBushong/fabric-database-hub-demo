@@ -3138,7 +3138,7 @@ function Complete-DemoRcaSidecarSave {
         $sentences.Add(('{0} sidecar(s) wait on the VMs, which keep them: {1} ({2} lists them).' -f $pending.Count, $said, (Get-DemoRcaShownPath -Path ([string]$list.Paths.Pending))))
     }
     if ($expired.Count -gt 0) {
-        $sentences.Add(('{0} sidecar(s) expired unread: the runner keeps one 30 days after its sealing, and no save took it in time.' -f $expired.Count))
+        $sentences.Add(('{0} sidecar(s) expired unread: the runner keeps one 30 days after its sealing, and wasn''t told in time that the history has it.' -f $expired.Count))
     }
     if ($Sidecar.Error) {
         $sentences.Add($Sidecar.Error)
@@ -3180,7 +3180,7 @@ function Complete-DemoRcaSidecarSave {
             $fixes.Add($(if ($Sidecar.CheckPrefix -eq 'STOP') { 'The next history save takes what waits: {0} while the VMs run, again while this line says sidecars wait, or ./scripts/stop-demo.ps1 -SaveHistory at the end of the next session.' -f $script:RcaRunAgain } else { 'The next history save takes what waits: {0} while the VMs run, again while this line says sidecars wait.' -f $script:RcaRunAgain }))
         }
         if ($expired.Count -gt 0 -or $runnerWarned.Count -gt 0) {
-            $fixes.Add('Save the history from the scripts within 30 days of each session, before the runner deletes its sidecars: ./scripts/stop-demo.ps1 -SaveHistory at the end of a session from the scripts; after Run all sessions, which leave theirs on the VMs until Run all takes them itself (a later release), ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.')
+            $fixes.Add('Save the history within 30 days of each session, before the runner deletes its sidecars: ./scripts/stop-demo.ps1 -SaveHistory at the end of a session from the scripts; after Run all sessions, whose sidecars Run all saves but only the next Run all''s start acknowledges, a Run all within 30 days, or ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.')
         }
     }
     $evidence = [ordered]@{

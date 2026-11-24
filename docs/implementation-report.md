@@ -9209,7 +9209,7 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 **The coordinator's decisions (2026-11-23).**
 
 1. `rca ack` exits 0 for IDs the runner no longer holds; T1a, and T1c's command wiring, keep it.
-2. A stop handed to the session control fetches no sidecars, as v1 exports nothing there; Run all's path is a later release.
+2. A stop handed to the session control fetches no sidecars, as v1 exports nothing there; Run all's path is a later release. (Superseded the same day: Run all's path joined this release, and T2c's merge, b215df02, brought it in, the handed-off stop's fetch included.)
 3. Any other file in the guest's `sidecars\` counts as unacknowledged, so the golden guard fails safe.
 4. The changes outside T2a's files are accepted: the two `ValidateSet`s, the UTF-8 decoding, and the save paths' test mocks.
 
@@ -9230,8 +9230,8 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 **Risks and what its live check needs.**
 
 - **Nothing has met a real runner yet:** T1a's runner, T2b's control script, and B's notebook meet first in the live proof, on a new deployment and on an update. It needs: `rca ack`'s exit code for IDs it no longer holds; a 3,400-character index line through T2's host within the Run Command's 4 KB; OneLake's answer for the acknowledgement; and the drain's bounds behind a real capacity queue.
-- **Run all's sessions leave their sidecars on the VMs** until a history save from the scripts, or Run all's own path in a later release; one sealed more than 30 days before such a save is lost, which the line says ("expired unread").
-- **A stop handed to the session control** fetches none, so after Run all sessions the scripts' save that brings them in is `./scripts/start-demo.ps1`, then `./scripts/stop-demo.ps1 -SaveHistory` ([troubleshooting](troubleshooting.md#the-incident-rcas-capture)).
+- **Run all's sessions leave their sidecars on the VMs** until a history save from the scripts, or Run all's own path in a later release; one sealed more than 30 days before such a save is lost, which the line says ("expired unread"). (Superseded by T2c's merge, b215df02: Run all saves them, and the VMs keep them until the next Run all's start acknowledges them; "expired unread" now means the runner wasn't told within 30 days, and the history can have them already.)
+- **A stop handed to the session control** fetches none, so after Run all sessions the scripts' save that brings them in is `./scripts/start-demo.ps1`, then `./scripts/stop-demo.ps1 -SaveHistory` ([troubleshooting](troubleshooting.md#the-incident-rcas-capture)). (Superseded by T2c's merge: the control's stop fetches them.)
 
 **The contract at 8afcca24 (T1c's codec).** `rca sidecar-export` exits 2 only when nothing is offerable, and prints its index line either way, whose status stands: a **Warning** counts sidecars the runner let expire unread. The scripts now read that line whatever the control script's result: Not selected (exit code 2, today's control script), **Warning** (T2b's next, for a Warning line), or Pass. Its message goes into the line after the VM's name ("sqlvm01's runner says: ..."), once a VM, with the expired fix, which now also names the save that brings in Run all's sessions' sidecars. A **Warning** without a line it can read keeps that VM's pending sidecars, since its index isn't known whole. Merge 260945d0, then the change with four tests that fail without it (`DbHubDemo.RcaSidecar` 28 passed).
 

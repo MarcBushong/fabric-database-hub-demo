@@ -40,10 +40,11 @@ function New-DemoT2GoldenSnapshot {
        its evaluation more than 7 days from its end (a Warning within 30 days).
     5. Turns T2's activity profile off. Then the Incident RCA's sidecars in T2's guest (2026-11-23,
        Test-DemoGoldenRcaSidecar): the acknowledgements a stop deferred to archost01 (the PC's list in
-       out/history-pending) go to the guest's runner first, then the guest is asked for sidecars that aren't in the history
-       yet, which Prepare would delete; any left is a GOLDEN.CAPTURE.RCA Fail, and nothing is captured: a scripts' history
-       save takes them first (Run all sessions leave theirs in the guest until Run all takes them itself). Then rotates the
-       host administrator's password to a value nobody keeps.
+       out/history-pending) go to the guest's runner first, then the guest is asked for sidecars its runner keeps until
+       it's told the history has them, which Prepare would delete; any left is a GOLDEN.CAPTURE.RCA Fail, and nothing is
+       captured: a scripts' history save takes them first (Run all saves its sessions' sidecars too, but the guest keeps
+       them until the next Run all's start acknowledges them). Then rotates the host administrator's password to a value
+       nobody keeps.
        Then the sign-in data gate (ADR 0009): vm/bootstrap/Invoke-DemoSignInResidue.ps1 removes the sign-in data
        left on the host and in the guest and scans again; anything left (GOLDEN.CAPTURE.SIGNIN Fail, or Manual
        action required for the Security log, which only an operator clears) means nothing is captured.

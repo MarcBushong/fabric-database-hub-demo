@@ -366,11 +366,14 @@ describe("the model guide", () => {
         expect(COSMOS_PROBE_DAX).toContain("[Has Cosmos DB Bins]");
     });
 
-    // The owner, 2026-11-23: the chat said "T1 doesn't have Query Store". The tables no capture writes yet say so, and that
-    // their emptiness says nothing about a target, so the chat can't read an empty RCA Queries as a target without one.
-    it("says the RCA tables no capture writes yet are empty for that reason, never because a target has no Query Store", () => {
+    // The owner, 2026-11-23: the chat said "T1 doesn't have Query Store". The tables no capture writes say why they're
+    // empty, and that their emptiness says nothing about a target, so the chat can't read an empty RCA Queries as a target
+    // without one. Since the sidecar, RCA Queries says where Query Store's statistics are: the guide that the chat reads with
+    // the sidecar's own (SIDECAR_GUIDE) must not say the capture doesn't collect them.
+    it("says the RCA tables no capture writes are empty for that reason, never because a target has no Query Store", () => {
         const description = (table: string) => MODEL_GUIDE.split(`## '${table}' (lakehouse table dbo.`)[1].split("\n")[1];
-        expect(description("RCA Queries")).toMatch(/^Not written yet: the capture doesn't collect Query Store's statistics yet, so this table is empty, and its emptiness says nothing about a target's Query Store: never that a target has none \(validate\.ps1's T1\.QUERYSTORE to T3\.QUERYSTORE say whether it's on\)\. /);
+        expect(description("RCA Queries")).toMatch(/^Not written: Query Store's statistics are in the sidecar's tables since 2026-11-23 \(RCA Query Stats, RCA Query Waits, and RCA Query Plans, when the model has them\), so this table from the RCA's first design stays empty, and its emptiness says nothing about a target's Query Store: never that a target has none \(validate\.ps1's T1\.QUERYSTORE to T3\.QUERYSTORE say whether it's on\)\. /);
+        expect(MODEL_GUIDE).not.toMatch(/the capture doesn't collect Query Store's/);
         expect(description("RCA Waits")).toMatch(/^Not written yet: the capture doesn't diff the wait statistics yet, so this table is empty, and its emptiness says nothing about the targets' waits or their Query Store; Telemetry Snapshots holds T1 to T3's waits by category\. /);
         // The tables the capture writes don't say it.
         for (const table of ["RCA Sessions", "RCA Events", "RCA Resource", "RCA Replica", "RCA Coverage"]) expect(description(table)).not.toMatch(/^Not written yet/);

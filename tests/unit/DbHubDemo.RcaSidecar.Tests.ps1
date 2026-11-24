@@ -377,7 +377,8 @@ Describe 'The Incident RCA''s sidecars from the scripts (2026-11-23, rca/README.
         $save.Line.status | Should -Be 'Warning'
         $save.Line.message | Should -Match ([regex]::Escape('archost01''s runner says: 3 sidecar(s) expired unread: sealed more than 30 days ago and never acknowledged.'))
         @($save.Line.evidence.runner) | Should -Be @('archost01: 3 sidecar(s) expired unread: sealed more than 30 days ago and never acknowledged.')
-        $save.Line.remediation | Should -Match ([regex]::Escape('after Run all sessions, which leave theirs on the VMs until Run all takes them itself (a later release), ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.'))
+        $save.Line.remediation | Should -Match ([regex]::Escape('after Run all sessions, whose sidecars Run all saves but only the next Run all''s start acknowledges, a Run all within 30 days, or ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.'))
+        $save.Line.remediation | Should -Not -Match 'later release|takes them itself' -Because 'Run all''s path is in since T2c''s merge (b215df02)'
         $script:vms['sqlvm01'].Sidecars['20261120T170000Z-sqlvm01-0001-sidecar'].Acked | Should -BeTrue
     }
 
@@ -708,7 +709,8 @@ Describe 'The Incident RCA''s sidecars from the scripts (2026-11-23, rca/README.
         $save = Invoke-TestSave -Now
         @((Read-TestList 'pending')['sidecars'] | ForEach-Object { '{0}: {1}' -f $_['documentId'], $_['reason'] }) | Should -Be @('20261121T170000Z-arcsql01-0002-sidecar: not fetched: archost01 isn''t running, so what its observer captured stays on it until the next export.')
         $save.Line.status | Should -Be 'Warning'
-        $save.Line.message | Should -Match '2 sidecar\(s\) expired unread: the runner keeps one 30 days after its sealing, and no save took it in time\.'
+        $save.Line.message | Should -Match '2 sidecar\(s\) expired unread: the runner keeps one 30 days after its sealing, and wasn''t told in time that the history has it\.'
+        $save.Line.message | Should -Not -Match 'no save took it' -Because 'a save can have written it, Run all''s or a stop''s whose acknowledgement waited, without the runner being told'
         $save.Line.evidence.expired | Should -Be 2
         $save.Line.remediation | Should -Match 'stop-demo\.ps1 -SaveHistory'
     }

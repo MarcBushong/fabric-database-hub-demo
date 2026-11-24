@@ -87,7 +87,7 @@ The Incident RCA ([ADR 0031](../docs/adr/0031-incident-rca.md)) explains blockin
 
 ### The Incident RCA's sidecar in the history (2026-11-23)
 
-Query Store's evidence on T1 to T4 and who held T4's connections travel beside the evidence in sidecar documents of their own kind, so everything above stays as it was ([rca/README.md, The sidecar](../rca/README.md#the-sidecar)). The scripts' path carries them first; Run all's follows in a later release.
+Query Store's evidence on T1 to T4 and who held T4's connections travel beside the evidence in sidecar documents of their own kind, so everything above stays as it was ([rca/README.md, The sidecar](../rca/README.md#the-sidecar)). Both paths carry them: the scripts', below, and Run all's ([Run all's path for the sidecars](../rca/README.md#run-alls-path-for-the-sidecars)).
 
 - **Stage:** the scripts fetch a save's sidecars and stage their part lines as one `ContosoCare.RcaSidecarParts` document in `Files/rca/inbox/sidecar-<time>[-<name>].json`, passed as `RCA_SIDECAR_FILE`, only to a notebook that declares the parameter. An older or edited notebook gets none, and the sidecars stay pending on the VMs.
 - **Save:** the sidecar's cells at the end of section 2 read the file (`notebookutils.fs.head`, 262,144 bytes), check every part and sidecar against the contract (a missing part, a SHA-256 that doesn't match, a newer version, or a part format the notebook can't read skips that sidecar, never written in part), and write each sidecar once by its ID to its six tables, `rca_query_coverage` last, which marks it saved. They run before section 3, so a run that saves only the evidence (`RCA_ONLY`), or a session already saved, writes them too.
