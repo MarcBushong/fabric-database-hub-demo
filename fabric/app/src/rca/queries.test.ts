@@ -171,13 +171,13 @@ describe("Query Store's rules: what this history doesn't hold", () => {
         expect(a.notCaptured[0]).not.toMatch(/not captured|no Query Store\b|didn't read|wasn't running/i);
     });
 
-    // The re-check of fc430a78: where the evidence waits, for how long, and the fix are one sentence, QS_EVIDENCE_FIX, so T2c
-    // (Run all's own path) changes them in one place; and the runner deletes a sidecar no save took 30 days after sealing it.
-    it("says where a Run all session's evidence waits, for as long as the runner keeps it, and the fix, in the one sentence", () => {
+    // The re-check of fc430a78: where the evidence waits, for how long, and the fix are one sentence, QS_EVIDENCE_FIX, which
+    // T2c (Run all's own path) changed in one place; and the runner deletes a sidecar no save took 30 days after sealing it.
+    it("says a Run all session's evidence comes with its save, where the rest waits and for how long, and the fix, in the one sentence", () => {
         const days = /A sealed sidecar stays until it's acknowledged, or for (\d+) days after its sealing\./.exec(readContractText("README.md"))?.[1];
         expect(days, "rca/README.md, The sidecar: how long the runner keeps a sealed sidecar").toBeDefined();
         expect(QS_EVIDENCE_FIX).toMatch(
-            new RegExp(`^After a Run all session, that evidence waits on the VMs for ${days} days for a save from the scripts to take it: \\./scripts/deploy\\.ps1, then \\./scripts/stop-demo\\.ps1 -SaveHistory with the VMs running \\(\\./scripts/start-demo\\.ps1 first when they're stopped\\)\\.$`),
+            new RegExp(`^After a Run all session, that evidence comes with the session's own history save; what the stop had no time left for waits on the VMs for ${days} days, for the next Run all's start or \\./scripts/stop-demo\\.ps1 -SaveHistory with the VMs running \\(\\./scripts/start-demo\\.ps1 first when they're stopped\\)\\. For minutes an older part of the demo saved, \\./scripts/deploy\\.ps1 brings the evidence from the next session on\\.$`),
         );
         // The words around it name none of the path: no Run all, VMs, script, or time the runner keeps it.
         for (const line of [notInHistoryYet("T3", "Which queries drove it"), notInHistoryYet("T4", "who held the connections from 10:06:00 to 10:12:00 UTC")]) {

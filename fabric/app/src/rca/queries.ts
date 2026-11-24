@@ -635,18 +635,19 @@ function unusualState(target: RcaTarget, rows: readonly QueryCoverage[]): string
 
 /**
  * Where a Run all session's Query Store evidence waits, for how long, and what brings it into the history: the one sentence
- * of it, which every "isn't in this history yet" holds (notInHistoryYet), as T2a's troubleshooting rows and fix say it
- * (eea61a49, 8e2ada18). A Run all session leaves its sidecars on the VMs, whose runner keeps one until it's acknowledged,
- * or for 30 days after it sealed it (rca/README.md, The sidecar); a save from the scripts takes them, and exports only from
- * running VMs (Invoke-DemoRcaScriptExport); the update comes first, as decision C has it. T2c, Run all's own path, changes
- * this sentence, and only it, when it merges (the re-check of fc430a78).
+ * of it, which every "isn't in this history yet" holds (notInHistoryYet). Since T2c, Run all's own path (rca/README.md,
+ * Run all's path for the sidecars), a session's sidecars come into the history with its own save; what its stop's bound
+ * (rca.stopMinutes) cut stays on the VMs, whose runner keeps one until it's acknowledged, or for 30 days after it sealed it
+ * (The sidecar), and the next start's export, or a save from the scripts from running VMs (Invoke-DemoRcaScriptExport),
+ * takes it. Minutes a part of the demo older than the sidecar saved have none: the update brings it from then on.
  */
-export const QS_EVIDENCE_FIX = "After a Run all session, that evidence waits on the VMs for 30 days for a save from the scripts to take it: ./scripts/deploy.ps1, then ./scripts/stop-demo.ps1 -SaveHistory with the VMs running (./scripts/start-demo.ps1 first when they're stopped).";
+export const QS_EVIDENCE_FIX = "After a Run all session, that evidence comes with the session's own history save; what the stop had no time left for waits on the VMs for 30 days, for the next Run all's start or ./scripts/stop-demo.ps1 -SaveHistory with the VMs running (./scripts/start-demo.ps1 first when they're stopped). For minutes an older part of the demo saved, ./scripts/deploy.ps1 brings the evidence from the next session on.";
 
 /**
  * Decision C (unit 2's integration plan, revision 2, section 0), the one place its words live: what the RCA says of minutes
  * for which this history holds no Query Store coverage row. After a Run all session the capture did read Query Store, and
- * its sidecars wait on the VMs for a save from the scripts (QS_EVIDENCE_FIX); or a part of the demo older than the sidecar
+ * its sidecars come with the session's save, or wait on the VMs for the next start or a save from the scripts
+ * (QS_EVIDENCE_FIX); or a part of the demo older than the sidecar
  * saved those minutes. So: not in this history yet, or saved by an older part, with where it waits and the fix, and nothing
  * about the target; never that it has no Query Store, or that its evidence wasn't captured (the review of d441fe13: "it
  * didn't read Query Store then" was false after a Run all session). `subject` names what isn't there: "Query Store's

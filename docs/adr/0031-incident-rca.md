@@ -430,7 +430,7 @@ A first design put Query Store's tables into a version 2 of the evidence documen
    - **Revised the same day:** Run all's path joins this release (rca/README.md, Run all's path for the sidecars), because demos run only through Run all.
    - **How:** the runbooks fetch the sidecars at each export, within the evidence's bounds, and write them as their own bundles with an index of their own. The final metrics carry only a pointer. The control notebook stages them, and the next session acknowledges them: at its start, per VM, and what the start leaves at that session's next export that reaches the VM.
    - **Cost:** two builders, about 16 to 20 builder-hours, and about 6 to 10 more job minutes a session.
-   - **The cut line:** if it isn't reviewed by 2026-11-24 18:00, the scripts' path ships first, and Run all's path follows as its own release.
+   - **The cut line:** if it isn't reviewed by 2026-11-24 18:00, the scripts' path ships first, and Run all's path follows as its own release. Not needed: both of its sides were reviewed (SHIP) before then, and merged into the release's integration beside the scripts' path.
 
 **Older runners.** A rollback isn't a supported path: `deploy.ps1` moves an environment forward. An older runner deletes neither the store's `sidecars\`, where the runner seals a span's rows at each export, at the span's end, and at its start, nor T4's watermark. Two losses are accepted limits (the coordinator's decision for the owner, who can reverse it):
 
