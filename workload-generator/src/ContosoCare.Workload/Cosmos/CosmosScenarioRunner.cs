@@ -16,7 +16,7 @@ namespace ContosoCare.Workload.Cosmos;
 /// the container, so an account it can't reach, a data-plane role that isn't effective yet, or a container that doesn't
 /// exist now (it exists only during a session, <see cref="CosmosEndpoint.ContainerMissingMessage"/>) is a refusal the
 /// profile host tries again. Then its writers send tagged REST requests (User-Agent
-/// <c>ContosoCare.Demo/&lt;scenario&gt;/&lt;run&gt;</c>) to <c>contosocare/patient-events</c> only, until the deadline or a
+/// <c>ContosoCare.Demo/&lt;service&gt;/&lt;run&gt;</c>) to <c>contosocare/patient-events</c> only, until the deadline or a
 /// stop: the runner reads its run's status every 2 seconds (a stop marks it Cancelled) and records its counters and rates
 /// every 5. Each request may take 30 seconds; 60 seconds after the deadline the runner cancels the requests still in
 /// flight, and 15 seconds later it records the run as TimedOut and stops waiting. There are no server-side sessions to
@@ -50,8 +50,8 @@ internal sealed class CosmosScenarioRunner(CosmosRestClient client, CosmosRunSto
 
     public async Task<RunResult> RunAsync(RunPlan plan, CancellationToken cancellationToken)
     {
-        var runId = SessionNames.NewRunId(time.GetUtcNow(), plan.Target);
-        var tag = SessionNames.ForRun(plan.Scenario.Id, runId);
+        var runId = SessionNames.NewRunId();
+        var tag = SessionNames.ForRun(plan.Scenario.Service, runId);
         var parameters = plan.Parameters.ToDictionary(p => p.Key, p => p.Value.ToString(), StringComparer.Ordinal);
         log.Info(
             "run.planned",

@@ -33,7 +33,18 @@ export function addsUp(row: Row): boolean {
     return ADDITIVE_ANALYSES.has(String(row.AnalysisKey ?? "")) || ADDITIVE_METRICS.has(String(row.Metric));
 }
 
-interface Span {
+/**
+ * A row's declared grain in minutes (F35): the step its save wrote it at, which the notebook stores in grain_minutes
+ * with each row (its bin for the SQL analyses, and the document's interval for Azure Monitor's). Null for a save
+ * written before it, which keeps today's reading, and for anything but a whole number of minutes from 1 to 1,440.
+ */
+export function declaredGrain(row: Row): number | null {
+    const value = typeof row.GrainMinutes === "string" && row.GrainMinutes.trim() !== "" ? Number(row.GrainMinutes) : row.GrainMinutes;
+    return typeof value === "number" && Number.isInteger(value) && value >= 1 && value <= 1440 ? value : null;
+}
+
+/** A stretch of time that a kept point holds, with its value: a total's share, or a peak's reading. */
+export interface Span {
     start: number;
     end: number;
     value: number | null;
@@ -53,7 +64,7 @@ function numberOf(value: unknown): number | null {
 }
 
 /** The spans that overlap [start, end), from spans sorted by start that don't overlap each other. */
-function overlapping(spans: readonly Span[], start: number, end: number): Span[] {
+export function overlapping(spans: readonly Span[], start: number, end: number): Span[] {
     let lo = 0;
     let hi = spans.length;
     while (lo < hi) {
@@ -66,7 +77,8 @@ function overlapping(spans: readonly Span[], start: number, end: number): Span[]
     return found;
 }
 
-function insert(spans: Span[], span: Span): void {
+/** Adds a span to spans sorted by start that don't overlap each other, in its place. */
+export function insert(spans: Span[], span: Span): void {
     let lo = 0;
     let hi = spans.length;
     while (lo < hi) {
@@ -78,7 +90,7 @@ function insert(spans: Span[], span: Span): void {
 }
 
 /** The stretches of [start, end) that none of the (sorted) spans covers. */
-function gapsIn(spans: readonly Span[], start: number, end: number): Array<[number, number]> {
+export function gapsIn(spans: readonly Span[], start: number, end: number): Array<[number, number]> {
     const gaps: Array<[number, number]> = [];
     let from = start;
     for (const span of spans) {
@@ -91,7 +103,7 @@ function gapsIn(spans: readonly Span[], start: number, end: number): Array<[numb
 }
 
 /** A total split across stretches by their length, in whole numbers when the total is one (largest remainders first). */
-function shares(total: number, lengths: readonly number[]): number[] {
+export function shares(total: number, lengths: readonly number[]): number[] {
     if (lengths.length === 1) return [total];
     const all = lengths.reduce((a, b) => a + b, 0);
     const exact = lengths.map((length) => (total * length) / all);
@@ -128,8 +140,9 @@ const MADE = new WeakSet<object>();
  * notebook's interval, to step runs by and name), `sources` the point that each piece of a coarser point came from, and
  * `upperBounds` the pieces that are an upper bound.
  *
- * - A point's grain is its save's step: the smallest gap in any of the save's series (T5's hourly metrics, at least an
- *   hour). Its data is its interval's inside its save's window, so a save that starts or ends inside an interval cuts it.
+ * - A point's grain is its save's step: the grain it declares (declaredGrain), or for a save written before that, the
+ *   smallest gap in any of the save's series (T5's hourly metrics, at least an hour). Its data is its interval's inside its
+ *   save's window, so a save that starts or ends inside an interval cuts it.
  * - The finest grain is kept first, and of equal grains the newest save.
  * - A coarser point is left out only where the kept points cover all of it. Otherwise it stays for the minutes they
  *   don't cover: a count or a total (addsUp) as its total less theirs, and a maximum or an average only when it's higher
@@ -181,7 +194,8 @@ export function finestPerInterval(rows: readonly Row[]): { kept: Row[]; interval
         const date = toDate(row.Bucket);
         if (!date) continue;
         const at = date.getTime();
-        const step = captureStep.get(captureOf(row)) ?? 0;
+        const declared = declaredGrain(row);
+        const step = declared === null ? (captureStep.get(captureOf(row)) ?? 0) : declared * MINUTE;
         const grain = HOURLY_METRICS.has(String(row.Metric)) ? Math.max(60 * MINUTE, step) : step;
         let start = at;
         let end = at + Math.max(grain, 1);

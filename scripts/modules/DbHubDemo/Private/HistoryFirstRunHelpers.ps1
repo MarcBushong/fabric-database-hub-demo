@@ -231,7 +231,8 @@ function Invoke-DemoHistoryFirstRunFollowUp {
     .SYNOPSIS
     Follows a first history run that was still queued or running when its wait ended (#68), for at most -FollowMinutes
     more, with the status page's Fabric.Report row saying so. Once it completes, the history model's step runs again
-    (Invoke-DemoPowerBIStage), so the model is refreshed with the run's tables, and its records are returned. Otherwise
+    (Invoke-DemoPowerBIStage), in the form the Fabric track's kept-value step allowed (-SnapshotValueForm, F35), so the
+    model is refreshed with the run's tables, and its records are returned. Otherwise
     nothing more runs, and the refresh's Warning (-RefreshWarning) and the run's record say what fills the model:
     deploy.ps1's history snapshot at the end of its run. Never a Fail of its own. Internal.
     #>
@@ -256,7 +257,10 @@ function Invoke-DemoHistoryFirstRunFollowUp {
         [string] $ProgressPath = '',
 
         [ValidateRange(1, 300)]
-        [int] $PollSeconds = 30
+        [int] $PollSeconds = 30,
+
+        [ValidateSet('', 'Kept')]
+        [string] $SnapshotValueForm = ''
     )
 
     if ($null -eq $FirstRun -or -not $FirstRun.Pending) {
@@ -275,7 +279,7 @@ function Invoke-DemoHistoryFirstRunFollowUp {
     if ($wait.Status -eq 'Completed') {
         Write-DemoLog -Message ('{0}, the first history run, completed after another {1} minutes, so the history model is refreshed now.' -f $name, $minutes)
         Set-DemoHistoryResultText -Result $FirstRun.Result -Status 'Pass' -Message ('{0}, the first history run, completed once the capacity ran it, {1} minutes after its first wait ended; deploy.ps1 then refreshed the history model.' -f $name, $minutes)
-        $again = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $ConfigPath)
+        $again = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $ConfigPath -SnapshotValueForm $SnapshotValueForm)
         $refreshed = @($again | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'FABRIC.SEMANTICMODEL.REFRESH' -and [string]$_.status -eq 'Pass' }).Count -gt 0
         if ($null -ne $RefreshWarning) {
             $tail = if ($refreshed) { 'It completed {0} minutes later, and deploy.ps1 refreshed the model then.' -f $minutes } else { 'It completed {0} minutes later; the model''s refresh after it is the FABRIC.SEMANTICMODEL.REFRESH that follows.' -f $minutes }

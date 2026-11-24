@@ -17,6 +17,7 @@ internal sealed class SpanWriter : ICaptureSpan
     private readonly Dictionary<string, TargetFile> files = new(StringComparer.Ordinal);
     private DateTimeOffset lastPersist = DateTimeOffset.MinValue;
     private bool closed;
+    private bool closeWritten;
 
     public SpanWriter(EvidenceStore store, string directory, SpanFile span)
     {
@@ -67,8 +68,26 @@ internal sealed class SpanWriter : ICaptureSpan
     {
         lock (gate)
         {
-            Target(target).Intervals.Add(new SpanInterval { From = at });
-            Persist(force: true);
+            var known = span.Targets.ContainsKey(target);
+            var state = Target(target);
+            var interval = new SpanInterval { From = at };
+            state.Intervals.Add(interval);
+            try
+            {
+                Persist(force: true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                // Taken back, so the lane's next try begins it once (the re-check of 60aacd7b): an interval left open here
+                // would never end, since only a target's last one does.
+                state.Intervals.Remove(interval);
+                if (!known)
+                {
+                    span.Targets.Remove(target);
+                }
+
+                throw;
+            }
         }
     }
 
@@ -95,28 +114,35 @@ internal sealed class SpanWriter : ICaptureSpan
     {
         lock (gate)
         {
-            if (closed)
+            if (closeWritten)
             {
                 return;
             }
 
-            foreach (var state in span.Targets.Values)
+            if (!closed)
             {
-                if (state.Intervals.LastOrDefault() is { To: null } open)
+                foreach (var state in span.Targets.Values)
                 {
-                    open.To = at;
+                    if (state.Intervals.LastOrDefault() is { To: null } open)
+                    {
+                        open.To = at;
+                    }
                 }
+
+                span.ClosedUtc = at;
+                foreach (var file in files.Values)
+                {
+                    file.Stream.Dispose();
+                }
+
+                files.Clear();
+                closed = true;
             }
 
-            span.ClosedUtc = at;
-            foreach (var file in files.Values)
-            {
-                file.Stream.Dispose();
-            }
-
-            files.Clear();
-            closed = true;
+            // A close whose write of span.json failed writes it when called again (the re-check of 9440acf2): the observer
+            // lane tries a held span's close again each second.
             Persist(force: true);
+            closeWritten = true;
         }
 
         store.Closed(this);

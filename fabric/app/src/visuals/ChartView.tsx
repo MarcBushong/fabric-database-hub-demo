@@ -246,6 +246,12 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
             >
                 <svg className="chart-svg" width={width} height={height + (axis?.extraBottom ?? 0)} aria-hidden="true" focusable="false">
                     <g transform={`translate(${left},${MARGIN.top})`}>
+                        {bars && activeX !== null ? (
+                            // The hovered category's band, under everything else, so its bars stay in view on it.
+                            <g className="chart-cursor chart-cursor-band">
+                                <rect x={band(keyOf(activeX)) ?? 0} y={0} width={band.bandwidth()} height={innerH} />
+                            </g>
+                        ) : null}
                         {(() => {
                             // Band labels skip when they'd overlap the previous one; the band itself always shows.
                             const placed = (annotations?.bands ?? []).map((b) => {
@@ -383,15 +389,13 @@ function Plot(props: ChartViewProps & { model: ChartModel; titleId: string; summ
                             );
                         })}
 
-                        {activeX !== null ? (
+                        {!bars && activeX !== null ? (
                             <g className="chart-cursor">
-                                {!bars ? <line x1={px(activeX)} x2={px(activeX)} y1={0} y2={innerH} /> : <rect x={band(keyOf(activeX)) ?? 0} y={0} width={band.bandwidth()} height={innerH} />}
-                                {!bars
-                                    ? visible.map((s) => {
-                                          const p = byX[model.series.indexOf(s)].get(activeX);
-                                          return p && p.y !== null ? <circle key={s.key} cx={px(activeX)} cy={y(p.y)} r={4} fill={colorOf(s)} /> : null;
-                                      })
-                                    : null}
+                                <line x1={px(activeX)} x2={px(activeX)} y1={0} y2={innerH} />
+                                {visible.map((s) => {
+                                    const p = byX[model.series.indexOf(s)].get(activeX);
+                                    return p && p.y !== null ? <circle key={s.key} cx={px(activeX)} cy={y(p.y)} r={4} fill={colorOf(s)} /> : null;
+                                })}
                             </g>
                         ) : null}
                     </g>

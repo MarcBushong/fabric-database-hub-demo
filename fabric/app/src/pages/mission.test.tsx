@@ -200,10 +200,10 @@ describe("Mission Control", () => {
             expect(within(dialog).queryByText("Investigating the session's minutes for the Cause, which can take a minute or two…")).toBeNull();
             // The capture's chain first, its head blocker named, with the rows it cites nested under it.
             const first = listUnder(dialog, "Cause").children[0];
-            expect(first.textContent).toMatch(/^T1, blocked processes, 14:02:30 to 14:11:40 UTC \(confidence high\): \[demo\]\.\[usp_scenario_chain_acquire\] \(session 63;/);
+            expect(first.textContent).toMatch(/^T1, blocked processes, 14:02:30 to 14:11:40 UTC \(confidence high\): \[scheduling\]\.\[usp_assign_work_item\] \(session 63;/);
             const cited = [...first.querySelectorAll("ul > li")].map((li) => li.textContent);
             expect(cited).toHaveLength(3);
-            expect(cited[0]).toMatch(/^head 63: sleeping, open transactions 1, idle \d+ s, \[demo\]\.\[usp_scenario_chain_acquire\] \(RCA Sessions, 14:03:00 UTC\)$/);
+            expect(cited[0]).toMatch(/^head 63: sleeping, open transactions 1, idle \d+ s, \[scheduling\]\.\[usp_assign_work_item\] \(RCA Sessions, 14:03:00 UTC\)$/);
             // What the plan injected, only in its own section.
             expect(listUnder(dialog, "What the demo injected (answer key)").textContent).toMatch(/on T1 \(Billing\)/);
             expect(client.ran.filter((id) => id.startsWith("rca-")).length).toBeGreaterThan(0);

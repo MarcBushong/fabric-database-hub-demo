@@ -217,7 +217,8 @@ function Get-DemoNonBlockingItem {
     when it wasn't created or doesn't work (Get-DemoInsightsAppSummary: State Failed; it's part of every deployment),
     the history report's data check while the Execute Queries setting is off (FABRIC.SEMANTICMODEL.* Manual action
     required), and deploy.ps1's history snapshot at the end of the run when it didn't work (Get-DemoHistorySnapshotItem,
-    2026-11-06). Each item has name, state (Failed or Action needed, as on the status page), message, and howTo;
+    2026-11-06), and the history's kept values when deploy.ps1's last step for them is a Warning (Get-DemoKeptValueItem,
+    F35, 2026-11-23). Each item has name, state (Failed or Action needed, as on the status page), message, and howTo;
     Format-DemoNonBlockingLine words it the same everywhere. Pure. Internal.
     #>
     [CmdletBinding()]
@@ -262,6 +263,11 @@ function Get-DemoNonBlockingItem {
     $history = Get-DemoHistorySnapshotItem -Result $Result
     if ($null -ne $history) {
         $items.Add($history)
+    }
+    # The history's kept values (F35, 2026-11-23), when deploy.ps1's last step that ran for them is a Warning.
+    $keptValue = Get-DemoKeptValueItem -Result $Result
+    if ($null -ne $keptValue) {
+        $items.Add($keptValue)
     }
     return $items.ToArray()
 }
@@ -433,8 +439,9 @@ function Get-DemoAskSummary {
 function Test-DemoNonBlockingResult {
     # True for a result that never blocks DONE (2026-11-05): the Insights app's (Test-DemoInsightsAppRecord; it's part of
     # every deployment, but DONE never waits for it), the history report's data check waiting for the Execute Queries
-    # setting, or deploy.ps1's history snapshot (DEPLOY.FABRIC.HISTORY, 2026-11-06; never a Fail or Manual action required
-    # anyway). Internal.
+    # setting, deploy.ps1's history snapshot (DEPLOY.FABRIC.HISTORY, 2026-11-06), or the history's kept values
+    # (DEPLOY.FABRIC.KEPTVALUE and DEPLOY.FABRIC.KEPTVALUE.END, F35, 2026-11-23); the last two are never a Fail or Manual
+    # action required anyway. Internal.
     [CmdletBinding()]
     [OutputType([bool])]
     param(
@@ -446,7 +453,7 @@ function Test-DemoNonBlockingResult {
         return $false
     }
     $id = [string]$Result.checkId
-    return ((Test-DemoInsightsAppRecord -Result $Result) -or ($id -like 'FABRIC.SEMANTICMODEL.*' -and [string]$Result.status -eq 'Manual action required') -or $id -eq 'DEPLOY.FABRIC.HISTORY')
+    return ((Test-DemoInsightsAppRecord -Result $Result) -or ($id -like 'FABRIC.SEMANTICMODEL.*' -and [string]$Result.status -eq 'Manual action required') -or $id -in 'DEPLOY.FABRIC.HISTORY', 'DEPLOY.FABRIC.KEPTVALUE', 'DEPLOY.FABRIC.KEPTVALUE.END')
 }
 
 function Test-DemoTenantSettingRead {
@@ -844,6 +851,14 @@ function Get-DemoOwnerGrantNote {
     if ($stopRole.Count -eq 0 -and $controlRoles.Count -eq 0) {
         return [pscustomobject]@{ Text = ''; SessionWaits = $false; StopCovered = $false }
     }
+    # An operator role that lacks only its network join actions (2026-11-23): Run all runs a whole session, and only T4's
+    # read replica waits for the grant, where Azure checks those joins.
+    $joinOnly = {
+        param($Item)
+        $lacking = @(Get-DemoActivityControlList -InputObject (Get-DemoMemberValue -InputObject $Item -Name 'evidence') -Name 'lacking')
+        [string]$Item.checkId -eq 'CONTROL.ROLE.DEFINITION' -and $lacking.Count -gt 0 -and @($lacking | Where-Object { [string]$_ -notlike 'Microsoft.Network/*' }).Count -eq 0
+    }
+    $sessionRoles = @($controlRoles | Where-Object { -not (& $joinOnly $_) })
     $command = if ($stopRole.Count) { [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $stopRole[0] -Name 'evidence') -Name 'command') } else { '' }
     if (-not $command) {
         $source = @($stopRole) + @($controlRoles) | Select-Object -First 1
@@ -853,8 +868,11 @@ function Get-DemoOwnerGrantNote {
         $command = Get-DemoSafetyStopCommand
     }
     $waits = [System.Collections.Generic.List[string]]::new()
-    if ($controlRoles.Count) {
+    if ($sessionRoles.Count) {
         $waits.Add('Run all can''t run a whole session (from a PC, ./scripts/start-demo.ps1 works)')
+    }
+    elseif ($controlRoles.Count) {
+        $waits.Add('Run all can''t create T4''s read replica where Azure checks that it may join T4''s subnet, as in West Central US (from a PC, ./scripts/start-demo.ps1 creates it)')
     }
     if ($stopRole.Count) {
         $waits.Add('nothing stops T4 when Azure starts it again 7 days after a stop')
@@ -865,7 +883,7 @@ function Get-DemoOwnerGrantNote {
     }
     $list = if ($waits.Count -le 2) { $waits -join ' and ' } else { '{0}, and {1}' -f ($waits[0..($waits.Count - 2)] -join ', '), $waits[-1] }
     $text = 'First, once: an Owner of the subscription runs {0}, which grants the nightly safety stop''s and the session control''s roles. Until then, {1}.' -f $command, $list
-    return [pscustomobject]@{ Text = $text; SessionWaits = [bool]$controlRoles.Count; StopCovered = [bool]$stopRole.Count }
+    return [pscustomobject]@{ Text = $text; SessionWaits = [bool]$sessionRoles.Count; StopCovered = [bool]$stopRole.Count }
 }
 
 function Get-DemoT4OffReason {

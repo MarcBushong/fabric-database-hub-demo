@@ -63,7 +63,8 @@ Combine scenarios on one target for multi-wait profiles (at most four runs at on
 ## Rules every scenario follows
 
 - **Bounded:** a hard maximum duration (also enforced in T-SQL by `demo.usp_run_begin`), a concurrency range, and an intensity from 1 to 10. Loops end at the run's deadline or within about a second of a stop request.
-- **Isolated:** only the `ContosoCare` database (`contosocare` on T4, and its `patient-events` container on T5), only sessions named `ContosoCare.Demo/<scenario>/<run>` (on T5, requests whose User-Agent starts with that tag). The one exception is `tempdb-contention`'s temporary tables, which belong to its own sessions and are dropped every iteration, as any `#table` in tempdb.
+- **Isolated:** only the `ContosoCare` database (`contosocare` on T4, and its `patient-events` container on T5), only sessions named `ContosoCare.Demo/<service>/<run>` (on T5, requests whose User-Agent starts with that tag). The one exception is `tempdb-contention`'s temporary tables, which belong to its own sessions and are dropped every iteration, as any `#table` in tempdb.
+- **Named as an application's:** the middle segment is the client service the scenario plays (its `scenario.json`'s `service`, shared by several scenarios, as a real estate's apps are), and the run ID an opaque token that `demo.scenario_runs` maps back to the scenario. The procedures and functions live in the application schemas `billing`, `frontdesk`, `records`, `reporting`, `scheduling`, and `supply`, so the application and module names a DBA reads in the DMVs, Query Store, or Database Hub name no scenario; `demo` keeps the control plane. Only the answer key maps the names back to scenarios ([`rca/blind-detection.json`](../rca/blind-detection.json), [ADR 0031, decision 6](../docs/adr/0031-incident-rca.md#2-names)).
 - **Recorded:** `demo.scenario_runs` holds every run (ID, scenario, target, start, deadline, stop, parameters, expected symptoms, outcome, session IDs); `demo.scenario_run_events` holds session IDs and timestamps. T5's runs, with their request counters, are in `t5-runs.json` on T1.
 - **Recoverable:** business data comes back as seeded (transactions roll back, the baseline toggles values within their ranges), scratch data is capped and emptied by auto-cleanup and reset, and reset verifies that no demo transaction is still open. On T5, every write is an upsert to a fixed set of documents, ru-storm deletes its own when it ends, and reset deletes any left over.
 - **Human-approved remediation:** the missing-index fix is a script a person runs ([`missing-index/remediation.sql`](missing-index/remediation.sql)); nothing applies it automatically.
@@ -95,7 +96,7 @@ Without the runner (for example from SSMS), register a run first, then call the 
 DECLARE @deadline datetime2(3);
 EXEC demo.usp_run_begin @run_id = 'manual-1', @scenario_id = 'locking-blocking', @target = 'T1',
     @duration_seconds = 300, @concurrency = 1, @intensity = 5, @deadline_at = @deadline OUTPUT;
-EXEC demo.usp_scenario_locking_hold @run_id = 'manual-1', @hold_seconds = 120;     -- session 1: the head blocker
-EXEC demo.usp_scenario_locking_contend @run_id = 'manual-1', @worker = 1;           -- session 2: blocked
+EXEC billing.usp_reprioritize_queue_batch @run_id = 'manual-1', @hold_seconds = 120;  -- session 1: the head blocker
+EXEC billing.usp_claim_work_item @run_id = 'manual-1', @worker = 1;                    -- session 2: blocked
 EXEC demo.usp_run_end @run_id = 'manual-1', @status = 'Completed';
 ```

@@ -219,7 +219,8 @@ export const APP_TOKENS: Record<ThemeId, AppTokens> = {
     },
     contrast: {
         surfaces: ["#000000"],
-        // High contrast keeps Fluent's own hover and pressed fills (cyan, under black text), as it was before the earth tones.
+        // High contrast keeps Fluent's own hover and pressed fills, cyan under black: what the app colors itself takes that
+        // black on them (styles/app.css), so none of these colors sits on them.
         states: [],
         text: {
             "--status-fail": "#FF8C8C",

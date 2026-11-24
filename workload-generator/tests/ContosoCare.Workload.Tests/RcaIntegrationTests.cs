@@ -232,8 +232,17 @@ public sealed class RcaIntegrationTests : IDisposable
         var waiting = sessions.Where(r => r.GetValueOrDefault("blocked_by") is not null && (string?)r.GetValueOrDefault("run_token") == chainToken).ToList();
         Assert.NotEmpty(waiting);
         var blockers = waiting.Select(r => (string)r["blocked_by"]!).ToHashSet(StringComparer.Ordinal);
-        Assert.Contains(sessions, h => h.GetValueOrDefault("blocked_by") is null && blockers.Contains(h["session_id"]!.ToString()!) && (string?)h.GetValueOrDefault("run_token") == chainToken && h.GetValueOrDefault("module_name") is string && h.GetValueOrDefault("login_name") is string);
-        Assert.Contains(waiting, w => ((string?)w.GetValueOrDefault("wait_type") ?? string.Empty).StartsWith("LCK_M_", StringComparison.Ordinal) && w.GetValueOrDefault("statement_text") is string);
+        // The chain's head is the scenario's idle holder, an application that forgot to commit: its last batch was ad hoc
+        // text, so it has no request, and so no statement, and the DMVs give a sleeping session's module only when its last
+        // batch was one. RCA-SQL-01 keeps its input buffer instead: that batch, as SQL Server shows it.
+        var brief = string.Join("; ", sessions.Select(r => string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{r.GetValueOrDefault("session_id")} by {r.GetValueOrDefault("blocked_by") ?? "none"}, {r.GetValueOrDefault("status")}, transactions {r.GetValueOrDefault("open_transactions")}, token {((string?)r.GetValueOrDefault("run_token") == chainToken ? "chain" : r.GetValueOrDefault("run_token") is null ? "none" : "other")}, module {r.GetValueOrDefault("module_name") is string}, statement {r.GetValueOrDefault("statement_text") is string}, buffer {r.GetValueOrDefault("input_buffer") is string}, login {r.GetValueOrDefault("login_name") is string}")));
+        var heads = sessions.Where(h => h.GetValueOrDefault("blocked_by") is null && blockers.Contains(h["session_id"]!.ToString()!) && (string?)h.GetValueOrDefault("run_token") == chainToken).ToList();
+        var headFound = heads.Count > 0;
+        Assert.True(headFound, "No head blocker with the chain's run token: " + brief);
+        var headShown = heads.Exists(h => h.GetValueOrDefault("login_name") is string && h.GetValueOrDefault("input_buffer") is string && Convert.ToInt64(h.GetValueOrDefault("open_transactions") ?? 0, System.Globalization.CultureInfo.InvariantCulture) > 0);
+        Assert.True(headShown, "The chain's head has no login, input buffer, or open transaction: " + brief);
+        var waiterShown = waiting.Exists(w => ((string?)w.GetValueOrDefault("wait_type") ?? string.Empty).StartsWith("LCK_M_", StringComparison.Ordinal) && w.GetValueOrDefault("statement_text") is string);
+        Assert.True(waiterShown, "No waiter in a lock wait with its statement: " + brief);
 
         var events = view.Table("rca_events");
         Assert.Contains(events, e => (string?)e["kind"] == "capture" && (string?)e["event_name"] == "escalated");
@@ -313,5 +322,9 @@ public sealed class RcaIntegrationTests : IDisposable
         }
 
         public bool IsActive(DemoTarget asked) => asked == target && active;
+
+        public bool IsActiveAfter(DemoTarget asked, DateTimeOffset end) => false;
+
+        public bool HoldsAfter(DemoTarget asked, DateTimeOffset end) => false;
     }
 }

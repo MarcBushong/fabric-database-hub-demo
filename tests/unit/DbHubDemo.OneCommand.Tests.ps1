@@ -466,6 +466,26 @@ Describe 'The one ending: DONE or NOT DONE (brief items 1, 15, 16)' {
         @($outcome.Notes | Where-Object { $_ -match '^The nightly safety stop ' }).Count | Should -Be 1
     }
 
+    It 'says that only T4''s read replica waits for the Owner''s grant when the control''s role lacks only its network join actions (2026-11-23)' {
+        $config = New-TestConfig -WithT4
+        $grant = './scripts/grant-safety-stop.ps1 -ConfigPath ./config/demo.config.json'
+        $outcomeOf = { param([object[]] $Extra) InModuleScope DbHubDemo -Parameters @{ Result = @(New-DoneResult -WithT4) + @($Extra); State = (New-FinishedState -WithT4); Config = $config } { Get-DemoDeploymentOutcome -Result $Result -State $State -Config $Config } }
+        $joins = @('Microsoft.Network/virtualNetworks/subnets/join/action', 'Microsoft.Network/privateDnsZones/join/action')
+        $definition = New-DemoResult -CheckId 'CONTROL.ROLE.DEFINITION' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'The custom role "DbHub Demo Activity Operator" lacks 2 of its approved actions.' -Evidence ([ordered]@{ role = 'DbHub Demo Activity Operator'; lacking = $joins }) -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $grant)
+        $outcome = & $outcomeOf @($definition)
+        $outcome.Kind | Should -Be 'Done'
+        $outcome.Notes[0] | Should -Be ('First, once: an Owner of the subscription runs {0}, which grants the nightly safety stop''s and the session control''s roles. Until then, Run all can''t create T4''s read replica where Azure checks that it may join T4''s subnet, as in West Central US (from a PC, ./scripts/start-demo.ps1 creates it).' -f $grant)
+        $outcome.SessionWaitsForGrant | Should -BeFalse -Because 'Run all runs the rest of the session'
+
+        # Anything else the control's roles lack still keeps Run all from a whole session.
+        $a1 = New-DemoResult -CheckId 'CONTROL.ROLE.A1' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'A1 isn''t in place.' -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $grant)
+        $outcome = & $outcomeOf @($definition, $a1)
+        $outcome.Notes[0] | Should -Match '^First, once: .* Until then, Run all can''t run a whole session \(from a PC, \./scripts/start-demo\.ps1 works\)\.$'
+        $outcome.SessionWaitsForGrant | Should -BeTrue
+        $mixed = New-DemoResult -CheckId 'CONTROL.ROLE.DEFINITION' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message 'The custom role "DbHub Demo Activity Operator" lacks 3 of its approved actions.' -Evidence ([ordered]@{ role = 'DbHub Demo Activity Operator'; lacking = (@($joins) + @('Microsoft.Resources/tags/write')) }) -Remediation ('An Owner of the subscription runs, signed in with multifactor authentication: {0}' -f $grant)
+        (& $outcomeOf @($mixed)).SessionWaitsForGrant | Should -BeTrue
+    }
+
     It 'names only the scripts for each session while Run all isn''t ready: Fabric skipped, or the notebook not in Fabric yet (the review of dd5aee1)' {
         $config = New-TestConfig -WithT4
         $scripts = 'Each session: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory.'

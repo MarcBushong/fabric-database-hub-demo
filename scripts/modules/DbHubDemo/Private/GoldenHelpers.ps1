@@ -993,6 +993,132 @@ function Get-DemoGoldenCaptureControlResult {
     return (& $new 'Pass' ('No on-demand run is active: no {0} or {1} job is queued or running, and no auto-stop is pending.' -f $name.ControlRunbook, $name.StopRunbook) $evidence)
 }
 
+function Invoke-DemoGoldenControlPendingJob {
+    <#
+    .SYNOPSIS
+    The session control's read-only job for capture-t2-golden.ps1 (2026-11-23): DbHub-Control's pending action, which
+    reads the session's status copy with Get-AutomationVariable, encrypted or not, and prints what it lists of the
+    Incident RCA's documents still on the VMs (Get-DbHubRcaPendingList in DbHubControl.Common.ps1). Started with Job -
+    Create and the WebhookData a webhook would pass, which Learn allows for a runbook started another way; waited for with
+    Job - Get, at most -WaitSeconds; and read from Job - Get Output's 'DBHUB-CONTROL <json>' line. Starting a job needs
+    only the Contributor the scripts already use on the control's account. Returns Ok, Status (Read, Empty, Refused,
+    Unread, Failed, TimedOut, or NoResult), Pending (the status's lists, or $null), JobId, and Error (what it couldn't do,
+    worded to follow "the session control's job that reads it"). Never throws. Internal.
+    https://learn.microsoft.com/rest/api/automation/job/create
+    https://learn.microsoft.com/rest/api/automation/job/get
+    https://learn.microsoft.com/rest/api/automation/job/get-output
+    https://learn.microsoft.com/azure/automation/automation-webhooks#parameters-used-when-the-webhook-starts-a-runbook
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory)]
+        [pscustomobject] $Name,
+
+        [ValidateRange(30, 3600)]
+        [int] $WaitSeconds = 600,
+
+        [ValidateRange(1, 300)]
+        [int] $PollSeconds = 15
+    )
+
+    $answer = [pscustomobject]@{ Ok = $false; Status = 'Failed'; Pending = $null; JobId = ''; Error = '' }
+    try {
+        $jobName = [guid]::NewGuid().ToString()
+        $url = Get-DemoActivityControlUrl -Id ('{0}/jobs/{1}' -f $Name.AutomationAccountId, $jobName) -ApiVersion (Get-DemoPinnedApiVersion -ResourceType 'Microsoft.Automation/automationAccounts')
+        # A runbook started another way than its webhook gets WebhookData as JSON with the same properties; only RequestBody
+        # is read, and it holds no secret: Azure Automation logs a job's parameters.
+        $requestBody = ConvertTo-Json -InputObject ([ordered]@{ action = 'pending'; requestedBy = 'capture-t2-golden.ps1' }) -Compress
+        $webhookData = ConvertTo-Json -InputObject ([ordered]@{ WebhookName = 'capture-t2-golden.ps1'; RequestBody = $requestBody }) -Compress
+        $created = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method put -Url $url -Body ([ordered]@{ properties = [ordered]@{ runbook = [ordered]@{ name = $Name.ControlRunbook }; parameters = [ordered]@{ WebhookData = $webhookData } } })
+        if (-not $created.Ok) {
+            $answer.Error = 'couldn''t be started: {0}' -f ([string]$created.Error).TrimEnd('.')
+            return $answer
+        }
+        $properties = Get-DemoMemberValue -InputObject $created.Value -Name 'properties'
+        $answer.JobId = [string](Get-DemoMemberValue -InputObject $properties -Name 'jobId')
+        if (-not $answer.JobId) {
+            $answer.JobId = $jobName
+        }
+        $status = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
+        $exception = ''
+        $waited = 0
+        while ($status -notin $script:T4StopJobEndedStatuses -and $waited -lt $WaitSeconds) {
+            Start-Sleep -Seconds $PollSeconds
+            $waited += $PollSeconds
+            $read = Invoke-DemoActivityControlArm -SubscriptionId $Name.SubscriptionId -Method get -Url $url
+            if ($read.Ok) {
+                $properties = Get-DemoMemberValue -InputObject $read.Value -Name 'properties'
+                $status = [string](Get-DemoMemberValue -InputObject $properties -Name 'status')
+                $exception = Protect-DemoText -Text ([string](Get-DemoMemberValue -InputObject $properties -Name 'exception'))
+            }
+        }
+        if ($status -notin $script:T4StopJobEndedStatuses) {
+            # The job only reads, and nothing ends it but itself (the review of 8ca2b39c): a capture run again meanwhile
+            # meets it as an active run (GOLDEN.CAPTURE.CONTROL), and Stop now doesn't end it.
+            $answer.Status = 'TimedOut'
+            $within = if ($WaitSeconds -lt 120) { '{0} seconds' -f $WaitSeconds } else { '{0} minutes' -f [int][Math]::Ceiling($WaitSeconds / 60.0) }
+            $answer.Error = 'didn''t end in {0}: its job {1} is {2}, and since it only reads, wait for it to end before you run the capture again' -f $within, $answer.JobId, $(if ($status) { $status } else { 'not read' })
+            return $answer
+        }
+        if ($status -ne 'Completed') {
+            $answer.Error = 'ended {0}: its job {1}{2}' -f $status, $answer.JobId, $(if ($exception) { ', ' + $exception.TrimEnd('.') } else { '' })
+            return $answer
+        }
+        $line = Get-DemoSafetyStopJobResult -Name $Name -JobName $jobName -Marker 'DBHUB-CONTROL'
+        if ($null -eq $line) {
+            # A job's output can come a little after its end (the review of f5972d2d): read once more.
+            Start-Sleep -Seconds $PollSeconds
+            $line = Get-DemoSafetyStopJobResult -Name $Name -JobName $jobName -Marker 'DBHUB-CONTROL'
+        }
+        if ($null -eq $line) {
+            $answer.Status = 'NoResult'
+            $answer.Error = 'ended without a readable result: its job {0}' -f $answer.JobId
+            return $answer
+        }
+        $result = [string](Get-DemoMemberValue -InputObject $line -Name 'status')
+        $message = Protect-DemoText -Text ([string](Get-DemoMemberValue -InputObject $line -Name 'message'))
+        # Only an older DbHub-Control's refusal of an action it doesn't know means the runbook predates it.
+        if ($result -eq 'Refused' -and $message -notmatch '^action must be ') {
+            $result = 'Unread'
+        }
+        switch ($result) {
+            'Read' {
+                $lists = Get-DemoMemberValue -InputObject $line -Name 'pending'
+                # Without its lists, a Read can't say what the capture mustn't delete (the review of 8ca2b39c). The runbook
+                # always writes all three (Get-DbHubRcaPendingList), so one that lacks any isn't its answer (the re-check of
+                # d06899f6: {} read as nothing listed).
+                if ($lists -is [System.Collections.IDictionary] -and @('rca', 'rcaHandoff', 'rcaEarlierPending' | Where-Object { -not $lists.Contains($_) }).Count -eq 0) {
+                    $answer.Ok = $true
+                    $answer.Status = 'Read'
+                    $answer.Pending = $lists
+                }
+                else {
+                    $answer.Status = 'Unread'
+                    $answer.Error = 'couldn''t either: its job {0} said Read without its lists' -f $answer.JobId
+                }
+            }
+            'Empty' {
+                $answer.Ok = $true
+                $answer.Status = 'Empty'
+            }
+            'Refused' {
+                # An older DbHub-Control refuses an action it doesn't know.
+                $answer.Status = 'Refused'
+                $answer.Error = 'can''t: the published DbHub-Control is from before it (2026-11-23), so its job {0} refused it ({1})' -f $answer.JobId, $message.TrimEnd('.')
+            }
+            default {
+                $answer.Status = 'Unread'
+                $answer.Error = 'couldn''t either: its job {0} says {1}' -f $answer.JobId, $(if ($message) { $message.TrimEnd('.') } else { 'nothing' })
+            }
+        }
+    }
+    catch {
+        $answer.Error = 'failed: {0}' -f (Protect-DemoText -Text $_.Exception.Message).TrimEnd('.')
+    }
+    return $answer
+}
+
 function Get-DemoGoldenControlRcaPending {
     <#
     .SYNOPSIS
@@ -1007,14 +1133,17 @@ function Get-DemoGoldenControlRcaPending {
     copy isn't read. Documents past the 7 days the runner keeps them are left out, since no start fetches them any more.
     An encrypted variable is unreadable here (2026-11-23): a tenant's policy can re-create Automation variables encrypted,
     and then only a runbook's Get-AutomationVariable reads the value, while Resource Manager returns the variable with no
-    value, which would otherwise read as a status that lists nothing. So isEncrypted, or a variable with no value, is an
-    Error, and Encrypted says why. So is a variable that's missing from an account that exists (the review of 40124992):
-    since 2026-11-23 deploy.ps1 creates it only when it's missing, so a deletion, or a deployment that couldn't create it,
-    can leave it missing while sessions run, and their stops' lists are then only in the control vault, which the runbooks
-    can't read back; Missing says so. Only a control whose account doesn't exist has had no session that listed any.
+    value, which would otherwise read as a status that lists nothing. So for isEncrypted, a variable with no value, or a
+    read that failed for another reason than a missing variable, the session control's own read-only job reads it
+    (Invoke-DemoGoldenControlPendingJob: DbHub-Control's pending action, 2026-11-23), and when that can't either, it's an
+    Error, with Encrypted, and RunbookOld when the published DbHub-Control is from before that action. So is a variable
+    that's missing from an account that exists (the review of 40124992): since 2026-11-23 deploy.ps1 creates it only when
+    it's missing, so a deletion, or a deployment that couldn't create it, can leave it missing while sessions run, and
+    their stops' lists are then only in the control vault, which the runbooks can't read back; Missing says so. Only a
+    control whose account doesn't exist has had no session that listed any.
     Returns Read (a status was read), Documents, Error (a read that failed), Encrypted (Resource Manager returned no value:
-    the variable is encrypted, or came with none), Missing (the variable doesn't exist, though its account does),
-    Variable, and Notebook. Never throws. Internal.
+    the variable is encrypted, or came with none), Missing (the variable doesn't exist, though its account does), ReadBy
+    (Resource Manager, or job), JobId, RunbookOld, Variable, and Notebook. Never throws. Internal.
     https://learn.microsoft.com/rest/api/automation/variable/get,
     https://learn.microsoft.com/rest/api/automation/automation-account/get,
     https://learn.microsoft.com/azure/automation/shared-resources/variables
@@ -1029,67 +1158,90 @@ function Get-DemoGoldenControlRcaPending {
     )
 
     $name = Get-DemoActivityControlName -Config $Config
-    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Missing = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
+    $answer = [pscustomobject]@{ Read = $false; Documents = @(); Error = ''; Encrypted = $false; Missing = $false; ReadBy = 'Resource Manager'; JobId = ''; RunbookOld = $false; Variable = ('the variable DbHubSessionStatus of {0}' -f $name.AutomationAccount); Notebook = $name.Notebook }
     if (-not (Get-DemoActivityControlSetting -Config $Config).Enabled) {
         return $answer
     }
     $read = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id ('{0}/variables/DbHubSessionStatus' -f $name.AutomationAccountId) -ApiVersion '2024-10-23')
+    # Why Resource Manager didn't give the status, when it didn't: the session control's own job reads it then.
+    $why = ''
+    $status = $null
     if (-not $read.Ok) {
         if (-not $read.Missing) {
-            $answer.Error = [string]$read.Error
-            return $answer
-        }
-        # Missing: from an account that doesn't exist, which has had no session, or from one that does, whose sessions' stops
-        # can have listed evidence the runbooks couldn't keep there (the review of 40124992), so the capture fails closed.
-        $account = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $name.AutomationAccountId -ApiVersion '2024-10-23')
-        if ($account.Missing) {
-            return $answer
-        }
-        $answer.Missing = $true
-        $answer.Error = if ($account.Ok) {
-            'it doesn''t exist, though {0} does' -f $name.AutomationAccount
+            $why = [string]$read.Error
         }
         else {
-            'it doesn''t exist, and whether {0} does couldn''t be read: {1}' -f $name.AutomationAccount, ([string]$account.Error).TrimEnd('.')
-        }
-        return $answer
-    }
-    # An encrypted variable's value only a runbook reads: Resource Manager leaves it out, and an empty value would read as
-    # a status that lists nothing, so the capture would delete what it lists (2026-11-23).
-    $properties = Get-DemoMemberValue -InputObject $read.Value -Name 'properties'
-    $hasValue = $false
-    if ($properties -is [System.Collections.IDictionary]) {
-        $hasValue = @($properties.Keys | Where-Object { [string]$_ -eq 'value' }).Count -gt 0
-    }
-    elseif ($null -ne $properties) {
-        $hasValue = $null -ne $properties.PSObject.Properties['value']
-    }
-    if ((Get-DemoMemberValue -InputObject $properties -Name 'isEncrypted') -eq $true) {
-        $answer.Encrypted = $true
-        $answer.Error = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
-        return $answer
-    }
-    if (-not $hasValue) {
-        $answer.Encrypted = $true
-        $answer.Error = 'Azure Resource Manager returned it with no value, as it does for an encrypted variable'
-        return $answer
-    }
-    # A variable's value is its JSON, so the status's JSON comes as a JSON string ('""' until the runbooks write one).
-    $text = [string](Get-DemoMemberValue -InputObject $properties -Name 'value')
-    $status = $null
-    try {
-        if (-not [string]::IsNullOrWhiteSpace($text)) {
-            $status = $text | ConvertFrom-Json -AsHashtable -Depth 64
-            if ($status -is [string]) {
-                $status = if ($status.TrimStart().StartsWith('{')) { $status | ConvertFrom-Json -AsHashtable -Depth 64 } else { $null }
+            # Missing: from an account that doesn't exist, which has had no session, or from one that does, whose sessions'
+            # stops can have listed evidence the runbooks couldn't keep there (the review of 40124992), so the capture fails
+            # closed.
+            $account = Invoke-DemoActivityControlArm -SubscriptionId $name.SubscriptionId -Method get -Url (Get-DemoActivityControlUrl -Id $name.AutomationAccountId -ApiVersion '2024-10-23')
+            if ($account.Missing) {
+                return $answer
             }
+            $answer.Missing = $true
+            $answer.Error = if ($account.Ok) {
+                'it doesn''t exist, though {0} does' -f $name.AutomationAccount
+            }
+            else {
+                'it doesn''t exist, and whether {0} does couldn''t be read: {1}' -f $name.AutomationAccount, ([string]$account.Error).TrimEnd('.')
+            }
+            return $answer
         }
     }
-    catch {
-        $answer.Error = 'its value isn''t the JSON of a status'
-        return $answer
+    else {
+        # An encrypted variable's value only a runbook reads: Resource Manager leaves it out, and an empty value would read
+        # as a status that lists nothing, so the capture would delete what it lists (2026-11-23).
+        $properties = Get-DemoMemberValue -InputObject $read.Value -Name 'properties'
+        $hasValue = $false
+        if ($properties -is [System.Collections.IDictionary]) {
+            $hasValue = @($properties.Keys | Where-Object { [string]$_ -eq 'value' }).Count -gt 0
+        }
+        elseif ($null -ne $properties) {
+            $hasValue = $null -ne $properties.PSObject.Properties['value']
+        }
+        if ((Get-DemoMemberValue -InputObject $properties -Name 'isEncrypted') -eq $true) {
+            $answer.Encrypted = $true
+            $why = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
+        }
+        elseif (-not $hasValue) {
+            $answer.Encrypted = $true
+            $why = 'Azure Resource Manager returned it with no value, as it does for an encrypted variable'
+        }
+        else {
+            # A variable's value is its JSON, so the status's JSON comes as a JSON string ('""' until the runbooks write one).
+            $text = [string](Get-DemoMemberValue -InputObject $properties -Name 'value')
+            try {
+                if (-not [string]::IsNullOrWhiteSpace($text)) {
+                    $status = $text | ConvertFrom-Json -AsHashtable -Depth 64
+                    if ($status -is [string]) {
+                        $status = if ($status.TrimStart().StartsWith('{')) { $status | ConvertFrom-Json -AsHashtable -Depth 64 } else { $null }
+                    }
+                }
+            }
+            catch {
+                $answer.Error = 'its value isn''t the JSON of a status'
+                return $answer
+            }
+            $answer.Read = $true
+        }
     }
-    $answer.Read = $true
+    if ($why) {
+        # The session control's own read-only job (2026-11-23): DbHub-Control's pending action reads the variable with
+        # Get-AutomationVariable, encrypted or not, and prints the lists this reads. It runs only now, since it takes a
+        # minute or two, and a Run all started meanwhile is refused as another job's.
+        $job = Invoke-DemoGoldenControlPendingJob -Name $name
+        $answer.JobId = [string]$job.JobId
+        if (-not $job.Ok) {
+            $answer.RunbookOld = $job.Status -eq 'Refused'
+            $answer.Error = '{0}, and the session control''s job that reads it {1}' -f $why.TrimEnd('.'), $job.Error
+            return $answer
+        }
+        $answer.Read = $true
+        $answer.ReadBy = 'job'
+        $status = $job.Pending
+        $copy = if ($status -is [System.Collections.IDictionary]) { 'session {0}, last written {1}' -f $(if ([string]$status['sessionId']) { [string]$status['sessionId'] } else { 'none' }), $(if ([string]$status['updatedUtc']) { [string]$status['updatedUtc'] } else { 'at no recorded time' }) } else { 'no session''s status' }
+        Write-DemoLog -Message ('The session control''s status ({0}) {1}, so its DbHub-Control job {2} read it: {3}.' -f $answer.Variable, $(if ($answer.Encrypted) { 'is encrypted' } else { 'couldn''t be read through Azure Resource Manager' }), $answer.JobId, $copy)
+    }
     if ($status -isnot [System.Collections.IDictionary]) {
         return $answer
     }

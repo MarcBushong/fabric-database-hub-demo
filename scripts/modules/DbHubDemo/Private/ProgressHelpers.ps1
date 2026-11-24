@@ -188,6 +188,9 @@ function Get-DemoProgressCatalog {
     if (-not $SkipFabric) {
         $tracks.Add([ordered]@{ name = 'Fabric'; label = 'Fabric'; steps = @(
                     (& $step 'Fabric.Items' 'Workspace, notebooks, and the Real-Time Dashboard' @('Fabric/Fabric'))
+                    # F35 (2026-11-23): the history's kept values through Livy, before the history model's step, which deploys
+                    # the form they allow (Invoke-DemoHistoryKeptValue). Non-blocking: it never keeps the run from DONE.
+                    (& $step 'Fabric.KeptValues' 'History''s kept values (worked out through Livy, so overlapping saves count once)' @('Fabric/Fabric') $true)
                     (& $step 'Fabric.Report' 'History report' @('Fabric/Fabric'))
                     (& $step 'Fabric.App' 'Insights app' @('Fabric/Fabric') $true)
                     # Ask (ADR 0028): the app's Copilot chat relay, set up by the app's step (configure-fabric-app.ps1).
@@ -220,6 +223,8 @@ function Get-DemoProgressCatalog {
         # Displayed after the validation, when it happens: deploy.ps1 itself runs it once DONE's checks are done
         # (Invoke-DemoHistorySnapshotStep, 2026-11-06).
         $validation.Add((& $step 'Fabric.History' 'History report''s snapshot (NB_DatabaseHub_LiveActivity, once, analyze-only)' @('Validation') $true))
+        # F35 (2026-11-23): the snapshot's kept values through Livy, right after it (Invoke-DemoKeptValueEndStep). Non-blocking.
+        $validation.Add((& $step 'Fabric.HistoryKept' 'Kept values of the history snapshot (worked out through Livy)' @('Validation') $true))
     }
     # The busy marker (2026-11-14): deploy.ps1's refresher says here when the nightly stop waits for this run, and its end
     # says when the demo stops tonight (Update-DemoBusyMarker, Complete-DemoBusyMarkerRun).
@@ -269,7 +274,7 @@ function Get-DemoProgressStepId {
         'T4/Server' { return @('T4.Server') }
         'T4/Replica' { return @('T4.Replica') }
         'T4/Telemetry' { return @('T4.Telemetry') }
-        'Fabric/Fabric' { return @('Fabric.Items', 'Fabric.Report', 'Fabric.App', 'Fabric.Ask') }
+        'Fabric/Fabric' { return @('Fabric.Items', 'Fabric.KeptValues', 'Fabric.Report', 'Fabric.App', 'Fabric.Ask') }
         default { return @() }
     }
 }
@@ -423,6 +428,8 @@ function Set-DemoProgressPlan {
     # The history report's snapshot runs at the end of every run that reaches its validation, a resumed one included, so it's
     # never "finished in an earlier run" (2026-11-06).
     $map['Fabric.History'] = if ($Plan.Validation) { 'Run' } else { 'Skip' }
+    # So do the kept values of its rows (F35, 2026-11-23).
+    $map['Fabric.HistoryKept'] = if ($Plan.Validation) { 'Run' } else { 'Skip' }
     # The T2 host's rebuild (2026-11-17) happens only when its agent stays down; the T2 track sets the row when it does.
     $map['T2.HostRebuild'] = if (@($Plan.Tracks['T2']).Count -gt 0) { 'Rebuild' } else { 'Skip' }
     # The guest's restart (issue #65) happens only when PowerShell Direct into it breaks; the T2 track sets the row then.

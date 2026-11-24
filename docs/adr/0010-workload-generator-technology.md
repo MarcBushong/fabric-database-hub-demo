@@ -47,12 +47,12 @@ Option 1.
 - **SQL access:** Microsoft.Data.SqlClient.
   - T1 and T2 connect locally with Windows authentication.
   - T1 connects to T3 with `Authentication=Active Directory Managed Identity`.
-- **Tagging:** every connection sets `Application Name=ContosoCare.Demo/<scenarioId>/<runId>`.
+- **Tagging:** every connection sets `Application Name=ContosoCare.Demo/<scenarioId>/<runId>`. Since 2026-11-23, `ContosoCare.Demo/<service>/<runId>`, which names no scenario ([amendment](#amendment-realistic-workload-names-2026-11-23)).
 - **Publishing:** framework-dependent `win-x64`, run with `dotnet.exe` from a .NET runtime that the VMs download from Microsoft against a pinned SHA-512 (Phase 6 decision below; it replaces the self-contained single-file plan). A `linux-x64` build is used for the container.
 
 ### Scenario logic
 
-- Scenario logic lives in bounded T-SQL stored procedures in the `demo` schema (`database/common`, plus per-target folders). It's portable across T1, T2, and T3, so every incident can run on any target. That matters because the Database Agent's target coverage is undocumented (ADR 0013).
+- Scenario logic lives in bounded T-SQL stored procedures in the `demo` schema (`database/common`, plus per-target folders); since 2026-11-23, in application schemas with realistic names, and `demo` keeps the control plane ([amendment](#amendment-realistic-workload-names-2026-11-23)). It's portable across T1, T2, and T3, so every incident can run on any target. That matters because the Database Agent's target coverage is undocumented (ADR 0013).
 - The runner orchestrates sessions, concurrency, timing, and recording. Scenario definitions (`scenarios/<id>/scenario.json`) declare default and maximum duration, concurrency, intensity, target applicability, expected Hub signals, and expected symptoms. They're validated against a JSON schema.
 
 ### Bounds, enforced in three layers
@@ -340,3 +340,22 @@ Sources for this amendment (checked 2026-11-09):
 - **Permissions:** CREATE ANY or ALTER ANY EVENT SESSION on T1 and T2, where the runner's SYSTEM is sysadmin, and CREATE ANY DATABASE EVENT SESSION on T3, which dbo holds through CONTROL. No new login, role, or role assignment.
 - **Without it:** deadlocks come from system_health on T1 and T2 (RCA-SQL-12), and errors aren't captured.
 - **Tests:** the capture's T-SQL parses with the SQL Server 2022 grammar, as `SqlScriptTests` does, and the observer's tests check that it creates only `ContosoCare_RCA` and drops it.
+
+## Amendment: realistic workload names (2026-11-23)
+
+- **Decision source:** the owner's approval on 2026-11-23 of [ADR 0031](0031-incident-rca.md#2-names)'s decision 6, options (a′) and (c): what a DBA reads about the workload names no fault, and the bounds stay as they are.
+- **Tagging:** every scenario session sets `Application Name=ContosoCare.Demo/<service>/<runId>`.
+  - **`service`** is the ContosoCare client service the scenario plays, required in each `scenario.json` (`billing-worker`, `scheduling-service`, and seven more). Several scenarios share each one, as a real estate's client apps share a database, and it's never `control` or a scenario ID.
+  - **`runId`** is 16 random lowercase hex characters, with no time or target in it. `demo.scenario_runs` maps it back to the scenario, target, start, and deadline, as before; T5's run store does on T5.
+  - **Unchanged:** the `ContosoCare.Demo/` prefix, and `ContosoCare.Demo/control/` for the runner's own sessions. So [the three layers](#bounds-enforced-in-three-layers), the watchdog, reset, and the kill tools' prefix filters stay as they are.
+- **A run's sessions are found by its run ID:** the kill tools match `ContosoCare.Demo/%/<runId>`, as `demo.fn_demo_sessions` already did. A run ID has no `%` or `_`, so the match is exact, and an older runner's names (`ContosoCare.Demo/<scenarioId>/<runId>`) still match. On T4's replica, a scenario's stop ends the sessions of that scenario's Running runs, by run ID, never by service: `missing-index` and `replica-lag` share `reporting-jobs` there.
+- **Scenario logic:** the bounded procedures and functions move from `demo` to six application schemas: `billing`, `frontdesk`, `records`, `reporting`, `scheduling`, and `supply`.
+  - **Ownership:** on SQL Server they're owned by `dbo`, like `care` and `demo`, so ownership chaining to the business tables and to the `demo` helpers is unchanged. The runner's role gets `EXECUTE` on them, and on PostgreSQL also `USAGE`.
+  - **Names:** a module keeps one name on both engines where its scenario runs on both, such as `billing.usp_claim_work_item` for `locking-blocking`'s contenders. `demo` keeps the control plane: runs, stops, the kill tools, reset, the catalog, and the scratch tables.
+  - **Its run, without naming it:** each module checks its run first, with no scenario ID in its text. On SQL Server the control plane maps the calling module (`@@PROCID`) to the scenarios it serves (`demo.fn_workload_procedures()`, part of the answer key), so a procedure still runs only under its own scenario's run; T4's steps check their run as before.
+  - **Comments:** no stored module text names a scenario. A module's header comment stays in the script, outside what SQL Server stores.
+- **Upgrade, in one `deploy.ps1`:** `setup` creates the new modules, then drops the old names once every replacement exists, on every target.
+  - **A newer runner** refuses a run whose entry procedure isn't there yet, or on T4 isn't one the runner's role can run yet: **Refused**, `out-of-step`, which the profile host tries again, bounded.
+  - **An older runner's** call to a dropped name fails its run, and the watchdog still ends its sessions by run ID.
+- **The answer key maps the names back** ([`rca/blind-detection.json`](../../rca/blind-detection.json), `answerKey.workloadNames`): each service and module to the scenarios it can stand for, for the grading step only. Every one of those names is forbidden in detection code.
+- **Tests:** `CatalogTests` (each scenario's service, and its modules in the answer key), `ConnectionTests` (the name, the run ID, and the watchdog's match by run), `SqlScriptTests` (realistic names that the answer key maps, no stored module that names a scenario, and the retired names dropped once their replacements exist), and the three blind-detection tests.

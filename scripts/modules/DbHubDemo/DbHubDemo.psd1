@@ -71,6 +71,7 @@
         'Invoke-DemoDeployment'
         'Invoke-DemoDeployScript'
         'Invoke-DemoFabricAppDeployment'
+        'Invoke-DemoHistoryKeptValue'
         'Invoke-DemoHubReadiness'
         'Invoke-DemoHubTelemetryQuery'
         'Invoke-DemoPreflight'

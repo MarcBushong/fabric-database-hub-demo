@@ -21,7 +21,7 @@ internal static class ReplicaLag
     public const int MinimumHoldSeconds = 30;
 
     /// <summary>The primary's step: one mark, and with @take_lock first the table's ACCESS EXCLUSIVE lock.</summary>
-    public const string StepSql = "SELECT marks_written, locks_taken, last_mark_id FROM demo.usp_scenario_replica_lag(@run_id, @take_lock);";
+    public const string StepSql = "SELECT marks_written, locks_taken, last_mark_id FROM reporting.usp_publish_feed_checkpoint(@run_id, @take_lock);";
 
     /// <summary>
     /// The report on the replica. Opening demo.replica_lag_marks takes its ACCESS SHARE lock, which lasts until the

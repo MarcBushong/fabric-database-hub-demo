@@ -287,6 +287,28 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
             }
         }
     }
+
+    It 'names no retired workload module in the fixtures, the app''s source, or the runner''s RCA tests (ADR 0031, decision 6)' {
+        # The workload's modules have realistic names since 2026-11-23. A branch from before that adds a fixture or a test
+        # with an earlier name: ./tests/Update-RcaFixtures.ps1 -RenameWorkloadModules -Path <its files> renames them and
+        # writes the fixtures' part lines again. Names match in any case, as SQL Server's do.
+        $retired = @('usp_scenario_', 'fn_locking_hot_rows', 'fn_chain_rows', 'fn_idle_rows', 'usp_io_scratch_grow', 'usp_visit_summary_lookup')
+        $files = @(
+            Get-ChildItem -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures') -File -Filter '*.json'
+            $appSource = Join-Path -Path $repoRoot -ChildPath 'fabric/app/src'
+            if (Test-Path -LiteralPath $appSource) { Get-ChildItem -LiteralPath $appSource -Recurse -File }
+            $runnerTests = Join-Path -Path $repoRoot -ChildPath 'workload-generator/tests/ContosoCare.Workload.Tests'
+            if (Test-Path -LiteralPath $runnerTests) { Get-ChildItem -LiteralPath $runnerTests -File -Filter 'Rca*.cs' }
+        )
+        $files.Count | Should -BeGreaterThan 0
+        $found = foreach ($file in $files) {
+            $text = [System.IO.File]::ReadAllText($file.FullName)
+            foreach ($name in $retired) {
+                if ($text.IndexOf($name, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { '{0}: {1}' -f $file.FullName.Substring($repoRoot.Length + 1).Replace('\', '/'), $name }
+            }
+        }
+        $found | Should -BeNullOrEmpty -Because 'the workload has realistic module names since 2026-11-23: run ./tests/Update-RcaFixtures.ps1 -RenameWorkloadModules -Path with the files it names'
+    }
 }
 
 Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {

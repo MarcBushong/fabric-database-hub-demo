@@ -809,6 +809,305 @@ public sealed class RcaExportTests : IDisposable
         Assert.Contains("\"status\":\"Not selected\"", again, StringComparison.Ordinal);
     }
 
+    [Fact]
+    public async Task AStopsExportEndsTheCaptureAndTakesTheSpanWholeWhileTheSessionRunsOn()
+    {
+        // O1 (Final tests' live round at d7df4f9f): the session control's stop sends nothing to stop the profiles, so the
+        // final export's wait ran out while the observer still captured, and the session's last minutes stayed on the VM.
+        var store = new EvidenceStore(root, TimeProvider.System, host: "sqlvm01");
+        var gate = new SessionGate();
+        var lane = new ObserverLane([T1Observer(RcaSimulation.T1(new ManualTime(T1From)))], [DemoTarget.T5], gate, store, RunnerLog.Null, TimeProvider.System);
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            await UntilAsync(() => store.Spans() is [{ Span.Targets.Count: 2 }]);
+            await Task.Delay(TimeSpan.FromSeconds(1.5), TestContext.Current.CancellationToken);
+
+            var watch = System.Diagnostics.Stopwatch.StartNew();
+            var result = await Task.Run(() => new Exporter(store, RunnerLog.Null, "1.0.0").Export(Session, final: false, TimeSpan.FromSeconds(30), endCapture: true), TestContext.Current.CancellationToken);
+
+            Assert.True(watch.Elapsed < TimeSpan.FromSeconds(15), $"The export took {watch.Elapsed.TotalSeconds:0} s: the observer didn't end its capture soon after the end.");
+            Assert.Equal("Pass", result.Status);
+            Assert.DoesNotContain(Exporter.StillCapturing, result.Message, StringComparison.Ordinal);
+            var span = Assert.Single(store.Spans());
+            Assert.NotNull(span.Span.ClosedUtc);
+            Assert.True(span.Export.Complete, "The stop's export took the span whole.");
+            Assert.True(store.CaptureEndedAt() is { } end && end <= span.Span.ClosedUtc);
+            Assert.True(gate.IsActive(DemoTarget.T1), "The workload runs on until the VM stops.");
+            var view = Decode(store, Assert.Single(result.Documents));
+            Assert.True(view.Root["final"]!.GetValue<bool>(), "--end-capture implies --final.");
+            Assert.Equal(["T1", "T5"], view.Table("rca_coverage").Select(r => (string)r["target"]!).Order(StringComparer.Ordinal));
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public void WhenTheObserverStillCapturesTheIndexSaysSoRightAfterItsSummary()
+    {
+        // A runner whose observer predates the end, or a target that didn't let it end in time: the tail is the runbook's to
+        // name, from this note, which the message's cut at 500 characters must never reach, even behind a failed span's.
+        var store = Store(T1From, out var clock);
+        var broken = store.Open(T1From);
+        broken.Began("T1", T1From);
+        broken.Write(new CaptureRow(RcaContract.Resource, "T1", T1From.AddMinutes(1), "RCA-SQL-09").Set("at_utc", T1From.AddMinutes(1)).Set("target", "T1").Set("source", "RCA-SQL-09").Set("value", 1.0));
+        broken.Close(T1From.AddMinutes(2));
+        var span = store.Open(T1From.AddMinutes(3));
+        span.Began("T1", T1From.AddMinutes(3));
+        WriteSentinel(span, T1From.AddMinutes(3), T1From.AddMinutes(8));
+        Watermark(span, clock, T1From.AddMinutes(8));
+
+        var result = new Exporter(store, RunnerLog.Null, "1.0.0").Export(Session, final: false, TimeSpan.Zero, endCapture: true);
+
+        Assert.Equal("Warning", result.Status);
+        var document = Assert.Single(result.Documents);
+        Assert.StartsWith($"1 evidence document, {document.Parts} parts, for session {Session}. {Exporter.StillCapturing} Span {broken.Id} couldn't be exported", result.Message, StringComparison.Ordinal);
+        Assert.Equal(clock.Now, store.CaptureEndedAt());
+        Assert.False(store.Spans().Single(s => s.Id == span.Id).Export.Complete);
+    }
+
+    [Fact]
+    public void AStopsExportRecordsTheEndEvenWhereNothingWasCapturedYet()
+    {
+        // A target that's about to be captured (T4's replica waits to answer) mustn't start a span after the stop.
+        var store = Store(T1From, out var clock);
+
+        var result = new Exporter(store, RunnerLog.Null, "1.0.0").Export(null, final: true, TimeSpan.Zero, endCapture: true);
+
+        Assert.Equal("Not selected", result.Status);
+        Assert.Empty(result.Documents);
+        Assert.Equal(clock.Now, store.CaptureEndedAt());
+        clock.Advance(TimeSpan.FromMinutes(30));
+        store.EndCapture(clock.Now, Session);
+        Assert.Equal(clock.Now, store.CaptureEndedAt());
+        File.Delete(store.CaptureEndPath);
+        Assert.Null(store.CaptureEndedAt());
+    }
+
+    [Fact]
+    public void TheEndCaptureOptionImpliesFinalAndTheRunbookReadsItsNote()
+    {
+        var start = DateTimeOffset.FromUnixTimeSeconds(DateTimeOffset.UtcNow.ToUnixTimeSeconds() - 600);
+        var store = Store(start, out _);
+        var span = store.Open(start);
+        span.Began("T1", start);
+        WriteSentinel(span, start, start.AddMinutes(3));
+        span.Close(start.AddMinutes(3));
+
+        var (exit, output, _) = CliHarness.Invoke("rca", "export", "--session", Session, "--end-capture", "--wait-seconds", "0", "--rca-store", root);
+
+        Assert.Equal(0, exit);
+        var index = JsonNode.Parse(output.Trim()[(RcaContract.IndexMarker.Length + 1)..])!;
+        Assert.Equal("Pass", index["status"]!.GetValue<string>());
+        var view = Decode(store, new ExportedDocument(index["documents"]![0]!["documentId"]!.GetValue<string>(), index["documents"]![0]!["parts"]!.GetValue<int>(), index["documents"]![0]!["sha256"]!.GetValue<string>()));
+        Assert.True(view.Root["final"]!.GetValue<bool>());
+        Assert.NotNull(store.CaptureEndedAt());
+        // The session control's runbook names a VM's tail from this note (Invoke-DbHubRcaExport's takeExport).
+        Assert.Contains(Exporter.StillCapturing, File.ReadAllText(RepositoryPaths.Combine("automation", "runbooks", "DbHubControl.Common.ps1")), StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public async Task AHeldRunsAnswerKeyReachesTheStopsExportWithNoCaptureAfterTheEnd()
+    {
+        // The review of 1ca916a9: a fault run that ended right before the stop's end is still being recorded when the stop's
+        // export begins. Every target's capture ends at the end; the span's close waits for the answer key, and the export,
+        // which waits for the span to close, takes the run with the rest.
+        var store = new EvidenceStore(root, TimeProvider.System, host: "sqlvm01");
+        var release = new TaskCompletionSource();
+        var events = new Dictionary<DemoTarget, Func<string, CancellationToken, Task<IReadOnlyList<Sql.RunEvent>>>>
+        {
+            [DemoTarget.T1] = async (_, token) =>
+            {
+                await release.Task.WaitAsync(token);
+                return [];
+            },
+        };
+        var recorder = new Rca.AnswerKey.AnswerKeyRecorder(store, events, RunnerLog.Null);
+        var gate = new SessionGate(recorder);
+        var lane = new ObserverLane([T1Observer(RcaSimulation.T1(new ManualTime(T1From)))], [DemoTarget.T5], gate, store, RunnerLog.Null, TimeProvider.System);
+        using var stop = new CancellationTokenSource();
+        var running = Task.Run(() => lane.RunAsync(stop.Token), CancellationToken.None);
+        try
+        {
+            await UntilAsync(() => store.Spans() is [{ Span.Targets.Count: 2 }]);
+            await Task.Delay(TimeSpan.FromSeconds(1.5), TestContext.Current.CancellationToken);
+            var ended = DateTimeOffset.UtcNow;
+            recorder.RunEnded(DemoTarget.T1, new Runs.RunResult
+            {
+                RunId = "20261123170000-t1-d4e5f6",
+                ScenarioId = "blocking-chain",
+                Target = DemoTarget.T1,
+                Status = "Completed",
+                Result = "Pass",
+                Outcome = "Completed",
+                StartedAt = ended.AddMinutes(-3),
+                EndedAt = ended,
+            });
+
+            var export = Task.Run(() => new Exporter(store, RunnerLog.Null, "1.0.0").Export(Session, final: false, TimeSpan.FromSeconds(30), endCapture: true), TestContext.Current.CancellationToken);
+            await UntilAsync(() => store.Spans() is [{ Span.Targets: var targets }] && targets.Count == 2 && targets.Values.All(t => t.Intervals.LastOrDefault() is { To: not null }));
+            await Task.Delay(TimeSpan.FromSeconds(1.5), TestContext.Current.CancellationToken);
+            Assert.False(export.IsCompleted, "The export waits for the span, whose close waits for the answer key.");
+            Assert.Null(Assert.Single(store.Spans()).Span.ClosedUtc);
+
+            var released = DateTimeOffset.UtcNow;
+            release.SetResult();
+            var result = await export.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+
+            Assert.Equal("Pass", result.Status);
+            Assert.DoesNotContain(Exporter.StillCapturing, result.Message, StringComparison.Ordinal);
+            var span = Assert.Single(store.Spans());
+            Assert.True(span.Export.Complete, "The stop's export took the span whole.");
+            var captureEnded = span.Span.Targets.Values.Max(t => t.Intervals[^1].To!.Value);
+            Assert.True(captureEnded < released, "The capture ended at the end, not when the answer key had the run.");
+            Assert.Equal(captureEnded, span.Span.ClosedUtc);
+            var view = Decode(store, Assert.Single(result.Documents));
+            var run = Assert.Single(view.AnswerKey(), r => (string?)r["kind"] == "run");
+            Assert.Equal("20261123170000-t1-d4e5f6", run["scenario_run_id"]);
+        }
+        finally
+        {
+            await stop.CancelAsync();
+            await running.WaitAsync(TimeSpan.FromSeconds(30), TestContext.Current.CancellationToken);
+        }
+    }
+
+    [Fact]
+    public void ASecondStopOfTheSameSessionKeepsTheEndItsFirstRecorded()
+    {
+        // The review of 1ca916a9: a second end moved the end later, so the fault runs that ended between the two stops held
+        // the span again. Another session's stop, or one with no session, records its own end.
+        var store = Store(T1From, out var clock);
+        var first = clock.Now;
+        _ = new Exporter(store, RunnerLog.Null, "1.0.0").Export(Session, final: true, TimeSpan.Zero, endCapture: true);
+        Assert.Equal(first, EndFile(store)!.EndedUtc);
+        var written = File.GetLastWriteTimeUtc(store.CaptureEndPath);
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        _ = new Exporter(store, RunnerLog.Null, "1.0.0").Export(Session, final: true, TimeSpan.Zero, endCapture: true);
+        Assert.Equal(first, store.EndCapture(clock.Now, Session));
+        Assert.Equal(first, EndFile(store)!.EndedUtc);
+        Assert.Equal(written, File.GetLastWriteTimeUtc(store.CaptureEndPath));
+
+        clock.Advance(TimeSpan.FromMinutes(2));
+        const string Next = "0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+        Assert.Equal(clock.Now, store.EndCapture(clock.Now, Next));
+        Assert.Equal((clock.Now, Next), (EndFile(store)!.EndedUtc, EndFile(store)!.SessionId));
+        clock.Advance(TimeSpan.FromMinutes(2));
+        Assert.Equal(clock.Now, store.EndCapture(clock.Now, null));
+        clock.Advance(TimeSpan.FromMinutes(2));
+        Assert.Equal(clock.Now, store.EndCapture(clock.Now, null));
+        Assert.Equal(clock.Now, EndFile(store)!.EndedUtc);
+
+        static CaptureEndFile? EndFile(EvidenceStore store) => EvidenceStore.ReadJson(store.CaptureEndPath, RcaStoreJsonContext.Default.CaptureEndFile);
+    }
+
+    [Fact]
+    public void ASpanWhoseCloseCouldntBeWrittenWritesItWhenClosedAgain()
+    {
+        // The re-check of 9440acf2: the observer lane tries a held span's close again each second, but the span took a close
+        // whose write of span.json failed for done, so span.json never said it closed while the runner ran.
+        var store = Store(T1From, out _);
+        var span = store.Open(T1From);
+        span.Began("T1", T1From);
+        var path = Path.Combine(span.Directory, "span.json");
+        var blocker = path + ".tmp";
+        Directory.CreateDirectory(blocker);
+        Assert.True(Record.Exception(() => span.Close(T1To)) is IOException or UnauthorizedAccessException);
+        Assert.Null(EvidenceStore.ReadJson(path, RcaStoreJsonContext.Default.SpanFile)!.ClosedUtc);
+
+        Directory.Delete(blocker);
+        span.Close(T1To);
+        Assert.Equal(T1To, EvidenceStore.ReadJson(path, RcaStoreJsonContext.Default.SpanFile)!.ClosedUtc);
+    }
+
+    [Fact]
+    public void ABeginThatCouldntBeWrittenIsTakenBackSoItsNextTryBeginsTheTargetOnce()
+    {
+        // The re-check of 60aacd7b: the lane tries a failed begin again at its next tick. An interval left open by the first
+        // try would never end, since a target's end closes only its last one.
+        var store = Store(T1From, out _);
+        var span = store.Open(T1From);
+        span.Began("T5", T1From);
+        var path = Path.Combine(span.Directory, "span.json");
+        var blocker = path + ".tmp";
+        Directory.CreateDirectory(blocker);
+        Assert.True(Record.Exception(() => span.Began("T1", T1From.AddSeconds(1))) is IOException or UnauthorizedAccessException);
+
+        Directory.Delete(blocker);
+        span.Began("T1", T1From.AddSeconds(2));
+        span.Ended("T1", T1From.AddMinutes(1));
+        var targets = EvidenceStore.ReadJson(path, RcaStoreJsonContext.Default.SpanFile)!.Targets;
+        var interval = Assert.Single(targets["T1"].Intervals);
+        Assert.Equal(T1From.AddSeconds(2), interval.From);
+        Assert.Equal(T1From.AddMinutes(1), interval.To);
+        Assert.Single(targets["T5"].Intervals);
+    }
+
+    [Fact]
+    public async Task AfterTheCapturesEndOnlyTheRunsThatEndedByThenHoldTheAnswerKeyPending()
+    {
+        var store = Store(T1From, out _);
+        var release = new TaskCompletionSource();
+        var events = new Dictionary<DemoTarget, Func<string, CancellationToken, Task<IReadOnlyList<Sql.RunEvent>>>>
+        {
+            [DemoTarget.T1] = async (_, token) =>
+            {
+                await release.Task.WaitAsync(token);
+                return [];
+            },
+            [DemoTarget.T3] = async (_, token) =>
+            {
+                await release.Task.WaitAsync(token);
+                return [];
+            },
+            [DemoTarget.T4] = async (_, token) =>
+            {
+                await release.Task.WaitAsync(token);
+                return [];
+            },
+            [DemoTarget.T2] = async (_, token) =>
+            {
+                await release.Task.WaitAsync(token);
+                return [];
+            },
+        };
+        var recorder = new Rca.AnswerKey.AnswerKeyRecorder(store, events, RunnerLog.Null);
+        var end = T1From.AddMinutes(10);
+
+        recorder.RunEnded(DemoTarget.T1, Run(DemoTarget.T1, end.AddSeconds(-5)));
+        recorder.RunEnded(DemoTarget.T3, Run(DemoTarget.T3, end.AddSeconds(5)));
+        // The review of 1ca916a9: only a run's own end counts, and a refused start, which has none, isn't recorded at all.
+        recorder.RunEnded(DemoTarget.T4, Run(DemoTarget.T4, end.AddSeconds(-5)) with { EndedAt = null });
+        recorder.RunEnded(DemoTarget.T2, Run(DemoTarget.T2, end.AddSeconds(-5)) with { Status = "Refused", StartedAt = null, EndedAt = null, RefusalReason = "run-limit" });
+
+        Assert.True(recorder.IsPending(DemoTarget.T1, end));
+        Assert.False(recorder.IsPending(DemoTarget.T3, end));
+        Assert.True(recorder.IsPending(DemoTarget.T3));
+        Assert.False(recorder.IsPending(DemoTarget.T4, end));
+        Assert.True(recorder.IsPending(DemoTarget.T4));
+        Assert.False(recorder.IsPending(DemoTarget.T2));
+        release.SetResult();
+        await UntilAsync(() => !recorder.IsPending(DemoTarget.T1) && !recorder.IsPending(DemoTarget.T3) && !recorder.IsPending(DemoTarget.T4));
+        Assert.False(recorder.IsPending(DemoTarget.T1, end));
+
+        static Runs.RunResult Run(DemoTarget target, DateTimeOffset ended) => new()
+        {
+            RunId = "20261120170000-" + target.ToString().ToLowerInvariant() + "-a1b2c3",
+            ScenarioId = "blocking-chain",
+            Target = target,
+            Status = "Completed",
+            Result = "Pass",
+            Outcome = "Completed",
+            StartedAt = ended.AddMinutes(-5),
+            EndedAt = ended,
+        };
+    }
+
     /// <summary>Drives T1's simulation into the store, closes its span at 17:05, and exports it as the fixture's export 1.</summary>
     private static async Task<EvidenceView> ExportT1Async(EvidenceStore store, ManualTime clock)
     {
@@ -1078,4 +1377,30 @@ public sealed class RcaExportTests : IDisposable
     private static CaptureRow Capture(DateTimeOffset at, string name, string code) =>
         new CaptureRow(RcaContract.Events, "T1", at, "observer")
             .Set("event_time_utc", at).Set("target", "T1").Set("kind", "capture").Set("event_name", name).Set("code", code).Set("event_count", 1L).Set("detail", "processes_blocked 1 >= 1.");
+
+    private static async Task UntilAsync(Func<bool> condition)
+    {
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(20);
+        while (!condition())
+        {
+            Assert.True(DateTime.UtcNow < deadline, "The condition wasn't met in time.");
+            await Task.Delay(50, TestContext.Current.CancellationToken);
+        }
+    }
+
+    /// <summary>
+    /// T1 and T5 in a session whose profiles were set an hour ago: the workload runs on whatever the capture does. With an
+    /// answer key, the span's close waits after the end as the profile host's does: while a run that ended by then is still
+    /// being recorded.
+    /// </summary>
+    private sealed class SessionGate(Rca.AnswerKey.IAnswerKeySink? answerKey = null) : IObservationGate
+    {
+        private readonly DateTimeOffset setAt = DateTimeOffset.UtcNow - TimeSpan.FromHours(1);
+
+        public bool IsActive(DemoTarget target) => target is DemoTarget.T1 or DemoTarget.T5;
+
+        public bool IsActiveAfter(DemoTarget target, DateTimeOffset end) => IsActive(target) && setAt > end;
+
+        public bool HoldsAfter(DemoTarget target, DateTimeOffset end) => answerKey?.IsPending(target, end) == true;
+    }
 }

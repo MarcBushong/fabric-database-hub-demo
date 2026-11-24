@@ -308,8 +308,9 @@ function Get-DemoFabricContentReopen {
     .SYNOPSIS
     Why a resumed deploy.ps1 runs the Fabric step again although an earlier run recorded it as finished: the Fabric content
     it last published in full (the state's FabricSha256) isn't what this copy of the scripts publishes (-Current,
-    Get-DemoFabricContentSha256), or nothing was recorded (a run from before 2026-11-16, or one whose Insights app wasn't
-    deployed). Returns that reason as a sentence, or '' when the content is the same. Pure. Internal.
+    Get-DemoFabricContentSha256), or nothing was recorded (a run from before 2026-11-16, one whose Insights app wasn't
+    deployed, or one that deployed the history model in the release's form while this copy has the kept values' one: F35,
+    Test-DemoKeptFormPending). Returns that reason as a sentence, or '' when the content is the same. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -326,7 +327,7 @@ function Get-DemoFabricContentReopen {
         return ''
     }
     if (-not $recorded) {
-        return 'no record says it published this version''s notebooks, history model and report, dashboard, and Insights app (an earlier version, or a run whose Insights app wasn''t deployed).'
+        return 'no record says it published this version''s notebooks, history model and report, dashboard, and Insights app (an earlier version, a run whose Insights app wasn''t deployed, or one that deployed the history model in the release''s form while this version has the kept values'' one).'
     }
     return ('this copy of the scripts has other notebooks, history model, report, dashboard, or Insights app than the ones it published ({0}, not {1}).' -f $Current.Substring(0, 12), $recorded.Substring(0, [System.Math]::Min(12, $recorded.Length)))
 }

@@ -3,7 +3,7 @@
 Repeated, bounded deadlocks for T1 (and any target): every pair of sessions deadlocks with itself, round after round (Phase 25b).
 
 - **Definition:** [`scenario.json`](scenario.json) (10 minutes by default, 30 at most; 2 pairs by default, 8 at most).
-- **Sessions:** two per pair, sides 1 and 2, tagged `ContosoCare.Demo/deadlock-storm/<run>`, each running `demo.usp_scenario_deadlock_storm`. Pair P uses inventory rows 100 + 2P - 1 and 100 + 2P (101 to 116), apart from `locking-blocking`'s rows 1 and 2.
+- **Sessions:** two per pair, sides 1 and 2, tagged `ContosoCare.Demo/supply-sync/<run>`, each running `supply.usp_reconcile_stock`. Pair P uses inventory rows 100 + 2P - 1 and 100 + 2P (101 to 116), apart from `locking-blocking`'s rows 1 and 2.
 - **Shapes** (`shape`):
   - `order`: side 1 locks row A, waits a second, then locks row B; side 2 does B then A.
   - `conversion`: both sides read row A with `HOLDLOCK` (a shared lock kept to the end of the transaction), wait a second, then both update row A.

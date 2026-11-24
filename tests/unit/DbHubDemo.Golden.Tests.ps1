@@ -202,7 +202,9 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $script:controlError = ''
         $script:controlEncrypted = $false
         $script:controlMissing = $false
-        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Encrypted = $script:controlEncrypted; Missing = $script:controlMissing; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
+        $script:controlRunbookOld = $false
+        $script:controlJobId = ''
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Encrypted = $script:controlEncrypted; Missing = $script:controlMissing; ReadBy = $(if ($script:controlJobId) { 'job' } else { 'Resource Manager' }); JobId = $script:controlJobId; RunbookOld = $script:controlRunbookOld; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
         # The demo workspace's NB_DatabaseHub_LiveActivity, read only when T2's documents are listed: this release's copy,
         # unless a test sets another.
         $script:notebookState = [pscustomobject]@{ Known = $true; Current = $true; Error = '' }
@@ -472,20 +474,35 @@ Describe 'New-DemoT2GoldenSnapshot' {
         }
     }
 
-    It 'captures nothing when a tenant''s policy encrypted the session control''s status, and says how to save what it lists first, since running it again can''t help (2026-11-23)' {
-        $script:controlError = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
+    It 'captures nothing when a tenant''s policy encrypted the session control''s status and its job couldn''t read it either, and says how to save what it lists first (2026-11-23)' {
+        $script:controlError = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted, and the session control''s job that reads it ended Failed: its job job-1'
         $script:controlEncrypted = $true
+        $script:controlJobId = 'job-1'
         $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
         $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
         $rca.status | Should -Be 'Fail'
-        $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
+        $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted, and the session control''s job that reads it ended Failed: its job job-1), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
         $accountId = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } { (Get-DemoActivityControlName -Config $Config).AutomationAccountId }
         $accountId | Should -Match '/resourceGroups/rg-dbhub-control/providers/Microsoft\.Automation/automationAccounts/aa-dbhub-control$'
-        $rca.remediation | Should -Be ('Running the capture again won''t help by itself: only the control''s runbooks read an encrypted variable, and ./scripts/deploy.ps1 keeps an existing one as it is. To save what it may list first, run sessions with Run all in NB_DatabaseHub_Control, each to its planned end, by Run all''s own end or its auto-stop (a stop before it, by STOP_NOW, the Insights app''s Stop now, or ./scripts/stop-demo.ps1, can leave capture that the stop''s lines don''t name), until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, delete it (az rest --method delete --url "https://management.azure.com{0}/variables/DbHubSessionStatus?api-version=2024-10-23", or aa-dbhub-control''s Variables in the Azure portal), run ./scripts/deploy.ps1, which creates it again, unencrypted and empty, and then ./scripts/capture-t2-golden.ps1.' -f $accountId) -Because 'since 2026-11-23 deploy.ps1 keeps the variable as it is, so the evidence it lists goes first, including another session''s that a session''s exports found and its status carries, which only RCA.EXPORT''s note counts (the review of a57539ed), and then it''s deleted, to be created again readable'
+        $rca.remediation | Should -Be ('Run ./scripts/capture-t2-golden.ps1 again: the session control''s DbHub-Control job reads an encrypted status, and what kept it from it may not last. If it keeps failing, save what the status may list first: run sessions with Run all in NB_DatabaseHub_Control until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, delete it (az rest --method delete --url "https://management.azure.com{0}/variables/DbHubSessionStatus?api-version=2024-10-23", or aa-dbhub-control''s Variables in the Azure portal), run ./scripts/deploy.ps1, which creates it again, unencrypted and empty, and then ./scripts/capture-t2-golden.ps1.' -f $accountId) -Because 'the job reads an encrypted status (2026-11-23); only when it keeps failing does the variable go, once its evidence is saved, to be created again readable, and a stop that can''t end the capture names that VM in RCA.PENDING (O1)'
         $rca.evidence.encrypted | Should -BeTrue
+        $rca.evidence.job | Should -Be 'job-1'
         foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
             $script:calls | Should -Not -Contain $step
         }
+    }
+
+    It 'captures nothing when the published DbHub-Control is from before the job that reads the status, and names ./scripts/deploy.ps1 (2026-11-23)' {
+        $script:controlError = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted, and the session control''s job that reads it can''t: the published DbHub-Control is from before it (2026-11-23), so its job job-4 refused it (action must be run, session, stop, capture, or reset)'
+        $script:controlEncrypted = $true
+        $script:controlRunbookOld = $true
+        $script:controlJobId = 'job-4'
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.remediation | Should -Be 'Run ./scripts/deploy.ps1, which publishes the session control''s runbooks again (CONTROL.RUNBOOKS), then ./scripts/capture-t2-golden.ps1 again: since 2026-11-23, DbHub-Control reads the status for the capture, encrypted or not.'
+        $rca.evidence.runbookOld | Should -BeTrue
+        $script:calls | Should -Not -Contain 'guest Prepare'
     }
 
     It 'updates a notebook from before the Incident RCA first, which no history save would take them with (<Case>, the review of c059878)' -ForEach @(
@@ -1466,6 +1483,11 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         function Get-ControlPending {
             & (Get-Module -Name DbHubDemo) { param($c, $n) Get-DemoGoldenControlRcaPending -Config $c -NowUtc $n } $config $script:now
         }
+        # The session control's read-only job (2026-11-23), which reads the variable when Resource Manager can't give it: one
+        # that fails, unless a test sets another.
+        $script:job = [pscustomobject]@{ Ok = $false; Status = 'Failed'; Pending = $null; JobId = 'job-1'; Error = 'ended Failed: its job job-1' }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenControlPendingJob -MockWith { $script:job }
+        Mock -ModuleName DbHubDemo -CommandName Write-DemoLog -MockWith { }
     }
 
     It 'reads the documents the status lists, each with its VM: its own, a re-check''s handoff, and earlier sessions'' not yet expired' {
@@ -1512,7 +1534,8 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $script:readFail = 'Forbidden'
         $failed = Get-ControlPending
         $failed.Read | Should -BeFalse
-        $failed.Error | Should -Be 'Forbidden'
+        $failed.Error | Should -Be 'Forbidden, and the session control''s job that reads it ended Failed: its job job-1' -Because 'the job reads it when Resource Manager can''t (2026-11-23), and fails here'
+        $failed.JobId | Should -Be 'job-1'
         $script:readFail = ''
         $script:variable = '{not json'
         (Get-ControlPending).Error | Should -Be 'its value isn''t the JSON of a status'
@@ -1534,12 +1557,13 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $unknown.Error | Should -Be 'it doesn''t exist, and whether aa-dbhub-control does couldn''t be read: Timeout'
     }
 
-    It 'can''t read a variable a tenant''s policy encrypted, which Resource Manager returns with no value, rather than reading it as a status that lists nothing (2026-11-23)' {
+    It 'can''t read a variable a tenant''s policy encrypted, which Resource Manager returns with no value, when the control''s job can''t either, rather than reading it as a status that lists nothing (2026-11-23)' {
         $script:properties = @{ isEncrypted = $true; description = 'The demo session''s last status (JSON)' }
         $encrypted = Get-ControlPending
         $encrypted.Read | Should -BeFalse
         $encrypted.Encrypted | Should -BeTrue
-        $encrypted.Error | Should -Be 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
+        $encrypted.Error | Should -Be 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted, and the session control''s job that reads it ended Failed: its job job-1'
+        $encrypted.RunbookOld | Should -BeFalse
         @($encrypted.Documents) | Should -BeNullOrEmpty
         # The flag alone decides it: a value that came with it isn't the status the runbooks read.
         $script:properties = @{ isEncrypted = $true; value = (ConvertTo-Json -InputObject (ConvertTo-Json -InputObject ([ordered]@{ sessionId = 'a' * 32; phase = 'stopped'; updatedUtc = '2026-11-20T19:00:00Z'; rca = [ordered]@{ pending = @([ordered]@{ documentId = 'doc-own-t2'; vm = 'archost01' }) } }) -Depth 8 -Compress)) }
@@ -1552,14 +1576,149 @@ Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
         $none = Get-ControlPending
         $none.Read | Should -BeFalse
         $none.Encrypted | Should -BeTrue
-        $none.Error | Should -Be 'Azure Resource Manager returned it with no value, as it does for an encrypted variable'
-        # The runbooks' unencrypted copy still reads, with no Error.
+        $none.Error | Should -Be 'Azure Resource Manager returned it with no value, as it does for an encrypted variable, and the session control''s job that reads it ended Failed: its job job-1'
+        # The runbooks' unencrypted copy still reads, with no Error, and no job.
         $script:properties = $null
         $script:variable = '""'
         $plain = Get-ControlPending
         $plain.Read | Should -BeTrue
         $plain.Encrypted | Should -BeFalse
         $plain.Error | Should -BeNullOrEmpty
+        $plain.ReadBy | Should -Be 'Resource Manager'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenControlPendingJob -Times 3 -Exactly
+    }
+
+    It 'reads an encrypted status through the session control''s own job, with the lists Resource Manager would give (2026-11-23)' {
+        # DbHub-Control's pending action reads the variable with Get-AutomationVariable, encrypted or not, and prints the
+        # fields this reads; the same rules then apply: the status's own documents for 7 days after its last write, and
+        # earlier sessions' until their carry expires.
+        $script:properties = @{ isEncrypted = $true }
+        $script:job = [pscustomobject]@{ Ok = $true; Status = 'Read'; JobId = 'job-2'; Error = ''; Pending = @{
+                sessionId = 'a' * 32; phase = 'stopped'; updatedUtc = '2026-11-20T19:00:00Z'
+                rca = @{ pending = @(@{ documentId = 'doc-own-t2'; vm = 'archost01' }, @{ documentId = 'doc-own-t1'; vm = 'sqlvm01' }) }
+                rcaHandoff = @(@{ documentId = 'doc-handoff-t2'; vm = 'archost01' })
+                rcaEarlierPending = @(
+                    @{ sessionId = 'b' * 32; pending = @(@{ documentId = 'doc-earlier-t2'; vm = 'archost01' }); expiresUtc = '2026-11-25T00:00:00Z' }
+                    @{ sessionId = 'c' * 32; pending = @(@{ documentId = 'doc-expired-t2'; vm = 'archost01' }); expiresUtc = '2026-11-20T00:00:00Z' }
+                )
+            }
+        }
+        $answer = Get-ControlPending
+        $answer.Read | Should -BeTrue
+        $answer.Error | Should -BeNullOrEmpty
+        $answer.Encrypted | Should -BeTrue
+        $answer.ReadBy | Should -Be 'job'
+        $answer.JobId | Should -Be 'job-2'
+        @($answer.Documents | ForEach-Object { '{0} {1} {2}' -f $_['documentId'], $_['vm'], $_['sessionId'] }) | Should -Be @(
+            ('doc-own-t2 archost01 ' + ('a' * 32)), ('doc-own-t1 sqlvm01 ' + ('a' * 32)), ('doc-handoff-t2 archost01 ' + ('a' * 32)), ('doc-earlier-t2 archost01 ' + ('b' * 32))
+        )
+        Should -Invoke -ModuleName DbHubDemo -CommandName Write-DemoLog -Times 1 -Exactly -ParameterFilter { $Message -eq ('The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) is encrypted, so its DbHub-Control job job-2 read it: session {0}, last written 2026-11-20T19:00:00Z.' -f ('a' * 32)) }
+        # A copy with no status yet lists nothing; so does one a read that failed through Resource Manager leaves to the job.
+        $script:job = [pscustomobject]@{ Ok = $true; Status = 'Empty'; JobId = 'job-3'; Error = ''; Pending = $null }
+        $empty = Get-ControlPending
+        $empty.Read | Should -BeTrue
+        @($empty.Documents) | Should -BeNullOrEmpty
+        $script:properties = $null
+        $script:readFail = 'Timeout'
+        $unread = Get-ControlPending
+        $unread.Read | Should -BeTrue
+        $unread.Encrypted | Should -BeFalse
+        $unread.ReadBy | Should -Be 'job'
+    }
+
+    It 'says when the published DbHub-Control is from before the job that reads the status (2026-11-23)' {
+        $script:properties = @{ isEncrypted = $true }
+        $script:job = [pscustomobject]@{ Ok = $false; Status = 'Refused'; JobId = 'job-4'; Pending = $null; Error = 'can''t: the published DbHub-Control is from before it (2026-11-23), so its job job-4 refused it (action must be run, session, stop, capture, or reset)' }
+        $old = Get-ControlPending
+        $old.Read | Should -BeFalse
+        $old.RunbookOld | Should -BeTrue
+        $old.Encrypted | Should -BeTrue
+        $old.Error | Should -Match ', and the session control''s job that reads it can''t: the published DbHub-Control is from before it'
+    }
+}
+
+Describe 'Invoke-DemoGoldenControlPendingJob (2026-11-23)' {
+    BeforeEach {
+        $config = New-TestConfig
+        # Job - Create's answer, the job's statuses that Job - Get returns in turn (the last one again after that), and its
+        # output; whether Azure refuses the create.
+        $script:createFail = ''
+        $script:statuses = @('Running', 'Completed')
+        $script:statusReads = 0
+        $script:jobException = ''
+        $script:output = 'Request: pending by capture-t2-golden.ps1.' + "`n" + 'DBHUB-CONTROL {"action":"pending","status":"Read","message":"The session''s status copy was read.","pending":{"sessionId":"' + ('a' * 32) + '","phase":"stopped","updatedUtc":"2026-11-20T19:00:00Z","rca":{"pending":[{"documentId":"doc-own-t2","vm":"archost01"}]},"rcaHandoff":[],"rcaEarlierPending":[]}}'
+        $script:outputReads = 0
+        $script:created = $null
+        Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            if ($Method -eq 'put') {
+                $script:created = [pscustomobject]@{ Url = $Url; Body = $Body }
+                if ($script:createFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = $script:createFail } }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ jobId = 'job-1'; status = 'New' } }; Error = '' }
+            }
+            if ($Url -match '/jobs/[0-9a-f-]+/output\?') {
+                $script:outputReads++
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = $script:output; Error = '' }
+            }
+            $index = [Math]::Min($script:statusReads, @($script:statuses).Count - 1)
+            $script:statusReads++
+            return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ properties = @{ jobId = 'job-1'; status = @($script:statuses)[$index]; exception = $script:jobException } }; Error = '' }
+        }
+        function Invoke-PendingJob([int] $WaitSeconds = 600) {
+            & (Get-Module -Name DbHubDemo) { param($c, $w) Invoke-DemoGoldenControlPendingJob -Name (Get-DemoActivityControlName -Config $c) -WaitSeconds $w -PollSeconds 15 } $config $WaitSeconds
+        }
+    }
+
+    It 'starts DbHub-Control''s read-only pending action as a job, with the WebhookData its webhook would pass, and reads its lists' {
+        $job = Invoke-PendingJob
+        $job.Ok | Should -BeTrue
+        $job.Status | Should -Be 'Read'
+        $job.JobId | Should -Be 'job-1'
+        $job.Pending['sessionId'] | Should -Be ('a' * 32)
+        @($job.Pending['rca']['pending'] | ForEach-Object { $_['documentId'] }) | Should -Be @('doc-own-t2')
+        $script:created.Url | Should -Match '/resourceGroups/rg-dbhub-control/providers/Microsoft\.Automation/automationAccounts/aa-dbhub-control/jobs/[0-9a-f-]{36}\?api-version=2024-10-23$'
+        $script:created.Body.properties.runbook.name | Should -Be 'DbHub-Control'
+        @($script:created.Body.properties.parameters.Keys) | Should -Be @('WebhookData')
+        $webhook = $script:created.Body.properties.parameters.WebhookData | ConvertFrom-Json -AsHashtable
+        @($webhook.Keys | Sort-Object) | Should -Be @('RequestBody', 'WebhookName') -Because 'a runbook started another way gets WebhookData with its properties as simple values (Learn)'
+        $request = $webhook['RequestBody'] | ConvertFrom-Json -AsHashtable
+        $request['action'] | Should -Be 'pending'
+        $request['requestedBy'] | Should -Be 'capture-t2-golden.ps1'
+        @($request.Keys) | Should -HaveCount 2
+        $script:statusReads | Should -Be 2
+    }
+
+    It 'says what kept it from the status: <Case>' -ForEach @(
+        @{ Case = 'a DbHub-Control from before the action'; Output = 'DBHUB-CONTROL {"action":"","status":"Refused","message":"action must be run, session, stop, capture, or reset."}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Refused'; Error = 'can''t: the published DbHub-Control is from before it (2026-11-23), so its job job-1 refused it (action must be run, session, stop, capture, or reset)' }
+        @{ Case = 'a copy it couldn''t read'; Output = 'DBHUB-CONTROL {"action":"pending","status":"Unread","message":"The variable DbHubSessionStatus isn''t the JSON of a status."}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 says The variable DbHubSessionStatus isn''t the JSON of a status' }
+        @{ Case = 'a refusal of the request, not of the action'; Output = 'DBHUB-CONTROL {"action":"","status":"Refused","message":"The webhook request has no body."}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 says The webhook request has no body' }
+        @{ Case = 'a job that failed'; Output = ''; Statuses = @('Running', 'Failed'); CreateFail = ''; Status = 'Failed'; Error = 'ended Failed: its job job-1, The sandbox ran out of memory' }
+        @{ Case = 'a job Azure refused'; Output = ''; Statuses = @('Completed'); CreateFail = 'Forbidden'; Status = 'Failed'; Error = 'couldn''t be started: Forbidden' }
+        @{ Case = 'a job with no result line'; Output = 'Request: pending by capture-t2-golden.ps1.'; Statuses = @('Completed'); CreateFail = ''; Status = 'NoResult'; Error = 'ended without a readable result: its job job-1' }
+        @{ Case = 'a Read without its lists (the review of 8ca2b39c)'; Output = 'DBHUB-CONTROL {"action":"pending","status":"Read","message":"x"}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
+        @{ Case = 'a Read whose lists aren''t an object (the review of 8ca2b39c)'; Output = 'DBHUB-CONTROL {"action":"pending","status":"Read","message":"x","pending":[]}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
+        @{ Case = 'a Read whose lists are an empty object (the re-check of d06899f6)'; Output = 'DBHUB-CONTROL {"action":"pending","status":"Read","message":"x","pending":{}}'; Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
+        @{ Case = 'a Read without the earlier sessions'' list (the re-check of d06899f6)'; Output = ('DBHUB-CONTROL {"action":"pending","status":"Read","message":"x","pending":{"sessionId":"' + ('a' * 32) + '","rca":{"pending":[]},"rcaHandoff":[]}}'); Statuses = @('Completed'); CreateFail = ''; Status = 'Unread'; Error = 'couldn''t either: its job job-1 said Read without its lists' }
+    ) {
+        $script:output = $Output
+        $script:statuses = $Statuses
+        $script:createFail = $CreateFail
+        $script:jobException = 'The sandbox ran out of memory.'
+        $job = Invoke-PendingJob
+        $job.Ok | Should -BeFalse
+        $job.Status | Should -Be $Status
+        $job.Error | Should -Be $Error
+        $job.Pending | Should -BeNullOrEmpty
+    }
+
+    It 'stops waiting after -WaitSeconds, and leaves the read-only job to end by itself, saying to wait for it before the capture again' {
+        $script:statuses = @('Running')
+        $job = Invoke-PendingJob -WaitSeconds 30
+        $job.Ok | Should -BeFalse
+        $job.Status | Should -Be 'TimedOut'
+        $job.Error | Should -Be 'didn''t end in 30 seconds: its job job-1 is Running, and since it only reads, wait for it to end before you run the capture again'
+        $script:statusReads | Should -Be 2
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -Times 0 -ParameterFilter { $Method -eq 'delete' }
     }
 }
 

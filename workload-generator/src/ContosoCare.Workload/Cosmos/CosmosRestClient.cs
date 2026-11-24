@@ -137,7 +137,7 @@ internal sealed record CosmosContainerInfo(string Id, IReadOnlyList<string> Part
 /// Entra token in every request's Authorization header (<c>type=aad&amp;ver=1.0&amp;sig=&lt;token&gt;</c>, URL-encoded).
 /// It only reads the container's definition and upserts, reads, queries, and deletes documents in
 /// <c>contosocare/patient-events</c>, within one partition per request. Every request's User-Agent starts with the run's
-/// tag, <c>ContosoCare.Demo/&lt;scenario&gt;/&lt;run&gt;</c>. One pooled HttpClient per runner; each request may take 30
+/// tag, <c>ContosoCare.Demo/&lt;service&gt;/&lt;run&gt;</c>. One pooled HttpClient per runner; each request may take 30
 /// seconds. It never logs a header, so the token can't reach a log, and its errors never contain it.
 /// </summary>
 internal sealed class CosmosRestClient : IDisposable

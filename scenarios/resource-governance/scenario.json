@@ -2,9 +2,10 @@
   "$schema": "../scenario.schema.json",
   "id": "resource-governance",
   "title": "Resource governance (CPU cap)",
+  "service": "reporting-jobs",
   "summary": "Sustained, well-planned reporting at more concurrency than the target has vCores: a full utilization rollup with a per-row scoring hash, parallelism allowed. On Azure SQL Database it drives CPU to the service objective's limit, so the database is throttled rather than slowed by a bad plan; on SQL Server it's plain CPU saturation. The fix is capacity or scheduling, not a rewrite, which contrasts with cpu-pressure.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_resource_governance",
+  "procedure": "reporting.usp_utilization_rollup",
   "duration": { "defaultSeconds": 300, "maxSeconds": 1200 },
   "concurrency": { "default": 4, "min": 1, "max": 32, "description": "Reporting sessions; more than the vCore limit to reach the cap." },
   "intensity": { "default": 6, "min": 1, "max": 10, "description": "Hashing work per row (1 to 4 passes) and a shorter pause between reports." },
@@ -20,7 +21,7 @@
   "expectedHubSignals": [
     { "signal": "SqlServerCPUUtilization at the tier limit on T3 (or near 100% of the VM on T1 and T2)", "surface": "Performance" },
     { "signal": "SqlServerWaitStats: CPU wait category (SOS_SCHEDULER_YIELD) with healthy plans", "surface": "Performance" },
-    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/resource-governance sessions running in parallel", "surface": "Performance" },
+    { "signal": "SqlServerActiveSessions: ContosoCare.Demo/reporting-jobs sessions running in parallel", "surface": "Performance" },
     { "signal": "A capacity or CPU-limit finding for the database", "surface": "Database Agent", "note": "Preview; coverage by target is undocumented (ADR 0013)." }
   ],
   "expectedSymptoms": [

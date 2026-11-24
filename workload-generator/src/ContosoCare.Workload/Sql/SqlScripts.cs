@@ -89,7 +89,7 @@ internal static partial class SqlScripts
     /// <summary>
     /// The procedures <c>setup</c> checks on a SQL Server or Azure SQL target: the procedure that each catalog scenario
     /// running on the target names in its scenario.json. An orchestrated scenario names its entry procedure, for example
-    /// demo.usp_scenario_chain_link for blocking-chain, so a naming convention can't stand in for the catalog (Phase 25d:
+    /// scheduling.usp_route_work_item for blocking-chain, so a naming convention can't stand in for the catalog (Phase 25d:
     /// blocking-chain, memory-grant-pressure, and log-flush-waits failed setup on every target that way).
     /// </summary>
     public static IReadOnlyList<string> ExpectedProcedures(ScenarioCatalog catalog, DemoTarget target) =>

@@ -8,12 +8,45 @@
 -- values within their seeded ranges, and the IO, log-rate, log-flush, and capacity scenarios write only to demo
 -- scratch tables. The tempdb scenario's #tables belong to its own sessions and are dropped every iteration.
 -- Each procedure returns one row of counters, which the runner records as the run's outcome.
+--
+-- Realistic names (ADR 0031, decision 6, 2026-11-23): the modules live in the schemas a ContosoCare application would
+-- use and are named for what they do, so Query Store, the DMVs, and Database Hub show an application, not the demo's
+-- script. rca/blind-detection.json (answerKey.workloadNames) maps each to its scenarios, for grading only. Each
+-- module's header comment is a batch of its own, ahead of a GO, so SQL Server never stores it with the module, and no
+-- module names a scenario: demo.usp_run_assert_running finds the run's scenario from the caller's @@PROCID. The old
+-- names are dropped at the end, once their replacements exist.
+
+-- Application schemas -------------------------------------------------------------------------------------------------
+
+-- Owned by dbo, as care and demo are, so a module reaches care.* and demo's control helpers by ownership chaining, and
+-- the runner's role, which may only run them, needs nothing more.
+IF SCHEMA_ID(N'billing') IS NULL
+    EXEC (N'CREATE SCHEMA billing AUTHORIZATION dbo;');
+IF SCHEMA_ID(N'frontdesk') IS NULL
+    EXEC (N'CREATE SCHEMA frontdesk AUTHORIZATION dbo;');
+IF SCHEMA_ID(N'records') IS NULL
+    EXEC (N'CREATE SCHEMA records AUTHORIZATION dbo;');
+IF SCHEMA_ID(N'reporting') IS NULL
+    EXEC (N'CREATE SCHEMA reporting AUTHORIZATION dbo;');
+IF SCHEMA_ID(N'scheduling') IS NULL
+    EXEC (N'CREATE SCHEMA scheduling AUTHORIZATION dbo;');
+IF SCHEMA_ID(N'supply') IS NULL
+    EXEC (N'CREATE SCHEMA supply AUTHORIZATION dbo;');
+GO
+GRANT EXECUTE ON SCHEMA::billing TO contosocare_runner;
+GRANT EXECUTE ON SCHEMA::frontdesk TO contosocare_runner;
+GRANT EXECUTE ON SCHEMA::records TO contosocare_runner;
+GRANT EXECUTE ON SCHEMA::reporting TO contosocare_runner;
+GRANT EXECUTE ON SCHEMA::scheduling TO contosocare_runner;
+GRANT EXECUTE ON SCHEMA::supply TO contosocare_runner;
+GO
 
 -- Healthy baseline -----------------------------------------------------------------------------------------------
 
 -- A steady Contoso Care OLTP mix of short, indexed reads and single-row writes. Also the "normal workload" that
 -- runs next to other scenarios, so it accepts any Running run.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_healthy_baseline
+GO
+CREATE OR ALTER PROCEDURE frontdesk.usp_process_requests
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 3
@@ -21,11 +54,11 @@ AS
 BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
-    -- Wait at most 10 seconds for a lock, so a blocking incident delays the baseline without stalling it.
+    -- Wait at most 10 seconds for a lock, so a slow lock holder delays a request without stalling the worker.
     SET LOCK_TIMEOUT 10000;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = NULL, @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     DECLARE @pause datetime = demo.fn_pause(@intensity, 1000, 50);
     DECLARE @patients int, @providers int, @inventory int, @appointments bigint, @work_items bigint;
@@ -148,7 +181,8 @@ GO
 
 -- The hot rows every locking session fights over: the first @hot_rows Billing work items (1 to 50, so the
 -- holder's row locks never escalate to a table lock).
-CREATE OR ALTER FUNCTION demo.fn_locking_hot_rows (@hot_rows int)
+GO
+CREATE OR ALTER FUNCTION billing.fn_priority_work_items (@hot_rows int)
 RETURNS TABLE
 AS
 RETURN
@@ -162,7 +196,8 @@ GO
 -- transaction and returns, leaving the session idle with its row locks. The runner keeps the transaction open for
 -- holdSeconds (never past the run's deadline) and then rolls it back, the watchdog rollback; closing the
 -- connection rolls it back too.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_locking_acquire
+GO
+CREATE OR ALTER PROCEDURE billing.usp_reprioritize_queue
     @run_id varchar(64),
     @hot_rows int = 10
 AS
@@ -174,12 +209,12 @@ BEGIN
 
     IF @@TRANCOUNT <> 1
         THROW 50141, N'Call this inside exactly one open transaction (BEGIN TRANSACTION first); the runner rolls it back.', 1;
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'locking-blocking', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     UPDATE w
     SET priority = CASE WHEN w.priority >= 5 THEN 1 ELSE w.priority + 1 END
     FROM care.work_queues AS w
-    WHERE w.work_item_id IN (SELECT h.work_item_id FROM demo.fn_locking_hot_rows(@hot_rows) AS h);
+    WHERE w.work_item_id IN (SELECT h.work_item_id FROM billing.fn_priority_work_items(@hot_rows) AS h);
     SET @locked = @@ROWCOUNT;
 
     SELECT session_id = @@SPID, locked_rows = @locked, deadline_at = @deadline;
@@ -189,7 +224,8 @@ GO
 -- The same head blocker as a self-contained procedure, for SSMS or sqlcmd demos without the runner: holds the
 -- hot rows for @hold_seconds (never past the run's deadline, and it stops early on a stop request), then always
 -- rolls back.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_locking_hold
+GO
+CREATE OR ALTER PROCEDURE billing.usp_reprioritize_queue_batch
     @run_id varchar(64),
     @hold_seconds int = 120,
     @hot_rows int = 10
@@ -204,21 +240,21 @@ BEGIN
         THROW 50142, N'@hold_seconds must be between 1 and 900.', 1;
     IF @@TRANCOUNT <> 0
         THROW 50143, N'Call this outside a transaction; it opens and rolls back its own.', 1;
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'locking-blocking', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     SET @started = SYSUTCDATETIME();
     SET @hold_until = DATEADD(second, @hold_seconds, @started);
     IF @hold_until > @deadline
         SET @hold_until = @deadline;
 
-    EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'holder-acquiring', @session_id = @@SPID, @detail = N'demo.usp_scenario_locking_hold';
+    EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'holder-acquiring', @session_id = @@SPID, @detail = N'billing.usp_reprioritize_queue_batch';
 
     BEGIN TRANSACTION;
 
     UPDATE w
     SET priority = CASE WHEN w.priority >= 5 THEN 1 ELSE w.priority + 1 END
     FROM care.work_queues AS w
-    WHERE w.work_item_id IN (SELECT h.work_item_id FROM demo.fn_locking_hot_rows(@hot_rows) AS h);
+    WHERE w.work_item_id IN (SELECT h.work_item_id FROM billing.fn_priority_work_items(@hot_rows) AS h);
     SET @locked = @@ROWCOUNT;
 
     WHILE @stopped = 0 AND SYSUTCDATETIME() < @hold_until
@@ -227,10 +263,10 @@ BEGIN
         SET @stopped = demo.fn_run_should_stop(@run_id);
     END;
 
-    -- The watchdog rollback: the holder never commits.
+    -- A dry run: the change always rolls back.
     ROLLBACK TRANSACTION;
 
-    EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'holder-rolled-back', @session_id = @@SPID, @detail = N'demo.usp_scenario_locking_hold';
+    EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'holder-rolled-back', @session_id = @@SPID, @detail = N'billing.usp_reprioritize_queue_batch';
 
     SELECT session_id = @@SPID, locked_rows = @locked, held_ms = DATEDIFF(millisecond, @started, SYSUTCDATETIME()), stop_requested = demo.fn_run_stop_requested(@run_id);
 END;
@@ -240,7 +276,8 @@ GO
 -- seconds for the lock (less near the deadline), and the change is rolled back, so it only probes. The UPDATE
 -- waits under row versioning too, and the READCOMMITTEDLOCK read shows a blocked reader. The list of hot item IDs
 -- is read once, without waiting on the holder's locks (the IDs never change), so only the claim itself blocks.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_locking_contend
+GO
+CREATE OR ALTER PROCEDURE billing.usp_claim_work_item
     @run_id varchar(64),
     @worker int = 1,
     @hot_rows int = 10
@@ -250,7 +287,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'locking-blocking', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     DECLARE @hot TABLE (ordinal int IDENTITY(0, 1) PRIMARY KEY, work_item_id bigint NOT NULL);
     DECLARE @rows int, @id bigint, @found int, @remaining_ms int, @started datetime2(7), @wait_ms int;
@@ -259,11 +296,11 @@ BEGIN
 
     SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
     INSERT INTO @hot (work_item_id)
-    SELECT h.work_item_id FROM demo.fn_locking_hot_rows(@hot_rows) AS h ORDER BY h.work_item_id;
+    SELECT h.work_item_id FROM billing.fn_priority_work_items(@hot_rows) AS h ORDER BY h.work_item_id;
     SET @rows = @@ROWCOUNT;
     SET TRANSACTION ISOLATION LEVEL READ COMMITTED;
     IF @rows = 0
-        THROW 50144, N'No Billing work items to contend for. Is ContosoCare seeded?', 1;
+        THROW 50144, N'No Billing work items to claim. Is ContosoCare seeded?', 1;
 
     WHILE @stopped = 0 AND SYSUTCDATETIME() < @deadline
     BEGIN
@@ -320,7 +357,8 @@ GO
 
 -- The optional, bounded deadlock: two sessions lock two inventory rows in opposite order. Side 2 runs at
 -- DEADLOCK_PRIORITY LOW, so it's the victim; both sides always roll back. At most three rounds.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_locking_deadlock
+GO
+CREATE OR ALTER PROCEDURE supply.usp_transfer_stock
     @run_id varchar(64),
     @side tinyint = 1,
     @rounds int = 1
@@ -331,7 +369,7 @@ BEGIN
     SET LOCK_TIMEOUT 30000;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'locking-blocking', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @side IS NULL OR @side NOT IN (1, 2)
         THROW 50145, N'@side must be 1 or 2.', 1;
@@ -386,7 +424,8 @@ GO
 -- bounded but expensive plan. 'healthy': the same question as a range on scheduled_start, joined with nested
 -- loops so each appointment seeks the index for its few neighbours (the optimizer otherwise picks a hash join
 -- that still compares every pair). @intensity sets how many providers each execution covers (4 per level).
-CREATE OR ALTER PROCEDURE demo.usp_scenario_cpu_pressure
+GO
+CREATE OR ALTER PROCEDURE scheduling.usp_find_double_bookings
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 5,
@@ -397,7 +436,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'cpu-pressure', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @variant IS NULL OR @variant NOT IN ('problem', 'healthy')
         THROW 50147, N'@variant must be problem or healthy.', 1;
@@ -461,7 +500,8 @@ GO
 -- session-owned application lock makes concurrent growers take turns, the free-space check against the file caps
 -- runs first, and the growth stops at @deadline_at or on a stop request, 8 MB per statement. A run that can't get
 -- the lock within a minute uses the rows already there. Returns the MB written in @written_mb.
-CREATE OR ALTER PROCEDURE demo.usp_io_scratch_grow
+GO
+CREATE OR ALTER PROCEDURE records.usp_load_archive_batch
     @run_id varchar(64),
     @scratch_mb int,
     @deadline_at datetime2(3),
@@ -523,11 +563,12 @@ BEGIN
 END;
 GO
 
--- Worker 1 first grows demo.io_scratch to @scratch_mb (demo.usp_io_scratch_grow, after the free-space check
+-- Worker 1 first grows demo.io_scratch to @scratch_mb (records.usp_load_archive_batch, after the free-space check
 -- confirms the headroom under the file caps, with a margin), 8 MB per statement. Then every worker alternates range
 -- scans of up to 256 MB (read IO, physical once the scratch set no longer fits in memory) with 16 MB range updates
 -- (dirty pages that checkpoints write). Nothing grows past @scratch_mb, and the scratch set is reused by later runs.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_io_pressure
+GO
+CREATE OR ALTER PROCEDURE records.usp_scan_archive
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 5,
@@ -538,7 +579,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'io-pressure', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @scratch_mb IS NULL OR @scratch_mb NOT BETWEEN 64 AND 6144
         THROW 50148, N'@scratch_mb must be between 64 and 6144.', 1;
@@ -549,7 +590,7 @@ BEGIN
     DECLARE @stopped bit = 0, @next_check datetime2(3) = SYSUTCDATETIME();
 
     IF @worker = 1
-        EXEC demo.usp_io_scratch_grow @run_id = @run_id, @scratch_mb = @scratch_mb, @deadline_at = @deadline, @written_mb = @written_mb OUTPUT;
+        EXEC records.usp_load_archive_batch @run_id = @run_id, @scratch_mb = @scratch_mb, @deadline_at = @deadline, @written_mb = @written_mb OUTPUT;
 
     SELECT @rows = ISNULL(MAX(scratch_id), 0) FROM demo.io_scratch;
     SET @stopped = demo.fn_run_should_stop(@run_id);
@@ -601,7 +642,8 @@ GO
 -- Each call scans its table, and the optimizer records a missing-index suggestion. The remediation,
 -- scenarios/missing-index/remediation.sql, is never applied automatically; demo.usp_undo_missing_index_remediation
 -- (or reset -UndoRemediation) restores the "before" state.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_missing_index
+GO
+CREATE OR ALTER PROCEDURE billing.usp_claims_aging_report
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 5
@@ -611,7 +653,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'missing-index', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     DECLARE @pause datetime = demo.fn_pause(@intensity, 1000, 20);
     DECLARE @r bigint, @payer varchar(20), @reason varchar(20), @from date, @claims int, @billed decimal(14, 2), @open int, @visits int;
@@ -667,7 +709,8 @@ GO
 -- A frequent front-desk lookup by the numeric part of the MRN. 'problem': RIGHT() on the indexed column hides it
 -- from uq_patients_mrn, so every call scans care.patients (high reads per execution, high execution count).
 -- 'healthy': the same lookup on the full MRN, which seeks. Compare the two in Query Store.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_inefficient_query
+GO
+CREATE OR ALTER PROCEDURE frontdesk.usp_find_patient_visits
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 5,
@@ -678,7 +721,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'inefficient-query', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @variant IS NULL OR @variant NOT IN ('problem', 'healthy')
         THROW 50147, N'@variant must be problem or healthy.', 1;
@@ -730,7 +773,8 @@ GO
 -- with a per-row scoring hash, parallelism allowed. On Azure SQL Database it drives CPU to the service
 -- objective's limit; on SQL Server it's plain CPU saturation. The plans are sound, so the fix is capacity or
 -- scheduling, not a rewrite. @intensity sets the hashing work per row and shortens the pause.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_resource_governance
+GO
+CREATE OR ALTER PROCEDURE reporting.usp_utilization_rollup
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 6
@@ -740,7 +784,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'resource-governance', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     DECLARE @level int = CASE WHEN @intensity BETWEEN 1 AND 10 THEN @intensity ELSE 6 END;
     DECLARE @repeat int = 1 + @level / 3;
@@ -784,7 +828,8 @@ GO
 -- shows as LOG_RATE_GOVERNOR waits; on SQL Server it shows as WRITELOG waits and log flushes. Each worker stops
 -- after its share of @max_log_mb (an estimate: about 6.3 KB of log per row inserted and deleted), at the
 -- deadline, or on a stop request, whichever comes first.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_log_rate_pressure
+GO
+CREATE OR ALTER PROCEDURE billing.usp_import_remittances
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 5,
@@ -794,18 +839,17 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
-    DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'log-rate-pressure', @deadline_at = @deadline OUTPUT;
+    DECLARE @deadline datetime2(3), @workers int;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT, @concurrency = @workers OUTPUT;
 
     IF @max_log_mb IS NULL OR @max_log_mb NOT BETWEEN 64 AND 8192
         THROW 50149, N'@max_log_mb must be between 64 and 8192.', 1;
 
-    DECLARE @workers int, @budget_mb decimal(18, 2), @written_mb decimal(18, 2) = 0, @rows_per_batch int = 256, @batches int = 0;
+    DECLARE @budget_mb decimal(18, 2), @written_mb decimal(18, 2) = 0, @rows_per_batch int = 256, @batches int = 0;
     DECLARE @level int = CASE WHEN @intensity BETWEEN 1 AND 10 THEN @intensity ELSE 5 END;
     DECLARE @rate_mb decimal(18, 4), @allowed_mb decimal(18, 2), @ahead_ms int, @wait datetime, @began datetime2(7) = SYSUTCDATETIME();
     DECLARE @stopped bit = 0, @next_check datetime2(3) = SYSUTCDATETIME();
 
-    SELECT @workers = concurrency FROM demo.scenario_runs WHERE run_id = @run_id;
     IF @workers IS NULL OR @workers < 1
         SET @workers = 1;
     SET @budget_mb = CAST(@max_log_mb AS decimal(18, 2)) / @workers;
@@ -858,7 +902,8 @@ GO
 -- Billing rows. Ordinal 0 is the head blocker's row. Level L (2 to 6) of branch B (1 to 4) owns ordinal
 -- (L - 2) * 4 + B and waits for its parent's row: ordinal 0 at level 2, ordinal (L - 3) * 4 + B deeper down. The IDs
 -- are read without locks (READUNCOMMITTED): they never change, and a locked chain row must not block the lookup.
-CREATE OR ALTER FUNCTION demo.fn_chain_rows ()
+GO
+CREATE OR ALTER FUNCTION scheduling.fn_open_work_items ()
 RETURNS TABLE
 AS
 RETURN
@@ -871,7 +916,8 @@ GO
 -- The chain's head blocker, like an application that forgot to commit: updates the head row inside the caller's
 -- open transaction and returns, leaving the session idle with its lock. The runner keeps the transaction open for
 -- holdSeconds (never past the run's deadline) and then rolls it back; closing the connection rolls it back too.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_chain_acquire
+GO
+CREATE OR ALTER PROCEDURE scheduling.usp_assign_work_item
     @run_id varchar(64)
 AS
 BEGIN
@@ -882,9 +928,9 @@ BEGIN
 
     IF @@TRANCOUNT <> 1
         THROW 50150, N'Call this inside exactly one open transaction (BEGIN TRANSACTION first); the runner rolls it back.', 1;
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'blocking-chain', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
-    SELECT @head = work_item_id FROM demo.fn_chain_rows() WHERE ordinal = 0;
+    SELECT @head = work_item_id FROM scheduling.fn_open_work_items() WHERE ordinal = 0;
     IF @head IS NULL
         THROW 50151, N'No Scheduling work items for the chain. Is ContosoCare seeded?', 1;
 
@@ -901,7 +947,8 @@ GO
 -- for it in turn (head blocker <- level 2 <- level 3 ...). Each wait lasts at most 60 seconds (less near the
 -- deadline), and every change rolls back. When its parent lets go, the link rolls back and tries again a second
 -- later, so the chain forms again every time the head blocker locks its row.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_chain_link
+GO
+CREATE OR ALTER PROCEDURE scheduling.usp_route_work_item
     @run_id varchar(64),
     @level int = 2,
     @branch int = 1
@@ -911,7 +958,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'blocking-chain', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @level IS NULL OR @level NOT BETWEEN 2 AND 6
         THROW 50152, N'@level must be between 2 and 6.', 1;
@@ -922,8 +969,8 @@ BEGIN
     DECLARE @attempts int = 0, @acquired int = 0, @timeouts int = 0, @deadlocks int = 0, @longest_wait_ms int = 0;
     DECLARE @waited_ms bigint = 0, @stopped bit = 0;
 
-    SELECT @own = work_item_id FROM demo.fn_chain_rows() WHERE ordinal = (@level - 2) * 4 + @branch;
-    SELECT @parent = work_item_id FROM demo.fn_chain_rows() WHERE ordinal = CASE WHEN @level = 2 THEN 0 ELSE (@level - 3) * 4 + @branch END;
+    SELECT @own = work_item_id FROM scheduling.fn_open_work_items() WHERE ordinal = (@level - 2) * 4 + @branch;
+    SELECT @parent = work_item_id FROM scheduling.fn_open_work_items() WHERE ordinal = CASE WHEN @level = 2 THEN 0 ELSE (@level - 3) * 4 + @branch END;
     IF @own IS NULL OR @parent IS NULL
         THROW 50151, N'No Scheduling work items for the chain. Is ContosoCare seeded?', 1;
 
@@ -967,7 +1014,7 @@ BEGIN
         SET @attempts += 1;
 
         SET @stopped = demo.fn_run_should_stop(@run_id);
-        -- A second's pause: the level below takes this row, and the head blocker locks its row again.
+        -- A second's pause before the next item.
         IF @stopped = 0 AND SYSUTCDATETIME() < @deadline
             WAITFOR DELAY '00:00:01';
     END;
@@ -987,7 +1034,8 @@ GO
 -- doesn't escalate there, and the sessions it blocks wait on that lock (LCK_M_*_XACT). Every change rolls back.
 -- Whether the escalation happened is read from sys.dm_tran_locks when the caller may see it, and recorded after the
 -- rollback as a lock-escalation event.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_chain_escalate
+GO
+CREATE OR ALTER PROCEDURE scheduling.usp_bulk_reschedule
     @run_id varchar(64),
     @rows int = 10000,
     @hold_seconds int = 15,
@@ -998,7 +1046,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'blocking-chain', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @rows IS NULL OR @rows NOT BETWEEN 7000 AND 20000
         THROW 50154, N'@rows must be between 7000 and 20000.', 1;
@@ -1024,7 +1072,7 @@ BEGIN
             SET @stopped = demo.fn_run_should_stop(@run_id);
         END;
 
-        -- Never start an escalation that couldn't finish before the deadline.
+        -- Never start a batch that couldn't finish before the deadline.
         IF @stopped = 1 OR SYSUTCDATETIME() >= DATEADD(second, -(@hold_seconds + 5), @deadline)
             BREAK;
 
@@ -1058,7 +1106,7 @@ BEGIN
                 SET @stopped = demo.fn_run_should_stop(@run_id);
             END;
 
-            -- The watchdog rollback: the escalation never commits.
+            -- A dry run: the change always rolls back.
             ROLLBACK TRANSACTION;
             SET @held = DATEDIFF(millisecond, @started, SYSUTCDATETIME());
         END TRY
@@ -1107,7 +1155,8 @@ GO
 -- to the end of the transaction), then both update it. 'mixed' alternates the two. Side 2 runs at
 -- DEADLOCK_PRIORITY LOW, so it's the victim (error 1205); every round rolls back, and each victim is recorded as a
 -- deadlock-victim event.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_deadlock_storm
+GO
+CREATE OR ALTER PROCEDURE supply.usp_reconcile_stock
     @run_id varchar(64),
     @pair int = 1,
     @side tinyint = 1,
@@ -1121,7 +1170,7 @@ BEGIN
     SET LOCK_TIMEOUT 30000;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'deadlock-storm', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @pair IS NULL OR @pair NOT BETWEEN 1 AND 8
         THROW 50158, N'@pair must be between 1 and 8.', 1;
@@ -1200,7 +1249,8 @@ GO
 -- scenario's own sessions (tempdb is the only place outside ContosoCare it touches, as any #table does), and the
 -- index added after CREATE TABLE stops SQL Server from caching and reusing them, so every iteration allocates pages
 -- and system catalog rows in tempdb: PAGELATCH waits on its allocation and catalog pages, and temp table creations.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_tempdb_contention
+GO
+CREATE OR ALTER PROCEDURE frontdesk.usp_refresh_dashboard
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 8,
@@ -1211,7 +1261,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'tempdb-contention', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @rows_per_table IS NULL OR @rows_per_table NOT BETWEEN 10 AND 2000
         THROW 50162, N'@rows_per_table must be between 10 and 2000.', 1;
@@ -1252,7 +1302,8 @@ GO
 -- rest wait in the RESOURCE_SEMAPHORE queue. Each query numbers appointments times a multiplier from @intensity in
 -- a scrambled order (a sort, MAXDOP 1); nothing is written. A query hint needs a literal, so the validated integer is
 -- placed in the statement text.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_memory_grants
+GO
+CREATE OR ALTER PROCEDURE reporting.usp_rank_visits
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 6,
@@ -1263,7 +1314,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'memory-grant-pressure', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @grant_percent IS NULL OR @grant_percent NOT BETWEEN 10 AND 100
         THROW 50163, N'@grant_percent must be between 10 and 100.', 1;
@@ -1309,7 +1360,8 @@ GO
 -- skewed key, leaves them uneven work; more sessions than schedulers add CPU waits. The outer query uses every
 -- column, so the optimizer can't drop the per-row work. Reads only. MAXDOP needs a literal and TOP gets an exact
 -- estimate from one, so the validated integers are placed in the statement text.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_parallel_scans
+GO
+CREATE OR ALTER PROCEDURE reporting.usp_encounter_summary
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 6,
@@ -1320,7 +1372,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'parallel-scans', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @maxdop IS NULL OR @maxdop NOT BETWEEN 2 AND 8
         THROW 50164, N'@maxdop must be between 2 and 8.', 1;
@@ -1372,7 +1424,8 @@ GO
 -- log flush (WRITELOG; on Azure SQL Database also Log Rate Governor when the rate passes the service objective's
 -- limit). Each worker deletes its rows every 1,000 inserts, so the table stays small, and it stops after
 -- @max_rows inserts, at the deadline, or on a stop request. Below intensity 10 it pauses after every 20 commits.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_commit_flood
+GO
+CREATE OR ALTER PROCEDURE frontdesk.usp_log_checkin
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 10,
@@ -1383,7 +1436,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'log-flush-waits', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @max_rows IS NULL OR @max_rows NOT BETWEEN 1000 AND 2000000
         THROW 50165, N'@max_rows must be between 1000 and 2000000.', 1;
@@ -1431,7 +1484,8 @@ GO
 -- rows and then pauses: the server fills the network buffers and waits for the client (ASYNC_NETWORK_IO). The
 -- procedure only reads. The runner cancels the query at the deadline or on a stop request, which the SQL Attention
 -- rate counter counts, and runs it again while the run lasts.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_slow_consumer
+GO
+CREATE OR ALTER PROCEDURE records.usp_export_visit_history
     @run_id varchar(64),
     @worker int = 1,
     @rows int = 100000
@@ -1440,7 +1494,7 @@ BEGIN
     SET NOCOUNT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'slow-consumer', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @rows IS NULL OR @rows NOT BETWEEN 1000 AND 500000
         THROW 50166, N'@rows must be between 1000 and 500000.', 1;
@@ -1458,10 +1512,11 @@ GO
 -- Every scheduler busy and the disks at their caps at the same time. Role 'cpu': back-to-back CPU-heavy reports at
 -- MAXDOP 1, one scheduler each, so more sessions than schedulers keeps every scheduler busy (SOS_SCHEDULER_YIELD
 -- and runnable tasks; on Azure SQL Database, CPU at the vCore limit). Role 'io': range scans and updates over
--- demo.io_scratch after its worker 1 grows it to @scratch_mb (demo.usp_io_scratch_grow, shared with io-pressure), so
+-- demo.io_scratch after its worker 1 grows it to @scratch_mb (records.usp_load_archive_batch, shared with io-pressure), so
 -- reads miss the buffer pool once the scratch set is bigger than memory (PAGEIOLATCH and the disk's IOPS and
 -- throughput caps; on Azure SQL Database, IO governance). Business data is only read.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_capacity_max
+GO
+CREATE OR ALTER PROCEDURE reporting.usp_nightly_batch
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 10,
@@ -1473,7 +1528,7 @@ BEGIN
     SET XACT_ABORT ON;
 
     DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'capacity-max', @deadline_at = @deadline OUTPUT;
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT;
 
     IF @role IS NULL OR @role NOT IN ('cpu', 'io')
         THROW 50167, N'@role must be cpu or io.', 1;
@@ -1515,7 +1570,7 @@ BEGIN
     ELSE
     BEGIN
         IF @worker = 1
-            EXEC demo.usp_io_scratch_grow @run_id = @run_id, @scratch_mb = @scratch_mb, @deadline_at = @deadline, @written_mb = @written_mb OUTPUT;
+            EXEC records.usp_load_archive_batch @run_id = @run_id, @scratch_mb = @scratch_mb, @deadline_at = @deadline, @written_mb = @written_mb OUTPUT;
         SET @stopped = demo.fn_run_should_stop(@run_id);
 
         WHILE @stopped = 0 AND SYSUTCDATETIME() < @deadline
@@ -1571,7 +1626,8 @@ GO
 -- (plan B), which then serves the narrow ranges far more slowly. Query Store sees one query with two plans: the
 -- parameter-sensitive regression that automatic tuning's FORCE_LAST_GOOD_PLAN corrects. The range predicate keeps
 -- it out of parameter-sensitive plan optimization, which handles equality predicates only.
-CREATE OR ALTER PROCEDURE demo.usp_visit_summary_lookup
+GO
+CREATE OR ALTER PROCEDURE frontdesk.usp_visit_summary
     @first_patient int,
     @last_patient int,
     @visits int = NULL OUTPUT,
@@ -1593,16 +1649,24 @@ GO
 -- goes on with narrow ranges on plan B. With FORCE_LAST_GOOD_PLAN on (Azure SQL Database's default), automatic tuning
 -- forces plan A once the estimated CPU gain is over 10 seconds (sys.dm_db_tuning_recommendations). At its start,
 -- worker 1 unforces a plan an earlier run left forced, so the regression can happen again. Only
--- demo.usp_visit_summary_lookup's own queries are touched, and only by reading. Azure SQL Database only: SQL Server
+-- frontdesk.usp_visit_summary's own queries are touched, and only by reading. Azure SQL Database only: SQL Server
 -- 2022 Standard (T1, T2) has no automatic tuning, and the runner there can't recompile or unforce.
 --
 -- The switch is checked (F26, 2026-11-21): sp_recompile only drops the cached plan, and the lookup's next run compiles
 -- it with its own patients (Learn: sp_recompile), so a lookup of another worker that compiled around the switch could put
--- plan A back within the same second. The other workers now stay out from 2 seconds before the switch, so worker 1's
--- compilation is the only one. Then worker 1 reads the lookup's cached plan (sys.dm_exec_procedure_stats,
--- sys.dm_exec_text_query_plan): one that still seeks ix_appointments_patient is switched again, 20 and 40 seconds later,
--- in the other workers' quiet windows then. Events: plan-switch, plan-switch-retry, or plan-switch-unverified, a Warning
--- that the regression didn't start, or couldn't be checked.
+-- plan A back within the same second. The other workers now stay out from 2 seconds before each switch until 5 seconds
+-- after it, in windows at @switch_at and @switch_gap_ms apart, whether worker 1 needs them or not, since the workers
+-- don't talk to each other; so worker 1's compilation is the only one. Then worker 1 reads the lookup's cached plan
+-- (sys.dm_exec_procedure_stats, sys.dm_exec_text_query_plan): plan A names ix_appointments_patient, and plan B, which
+-- scans care.appointments, doesn't. Plan B, or plan A that automatic tuning has forced already (the regression ran and
+-- was corrected), is event plan-switch and @switch_verified = 1. Plan A otherwise is switched again, 20 and 40 seconds
+-- after the first, in the other workers' quiet windows then (plan-switch-retry). After 3 switches, or when the plan
+-- can't be read, plan-switch-unverified, a Warning that the regression didn't start or couldn't be checked, and
+-- @switch_verified = 0; -1 is a run that ended or responded before its check.
+--
+-- The procedure's stored text says "attempt" for a switch, "the seek plan" for plan A, and "the scan plan" for plan B,
+-- and its comments and event details don't narrate the regression: SQL Server stores the body, comments included, where a
+-- DBA or Database Agents reads it (ADR 0031: no stored definition narrates its fault). This header isn't stored.
 --
 -- The Database Agent beat (2026-11-18, the showcase's second cycle on T3): @hold_auto_correction = 1 turns
 -- FORCE_LAST_GOOD_PLAN off for the run, after demo.auto_tuning_hold records how it was, so the regression lasts until
@@ -1612,7 +1676,8 @@ GO
 -- lookup's plan with the lowest average CPU; then it puts FORCE_LAST_GOOD_PLAN back. Worker 1 also puts it back when the
 -- run ends, and demo.usp_release_auto_tuning_hold does when it ends any other way. The forced plan stays, so it can be
 -- shown; the next run, or reset, unforces it.
-CREATE OR ALTER PROCEDURE demo.usp_scenario_plan_regression
+GO
+CREATE OR ALTER PROCEDURE frontdesk.usp_refresh_visit_summaries
     @run_id varchar(64),
     @worker int = 1,
     @intensity tinyint = 6,
@@ -1625,11 +1690,11 @@ BEGIN
     SET NOCOUNT ON;
     SET XACT_ABORT ON;
 
-    DECLARE @deadline datetime2(3);
-    EXEC demo.usp_run_assert_running @run_id = @run_id, @scenario_id = 'plan-regression', @deadline_at = @deadline OUTPUT;
+    DECLARE @deadline datetime2(3), @started datetime2(3);
+    EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT, @started_at = @started OUTPUT;
 
     IF CAST(SERVERPROPERTY('EngineEdition') AS int) <> 5
-        THROW 50168, N'plan-regression runs on Azure SQL Database (T3) only: SQL Server 2022 Standard has no automatic tuning.', 1;
+        THROW 50168, N'This job runs on Azure SQL Database only: SQL Server 2022 Standard has no automatic tuning.', 1;
     IF @good_percent IS NULL OR @good_percent NOT BETWEEN 10 AND 80
         THROW 50169, N'@good_percent must be between 10 and 80.', 1;
     IF @respond_percent IS NULL OR (@respond_percent <> 0 AND (@respond_percent <= @good_percent OR @respond_percent > 95))
@@ -1637,24 +1702,23 @@ BEGIN
     IF @pause_ms IS NULL OR @pause_ms NOT BETWEEN 0 AND 1000
         THROW 50171, N'@pause_ms must be between 0 (from the intensity) and 1000.', 1;
 
-    DECLARE @started datetime2(3), @switch_at datetime2(3), @respond_at datetime2(3) = NULL;
+    DECLARE @switch_at datetime2(3), @respond_at datetime2(3) = NULL;
     DECLARE @patients int, @first int, @last int, @visits int, @minutes int, @r bigint;
     DECLARE @good bigint = 0, @regressed bigint = 0, @after_response bigint = 0, @switched bit = 0, @unforced int = 0;
     DECLARE @pause datetime = CASE WHEN @pause_ms > 0 THEN DATEADD(millisecond, @pause_ms, CAST(0 AS datetime)) ELSE demo.fn_pause(@intensity, 400, 0) END;
     DECLARE @stopped bit = 0, @next_check datetime2(3) = SYSUTCDATETIME();
-    DECLARE @lookup int = OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P');
+    DECLARE @lookup int = OBJECT_ID(N'frontdesk.usp_visit_summary', N'P');
     DECLARE @forced TABLE (n int IDENTITY(1, 1) PRIMARY KEY, query_id bigint NOT NULL, plan_id bigint NOT NULL);
     DECLARE @remaining int = 0, @query_id bigint, @plan_id bigint;
     DECLARE @held bit = 0, @was_held bit = 0, @released bit = 0, @restored nvarchar(60), @prior nvarchar(60);
     DECLARE @responded bit = 0, @responded_after_seconds int = 0, @already_forced bit = 0;
     DECLARE @response_query_id bigint = NULL, @forced_plan_id bigint = NULL, @regressed_plan_id bigint = NULL, @response_detail nvarchar(400);
-    -- The switch's attempts (F26): at @switch_at and @switch_gap_ms apart, @switch_attempts_max at most; each checked once
-    -- the other workers have run the lookup again for 2 seconds. @switch_verified: 1 the regression runs (or automatic
-    -- tuning has corrected it already), 0 it doesn't or couldn't be read, -1 not checked (the run ended or responded first).
+    -- Attempts at @switch_at and @switch_gap_ms apart, @switch_attempts_max at most, each read once the other workers have
+    -- run the lookup again for 2 seconds. @switch_verified: 1 the scan plan, or a plan forced already; 0 the seek plan after
+    -- the last attempt, or a plan that can't be read; -1 not read (the run ended or responded first).
     DECLARE @switch_gap_ms int = 20000, @switch_attempts_max int = 3, @switch_attempts int = 0, @switch_verified int = -1;
     DECLARE @attempt_at datetime2(3) = NULL, @verify_at datetime2(3) = NULL, @scans int, @since bigint, @switch_detail nvarchar(400);
 
-    SELECT @started = started_at FROM demo.scenario_runs WHERE run_id = @run_id;
     SET @switch_at = DATEADD(millisecond, CAST(DATEDIFF_BIG(millisecond, @started, @deadline) * @good_percent / 100 AS int), @started);
     IF @respond_percent > 0
         SET @respond_at = DATEADD(millisecond, CAST(DATEDIFF_BIG(millisecond, @started, @deadline) * @respond_percent / 100 AS int), @started);
@@ -1679,12 +1743,12 @@ BEGIN
             SET @unforced += 1;
             SET @remaining -= 1;
         END;
-        EXEC sys.sp_recompile @objname = N'demo.usp_visit_summary_lookup';
+        EXEC sys.sp_recompile @objname = N'frontdesk.usp_visit_summary';
 
         IF @hold_auto_correction = 1
         BEGIN
             -- A hold an earlier run left goes back first, so the state recorded here is the database's own.
-            EXEC demo.usp_release_auto_tuning_hold @by = N'the next Database Agent beat''s start (the run that held it had ended)';
+            EXEC demo.usp_release_auto_tuning_hold @by = N'the next run''s start (the run that held it had ended)';
             IF NOT EXISTS (SELECT 1 FROM demo.auto_tuning_hold WHERE option_name = N'FORCE_LAST_GOOD_PLAN')
             BEGIN
                 SELECT @prior = desired_state_desc FROM sys.database_automatic_tuning_options WHERE name = N'FORCE_LAST_GOOD_PLAN';
@@ -1695,7 +1759,7 @@ BEGIN
                 SET @held = 1;
                 SET @was_held = 1;
                 EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'auto-tuning-held', @session_id = @@SPID,
-                    @detail = N'FORCE_LAST_GOOD_PLAN is off for the Database Agent beat, so automatic tuning doesn''t correct the regression first; it comes back at the response or the run''s end.';
+                    @detail = N'FORCE_LAST_GOOD_PLAN is off for this run; it comes back when a plan is forced or at the run''s end.';
             END;
         END;
     END;
@@ -1711,10 +1775,10 @@ BEGIN
 
         IF @worker = 1 AND @responded = 0 AND @attempt_at IS NOT NULL AND SYSUTCDATETIME() >= @attempt_at
         BEGIN
-            -- The regression: the next compilation sees every patient, so the cached plan scans.
+            -- From here the next compilation sees every patient, so the cached plan scans.
             SET @switch_attempts += 1;
-            EXEC sys.sp_recompile @objname = N'demo.usp_visit_summary_lookup';
-            EXEC demo.usp_visit_summary_lookup @first_patient = 1, @last_patient = @patients, @visits = @visits OUTPUT, @minutes = @minutes OUTPUT;
+            EXEC sys.sp_recompile @objname = N'frontdesk.usp_visit_summary';
+            EXEC frontdesk.usp_visit_summary @first_patient = 1, @last_patient = @patients, @visits = @visits OUTPUT, @minutes = @minutes OUTPUT;
             -- Checked once the other workers have run the lookup again for 2 seconds (their quiet window ends 5 seconds after
             -- the attempt), and at least 2 seconds from now.
             SET @verify_at = DATEADD(second, 7, @attempt_at);
@@ -1725,9 +1789,8 @@ BEGIN
 
         IF @worker = 1 AND @responded = 0 AND @verify_at IS NOT NULL AND SYSUTCDATETIME() >= @verify_at
         BEGIN
-            -- Is the plan the lookup runs now the scanning one? Plan A seeks ix_appointments_patient; plan B scans
-            -- care.appointments and names no other index. A plan that can't be read leaves it unknown. Plan A that automatic
-            -- tuning forced already (FORCE_LAST_GOOD_PLAN on) means the regression ran and was corrected.
+            -- Which plan does the lookup run now? @scans: 1 the scan plan, 0 the seek plan (it names ix_appointments_patient),
+            -- 2 a seek plan that automatic tuning has forced already (FORCE_LAST_GOOD_PLAN), NULL a plan that can't be read.
             SET @verify_at = NULL;
             SET @scans = NULL;
             SET @switch_detail = NULL;
@@ -1747,35 +1810,36 @@ BEGIN
             END CATCH;
             IF @scans IN (1, 2)
             BEGIN
+
                 SET @switch_verified = 1;
                 SET @switch_detail = CASE WHEN @scans = 1
-                    THEN CONCAT(N'The lookup''s cached plan scans care.appointments: the regression runs (switch ', @switch_attempts, N' of ', @switch_attempts_max, N').')
-                    ELSE N'The regression ran, and automatic tuning has forced plan A back already (FORCE_LAST_GOOD_PLAN).' END;
+                    THEN CONCAT(N'The lookup''s cached plan scans care.appointments (attempt ', @switch_attempts, N' of ', @switch_attempts_max, N').')
+                    ELSE N'The lookup''s cached plan seeks ix_appointments_patient, and automatic tuning has forced a plan for it already (FORCE_LAST_GOOD_PLAN).' END;
                 EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'plan-switch', @session_id = @@SPID, @detail = @switch_detail;
             END;
             ELSE IF @scans = 0 AND @switch_attempts < @switch_attempts_max
             BEGIN
                 SET @attempt_at = DATEADD(millisecond, @switch_gap_ms * @switch_attempts, @switch_at);
-                SET @switch_detail = CONCAT(N'The lookup''s cached plan still seeks ix_appointments_patient after switch ', @switch_attempts,
-                    N': another compilation put plan A back, so the switch runs again ', @switch_gap_ms * @switch_attempts / 1000, N' seconds after the first.');
+                SET @switch_detail = CONCAT(N'The lookup''s cached plan still seeks ix_appointments_patient after attempt ', @switch_attempts,
+                    N': another compilation cached the seek plan, so attempt ', @switch_attempts + 1, N' runs ', @switch_gap_ms * @switch_attempts / 1000, N' seconds after the first.');
                 EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'plan-switch-retry', @session_id = @@SPID, @detail = @switch_detail;
             END;
             ELSE
             BEGIN
                 SET @switch_verified = 0;
                 SET @switch_detail = LEFT(CASE WHEN @scans = 0
-                    THEN CONCAT(N'The regression didn''t start: the lookup''s cached plan still seeks ix_appointments_patient after ', @switch_attempts,
-                        N' switches, so T3''s CPU stays low and Database Agents has no issue to raise. The next run of plan-regression tries again.')
-                    ELSE CONCAT(N'Whether the regression started couldn''t be checked: ', ISNULL(@switch_detail, N'the lookup''s plan isn''t in the plan cache'),
-                        N'. T3''s CPU shows it: it rises within minutes when it did.') END, 400);
+                    THEN CONCAT(N'The lookup''s cached plan still seeks ix_appointments_patient after ', @switch_attempts,
+                        N' attempts. The next run tries again.')
+                    ELSE CONCAT(N'The lookup''s cached plan couldn''t be read: ', ISNULL(@switch_detail, N'it isn''t in the plan cache'),
+                        N'. The database''s CPU shows which plan runs.') END, 400);
                 EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'plan-switch-unverified', @session_id = @@SPID, @detail = @switch_detail;
             END;
         END;
 
         IF @worker = 1 AND @respond_at IS NOT NULL AND @responded = 0 AND @switched = 1 AND SYSUTCDATETIME() >= @respond_at
         BEGIN
-            -- The manual response (Database Agents applies none itself): force the last good plan through Query Store, the
-            -- plan the engine's own recommendation names (Learn: automatic tuning, sys.dm_db_tuning_recommendations).
+            -- Force the last good plan through Query Store: the plan the engine's own recommendation names
+            -- (sys.dm_db_tuning_recommendations), or else the lookup's plan with the lowest average CPU.
             SET @responded = 1;
             SET @responded_after_seconds = DATEDIFF(second, @started, SYSUTCDATETIME());
             SELECT TOP (1) @response_query_id = d.query_id, @forced_plan_id = d.recommended_plan_id, @regressed_plan_id = d.regressed_plan_id
@@ -1800,11 +1864,11 @@ BEGIN
                     SET @already_forced = 1;
                 ELSE
                     EXEC sys.sp_query_store_force_plan @query_id = @response_query_id, @plan_id = @forced_plan_id;
-                EXEC sys.sp_recompile @objname = N'demo.usp_visit_summary_lookup';
+                EXEC sys.sp_recompile @objname = N'frontdesk.usp_visit_summary';
             END;
             SET @response_detail = CASE WHEN @forced_plan_id IS NULL
-                THEN N'The response found no plan of the lookup in Query Store to force.'
-                ELSE LEFT(CONCAT(N'The manual response: Query Store forces plan ', @forced_plan_id, N' of query ', @response_query_id,
+                THEN N'No plan of the lookup in Query Store to force.'
+                ELSE LEFT(CONCAT(N'Query Store forces plan ', @forced_plan_id, N' of query ', @response_query_id,
                     CASE WHEN @regressed_plan_id IS NOT NULL THEN CONCAT(N' (automatic tuning''s recommendation; regressed plan ', @regressed_plan_id, N')') ELSE N' (the lookup''s plan with the lowest average CPU)' END,
                     CASE WHEN @already_forced = 1 THEN N', already forced' ELSE N'' END, N'.'), 400) END;
             EXEC demo.usp_run_event @run_id = @run_id, @event_name = 'agent-response', @session_id = @@SPID, @detail = @response_detail;
@@ -1815,10 +1879,8 @@ BEGIN
             END;
         END;
 
-        -- The other workers stay out of the lookup from 2 seconds before each of worker 1's switches until 5 seconds after it,
-        -- so the lookup compiles only for every patient then (F26): a lookup that was compiling around the switch, with its
-        -- few patients, could put plan A back. Windows at @switch_at and @switch_gap_ms apart, whether worker 1 needs them
-        -- or not, since the workers don't talk to each other.
+        -- The other workers stay out of the lookup from 2 seconds before each of worker 1's attempts until 5 seconds after
+        -- it, in windows at @switch_at and @switch_gap_ms apart, whether worker 1 needs them or not.
         SET @since = DATEDIFF_BIG(millisecond, @switch_at, SYSUTCDATETIME());
         IF @worker > 1 AND @since >= -2000 AND @since < CAST(@switch_gap_ms AS bigint) * (@switch_attempts_max - 1) + 5000 AND (@since + 2000) % @switch_gap_ms < 7000
             WAITFOR DELAY '00:00:01';
@@ -1827,7 +1889,7 @@ BEGIN
             SET @r = ABS(CAST(CHECKSUM(NEWID()) AS bigint));
             SET @first = 1 + CAST(@r % @patients AS int);
             SET @last = @first + CAST(@r % 3 AS int);
-            EXEC demo.usp_visit_summary_lookup @first_patient = @first, @last_patient = @last, @visits = @visits OUTPUT, @minutes = @minutes OUTPUT;
+            EXEC frontdesk.usp_visit_summary @first_patient = @first, @last_patient = @last, @visits = @visits OUTPUT, @minutes = @minutes OUTPUT;
             IF @respond_at IS NOT NULL AND SYSUTCDATETIME() >= @respond_at
                 SET @after_response += 1;
             ELSE IF @switched = 1
@@ -1862,4 +1924,62 @@ BEGIN
         force_last_good_plan = (SELECT TOP (1) actual_state_desc FROM sys.database_automatic_tuning_options WHERE name = N'FORCE_LAST_GOOD_PLAN'),
         stop_requested = demo.fn_run_stop_requested(@run_id);
 END;
+GO
+
+-- Retired names (ADR 0031, decision 6, 2026-11-23) -----------------------------------------------------------------------
+
+-- The modules' earlier names, which named the scenario a module belonged to, go once every replacement above exists.
+-- A runner from before the rename that calls one fails at once (error 2812) and its run ends Failed; the kill tools
+-- still end that runner's sessions, which they match by run. Query Store keeps a dropped module's queries, so a plan
+-- that automatic tuning forced for the old lookup is unforced first (Azure SQL Database), and nothing stays forced for
+-- an object that's gone. A failed unforce never stops setup.
+IF CAST(SERVERPROPERTY('EngineEdition') AS int) = 5 AND OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') IS NOT NULL
+BEGIN
+    DECLARE @old_forced TABLE (n int IDENTITY(1, 1) PRIMARY KEY, query_id bigint NOT NULL, plan_id bigint NOT NULL);
+    DECLARE @remaining int, @query_id bigint, @plan_id bigint;
+    BEGIN TRY
+        INSERT INTO @old_forced (query_id, plan_id)
+        SELECT p.query_id, p.plan_id
+        FROM sys.query_store_plan AS p
+        INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+        WHERE q.object_id = OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') AND p.is_forced_plan = 1;
+        SET @remaining = @@ROWCOUNT;
+        WHILE @remaining > 0
+        BEGIN
+            SELECT @query_id = query_id, @plan_id = plan_id FROM @old_forced WHERE n = @remaining;
+            EXEC sys.sp_query_store_unforce_plan @query_id = @query_id, @plan_id = @plan_id;
+            SET @remaining -= 1;
+        END;
+    END TRY
+    BEGIN CATCH
+        PRINT CONCAT(N'A plan forced for the retired lookup wasn''t unforced: ', ERROR_MESSAGE());
+    END CATCH;
+END;
+GO
+DROP PROCEDURE IF EXISTS demo.usp_scenario_healthy_baseline;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_locking_acquire;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_locking_hold;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_locking_contend;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_locking_deadlock;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_cpu_pressure;
+DROP PROCEDURE IF EXISTS demo.usp_io_scratch_grow;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_io_pressure;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_missing_index;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_inefficient_query;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_resource_governance;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_log_rate_pressure;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_chain_acquire;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_chain_link;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_chain_escalate;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_deadlock_storm;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_tempdb_contention;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_memory_grants;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_parallel_scans;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_commit_flood;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_slow_consumer;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_capacity_max;
+DROP PROCEDURE IF EXISTS demo.usp_visit_summary_lookup;
+DROP PROCEDURE IF EXISTS demo.usp_scenario_plan_regression;
+DROP FUNCTION IF EXISTS demo.fn_locking_hot_rows;
+DROP FUNCTION IF EXISTS demo.fn_chain_rows;
 GO
