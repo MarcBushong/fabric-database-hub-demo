@@ -1,0 +1,18 @@
+{
+  "kind": "ContosoCare.RcaExportIndex",
+  "version": 1,
+  "documents": [
+    {
+      "documentId": "20261120T165000Z-sqlvm01-0001",
+      "parts": 2,
+      "sha256": "31f0f457bc0e274187e73f74c21aba1690d97fe09fd41a74069efc211836afc9"
+    },
+    {
+      "documentId": "20261120T170000Z-sqlvm01-0002",
+      "parts": 2,
+      "sha256": "d2cee2d46813236d2b39a0c4947461bb20bf016ba594f59d49ff60afb777db5f"
+    }
+  ],
+  "status": "Pass",
+  "message": "2 evidence documents, 4 parts, for session 5f1c0e7a9b2d4c6e8f0a1b3c5d7e9f21."
+}

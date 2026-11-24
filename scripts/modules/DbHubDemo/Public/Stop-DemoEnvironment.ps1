@@ -30,7 +30,8 @@ function Stop-DemoEnvironment {
       T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), gets its profile off. An account has no stop, and a
       container's throughput can't be taken away, so its container is deleted at the end (2026-11-19, STOP.T5,
       Invoke-DemoT5ContainerStop): its throughput stops billing until the next session creates it again, and only its
-      private endpoint and DNS zone bill between sessions. It's kept, with a Warning and the grant command, while Run all
+      private endpoint and DNS zone, when it has them (2026-11-21), bill between sessions. It's kept, with a Warning and the
+      grant command, while Run all
       couldn't create it again (the session control's role lacks the container's actions; the DbHubT5Container tag isn't
       Session), so a session never runs without it. destroy.ps1 deletes the account.
       With the on-demand activity control (control.enabled, ADR 0020), it first removes a pending auto-stop, so
@@ -43,6 +44,22 @@ function Stop-DemoEnvironment {
       host goes only after its expiry tag (the bastion-cleanup workflow), and a leftover public IP goes at once.
     - -RemoveT3: also deletes T3 and its private endpoint (Remove-DemoT3; the user-directed lifecycle). The
       next start-demo.ps1 recreates it under the same names.
+    - During a Run all session (2026-11-22, the coordinator's decision for the owner): the session's stop goes to the session
+      control, as Stop now's does, right after Bastion and the host password (Invoke-DemoStopHandoff, STOP.CONTROL.SESSION).
+      Its DbHub-Stop job marks the stop begun, which keeps a re-check's export of the session's evidence apart from the
+      stop's own, runs that export, and saves the session's metrics and stopped status; this stop waits for it, prints its lines
+      (STOP.RCA.EXPORT, STOP.RCA.CAPTURE.<target>, STOP.RCA.PENDING), and then does the rest, as before, apart from what
+      that job did: the activity profiles aren't set to off, T2's guest isn't shut down first (the VMs' deallocation ends
+      both, as with Stop now), and the scripts' own export doesn't run, so -SaveHistory saves the history without the
+      session's Incident RCA evidence, which the control's stop keeps in the control vault for the session's own save (the
+      next Run all that starts a session within 7 days, or Run all's at the session's planned end; after 7 days, nothing
+      saves it; reviews of f5972d2d and 0d0776e4). The Database Agent beat's hold, and with
+      -SaveHistory T4's and the replica's metrics, are taken before it; right before its job, the T2 host's password Run
+      Command is waited for (STOP.CONTROL.HOSTPASSWORD), and the session's auto-stop goes (STOP.CONTROL.AUTOSTOP), so the
+      auto-stop can't start a second stop beside it, and a Stop now that starts anyway waits for it and stops only what's
+      left. When the control can't take it, the stop goes on as
+      before, with a Warning that names the risk; while a stop job of the control's still runs, nothing is stopped under it.
+      Not with -ParkT2, -RemoveBastionOnly, or -UpdateEnd.
     - Phase 26b (ADR 0023), both opt-in and skipped with -ParkT2: -SaveHistory (or fabric.saveHistoryOnStop) runs
       NB_DatabaseHub_LiveActivity on demand to save the session's history (Save-DemoFabricHistory), and then, with
       fabric.manageCapacity true, the Fabric capacity that start-demo.ps1 resumed is paused (STOP.FABRIC.CAPACITY,
@@ -53,6 +70,10 @@ function Stop-DemoEnvironment {
       the capacity runs (STOP.T4.HISTORY.PENDING, Save-DemoPostgresHistoryPending). T5's Azure Monitor metrics
       (2026-11-18, ADR 0027) are read right before the run (STOP.T5.HISTORY, Get-DemoCosmosHistoryCapture) and sent as
       COSMOS_METRICS; its account stays, so a run that doesn't save them leaves them in Azure Monitor for a later one.
+      The Incident RCA's evidence (2026-11-20, ADR 0031) is exported from the runners before T2's guest and the VMs stop
+      (Invoke-DemoRcaScriptExport: STOP.RCA.EXPORT and STOP.RCA.CAPTURE.<target>), staged in the lakehouse, and passed
+      with that run as RCA_EVIDENCE_FILE; the documents the run didn't take stay listed in out/history-pending for the next
+      save, which fetches them again from the runner (STOP.RCA.PENDING, Save-DemoRcaPending).
     Run Command needs a running VM: a password rotation on a deallocated host reports Manual action required
     with the steps, and a profile on a VM that isn't running is already inactive (Not selected).
 
@@ -195,9 +216,32 @@ function Stop-DemoEnvironment {
     if ($RemoveBastionOnly) {
         return $results.ToArray()
     }
+    # A Run all session's stop goes to the session control (2026-11-22, Invoke-DemoStopHandoff), as Stop now's does, which
+    # keeps a re-check's export of its evidence apart from the stop's; this stop then does what that one doesn't cover.
+    $handoff = $null
+    if (-not $ParkT2 -and -not $updateEnd) {
+        $handoff = Invoke-DemoStopHandoff -Config $Config -State $state -SaveHistory:(-not $SkipFabric -and ($SaveHistory -or (Get-DemoFabricCapacitySetting -Config $Config).SaveHistoryOnStop)) -SaveHistoryWindowMinutes $SaveHistoryWindowMinutes -Confirm:$false
+        foreach ($item in @($handoff.Results)) {
+            $results.Add($item)
+        }
+        if ([string]$handoff.Outcome -eq 'Running') {
+            return $results.ToArray()
+        }
+    }
+    $handedOff = $null -ne $handoff -and [string]$handoff.Outcome -eq 'Stopped'
+    if ($null -ne $handoff -and $null -ne $handoff.State) {
+        # Read again after the control's stop, or after a job of the control's that ran first.
+        $state = $handoff.State
+    }
     if (-not $ParkT2 -and (Get-DemoActivityControlSetting -Config $Config).Enabled) {
-        # The on-demand activity control's pending auto-stop (ADR 0020) would deallocate a later session's VMs.
-        $results.Add((Clear-DemoActivityControlAutoStop -Config $Config -Confirm:$false))
+        # The on-demand activity control's pending auto-stop (ADR 0020) would deallocate a later session's VMs. The handoff
+        # removed it already when it went to the control (review of f5972d2d): its result is reported instead.
+        if ($null -ne $handoff -and $null -ne (Get-DemoMemberValue -InputObject $handoff -Name 'AutoStop')) {
+            $results.Add($handoff.AutoStop)
+        }
+        else {
+            $results.Add((Clear-DemoActivityControlAutoStop -Config $Config -Confirm:$false))
+        }
     }
     if (-not $ParkT2 -and -not $updateEnd) {
         # The busy marker (2026-11-14): everything stops now, so nothing waits for the nightly stop any more; a deferred
@@ -291,7 +335,9 @@ function Stop-DemoEnvironment {
         else {
             $capacitySettingEarly = Get-DemoFabricCapacitySetting -Config $Config
             if (-not $SkipFabric -and ($SaveHistory -or $capacitySettingEarly.SaveHistoryOnStop)) {
-                $postgresHistory = Get-DemoPostgresHistoryCapture -Config $Config -WindowMinutes $SaveHistoryWindowMinutes
+                # Read before the stop went to the control when it went there (Invoke-DemoStopHandoff), so before the control's
+                # stop deleted the replica.
+                $postgresHistory = if ($null -ne $handoff -and $null -ne $handoff.PostgresHistory) { $handoff.PostgresHistory } else { Get-DemoPostgresHistoryCapture -Config $Config -WindowMinutes $SaveHistoryWindowMinutes }
                 if ($null -ne $postgresHistory -and $null -ne $postgresHistory.Result) {
                     $results.Add($postgresHistory.Result)
                 }
@@ -312,7 +358,12 @@ function Stop-DemoEnvironment {
     # person set outside the demo stays (2026-11-18 review). T3 is read only when its profile went off here, in a session.
     $t3Tuning = $null
     $tuningRelease = $null
-    if (-not $ParkT2 -and 'T3' -in $offTargets) {
+    if ($null -ne $handoff -and $null -ne $handoff.TuningRelease) {
+        # Released before the stop went to the control (Invoke-DemoStopHandoff), whatever came of it, so never twice.
+        $t3Tuning = $handoff.T3
+        $tuningRelease = $handoff.TuningRelease
+    }
+    elseif (-not $ParkT2 -and 'T3' -in $offTargets) {
         $t3Tuning = Get-DemoT3State -Config $Config -DeploymentId ([string]$state.Tags['deploymentId'])
         $tuningRelease = Invoke-DemoT3AutoTuningRelease -Config $Config -T3 $t3Tuning -DeploymentId ([string]$state.Tags['deploymentId'])
     }
@@ -323,6 +374,17 @@ function Stop-DemoEnvironment {
         if ([bool]$session.Held) {
             $results.Add((New-DemoUpdateStopSessionResult -Config $Config -Session $session -Stage During -ReplicaDeleting:$replicaDeleting))
             return $results.ToArray()
+        }
+    }
+    # The Incident RCA's evidence (2026-11-20, ADR 0031), for the history save: the runners' export, now that the activity is
+    # off and before T2's guest and the VMs stop, since it runs on them (Invoke-DemoRcaScriptExport, STOP.RCA.EXPORT and
+    # STOP.RCA.CAPTURE.<target>). Without a save, nothing is exported: what the observers captured stays on the VMs for the
+    # next export. The control's stop of a Run all session ran its own export (Invoke-DemoStopHandoff).
+    $rcaExport = $null
+    if (-not $ParkT2 -and -not $SkipFabric -and -not $handedOff -and ($SaveHistory -or (Get-DemoFabricCapacitySetting -Config $Config).SaveHistoryOnStop)) {
+        $rcaExport = Invoke-DemoRcaScriptExport -Config $Config -CheckPrefix STOP -Final -State $state -Power $power
+        foreach ($item in @($rcaExport.Results)) {
+            $results.Add($item)
         }
     }
     if ($hostVm -eq 'archost01' -and $power[$hostVm] -eq 'PowerState/running') {
@@ -391,6 +453,8 @@ function Stop-DemoEnvironment {
         $historyRunning = $false
         if ($SaveHistory -or $capacitySetting.SaveHistoryOnStop) {
             $historySaved = $false
+            $rcaSaved = $false
+            $rcaWhy = ''
             # T5's Azure Monitor metrics (2026-11-18, ADR 0027), for the notebook's COSMOS_METRICS: its account stays, so
             # they're read now, right before the run (Get-DemoCosmosHistoryCapture never throws).
             $cosmosHistory = $null
@@ -401,14 +465,28 @@ function Stop-DemoEnvironment {
                 }
             }
             try {
-                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' })
+                $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' }) -RcaEvidence $(if ($null -ne $rcaExport) { [string]$rcaExport.Evidence } else { '' })
+                if ($handedOff -and $null -ne $saved.Result -and ([string]$saved.Result.status -in 'Pass', 'Warning' -or [bool]$saved.StillRunning)) {
+                    # The control's stop exported the session's evidence into the control vault, which this save can't read
+                    # (review of f5972d2d): the session's own save takes it.
+                    $saved.Result.message = '{0} It''s without the Run all session''s Incident RCA evidence, which the session control''s stop kept in the control vault: the next Run all that starts a session within 7 days saves it, or Run all''s own save at the session''s planned end does, if the capacity stays on; after 7 days, nothing saves it. To save it at once, stop a session with Stop now in {1} instead.' -f ([string]$saved.Result.message).TrimEnd(), (Get-DemoActivityControlName -Config $Config).Notebook
+                }
                 $results.Add($saved.Result)
                 $historyRunning = [bool]$saved.StillRunning
                 # A notebook that doesn't know POSTGRES_METRICS wasn't sent them (2026-11-16): they're kept below.
                 $historySaved = ([string]$saved.Result.status -eq 'Pass' -or $historyRunning) -and -not [bool](Get-DemoMemberValue -InputObject $saved -Name 'PostgresDropped')
+                $rcaSaved = [bool](Get-DemoMemberValue -InputObject $saved -Name 'RcaSaved')
+                $rcaWhy = [string](Get-DemoMemberValue -InputObject $saved -Name 'RcaNote')
             }
             catch {
                 $results.Add((New-DemoResult -CheckId 'STOP.FABRIC.SAVEHISTORY' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The session''s history wasn''t saved: {0}' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'In Fabric, run NB_DatabaseHub_LiveActivity in the demo''s workspace (Run all).'))
+            }
+            # The RCA evidence that the run didn't take, or didn't confirm, stays listed in out/history-pending, and the
+            # runner keeps it for 7 days, so the next save fetches it again (STOP.RCA.PENDING).
+            $rcaReason = if ($rcaSaved) { '' } elseif ($rcaWhy) { $rcaWhy } else { 'the session''s history wasn''t saved (STOP.FABRIC.SAVEHISTORY says why)' }
+            $rcaPending = Save-DemoRcaPending -Config $Config -CheckPrefix STOP -Export $rcaExport -Saved:$rcaSaved -Why $rcaReason -Confirm:$false
+            if ($null -ne $rcaPending) {
+                $results.Add($rcaPending)
             }
             # T4's read replica is deleted by now, and its metrics with it (ADR 0025): when the run that would have added them
             # to the history didn't (a paused capacity, for example), they're kept in out/history-pending, with the command

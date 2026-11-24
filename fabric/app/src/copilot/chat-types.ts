@@ -46,6 +46,8 @@ export interface ChatState {
     pending: AskContext | null;
     /** True once the history model is known to hold T5's (Azure Cosmos DB) metrics: the dock offers T5's starter. */
     cosmosHistory: boolean;
+    /** True once the history model is known to have the Incident RCA's tables: the dock offers the investigation starters and tools. */
+    rcaHistory: boolean;
     /** The function's sentence while Database Hub refuses the app as a whole, by the latest reads in this browser (liveOffNow): new conversations start without the live view. */
     liveOff: string | null;
     /** From a sign-in's click until GitHub's code arrives: the dock shows that it's getting the code. */

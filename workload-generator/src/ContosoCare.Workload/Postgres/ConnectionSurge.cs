@@ -8,7 +8,7 @@ internal enum SurgeAttemptOutcome
     /// <summary>The server had a free slot; the burst holds the connection for a few seconds at most.</summary>
     Opened,
 
-    /// <summary>The server refused it at its connection limit (SQLSTATE 53300), which Azure Monitor counts as a failed connection.</summary>
+    /// <summary>The server refused it at its connection limit (SQLSTATE 53300). The run's events record it: Azure Monitor's failed connections didn't count these live (2026-11-21).</summary>
     Refused,
 
     /// <summary>A sign-in failure (SQLSTATE class 28): the surge stops for good, so it never repeats a failed sign-in.</summary>

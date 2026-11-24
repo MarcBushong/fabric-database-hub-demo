@@ -26,7 +26,9 @@ function Invoke-DemoTemplateDeployment {
        through diskSkuOverrides, with the DEPLOY.DISKS.DRIFT Warning; T4's availability zone goes only to a
        server that doesn't exist yet.
     6. T4's fallback (ADR 0019; since T4's 4-vCore default, 2026-11-04), only when T4 doesn't exist yet, and only for
-       Azure's SkuNotAvailable (a quota, a policy denial, or a transient error fails the template as before). For a size
+       Azure's SkuNotAvailable or, since 2026-11-22 (F37), Learn's refusal over the subscription's vCore quota
+       (Get-DemoT4QuotaRefusal), which skips the retry in another zone; another quota, a policy denial, or a transient
+       error fails the template as before. For a size
        t4SkuName sets (2026-11-09, user-directed: "fall back automatically, cheapest first, with a Warning"): the size
        once more in another zone the region lists for it, then the next size Azure accepts, cheapest first
        (Get-DemoT4FallbackOrder: the sizes that cost as much or more, then the cheaper ones, nearest first), each after
@@ -178,6 +180,11 @@ function Invoke-DemoTemplateDeployment {
     .PARAMETER T4RemovalPollSeconds
     How often that wait reads T4's server (15 by default).
 
+    .PARAMETER T5Policy
+    PREFLIGHT.POLICY.COSMOSPUBLIC's evidence (2026-11-21, ADR 0027): whether a policy needs T5's private endpoint, for a T5
+    this run creates (Resolve-DemoT5NetworkAccess). Without it, a new T5 gets the endpoint, which works under any policy;
+    an existing T5 keeps what it has either way. DEPLOY.T5.NETWORK says which and why.
+
     .EXAMPLE
     Invoke-DemoTemplateDeployment -Config $config -NetworkMode private -T3UseFreeLimit $false
     #>
@@ -229,7 +236,10 @@ function Invoke-DemoTemplateDeployment {
         [int] $T4RemovalWaitMinutes = 15,
 
         [ValidateRange(1, 300)]
-        [int] $T4RemovalPollSeconds = 15
+        [int] $T4RemovalPollSeconds = 15,
+
+        [AllowNull()]
+        [object] $T5Policy = $null
     )
 
     $subscriptionId = [string]$Config['subscriptionId']
@@ -314,6 +324,41 @@ function Invoke-DemoTemplateDeployment {
             $t4ServerSku = ''
         }
     }
+    # T5's network (2026-11-21, ADR 0027): a private endpoint only when something needs it, as T3; an existing account keeps
+    # what it has, so an update changes nothing in its network (Resolve-DemoT5NetworkAccess, DEPLOY.T5.NETWORK). Decided
+    # before T4's cost checks below, which price T5's network as this run deploys it; the free tier reuses the read.
+    $t5PrivateAccess = $true
+    $t5State = $null
+    $t5NetworkResult = $null
+    if (Test-DemoT5Enabled -Config $effective) {
+        try {
+            $t5State = Get-DemoT5State -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' })
+            $t5Network = Resolve-DemoT5NetworkAccess -Config $effective -NetworkMode $NetworkMode -Policy $T5Policy -AccountState $t5State
+            $t5PrivateAccess = [bool]$t5Network.PrivateAccess
+            $t5NetworkResult = $t5Network.Result
+            $results.Add($t5NetworkResult)
+        }
+        catch {
+            $t5State = $null
+            $t5NetworkResult = New-DemoResult -CheckId 'DEPLOY.T5.NETWORK' -Area 't5' -Target 'T5' -Status 'Warning' -Message ('T5''s network couldn''t be decided ({0}), so it keeps, or gets, a private endpoint, which works in every case.' -f (Protect-DemoText -Text $_.Exception.Message)) -Remediation 'Nothing to do: the next ./scripts/deploy.ps1 decides again.' -DocUrl ([string](Get-DemoCosmosSetting)['docUrls']['privateEndpoint'])
+            $results.Add($t5NetworkResult)
+        }
+    }
+    $t5EndpointCost = if (Test-DemoT5Enabled -Config $effective) { $t5PrivateAccess } else { $null }
+    # Whether T5's account is public now (the review of 31ccf40, 2026-11-22): snet-sqlvm then keeps its Azure Cosmos DB service
+    # endpoint in every attempt, also one that moves the account to its private endpoint, because a move that Azure refuses
+    # (a policy the endpoint doesn't satisfy, say) leaves the account public, with its rule for that subnet. The next
+    # deploy.ps1 drops it once the account reads public network access off.
+    $t5WasPublic = Test-DemoT5WasPublic -Config $effective -AccountState $t5State
+    # DEPLOY.T5.NETWORK says so when this run moves such an account to its endpoint, on the console and the status page.
+    $noteKept = {
+        param([object] $Result)
+        if ($null -ne $Result -and $t5WasPublic -and $t5PrivateAccess) {
+            $Result.evidence['subnetServiceEndpointKept'] = $true
+            $Result.message = '{0} snet-sqlvm keeps its Azure Cosmos DB service endpoint until the next ./scripts/deploy.ps1, which drops it once T5 reads public network access off, so T1 reaches T5 whether or not Azure lets it move now.' -f $Result.message
+        }
+    }
+    & $noteKept $t5NetworkResult
     # An existing server keeps its own size unless the configuration sets one, or it moves to the default (below): the
     # fallback never resizes a server, so a redeploy never sends another size to a server the fallback created, whatever
     # the record says (Phase 28 follow-up). A record that doesn't match the server that exists no longer holds, and is
@@ -336,17 +381,18 @@ function Invoke-DemoTemplateDeployment {
     # (-ScaleT4) while it's Ready, which restarts it (DEPLOY.T4.SIZE); otherwise it keeps its size this time. A move to a
     # larger size, the default or a t4SkuName the configuration changed, is priced first, as the 2-vCore fallback is,
     # because deploy.ps1 -FromStage Infrastructure skips preflight's cost checks (review of PR 20): over either ceiling, or
-    # without a price, T4 keeps its size this time (DEPLOY.T4.SIZE Ceiling), and the next run checks again.
+    # without a price, T4 keeps its size this time (DEPLOY.T4.SIZE Ceiling), and the next run checks again. So is a move
+    # between the two 4-vCore sizes, whose list prices can differ in a region (Test-DemoT4SizeIncrease, 2026-11-22).
     $t4Default = Get-DemoT4DefaultSkuName -Config $Config
     $t4Scaling = $false
-    # T4's read replica (ADR 0025) has to be at least T4's size, so a T4 about to grow loses it first (below).
+    # T4's read replica (ADR 0025) has to be at least T4's size, so a T4 about to move to another size loses it first (below).
     $t4ScaleTo = ''
     $priceMove = {
         param([string] $Target)
         if (-not (Test-DemoT4SizeIncrease -From $t4ServerSku -To $Target)) {
             return $null
         }
-        return (Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $T3UseFreeLimit -SkuName $Target)
+        return (Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $T3UseFreeLimit -SkuName $Target -T5PrivateEndpoint $t5EndpointCost)
     }
     if ($t4Exists -and -not $t4Explicit -and $t4ServerSku) {
         $toDefault = $t4ServerSku -cne $t4Default -and (Get-DemoT4SkuName -Config $effective) -ceq $t4Default
@@ -391,10 +437,10 @@ function Invoke-DemoTemplateDeployment {
         # Azure scales a primary only within its replicas' compute ("Scaling up: First scale up a replica's compute, then
         # scale up the primary"; "Compute on the primary must always be equal to or smaller than the compute on the smallest
         # replica"; Learn, read replicas, checked 2026-11-13). T4's read replica is created for each session anyway (ADR
-        # 0025), so one that's there now is deleted before T4 grows; the T4 track creates it again at T4's new size.
+        # 0025), so one that's there now is deleted before T4 moves; the T4 track creates it again at T4's new size.
         $replicaNow = Get-DemoT4ReplicaState -Config $effective -DeploymentId ([string]$tags['deploymentId'])
         if ($replicaNow.Present) {
-            Write-DemoLog -Message ('T4 grows to {0}, so its read replica ({1}) is deleted first; this run creates it again at T4''s new size.' -f $t4ScaleTo, $replicaNow.Names.ServerName)
+            Write-DemoLog -Message ('T4 moves to {0}, so its read replica ({1}) is deleted first; this run creates it again at T4''s new size.' -f $t4ScaleTo, $replicaNow.Names.ServerName)
             $removed = Remove-DemoT4Replica -Config $effective -CheckPrefix DEPLOY -CheckId 'DEPLOY.T4.REPLICA.REMOVE' -DeploymentId ([string]$tags['deploymentId'])
             if ($null -ne $removed) {
                 $results.Add($removed)
@@ -415,9 +461,13 @@ function Invoke-DemoTemplateDeployment {
     $t5Creating = $false
     $t5OffTried = $false
     $t5LeftOut = ''
+    # A public T5 that Azure Policy denies, or whose public network access it turns off, under a policy preflight didn't find
+    # (one assigned to the resource group, say): the template is deployed again once with T5's private endpoint, which works
+    # under it (the review of fae05b4, 2026-11-22), before T5 is left out.
+    $t5PrivateTried = $false
     if (Test-DemoT5Enabled -Config $effective) {
         try {
-            $t5Free = Resolve-DemoT5FreeTier -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' })
+            $t5Free = Resolve-DemoT5FreeTier -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' }) -AccountState $t5State
             $t5FreeTier = [bool]$t5Free.UseFreeTier
             $t5FreeResult = $t5Free.Result
             $t5Creating = -not [bool]$t5Free.Exists
@@ -488,9 +538,11 @@ function Invoke-DemoTemplateDeployment {
     $groupSeen = $tags.Count -gt 0
     $record = {
         # -KeptFrom (#25, 2026-11-17): a refused scale's record, which says the server kept its size (ConvertTo-DemoT4RefusedRecord
-        # -Kept), with the size Azure refused first, so DONE and status.ps1 never call the server the fallback's creation.
+        # -Kept), with the size Azure refused first, so DONE and status.ps1 never call the server the fallback's creation; a
+        # refusal over the subscription's vCore quota is marked "quota" among its zones (F37, 2026-11-22).
         param([string] $Value, [AllowNull()] [object] $KeptFrom = $null)
-        $refusedValue = if (-not $Value) { '' } elseif ($null -ne $KeptFrom) { ConvertTo-DemoT4RefusedRecord -Refusal @([pscustomobject]@{ Sku = [string]$KeptFrom.Sku; Zones = [string[]]@($(if ([string]$KeptFrom.Zone) { [string]$KeptFrom.Zone } else { 'any' })) }) -TimeUtc ([string]$KeptFrom.TimeUtc) -Kept } elseif ($t4Pinned -or $t4Refusals.Count -gt 0) { ConvertTo-DemoT4RefusedRecord -Refusal @(& $refusalList) -TimeUtc $t4RefusalUtc } else { [string]$tags[$t4RefusedTagName] }
+        $keptZones = if ($null -ne $KeptFrom) { [string[]]@(@($(if ([string]$KeptFrom.Zone) { [string]$KeptFrom.Zone } else { 'any' })) + @($(if ($null -ne (Get-DemoMemberValue -InputObject $KeptFrom -Name 'Quota')) { 'quota' }))) } else { [string[]]@() }
+        $refusedValue = if (-not $Value) { '' } elseif ($null -ne $KeptFrom) { ConvertTo-DemoT4RefusedRecord -Refusal @([pscustomobject]@{ Sku = [string]$KeptFrom.Sku; Zones = $keptZones }) -TimeUtc ([string]$KeptFrom.TimeUtc) -Kept } elseif ($t4Pinned -or $t4Refusals.Count -gt 0) { ConvertTo-DemoT4RefusedRecord -Refusal @(& $refusalList) -TimeUtc $t4RefusalUtc } else { [string]$tags[$t4RefusedTagName] }
         if ([string]$tags[$t4TagName] -ceq $Value -and [string]$tags[$t4RefusedTagName] -ceq $refusedValue) {
             return
         }
@@ -527,6 +579,20 @@ function Invoke-DemoTemplateDeployment {
         catch {
             Write-DemoLog -Level Warning -Message ('T5''s record (DbHubT5Refused) wasn''t set on the resource group, so a resume may start from preflight for T5: {0}' -f $_.Exception.Message)
         }
+    }
+    # T5 moved to its private endpoint for the next attempt (the review of fae05b4, 2026-11-22): DEPLOY.T5.NETWORK says what
+    # Azure Policy did, in place of this run's earlier decision, with the account as it is now and whether it existed
+    # before this run. The caller sets $t5PrivateAccess and the rest.
+    $t5ToPrivate = {
+        param([string] $Found, [string] $Text, [object] $State, [object] $Replaces)
+        $switched = (Resolve-DemoT5NetworkAccess -Config $effective -NetworkMode $NetworkMode -Policy $T5Policy -AccountState $State -PolicyFound $Found -PolicyFoundText $Text).Result
+        $switched.evidence['existed'] = [bool](Get-DemoMemberValue -InputObject $t5State -Name 'Exists')
+        & $noteKept $switched
+        if ($null -ne $Replaces) {
+            [void]$results.Remove($Replaces)
+        }
+        $results.Add($switched)
+        return $switched
     }
     # A refused scale's record (#25) whose server is gone: this run creates T4 at the recorded size, so the record becomes
     # the fallback's, without "kept".
@@ -621,16 +687,18 @@ function Invoke-DemoTemplateDeployment {
         return (-not $shell)
     }
     # One attempt for each size the fallback can try, the asked size's retry in another zone, one without T4 after Azure
-    # refused them all, one after the T3 free offer's rejection, one after T5's free tier's refusal, and one without T5
-    # after Azure didn't create its account (review, 2026-11-19): 8 without t4SkuName, and up to 10 for a size it sets.
-    $attemptLimit = 6 + @(Get-DemoT4FallbackOrder -Config $effective).Count
+    # refused them all, one after the T3 free offer's rejection, one after T5's free tier's refusal, one with T5 behind its
+    # private endpoint after a policy refused or changed its public network access (the review of fae05b4, 2026-11-22), and
+    # one without T5 after Azure didn't create its account (review, 2026-11-19): 9 without t4SkuName, and up to 11 for a
+    # size it sets.
+    $attemptLimit = 7 + @(Get-DemoT4FallbackOrder -Config $effective).Count
     for ($attempt = 1; $attempt -le $attemptLimit; $attempt++) {
         # A size t4SkuName sets (2026-11-09): right before the fallback creates T4 at another size, that size's cost check
         # runs, as the 2-vCore one does, and only reports; its result says what this run tries, and why.
         if ($ladder -and $t4Pinned -and (Test-DemoT4Enabled -Config $effective)) {
             $stepSku = Get-DemoT4SkuName -Config $effective
             if ($stepSku -cne $t4Asked -and -not $t4Costs.Contains($stepSku)) {
-                $stepCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $stepSku -Cache $costCache
+                $stepCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $stepSku -Cache $costCache -T5PrivateEndpoint $t5EndpointCost
                 $t4Costs[$stepSku] = $stepCost
                 & $record $stepSku
                 $stepResult = New-DemoT4FallbackResult -Refused $lastRefusal -Next $stepSku -Cost $stepCost -Pinned $t4Pinned
@@ -644,7 +712,7 @@ function Invoke-DemoTemplateDeployment {
         # deployment). Never for a size the configuration sets.
         if ($ladder -and -not $t4Pinned -and -not $gpChecked -and (Test-DemoT4Enabled -Config $effective) -and (Get-DemoT4SkuName -Config $effective) -ceq 'Standard_D2ds_v5') {
             $gpChecked = $true
-            $cost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -Cache $costCache
+            $cost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -Cache $costCache -T5PrivateEndpoint $t5EndpointCost
             $t4Costs['Standard_D2ds_v5'] = $cost
             if ($cost.Allowed) {
                 & $record 'Standard_D2ds_v5'
@@ -668,7 +736,7 @@ function Invoke-DemoTemplateDeployment {
             $creating = Get-DemoT4SkuName -Config $effective
             if (-not $t4Costs.Contains($creating)) {
                 $createSku = $creating
-                $createCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $createSku -Cache $costCache
+                $createCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $createSku -Cache $costCache -T5PrivateEndpoint $t5EndpointCost
                 $t4Costs[$createSku] = $createCost
                 if (-not $createCost.Allowed) {
                     $createResult = New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku '' -SkuName $createSku -Outcome Create -Cost $createCost -Explicit:($createSku -ceq $t4Pinned)
@@ -732,6 +800,8 @@ function Invoke-DemoTemplateDeployment {
             T1SecurityType            = $securityType.SecurityType
             T3UseFreeLimit            = $useFreeLimit
             T5FreeTier                = $t5FreeTier
+            T5PrivateAccess           = $t5PrivateAccess
+            T5WasPublic               = $t5WasPublic
         }
         if ($budgetStart) {
             $parameterArguments['BudgetStartDate'] = $budgetStart
@@ -806,6 +876,28 @@ function Invoke-DemoTemplateDeployment {
             }
             $state = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $parsed -Name 'properties') -Name 'provisioningState')
             $duration = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $parsed -Name 'properties') -Name 'duration')
+            # A policy that turns a public T5's public network access off (Modify) where preflight can't see it, one assigned
+            # to the resource group, say: Azure creates, or updates, the account with it off and no private endpoint, which T1
+            # can't reach, so T5.NETWORK would fail and the run end NOT DONE. Read once after the deployment, and the template
+            # is deployed again with T5's endpoint, which works under it (the review of fae05b4, 2026-11-22).
+            if ($Action -eq 'Create' -and $state -eq 'Succeeded' -and -not $t5PrivateAccess -and -not $t5PrivateTried -and (Test-DemoT5Enabled -Config $effective)) {
+                $t5After = $null
+                try {
+                    $t5After = Get-DemoT5State -Config $effective -DeploymentId $(if ([string]$tags['deploymentId'] -match '^[a-z0-9]{6}$') { [string]$tags['deploymentId'] } else { '' })
+                }
+                catch {
+                    Write-DemoLog -Level Warning -Message ('T5''s network couldn''t be read after the deployment, so T5.NETWORK checks it: {0}' -f (Protect-DemoText -Text $_.Exception.Message))
+                }
+                $afterPublic = [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $t5After -Name 'Account') -Name 'properties') -Name 'publicNetworkAccess')
+                if ([bool](Get-DemoMemberValue -InputObject $t5After -Name 'Exists') -and $afterPublic -and $afterPublic -ine 'Enabled') {
+                    $t5PrivateTried = $true
+                    $t5PrivateAccess = $true
+                    $t5EndpointCost = $true
+                    $t5NetworkResult = & $t5ToPrivate 'Modified' '' $t5After $t5NetworkResult
+                    Write-DemoLog -Level Warning -Message ('Azure Policy turned T5''s public network access off ({0}) when the template deployed it; deploying again with its private endpoint, which works under it.' -f $afterPublic)
+                    continue
+                }
+            }
             $status = if ($state -eq 'Succeeded') { 'Pass' } else { 'Fail' }
             $t4Deployed = Test-DemoT4Enabled -Config $effective
             $t4SkuName = if ($t4Deployed) { Get-DemoT4SkuName -Config $effective } else { '' }
@@ -819,8 +911,8 @@ function Invoke-DemoTemplateDeployment {
                 # with the zones, what was deployed, and T4's monthly estimate at both with the difference, priced as the
                 # fallback's cost check is: on the console now, and through T4Note on the status page's Infrastructure and T4
                 # rows and at DONE or NOT DONE.
-                $askedCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4Asked -Cache $costCache
-                $deployedCost = if ($t4Costs.Contains($t4SkuName)) { $t4Costs[$t4SkuName] } else { Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4SkuName -Cache $costCache }
+                $askedCost = Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4Asked -Cache $costCache -T5PrivateEndpoint $t5EndpointCost
+                $deployedCost = if ($t4Costs.Contains($t4SkuName)) { $t4Costs[$t4SkuName] } else { Get-DemoT4GeneralPurposeCost -Config $effective -NetworkMode $NetworkMode -T3UseFreeLimit $useFreeLimit -SkuName $t4SkuName -Cache $costCache -T5PrivateEndpoint $t5EndpointCost }
                 $change = New-DemoT4SizeChangeResult -Config $effective -Deployed $t4SkuName -Refusal @(& $refusalList) -AskedCost $askedCost -DeployedCost $deployedCost
                 $results.Add($change)
                 $t4Note = [string]$change.message
@@ -962,32 +1054,39 @@ function Invoke-DemoTemplateDeployment {
             $t4Failure = Get-DemoT4CreateFailure -Config $effective
         }
         $current = Get-DemoT4SkuName -Config $effective
-        # A scale to the default that Azure refused with SkuNotAvailable (2026-11-04): T4 keeps its size, which the group
-        # records, so later runs keep it too, and this run deploys again without the scale.
+        # Azure's refusal over the subscription's vCore quota (F37, 2026-11-22) moves the fallback on as SkuNotAvailable
+        # does, but never to the same size in another zone: a quota is the subscription's in the region, not a zone's.
+        $t4QuotaRefusal = $null -ne (Get-DemoMemberValue -InputObject $t4Failure -Name 'Quota')
+        # A scale to the default that Azure refused with SkuNotAvailable (2026-11-04), or over the quota: T4 keeps its size,
+        # which the group records, so later runs keep it too, and this run deploys again without the scale.
         if ($t4Scaling -and $null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current) {
             $t4Scaling = $false
             $effective = Copy-DemoT4Config -Config $effective -Source server -SkuName $t4ServerSku
-            & $record $t4ServerSku -KeptFrom ([pscustomobject]@{ Sku = $current; Zone = [string]$t4Failure.Zone; TimeUtc = [string]$t4Failure.TimeUtc })
+            & $record $t4ServerSku -KeptFrom ([pscustomobject]@{ Sku = $current; Zone = [string]$t4Failure.Zone; TimeUtc = [string]$t4Failure.TimeUtc; Quota = (Get-DemoMemberValue -InputObject $t4Failure -Name 'Quota') })
             $results.Add((New-DemoT4SizeResult -CheckPrefix DEPLOY -ServerSku $t4ServerSku -SkuName $current -Outcome Refused -Failure $t4Failure))
             Write-DemoLog -Level Warning -Message ('Azure refused to scale T4 to {0}; deploying again with T4 at {1}.' -f $current, $t4ServerSku)
             continue
         }
         # The fallback (ADR 0019, since T4's 4-vCore default, 2026-11-04): only Azure's SkuNotAvailable for the size this
-        # attempt sent moves it on, and only while T4's server doesn't exist (read above): the asked size once more in
-        # another zone the region lists for it, then, without t4SkuName, Standard_D4ads_v5, then Standard_D2ds_v5 (after its
-        # cost check, at the top of the next attempt), and Standard_D2ds_v5 to no T4; for a size t4SkuName sets (2026-11-09),
-        # the next size Azure accepts, cheapest first (Get-DemoT4NextSku), each after its cost check, and the last one to no
-        # T4. A quota, a policy denial, or a transient error fails the template as before. What it chose is recorded for
-        # later runs, with what Azure refused.
+        # attempt sent, or its refusal over the subscription's vCore quota (F37), moves it on, and only while T4's server
+        # doesn't exist (read above): the asked size once more in another zone the region lists for it (not after a quota
+        # refusal), then, without t4SkuName, Standard_D4ads_v5, then Standard_D2ds_v5 (after its cost check, at the top of
+        # the next attempt), and Standard_D2ds_v5 to no T4; for a size t4SkuName sets (2026-11-09), the next size Azure
+        # accepts, cheapest first (Get-DemoT4NextSku), each after its cost check, and the last one to no T4. Another quota,
+        # a policy denial, or a transient error fails the template as before. What it chose is recorded for later runs, with
+        # what Azure refused ("quota" among a size's zones for a quota refusal).
         if ($ladder -and $null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current -and $current -notin $t4Refused) {
             if (-not $t4Refusals.Contains($current)) {
                 $t4Refusals[$current] = [System.Collections.Generic.List[string]]::new()
             }
             $t4Refusals[$current].Add($(if ([string]$t4Failure.Zone) { [string]$t4Failure.Zone } else { 'any' }))
+            if ($t4QuotaRefusal -and -not $t4Refusals[$current].Contains('quota')) {
+                $t4Refusals[$current].Add('quota')
+            }
             $t4RefusalUtc = [string]$t4Failure.TimeUtc
             $lastRefusal = $t4Failure
             $retryZone = ''
-            if ($current -ceq $t4Asked -and -not $zoneTried) {
+            if ($current -ceq $t4Asked -and -not $zoneTried -and -not $t4QuotaRefusal) {
                 $zoneTried = $true
                 $retryZone = [string](@(Get-DemoT4SkuZone -Config $effective -SkuName $current) | Where-Object { $_ -ne [string]$t4Failure.Zone } | Select-Object -First 1)
             }
@@ -1021,7 +1120,7 @@ function Invoke-DemoTemplateDeployment {
                     # the fix); nothing is recorded, so every run tries the sizes again.
                     $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
                     & $record ''
-                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused' -Pinned $t4Pinned -Tried @(& $refusalList)))
+                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused' -Pinned $t4Pinned -Tried @(& $refusalList) -Location ([string]$Config['location'])))
                     Write-DemoLog -Level Warning -Message ('Azure refused every size T4''s fallback tries for {0}; deploying the rest again without T4, and the run ends NOT DONE.' -f $t4Pinned)
                 }
                 continue
@@ -1044,7 +1143,7 @@ function Invoke-DemoTemplateDeployment {
                     # tries the sizes again (2026-11-09).
                     $effective = Copy-DemoT4Config -Config $effective -Source fallback -Off
                     & $record ''
-                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused'))
+                    $results.Add((New-DemoT4FallbackResult -Refused $t4Failure -Next 'Refused' -Tried @(& $refusalList) -Location ([string]$Config['location'])))
                     Write-DemoLog -Level Warning -Message 'Azure refused T4''s 2-vCore fallback, Standard_D2ds_v5, too; deploying the rest again without T4, and the run ends NOT DONE.'
                 }
             }
@@ -1053,6 +1152,22 @@ function Invoke-DemoTemplateDeployment {
         # Phase 28 live finding (2026-11-02): a deployment that failed while it ran names its cause in its operations, read
         # only now, after the free offer's and T4's own handling above, which reads the error as before.
         $cause = if ($Action -eq 'Create') { Get-DemoDeploymentFailure -Config $Config -DeploymentName $deploymentName -ErrorText ([string]$run.StdErr) } else { $null }
+        # A public T5 that Azure Policy denied (RequestDisallowedByPolicy), and nothing else, under a policy preflight didn't
+        # find, one assigned to the resource group, say: deployed again once behind its private endpoint, which works under
+        # a policy that denies public network access (the review of fae05b4, 2026-11-22), before T5 is left out (below). An
+        # existing public account moves to its endpoint too, as it does under a policy the inventory reads
+        # (Resolve-DemoT5NetworkAccess).
+        if ($Action -eq 'Create' -and -not $t5PrivateAccess -and -not $t5PrivateTried -and (Test-DemoT5Enabled -Config $effective)) {
+            $t5Denied = Get-DemoT5OnlyFailure -Config $effective -Cause $cause -ErrorText ([string]$run.StdErr)
+            if ($t5Denied.T5Only -and [string]$t5Denied.Text -match '(?i)\bRequestDisallowedByPolicy\b') {
+                $t5PrivateTried = $true
+                $t5PrivateAccess = $true
+                $t5EndpointCost = $true
+                $t5NetworkResult = & $t5ToPrivate 'Denied' ([string]$t5Denied.Text) $t5State $t5NetworkResult
+                Write-DemoLog -Level Warning -Message ('Azure Policy denied T5 with public network access ({0}); deploying again with its private endpoint, which works under it.' -f [string]$t5Denied.Text)
+                continue
+            }
+        }
         # T5's creation failed, and nothing else did (review, 2026-11-19): a region that refuses new Azure Cosmos DB accounts,
         # or a policy that denies them that preflight couldn't evaluate. The template is deployed again once without T5, so
         # the rest of the run finishes and can end DONE; DEPLOY.T5 says why, with the fix (t5Enabled false), and the group
@@ -1070,6 +1185,11 @@ function Invoke-DemoTemplateDeployment {
                     [void]$results.Remove($t5FreeResult)
                     $t5FreeResult = $null
                 }
+                # Nor does T5's network: DEPLOY.T5 says T5 is left out.
+                if ($null -ne $t5NetworkResult) {
+                    [void]$results.Remove($t5NetworkResult)
+                    $t5NetworkResult = $null
+                }
                 $results.Add($t5Off)
                 & $recordT5 ([DateTime]::UtcNow.ToString("yyyy-MM-dd'T'HH:mm:ss'Z'", [System.Globalization.CultureInfo]::InvariantCulture))
                 Write-DemoLog -Level Warning -Message ('{0} Deploying the rest again without T5.' -f $t5Off.message)
@@ -1085,7 +1205,7 @@ function Invoke-DemoTemplateDeployment {
         $results.Add($failure)
         if ($null -ne $t4Failure -and [string]$t4Failure.Sku -ceq $current) {
             # A size Azure refused for T4 that the configuration sets gets its own Fail, with the documented fallback (Phase 24, ADR 0019).
-            $results.Add((New-DemoT4SkuFailureResult -CheckId 'DEPLOY.T4.SKU' -Failure $t4Failure))
+            $results.Add((New-DemoT4SkuFailureResult -CheckId 'DEPLOY.T4.SKU' -Failure $t4Failure -Location ([string]$Config['location'])))
         }
         return [pscustomobject]@{ Succeeded = $false; Results = $results.ToArray(); Outputs = @{}; Changes = @(); T3UseFreeLimit = $useFreeLimit; T4Enabled = (Test-DemoT4Enabled -Config $effective); T4SkuName = (Get-DemoT4SkuName -Config $effective); T4Note = $t4Note; T5Enabled = (Test-DemoT5Enabled -Config $effective); T5LeftOut = $t5LeftOut }
     }

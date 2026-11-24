@@ -9,13 +9,18 @@ already redacted by the bootstrap. Windows PowerShell 5.1.
 
 With -View Summary (Phase 7), only the fields the orchestrator gates on are printed: role, state, status,
 the first 500 characters of message, currentStep, generation, updatedUtc, and from details the install mode,
-Arc onboarding, the guest's state, and its SQL Server edition. Since 2026-11-09 it also prints the configured install
+Arc onboarding, the guest's state, and its SQL Server edition. Since 2026-11-20 (F24) it also prints the first two
+warnings, each cut to 240 characters and naming the step it came from, and how many there are (warningCount): a Ready VM
+with warnings reports Warning, and the validator says which step warned. Since 2026-11-23 it prints the notes the same way
+(notes, noteCount): what a new VM's bootstrap gives by design, as information, which leaves a Ready VM a Pass; only when
+health.json has notes, as every bundle since then writes, even empty, so an older bundle's summary has neither. Since 2026-11-09 it also prints the configured install
 mode, whether the configuration names it (modeSource), whether the host kept an existing guest's mode (modeAdopted), the
 guest's own mode (guestMode) and whether a pass saw SQL Server set up in it (guestSetUp), and the last rebuild of an
 unfinished guest, read from guest-rebuild.json itself (guestRebuild: Removing, Removed, or Done once the new guest
 passed ArcOnboarding; rebuildUtc, rebuildMode, rebuildArcId, the old guest's Arc machine, and rebuildArcNew, whether
 the Arc marker is already for the guest that exists now: true, false only on positive evidence, or null when that
-can't be told; the Full view adds them as t2Rebuild). Since Phase 28 it also prints the PaygWizard
+can't be told; since 2026-11-21 rebuildRequested, true when reset-demo.ps1 -RebuildGuest asked for the rebuild; the Full
+view adds them as t2Rebuild). Since Phase 28 it also prints the PaygWizard
 guided stop's state (details.guidedSetup): whether automatic sign-in is armed in the guest, deploy.ps1's
 request (none, valid, expired, or invalid), setup's sign-in preparation (none, preparing, ready, or restoring:
 the WebView2 runtime, IE Enhanced Security Configuration off for administrators, and the Trusted sites entries;
@@ -165,10 +170,10 @@ function Get-DemoHealthRebuildFact {
     if (-not (Test-Path -LiteralPath $recordPath -PathType Leaf)) {
         return $null
     }
-    $facts = [ordered]@{ state = 'Unreadable'; startedUtc = ''; oldMode = ''; arcResourceId = ''; oldGuestVmId = ''; arcCurrent = $null }
+    $facts = [ordered]@{ state = 'Unreadable'; startedUtc = ''; oldMode = ''; arcResourceId = ''; oldGuestVmId = ''; requestId = ''; arcCurrent = $null }
     try {
         $record = [System.IO.File]::ReadAllText($recordPath) | ConvertFrom-Json
-        foreach ($name in 'state', 'startedUtc', 'oldMode', 'arcResourceId', 'oldGuestVmId') {
+        foreach ($name in 'state', 'startedUtc', 'oldMode', 'arcResourceId', 'oldGuestVmId', 'requestId') {
             $property = $record.PSObject.Properties[$name]
             if ($property -and $null -ne $property.Value) {
                 # PowerShell 7's ConvertFrom-Json reads an ISO time as a DateTime; Windows PowerShell 5.1 keeps the text.
@@ -360,6 +365,13 @@ if ($View -eq 'Summary') {
     if ($message.Length -gt 500) {
         $message = $message.Substring(0, 500)
     }
+    # The warnings that keep a Ready VM's status a Warning, each naming its step (F24, 2026-11-20): the first two, each
+    # cut to 240 characters, with how many there are, so the summary still fits.
+    $allWarnings = @(& $read $health @('warnings') | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $shownWarnings = @($allWarnings | Select-Object -First 2 | ForEach-Object { if ($_.Length -gt 240) { $_.Substring(0, 237) + '...' } else { $_ } })
+    # The notes a new VM's bootstrap gives by design, as information (2026-11-23): the first two, as the warnings are.
+    $allNotes = @(& $read $health @('notes') | Where-Object { $_ } | ForEach-Object { [string]$_ })
+    $shownNotes = @($allNotes | Select-Object -First 2 | ForEach-Object { if ($_.Length -gt 240) { $_.Substring(0, 237) + '...' } else { $_ } })
     $summary = [ordered]@{
         schemaVersion  = 1
         role           = & $read $health @('role')
@@ -380,6 +392,8 @@ if ($View -eq 'Summary') {
         rebuildMode    = $(if ($null -ne $rebuildFacts) { $rebuildFacts['oldMode'] } else { $null })
         rebuildArcId   = $(if ($null -ne $rebuildFacts) { $rebuildFacts['arcResourceId'] } else { $null })
         rebuildArcNew  = $(if ($null -ne $rebuildFacts) { $rebuildFacts['arcCurrent'] } else { $null })
+        # 2026-11-21: a rebuild that reset-demo.ps1 -RebuildGuest asked for (the record carries its request's id).
+        rebuildRequested = $(if ($null -ne $rebuildFacts) { [bool]$rebuildFacts['requestId'] } else { $null })
         arcOnboarded   = & $read $health @('details', 'arcOnboarded')
         guestState     = & $read $health @('details', 'guest', 'state')
         sqlEdition     = & $read $health @('details', 'guest', 'sql', 'edition')
@@ -397,6 +411,15 @@ if ($View -eq 'Summary') {
         imagePinned    = & $read $health @('details', 'jumpstart', 'image', 'pinned')
         signInFound    = & $read $health @('details', 'signIn', 'found')
         signInNote     = & $read $health @('details', 'signIn', 'note')
+        warningCount   = $allWarnings.Count
+        warnings       = $shownWarnings
+    }
+    # The notes, and how many, only from a health.json that has them (the re-check of ea1ea20f, 2026-11-23): every bundle
+    # since 2026-11-23 writes notes, even empty, and an older one never does, so the validator can tell whether a warning
+    # with an expected note's text comes from a bundle that gives those as notes, which makes it an established VM's.
+    if ($null -ne $health.PSObject.Properties['notes']) {
+        $summary['noteCount'] = $allNotes.Count
+        $summary['notes'] = $shownNotes
     }
     if ($null -ne $guestFacts) {
         $summary['t2Guest'] = $guestFacts

@@ -31,6 +31,10 @@
     <EmbeddedResource Include="..\..\..\database\common\0*.sql;..\..\..\database\common\1*.sql" LogicalName="sql/%(Filename)%(Extension)" />
     <!-- T4 (Phase 24): the PostgreSQL schema, seed, control objects, and scenario steps. -->
     <EmbeddedResource Include="..\..\..\database\postgresql\0*.sql;..\..\..\database\postgresql\1*.sql" LogicalName="pgsql/%(Filename)%(Extension)" />
+    <!-- The Incident RCA contract (ADR 0031): the capture catalog the observer runs, block by block, and the history
+         tables' spec the export encodes its documents with. -->
+    <EmbeddedResource Include="..\..\..\rca\capture\*.sql" LogicalName="rca/capture/%(Filename)%(Extension)" />
+    <EmbeddedResource Include="..\..\..\rca\history-tables.json" LogicalName="rca/history-tables.json" />
   </ItemGroup>
 
   <!-- The Azure extension brings the Windows broker's native runtime (about 3 MB) for interactive sign-in. The runner

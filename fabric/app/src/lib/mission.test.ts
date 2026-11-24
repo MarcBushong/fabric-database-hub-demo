@@ -4,20 +4,25 @@
 import { describe, expect, it } from "vitest";
 
 import type { AgentBeat, Bin, CosmosCapture, Incident, PostgresCapture, SessionRun } from "@/data/model";
+import { latestPostgresCapture } from "@/data/model";
 import type { Row } from "@/data/query-client";
-import { sessionsQuery } from "@/data/queries";
+import { postgresSeriesQuery, seriesQuery, sessionsQuery } from "@/data/queries";
 import { impactOf, SERVICES, serviceOf } from "@/lib/business";
-import { postgresHealth } from "@/lib/health";
-import { buildPostmortem, postmortemAsk, postmortemFileName } from "@/lib/postmortem";
+import { cosmosHealth, postgresHealth } from "@/lib/health";
+import { buildPostmortem, causeWindow, nextSessionStart, postmortemAsk, postmortemFileName, postmortemTitle } from "@/lib/postmortem";
+import type { BlindCauses } from "@/rca/postmortem";
 import {
     aggregate,
     cosmosEpisodes,
     detectionBound,
+    episodesIn,
+    expectedFamilies,
     howMeasured,
     minutesText,
     nextInjection,
     planEvents,
     postgresEpisodes,
+    scenarioTitle,
     scorePlan,
     stateAt,
     summarize,
@@ -145,9 +150,36 @@ describe("the business lens", () => {
             "Patient events: 100 % of requests throttled for 2 min",
         ]);
     });
+
+    it("writes T4's connection surge as its measured connections at the server's limit, never as refused attempts (F34)", () => {
+        // Live (2026-11-21): Azure Monitor's failed connections stayed 0 while the surge's attempts were refused, so the lens
+        // says what was measured, T4's connections against the 35 slots clients can use.
+        expect(impactOf({ target: "T4", family: "connections", durationMin: 10, peak: 39 }).sentence).toBe(
+            "Reporting: connections at the server's limit for 10 min (active connections peak 39, at or above the 35 slots clients can use)",
+        );
+        expect(impactOf({ target: "T4", family: "connections", durationMin: 5, peak: 34 }).sentence).toBe(
+            "Reporting: connections short of the server's limit for 5 min (active connections peak 34, under the 35 slots clients can use)",
+        );
+        for (const peak of [39, 34, null]) expect(impactOf({ target: "T4", family: "connections", durationMin: 5, peak }).sentence).not.toMatch(/refus|fail/i);
+    });
 });
 
 describe("the scoreboard", () => {
+    // The review of 96abcf65: T4's connection surge read "Buffer IO (PAGEIOLATCH) waits" in the Signal column, the first
+    // family a keyword in its name gave ("connect-io-n"), as the notebook's own fallback did; T5's storm read its raw ID.
+    // Since the release's follow-ups (F34), the surge is graded by T4's connections, which name its signal.
+    it("names T4's and T5's beats, which it doesn't measure, by their title in the Signal column, and T4's connection surge by its connections (F34)", () => {
+        const runs = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T4", "incident:connection-surge", 10, 18), run(`${SESSION}:01`, "T5", "incident:ru-storm", 30, 40)];
+        const scores = scorePlan(toPlans(runs)[0], { bins: [], beats: [], runs });
+        expect(scores.map((s) => [s.status, s.signal])).toEqual([
+            ["Not supported", "active connections"],
+            ["Not supported", scenarioTitle("ru-storm")],
+        ]);
+        expect(scenarioTitle("ru-storm")).not.toBe("ru-storm");
+        // The keyword fallback matches a keyword only at a word's start, as the notebook does since F34.
+        expect(expectedFamilies("connection-surge")).toEqual(["connections"]);
+    });
+
     it("groups the faults under their session, newest first, and leaves out the baseline and failed requests", () => {
         const plans = toPlans(RUNS);
         expect(plans.map((p) => `${p.kind}:${p.label}:${p.faults.length}`)).toEqual(["session:Session 7f3a9c21:4", "request:CPU pressure on T1:1"]);
@@ -461,6 +493,118 @@ describe("the scoreboard", () => {
     });
 });
 
+describe("T4's connection surge (F34)", () => {
+    // Azure Monitor's active_connections, the highest value in each 5-minute interval, shaped as captured live (2026-11-21):
+    // the surge at 36 to 39, the rest at 28 or less, and its failed connections at 0 throughout.
+    const capture = (values: number[]): PostgresCapture => ({
+        capturedAt: at(120),
+        windowStart: at(0),
+        windowEnd: at(values.length * 5),
+        intervalMinutes: 5,
+        servers: { T4: "pgflex01-test" },
+        points: [
+            ...values.map((value, i) => ({ at: at(i * 5), target: "T4" as const, server: "pgflex01-test", metric: "active_connections", value })),
+            ...values.map((_, i) => ({ at: at(i * 5), target: "T4" as const, server: "pgflex01-test", metric: "connections_failed", value: 0 })),
+        ],
+    });
+    const surgeRuns = [run(SESSION, "all", "session", 0, 90), run(`${SESSION}:00`, "T4", "incident:connection-surge", 8, 12), run(`${SESSION}:01`, "T4", "incident:idle-in-transaction", 22, 30)];
+    const score = (postgres: PostgresCapture | null) => scorePlan(toPlans(surgeRuns)[0], { bins: [], beats: [], runs: surgeRuns, postgres });
+
+    it("grades it by T4's connections at the slots clients can use, not by its failed connections, which stayed 0", () => {
+        const [surge] = score(capture([13, 39, 37, 28, 26, 18]));
+        expect(surge).toMatchObject({ status: "Pass", family: "connections", signal: "active connections", peak: 39, ttdMin: 0, ttrMin: 7, visibleMin: 10, ongoing: false });
+        expect(surge.visibleAt).toEqual(at(5));
+        expect(surge.recoveredAt).toEqual(at(15));
+        expect(howMeasured(surge)).toBe("at least 35 (the slots clients can use)");
+        expect(surge.note).toBe("Visible: active connections at least 35 (the slots clients can use: max_connections 50, less 15 reserved) in T4's Azure Monitor metrics.");
+        expect(surge.impact?.sentence).toBe("Reporting: connections at the server's limit for 10 min (active connections peak 39, at or above the 35 slots clients can use)");
+        // Still at the limit when the capture ends: at least its visible time, never a recovery.
+        const [held] = score(capture([13, 39, 37]));
+        expect(held).toMatchObject({ status: "Pass", recoveredAt: null, ongoing: true, recoveryWord: "Still visible" });
+    });
+
+    it("says how far its connections got when they stayed under the slots, and why it isn't measured without a capture that covers it", () => {
+        const [under] = score(capture([13, 28, 30, 27, 26, 18]));
+        expect(under).toMatchObject({ status: "Warning", signal: "active connections", peak: 30, visibleAt: null, impact: null });
+        expect(under.note).toBe("Not visible: active connections stayed under 35 in its window, until 13:42 UTC; its peak was 30 at 13:40 UTC.");
+        const later = capture([13, 39]);
+        const [elsewhere] = score({ ...later, points: later.points.map((p) => ({ ...p, at: new Date(p.at.getTime() + 3 * 3600000) })) });
+        expect(elsewhere).toMatchObject({ status: "Not supported", family: "connections", signal: "active connections" });
+        expect(elsewhere.note).toMatch(/^No capture of T4's Azure Monitor metrics in view covers it/);
+        expect(score(null)[0]).toMatchObject({ status: "Not supported", signal: "active connections" });
+    });
+
+    // The review of 3fe52edb: the session's 5-minute save and a later day-long one (15 minutes), with T4 stopped from 13:57
+    // to 15:00. The newest save's interval put the break-off 15 minutes before the run's end, at 13:42.
+    it("says its metrics break off after its last interval at the slots, whatever the newest save's interval (F35)", () => {
+        const session = { CapturedAt: "2026-11-17T14:10:00", WindowStart: "2026-11-17T13:30:00", WindowEnd: "2026-11-17T13:57:00" };
+        const day = { CapturedAt: "2026-11-17T18:30:00", WindowStart: "2026-11-16T18:30:00", WindowEnd: "2026-11-17T18:30:00" };
+        const row = (save: Record<string, string>) => ([minute, value]: readonly [number, number]): Row => ({ Bucket: at(minute).toISOString(), TargetKey: "T4", ResourceName: "pgflex01-test", Metric: "active_connections", Value: value, ...save });
+        const pg = latestPostgresCapture([
+            ...(
+                [
+                    [-30, 13],
+                    [-15, 13],
+                    [0, 39],
+                    [15, 39],
+                    [90, 13],
+                    [105, 13],
+                ] as const
+            ).map(row(day)),
+            ...(
+                [
+                    [0, 13],
+                    [5, 39],
+                    [10, 37],
+                    [15, 38],
+                    [20, 36],
+                    [25, 39],
+                ] as const
+            ).map(row(session)),
+        ]);
+        expect(pg).toMatchObject({ saves: 2, intervalMinutes: 15 });
+        const [surge] = score(pg);
+        expect(surge).toMatchObject({ status: "Pass", recoveredAt: null, ongoing: false, visibleMin: 22 });
+        expect(surge.recoveryNote).toBe("Its metrics break off after 13:55 UTC, its last interval at its bound, so its recovery isn't measured.");
+        // T4's measured episode says the same.
+        expect(postgresEpisodes(pg).find((e) => e.family === "connections")?.note).toBe("Its metrics break off after 13:55 UTC, so its recovery isn't in the capture.");
+    });
+
+    it("expects connection-surge's connections, and matches a keyword only at a word's start: never IO inside 'connection' or 'transaction'", () => {
+        expect(expectedFamilies("connection-surge")).toEqual(["connections"]);
+        expect(expectedFamilies("idle-in-transaction")).toEqual([]);
+        expect(expectedFamilies("session-locking")).toEqual(["blocking"]);
+        expect(expectedFamilies("io-pressure")).toEqual(["io"]);
+        expect(expectedFamilies("index-io-mix")).toEqual(["cpu", "io"]);
+        // T4's other beats stay unmeasured here, under their title (the RCA's Signal column), never under Buffer IO waits.
+        const idle = score(capture([13, 39, 37, 28, 26, 18, 14]))[1];
+        expect(idle).toMatchObject({ status: "Not supported", signal: scenarioTitle("idle-in-transaction") });
+    });
+
+    it("shows T4's connections at their peak on its card, against the slots clients can use, never its failed connections", () => {
+        const card = postgresHealth(capture([13, 39, 37, 28]), []);
+        expect(card.metrics.map((m) => m.label)).toEqual(["CPU peak", "Replica lag", "Conn. peak"]);
+        expect(card.metrics[2].value).toBe("39 / 35");
+        expect(card.note).toMatch(/; connections reached the server's limit$/);
+        const calm = postgresHealth(capture([13, 28]), []);
+        expect(calm.metrics[2].value).toBe("28 / 35");
+        expect(calm.note).not.toMatch(/limit/);
+    });
+
+    it("shows a session's surges as T4's measured episodes, by its connections at the slots clients can use, and a recorded surge once", () => {
+        // A session's T4 beats aren't in Scenario Runs (ADR 0030), so its surges show only here.
+        const pg = capture([13, 39, 37, 28, 26, 18]);
+        const [conn] = postgresEpisodes(pg).filter((e) => e.family === "connections");
+        expect(conn).toMatchObject({ target: "T4", signal: "active connections", peak: 39, visibleMin: 10, ongoing: false, note: "Back under 35 connections at 13:45 UTC." });
+        expect(conn.impact.sentence).toBe("Reporting: connections at the server's limit for 10 min (active connections peak 39, at or above the 35 slots clients can use)");
+        expect(postgresEpisodes(capture([13, 28, 30, 27])).filter((e) => e.family === "connections")).toEqual([]);
+        // A plan that records the surge as its fault scores it there, and doesn't list its episode again.
+        const session = toPlans([run(SESSION, "all", "session", 0, 90)])[0];
+        expect(episodesIn(postgresEpisodes(pg), session).map((e) => e.family)).toContain("connections");
+        expect(episodesIn(postgresEpisodes(pg), toPlans(surgeRuns)[0]).map((e) => e.family)).not.toContain("connections");
+    });
+});
+
 describe("the service map's nodes", () => {
     it("gives the DR copy its status from the capture's read replica lag, and No data without a lag series", () => {
         const capture = (lag: number[]): PostgresCapture => ({
@@ -478,6 +622,24 @@ describe("the service map's nodes", () => {
         expect(dr(capture([]))?.status).toBeNull();
         expect(dr(capture([6, 241.4, 80, 30, 2]))?.status).toBe("Warning");
         expect(dr(capture([2, 3, 4, 3, 2]))?.status).toBe("Pass");
+    });
+
+    it("writes T5's normalized RU peak and lowest availability just under 100 % as they are, never 100.0 % (2026-11-21)", () => {
+        // One decimal alone writes 99.96 % as 100.0 %, the throttling line, for a peak that didn't throttle.
+        const capture: CosmosCapture = {
+            account: "cosmos01-test",
+            capturedAt: at(10),
+            windowStart: at(0),
+            windowEnd: at(3),
+            intervalMinutes: 1,
+            points: [
+                ...[10, 99.96, 30].map((value, m) => ({ at: at(m), metric: "NormalizedRUConsumption", value })),
+                ...[100, 99.996, 100].map((value, m) => ({ at: at(m), metric: "ServiceAvailability", value })),
+            ],
+        };
+        const health = cosmosHealth(capture, []);
+        expect(health.metrics.map((m) => m.value)).toEqual(["99.96 %", "0", "99.996 %"]);
+        expect(mapNodes([health], [], [], null).find((n) => n.target === "T5")?.metric).toBe("Norm. RU peak 99.96 %");
     });
 });
 describe("the postmortem", () => {
@@ -535,19 +697,237 @@ describe("the postmortem", () => {
         expect(markdown).toContain("| 13:30 | T1 | Injected | Deep blocking chain and lock escalation on T1 (not measured) |");
         expect(markdown).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.");
         expect(markdown).toContain("- **The telemetry didn't load, so its 4 faults aren't measured:** select Retry on the page, then write the postmortem again.");
-        // Copilot gets the same faults, each marked not measured, rather than no rows at all.
+        // Copilot's draft is blind (ADR 0031): the window and what was measured, never the plan's faults.
         const ctx = postmortemAsk(unscored);
-        expect(ctx.totalRows).toBe(4);
-        expect(ctx.rows?.[0]).toMatchObject({ target: "T1", fault: "Deep blocking chain and lock escalation", visible: null, evidence: "Not measured: the telemetry didn't load." });
+        expect(ctx.totalRows).toBe(0);
+        expect(JSON.stringify(ctx)).not.toMatch(/inject|Deep blocking chain|Scenario Runs/i);
     });
 
-    it("hands Copilot the template, the measured rows, and the queries through the ask contract", () => {
-        const ctx = postmortemAsk(input);
-        expect(ctx).toMatchObject({ title: "Postmortem: ContosoCare session 7f3a9c21", page: "scoreboard", visualId: "postmortem.plan", source: "history", totalRows: 4 });
-        expect(ctx.prompt).toMatch(/^Write the postmortem of ContosoCare session 7f3a9c21 .+ with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Times to signal and recover, Follow-ups\./);
+    it("hands Copilot a blind draft: the window, the measured episodes, and the measured queries, never what was injected (ADR 0031)", () => {
+        const cpu = [20, 85, 90, 88, 20].map((value, i) => ({ at: at(i * 5), target: "T4" as const, server: "pg01-test", metric: "cpu_percent", value }));
+        const pg: PostgresCapture = { capturedAt: null, windowStart: at(0), windowEnd: at(30), intervalMinutes: 5, servers: {}, points: cpu };
+        const episodes = postgresEpisodes(pg);
+        const ctx = postmortemAsk({ ...input, episodes, askSpecs: [seriesQuery({ targets: ["T1", "T2", "T3"], window: null })] });
+        expect(ctx).toMatchObject({ page: "scoreboard", visualId: "postmortem.plan", source: "history", totalRows: episodes.length });
+        expect(ctx.title).toMatch(/^Postmortem draft: ContosoCare from .+ 13:30 to .+ UTC$/);
+        expect(ctx.prompt).toMatch(/^Write the postmortem of what ContosoCare's databases went through from .+ UTC, in Markdown, with exactly these sections: Summary, Timeline \(UTC\), Impact on ContosoCare, Cause, Response, Follow-ups\./);
         expect(ctx.prompt).toMatch(/never that Database Hub detected something/);
-        expect(ctx.rows?.[2]).toMatchObject({ target: "T3", service: "Scheduling", injected: "2026-11-17T14:03:00.000Z", ttdMin: 1, ttrMin: 24, status: "Pass" });
-        expect(ctx.dax).toMatch(/^\/\/ Sessions and activity requests\nEVALUATE/);
+        expect(ctx.rows?.[0]).toMatchObject({ target: "T4", service: "Reporting", signal: "CPU" });
+        expect(ctx.dax).toMatch(/^\/\/ .+\nEVALUATE/);
+        expect(JSON.stringify(ctx)).not.toMatch(/inject|Scenario Runs|Incident Windows|Analysis Findings|blocking chain/i);
+    });
+
+    describe("with the Incident RCA's tables, its Cause is the blind investigation (ADR 0031, section 9)", () => {
+        const chain = "[demo].[usp_scenario_chain_acquire] (session 63; ContosoCare.Demo, login runner, host SQLVM01) sat idle with its transaction open for up to 79 s, holding X KEY lock on [care].[work_queues] (pk_work_queues).";
+        const rca: BlindCauses = {
+            from: plan.start,
+            to: new Date(plan.end.getTime() + 15 * 60000),
+            causes: [
+                { key: "T1-blocking-20261117T133030Z", target: "T1", signal: "blocked processes", start: new Date(T0 + 30_000), end: new Date(T0 + 10 * 60000 + 10_000), statement: chain, confidence: "high", evidence: ["head 63: sleeping, open transactions 1, idle 59 s (RCA Sessions, 13:31:00 UTC)", "session 64 waits on 63: LCK_M_U for 58 s (RCA Sessions, 13:31:00 UTC)"], also: ["T1, deadlocks, from 13:32:00 UTC"], notes: [] },
+                { key: "T1-deadlock-20261117T133200Z", target: "T1", signal: "deadlocks", start: at(2), end: at(3), statement: chain, confidence: "high", evidence: ["head 63: sleeping, open transactions 1, idle 59 s (RCA Sessions, 13:31:00 UTC)"], also: [], notes: [] },
+                { key: "T2-memory-20261117T134100Z", target: "T2", signal: "Memory waits", start: at(11), end: null, statement: null, confidence: null, evidence: [], also: [], notes: ["T2: no RCA capture recorded for 13:41:00-13:48:00 UTC; only the telemetry (Telemetry Snapshots) is known"] },
+                { key: "T3-cpu-20261117T140400Z", target: "T3", signal: "CPU", start: at(34), end: at(57), statement: null, confidence: null, evidence: [], also: [], notes: [], failed: "RCA Resource: The model didn't answer." },
+            ],
+            more: "3 more incidents in these minutes (T3 3), with less evidence: the Root cause page explains each.",
+            notCaptured: ["T5: no RCA capture recorded for 13:30:00-15:15:00 UTC; only the telemetry (Telemetry Snapshots) is known"],
+            queries: [{ title: "Incident RCA: RCA Sessions", dax: "EVALUATE 'RCA Sessions'" }],
+        };
+        const sectionOf = (markdown: string, heading: string) => markdown.slice(markdown.indexOf(`## ${heading}\n`), markdown.indexOf("\n## ", markdown.indexOf(`## ${heading}\n`) + 3));
+
+        it("explains each incident head blocker first, with its confidence and the rows it cites, then gives what was injected, labeled as the answer key", () => {
+            expect(causeWindow(plan)).toEqual({ from: plan.start, to: new Date(plan.end.getTime() + 15 * 60000) });
+            const { title, markdown } = buildPostmortem({ ...input, rca });
+            expect(title).toBe(postmortemTitle(plan));
+            const sections = markdown.split("\n").filter((l) => l.startsWith("## "));
+            expect(sections).toEqual(["## Summary", "## Timeline (UTC)", "## Impact on ContosoCare", "## Cause", "## What the demo injected (answer key)", "## Response", "## Times to signal and recover", "## Follow-ups", "## How this was measured", "## Queries"]);
+            const cause = sectionOf(markdown, "Cause");
+            expect(cause).toContain(
+                [
+                    "A blind investigation, the way a DBA would make it, of the session's minutes as the session control recorded them, and the 15 minutes after them, where a signal can still show (13:30 to 15:15 UTC). It reads what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, and nothing about the faults the demo planned.",
+                    "",
+                    "What it found, with the incidents the richest evidence explains first; the Root cause page has each one in full:",
+                    "",
+                    `- **T1, blocked processes, 13:30:30 to 13:40:10 UTC** (confidence high): ${chain}`,
+                    "  - head 63: sleeping, open transactions 1, idle 59 s (RCA Sessions, 13:31:00 UTC)",
+                    "  - session 64 waits on 63: LCK_M_U for 58 s (RCA Sessions, 13:31:00 UTC)",
+                    "  - Also in these minutes: T1, deadlocks, from 13:32:00 UTC",
+                    // One root cause behind two incidents is said once.
+                    "- **T1, deadlocks, 13:32:00 to 13:33:00 UTC** (confidence high): the same root cause as **T1, blocked processes, 13:30:30 to 13:40:10 UTC** above.",
+                    "- **T2, Memory waits, from 13:41:00 UTC**: no root cause:",
+                    "  - T2: no RCA capture recorded for 13:41:00-13:48:00 UTC; only the telemetry (Telemetry Snapshots) is known",
+                    "- **T3, CPU, 14:04:00 to 14:27:00 UTC**: it couldn't be explained: RCA Resource: The model didn't answer.",
+                    "",
+                    "3 more incidents in these minutes (T3 3), with less evidence: the Root cause page explains each.",
+                    "",
+                    "**Not captured:**",
+                    "",
+                    "- T5: no RCA capture recorded for 13:30:00-15:15:00 UTC; only the telemetry (Telemetry Snapshots) is known",
+                ].join("\n"),
+            );
+            expect(cause.match(/head 63/g)).toHaveLength(1);
+            // The Cause is blind: no word of the plan, which follows in its own section, labeled.
+            expect(cause).not.toMatch(/inject|Scenario Runs|Deep blocking chain|blocking-chain/i);
+            const key = sectionOf(markdown, "What the demo injected (answer key)");
+            expect(key).toContain("What the demo planned, from Scenario Runs: the answer key, for checking what the investigation above found. It took only the session's minutes from the session control's record, never the faults in them.");
+            expect(key).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.");
+            expect(markdown).toContain("- **Cause:** the Incident RCA's blind investigation of the session's minutes, as the session control recorded them, and the 15 minutes after them, up to the next session's start: find_incidents, then explain_incident for each incident, at most 6 in the Root cause page's order.");
+            // Every query behind it: the page's, then the investigation's.
+            expect(markdown).toContain("```dax\n// Sessions and activity requests\nEVALUATE");
+            expect(markdown).toContain("And the investigation's, behind the Cause, each once:\n\n```dax\n// Incident RCA: RCA Sessions\nEVALUATE 'RCA Sessions'\n```");
+            // Copilot's draft is the same blind draft, with or without the investigation.
+            expect(postmortemAsk({ ...input, rca })).toEqual(postmortemAsk(input));
+        });
+
+        it("says an investigation that couldn't run, and one that found nothing, never taking either for the plan's faults", () => {
+            const failed = buildPostmortem({ ...input, rca: { ...rca, causes: [], more: undefined, notCaptured: [], queries: [], error: "the check of the Incident RCA's tables failed: The model didn't answer." } }).markdown;
+            const cause = sectionOf(failed, "Cause");
+            expect(cause).toContain("\n\nIt couldn't run, so it gives no cause: the check of the Incident RCA's tables failed: The model didn't answer.");
+            expect(cause).not.toMatch(/inject|Nothing abnormal/i);
+            expect(sectionOf(failed, "What the demo injected (answer key)")).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.");
+            expect(failed).not.toContain("And the investigation's");
+            const quiet = buildPostmortem({ ...input, rca: { ...rca, causes: [], more: undefined, notCaptured: [], none: "Nothing abnormal in these minutes: the detector found no episode." } }).markdown;
+            expect(sectionOf(quiet, "Cause")).toMatch(/\n\nNothing abnormal in these minutes: the detector found no episode\.\n/);
+            // Without the RCA tables, the Cause is what was injected, as the release wrote it.
+            const release = buildPostmortem(input).markdown;
+            expect(sectionOf(release, "Cause")).toMatch(/^## Cause\n\nEvery fault was injected on purpose by the demo's session control/);
+            expect(release).not.toMatch(/answer key|the Incident RCA's blind investigation/);
+        });
+
+        it("never aims the investigation at a lone incident request's minutes, which are its fault's own, and points to the Root cause page (the review of 63fb530c)", () => {
+            const request = toPlans(RUNS).find((p) => p.kind === "request")!;
+            expect(request.key).toBe("r9");
+            expect(causeWindow(request)).toBeNull();
+            const { markdown } = buildPostmortem({ ...input, plan: request, scores: [], episodes: [], beat: null, rca: "request" });
+            const cause = sectionOf(markdown, "Cause");
+            expect(cause).toBe(
+                "## Cause\n\nThis is one incident request's postmortem, and its minutes are its fault's own, from what the demo planned, so a blind investigation aimed at them would be told where the fault was. The Root cause page finds the incidents from the signals alone, in what the RCA capture, Database Hub's telemetry, and Azure Monitor recorded, and explains each one.\n",
+            );
+            const key = sectionOf(markdown, "What the demo injected (answer key)");
+            expect(key).toContain("What the demo planned, from Scenario Runs: the answer key.\n");
+            expect(key).toMatch(/^- \*\*.+\*\* on T1 \(Billing\), \d\d:\d\d to \d\d:\d\d UTC\.$/m);
+            expect(markdown).toContain("- **Cause:** none here: a lone incident request's minutes are its fault's own, so the Root cause page finds and explains the incidents instead (ADR 0031).");
+            expect(markdown).not.toContain("And the investigation's");
+        });
+
+        it("ends a session's minutes at the next session's start, from the session control's record, when it comes within 15 minutes (the review of 63fb530c)", () => {
+            const next = "session:abcdef12-1111-2222-3333-444444444444";
+            // A lone request right after the session is a fault's own minutes, so it never ends them.
+            const runs = [...RUNS, run("r12", "T2", "incident:io-pressure", 92, 100), run(next, "all", "session", 95, 125)];
+            const plans = toPlans(runs);
+            const first = plans.find((p) => p.key === SESSION)!;
+            expect(nextSessionStart(plans, first)).toEqual(at(95));
+            expect(nextSessionStart(plans, plans.find((p) => p.key === next)!)).toBeNull();
+            expect(causeWindow(first, at(95))).toEqual({ from: at(0), to: at(95) });
+            expect(causeWindow(first, at(110))).toEqual({ from: at(0), to: at(105) });
+            expect(causeWindow(first, at(80))).toEqual({ from: at(0), to: at(90) });
+            const { markdown } = buildPostmortem({ ...input, rca: { ...rca, to: at(95) } });
+            expect(sectionOf(markdown, "Cause")).toContain("of the session's minutes as the session control recorded them, and the 5 minutes after them, up to the next session's start (13:30 to 15:05 UTC).");
+        });
+
+        it("lists other plans' faults that reach into the investigated minutes in the answer key, labeled as outside this session, never in the Cause or the draft (the re-review of feb64ad3)", () => {
+            const next = "session:abcdef12-1111-2222-3333-444444444444";
+            // The review's lone request after the session, before the next one's start; one that began just before the
+            // session; one that ended 14 minutes before it, whose signal can still show; and what's out: one that ended 16
+            // minutes before it, one that ended exactly 15 before it (the review of b4370565), and the next session's own fault.
+            const runs = [
+                ...RUNS,
+                run("r12", "T2", "incident:io-pressure", 92, 100),
+                run(next, "all", "session", 95, 125),
+                run(`${next}:00`, "T3", "incident:cpu-pressure", 96, 106),
+                run("r13", "T1", "incident:cpu-pressure", -5, 5),
+                run("r14", "T3", "incident:cpu-pressure", -30, -14),
+                run("r15", "T3", "incident:cpu-pressure", -40, -16),
+                run("r16", "T2", "incident:cpu-pressure", -35, -15),
+            ];
+            const plans = toPlans(runs);
+            const first = plans.find((p) => p.key === SESSION)!;
+            const investigated = { ...rca, ...causeWindow(first, nextSessionStart(plans, first))! };
+            const { markdown } = buildPostmortem({ ...input, plan: first, plans, rca: investigated });
+            const key = sectionOf(markdown, "What the demo injected (answer key)");
+            expect(key).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.\n");
+            expect(key).toContain(
+                [
+                    "**Outside this session:** other plans injected these faults in the investigated minutes, or up to 15 minutes before them, where a signal can still show, so an incident above may be one of theirs:",
+                    "",
+                    "- **CPU pressure** on T3 (Scheduling), 13:00 to 13:16 UTC: a lone incident request.",
+                    "- **CPU pressure** on T1 (Billing), 13:25 to 13:35 UTC: a lone incident request.",
+                    "- **IO pressure** on T2 (Front desk), 15:02 to 15:10 UTC: a lone incident request.",
+                    "",
+                ].join("\n"),
+            );
+            expect(key).not.toMatch(/12:50|12:55|15:06/);
+            // The Cause stays blind, and so does Copilot's draft: neither gets them.
+            expect(sectionOf(markdown, "Cause")).not.toMatch(/pressure|lone incident request|Outside this session/);
+            expect(postmortemAsk({ ...input, plan: first, plans, rca: investigated })).toEqual(postmortemAsk({ ...input, plan: first }));
+            // A session whose plan injected nothing says so of its own plan only; without an investigation, nothing is added.
+            const quiet = toPlans(runs.filter((r) => !r.requestId.startsWith(`${SESSION}:`)));
+            const empty = quiet.find((p) => p.key === SESSION)!;
+            expect(sectionOf(buildPostmortem({ ...input, plan: empty, scores: [], beat: null, plans: quiet, rca: investigated }).markdown, "What the demo injected (answer key)")).toContain("This session's plan injected nothing.\n\n**Outside this session:**");
+            expect(buildPostmortem({ ...input, plan: first, plans }).markdown).not.toContain("Outside this session");
+        });
+
+        it("lists the session's faults and T4's and T5's episodes on targets the page's filter hides in the answer key, since the investigation reads every target (the review of b4370565)", () => {
+            // The period's runs before the filter, with a lone request on T4 after the session. The page's filter shows T1
+            // only, so its plan, scores, and beat are T1's, as use-mission builds them.
+            const runs = [...RUNS, run("r12", "T4", "incident:connection-surge", 92, 100)];
+            const all = toPlans(runs);
+            const shown = toPlans(runs.filter((r) => !r.profile.startsWith("incident:") || r.target === "T1")).find((p) => p.key === SESSION)!;
+            const filtered = { ...input, plan: shown, scores: input.scores.filter((s) => s.target === "T1"), beat: null };
+            const cpu = [20, 85, 90, 88, 20, 20].map((value, i) => ({ at: at(60 + i * 5), target: "T4" as const, server: "pg01-test", metric: "cpu_percent", value }));
+            const pg: PostgresCapture = { capturedAt: null, windowStart: at(60), windowEnd: at(90), intervalMinutes: 5, servers: {}, points: cpu };
+            const hidden = { episodes: postgresEpisodes(pg), specs: [postgresSeriesQuery()], errors: ["T5's Azure Monitor capture couldn't be read for this key, so its episodes aren't in it: The model didn't answer."] };
+            expect(hidden.episodes).toHaveLength(1);
+            const recovered = (hidden.episodes[0].recoveredAt ?? hidden.episodes[0].endAt)?.toISOString().slice(11, 16);
+            const investigated = { ...rca, to: at(95) };
+            const { markdown } = buildPostmortem({ ...filtered, plans: all, rca: investigated, hidden });
+            const key = sectionOf(markdown, "What the demo injected (answer key)");
+            expect(key).toContain(
+                [
+                    "**On targets this page's filter hides:** the investigation above reads every target, so the key does too, though the sections above leave these out:",
+                    "",
+                    "- **Memory grant pressure** on T2 (Front desk), 13:40 to 13:48 UTC.",
+                    "- **Plan regression (automatic plan correction)** on T3 (Scheduling), 14:00 to 14:30 UTC.",
+                    "- **IO pressure** on T2 (Front desk), 14:10 to 14:18 UTC.",
+                    `- **CPU** on T4 (Reporting), 14:35 to ${recovered} UTC, an episode in its Azure Monitor metrics.`,
+                    "- T5's Azure Monitor capture couldn't be read for this key, so its episodes aren't in it: The model didn't answer.",
+                    "",
+                ].join("\n"),
+            );
+            // The filter's own fault is above them, once.
+            expect(key.match(/Deep blocking chain and lock escalation/g)).toHaveLength(1);
+            // Another plan's fault on a hidden target is outside this session, as on any other.
+            expect(key).toContain("- **Connection surge (capacity maxed)** on T4 (Reporting), 15:02 to 15:10 UTC: a lone incident request.");
+            // The sections above stay the filter's, and the queries behind the key's part end the postmortem.
+            expect(markdown.slice(0, markdown.indexOf("## What the demo injected"))).not.toMatch(/Memory grant|Plan regression|IO pressure|T4 \(Reporting\)/);
+            expect(markdown).toContain(`And the answer key's, for the targets this page's filter hides:\n\n\`\`\`dax\n// ${postgresSeriesQuery().title}\nEVALUATE`);
+            // A session whose every fault the filter hides never says its plan injected nothing, nor that nothing was injected:
+            // its Summary, Impact, and Follow-ups speak of the targets the filter shows, and the Summary points to the key (the
+            // review of 96abcf65: they said "No fault was injected in this window" beside the key's list of its faults).
+            const none = buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: all, rca: investigated, hidden: null }).markdown;
+            // The review of 3c0f5aeb: the Timeline and the Response still said "No event in this window." and "No response step
+            // in this window.", though the hidden T3 plan regression was answered at 14:26.
+            const empty = /injected nothing|No fault was injected|nothing was injected|Nothing was injected|No event in this window|No response step in this window/;
+            expect(none).not.toMatch(empty);
+            expect(sectionOf(none, "Summary")).toContain("- None of the session's faults is on the targets this page's filter shows: its 4 faults are on T1, T2, and T3, which the filter hides, and the answer key below lists them.\n");
+            expect(sectionOf(none, "Timeline (UTC)")).toContain("No event on the targets this page's filter shows.");
+            expect(sectionOf(none, "Impact on ContosoCare")).toContain("No measured impact on the targets this page's filter shows: the session's faults are all on targets it hides.");
+            expect(sectionOf(none, "Response")).toContain("- No response step on the targets this page's filter shows.");
+            expect(sectionOf(none, "Follow-ups")).toContain("- None from the data on the targets this page's filter shows: the session's faults are all on targets it hides.");
+            expect(sectionOf(none, "What the demo injected (answer key)")).toContain("- **Deep blocking chain and lock escalation** on T1 (Billing), 13:30 to 13:40 UTC.\n");
+            // Without the RCA tables, the same, with no key to point to; the Cause, which lists what was injected then, too.
+            const plain = buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: all }).markdown;
+            expect(plain).not.toMatch(new RegExp(`${empty.source}|answer key`));
+            expect(sectionOf(plain, "Summary")).toContain("- None of the session's faults is on the targets this page's filter shows: its 4 faults are on T1, T2, and T3, which the filter hides.\n");
+            expect(sectionOf(plain, "Timeline (UTC)")).toContain("No event on the targets this page's filter shows.");
+            expect(sectionOf(plain, "Response")).toContain("- No response step on the targets this page's filter shows.");
+            expect(sectionOf(plain, "Cause")).toContain("None of the session's faults is on the targets this page's filter shows.");
+            // A window with no fault on any target still says so.
+            const nothing = buildPostmortem({ ...filtered, plan: { ...shown, faults: [] }, scores: [], plans: [{ ...shown, faults: [] }] }).markdown;
+            expect(sectionOf(nothing, "Summary")).toContain("- No fault was injected in this window: Scenario Runs has no incident request in it.");
+            expect([sectionOf(nothing, "Timeline (UTC)"), sectionOf(nothing, "Response")].join("\n")).toMatch(/No event in this window\.[\s\S]*- No response step in this window\./);
+            // Without the investigation, the answer key is the release's: what the filter shows.
+            expect(buildPostmortem({ ...filtered, plans: all, hidden }).markdown).not.toMatch(/filter hides|Memory grant|Connection surge/);
+        });
     });
 
     it("says no fault's signal was visible by its rule, never that no signal showed, when each rose short of its rule (F23)", () => {

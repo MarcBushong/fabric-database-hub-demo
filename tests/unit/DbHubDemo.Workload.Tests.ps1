@@ -196,6 +196,20 @@ Describe 'Publish-DemoWorkloadRunner' {
         $before | Should -Match '^[0-9a-f]{64}$'
     }
 
+    It 'hashes the Incident RCA capture catalog and history tables the runner embeds, so changing them builds a new runner' {
+        $fake = New-FakeRunnerRepository
+        New-Item -ItemType Directory -Path (Join-Path -Path $fake -ChildPath 'rca/capture') -Force | Out-Null
+        Set-Content -LiteralPath (Join-Path -Path $fake -ChildPath 'rca/capture/sqlserver.sql') -Value '-- name: RCA-SQL-09'
+        Set-Content -LiteralPath (Join-Path -Path $fake -ChildPath 'rca/history-tables.json') -Value '{ "version": 1 }'
+        $before = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoWorkloadSourceHash -RepositoryRoot $r -RuntimeIdentifier 'win-x64' -SdkVersion '10.0.402' } $fake
+        Set-Content -LiteralPath (Join-Path -Path $fake -ChildPath 'rca/capture/sqlserver.sql') -Value '-- name: RCA-SQL-01'
+        $catalog = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoWorkloadSourceHash -RepositoryRoot $r -RuntimeIdentifier 'win-x64' -SdkVersion '10.0.402' } $fake
+        Set-Content -LiteralPath (Join-Path -Path $fake -ChildPath 'rca/history-tables.json') -Value '{ "version": 2 }'
+        $tables = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoWorkloadSourceHash -RepositoryRoot $r -RuntimeIdentifier 'win-x64' -SdkVersion '10.0.402' } $fake
+        $catalog | Should -Not -Be $before
+        $tables | Should -Not -Be $catalog
+    }
+
     It 'hashes the publish properties too, so changing them builds a new runner' {
         $fake = New-FakeRunnerRepository
         $without = & (Get-Module -Name DbHubDemo) { param($r) Get-DemoWorkloadSourceHash -RepositoryRoot $r -RuntimeIdentifier 'win-x64' -SdkVersion '10.0.402' -BuildProperty '-p:RestoreLockedMode=true' } $fake
@@ -508,6 +522,13 @@ Describe 'Workload control through action Run Command' {
         $request = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encoded)) | ConvertFrom-Json
         $request.target | Should -Be 'T3'
         $request.arguments | Should -Be @('profile', 'set', '--name', 'off')
+        $request.PSObject.Properties['bounds'] | Should -BeNullOrEmpty -Because 'only validate.ps1''s status asks for the bounds'
+
+        # validate.ps1's status asks the VM for the running runs' bounds, read from the runner's whole output (F20).
+        Invoke-DemoWorkloadCommand -Config $config -Target T1 -ArgumentList 'status', '--json', '--runs', '5' -Bounds -Confirm:$false | Out-Null
+        $last = $script:azCalls | Where-Object { $_.Arguments[0] -eq 'vm' } | Select-Object -Last 1
+        $encoded = [regex]::Match($last.Script, "-RequestBase64 '([A-Za-z0-9+/=]+)'").Groups[1].Value
+        ([System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String($encoded)) | ConvertFrom-Json).bounds | Should -BeTrue
     }
 
     It 'takes a single JSON object, such as profile get''s, as one record' {

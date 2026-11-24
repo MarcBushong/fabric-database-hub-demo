@@ -298,6 +298,152 @@ Describe 'Stopped VMs are expected (validation areas)' {
         $other.status | Should -Be 'Fail'
     }
 
+    It 'warns, and never fails, about a loader it can''t check because the health read didn''t answer (F31, live on dbhubra)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        Mock -ModuleName DbHubDemo -CommandName Wait-DemoBootstrapLoader -MockWith { New-DemoResult -CheckId ('INFRA.BOOTSTRAP.LOADER_{0}' -f $VmName.ToUpperInvariant()) -Area 'infra' -Target 'T2' -Status 'Fail' -Message ('{0} has no bootstrap loader Run Command (DbHubDemo-Bootstrap): ERROR: Not Found' -f $VmName) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw ('Reading health.json on {0} failed (execution state Pending, exit code ): ' -f $VmName) }
+        $context = New-TestContext
+        $context.Tags['DbHubBundleSha256'] = 'abcdefabcdef' + ('0' * 52)
+        $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X })
+        $loader = $results | Where-Object { $_.checkId -eq 'INFRA.BOOTSTRAP.LOADER_ARCHOST01' }
+        $loader.status | Should -Be 'Warning'
+        $loader.message | Should -BeExactly 'Whether archost01''s bootstrap loader ran couldn''t be checked: there''s no DbHubDemo-Bootstrap Run Command to read, because deploy.ps1''s parallel tracks remove it after the loader runs, and health.json, which names the bundle the loader installed, couldn''t be read (INFRA.HEALTH.ARCHOST01 says why).'
+        $loader.message | Should -Not -Match 'has no bootstrap loader Run Command'
+        $loader.remediation | Should -Be 'Run validate.ps1 again in a few minutes.'
+        ($results | Where-Object { $_.checkId -eq 'INFRA.HEALTH.ARCHOST01' }).status | Should -Be 'Warning'
+        @($results | Where-Object { $_.checkId -like 'INFRA.BOOTSTRAP.*' -and $_.status -eq 'Fail' }) | Should -BeNullOrEmpty -Because 'health unknown is not a loader that''s missing'
+    }
+
+    It 'names the step that warned, and what to do, for a Ready VM whose status is a Warning (F24, 2026-11-20)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        $script:summary = [pscustomobject]@{ role = 'sqlvm'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 3; warnings = @('AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.', 'SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.') }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:summary }
+        $context = New-TestContext -Target T1
+        $health = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.SQLVM01' }
+        $health.status | Should -Be 'Warning'
+        $health.message | Should -Be 'sqlvm01 reports Ready: Every step is in the desired state. Its bootstrap has 3 warnings: AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it; SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure (1 more). 2 of them are expected: SQL Server setup asks for a restart when it removes Analysis Services and Integration Services from a new T1; a new T1 needs the sysadmin recovery, because its image''s SQL IaaS Agent least-privilege mode doesn''t make SYSTEM a sysadmin.'
+        $health.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it and says what happens next\. A one-off note, such as a restart that''s pending, goes with the next bootstrap generation, which the next \./scripts/deploy\.ps1 that sends sqlvm01 a new bundle starts; any other warning stays while its cause does, until its step runs again\.'
+        $health.remediation | Should -Match 'Get-DemoVmHealth -Config \$config -VmName sqlvm01 -View Full lists them all\.$'
+        $health.remediation | Should -Not -Match 'still working' -Because 'a Ready bootstrap isn''t working or waiting'
+        $health.evidence['warningCount'] | Should -Be 3
+        @($health.evidence['warnings']).Count | Should -Be 2
+
+        # A VM whose bundle predates the summary's warnings: it says so, and how to see them.
+        $script:summary = [pscustomobject]@{ role = 'sqlvm'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = '' }
+        $fresh = New-TestContext -Target T1
+        $old = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $fresh } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.SQLVM01' }
+        $old.message | Should -Match 'Its bootstrap reported a warning that this VM''s summary doesn''t name \(its bootstrap bundle predates 2026-11-20\)\.$'
+        $old.remediation | Should -Match 'Get-DemoVmHealth -Config \$config -VmName sqlvm01 -View Full lists the warning and its step'
+
+        # A bootstrap that's still working keeps its own fix.
+        $script:summary = [pscustomobject]@{ role = 'sqlvm'; state = 'InProgress'; status = 'Warning'; message = 'Step SeedDatabase is converging.'; currentStep = 'SeedDatabase' }
+        $working = New-TestContext -Target T1
+        (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $working } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.SQLVM01' }).remediation | Should -Be 'The bootstrap is still working or waiting; run validate.ps1 again later.'
+    }
+
+    It 'says a new host''s sign-in cleanup is expected, and why, when it''s the only cause of the Warning (F32, live on dbhubra)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        $cleanup = 'GuestSignInCleanup: The sign-in cleanup cleared Application on archost01, because they held token-shaped values; endpoint protection may report a cleared event log.'
+        $script:summary = [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 1; warnings = @($cleanup) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:summary }
+        $read = {
+            $context = New-TestContext
+            @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.ARCHOST01' }
+        }
+        $health = & $read
+        $health.status | Should -Be 'Warning' -Because 'health.json''s own status stands'
+        $health.message | Should -Be ('archost01 reports Ready: Every step is in the desired state. Its bootstrap has a warning: {0} That''s expected: a sign-in cleanup that clears an event log follows T2''s Arc onboarding, on a new host or a rebuilt guest (ADR 0009).' -f $cleanup)
+        $health.remediation | Should -Be 'Nothing to do: it''s expected, and the next bootstrap generation clears it, which the next ./scripts/deploy.ps1 that sends archost01 a new bundle starts. Get-DemoVmHealth -Config $config -VmName archost01 -View Full lists them all.'
+        $health.evidence['warningsExpected'] | Should -BeTrue
+
+        # An older bundle's note, which names no step, is the same note.
+        $script:summary.warnings = @('The sign-in cleanup cleared Application on archost01, because they held token-shaped values.')
+        (& $read).message | Should -Match ' That''s expected: a sign-in cleanup that clears an event log follows '
+
+        # Beside a warning that isn't by design, it says which; the fix stays the general one.
+        $script:summary.warningCount = 2
+        $script:summary.warnings = @($cleanup, 'GuestFirstBoot: Uninstalling SSIS in arcsql01 didn''t pass (setup exit code 1).')
+        $mixed = & $read
+        $mixed.message | Should -Match '\. 1 of them is expected: a sign-in cleanup that clears an event log follows T2''s Arc onboarding'
+        $mixed.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it'
+        $mixed.evidence['warningsExpected'] | Should -BeFalse
+
+        # Automatic sign-in left armed isn't by design: nothing in the demo arms it.
+        $script:summary.warningCount = 1
+        $script:summary.warnings = @('AutoLogonSecret: Windows automatic sign-in was armed on sqlvm01, which nothing in the demo does; the cleanup turned it off and deleted its LSA secret and Winlogon values.')
+        (& $read).message | Should -Not -Match 'expected'
+    }
+
+    It 'passes a Ready VM whose bootstrap recorded its by-design notes as information, and still names them and why (2026-11-23)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        $cleanup = 'GuestSignInCleanup: The sign-in cleanup cleared Application on archost01, because they held token-shaped values; endpoint protection may report a cleared event log.'
+        $image = 'GuestImage: The image has no Content-MD5 here, so it was checked by its length and its pinned SHA-256.'
+        $script:summary = [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Pass'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 0; warnings = @(); noteCount = 2; notes = @($cleanup, $image) }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:summary }
+        $read = {
+            $context = New-TestContext
+            @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.ARCHOST01' }
+        }
+        $health = & $read
+        $health.status | Should -Be 'Pass' -Because 'health.json''s own status is a Pass: a note is information'
+        $health.message | Should -Be ('archost01 reports Ready: Every step is in the desired state. Its bootstrap noted, as information: {0}; {1}. Those are expected: a sign-in cleanup that clears an event log follows T2''s Arc onboarding, on a new host or a rebuilt guest (ADR 0009); Jumpstart''s image has no Content-MD5, so a new T2 host checks it by its length and its pinned SHA-256.' -f $cleanup.TrimEnd('.'), $image.TrimEnd('.'))
+        $health.remediation | Should -BeNullOrEmpty
+        $health.evidence['noteCount'] | Should -Be 2
+        @($health.evidence['notes']).Count | Should -Be 2
+
+        # Beside a warning: the warning sets the status, and the notes are still named.
+        $script:summary = [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 1; warnings = @('GuestFirstBoot: Uninstalling SSIS in arcsql01 didn''t pass (setup exit code 1).'); noteCount = 1; notes = @($cleanup) }
+        $mixed = & $read
+        $mixed.status | Should -Be 'Warning'
+        $mixed.message | Should -Match 'Its bootstrap has a warning: GuestFirstBoot: Uninstalling SSIS in arcsql01 didn''t pass \(setup exit code 1\)\. Its bootstrap noted, as information: GuestSignInCleanup: '
+        $mixed.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it'
+    }
+
+    It 'calls none of a VM''s warnings expected when its bundle gives the by-design notes as notes, since a warning with their text is an established VM''s (the review of cb4bc479)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        $cleanup = 'GuestSignInCleanup: The sign-in cleanup cleared Application on archost01, because they held token-shaped values; endpoint protection may report a cleared event log.'
+        $script:summary = [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 1; warnings = @($cleanup); noteCount = 0; notes = @() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:summary }
+        $context = New-TestContext
+        $health = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.ARCHOST01' }
+        $health.status | Should -Be 'Warning'
+        $health.message | Should -Be ('archost01 reports Ready: Every step is in the desired state. Its bootstrap has a warning: {0}' -f $cleanup)
+        $health.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it'
+        $health.evidence['warningsExpected'] | Should -BeFalse
+    }
+
+    It 'tells a bundle that gives the by-design notes as notes from an older one by health.json''s notes, in both views, as the real health read prints them (the re-check of ea1ea20f)' {
+        # status.ps1 -Detail reads the full view, which never has noteCount, and the summary had noteCount for an older
+        # health.json too, so neither told the bundles apart: an established T1's later recovery was called expected.
+        $healthScript = Join-Path -Path $repoRoot -ChildPath 'vm/health/Get-DemoHealth.ps1'
+        $recovery = 'SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.'
+        foreach ($case in @(@{ Format = 'older'; Notes = $false; Expected = $true }, @{ Format = 'newer'; Notes = $true; Expected = $false })) {
+            $root = Join-Path -Path $TestDrive -ChildPath ('health-' + $case.Format)
+            $null = New-Item -ItemType Directory -Path $root -Force
+            $written = [ordered]@{ schemaVersion = 1; role = 'SqlVm'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; warnings = @($recovery); steps = @() }
+            if ($case.Notes) {
+                # Every bundle since 2026-11-23 writes notes, even empty.
+                $written['notes'] = @()
+            }
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), ($written | ConvertTo-Json -Depth 5))
+            foreach ($view in 'Summary', 'Full') {
+                $read = (& $healthScript -Root $root -View $view) | ConvertFrom-Json
+                $note = InModuleScope -ModuleName DbHubDemo -Parameters @{ H = $read } { param($H) Get-DemoHealthWarningNote -Health $H -VmName 'sqlvm01' }
+                $because = 'an {0} bundle''s health.json, read in the {1} view' -f $case.Format, $view
+                $note.Count | Should -Be 1 -Because $because
+                $note.Expected | Should -Be $case.Expected -Because $because
+                if ($case.Expected) {
+                    $note.Text | Should -Match 'That''s expected: a new T1 needs the sysadmin recovery' -Because $because
+                    $note.Remediation | Should -Match '^Nothing to do' -Because $because
+                }
+                else {
+                    $note.Text | Should -Not -Match 'expected' -Because $because
+                    $note.Remediation | Should -Match '^Nothing blocks the demo' -Because $because
+                }
+            }
+        }
+    }
+
     It 'warns, with the extension-update finding, when health.json can''t be read' {
         Set-TestAzResponse (Get-TestAzResponse -Power 'running')
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'Reading health.json on sqlvm01 failed (execution state Pending, exit code ).' }
@@ -490,6 +636,33 @@ Describe 'Workload bounds' {
             (Test-DemoValidationWorkloadBound -Target T1 -StdOut '...truncated output' -NowUtc $now).status | Should -Be 'Warning'
         }
     }
+
+    It 'checks the bounds from the relay''s compact form when the status it kept is cut, as during every session (F20)' {
+        InModuleScope DbHubDemo {
+            $now = [datetime]::new(2026, 10, 21, 12, 0, 0, [System.DateTimeKind]::Utc)
+            $cut = '...ns": [], "dataHeadroomMb": 1834, "host": { "status": "Pass" } }'
+            $runnerProfile = [ordered]@{ name = 'business-day'; expiresAt = '2026-10-21T22:58:00.000Z' }
+            $bounds = {
+                param([string] $Deadline, [int] $Maximum = 3600)
+                # As the relay's evidence comes back: through JSON, so its times are DateTime values.
+                ([ordered]@{ listed = 5; running = @([ordered]@{ runId = 'r1'; scenario = 'cpu-pressure'; startedAt = '2026-10-21T11:50:00.000Z'; deadlineAt = $Deadline; maxDurationSeconds = $Maximum }); demoSessions = 14 } | ConvertTo-Json -Depth 5 | ConvertFrom-Json -AsHashtable)
+            }
+            $pass = Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -Bounds (& $bounds '2026-10-21T12:20:00.000Z') -RunnerProfile $runnerProfile -NowUtc $now
+            $pass.status | Should -Be 'Pass'
+            $pass.message | Should -Be '1 running scenario(s) on T1, each within its deadline and maximum duration; the activity profile ''business-day'' ends at 2026-10-21 22:58:00Z.'
+            $pass.evidence.source | Should -Be 'relay'
+            $pass.evidence.demoSessions | Should -Be 14
+            ([datetime]$pass.evidence.runs[0].deadlineAt).ToUniversalTime() | Should -Be ([datetime]::new(2026, 10, 21, 12, 20, 0, [System.DateTimeKind]::Utc))
+            (Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -Bounds (& $bounds '2026-10-21T10:30:00.000Z') -RunnerProfile $runnerProfile -NowUtc $now).status | Should -Be 'Warning'
+            (Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -Bounds (& $bounds '2026-10-21T14:20:00.000Z' 1800) -RunnerProfile $runnerProfile -NowUtc $now).status | Should -Be 'Fail'
+            # A VM whose bundle predates it, and a status too long for the relay to carry the bounds: a Warning that says which.
+            $old = Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -NowUtc $now
+            $old.status | Should -Be 'Warning'
+            $old.message | Should -Match 'bootstrap bundle predates the compact bounds'
+            $old.remediation | Should -Match '^Run \./scripts/deploy\.ps1, which sends the VMs the current bootstrap bundle'
+            (Test-DemoValidationWorkloadBound -Target T1 -StdOut $cut -RunnerProfile $runnerProfile -BoundsCut -NowUtc $now).message | Should -Match 'too long to carry them'
+        }
+    }
 }
 
 Describe 'Workload host' {
@@ -668,6 +841,26 @@ Describe 'Validation during business-day''s incidents (2026-11-03)' {
         (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Fail'
     }
 
+    It 'asks the relay for the running runs'' bounds, and checks them from a status with 5 runs, whose kept tail has none (F20)' {
+        $status = New-RunnerStatus -Runs 5
+        $script:tail = Get-RelayTail $status
+        (InModuleScope -ModuleName DbHubDemo -Parameters @{ T = $script:tail } { param($T) Test-DemoValidationWorkloadBound -Target T2 -StdOut $T }).status | Should -Be 'Warning' -Because 'the kept tail alone doesn''t parse, so it was a Warning during every session'
+        $script:relayBounds = [ordered]@{ listed = 5; running = @([ordered]@{ runId = '20261103T140500-healthy-baseline'; scenario = 'healthy-baseline'; startedAt = [datetime]::UtcNow.AddMinutes(-5).ToString('yyyy-MM-ddTHH:mm:ss.fffZ'); deadlineAt = [datetime]::UtcNow.AddMinutes(3).ToString('yyyy-MM-ddTHH:mm:ss.fffZ'); maxDurationSeconds = 600 }); demoSessions = 9 }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $evidence = [ordered]@{ exitCode = 0; stdout = $script:tail; profile = [ordered]@{ name = 'business-day'; expiresAt = '2099-11-03T21:01:12.000Z' } }
+            if ($Bounds) {
+                $evidence['bounds'] = $script:relayBounds
+            }
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:tail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status' -Evidence $evidence) }
+        }
+        $context = New-TestContext -Target T2
+        $bound = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.BOUNDS' }
+        $bound.status | Should -Be 'Pass'
+        $bound.evidence['source'] | Should -Be 'relay'
+        $bound.evidence['runningRuns'] | Should -Be 1
+        $bound.evidence['demoSessions'] | Should -Be 9
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -Times 1 -Exactly -ParameterFilter { $Target -eq 'T2' -and $Bounds -and ($ArgumentList -join ' ') -eq 'status --json --runs 5' }
+    }
     It 'still reads a status with one run, which the relay keeps whole, without the relay''s profile' {
         $status = New-RunnerStatus -Runs 1
         $status.Length | Should -BeLessOrEqual 1800
@@ -677,6 +870,27 @@ Describe 'Validation during business-day''s incidents (2026-11-03)' {
         }
         $context = New-TestContext -Target T2
         (@(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'WORKLOAD.T2.HOST' }).status | Should -Be 'Warning'
+    }
+
+    # 2026-11-23: T2.QUERYSTORE (and T1's) from the same status read, which the relay keeps from the whole output, since the
+    # kept tail of a status with runs loses it (the review of the Query Store design, finding 6).
+    It 'adds T2.QUERYSTORE from the relay''s Query Store state, with area t2, and a Warning when the status read fails' {
+        $script:tail = Get-RelayTail (New-RunnerStatus -Runs 5)
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith {
+            $evidence = [ordered]@{ exitCode = 0; stdout = $script:tail; queryStore = [ordered]@{ actualState = 'READ_WRITE'; desiredState = 'READ_WRITE'; readonlyReason = 0; captureMode = 'AUTO'; intervalMinutes = 15; storageMb = 3; maxStorageMb = 512 } }
+            [pscustomobject]@{ Target = $Target; Status = 'Pass'; StdOut = $script:tail; Result = (New-DemoResult -CheckId ('WORKLOAD.{0}.COMMAND' -f $Target) -Area 'workload' -Target $Target -Status 'Pass' -Message 'status' -Evidence $evidence) }
+        }
+        $context = New-TestContext -Target T2
+        $check = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'T2.QUERYSTORE' }
+        @($check).Count | Should -Be 1
+        $check.area | Should -Be 't2'
+        $check.status | Should -Be 'Pass'
+        $check.message | Should -Match '^Query Store is on in ContosoCare on T2: READ_WRITE'
+
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoWorkloadCommand -MockWith { throw 'Run Command timed out.' }
+        $check = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationWorkload -Context $X }) | Where-Object { $_.checkId -eq 'T2.QUERYSTORE' }
+        $check.status | Should -Be 'Warning'
+        $check.message | Should -Be 'Query Store''s state on T2 wasn''t read: the runner''s status couldn''t be read (WORKLOAD.T2.COMMAND).'
     }
 
     It 'turns a T3.PROPERTY check that couldn''t run during an incident into a Warning, and keeps a property that''s read and wrong a Fail' {
@@ -778,6 +992,25 @@ Describe 'Cost area' {
         $results = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationCost -Context $X })
         ($results | Where-Object { $_.checkId -eq 'COST.BUDGET' }).status | Should -Be 'Warning'
         ($results | Where-Object { $_.checkId -eq 'COST.AUTOSHUTDOWN' }).status | Should -Be 'Warning'
+    }
+
+    It 'names an auto-shutdown that deploy.ps1 moved for a deferred nightly stop, with the commands that put it back (F27)' {
+        # Live (dbhubfr at bf010ed): after a Run all session in the grace of a run the nightly stop waited for, both VMs still
+        # shut down at 22:15, and validate.ps1 said only to deploy again.
+        $script:schedule.properties.dailyRecurrence.time = '2215'
+        $script:costResponse['^resource show --resource-group rg-dbhub-demo --name shutdown-computevm-.* --resource-type Microsoft\.DevTestLab/schedules'] = Get-TestAzOk $script:schedule
+        $context = New-TestContext
+        $context.Results.Add((New-DemoResult -CheckId 'PREFLIGHT.COST.MONTHLY' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'estimate'))
+        $context.Tags['DbHubAutoShutdownMoved'] = '2215'
+        $moved = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationCost -Context $X }) | Where-Object { $_.checkId -eq 'COST.AUTOSHUTDOWN' }
+        $moved.status | Should -Be 'Warning'
+        $moved.message | Should -Match 'sqlvm01 shuts down at 2215 Pacific Standard Time, not 1900 Pacific Standard Time, where deploy\.ps1 moved it for a run the nightly stop waited for'
+        $moved.remediation | Should -Be 'Run ./scripts/stop-demo.ps1 or ./scripts/start-demo.ps1, which put it back at 1900, as the next ./scripts/deploy.ps1 does; until then, a Run all session ends before it (ADR 0024).'
+        # A time nothing recorded is still the configuration's to restore.
+        $context.Tags.Remove('DbHubAutoShutdownMoved')
+        $other = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationCost -Context $X }) | Where-Object { $_.checkId -eq 'COST.AUTOSHUTDOWN' }
+        $other.message | Should -Not -Match 'moved it'
+        $other.remediation | Should -Be 'Deploy again (deploy.ps1 -Resume) to restore autoShutdownTime and autoShutdownTimeZone.'
     }
 }
 

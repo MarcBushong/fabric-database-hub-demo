@@ -447,6 +447,22 @@ Describe 'Lifecycle scripts' {
             Should -Invoke -CommandName Complete-DemoDeploymentRun -Times 1 -Exactly -ParameterFilter { [bool]$PesterBoundParameters['Sequential'] }
         }
 
+        It 'writes the Insights app once, as the ending deployed it again with T2''s readiness, to out/deploy.jsonl (F18, 2026-11-20)' {
+            $capture['earlier'] = New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not supported' -Message 'Azure had no assessment result for T2 at this deploy.' -Evidence ([ordered]@{ t2MigrationReadAt = ''; nonBlocking = 'insightsApp' })
+            $capture['again'] = New-DemoResult -CheckId 'FABRIC.APP.ESTATE' -Area 'fabric' -Target 'fabric' -Status 'Not supported' -Message 'T2''s migration readiness as Azure had it at this deploy.' -Evidence ([ordered]@{ t2MigrationReadAt = '2026-11-23T15:21:00Z'; nonBlocking = 'insightsApp' })
+            Mock -CommandName Invoke-DemoDeployment -MockWith { @((New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok'), $capture['earlier']) }
+            Mock -CommandName Complete-DemoDeploymentRun -MockWith { [pscustomobject]@{ Kind = 'Done'; ExitCode = 0; Minutes = 1; Reason = ''; Next = ''; NextCommand = './scripts/deploy.ps1'; Optional = @(); Notes = @(); Resume = ''; Added = @((New-DemoResult -CheckId 'DEPLOY.ENDSTOP' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'Stopped at the end.'), $capture['again']) } }
+            $output = Join-Path -Path $TestDrive -ChildPath ('f18-' + [guid]::NewGuid().ToString('N') + '.jsonl')
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/deploy.ps1') -ConfigPath $configPath -OutputPath $output
+            $LASTEXITCODE | Should -Be 0
+            $exported = @(Get-Content -LiteralPath $output | Where-Object { $_ } | ForEach-Object { $_ | ConvertFrom-Json })
+            $estate = @($exported | Where-Object { $_.checkId -eq 'FABRIC.APP.ESTATE' })
+            $estate.Count | Should -Be 1
+            ([datetime]$estate[0].evidence.t2MigrationReadAt).ToUniversalTime() | Should -Be ([datetime]::new(2026, 11, 23, 15, 21, 0, [System.DateTimeKind]::Utc))
+            @($exported | Where-Object { $_.checkId -eq 'TEST.RESULT' }).Count | Should -Be 1
+            @($exported | Where-Object { $_.checkId -eq 'DEPLOY.ENDSTOP' }).Count | Should -Be 1
+        }
+
         It 'resolves relative paths against PowerShell''s location, not the process''s working directory (review fix 8)' {
             # .NET resolves relative paths against [Environment]::CurrentDirectory, which Push-Location doesn't change.
             $location = Join-Path -Path $TestDrive -ChildPath ('location-' + [guid]::NewGuid().ToString('N'))
@@ -726,10 +742,30 @@ Describe 'Lifecycle scripts' {
     It 'reset-demo.ps1 and status.ps1 pass their switches through' {
         Mock -CommandName Reset-DemoWorkload -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
         Mock -CommandName Get-DemoEnvironmentStatus -MockWith { New-DemoResult -CheckId 'TEST.RESULT' -Area 'infra' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        Mock -CommandName Invoke-DemoDeployScript -MockWith { 0 }
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/reset-demo.ps1') -ConfigPath $configPath -Target T1 -Reseed -OutputPath $outputPath
         Should -Invoke -CommandName Reset-DemoWorkload -Times 1 -Exactly -ParameterFilter { $Target -eq 'T1' -and $Reseed -and -not $UndoRemediation }
+        Should -Invoke -CommandName Invoke-DemoDeployScript -Times 0 -Exactly
         & (Join-Path -Path $repoRoot -ChildPath 'scripts/status.ps1') -ConfigPath $configPath -Detail -OutputPath $outputPath
         Should -Invoke -CommandName Get-DemoEnvironmentStatus -Times 1 -Exactly -ParameterFilter { $Detail }
+    }
+
+    It 'reset-demo.ps1 -RebuildGuest runs deploy.ps1 -FromStage Artifacts once archost01 has the request, with deploy.ps1''s exit code, and not otherwise (2026-11-21)' {
+        Mock -CommandName Reset-DemoWorkload -MockWith { New-DemoResult -CheckId 'RESET.GUEST' -Area 'workload' -Target 'T2' -Status $capture['guestStatus'] -Message 'guest' }
+        Mock -CommandName Invoke-DemoDeployScript -MockWith { 3 }
+        $capture['guestStatus'] = 'Pass'
+        $capture['configPath'] = $configPath
+        & (Join-Path -Path $repoRoot -ChildPath 'scripts/reset-demo.ps1') -ConfigPath $configPath -RebuildGuest -OutputPath $outputPath
+        $LASTEXITCODE | Should -Be 3 -Because 'the command''s exit code is deploy.ps1''s'
+        Should -Invoke -CommandName Reset-DemoWorkload -Times 1 -Exactly -ParameterFilter { $RebuildGuest }
+        Should -Invoke -CommandName Invoke-DemoDeployScript -Times 1 -Exactly -ParameterFilter { $FromStage -eq 'Artifacts' -and [System.IO.Path]::GetFileName($ConfigPath) -eq [System.IO.Path]::GetFileName($capture['configPath']) }
+        foreach ($status in 'Fail', 'Not selected', 'Not supported') {
+            $capture['guestStatus'] = $status
+            & (Join-Path -Path $repoRoot -ChildPath 'scripts/reset-demo.ps1') -ConfigPath $configPath -RebuildGuest -OutputPath $outputPath
+        }
+        $capture['guestStatus'] = 'Pass'
+        & (Join-Path -Path $repoRoot -ChildPath 'scripts/reset-demo.ps1') -ConfigPath $configPath -RebuildGuest -OutputPath $outputPath -WhatIf
+        Should -Invoke -CommandName Invoke-DemoDeployScript -Times 1 -Exactly
     }
 
     It 'demo-control.ps1 takes the workflow''s string inputs' {

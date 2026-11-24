@@ -375,7 +375,7 @@ try {
                 $endingOutcome = $ending['Outcome']
                 $endingResults = @($results)
                 if ($null -ne $endingOutcome.PSObject.Properties['Added']) {
-                    $endingResults = @($endingResults) + @($endingOutcome.Added | Where-Object { $null -ne $_ })
+                    $endingResults = @(Merge-DemoRunResult -Result @($endingResults) -Added @($endingOutcome.Added))
                 }
                 Write-DemoResultReport -Result $endingResults -Title 'deploy.ps1' -OutcomeDone:([string]$endingOutcome.Kind -eq 'Done') -DeployCommand ([string]$run.Command)
                 Export-DemoResult -Result $endingResults -Path $OutputPath
@@ -387,9 +387,10 @@ try {
         }
     }
 
-    # What the ending added (DEPLOY.NIGHTLYSTOP: when the nightly stop waited for this run, and when the demo stops).
+    # What the ending added (DEPLOY.NIGHTLYSTOP: when the nightly stop waited for this run, and when the demo stops), and the
+    # Insights app's records when the ending deployed it once more with T2's readiness (F18): those replace the earlier ones.
     if ($null -ne $outcome -and $null -ne $outcome.PSObject.Properties['Added']) {
-        $results = @($results) + @($outcome.Added | Where-Object { $null -ne $_ })
+        $results = @(Merge-DemoRunResult -Result @($results) -Added @($outcome.Added))
     }
 
     # A remediation that says to run deploy.ps1 names this run's own command, with its -ConfigPath (2026-11-06).

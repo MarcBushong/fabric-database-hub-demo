@@ -1,13 +1,14 @@
-/* The Copilot dock. It uses the Fluent 2 tokens the FluentProvider sets, with fallbacks, so it follows the app's
-   theme. The shell sizes and places the panel; everything here is inside it. */
+/* The Copilot dock. Colors come only from the theme: the Fluent 2 tokens the FluentProvider sets in the app's earth tones,
+   and the Copilot mark's own (--copilot-mark, APP_TOKENS in src/theme/fluent.ts). The shell sizes and places the panel;
+   everything here is inside it. */
 
 .copilot-dock {
     display: flex;
     flex-direction: column;
     height: 100%;
     min-height: 0;
-    background: var(--colorNeutralBackground1, #ffffff);
-    color: var(--colorNeutralForeground1, #242424);
+    background: var(--colorNeutralBackground1);
+    color: var(--colorNeutralForeground1);
 }
 
 .copilot-dock-head {
@@ -15,7 +16,7 @@
     align-items: center;
     gap: 6px;
     padding: 8px 8px 8px 14px;
-    border-bottom: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    border-bottom: 1px solid var(--colorNeutralStroke2);
 }
 
 .copilot-dock-titles {
@@ -44,8 +45,8 @@
     height: 28px;
     flex: none;
     border-radius: 8px;
-    color: #ffffff;
-    background: linear-gradient(135deg, #8a3ffc 0%, #0f6cbd 100%);
+    color: var(--copilot-mark-ink);
+    background: var(--copilot-mark);
 }
 
 .copilot-dock-spacer {
@@ -60,7 +61,7 @@
     padding: 0;
     gap: 4px;
     justify-content: flex-start;
-    color: var(--colorNeutralForeground2, #424242);
+    color: var(--colorNeutralForeground2);
     font-size: var(--fontSizeBase200, 12px);
 }
 
@@ -72,7 +73,7 @@
 }
 
 .copilot-account-plan {
-    color: var(--colorNeutralForeground3, #616161);
+    color: var(--colorNeutralForeground3);
 }
 
 .copilot-dock-body {
@@ -97,8 +98,8 @@
     gap: 10px;
     padding: 16px;
     border-radius: var(--borderRadiusXLarge, 8px);
-    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
-    background: var(--colorNeutralBackground2, #fafafa);
+    border: 1px solid var(--colorNeutralStroke2);
+    background: var(--colorNeutralBackground2);
 }
 
 .copilot-card h3 {
@@ -127,7 +128,7 @@
     margin: 0;
     padding-left: 18px;
     font-size: var(--fontSizeBase200, 12px);
-    color: var(--colorNeutralForeground3, #616161);
+    color: var(--colorNeutralForeground3);
     line-height: 1.45;
 }
 
@@ -138,7 +139,7 @@ p.copilot-fine {
 
 .copilot-error {
     margin: 0;
-    color: var(--colorPaletteRedForeground1, #bc2f32);
+    color: var(--colorPaletteRedForeground1);
 }
 
 .copilot-row {
@@ -156,7 +157,7 @@ p.copilot-fine {
 
 .copilot-intro p {
     margin: 0 0 12px;
-    color: var(--colorNeutralForeground2, #424242);
+    color: var(--colorNeutralForeground2);
     line-height: 1.45;
 }
 
@@ -192,8 +193,8 @@ p.copilot-fine {
     max-width: 88%;
     padding: 9px 12px;
     border-radius: 14px 14px 4px 14px;
-    background: var(--colorBrandBackground, #0f6cbd);
-    color: var(--colorNeutralForegroundOnBrand, #ffffff);
+    background: var(--colorBrandBackground);
+    color: var(--colorNeutralForegroundOnBrand);
 }
 
 .copilot-user p {
@@ -224,26 +225,26 @@ p.copilot-fine {
 
 .copilot-model {
     margin-left: auto;
-    color: var(--colorNeutralForeground4, #707070);
+    color: var(--colorNeutralForeground4);
 }
 
 .copilot-figure {
     margin: 0;
     padding: 10px;
     border-radius: var(--borderRadiusXLarge, 8px);
-    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
-    background: var(--colorNeutralBackground1, #ffffff);
+    border: 1px solid var(--colorNeutralStroke2);
+    background: var(--colorNeutralBackground1);
 }
 
 .copilot-source {
     border-radius: var(--borderRadiusLarge, 6px);
-    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
-    background: var(--colorNeutralBackground2, #fafafa);
+    border: 1px solid var(--colorNeutralStroke2);
+    background: var(--colorNeutralBackground2);
     font-size: var(--fontSizeBase200, 12px);
 }
 
 .copilot-source-failed {
-    border-color: var(--colorPaletteYellowBorder2, #e9a23b);
+    border-color: var(--colorPaletteYellowBorder2);
 }
 
 .copilot-source-head {
@@ -261,13 +262,13 @@ p.copilot-fine {
 }
 
 .copilot-source-head:focus-visible {
-    outline: 2px solid var(--colorStrokeFocus2, #000000);
+    outline: 2px solid var(--colorStrokeFocus2);
     outline-offset: -2px;
 }
 
 .copilot-source-head svg {
     flex: none;
-    color: var(--colorNeutralForeground3, #616161);
+    color: var(--colorNeutralForeground3);
 }
 
 .copilot-source-purpose {
@@ -279,7 +280,7 @@ p.copilot-fine {
 }
 
 .copilot-source-meta {
-    color: var(--colorNeutralForeground3, #616161);
+    color: var(--colorNeutralForeground3);
     white-space: nowrap;
 }
 
@@ -308,7 +309,7 @@ p.copilot-fine {
     max-height: 260px;
     overflow: auto;
     border-radius: var(--borderRadiusMedium, 4px);
-    background: var(--colorNeutralBackground3, #f5f5f5);
+    background: var(--colorNeutralBackground3);
     font-family: "JetBrains Mono Variable", ui-monospace, monospace;
     font-size: 11px;
 }
@@ -318,7 +319,7 @@ p.copilot-fine {
     flex-direction: column;
     gap: 6px;
     padding: 10px 14px 14px;
-    border-top: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    border-top: 1px solid var(--colorNeutralStroke2);
 }
 
 .copilot-attached {
@@ -328,8 +329,8 @@ p.copilot-fine {
     gap: 8px;
     padding: 4px 4px 4px 10px;
     border-radius: var(--borderRadiusLarge, 6px);
-    background: var(--colorNeutralBackground2, #fafafa);
-    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    background: var(--colorNeutralBackground2);
+    border: 1px solid var(--colorNeutralStroke2);
     font-size: var(--fontSizeBase200, 12px);
 }
 
@@ -385,25 +386,25 @@ p.copilot-fine {
 .cp-md code {
     padding: 1px 5px;
     border-radius: 4px;
-    background: var(--colorNeutralBackground3, #f5f5f5);
+    background: var(--colorNeutralBackground3);
     font-family: "JetBrains Mono Variable", ui-monospace, monospace;
     font-size: 0.86em;
 }
 
 .cp-md a {
-    color: var(--colorBrandForegroundLink, #115ea3);
+    color: var(--colorBrandForegroundLink);
 }
 
 .cp-md blockquote {
     margin: 8px 0;
     padding-left: 10px;
-    border-left: 3px solid var(--colorNeutralStroke1, #d1d1d1);
-    color: var(--colorNeutralForeground2, #424242);
+    border-left: 3px solid var(--colorNeutralStroke1);
+    color: var(--colorNeutralForeground2);
 }
 
 .cp-md hr {
     border: none;
-    border-top: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    border-top: 1px solid var(--colorNeutralStroke2);
 }
 
 .cp-code {
@@ -411,7 +412,7 @@ p.copilot-fine {
     padding: 10px;
     overflow-x: auto;
     border-radius: var(--borderRadiusMedium, 4px);
-    background: var(--colorNeutralBackground3, #f5f5f5);
+    background: var(--colorNeutralBackground3);
     font-family: "JetBrains Mono Variable", ui-monospace, monospace;
     font-size: 12px;
     white-space: pre;
@@ -421,7 +422,7 @@ p.copilot-fine {
     overflow-x: auto;
     margin: 0 0 8px;
     border-radius: var(--borderRadiusMedium, 4px);
-    border: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    border: 1px solid var(--colorNeutralStroke2);
 }
 
 .cp-table-wrap table {
@@ -433,12 +434,12 @@ p.copilot-fine {
 .cp-table-wrap th,
 .cp-table-wrap td {
     padding: 5px 8px;
-    border-bottom: 1px solid var(--colorNeutralStroke2, #e0e0e0);
+    border-bottom: 1px solid var(--colorNeutralStroke2);
     text-align: left;
     white-space: nowrap;
 }
 
 .cp-table-wrap th {
-    background: var(--colorNeutralBackground2, #fafafa);
+    background: var(--colorNeutralBackground2);
     font-weight: 600;
 }

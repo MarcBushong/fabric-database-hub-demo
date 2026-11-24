@@ -5,8 +5,8 @@ function Get-DemoVmHealth {
     (ADR 0003, ADR 0012).
 
     .DESCRIPTION
-    Runs vm/health/Get-DemoHealth.ps1 with Invoke-DemoVmRunCommand (Run Command DbHubDemo-HealthRead, deleted
-    afterward) and returns the parsed JSON. -View Summary (the default) returns only role, state, status,
+    Runs vm/health/Get-DemoHealth.ps1 with Invoke-DemoVmRunCommand (Run Command DbHubDemo-HealthRead-<yyyyMMddHHmmss>, a
+    fresh name for each read since 2026-11-22 (F31), deleted afterward) and returns the parsed JSON. -View Summary (the default) returns only role, state, status,
     message, currentStep, generation, updatedUtc, installMode, arcOnboarded, guestState, and sqlEdition, plus
     the PaygWizard guided stop's guidedArmed, guidedRequest, guidedLast, and guidedLeft (Phase 28), which
     always fits in the 4 KB the instance view keeps. On the T2 host, both views add t2Guest, the guest as Hyper-V
@@ -46,7 +46,9 @@ function Get-DemoVmHealth {
     )
 
     $script = Get-Content -LiteralPath (Join-Path -Path $script:RepoRoot -ChildPath 'vm/health/Get-DemoHealth.ps1') -Raw
-    $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-HealthRead' -Script $script -Parameter @{ View = $View } -TimeoutSeconds $TimeoutSeconds -Confirm:$false
+    # A fresh name for each read, and a read that hasn't started in 90 seconds once more under another (F31, 2026-11-22):
+    # under its one fixed name, the VM's Run Command handler could skip a read, which then stayed Pending for minutes.
+    $run = Invoke-DemoVmRunCommand -Config $Config -VmName $VmName -RunCommandName 'DbHubDemo-HealthRead' -Script $script -Parameter @{ View = $View } -TimeoutSeconds $TimeoutSeconds -FreshName -PendingRetrySeconds 90 -Confirm:$false
     if ($null -eq $run) {
         return $null
     }

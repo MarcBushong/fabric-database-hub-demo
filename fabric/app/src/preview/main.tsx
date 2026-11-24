@@ -17,6 +17,7 @@ import { isThemeChoice } from "../theme/fluent";
 import { AppThemeProvider } from "../theme/AppThemeProvider";
 import { sampleRows } from "./sample-data";
 import { sampleLiveReader } from "./sample-live";
+import { sampleRcaRows } from "./sample-rca";
 
 import "../styles/app.css";
 
@@ -48,7 +49,7 @@ const sample: DataSource = {
     answers: () => true,
     fetch: async (spec) => {
         await new Promise((resolve) => setTimeout(resolve, 40));
-        return { rows: empty ? [] : sampleRows(spec), requestId: "sample" };
+        return { rows: empty ? [] : (sampleRcaRows(spec) ?? sampleRows(spec)), requestId: "sample" };
     },
 };
 

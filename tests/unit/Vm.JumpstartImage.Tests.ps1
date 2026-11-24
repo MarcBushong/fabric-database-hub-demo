@@ -67,7 +67,7 @@ Describe 'JumpstartImage step plan' {
         $plan = Get-DemoHostStepPlan -Context $context
         $plan.Name | Should -Be @(
             'NestedVirtualization', 'HyperVRole', 'DnsServerRole', 'NatNetwork', 'DnsForwarder', 'GuestSource', 'DataDisk', 'GuestOsMedia',
-            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2',
+            'GuestVhdx', 'GuestImage', 'GuestVm', 'GuestFirstBoot', 'GuestNetwork', 'GuestOnline', 'GuestHardening', 'SqlMedia', 'GuestWebView2',
             'SqlUnattendedInstall', 'JumpstartImageCheck', 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'GuidedSetup', 'SqlSetupWizard',
             'GuestSignInCleanup', 'ConfigureSql', 'SeedDatabase', 'WorkloadRunner')
         $selected = @($plan | Where-Object { -not $_.Contains('When') -or [bool](@(& $_['When'] $_)[-1]) } | ForEach-Object { $_.Name })
@@ -101,6 +101,8 @@ Describe 'JumpstartImage step plan' {
         $script:firstBoot = $false
         Mock -CommandName Test-DemoJumpstartFirstBoot -MockWith { $script:firstBoot }
         Mock -CommandName Invoke-DemoJumpstartFirstBoot -MockWith { $script:firstBoot = $true }
+        # The GuestNetwork step (2026-11-21): the first boot connected the guest.
+        Mock -CommandName Test-DemoHostGuestNetwork -MockWith { $script:firstBoot }
         Mock -CommandName Test-DemoHostGuestReachable -MockWith { $true }
         Mock -CommandName Wait-DemoHostGuest -MockWith { $true }
         Mock -CommandName Get-DemoGuestCredential -MockWith {
@@ -389,6 +391,22 @@ namespace DbHubDemoTest
     It 'decides a short download is incomplete, so the next run resumes it' {
         $decision = Get-DemoJumpstartImageDecision -Pin (New-TestPin -Size 100) -Remote ([pscustomobject]@{ ContentLength = 100; ETag = '0xPINNED'; ContentMd5 = ''; LastModified = '' }) -Length 60 -Hash ([pscustomobject]@{ Md5Base64 = ''; Sha256 = '' })
         $decision.Outcome | Should -Be 'Incomplete'
+    }
+
+    It 'notes the tested image checked by its pinned SHA-256 without a Content-MD5 as information, by design, and warns when only its length was checked (2026-11-23)' {
+        # Jumpstart's image has no Content-MD5, so a new host checks it this way every time: a note, which leaves the host a Pass.
+        $script:remote.ContentMd5 = ''
+        $result = Save-DemoJumpstartImage -Context $script:context -VhdxPath $script:vhdx
+        $result.Outcome | Should -Be 'Done'
+        @($result.NoteMessage) | Should -Be @('The image has no Content-MD5 here, so it was checked by its length and its pinned SHA-256.')
+        @($result.TransientWarningMessage).Count | Should -Be 0
+        @($result.WarningMessage).Count | Should -Be 0
+
+        # Without a pinned SHA-256, only the length was checked: that stays a one-off warning, the repository's to fix.
+        $remote = [pscustomobject]@{ ContentLength = 100; ETag = '0xPINNED'; ContentMd5 = ''; LastModified = '' }
+        $decision = Get-DemoJumpstartImageDecision -Pin (New-TestPin -Size 100) -Remote $remote -Length 100 -Hash ([pscustomobject]@{ Md5Base64 = ''; Sha256 = ('a' * 64) })
+        @($decision.Note) | Should -Be @('The image has no Content-MD5 here and no pinned SHA-256, so only its length was checked; the image checks run next.')
+        @($decision.Info).Count | Should -Be 0
     }
 }
 

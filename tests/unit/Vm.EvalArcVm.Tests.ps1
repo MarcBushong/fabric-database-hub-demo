@@ -60,6 +60,32 @@ Describe 'Evaluation-only T2 bootstrap (EvalArcVm)' {
         ($plan | Where-Object { $_.Name -eq 'SignInCleanup' }).Contains('When') | Should -BeFalse -Because 'Arc onboarding uses a token in every mode'
     }
 
+    It 'notes a cleared event log only after Arc onboarding in this generation, not after SQL Server''s setup steps, whose Sets also run on an established VM (the re-check of ea1ea20f)' {
+        $step = Get-DemoEvalArcStepPlan -Context (New-TestEvalContext -Mode 'Developer') | Where-Object { $_.Name -eq 'SignInCleanup' }
+        Mock -CommandName Get-DemoSetupProcess -MockWith { @() }
+        Mock -CommandName Enable-DemoIeEsc -MockWith { }
+        Mock -CommandName Invoke-DemoSignInSweep -MockWith {
+            $counts = [pscustomobject]@{ userTokens = 0; otherTokens = 0; filesWithUserData = 0; eventLogUserTokens = 0; browserCaches = 0; archives = 0; filesUnverified = 0; appTokens = 0; eventLogAppTokens = 0; securityLogTokens = 0 }
+            [pscustomobject]@{ pass = $true; cleaned = $true; found = $counts; remaining = $counts; actions = [pscustomobject]@{ filesRedacted = 0; filesDeleted = 0; cachesRemoved = 0; brokerEntriesRemoved = 0; eventLogsCleared = @('Windows PowerShell') }; foundLocations = @(); foundEventLogs = @() }
+        }
+        # An established VM whose SQL Server service was stopped: SqlUnattendedInstall's Set ran in this generation, and Arc
+        # onboarding in an earlier one. A one-off warning, not a note.
+        $state = Get-DemoVmState
+        $state['generation'] = 'g2'
+        $state['steps']['ArcOnboarding'] = [ordered]@{ status = 'Succeeded'; setGeneration = 'g1'; completedUtc = (Get-DemoVmUtcNow) }
+        $state['steps']['SqlUnattendedInstall'] = [ordered]@{ status = 'Succeeded'; setGeneration = 'g2'; completedUtc = (Get-DemoVmUtcNow) }
+        Save-DemoVmState -State $state
+        $established = & $step.Set $step
+        @($established.NoteMessage).Count | Should -Be 0 -Because 'SQL Server''s setup steps run again while its service is stopped'
+        $established.TransientWarningMessage[0] | Should -Match 'Windows PowerShell on arcsql01'
+        # A new VM's, whose Arc onboarding ran in this generation: a note, as information.
+        $state['steps']['ArcOnboarding']['setGeneration'] = 'g2'
+        Save-DemoVmState -State $state
+        $onboarded = & $step.Set $step
+        $onboarded.NoteMessage[0] | Should -Match 'Windows PowerShell on arcsql01'
+        @($onboarded.TransientWarningMessage).Count | Should -Be 0
+    }
+
     It 'waits while setup runs, then removes the sign-in data on this VM and fails closed when any is left' {
         $step = Get-DemoEvalArcStepPlan -Context (New-TestEvalContext) | Where-Object { $_.Name -eq 'SignInCleanup' }
         Mock -CommandName Get-DemoSetupProcess -MockWith { @('ScenarioEngine') }

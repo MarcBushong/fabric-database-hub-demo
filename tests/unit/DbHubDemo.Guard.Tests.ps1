@@ -959,3 +959,53 @@ Describe 'Invoke-DemoAzCli through a batch-file wrapper' -Skip:(-not $IsWindows)
         $children | Should -BeNullOrEmpty
     }
 }
+
+Describe 'Invoke-DemoAzCli for a caller with -Confirm, in a non-interactive shell (1f7dca70''s review, 2026-11-22)' {
+    # Under a caller's -Confirm, the inherited $ConfirmPreference 'Low' made the stderr redirection ask ("Output to File",
+    # through Out-File), and the temporary file's deletion too, which a non-interactive shell, such as an assistant's,
+    # refuses: for example ./scripts/check-sign-in-data.ps1 -Clean without -Force, after a Yes for a VM. Here an advanced
+    # caller with -Confirm runs one call in a pwsh -NonInteractive child, with a stand-in Azure CLI first on PATH that
+    # writes to both streams, and a temporary folder of its own.
+    BeforeAll {
+        $script:confirmRoot = Join-Path -Path $TestDrive -ChildPath 'confirm'
+        $script:confirmBin = Join-Path -Path $script:confirmRoot -ChildPath 'bin'
+        $script:confirmTemp = Join-Path -Path $script:confirmRoot -ChildPath 'temp'
+        $null = New-Item -ItemType Directory -Path $script:confirmBin, $script:confirmTemp -Force
+        if ($IsWindows) {
+            Set-Content -LiteralPath (Join-Path -Path $script:confirmBin -ChildPath 'az.cmd') -Encoding ascii -Value @('@echo {"azure-cli": "0.0.0"}', '@echo stand-in warning 1>&2')
+        }
+        else {
+            $wrapper = Join-Path -Path $script:confirmBin -ChildPath 'az'
+            Set-Content -LiteralPath $wrapper -Encoding ascii -Value @('#!/bin/sh', 'echo ''{"azure-cli": "0.0.0"}''', 'echo ''stand-in warning'' 1>&2')
+            & chmod '+x' $wrapper
+        }
+        $script:confirmChild = Join-Path -Path $script:confirmRoot -ChildPath 'run-confirm.ps1'
+        Set-Content -LiteralPath $script:confirmChild -Encoding ascii -Value @(
+            'param([string] $ModulePath, [string] $Bin, [string] $Temp)'
+            '$env:PATH = $Bin + [System.IO.Path]::PathSeparator + $env:PATH'
+            '$env:TMP = $Temp'
+            '$env:TEMP = $Temp'
+            '$env:TMPDIR = $Temp'
+            'Import-Module -Name $ModulePath -Force'
+            '$result = & (Get-Module -Name DbHubDemo) {'
+            '    function Test-DemoConfirmCaller {'
+            '        [CmdletBinding(SupportsShouldProcess = $true)]'
+            '        param()'
+            '        Invoke-DemoAzCli -ArgumentList @(''version'')'
+            '    }'
+            '    Test-DemoConfirmCaller -Confirm'
+            '}'
+            '''RESULT exit={0} out={1} err={2}'' -f $result.ExitCode, $result.StdOut, ([string]$result.StdErr).Trim()'
+            '''LEFT={0}'' -f @(Get-ChildItem -LiteralPath $Temp -Filter ''tmp*.tmp'' -File).Count'
+        )
+    }
+
+    It 'runs the call without asking, reads both streams, and leaves no temporary file' {
+        $pwshPath = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+        $output = @(& $pwshPath -NoProfile -NonInteractive -File $script:confirmChild -ModulePath $modulePath -Bin $script:confirmBin -Temp $script:confirmTemp 2>&1 | ForEach-Object { [string]$_ })
+        $text = $output -join "`n"
+        $text | Should -Not -Match 'NonInteractive mode' -Because 'an Azure CLI call never asks; its caller decides with ShouldProcess'
+        $output | Should -Contain 'RESULT exit=0 out={"azure-cli": "0.0.0"} err=stand-in warning' -Because $text
+        $output | Should -Contain 'LEFT=0' -Because ('the temporary file goes without asking: {0}' -f $text)
+    }
+}

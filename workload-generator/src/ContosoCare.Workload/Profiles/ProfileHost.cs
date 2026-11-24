@@ -1,7 +1,10 @@
+using System.Collections.Concurrent;
 using System.Globalization;
 using System.Text.Json;
 using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
+using ContosoCare.Workload.Rca.AnswerKey;
+using ContosoCare.Workload.Rca.Observer;
 using ContosoCare.Workload.Runs;
 using ContosoCare.Workload.Sql;
 
@@ -270,12 +273,25 @@ internal sealed class ProfileHost(
     RunnerLog log,
     TimeProvider time,
     ProfileHostOptions? options = null,
-    Func<ProfileTarget, ILaneWork>? workFactory = null)
+    Func<ProfileTarget, ILaneWork>? workFactory = null,
+    IAnswerKeySink? answerKey = null) : IObservationGate
 {
     private readonly ProfileHostOptions options = options ?? ProfileHostOptions.From(definitions, null);
     private readonly Func<ProfileTarget, ILaneWork> workFactory = workFactory ?? (t => new ExecutorLaneWork(t.Executor));
+    private readonly ConcurrentDictionary<DemoTarget, bool> profileActive = new();
+    private readonly ConcurrentDictionary<DemoTarget, int> runningRuns = new();
     private int stateWriteFailures;
     private string? processPriority;
+
+    /// <summary>
+    /// The RCA observer's gate (ADR 0031): a target is in a session while its profile is active, while runs it started
+    /// are still ending, and while the answer key is still recording one. Only that: the observer never learns what the
+    /// profile plans.
+    /// </summary>
+    public bool IsActive(DemoTarget target) =>
+        (profileActive.TryGetValue(target, out var active) && active)
+        || (runningRuns.TryGetValue(target, out var running) && running > 0)
+        || answerKey?.IsPending(target) == true;
 
     public async Task RunAsync(IReadOnlyList<ProfileTarget> targets, DateTimeOffset? notAfter, CancellationToken cancellationToken)
     {
@@ -494,6 +510,7 @@ internal sealed class ProfileHost(
         }
 
         now = time.GetUtcNow();
+        profileActive[target] = IsActive(state, now, definitions, catalog);
         IReadOnlyList<PlannedActivity> planned;
         try
         {
@@ -672,7 +689,8 @@ internal sealed class ProfileHost(
         log.Info("profile.starting-run", "Starting a scheduled activity.", ("target", target), ("activity", activity.Key), ("until", activity.End));
         var work = lane.Work;
         var task = Task.Run(() => work.RunAsync(plan, cancellation.Token), CancellationToken.None);
-        lane.Running[activity.Key] = new ActiveRun(task, cancellation, activity.ScenarioId);
+        runningRuns.AddOrUpdate(target, 1, (_, count) => count + 1);
+        lane.Running[activity.Key] = new ActiveRun(task, cancellation, activity.ScenarioId, activity.IsBaseline);
     }
 
     private async Task ResetBeforeProfileAsync(Lane lane, ProfileState state, CancellationToken laneToken)
@@ -718,10 +736,17 @@ internal sealed class ProfileHost(
         {
             var active = lane.Running[key];
             lane.Running.Remove(key);
+            runningRuns.AddOrUpdate(target, 0, (_, count) => Math.Max(0, count - 1));
             if (active.Task.IsCompletedSuccessfully)
             {
                 var result = active.Task.Result;
                 log.Info("profile.run-finished", "A scheduled activity finished.", ("target", target), ("activity", key), ("runId", result.RunId), ("status", result.Status));
+                if (!active.IsBaseline)
+                {
+                    // The answer key (ADR 0031): the fault this host ran, kept apart from the capture.
+                    answerKey?.RunEnded(target, result);
+                }
+
                 if (result.CanRetryRefusal && !active.StopRequested)
                 {
                     ScheduleStartRetry(lane, key, result, now);
@@ -982,13 +1007,16 @@ internal sealed class ProfileHost(
         }
     }
 
-    private sealed class ActiveRun(Task<RunResult> task, CancellationTokenSource cancellation, string scenarioId)
+    private sealed class ActiveRun(Task<RunResult> task, CancellationTokenSource cancellation, string scenarioId, bool isBaseline)
     {
         public Task<RunResult> Task { get; } = task;
 
         public CancellationTokenSource Cancellation { get; } = cancellation;
 
         public string ScenarioId { get; } = scenarioId;
+
+        /// <summary>A baseline chunk: the workload's healthy load, which the answer key leaves out.</summary>
+        public bool IsBaseline { get; } = isBaseline;
 
         public bool StopRequested { get; set; }
     }

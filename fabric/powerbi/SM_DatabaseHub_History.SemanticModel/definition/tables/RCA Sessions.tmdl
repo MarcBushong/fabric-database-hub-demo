@@ -1,0 +1,203 @@
+/// One session in one sample of a blocking chain: every session that waits on another, and every session another waits on. The Incident RCA's evidence (ADR 0031): what the observer beside the workload captured, which NB_DatabaseHub_LiveActivity writes from its evidence documents (rca/history-tables.json).
+table 'RCA Sessions'
+
+    /// The most sessions blocked in one sample in context.
+    measure 'Blocked Sessions (captured)' = MAXX ( VALUES ( 'RCA Sessions'[Captured At UTC] ), CALCULATE ( COUNTROWS ( 'RCA Sessions' ), NOT ISBLANK ( 'RCA Sessions'[Blocked By] ) ) )
+        formatString: #,0
+        displayFolder: RCA
+
+    /// The longest a head blocker (a session others wait on that waits on no one) sat idle, in seconds.
+    measure 'Head Blocker Idle (s)' =
+            VAR Heads =
+                FILTER (
+                    'RCA Sessions',
+                    ISBLANK ( 'RCA Sessions'[Blocked By] ) && NOT ISBLANK ( 'RCA Sessions'[Idle (ms)] )
+                )
+            VAR Waiters =
+                SELECTCOLUMNS (
+                    FILTER ( 'RCA Sessions', NOT ISBLANK ( 'RCA Sessions'[Blocked By] ) ),
+                    "WaiterTarget", 'RCA Sessions'[Target Key],
+                    "WaiterTime", 'RCA Sessions'[Captured At UTC],
+                    "WaiterBlockers", "," & SUBSTITUTE ( 'RCA Sessions'[Blocked By], " ", "" ) & ","
+                )
+            VAR Blockers =
+                FILTER (
+                    Heads,
+                    VAR HeadTarget = 'RCA Sessions'[Target Key]
+                    VAR HeadTime = 'RCA Sessions'[Captured At UTC]
+                    VAR HeadId = "," & 'RCA Sessions'[Session ID] & ","
+                    RETURN
+                        NOT ISEMPTY (
+                            FILTER (
+                                Waiters,
+                                [WaiterTarget] = HeadTarget && [WaiterTime] = HeadTime && CONTAINSSTRING ( [WaiterBlockers], HeadId )
+                            )
+                        )
+                )
+            RETURN
+                DIVIDE ( MAXX ( Blockers, 'RCA Sessions'[Idle (ms)] ), 1000 )
+        formatString: #,0
+        displayFolder: RCA
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The evidence document the row came from (documentId).
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// When the observer took the sample (UTC).
+    column 'Captured At UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: captured_at_utc
+
+    /// T1, T2, T3, T4, or T4-replica.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// The SQL Server session_id (SPID) or the PostgreSQL pid.
+    column 'Session ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: session_id
+
+    /// Comma-separated IDs of the sessions this one waits on (SQL Server: blocking_session_id, including the documented negative owners; PostgreSQL: pg_blocking_pids, or the lock's holders from pg_locks). Null when it isn't blocked.
+    column 'Blocked By'
+        dataType: string
+        sourceColumn: blocked_by
+
+    /// SQL Server: the request's status when the session has a request (running, runnable, suspended), else the session's (sleeping). PostgreSQL: pg_stat_activity.state (active, idle, idle in transaction).
+    column Status
+        dataType: string
+        sourceColumn: status
+
+    /// SQL Server wait_type, or PostgreSQL wait_event_type:wait_event.
+    column 'Wait Type'
+        dataType: string
+        sourceColumn: wait_type
+
+    /// How long the current wait has lasted.
+    column 'Wait (ms)'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: wait_ms
+
+    /// SQL Server wait_resource; PostgreSQL's lock tag (locktype and its fields).
+    column 'Wait Resource'
+        dataType: string
+        sourceColumn: wait_resource
+
+    /// KEY, PAGE, RID, OBJECT, XACT (SQL Server); relation, tuple, transactionid (PostgreSQL).
+    column 'Lock Resource Type'
+        dataType: string
+        sourceColumn: lock_resource_type
+
+    /// The locked table, [schema].[table] on SQL Server or schema.table on PostgreSQL, when the lock names one.
+    column 'Lock Object'
+        dataType: string
+        sourceColumn: lock_object
+
+    /// The locked index, for KEY and PAGE locks.
+    column 'Lock Index'
+        dataType: string
+        sourceColumn: lock_index
+
+    /// The mode this session waits for.
+    column 'Lock Mode Wanted'
+        dataType: string
+        sourceColumn: lock_mode_wanted
+
+    /// The mode this session holds on the resource others wait for.
+    column 'Lock Mode Held'
+        dataType: string
+        sourceColumn: lock_mode_held
+
+    /// Open transactions (SQL Server open_transaction_count; PostgreSQL 1 when xact_start is set).
+    column 'Open Transactions'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: open_transactions
+
+    /// How long its oldest open transaction has been open.
+    column 'Transaction Age (ms)'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: transaction_age_ms
+
+    /// How long an idle session (sleeping, or idle in transaction) has been idle.
+    column 'Idle (ms)'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: idle_ms
+
+    /// The login or role. The workload's own sessions only; null for any other session.
+    column Login
+        dataType: string
+        sourceColumn: login_name
+
+    /// The client host. The workload's own sessions only.
+    column Host
+        dataType: string
+        sourceColumn: host_name
+
+    /// The application name as a DBA would see it, without the workload's internal segments (rca/README.md, Names). The workload's own sessions only.
+    column Program
+        dataType: string
+        sourceColumn: program_name
+
+    /// An opaque token shared by the sessions of one workload run, so the rules can group them; it names nothing (rca/README.md, Names).
+    column 'Run Token'
+        dataType: string
+        isHidden
+        sourceColumn: run_token
+
+    /// The stored procedure or function the statement belongs to: [schema].[name] on SQL Server, the called function on PostgreSQL.
+    column Module
+        dataType: string
+        sourceColumn: module_name
+
+    /// The running statement, or the last one for an idle session, normalized (literals replaced, at most 2,000 characters).
+    column Statement
+        dataType: string
+        sourceColumn: statement_text
+
+    /// SQL Server's input buffer for an idle session (the last batch or RPC), normalized.
+    column 'Input Buffer'
+        dataType: string
+        sourceColumn: input_buffer
+
+    /// PostgreSQL backend_type (client backend, startup, walreceiver, walsender).
+    column 'Backend Type'
+        dataType: string
+        sourceColumn: backend_type
+
+    /// True for the demo workload's own sessions, the baseline's and any fault's alike, which keep text, login, and host; false for any other session, which arrives without them.
+    column 'Is Workload Session'
+        dataType: boolean
+        sourceColumn: is_demo
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Sessions' = entity
+        mode: directLake
+        source
+            entityName: rca_sessions
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

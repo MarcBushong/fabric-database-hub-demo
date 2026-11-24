@@ -15,8 +15,8 @@ import {
     type PostgresFinding,
     type TargetSummary,
 } from "@/data/model";
-import { formatAgo, formatNumber } from "./format";
-import { REPLICA_LAG_WARNING_SECONDS } from "./insights";
+import { formatAgo, formatBeside, formatNumber } from "./format";
+import { POSTGRES_CPU_WARNING_PERCENT, POSTGRES_USABLE_CONNECTIONS, REPLICA_LAG_WARNING_SECONDS } from "./insights";
 import { statusBySort, worstStatus, type StatusName } from "./status";
 import type { EstateTarget } from "./view-state";
 
@@ -55,7 +55,7 @@ export function sqlHealth(targets: readonly TargetSummary[], findings: readonly 
             reporting: Boolean(t && t.bins > 0),
             metrics: t
                 ? [
-                      { label: "CPU peak", value: formatNumber(t.cpuPeak, "percent") },
+                      { label: "CPU peak", value: formatBeside(t.cpuPeak, "percent", 80) },
                       { label: "Waits", value: formatNumber(t.waitS, "seconds") },
                       { label: "Sessions", value: formatNumber(t.sessionsPeak, "int") },
                   ]
@@ -89,17 +89,20 @@ export function postgresHealth(capture: PostgresCapture | null, findings: readon
     const lag = postgresSeries(capture, "T4-replica", POSTGRES_METRICS.lag);
     const caught = replicaCatchUp(capture, lag);
     const lagPeak = postgresPeak(lag.filter((p) => !caught.includes(p)));
-    const failed = postgresSeries(capture, "T4", POSTGRES_METRICS.failed).reduce((a, p) => a + p.value, 0);
+    // T4's connections at their peak, against the slots clients can use: connection-surge's measured signal. Failed
+    // connections aren't shown here: Azure Monitor didn't count the surge's refused attempts in them (F34).
+    const connectionPeak = postgresPeak(postgresSeries(capture, "T4", POSTGRES_METRICS.connections));
+    const atLimit = connectionPeak !== null && connectionPeak.value >= POSTGRES_USABLE_CONNECTIONS;
     return {
         key: "T4",
         status: worst?.name ?? "Pass",
         reporting: true,
         metrics: [
-            { label: "CPU peak", value: formatNumber(postgresPeak(cpu)?.value ?? null, "percent") },
-            { label: "Replica lag", value: lagPeak ? formatNumber(lagPeak.value, "seconds") : "–" },
-            { label: "Failed conn.", value: formatNumber(failed, "int") },
+            { label: "CPU peak", value: formatBeside(postgresPeak(cpu)?.value ?? null, "percent", POSTGRES_CPU_WARNING_PERCENT) },
+            { label: "Replica lag", value: lagPeak ? formatBeside(lagPeak.value, "seconds", REPLICA_LAG_WARNING_SECONDS) : "–" },
+            { label: "Conn. peak", value: connectionPeak ? `${formatBeside(connectionPeak.value, "int", POSTGRES_USABLE_CONNECTIONS)} / ${POSTGRES_USABLE_CONNECTIONS}` : "–" },
         ],
-        note: `Captured ${formatAgo(capture.capturedAt)}${lagPeak && lagPeak.value >= REPLICA_LAG_WARNING_SECONDS ? "; the replica lagged" : ""}`,
+        note: `Captured ${formatAgo(capture.capturedAt)}${lagPeak && lagPeak.value >= REPLICA_LAG_WARNING_SECONDS ? "; the replica lagged" : ""}${atLimit ? "; connections reached the server's limit" : ""}`,
         spark: cpu.map((p) => p.value),
         incidents: 0,
         attention: attention.length,
@@ -122,9 +125,10 @@ export function cosmosHealth(capture: CosmosCapture | null, findings: readonly P
         status: worst?.name ?? "Pass",
         reporting: true,
         metrics: [
-            { label: "Norm. RU peak", value: formatNumber(postgresPeak(ru)?.value ?? null, "percent") },
+            // Each beside the line T5's page judges it by (formatBeside): 100 % throttles, under 99.99 % availability warns.
+            { label: "Norm. RU peak", value: formatBeside(postgresPeak(ru)?.value ?? null, "percent", 100) },
             { label: "429s", value: formatNumber(throttled, "int") },
-            { label: "Availability", value: availability.length > 0 ? formatNumber(Math.min(...availability), "percent") : "\u2013" },
+            { label: "Availability", value: availability.length > 0 ? formatBeside(Math.min(...availability), "percent", 99.99) : "\u2013" },
         ],
         note: `Captured ${formatAgo(capture.capturedAt)}${throttled > 0 ? (recovered ? "; throttled, then recovered" : "; throttled") : ""}`,
         spark: ru.map((p) => p.value),

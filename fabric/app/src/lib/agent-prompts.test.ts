@@ -16,6 +16,7 @@ import {
     PROPOSE_ONLY,
     signalClause,
     sqlHost,
+    STORAGE_IO_RULE,
     timesPhrase,
     windowPhrase,
     type LibraryContext,
@@ -92,6 +93,9 @@ describe("incident prompts for the Database Agent", () => {
         const [telemetry, baseline, sql] = prompts;
         expect(telemetry.text).toContain("Using the telemetry agent instructions, write a KQL query on SqlServerStorageIO for arcsql01 in resource group rg-dbhub-test from 2026-10-22T14:05Z to 2026-10-22T14:35Z");
         expect(telemetry.text).toContain("Follow the rule for cumulative counters");
+        // F36: a key's files added within a sample before the deltas, right after the storage sentence.
+        expect(telemetry.text).toContain(`read and write stalls. ${STORAGE_IO_RULE} Then adapt sample query 5`);
+        expect(STORAGE_IO_RULE).toMatch(/^On SqlServerStorageIO, add up the rows of each database and file ID within each SampleTimeUTC before taking deltas, report them as one file, and skip a step whose number of rows changed/);
         expect(baseline.text).toContain("(2026-10-22T13:35Z to 2026-10-22T14:05Z)");
         expect(sql.text).toContain("Use the diagnose-resource-pressure skill on the ContosoCare database of arcsql01, connected as me");
         expect(sql.text).toContain("never with a SQL login or password");

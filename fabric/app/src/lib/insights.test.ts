@@ -19,6 +19,7 @@ import {
     timesShort,
     timesText,
     baselineText,
+    waitFamilyInsight,
 } from "./insights";
 import { mean, quantile, density } from "./stats";
 import { statusBySort, statusClass, statusColor, statusMeta, worstStatus } from "./status";
@@ -130,6 +131,19 @@ describe("insights", () => {
         expect(insight.title).toContain("lasted 1 h");
     });
 
+    it("never writes a ratio just under the 2× Warning as 2.0 (the review of 29a7cb4)", () => {
+        const base = compareIncident(incident, [bin(9, 30, 10), bin(10, 0, 40)]);
+        const under = incidentInsight(incident, { ...base, during: 19.6, ratio: 1.96 });
+        expect(under.status).toBeNull();
+        expect(under.metric).toBe("1.96×");
+        expect(under.title).toContain("ran at 1.96 times their baseline");
+        const at2 = incidentInsight(incident, { ...base, during: 20, ratio: 2 });
+        expect(at2.status).toBe("Warning");
+        expect(at2.metric).toBe("2.0×");
+        expect(at2.title).toContain("ran at 2.0 times their baseline");
+        expect([timesShort(1.999), timesShort(3.42), timesText(9.96), timesShort(35.3)]).toEqual(["1.999×", "3.4×", "10.0 times", "35×"]);
+    });
+
     it("measures a wait family by its own category, as the detector does, not by all waits (dbhubc5, 2026-11-18)", () => {
         // T3's detected log flush waits: Tran Log IO at about 0.4 s a bin, then 15.8 to 20.4 s, while all the waits fell.
         const logFlush: Incident = { ...incident, key: "detected:T3:tran_log", family: "tran_log", start: at(1, 52), end: at(1, 57), durationMin: 5, peakValue: 20.417 };
@@ -202,6 +216,18 @@ describe("insights", () => {
         expect(readinessInsight(summary, [])?.metric).toBe("less than 1 %");
         expect(readinessInsight({ ...summary, warnings: 1, passed: 299 }, [])?.metric).toBe("more than 99 %");
         expect(readinessInsight({ ...summary, warnings: 0, passed: 300 }, [])?.metric).toBe("100 %");
+    });
+
+    it("never writes the largest wait family's or the busiest hour's share as 100 % when it isn't (2026-11-21)", () => {
+        // 99.6 % of all wait time, which a whole percent alone writes as 100 %.
+        const family = waitFamilyInsight([
+            { category: "CPU", target: "T3", seconds: 996 },
+            { category: "Buffer IO (PAGEIOLATCH)", target: "T3", seconds: 4 },
+        ]);
+        expect(family?.metric).toBe("more than 99 %");
+        expect(family?.title).toBe("CPU and scheduling is the largest wait family: more than 99 % of all wait time.");
+        expect(busiestHourInsight([bin(9, 0, 4), bin(14, 0, 996)])?.detail).toBe("996 s in that hour across the window, more than 99 % of the total.");
+        expect(busiestHourInsight([bin(14, 0, 50), bin(14, 15, 50)])?.detail).toBe("100 s in that hour across the window, 100 % of the total.");
     });
 
     it("asks for a notebook run when there is no snapshot, and warns when it's old", () => {
@@ -284,15 +310,30 @@ describe("T4's insights (ADR 0025)", () => {
         expect(postgresCpuInsight(capture([point("T4-replica", "cpu_percent", 0, 99)]))).toBeNull();
     });
 
-    it("counts T4's failed connections: a warning above 0, a pass at 0", () => {
+    it("never writes a peak just under its warning line as the line, beside a Pass (2026-11-21)", () => {
+        // One decimal alone writes 79.996 % as 80.0 %, and 59.96 s as 60.0 s: the lines where they'd warn.
+        const cpu = postgresCpuInsight(capture([point("T4", "cpu_percent", 0, 20), point("T4", "cpu_percent", 5, 79.996)]));
+        expect(cpu?.status).toBe("Pass");
+        expect(cpu?.metric).toBe("79.996 %");
+        expect(cpu?.title).toBe("T4's CPU peaked at 79.996 % at 17:05 UTC on 13 Nov.");
+        expect(postgresCpuInsight(capture([point("T4", "cpu_percent", 0, 80)]))?.metric).toBe("80.0 %");
+        const lag = replicaLagInsight(capture([point("T4-replica", "physical_replication_delay_in_seconds", 0, 6), point("T4-replica", "physical_replication_delay_in_seconds", 5, 59.96)]));
+        expect(lag?.status).toBe("Pass");
+        expect(lag?.metric).toBe("59.96 s");
+    });
+
+    it("counts T4's failed connections: a warning above 0, a pass at 0, and says a client refused at the connection limit isn't among them (F34)", () => {
+        const caveat = "At the limit, PostgreSQL refuses a new client (too many connections), and Azure Monitor's failed connections don't count that refusal.";
         const failed = failedConnectionsInsight(capture([point("T4", "connections_failed", 0, 0), point("T4", "connections_failed", 5, 3), point("T4", "connections_failed", 10, 1)]));
         expect(failed?.status).toBe("Warning");
         expect(failed?.metric).toBe("4");
         expect(failed?.title).toBe("4 failed connections on T4 in the latest capture.");
-        expect(failed?.detail).toBe("At most 3 in one 5-minute interval, at 17:05 UTC on 13 Nov.");
+        expect(failed?.detail).toBe(`At most 3 in one 5-minute interval, at 17:05 UTC on 13 Nov. ${caveat}`);
+        // Live (2026-11-21): 0 in every interval while connection-surge's attempts were refused, so 0 never reads as "none refused".
         const none = failedConnectionsInsight(capture([point("T4", "connections_failed", 0, 0)]));
         expect(none?.status).toBe("Pass");
-        expect(none?.title).toBe("No failed connections on T4 in the latest capture.");
+        expect(none?.title).toBe("Azure Monitor counted no failed connections on T4 in the latest capture.");
+        expect(none?.detail).toMatch(new RegExp(`\\. ${caveat.replace(/[().]/g, "\\$&")}$`));
         expect(failedConnectionsInsight(null)).toBeNull();
     });
 });

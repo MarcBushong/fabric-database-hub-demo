@@ -30,6 +30,7 @@ public sealed class ProgramTests
     [InlineData("warmup")]
     [InlineData("setup")]
     [InlineData("scenarios")]
+    [InlineData("rca")]
     public void EveryCommandIsAvailable(string command)
     {
         Assert.Contains(Program.BuildRootCommand().Subcommands, c => c.Name == command);

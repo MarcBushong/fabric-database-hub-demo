@@ -12,6 +12,24 @@ BeforeAll {
     $zero = '00000000-0000-0000-0000-000000000000'
     $tableFiles = @(Get-ChildItem -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/tables') -Filter '*.tmdl' -File)
 
+    # Strips comments in one pass from the start, so a // or /* inside a string, a name, or another comment, or a double
+    # quote inside a name, is text there and can't hide the code after it.
+    # - DAX: "..." strings, with "" inside, also across lines; 'table' and [column] names, which can't hold an apostrophe,
+    #   a slash, a bracket, or a control character such as a newline, but can hold a double quote
+    #   (https://learn.microsoft.com/dax/dax-syntax-reference); and // and /* */ comments. The DAX query view's page
+    #   lists those two, not -- (https://learn.microsoft.com/power-bi/transform-model/dax-query-view), so a -- line is
+    #   kept whole: a name in it is still checked, and a double quote in it opens no string.
+    # - TypeScript: '...', "...", and `...` strings, where a backslash escapes, and // and /* */ comments. A template's
+    #   text is kept whole, a DAX comment in it included, so a name there is checked too: at worst, a false alarm.
+    # A /* */ comment becomes a space, so the words on either side stay apart. Its limits, which none of the files it
+    # reads has: a string or a /* that's never closed, or a template inside another's ${...}, can shift what it reads
+    # as a string or a comment from there on.
+    $script:stripComments = {
+        param([string] $Text, [bool] $TypeScript)
+        $kept = if ($TypeScript) { '''(?:[^''\\\n]|\\[\s\S])*''|"(?:[^"\\\n]|\\[\s\S])*"|`(?:[^`\\]|\\[\s\S])*`' } else { '"(?:[^"]|"")*"|''[^''\n]*''|\[[^\]\n]*\]|--[^\n]*' }
+        [regex]::Replace($Text, '(?<kept>' + $kept + ')|(?<block>/\*[\s\S]*?\*/)|//[^\n]*', [System.Text.RegularExpressions.MatchEvaluator] { param($Match) if ($Match.Groups['kept'].Success) { $Match.Value } elseif ($Match.Groups['block'].Success) { ' ' } else { '' } })
+    }
+
     # Every measure: table, name, the /// description above it, and its properties.
     $script:measures = foreach ($file in $tableFiles) {
         $lines = [System.IO.File]::ReadAllLines($file.FullName)
@@ -62,15 +80,17 @@ BeforeAll {
 }
 
 Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
-    It 'is a TMDL folder: definition.pbism, compatibility level 1702, en-US, implicit measures off, 10 tables' {
+    It 'is a TMDL folder: definition.pbism, compatibility level 1702, en-US, implicit measures off, 18 tables' {
         Test-Path -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition.pbism') | Should -BeTrue
         Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/database.tmdl') -Raw | Should -Match 'compatibilityLevel: 1702'
         $model = Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/model.tmdl') -Raw
         $model | Should -Match 'culture: en-US'
         $model | Should -Match 'discourageImplicitMeasures'
-        $tableFiles.Count | Should -Be 10
-        @($script:measures).Count | Should -Be 114
-        ([regex]::Matches((Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/relationships.tmdl') -Raw), '(?m)^relationship ')).Count | Should -Be 16
+        # The ten tables before the Incident RCA, and its eight (ADR 0031), each with a ref in model.tmdl.
+        $tableFiles.Count | Should -Be 18
+        @([regex]::Matches($model, '(?m)^ref table ')).Count | Should -Be 18
+        @($script:measures).Count | Should -Be 121
+        ([regex]::Matches((Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/relationships.tmdl') -Raw), '(?m)^relationship ')).Count | Should -Be 32
     }
 
     It 'commits no real ID: the only GUIDs are the all-zero OneLake placeholder, twice' {
@@ -82,12 +102,70 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
         Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/expressions.tmdl') -Raw | Should -Match ([regex]::Escape("https://onelake.dfs.fabric.microsoft.com/$zero/$zero"))
     }
 
-    It 'reads only the five notebook tables, from schema dbo, through the Direct Lake expression' {
+    It 'reads only the thirteen notebook tables, from schema dbo, through the Direct Lake expression' {
         $text = ($tableFiles | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join "`n"
         $entities = @([regex]::Matches($text, '(?m)^\s+entityName:\s*(\S+)\s*$') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
-        $entities | Should -Be @('analysis_findings', 'incident_windows', 'scenario_runs', 'telemetry_snapshots', 'validation_results')
+        $rca = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).tables.name
+        $entities | Should -Be @(@('analysis_findings', 'incident_windows', 'scenario_runs', 'telemetry_snapshots', 'validation_results') + @($rca) | Sort-Object)
         @([regex]::Matches($text, '(?m)^\s+schemaName:\s*(\S+)\s*$') | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique) | Should -Be @('dbo')
         @([regex]::Matches($text, "(?m)^\s+expressionSource:\s*(.+?)\s*$") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique) | Should -Be @("'DirectLake - LH_DatabaseHub'")
+    }
+
+    It 'models the Incident RCA''s eight tables as rca/history-tables.json says: columns, types, hidden ones, formats, measures, and Target and Date relationships (ADR 0031)' {
+        $contract = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json -AsHashtable
+        $relationships = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/relationships.tmdl'))
+        $notebook = @{}
+        foreach ($column in $contract['notebookColumns']) {
+            $notebook[$column['name']] = $column
+        }
+        foreach ($table in $contract['tables']) {
+            $name = $table['model']
+            $file = Join-Path -Path $modelRoot -ChildPath ('definition/tables/{0}.tmdl' -f $name)
+            Test-Path -LiteralPath $file | Should -BeTrue -Because $name
+            $text = [System.IO.File]::ReadAllText($file)
+            $text | Should -Match ("(?m)^table '{0}'$" -f [regex]::Escape($name))
+            $text | Should -Match ('(?m)^\s+entityName: {0}$' -f $table['name'])
+            $text | Should -Match '(?m)^/// \S'
+            # Each column: the notebook's run_id and document_id, the contract's, then report_date_utc, with their model
+            # names, types, hidden flags, and formats.
+            $columns = @($notebook['run_id'], $notebook['document_id']) + @($table['columns']) + @($notebook['report_date_utc'])
+            $blocks = [regex]::Matches($text, "(?ms)^ {4}column ('(?:[^']|'')+'|\S+)\n(.*?)(?=^ {4}\S|\z)")
+            @($blocks | ForEach-Object { $_.Groups[1].Value.Trim("'") }) | Should -Be @($columns | ForEach-Object { $_['model']['column'] }) -Because $name
+            for ($index = 0; $index -lt $columns.Count; $index++) {
+                $column = $columns[$index]
+                $body = $blocks[$index].Groups[2].Value
+                $body | Should -Match ('(?m)^ {{8}}dataType: {0}$' -f $contract['typeMap'][$column['type']]['model']) -Because ('{0}.{1}' -f $name, $column['name'])
+                $body | Should -Match ('(?m)^ {{8}}sourceColumn: {0}$' -f $column['name']) -Because ('{0}.{1}' -f $name, $column['name'])
+                ($body -match '(?m)^ {8}isHidden$') | Should -Be ([bool]$column['model']['hidden']) -Because ('{0}.{1} hidden' -f $name, $column['name'])
+                if ($column['model']['formatString']) {
+                    $body | Should -Match ('(?m)^ {{8}}formatString: {0}$' -f [regex]::Escape($column['model']['formatString'])) -Because ('{0}.{1}' -f $name, $column['name'])
+                }
+            }
+            # Every table relates to Target and Date, and to nothing else: never to the answer key's other tables.
+            $relationships | Should -Match ("(?m)^ {{4}}fromColumn: '{0}'\.'Target Key'\n {{4}}toColumn: Target\.'Target Key'$" -f [regex]::Escape($name))
+            $relationships | Should -Match ("(?m)^ {{4}}fromColumn: '{0}'\.'Report Date UTC'\n {{4}}toColumn: Date\.Date$" -f [regex]::Escape($name))
+            @([regex]::Matches($relationships, ("(?m)^ {{4}}(from|to)Column: '{0}'\." -f [regex]::Escape($name)))).Count | Should -Be 2 -Because $name
+        }
+        foreach ($measure in $contract['measures']) {
+            $file = Join-Path -Path $modelRoot -ChildPath ('definition/tables/{0}.tmdl' -f $measure['table'])
+            $text = [System.IO.File]::ReadAllText($file)
+            $block = [regex]::Match($text, ("(?ms)^ {{4}}/// (?<description>[^\n]*)\n {{4}}measure '{0}' =(?<body>.*?)(?=^ {{4}}\S|\z)" -f [regex]::Escape($measure['name'])))
+            $block.Success | Should -BeTrue -Because $measure['name']
+            $block.Groups['description'].Value | Should -BeExactly $measure['description']
+            $block.Groups['body'].Value | Should -Match ('(?m)^ {{8}}formatString: {0}$' -f [regex]::Escape($measure['formatString']))
+            $block.Groups['body'].Value | Should -Match ('(?m)^ {{8}}displayFolder: {0}$' -f [regex]::Escape($measure['displayFolder']))
+            if ($measure['definition'] -match '^[A-Z]+ \(') {
+                ($block.Groups['body'].Value -split "`n")[0].Trim() | Should -BeExactly $measure['definition'] -Because $measure['name']
+            }
+        }
+        # The one measure the contract describes in words: the longest idle among sessions others wait on, in one sample.
+        $head = [regex]::Match([System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/RCA Sessions.tmdl')), "(?ms)^ {4}measure 'Head Blocker Idle \(s\)' =.*?(?=^ {4}\S|\z)").Value
+        $head | Should -Match "ISBLANK \( 'RCA Sessions'\[Blocked By\] \)"
+        $head | Should -Match "CONTAINSSTRING \( \[WaiterBlockers\], HeadId \)"
+        $head | Should -Match "\[WaiterTarget\] = HeadTarget && \[WaiterTime\] = HeadTime"
+        $head | Should -Match "DIVIDE \( MAXX \( Blockers, 'RCA Sessions'\[Idle \(ms\)\] \), 1000 \)"
+        # The notebook's RCA.EVIDENCE finding has its row in the Analysis dimension.
+        [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Analysis.tmdl')) | Should -Match '\{ "rca_evidence", "Incident RCA evidence", "Readiness", "Per run", 20 \}'
     }
 
     It 'gives every measure a /// description' {
@@ -173,6 +251,100 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
             $bytes -contains 9 | Should -BeFalse -Because $file.Name
             ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) | Should -BeFalse -Because $file.Name
         }
+    }
+}
+
+Describe 'DAX variable names' {
+    BeforeAll {
+        # Learn's VAR page: a name has only a-z, A-Z, and 0-9, never a digit first, with __ allowed as a prefix, and isn't a
+        # reserved keyword or an existing table's name (https://learn.microsoft.com/dax/var-dax). Live, the engine refused
+        # 'Under' (2026-11-22) in a measure whose texts every other check passed, so each DAX source is checked here.
+        $script:reservedWords = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
+        foreach ($line in [System.IO.File]::ReadAllLines((Join-Path -Path $PSScriptRoot -ChildPath 'data/dax-reserved-words.txt'))) {
+            if ($line -and -not $line.StartsWith('#')) {
+                [void]$script:reservedWords.Add($line.Trim())
+            }
+        }
+        $script:tableNames = @($tableFiles | ForEach-Object {
+                [regex]::Match([System.IO.File]::ReadAllText($_.FullName), "(?m)^table\s+('(?:[^']|'')+'|\S+)").Groups[1].Value.Trim("'").Replace("''", "'")
+            })
+        # The model's measures, every DAX file in fabric/powerbi, and the Insights app's queries.
+        $script:daxSources = @($tableFiles) + @(Get-ChildItem -LiteralPath $powerbi -Filter '*.dax' -File -Recurse) +
+            @(Get-Item -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/app/src/data/queries.ts'))
+    }
+
+    It 'has the reserved words and the model''s tables to check against' {
+        $script:reservedWords.Count | Should -BeGreaterThan 500
+        foreach ($word in 'UNDER', 'FUNCTION', 'EVALUATE', 'RETURN', 'CALCULATE', 'FIRST', 'ROWS', 'CURRENTMEMBER') {
+            $script:reservedWords.Contains($word) | Should -BeTrue -Because $word
+        }
+        $script:tableNames | Should -Contain 'Telemetry Snapshots'
+        $script:tableNames | Should -Contain 'Date'
+    }
+
+    It 'names every VAR as Learn allows: letters and digits, never a DAX keyword, a function''s name, or a table''s' {
+        $declared = 0
+        $problems = foreach ($file in $script:daxSources) {
+            $text = & $script:stripComments ([System.IO.File]::ReadAllText($file.FullName)) ($file.Extension -eq '.ts')
+            # DAX keywords are case-insensitive. In TypeScript, the language's own var is a lint error there (no-var), so a
+            # var in any case is DAX's.
+            foreach ($match in [regex]::Matches($text, '\bVAR\s+([^\s=]+)\s*=', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)) {
+                $declared++
+                $name = $match.Groups[1].Value
+                if ($name -cnotmatch '^(__)?[A-Za-z][A-Za-z0-9]*$') {
+                    '{0}: VAR {1} has a character a variable''s name can''t' -f $file.Name, $name
+                }
+                elseif ($script:reservedWords.Contains($name)) {
+                    '{0}: VAR {1} is a DAX keyword or function name' -f $file.Name, $name
+                }
+                elseif ($script:tableNames -contains $name) {
+                    '{0}: VAR {1} is a table''s name' -f $file.Name, $name
+                }
+            }
+        }
+        # 81 on 2026-11-22: a floor, so a stripper or a path that reads nothing can't pass.
+        $declared | Should -BeGreaterThan 60
+        @($problems | Sort-Object -Unique) | Should -BeNullOrEmpty
+    }
+
+    It 'reads a // inside a string as text, and finds a lowercase var, so neither hides a name' {
+        $dax = "VAR Url = ""https://learn.microsoft.com"" VAR Under = 1 // VAR Hidden = 2`nRETURN Url"
+        $stripped = & $script:stripComments $dax $false
+        $stripped | Should -BeLikeExactly '*VAR Under = 1 *'
+        $stripped | Should -Not -BeLike '*Hidden*'
+        $ts = "const q = ``var Under = 1`` // var Hidden = 2`nconst u = 'https://x' + ""a//b"""
+        $tsStripped = & $script:stripComments $ts $true
+        @([regex]::Matches($tsStripped, '\bVAR\s+([^\s=]+)\s*=', 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }) -join ',' | Should -BeExactly 'Under'
+        $tsStripped | Should -BeLikeExactly "*'https://x' + ""a//b""*"
+    }
+
+    It 'finds every name after a /* */ comment, a string across lines, a URL in a template, and a name or -- line with a double quote in it' {
+        $dax = @(
+            '/* https://x */ VAR A1 = 1'
+            'VAR A2 = "a string'
+            'across two lines, https://x" VAR A3 = 3'
+            '/* one'
+            'two // three */ VAR A4 = 4 VAR/* a comment is a space */A5 = 5'
+            'VAR A6 = ''Odd "Table''[Col] VAR A7 = "https://x" VAR A8 = 8'
+            'VAR A9 = [Say "x] VAR A10 = "https://x" VAR A11 = 11'
+            '-- a "quote, and VAR A12 = 12 is still read'
+            'VAR A13 = "https://x" VAR A14 = 14 /* VAR Hidden = 0 */ // VAR Hidden = 0'
+        ) -join "`n"
+        $names = { param([string] $Code) @([regex]::Matches($Code, '\bVAR\s+([^\s=]+)\s*=', 'IgnoreCase') | ForEach-Object { $_.Groups[1].Value }) -join ',' }
+        & $names (& $script:stripComments $dax $false) | Should -BeExactly 'A1,A2,A3,A4,A5,A6,A7,A8,A9,A10,A11,A12,A13,A14'
+        $ts = @(
+            '/* https://x */ var T1 = 1'
+            '/** an odd ` in a doc comment */'
+            'const q = `var T2 = 2 // the query''s own text'
+            'VAR T3 = "https://x" VAR T4 = 4`'
+            'const s = ''it\''s // text'' + "a\"b // text" // var Hidden = 0'
+            'const u = ''a line \'
+            'continued // text''; var T5 = 5'
+            'const v = `https://x/${id}`; var T6 = 6'
+        ) -join "`n"
+        $tsStripped = & $script:stripComments $ts $true
+        & $names $tsStripped | Should -BeExactly 'T1,T2,T3,T4,T5,T6'
+        $tsStripped.Contains('''it\''s // text'' + "a\"b // text"') | Should -BeTrue
     }
 }
 

@@ -1,7 +1,7 @@
 // Rule-based insights: plain sentences computed from the query results in the browser. No external AI service.
 
 import { SQL_TARGETS, type TargetKey } from "./dax";
-import { formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc, percent, type NumberKind } from "./format";
+import { formatBeside, formatDateTimeUtc, formatDayUtc, formatDuration, formatNumber, formatTimeUtc, percent, type NumberKind } from "./format";
 import { mean } from "./stats";
 import type { StatusName } from "./status";
 import type { EstateTarget, PageId } from "./view-state";
@@ -34,6 +34,8 @@ export interface Insight {
     /** The target the page drills into. */
     target?: EstateTarget;
     incident?: string;
+    /** Computed from the demo's answer key (its incident windows): shown, but never handed to the chat, which is blind (ADR 0031). */
+    fromAnswerKey?: boolean;
 }
 
 type BinField = "cpu" | "blocked" | "lockWaitS" | "bufferIoS" | "logRateS" | "waitS" | "ioMb" | "batch" | "sessions";
@@ -97,15 +99,24 @@ export interface IncidentComparison {
     ratio: number | null;
 }
 
+/** Twice its baseline or more is an incident insight's Warning. */
+const INCIDENT_WARNING_RATIO = 2;
+
+/** A ratio under 10 as formatBeside writes it against the Warning's 2×, so 1.96 reads "1.96", never "2.0" without the
+ *  Warning; 10 and more, whole. */
+function timesNumber(ratio: number): string {
+    return ratio >= 10 ? String(Math.round(ratio)) : formatBeside(ratio, "decimal", INCIDENT_WARNING_RATIO);
+}
+
 /** A ratio against a baseline on a tile: "3.4×", "35×", and ">100×" beyond, where a baseline near zero makes the exact
  *  number noise (dbhubc5's tempdb latch: 1610× a baseline of 0.02 s). */
 export function timesShort(ratio: number): string {
-    return ratio >= 100 ? ">100×" : `${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)}×`;
+    return ratio >= 100 ? ">100×" : `${timesNumber(ratio)}×`;
 }
 
 /** The same ratio in a sentence: "3.4 times", "35 times", "more than 100 times". */
 export function timesText(ratio: number): string {
-    return ratio >= 100 ? "more than 100 times" : `${ratio >= 10 ? Math.round(ratio) : ratio.toFixed(1)} times`;
+    return ratio >= 100 ? "more than 100 times" : `${timesNumber(ratio)} times`;
 }
 
 /** "baseline 0.4 s per bin", or "baseline near zero" when it rounds to nothing at the signal's precision. */
@@ -144,7 +155,7 @@ export function incidentInsight(incident: Incident, comparison: IncidentComparis
     if (comparison && comparison.ratio !== null && comparison.during !== null) {
         return {
             id: `incident-ratio-${incident.key}`,
-            status: comparison.ratio >= 2 ? "Warning" : null,
+            status: comparison.ratio >= INCIDENT_WARNING_RATIO ? "Warning" : null,
             metric: timesShort(comparison.ratio),
             title: `${incident.target} ${comparison.signal} ran at ${timesText(comparison.ratio)} their baseline from ${span}.`,
             detail: `${formatNumber(comparison.during, comparison.kind)} per bin on average during the window, against ${formatNumber(comparison.baseline, comparison.kind)} in the ${formatDuration(incidentPadMinutes(incident))} before; peak ${formatNumber(comparison.peak, comparison.kind)} at ${formatTimeUtc(comparison.peakAt)} UTC.`,
@@ -164,6 +175,7 @@ export function incidentInsight(incident: Incident, comparison: IncidentComparis
                 : `${incident.source}.`,
         page: "incidents",
         incident: incident.key,
+        fromAnswerKey: true,
     };
 }
 
@@ -182,6 +194,7 @@ export function incidentsOverview(incidents: readonly Incident[]): Insight | nul
         detail: `${[...families].join(", ")}; the longest ran ${formatDuration(longest.durationMin)} on ${longest.target} from ${formatDateTimeUtc(longest.start)}.`,
         page: "incidents",
         incident: incidents[0].key,
+        fromAnswerKey: true,
     };
 }
 
@@ -212,8 +225,8 @@ export function waitFamilyInsight(flows: readonly WaitFlow[]): Insight | null {
     return {
         id: "wait-family",
         status: null,
-        metric: `${Math.round((seconds / total) * 100)} %`,
-        title: `${family} is the largest wait family: ${Math.round((seconds / total) * 100)} % of all wait time.`,
+        metric: percent(seconds / total),
+        title: `${family} is the largest wait family: ${percent(seconds / total)} of all wait time.`,
         detail: `${formatNumber(seconds, "seconds")} of ${formatNumber(total, "seconds")} across ${byFamily.size} families.`,
         page: "incidents",
     };
@@ -237,7 +250,7 @@ export function busiestHourInsight(bins: readonly Bin[], field: "batch" | "waitS
         status: null,
         metric: `${String(hour).padStart(2, "0")}:00`,
         title: `The estate's busiest hour for ${label} is ${String(hour).padStart(2, "0")}:00 to ${String((hour + 1) % 24).padStart(2, "0")}:00 UTC.`,
-        detail: `${formatNumber(byHour[hour], field === "waitS" ? "seconds" : "int")} in that hour across the window, ${Math.round((byHour[hour] / byHour.reduce((a, v) => a + v, 0)) * 100)} % of the total.`,
+        detail: `${formatNumber(byHour[hour], field === "waitS" ? "seconds" : "int")} in that hour across the window, ${percent(byHour[hour] / byHour.reduce((a, v) => a + v, 0))} of the total.`,
         page: "estate",
     };
 }
@@ -341,6 +354,22 @@ export function freshnessInsight(meta: Meta | null, now: Date = new Date()): Ins
 export const REPLICA_LAG_WARNING_SECONDS = 60;
 export const POSTGRES_CPU_WARNING_PERCENT = 80;
 
+/** T4's max_connections, which the template sets on every size (config/versions.json, postgresql.maxConnections). */
+export const POSTGRES_MAX_CONNECTIONS = 50;
+/** The slots Azure keeps for physical replication and monitoring: reserved_connections plus superuser_reserved_connections (Learn: limits). */
+export const POSTGRES_RESERVED_CONNECTIONS = 15;
+/**
+ * The connection slots clients can use on T4, as the notebook counts them: connection-surge's measured signal is T4's
+ * Connections (active_connections) at this many or more (F34). Azure Monitor counts the reserved slots' sessions too, so
+ * a surge that fills the slots reads 35 or more (36 to 39 live, 2026-11-21). Its refused attempts aren't in Failed
+ * connections (connections_failed), which stayed 0 in every interval then.
+ */
+export const POSTGRES_USABLE_CONNECTIONS = POSTGRES_MAX_CONNECTIONS - POSTGRES_RESERVED_CONNECTIONS;
+/** The rule above, in words, for a sentence or a chart's line. */
+export const USABLE_SLOTS_TEXT = `the ${POSTGRES_USABLE_CONNECTIONS} slots clients can use (max_connections ${POSTGRES_MAX_CONNECTIONS}, less ${POSTGRES_RESERVED_CONNECTIONS} reserved)`;
+/** What Azure Monitor's failed connections leave out, wherever they're shown (F34). */
+export const FAILED_CONNECTIONS_CAVEAT = "At the limit, PostgreSQL refuses a new client (too many connections), and Azure Monitor's failed connections don't count that refusal.";
+
 /** The read replica's peak lag in the latest capture, or why there's none: the replica exists only during a session. Its catch-up after a restart isn't lag (replicaCatchUp). */
 export function replicaLagInsight(capture: PostgresCapture | null): Insight | null {
     if (!capture) return null;
@@ -376,8 +405,8 @@ export function replicaLagInsight(capture: PostgresCapture | null): Insight | nu
     return {
         id: "replica-lag",
         status: peak.value >= REPLICA_LAG_WARNING_SECONDS ? "Warning" : "Pass",
-        metric: formatNumber(peak.value, "seconds"),
-        title: `Read replica lag peaked at ${formatNumber(peak.value, "seconds")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
+        metric: formatBeside(peak.value, "seconds", REPLICA_LAG_WARNING_SECONDS),
+        title: `Read replica lag peaked at ${formatBeside(peak.value, "seconds", REPLICA_LAG_WARNING_SECONDS)} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
         detail: `${formatNumber(mean(lag.map((p) => p.value)), "seconds")} on average over ${lag.length} interval${lag.length === 1 ? "" : "s"}${replica ? ` on ${replica}` : ""}; ${REPLICA_LAG_WARNING_SECONDS} s or more is a warning.${left}`,
         page: "estate",
         target: "T4",
@@ -393,15 +422,15 @@ export function postgresCpuInsight(capture: PostgresCapture | null): Insight | n
     return {
         id: "postgres-cpu",
         status: peak.value >= POSTGRES_CPU_WARNING_PERCENT ? "Warning" : "Pass",
-        metric: formatNumber(peak.value, "percent"),
-        title: `T4's CPU peaked at ${formatNumber(peak.value, "percent")} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
+        metric: formatBeside(peak.value, "percent", POSTGRES_CPU_WARNING_PERCENT),
+        title: `T4's CPU peaked at ${formatBeside(peak.value, "percent", POSTGRES_CPU_WARNING_PERCENT)} at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
         detail: `${formatNumber(mean(cpu.map((p) => p.value)), "percent")} on average${connections ? `; active connections peaked at ${formatNumber(connections.value, "int")} at ${formatTimeUtc(connections.at)} UTC` : ""}. ${POSTGRES_CPU_WARNING_PERCENT} % or more is a warning.`,
         page: "estate",
         target: "T4",
     };
 }
 
-/** T4's failed connections in the latest capture: their total, and the interval with the most. */
+/** T4's failed connections in the latest capture: their total, and the interval with the most. A client refused at the connection limit isn't among them (F34). */
 export function failedConnectionsInsight(capture: PostgresCapture | null): Insight | null {
     const failed = postgresSeries(capture, "T4", POSTGRES_METRICS.failed);
     const peak = postgresPeak(failed);
@@ -412,19 +441,20 @@ export function failedConnectionsInsight(capture: PostgresCapture | null): Insig
             id: "postgres-failed",
             status: "Pass",
             metric: "0",
-            title: "No failed connections on T4 in the latest capture.",
-            detail: `${failed.length} interval${failed.length === 1 ? "" : "s"} from ${formatDateTimeUtc(failed[0].at)} to ${formatDateTimeUtc(failed[failed.length - 1].at)}.`,
+            title: "Azure Monitor counted no failed connections on T4 in the latest capture.",
+            detail: `${failed.length} interval${failed.length === 1 ? "" : "s"} from ${formatDateTimeUtc(failed[0].at)} to ${formatDateTimeUtc(failed[failed.length - 1].at)}. ${FAILED_CONNECTIONS_CAVEAT}`,
             page: "estate",
             target: "T4",
         };
     }
-    const interval = capture?.intervalMinutes;
+    const top = failed.find((p) => p.at === peak.at);
+    const interval = (capture?.saves ?? 1) > 1 ? (top?.grain ?? capture?.intervalMinutes) : capture?.intervalMinutes;
     return {
         id: "postgres-failed",
         status: "Warning",
         metric: formatNumber(total, "int"),
         title: `${formatNumber(total, "int")} failed connection${total === 1 ? "" : "s"} on T4 in the latest capture.`,
-        detail: `At most ${formatNumber(peak.value, "int")} in one${interval ? ` ${formatNumber(interval, "int")}-minute` : ""} interval, at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}.`,
+        detail: `At most ${formatNumber(peak.value, "int")} in one${interval ? ` ${formatNumber(interval, "int")}-minute` : ""} interval, at ${formatTimeUtc(peak.at)} UTC on ${formatDayUtc(peak.at)}. ${FAILED_CONNECTIONS_CAVEAT}`,
         page: "estate",
         target: "T4",
     };

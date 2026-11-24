@@ -1,0 +1,405 @@
+/* The Root cause view (ADR 0031): ADR 0030's stage tokens only, never a literal color, so light, dark, and high contrast each
+   keep their contrast; under Windows forced colors, the system's colors, as everywhere in the app (F22). */
+
+.rca-page .rca-layout {
+    display: grid;
+    grid-template-columns: minmax(260px, 360px) minmax(0, 1fr);
+    gap: 16px;
+    align-items: start;
+}
+
+@media (max-width: 980px) {
+    .rca-page .rca-layout {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.rca-panel {
+    background: var(--stage-panel);
+    color: var(--stage-ink);
+    border: 1px solid var(--stage-line);
+    border-radius: 8px;
+    padding: 14px 16px;
+    box-shadow: var(--stage-shadow);
+    min-width: 0;
+}
+
+.rca-panel h2 {
+    font-size: 15px;
+    font-weight: 600;
+    margin: 0 0 10px;
+}
+
+.rca-panel h3 {
+    font-size: 13px;
+    font-weight: 600;
+    margin: 12px 0 6px;
+}
+
+.rca-muted {
+    color: var(--stage-ink-2);
+}
+
+.rca-sections {
+    display: grid;
+    gap: 14px;
+    min-width: 0;
+}
+
+.rca-episodes {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: grid;
+    gap: 6px;
+}
+
+.rca-episode {
+    width: 100%;
+    text-align: start;
+    background: var(--stage-panel-2);
+    color: var(--stage-ink);
+    border: 1px solid var(--stage-line);
+    border-radius: 6px;
+    padding: 8px 10px;
+    cursor: pointer;
+    font: inherit;
+    display: grid;
+    gap: 2px;
+}
+
+.rca-episode[aria-current="true"] {
+    border-color: var(--stage-accent);
+    box-shadow: inset 3px 0 0 var(--stage-accent);
+}
+
+.rca-episode:focus-visible,
+.rca-panel summary:focus-visible {
+    outline: 2px solid var(--stage-accent);
+    outline-offset: 2px;
+}
+
+.rca-chip {
+    display: inline-block;
+    border: 1px solid var(--stage-line);
+    border-radius: 999px;
+    padding: 0 8px;
+    font-size: 12px;
+    line-height: 20px;
+    color: var(--stage-ink-2);
+    margin-inline-end: 6px;
+    white-space: nowrap;
+}
+
+.rca-chip.accent {
+    border-color: var(--stage-accent);
+    color: var(--stage-accent-ink);
+}
+
+.rca-chip.alert {
+    border-color: var(--stage-alert);
+    color: var(--stage-alert-ink);
+}
+
+.rca-cause {
+    font-size: 15px;
+    line-height: 1.5;
+    margin: 0;
+}
+
+.rca-evidence {
+    margin: 8px 0 0;
+    padding-inline-start: 18px;
+    color: var(--stage-ink-2);
+    font-size: 13px;
+}
+
+.rca-tree,
+.rca-tree ul {
+    list-style: none;
+    margin: 0;
+    padding-inline-start: 0;
+}
+
+.rca-tree ul {
+    padding-inline-start: 20px;
+    margin-inline-start: 10px;
+    border-inline-start: 1px dashed var(--stage-line);
+}
+
+.rca-node {
+    margin: 6px 0;
+    padding: 8px 10px;
+    border: 1px solid var(--stage-line);
+    border-radius: 6px;
+    background: var(--stage-panel-2);
+    display: grid;
+    gap: 2px;
+    font-size: 13px;
+}
+
+.rca-node.head {
+    border-color: var(--stage-alert);
+    box-shadow: inset 3px 0 0 var(--stage-alert);
+}
+
+.rca-node strong {
+    color: var(--stage-ink);
+}
+
+.rca-code,
+.rca-node code {
+    font-family: "Cascadia Mono", Consolas, monospace;
+    font-size: 12px;
+    color: var(--stage-ink);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.rca-spark {
+    display: block;
+    width: 100%;
+    height: 80px;
+}
+
+.rca-spark .rca-spark-line {
+    fill: none;
+    stroke: var(--stage-accent);
+    stroke-width: 2;
+}
+
+.rca-spark .rca-spark-axis {
+    stroke: var(--stage-line);
+    stroke-width: 1;
+}
+
+.rca-spark .rca-spark-peak {
+    fill: var(--stage-alert);
+}
+
+.rca-spark-legend {
+    display: flex;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--stage-ink-2);
+}
+
+.rca-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 13px;
+}
+
+.rca-table th,
+.rca-table td {
+    text-align: start;
+    padding: 4px 8px;
+    border-bottom: 1px solid var(--stage-line);
+    vertical-align: top;
+}
+
+.rca-table th {
+    color: var(--stage-ink-2);
+    font-weight: 600;
+}
+
+.rca-list {
+    margin: 0;
+    padding-inline-start: 18px;
+    display: grid;
+    gap: 6px;
+    font-size: 13px;
+}
+
+.rca-list a {
+    color: var(--stage-accent-ink);
+}
+
+.rca-dax pre {
+    max-height: 220px;
+    overflow: auto;
+    margin: 4px 0 10px;
+    padding: 8px;
+    background: var(--stage-panel-2);
+    border: 1px solid var(--stage-line);
+    border-radius: 6px;
+}
+
+.rca-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+/* The list's facets (the owner's feedback, 2026-11-23): one row per facet, each value a toggle with its count. */
+.rca-facets {
+    display: grid;
+    gap: 8px;
+    margin-bottom: 16px;
+}
+
+.rca-facet {
+    display: grid;
+    grid-template-columns: 150px minmax(0, 1fr);
+    align-items: center;
+    gap: 6px 8px;
+}
+
+.rca-facet-values,
+.rca-facet-view {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+}
+
+.rca-facet-name {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--stage-ink-2);
+}
+
+.rca-facet-view > .rca-facet-name:first-child {
+    min-width: 150px;
+}
+
+@media (max-width: 700px) {
+    .rca-facet {
+        grid-template-columns: minmax(0, 1fr);
+    }
+}
+
+.rca-facet-chip {
+    gap: 6px;
+}
+
+.rca-count {
+    margin-inline-start: 6px;
+    font-variant-numeric: tabular-nums;
+    font-weight: 600;
+    color: var(--stage-ink-2);
+}
+
+.rca-facet-summary {
+    margin: 0;
+    font-size: 13px;
+}
+
+/* Severity: a word and bars, never color alone. */
+.rca-sev {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    font-size: 12px;
+    font-weight: 600;
+    margin-inline-end: 6px;
+}
+
+.rca-sev svg {
+    width: 14px;
+    height: 12px;
+}
+
+.rca-sev rect {
+    stroke: currentColor;
+    stroke-width: 1;
+}
+
+.rca-sev rect.on {
+    fill: currentColor;
+}
+
+.rca-sev rect.off {
+    fill: none;
+}
+
+.rca-sev-high {
+    color: var(--stage-alert-ink);
+}
+
+.rca-sev-medium {
+    color: var(--status-warning);
+}
+
+.rca-sev-low {
+    color: var(--stage-ink-2);
+}
+
+.rca-sev-reason {
+    margin: 0 0 8px;
+    font-size: 13px;
+}
+
+/* Each target's mark, as the rest of the app colors it. */
+.rca-dot {
+    display: inline-block;
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    margin-inline-end: 6px;
+    background: var(--target-t1);
+}
+
+.rca-dot-t2 {
+    background: var(--target-t2);
+}
+
+.rca-dot-t3 {
+    background: var(--target-t3);
+}
+
+.rca-dot-t4 {
+    background: var(--target-t4);
+}
+
+.rca-dot-t4-replica {
+    background: var(--target-t4r);
+}
+
+.rca-dot-t5 {
+    background: var(--target-t5);
+}
+
+.rca-groups {
+    display: grid;
+    gap: 14px;
+}
+
+.rca-group h3 {
+    display: flex;
+    align-items: center;
+    font-size: 13px;
+    font-weight: 600;
+    margin: 0 0 6px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--stage-line);
+}
+
+.rca-episode-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 2px 4px;
+}
+
+/* Windows forced colors (F22): the stage's marks, a border's color and an inset shadow, give way. The current incident takes
+   the system's selection colors, as the current page does, with nothing else forced, and the head blocker a wider border. */
+@media (forced-colors: active) {
+    .rca-episode[aria-current="true"] {
+        forced-color-adjust: none;
+        background: Highlight;
+        color: HighlightText;
+        box-shadow: none;
+        outline-color: CanvasText;
+    }
+
+    .rca-episode[aria-current="true"] .rca-muted {
+        color: HighlightText;
+    }
+
+    .rca-node.head {
+        border-inline-start-width: 4px;
+        box-shadow: none;
+    }
+}

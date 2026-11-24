@@ -354,7 +354,7 @@ function Invoke-DemoArcOnboarding {
         # 60 minutes: a probe takes about a minute, but it first waits for the host's bootstrap pass (at most 30 minutes),
         # runs again while the guest doesn't answer (about 2 minutes more), and one that finds the channel broken restarts
         # the guest and waits for it (issue #65); Run Command ends a script at its timeout.
-        $probeRun = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcProbe' -Script $script -Parameter $probeParameters -TimeoutSeconds (1500 + $arcLockMinutes * 60 + 300) -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -Confirm:$false
+        $probeRun = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcProbe' -Script $script -Parameter $probeParameters -TimeoutSeconds (1500 + $arcLockMinutes * 60 + 300) -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -FreshAction -Confirm:$false
     }
     catch {
         return (& $newResult 'Fail' ('The guest could not be probed: {0}' -f $_.Exception.Message) 'Run configure-arc.ps1 again; a conflict with an extension that a policy installs clears within minutes.')
@@ -497,7 +497,7 @@ function Invoke-DemoArcOnboarding {
     }
     try {
         # The onboarding's own work, plus the wait for the host's bootstrap pass and the tries while the guest doesn't answer.
-        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcOnboard' -Script $script -Parameter $parameters -ProtectedParameter $protected -TimeoutSeconds ([System.Math]::Min(7200, $TimeoutSeconds + $arcLockMinutes * 60 + 300)) -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -Confirm:$false
+        $run = Invoke-DemoVmRunCommand -Config $Config -VmName $target.HostVmName -RunCommandName 'DbHubDemo-ArcOnboard' -Script $script -Parameter $parameters -ProtectedParameter $protected -TimeoutSeconds ([System.Math]::Min(7200, $TimeoutSeconds + $arcLockMinutes * 60 + 300)) -PollIntervalSeconds ([System.Math]::Min(30, $PollIntervalSeconds)) -FreshAction -Confirm:$false
     }
     catch {
         return (& $newResult 'Fail' ('The onboarding Run Command could not run: {0}' -f $_.Exception.Message) 'Run configure-arc.ps1 again; a conflict with an extension that a policy installs clears within minutes.')

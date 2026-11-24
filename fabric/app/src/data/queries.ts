@@ -115,9 +115,11 @@ ROW (
 }
 
 /** One row per SQL target: the key signals, findings, coverage, and incidents in the window. */
-export function estateQuery(f: Filters): QuerySpec {
+export function estateQuery(f: Filters, options: { measured?: boolean } = {}): QuerySpec {
+    // measured: without the findings and incident-window counts, the demo's answer key (ADR 0031): Ask Copilot's DAX.
+    const all = !options.measured;
     return {
-        id: "estate-targets",
+        id: all ? "estate-targets" : "estate-targets-measured",
         title: "Estate: key signals per target",
         rowLimit: 10,
         params: filterParams(f),
@@ -140,12 +142,12 @@ SUMMARIZECOLUMNS (
         '"BatchRequests", [Batch Requests]',
         '"SessionsPeak", [Active Sessions (peak)]',
         '"Deadlocks", [Deadlocks]',
-        '"FindingsAttention", [Findings Needing Attention]',
-        '"WorstFindingSort", [Worst Finding Status Sort]',
+        all && '"FindingsAttention", [Findings Needing Attention]',
+        all && '"WorstFindingSort", [Worst Finding Status Sort]',
         '"LagMin", [Telemetry Lag at Capture (min)]',
         '"CoverageTables", [Coverage Tables (selected run)]',
         '"CoverageAgeMin", [Coverage Last Sample Age (min)]',
-        '"Incidents", [Incidents]',
+        all && '"Incidents", [Incidents]',
         "\"Bins\", CALCULATE ( DISTINCTCOUNT ( 'Telemetry Snapshots'[Bucket UTC] ), KEEPFILTERS ( 'Telemetry Snapshots'[Analysis Key] = \"cpu\" ) )",
     ])}
 )
@@ -161,11 +163,11 @@ ORDER BY 'Target'[Target Key]`,
             { key: "WaitS", label: "Wait time (s)", kind: "seconds" },
             { key: "BatchRequests", label: "Batch requests", kind: "int" },
             { key: "SessionsPeak", label: "Active sessions, peak", kind: "int" },
-            { key: "FindingsAttention", label: "Findings needing attention", kind: "int" },
+            ...(all ? [{ key: "FindingsAttention", label: "Findings needing attention", kind: "int" as const }] : []),
             { key: "LagMin", label: "Telemetry lag at capture (min)", kind: "minutes" },
             { key: "CoverageTables", label: "Telemetry tables (latest validation run)", kind: "int" },
             { key: "CoverageAgeMin", label: "Newest sample age (min)", kind: "minutes" },
-            { key: "Incidents", label: "Incident windows", kind: "int" },
+            ...(all ? [{ key: "Incidents", label: "Incident windows", kind: "int" as const }] : []),
             { key: "Bins", label: "CPU bins in the window", kind: "int" },
         ],
     };
@@ -518,24 +520,61 @@ VAR LatestRun =
     )`;
 
 /**
- * T4's and its read replica's Azure Monitor metrics from the latest capture (analysis `postgresql`; targets T4 and
- * T4-replica), one row per metric and interval. The notebook can't read Azure Monitor, so stop-demo.ps1 -SaveHistory and
- * deploy.ps1 pass these metrics to it; there are none until one of them ran. Not filtered by target or period.
+/**
+ * The most Azure Monitor rows one of T4's or T5's reads returns (F35), the app's bound for any query: the saves whose
+ * windows overlap the latest capture's, each at most about 1,000 points (its document's 24 KB bound) and usually 200 to
+ * 900, so 20 to 30 of them. Over it, the query fails as overflow, and the deploy's app check says so (FABRIC.APP.QUERIES).
  */
-export function postgresSeriesQuery(): QuerySpec {
+export const MONITOR_SERIES_ROW_LIMIT = 20000;
+
+/** The latest run's window (F35), after POSTGRES_LATEST_RUN, COSMOS_LATEST_RUN, or latestRunWithPoints: the earliest start and latest end of its rows. */
+const latestWindow = (analysis: string) => `VAR WindowStart =
+    CALCULATE ( MIN ( 'Telemetry Snapshots'[Window Start UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "${analysis}", TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] ) )
+VAR WindowEnd =
+    CALCULATE ( MAX ( 'Telemetry Snapshots'[Window End UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "${analysis}", TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] ) )`;
+
+/**
+ * The latest capture's run of an analysis read from Telemetry Snapshots alone, with points (ADR 0031): the DAX Ask Copilot
+ * hands the chat, which doesn't read Analysis Findings. The pages keep POSTGRES_LATEST_RUN and COSMOS_LATEST_RUN, whose
+ * finding marks a capture even when it has no points.
+ */
+const latestRunWithPoints = (analysis: string) => `VAR LatestCapture =
+    CALCULATE ( MAX ( 'Telemetry Snapshots'[Captured At UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "${analysis}" )
+VAR LatestRun =
+    CALCULATETABLE (
+        VALUES ( 'Telemetry Snapshots'[Run ID] ),
+        REMOVEFILTERS (),
+        'Telemetry Snapshots'[Analysis Key] = "${analysis}",
+        'Telemetry Snapshots'[Captured At UTC] = LatestCapture
+    )`;
+
+/**
+ * T4's and its read replica's Azure Monitor metrics (analysis `postgresql`; targets T4 and T4-replica) in the latest
+ * capture's window, from every save whose window overlaps it (F35), one row per save, metric, and interval, the newest
+ * save first: toPostgresCapture keeps each interval's finest point, so a session's own 5-minute points stay beside a later
+ * day-long save's 15-minute ones, and nothing counts twice. The day before the window gives a save that only overlaps its
+ * start its step. The notebook can't read Azure Monitor, so stop-demo.ps1 -SaveHistory and deploy.ps1 pass these metrics
+ * to it; there are none until one of them ran. Not filtered by target or period.
+ * `measured`: the latest run from Telemetry Snapshots (latestRunWithPoints) gives the window, for Ask Copilot (ADR 0031).
+ */
+export function postgresSeriesQuery(options: { measured?: boolean } = {}): QuerySpec {
     return {
-        id: "postgres-series",
-        title: "T4 and its read replica: Azure Monitor metrics, latest capture",
-        rowLimit: 5000,
+        id: options.measured ? "postgres-series-measured" : "postgres-series",
+        title: "T4 and its read replica: Azure Monitor metrics in the latest capture's window",
+        rowLimit: MONITOR_SERIES_ROW_LIMIT,
         dax: `EVALUATE
-${POSTGRES_LATEST_RUN}
+${options.measured ? latestRunWithPoints("postgresql") : POSTGRES_LATEST_RUN}
+${latestWindow("postgresql")}
 RETURN
     SELECTCOLUMNS (
         CALCULATETABLE (
             'Telemetry Snapshots',
             REMOVEFILTERS (),
             'Telemetry Snapshots'[Analysis Key] = "postgresql",
-            TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )
+            'Telemetry Snapshots'[Window End UTC] > WindowStart,
+            'Telemetry Snapshots'[Window Start UTC] < WindowEnd,
+            'Telemetry Snapshots'[Bucket UTC] >= WindowStart - 1,
+            'Telemetry Snapshots'[Bucket UTC] <= WindowEnd
         ),
         "Bucket", 'Telemetry Snapshots'[Bucket UTC],
         "TargetKey", 'Telemetry Snapshots'[Target Key],
@@ -547,7 +586,7 @@ RETURN
         "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
         "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
     )
-ORDER BY [Bucket] ASC, [TargetKey] ASC, [Metric] ASC`,
+ORDER BY [CapturedAt] DESC, [Bucket] ASC, [TargetKey] ASC, [Metric] ASC`,
         columns: [
             { key: "Bucket", label: "Interval start (UTC)", kind: "datetime" },
             { key: "TargetKey", label: "Target", kind: "text" },
@@ -616,18 +655,22 @@ VAR LatestRun =
 const COSMOS_EMPTY = "until a capture of T5's metrics: a session's end saves one (Run all), and so do stop-demo.ps1 -SaveHistory and deploy.ps1; none while T5 is off";
 
 /**
- * T5's Azure Monitor metrics from the latest capture (analysis `cosmosdb`), one row per metric and interval: normalized
- * RU, request units, requests and 429s, gateway latency, and the hourly provisioned throughput and availability. The
- * notebook can't read Azure Monitor, so the operator side passes them (COSMOS_METRICS). Not filtered by target or period.
+ * T5's Azure Monitor metrics (analysis `cosmosdb`, target T5) in the latest capture's window, from every save whose window
+ * overlaps it (F35), one row per save, metric, and interval, the newest save first: normalized RU, request units, requests and
+ * 429s, gateway latency, and the hourly provisioned throughput and availability. toCosmosCapture keeps each interval's
+ * finest point, as T4's does. The notebook can't read Azure Monitor, so the operator side passes them (COSMOS_METRICS).
+ * Not filtered by target or period. `measured`: the latest run from Telemetry Snapshots (latestRunWithPoints) gives the
+ * window, for Ask Copilot (ADR 0031).
  */
-export function cosmosSeriesQuery(): QuerySpec {
+export function cosmosSeriesQuery(options: { measured?: boolean } = {}): QuerySpec {
     return {
-        id: "cosmos-series",
-        title: "T5 Azure Cosmos DB: Azure Monitor metrics, latest capture",
-        rowLimit: 5000,
+        id: options.measured ? "cosmos-series-measured" : "cosmos-series",
+        title: "T5 Azure Cosmos DB: Azure Monitor metrics in the latest capture's window",
+        rowLimit: MONITOR_SERIES_ROW_LIMIT,
         mayBeEmpty: COSMOS_EMPTY,
         dax: `EVALUATE
-${COSMOS_LATEST_RUN}
+${options.measured ? latestRunWithPoints("cosmosdb") : COSMOS_LATEST_RUN}
+${latestWindow("cosmosdb")}
 RETURN
     SELECTCOLUMNS (
         CALCULATETABLE (
@@ -635,9 +678,13 @@ RETURN
             REMOVEFILTERS (),
             'Telemetry Snapshots'[Analysis Key] = "cosmosdb",
             'Telemetry Snapshots'[Target Key] = "T5",
-            TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )
+            'Telemetry Snapshots'[Window End UTC] > WindowStart,
+            'Telemetry Snapshots'[Window Start UTC] < WindowEnd,
+            'Telemetry Snapshots'[Bucket UTC] >= WindowStart - 1,
+            'Telemetry Snapshots'[Bucket UTC] <= WindowEnd
         ),
         "Bucket", 'Telemetry Snapshots'[Bucket UTC],
+        "TargetKey", 'Telemetry Snapshots'[Target Key],
         "ResourceName", 'Telemetry Snapshots'[Resource Name],
         "Metric", 'Telemetry Snapshots'[Metric],
         "Value", 'Telemetry Snapshots'[Value],
@@ -646,9 +693,10 @@ RETURN
         "WindowEnd", 'Telemetry Snapshots'[Window End UTC],
         "CapturedAt", 'Telemetry Snapshots'[Captured At UTC]
     )
-ORDER BY [Bucket] ASC, [Metric] ASC`,
+ORDER BY [CapturedAt] DESC, [Bucket] ASC, [Metric] ASC`,
         columns: [
             { key: "Bucket", label: "Interval start (UTC)", kind: "datetime" },
+            { key: "TargetKey", label: "Target", kind: "text" },
             { key: "ResourceName", label: "Account", kind: "text" },
             { key: "Metric", label: "Azure Monitor metric", kind: "text" },
             { key: "Value", label: "Value", kind: "decimal" },
@@ -781,10 +829,14 @@ ORDER BY [WindowStart] DESC`,
     };
 }
 
-/** One row per UTC day and SQL target: the history past the telemetry's 7 days. */
-export function dailyTrendQuery(f: Filters): QuerySpec {
+/**
+ * One row per UTC day and SQL target: the history past the telemetry's 7 days. `incidents: false` leaves out the count of
+ * incident windows (the demo's answer key, ADR 0031): what Ask Copilot hands the chat, which reads only measurements.
+ */
+export function dailyTrendQuery(f: Filters, options: { incidents?: boolean } = {}): QuerySpec {
+    const incidents = options.incidents ?? true;
     return {
-        id: "daily-trend",
+        id: incidents ? "daily-trend" : "daily-trend-measured",
         title: "Daily history per target",
         rowLimit: 2000,
         params: filterParams(f),
@@ -802,7 +854,7 @@ SUMMARIZECOLUMNS (
         '"LockWaitS", [Lock Wait (s)]',
         '"Batch", [Batch Requests]',
         '"SessionsPeak", [Active Sessions (peak)]',
-        '"Incidents", [Incidents]',
+        incidents && '"Incidents", [Incidents]',
     ])}
 )
 ORDER BY 'Date'[Date], 'Target'[Target Key]`,
@@ -816,7 +868,7 @@ ORDER BY 'Date'[Date], 'Target'[Target Key]`,
             { key: "LockWaitS", label: "Lock waits (s)", kind: "seconds" },
             { key: "Batch", label: "Batch requests", kind: "int" },
             { key: "SessionsPeak", label: "Active sessions, peak", kind: "int" },
-            { key: "Incidents", label: "Incident windows", kind: "int" },
+            ...(incidents ? [{ key: "Incidents", label: "Incident windows", kind: "int" as const }] : []),
         ],
     };
 }

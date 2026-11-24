@@ -17,15 +17,14 @@
   },
   "parameters": {
     "headroom": { "type": "integer", "default": 2, "minimum": 1, "maximum": 20, "description": "Connection slots left free below max_connections, after the reserved ones, while a wave holds its connections. A wave that overshoots fills them for 5 seconds at most, then frees them again." },
-    "overshoot": { "type": "integer", "default": 2, "minimum": 0, "maximum": 5, "description": "Connection attempts past the limit in each wave, once the headroom is filled; the server refuses them as too many connections (SQLSTATE 53300, never a failed sign-in), which Database Hub counts as failed connections. Fixed caps, whatever this is set to: at most 5 refused attempts in any minute and 30 in a run; a sign-in failure ends the surge." },
+    "overshoot": { "type": "integer", "default": 2, "minimum": 0, "maximum": 5, "description": "Connection attempts past the limit in each wave, once the headroom is filled; the server refuses them as too many connections (SQLSTATE 53300, never a failed sign-in), and the run's events record them. Azure Monitor's failed connections, which Database Hub charts, didn't count them live (2026-11-21). Fixed caps, whatever this is set to: at most 5 refused attempts in any minute and 30 in a run; a sign-in failure ends the surge." },
     "maxConnections": { "type": "integer", "default": 60, "minimum": 5, "maximum": 400, "description": "A hard cap on the connections a wave holds, whatever the server allows." },
     "holdSeconds": { "type": "integer", "default": 120, "minimum": 10, "maximum": 600, "description": "How long each wave holds its connections (never past the run's deadline)." },
     "pauseSeconds": { "type": "integer", "default": 30, "minimum": 0, "maximum": 300, "description": "Quiet time between waves." }
   },
   "expectedHubSignals": [
-    { "signal": "T4: Connections (active_connections) climbs to the server's limit each wave", "surface": "Performance" },
-    { "signal": "T4: Failed connections (connections_failed) above 0 while a wave overshoots", "surface": "Performance" },
-    { "signal": "T4: Sessions By State (sessions_by_state) idle jumps; TCP Connection Backlog (tcp_connection_backlog) may rise", "surface": "Azure Monitor", "note": "PostgreSQL enhanced metrics, in the Azure portal's Metrics; Hub's PostgreSQL dashboard shows connections and failed connections." }
+    { "signal": "T4: Connections (active_connections) reaches the server's limit each wave: 35 or more, the slots clients can use", "surface": "Performance", "note": "max_connections 50, less the 15 slots Azure reserves; Azure Monitor counts the reserved slots' sessions too (36 to 39 live, 2026-11-21). At the limit, a new client is refused (too many connections), but Failed connections (connections_failed) doesn't count those refusals: it stayed 0 live." },
+    { "signal": "T4: Sessions By State (sessions_by_state) idle jumps; TCP Connection Backlog (tcp_connection_backlog) may rise", "surface": "Azure Monitor", "note": "PostgreSQL enhanced metrics, in the Azure portal's Metrics; Database Hub's PostgreSQL dashboard shows Connections." }
   ],
   "expectedSymptoms": [
     "The server's connection count reaches max_connections minus the reserved slots and headroom",

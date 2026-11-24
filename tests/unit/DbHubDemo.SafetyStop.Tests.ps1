@@ -243,6 +243,7 @@ BeforeAll {
         $script:published = ''
         $script:draft = ''
         $script:templateFails = $false
+        $script:templateError = ''
         $script:jobs = @()
         $script:jobsReadFails = $false
         $script:outputs = @{}
@@ -323,6 +324,9 @@ BeforeAll {
                     $script:deployments.Add([pscustomobject]@{ Text = $text; Parameters = (Get-Content -LiteralPath $file -Raw | ConvertFrom-Json -AsHashtable) })
                     if ($script:templateFails) {
                         return (New-AzResult -ExitCode 1 -StdErr 'ERROR: (RequestDisallowedByPolicy) Resource ''aa-dbhub-demo-safetystop'' was disallowed by policy.')
+                    }
+                    if ($script:templateError) {
+                        return (New-AzResult -ExitCode 1 -StdErr $script:templateError)
                     }
                     return (New-AzResult -StdOut (ConvertTo-Json -InputObject @{ identityPrincipalId = @{ value = $script:principal }; identityClientId = @{ value = $script:clientId }; automationAccountId = @{ value = $script:account } }))
                 }
@@ -634,6 +638,19 @@ Describe 'Invoke-DemoSafetyStopSetup against a fake Azure (ADR 0024)' {
         $script:writes | Should -BeNullOrEmpty
         $note = InModuleScope DbHubDemo -Parameters @{ Result = $results } { Get-DemoSafetyStopNote -Result $Result }
         $note | Should -Match '^The nightly safety stop isn''t fully set up \(SAFETYSTOP\.RESOURCES\): .*RequestDisallowedByPolicy.* Until it is, T4 isn''t stopped when Azure starts it again after 7 days'
+    }
+
+    It 'says the subscription''s quota for Automation accounts in the region is used up, with how to free one or raise it (F28, live 2026-11-21)' {
+        # Azure's answer on dbhubra, in a subscription with 10 Automation accounts in westus3 (five environments' two each).
+        $script:templateError = 'ERROR: {"status":"Failed","error":{"code":"DeploymentFailed","target":"/subscriptions/<subscription>/resourceGroups/rg-dbhub-demo/providers/Microsoft.Resources/deployments/dbhub-safetystop","message":"At least one resource deployment operation failed. Please list deployment operations for details. Please see https://aka.ms/arm-deployment-operations for usage details.","details":[{"code":"Conflict","target":"/subscriptions/<subscription>/resourceGroups/rg-dbhub-demo/providers/Microsoft.Automation/automationAccounts/aa-dbhub-demo-safetystop","message":"{\r\n  \"code\": \"Conflict\",\r\n  \"message\": \"The operation could not be completed because it exceeded your quota for Automation accounts in your subscription in the region. Please check the applicable quotas for your subscription. Requests for quota increase are subject to approval and resource availability in the region.  Learn more- https://aka.ms/Azure-Automation-Quotas-and-Limits\"\r\n}"}]}}'
+        $results = & $script:setup
+        @($results | ForEach-Object { '{0}={1}' -f $_.checkId, $_.status }) | Should -Be @('SAFETYSTOP.RESOURCES=Warning')
+        $results[0].message | Should -BeExactly 'The nightly safety stop isn''t set up: infra/safetystop/safetystop.bicep couldn''t be deployed: Azure refused aa-dbhub-demo-safetystop because the subscription''s quota for Azure Automation accounts in westus3 is used up (Conflict).'
+        $results[0].remediation | Should -Match '^Free an Automation account in westus3: \./scripts/destroy\.ps1 on a demo environment you no longer use deletes its two, .* Or raise the subscription''s quota for Automation accounts in westus3 \(the Azure portal''s Quotas page, .*\)\. Then run \./scripts/deploy\.ps1 again\. Meanwhile the VMs'' nightly auto-shutdown and T3''s auto-pause still apply\.$'
+        $results[0].remediation | Should -Not -Match 'policy denial'
+        $results[0].evidence['quotaUsedUp'] | Should -BeTrue
+        $results[0].evidence['error'] | Should -Match 'exceeded your quota for Automation accounts'
+        $results[0].docUrl | Should -Be 'https://learn.microsoft.com/azure/automation/automation-limits-quotas'
     }
 
     It 'changes nothing with -WhatIf' {
@@ -1089,6 +1106,8 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         # The VMs' own auto-shutdown at 19:00 would cut the run: it moves to a quarter hour about an hour after the marker.
         $script:shutdowns['sqlvm01'] | Should -Be '2015'
         $script:shutdowns['archost01'] | Should -Be '2015'
+        # And the group says where it is, for the control notebook's Run all, which can't read it (F25).
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -Be '2015'
         $body = $script:shutdownBodies[0].Body
         $body['location'] | Should -Be 'westus3'
         $body['tags']['solution'] | Should -Be 'fabric-database-hub-demo'
@@ -1111,6 +1130,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $null = Invoke-TestTick -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T02:30:00Z'
         $script:shutdowns['sqlvm01'] | Should -Be '2030'
         $script:shutdowns['archost01'] | Should -Be '2015' -Because 'its 20:15 is past the marker and its margin'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -Be '2015,2030'
     }
 
     It 'only marks the group busy while no nightly pass falls inside the run' {
@@ -1150,6 +1170,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         @($script:links | Where-Object Schedule -EQ 'dbhub-safety-deferred').Count | Should -Be 1 -Because 'it replaces the pass the run scheduled'
         $script:shutdowns['sqlvm01'] | Should -Be '2135'
         $script:shutdowns['archost01'] | Should -Be '2135'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -Be '2135'
         # Once only.
         InModuleScope DbHubDemo -Parameters @{ Config = (New-SafetyConfig); Run = $end.Run } { Complete-DemoBusyMarkerRun -Run $Run -Config $Config -Confirm:$false } | Should -BeNullOrEmpty
         # DONE stays DONE and says it, with both commands.
@@ -1173,6 +1194,7 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $script:shutdowns['sqlvm01'] | Should -Be '1900'
         $script:groupTags['DbHubBusyUntilUtc'] | Should -BeNullOrEmpty
         $script:groupTags['DbHubBusyBy'] | Should -BeNullOrEmpty
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -BeNullOrEmpty
     }
 
     It 'adds nothing, and only clears the marker, when no nightly pass came near the run' {
@@ -1292,6 +1314,82 @@ Describe 'The busy marker (2026-11-14): the nightly stop waits for a deploy.ps1 
         $left.status | Should -Be 'Warning'
         $left.message | Should -Match 'No run keeps it there'
         $left.remediation | Should -Be './scripts/start-demo.ps1, ./scripts/stop-demo.ps1, and ./scripts/deploy.ps1 put it back at 19:00.'
+    }
+
+    It 'puts back an auto-shutdown that''s still moved after a Run all session cleared the marker, and status.ps1 warns until then (F25)' {
+        $null = Invoke-TestTick -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T02:10:00Z'
+        $null = Invoke-TestEnd -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T04:30:00Z'
+        # A Run all session overwrote the marker with its own and cleared it at its end; the deferred pass has expired since.
+        $script:groupTags['DbHubBusyUntilUtc'] = ''
+        $script:groupTags['DbHubBusyBy'] = ''
+        $script:schedules.Remove('dbhub-safety-deferred')
+        $status = Get-TestBusyStatus -Now '2026-11-07T02:00:00Z'
+        $status.status | Should -Be 'Warning'
+        $status.message | Should -Match 'sqlvm01 at 21:35, archost01 at 21:35\. No run keeps it there: a Run all session took over from the run it was moved for\. Until it''s put back, a Run all session ends before it\.$'
+        $script:tagWrites.Clear()
+        $settled = Invoke-TestSettle -Purpose Stop -Now '2026-11-07T02:00:00Z'
+        $settled.Count | Should -Be 1
+        $settled[0].checkId | Should -Be 'STOP.NIGHTLYSTOP'
+        $settled[0].status | Should -Be 'Pass'
+        $settled[0].message | Should -Be 'The VMs'' auto-shutdown was still where deploy.ps1 had moved it for a run the nightly stop waited for, after a Run all session: sqlvm01''s auto-shutdown is back at 19:00, archost01''s auto-shutdown is back at 19:00.'
+        $script:shutdowns['sqlvm01'] | Should -Be '1900'
+        $script:shutdowns['archost01'] | Should -Be '1900'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -BeNullOrEmpty
+        @($script:tagWrites | Where-Object { $_ -like 'DbHubBusy*' }) | Should -BeNullOrEmpty -Because 'there''s no marker to clear'
+        Get-TestBusyStatus -Now '2026-11-07T02:05:00Z' | Should -BeNullOrEmpty
+    }
+
+    It 'stop-demo.ps1 settles a deferred night after a Run all session took the marker over and cleared it (F27)' {
+        # Live (dbhubfr at bf010ed): DONE at 21:08 deferred the nightly stop to 21:35 here; a Run all session in the grace
+        # replaced the deploy-grace marker with its own and cleared it at its end; stop-demo.ps1 then said nothing about the
+        # nightly stop, and the VMs' auto-shutdown and the deferred pass stayed until the next deploy.ps1.
+        $null = Invoke-TestTick -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T02:10:00Z'
+        $null = Invoke-TestEnd -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T04:30:00Z'
+        $script:groupTags['DbHubBusyBy'] = 'session'
+        $script:groupTags['DbHubBusyUntilUtc'] = '2026-11-06T05:20:00Z'
+        $script:groupTags['DbHubBusyBy'] = ''
+        $script:groupTags['DbHubBusyUntilUtc'] = ''
+        $script:schedules.Contains('dbhub-safety-deferred') | Should -BeTrue -Because 'it runs hourly until the morning'
+        $stopped = Invoke-TestSettle -Purpose Stop -Now '2026-11-06T06:03:00Z'
+        $stopped.Count | Should -Be 1
+        $stopped[0].checkId | Should -Be 'STOP.NIGHTLYSTOP'
+        $stopped[0].status | Should -Be 'Pass'
+        $stopped[0].message | Should -Be 'The VMs'' auto-shutdown was still where deploy.ps1 had moved it for a run the nightly stop waited for, after a Run all session: the deferred nightly pass dbhub-safety-deferred is removed, sqlvm01''s auto-shutdown is back at 19:00, archost01''s auto-shutdown is back at 19:00.'
+        $script:schedules.Contains('dbhub-safety-deferred') | Should -BeFalse
+        @($script:links | Where-Object Schedule -EQ 'dbhub-safety-deferred') | Should -BeNullOrEmpty
+        $script:shutdowns['sqlvm01'] | Should -Be '1900'
+        $script:shutdowns['archost01'] | Should -Be '1900'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -BeNullOrEmpty
+    }
+
+    It 'start-demo.ps1, taking over from a Run all session, removes the deferred stop and puts the auto-shutdown back, and keeps the session''s marker (F25)' {
+        $null = Invoke-TestTick -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T02:10:00Z'
+        $null = Invoke-TestEnd -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T04:30:00Z'
+        # A Run all session started at 20:40, during the grace: its marker lasts until its auto-stop's margin.
+        $script:groupTags['DbHubBusyBy'] = 'session'
+        $script:groupTags['DbHubBusyUntilUtc'] = '2026-11-06T05:30:00Z'
+        $settled = Invoke-TestSettle -Purpose Start -Now '2026-11-06T04:45:00Z'
+        $settled.Count | Should -Be 1
+        $settled[0].checkId | Should -Be 'START.NIGHTLYSTOP'
+        $settled[0].status | Should -Be 'Pass'
+        $settled[0].message | Should -Be 'This session takes over from the Run all session, and from the run the nightly stop waited for before it: the deferred nightly pass dbhub-safety-deferred is removed, sqlvm01''s auto-shutdown is back at 19:00, archost01''s auto-shutdown is back at 19:00. The demo runs until its auto-stop (START.CONTROL.AUTOSTOP says when), ./scripts/stop-demo.ps1, or the next nightly stop at 19:00 (Pacific Standard Time).'
+        $script:schedules.Contains('dbhub-safety-deferred') | Should -BeFalse
+        $script:shutdowns['archost01'] | Should -Be '1900'
+        $script:groupTags['DbHubAutoShutdownMoved'] | Should -BeNullOrEmpty
+        $script:groupTags['DbHubBusyBy'] | Should -Be 'session'
+        $script:groupTags['DbHubBusyUntilUtc'] | Should -Be '2026-11-06T05:30:00Z'
+    }
+
+    It 'tells DONE what Run all does before the deferred stop only when this run published the control''s runbooks: <Case> (F25)' -ForEach @(
+        @{ Case = 'published'; Status = 'Pass'; Says = $true }
+        @{ Case = 'an older DbHub-Control, which plans as if the auto-shutdown weren''t moved'; Status = 'Fail'; Says = $false }
+    ) {
+        $null = Invoke-TestTick -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T02:10:00Z'
+        $runbooks = New-DemoResult -CheckId 'CONTROL.RUNBOOKS' -Area 'workload' -Target 'subscription' -Status $Status -Message 'The control''s runbooks.'
+        $end = Invoke-TestEnd -Start '2026-11-06T01:30:00Z' -Now '2026-11-06T04:30:00Z' -Result @($runbooks)
+        $sentence = ' Run all in NB_DatabaseHub_Control before 21:35 ends its session before then, since a session can''t move the VMs'' auto-shutdown; from 21:35 on, Run all runs a full session.'
+        $end.Results[0].remediation.EndsWith($sentence, [System.StringComparison]::Ordinal) | Should -Be $Says
+        $end.Results[0].remediation | Should -Match '^To keep the demo running tonight, run \./scripts/start-demo\.ps1'
     }
 
     It 'takes a Deferred stop and a Deferred T3 check as no failure (STATUS.SAFETYSTOP and the T4 restart reading)' {

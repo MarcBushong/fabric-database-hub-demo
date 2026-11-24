@@ -138,12 +138,26 @@ export function MarkdownView({ markdown }: { markdown: string }) {
                 </div>,
             );
         } else if (text.startsWith("- ")) {
-            const items: string[] = [];
-            while (i < lines.length && lines[i].startsWith("- ")) items.push(lines[i++].slice(2));
+            // A list, with one nested level: "  - " lines belong to the item above them (the postmortem's evidence).
+            const items: Array<{ text: string; sub: string[] }> = [];
+            while (i < lines.length && (lines[i].startsWith("- ") || (items.length > 0 && lines[i].startsWith("  - ")))) {
+                const line = lines[i++];
+                if (line.startsWith("- ")) items.push({ text: line.slice(2), sub: [] });
+                else items[items.length - 1].sub.push(line.slice(4));
+            }
             out.push(
                 <ul key={out.length}>
                     {items.map((t, k) => (
-                        <li key={k}>{inline(t)}</li>
+                        <li key={k}>
+                            {inline(t.text)}
+                            {t.sub.length > 0 ? (
+                                <ul>
+                                    {t.sub.map((s, j) => (
+                                        <li key={j}>{inline(s)}</li>
+                                    ))}
+                                </ul>
+                            ) : null}
+                        </li>
                     ))}
                 </ul>,
             );

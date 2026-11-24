@@ -17,19 +17,22 @@ import {
     FAMILY_LABEL,
     COSMOS_METRICS,
     cosmosSeries,
+    grainMinutes,
+    perMinute,
     POSTGRES_METRICS,
     postgresPeak,
     postgresSeries,
     postgresSkus,
     replicaCatchUp,
+    spanMinutes,
     toBins,
     toFindings,
     toIncidents,
     throttledRuns,
     throttleEpisodes,
     toCaptureFindings,
-    toCosmosCapture,
-    toPostgresCapture,
+    latestCosmosCapture,
+    latestPostgresCapture,
     toPostgresFindings,
     toTargetNames,
     toTargets,
@@ -38,16 +41,19 @@ import {
     type PostgresCapture,
     type PostgresTarget,
 } from "@/data/model";
+import { ADDITIVE_METRICS } from "@/data/finest-per-interval";
 import { cosmosFindingsQuery, cosmosSeriesQuery, estateQuery, findingsQuery, incidentsQuery, postgresFindingsQuery, postgresSeriesQuery, seriesQuery, targetNamesQuery, waitsQuery, type ColumnSpec } from "@/data/queries";
 import type { Row } from "@/data/query-client";
 import { useQuery } from "@/data/use-query";
 import { hubUrlOf, libraryPrompts, type AgentSurface } from "@/lib/agent-prompts";
+import { measuredFindings, withoutColumns } from "@/lib/ask";
 import type { TargetKey } from "@/lib/dax";
 import { ENGINES, engineOf, TARGETS } from "@/lib/estate";
-import { formatAgo, formatDateTimeUtc, formatDuration, formatNumber, percent } from "@/lib/format";
+import { formatAgo, formatBeside, formatDateTimeUtc, formatDuration, formatNumber, percent } from "@/lib/format";
 import { cosmosHealth, postgresHealth, sqlHealth, type TargetHealth } from "@/lib/health";
-import { POSTGRES_CPU_WARNING_PERCENT, REPLICA_LAG_WARNING_SECONDS } from "@/lib/insights";
+import { FAILED_CONNECTIONS_CAVEAT, POSTGRES_CPU_WARNING_PERCENT, POSTGRES_USABLE_CONNECTIONS, REPLICA_LAG_WARNING_SECONDS, USABLE_SLOTS_TEXT } from "@/lib/insights";
 import type { EstateTarget } from "@/lib/view-state";
+import { findIncidentsAsk } from "@/rca/entry";
 import { PageHeader } from "@/shell/PageHeader";
 import { ChartView } from "@/visuals/ChartView";
 
@@ -107,13 +113,17 @@ function useEstateData() {
     const cosmosFindingsSpec = useMemo(() => (view.targets.includes("T5") ? cosmosFindingsQuery() : null), [view.targets]);
     const cosmosSeriesState = useQuery(cosmosSeriesSpec);
     const cosmosFindingsState = useQuery(cosmosFindingsSpec);
+    // What Ask Copilot hands the chat instead (ADR 0031): the same measurements, with no answer-key table or measure in the DAX.
+    const estateAskSpec = useMemo(() => (filters.targets.length ? estateQuery(filters, { measured: true }) : null), [filters]);
+    const pgSeriesAskSpec = useMemo(() => (view.targets.includes("T4") ? postgresSeriesQuery({ measured: true }) : null), [view.targets]);
+    const cosmosSeriesAskSpec = useMemo(() => (view.targets.includes("T5") ? cosmosSeriesQuery({ measured: true }) : null), [view.targets]);
     const targets = useMemo(() => toTargets(estate.data?.rows ?? []), [estate.data]);
     const bins = useMemo(() => toBins(series.data?.rows ?? []), [series.data]);
     const findings = useMemo(() => toFindings(findingsState.data?.rows ?? []), [findingsState.data]);
     const names = useMemo(() => toTargetNames(namesState.data?.rows ?? []), [namesState.data]);
-    const capture = useMemo(() => toPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
+    const capture = useMemo(() => latestPostgresCapture(pgSeries.data?.rows ?? []), [pgSeries.data]);
     const pgFindingRows = useMemo(() => toPostgresFindings(pgFindings.data?.rows ?? []), [pgFindings.data]);
-    const cosmos = useMemo(() => toCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
+    const cosmos = useMemo(() => latestCosmosCapture(cosmosSeriesState.data?.rows ?? []), [cosmosSeriesState.data]);
     const cosmosFindingRows = useMemo(() => toCaptureFindings(cosmosFindingsState.data?.rows ?? []), [cosmosFindingsState.data]);
     return {
         estateSpec,
@@ -123,6 +133,9 @@ function useEstateData() {
         pgFindingsSpec,
         cosmosSeriesSpec,
         cosmosFindingsSpec,
+        estateAskSpec,
+        pgSeriesAskSpec,
+        cosmosSeriesAskSpec,
         estate,
         series,
         findingsState,
@@ -238,6 +251,12 @@ function Inventory() {
                 table={{ columns: INVENTORY_COLUMNS.map((c) => ({ key: c.key, label: c.label, kind: c.kind ?? "text" })) as ColumnSpec[], rows: rows as unknown as Row[], caption: "Estate inventory" }}
                 summary={`${rows.length} targets.`}
                 askPrompt="Summarize the estate: which target is busiest, which needs attention, and why?"
+                ask={{
+                    // The measurements only: the incident windows, the findings to review, and the status they set are the answer key (ADR 0031).
+                    specs: [d.estateAskSpec, d.pgSeriesAskSpec],
+                    table: withoutColumns({ columns: INVENTORY_COLUMNS.map((c) => ({ key: c.key, label: c.label, kind: c.kind ?? "text" })) as ColumnSpec[], rows: rows as unknown as Row[], caption: "Estate inventory" }, ["incidents", "attention", "status"]),
+                    prompt: "Summarize the estate: which target is busiest, and why?",
+                }}
             >
                 <DataGrid columns={INVENTORY_COLUMNS} rows={rows} caption="Estate inventory" exportName="estate-inventory" onRowClick={(r) => navigate("estate", { target: r.target })} rowLabel={(r) => `Open ${r.target}`} filterable={false} />
             </VisualCard>
@@ -256,7 +275,7 @@ function TargetDetail({ target }: { target: EstateTarget }) {
 }
 
 function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<{ label: string; onClick?: () => void }> }) {
-    const { navigate, filters, runtime, meta, view } = useApp();
+    const { navigate, filters, runtime, meta, view, rca } = useApp();
     const info = TARGETS[target];
     const d = useEstateData();
     const incidentsSpec = useMemo(() => incidentsQuery({ ...filters, targets: [target] }), [filters, target]);
@@ -305,7 +324,7 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
             />
 
             <section className="kpis" aria-label={`${target} at a glance`}>
-                <KpiTile label="CPU, average · peak" value={`${formatNumber(t?.cpuAvg ?? null, "percent")}`} sub={`peak ${formatNumber(t?.cpuPeak ?? null, "percent")}${peak ? ` at ${formatDateTimeUtc(peak.at)}` : ""}`} status={t && (t.cpuPeak ?? 0) >= 80 ? "Warning" : t ? "Pass" : null} actions={
+                <KpiTile label="CPU, average · peak" value={`${formatNumber(t?.cpuAvg ?? null, "percent")}`} sub={`peak ${formatBeside(t?.cpuPeak ?? null, "percent", 80)}${peak ? ` at ${formatDateTimeUtc(peak.at)}` : ""}`} status={t && (t.cpuPeak ?? 0) >= 80 ? "Warning" : t ? "Pass" : null} actions={
                     peak && median && peak.value >= 2 * median ? (
                         <AskWhy
                             title={`${target} CPU`}
@@ -337,14 +356,14 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
                 empty={!d.series.loading && mine.length === 0}
                 emptyText={`No telemetry bins on ${target} in this period.`}
                 table={d.seriesSpec && d.series.data ? { columns: d.seriesSpec.columns, rows: d.series.data.rows.filter((r) => r["Target Key"] === target), caption: `${target}'s bins` } : null}
-                summary={`CPU on ${target}; peak ${formatNumber(peak?.value ?? null, "percent")}.`}
+                summary={`CPU on ${target}; peak ${formatBeside(peak?.value ?? null, "percent", 80)}.`}
                 askPrompt={`Explain ${target}'s CPU over this period: what drove the peaks, and is anything abnormal?`}
             >
                 <ChartView
                     hideHeader
                     spec={{ kind: "area", title: `${target} CPU`, rows: cpuRows, x: "at", y: "CPU", unit: "%" }}
                     colors={{ CPU: info.color }}
-                    annotations={{ bands, thresholds: [{ value: 80, label: "80 %", tone: "warning" }], markers: peak ? [{ x: peak.at, y: peak.value, label: `peak ${formatNumber(peak.value, "percent")}` }] : [] }}
+                    annotations={{ bands, thresholds: [{ value: 80, label: "80 %", tone: "warning" }], markers: peak ? [{ x: peak.at, y: peak.value, label: `peak ${formatBeside(peak.value, "percent", 80)}` }] : [] }}
                 />
             </VisualCard>
 
@@ -407,6 +426,8 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
                 table={incidentsState.data ? { columns: incidentsSpec.columns, rows: incidentsState.data.rows, caption: `${target}'s incident windows` } : null}
                 summary={`${incidents.length} incidents.`}
                 quiet
+                // The incident windows are the answer key: with the RCA tables, the chat finds this target's incidents itself (ADR 0031).
+                ask={rca === true ? findIncidentsAsk({ targets: [target] }) : false}
             >
                 <ol className="feed">
                     {incidents.map((i) => (
@@ -438,6 +459,10 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
                 table={d.findingsState.data ? { columns: d.findingsSpec.columns, rows: d.findingsState.data.rows.filter((r) => r.TargetKey === target), caption: `${target}'s findings` } : null}
                 summary={`${findings.length} findings.`}
                 quiet
+                ask={{
+                    specs: [],
+                    table: d.findingsState.data ? { columns: d.findingsSpec.columns, rows: measuredFindings(d.findingsState.data.rows.filter((r) => r.TargetKey === target)), caption: `${target}'s findings` } : null,
+                }}
             >
                 <ol className="feed">
                     {findings.map((f) => (
@@ -469,10 +494,15 @@ function SqlTargetDetail({ target, crumbs }: { target: TargetKey; crumbs: Array<
 function lineRows(capture: PostgresCapture | null, series: Array<[PostgresTarget, string, string]>): Row[] {
     const out: Row[] = [];
     for (const [target, metric, label] of series) {
-        for (const p of postgresSeries(capture, target, metric)) out.push({ at: iso(p.at), series: label, value: p.value });
+        const points = postgresSeries(capture, target, metric);
+        for (const p of ADDITIVE_METRICS.has(metric) ? perMinute(points, capture) : points) out.push({ at: iso(p.at), series: label, value: p.value });
     }
     return out.sort((a, b) => String(a.at).localeCompare(String(b.at)));
 }
+
+/** The page's words for a capture whose window holds saves at different intervals (F35). */
+const MERGED_NOTE = "with each interval from the finest save that has it";
+const PER_MINUTE_NOTE = "The saves here have different intervals, so totals show per minute.";
 
 function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onClick?: () => void }>; focus: EstateTarget }) {
     const { runtime } = useApp();
@@ -482,6 +512,10 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
     const caught = replicaCatchUp(capture, lagSeries);
     const lagPeak = postgresPeak(lagSeries.filter((p) => !caught.includes(p)));
     const cpuPeak = postgresPeak(postgresSeries(capture, "T4", POSTGRES_METRICS.cpu));
+    // connection-surge's measured signal (F34): T4's connections against the slots clients can use. Its refused attempts
+    // aren't in failed connections, so those only show, dashed, with what they leave out.
+    const connPeak = postgresPeak(postgresSeries(capture, "T4", POSTGRES_METRICS.connections));
+    const atLimit = connPeak !== null && connPeak.value >= POSTGRES_USABLE_CONNECTIONS;
     const failed = postgresSeries(capture, "T4", POSTGRES_METRICS.failed);
     const failedTotal = failed.reduce((a, p) => a + p.value, 0);
     const skus = postgresSkus(d.pgFindingRows);
@@ -503,7 +537,13 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
         <div className="page">
             <PageHeader
                 title={title}
-                description={capture ? `The latest capture of Azure Monitor metrics, ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)}, captured ${formatAgo(capture.capturedAt)}.` : "T4, the PostgreSQL flexible server, and its read replica, from Azure Monitor metrics the demo captures at a session's end."}
+                description={
+                    capture
+                        ? (capture.saves ?? 1) > 1
+                            ? `Azure Monitor metrics from ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)}, the latest capture's window, captured ${formatAgo(capture.capturedAt)}, ${MERGED_NOTE}.`
+                            : `The latest capture of Azure Monitor metrics, ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)}, captured ${formatAgo(capture.capturedAt)}.`
+                        : "T4, the PostgreSQL flexible server, and its read replica, from Azure Monitor metrics the demo captures at a session's end."
+                }
                 crumbs={crumbs}
                 filter={false}
                 actions={
@@ -525,7 +565,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         <KpiTile label="Read replica" value={capture?.servers["T4-replica"] ?? "Not in this capture"} sub={skus["T4-replica"] ?? "It exists only during a session"} />
                         <KpiTile
                             label="Read replica lag, peak"
-                            value={lagPeak ? formatNumber(lagPeak.value, "seconds") : "–"}
+                            value={lagPeak ? formatBeside(lagPeak.value, "seconds", REPLICA_LAG_WARNING_SECONDS) : "–"}
                             status={lagPeak ? (lagPeak.value >= REPLICA_LAG_WARNING_SECONDS ? "Warning" : "Pass") : null}
                             sub={lagPeak ? `at ${formatDateTimeUtc(lagPeak.at)} · warning at ${REPLICA_LAG_WARNING_SECONDS} s` : "No lag in this capture"}
                             actions={
@@ -535,14 +575,19 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                                         visualId="estate.t4.lag"
                                         prompt={`Why did T4's read replica lag reach ${formatNumber(lagPeak.value, "seconds")} at ${formatDateTimeUtc(lagPeak.at)}? What load on T4 caused it, and how do I keep the replica close?`}
                                         anomaly={{ metric: "Read replica lag", target: "T4-replica", at: lagPeak.at.toISOString(), value: lagPeak.value, unit: "s" }}
-                                        specs={[d.pgSeriesSpec]}
+                                        specs={[d.pgSeriesAskSpec]}
                                         rows={lagRows}
                                     />
                                 ) : undefined
                             }
                         />
-                        <KpiTile label="T4 CPU, peak" value={formatNumber(cpuPeak?.value ?? null, "percent")} status={cpuPeak ? (cpuPeak.value >= POSTGRES_CPU_WARNING_PERCENT ? "Warning" : "Pass") : null} sub={cpuPeak ? `at ${formatDateTimeUtc(cpuPeak.at)}` : ""} />
-                        <KpiTile label="Failed connections" value={formatNumber(failedTotal, "int")} status={failedTotal > 0 ? "Warning" : "Pass"} sub="On T4 in the capture" />
+                        <KpiTile label="T4 CPU, peak" value={formatBeside(cpuPeak?.value ?? null, "percent", POSTGRES_CPU_WARNING_PERCENT)} status={cpuPeak ? (cpuPeak.value >= POSTGRES_CPU_WARNING_PERCENT ? "Warning" : "Pass") : null} sub={cpuPeak ? `at ${formatDateTimeUtc(cpuPeak.at)}` : ""} />
+                        <KpiTile
+                            label="Connections, peak"
+                            value={connPeak ? formatBeside(connPeak.value, "int", POSTGRES_USABLE_CONNECTIONS) : "–"}
+                            status={connPeak ? (atLimit ? "Warning" : "Pass") : null}
+                            sub={connPeak ? `at ${formatDateTimeUtc(connPeak.at)} · ${POSTGRES_USABLE_CONNECTIONS} slots for clients` : "No connections in this capture"}
+                        />
                     </section>
 
                     <VisualCard
@@ -551,18 +596,19 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         title="Read replica lag"
                         subtitle={`Database Hub's Read replica lag (physical_replication_delay_in_seconds), the highest value in each interval. ${REPLICA_LAG_WARNING_SECONDS} s or more is a warning.`}
                         specs={[d.pgSeriesSpec]}
+                        ask={{ specs: [d.pgSeriesAskSpec] }}
                         loading={d.pgSeries.loading}
                         error={d.pgSeries.error}
                         empty={!d.pgSeries.loading && lagRows.length === 0}
                         emptyText="No Read replica lag in this capture: T4's read replica exists only during a session."
                         table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "T4-replica", label: "Read replica lag (s)", kind: "seconds" }], rows: lagRows, caption: "Read replica lag per interval" }}
-                        summary={lagPeak ? `Read replica lag peaked at ${formatNumber(lagPeak.value, "seconds")}.` : "No lag."}
+                        summary={lagPeak ? `Read replica lag peaked at ${formatBeside(lagPeak.value, "seconds", REPLICA_LAG_WARNING_SECONDS)}.` : "No lag."}
                         askPrompt="Explain the read replica's lag in this capture: what caused the peak, and is it a problem?"
                     >
                         <ChartView
                             hideHeader
                             spec={{ kind: "area", title: "Read replica lag", rows: lagRows, x: "at", y: "T4-replica", unit: "s" }}
-                            annotations={{ thresholds: [{ value: REPLICA_LAG_WARNING_SECONDS, label: `${REPLICA_LAG_WARNING_SECONDS} s: warning`, tone: "warning" }], markers: lagPeak ? [{ x: lagPeak.at, y: lagPeak.value, label: `peak ${formatNumber(lagPeak.value, "seconds")}` }] : [] }}
+                            annotations={{ thresholds: [{ value: REPLICA_LAG_WARNING_SECONDS, label: `${REPLICA_LAG_WARNING_SECONDS} s: warning`, tone: "warning" }], markers: lagPeak ? [{ x: lagPeak.at, y: lagPeak.value, label: `peak ${formatBeside(lagPeak.value, "seconds", REPLICA_LAG_WARNING_SECONDS)}` }] : [] }}
                         />
                     </VisualCard>
 
@@ -572,11 +618,12 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         title="CPU"
                         subtitle={`cpu_percent on T4 and its read replica. ${POSTGRES_CPU_WARNING_PERCENT} % or more on T4 is a warning.`}
                         specs={[d.pgSeriesSpec]}
+                        ask={{ specs: [d.pgSeriesAskSpec] }}
                         loading={d.pgSeries.loading}
                         error={d.pgSeries.error}
                         empty={!d.pgSeries.loading && cpuRows.length === 0}
                         table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "series", label: "Server", kind: "text" }, { key: "value", label: "CPU (%)", kind: "percent" }], rows: cpuRows, caption: "CPU per interval" }}
-                        summary={`T4's CPU peaked at ${formatNumber(cpuPeak?.value ?? null, "percent")}.`}
+                        summary={`T4's CPU peaked at ${formatBeside(cpuPeak?.value ?? null, "percent", POSTGRES_CPU_WARNING_PERCENT)}.`}
                     >
                         <ChartView hideHeader height={200} spec={{ kind: "line", title: "CPU", rows: cpuRows, x: "at", y: "value", series: "series", unit: "%" }} annotations={{ thresholds: [{ value: POSTGRES_CPU_WARNING_PERCENT, label: `${POSTGRES_CPU_WARNING_PERCENT} %`, tone: "warning" }] }} />
                     </VisualCard>
@@ -585,15 +632,27 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         id="estate.t4.connections"
                         className="span-6"
                         title="Connections"
-                        subtitle="Active connections on T4 and its read replica, and T4's failed connections (dashed)."
+                        subtitle={`Active connections on T4 and its read replica, as Database Hub's Connections chart shows them, and T4's failed connections (dashed). ${POSTGRES_USABLE_CONNECTIONS} or more on T4 is a warning: ${USABLE_SLOTS_TEXT}. ${FAILED_CONNECTIONS_CAVEAT}${(capture?.saves ?? 1) > 1 ? ` ${PER_MINUTE_NOTE}` : ""}`}
                         specs={[d.pgSeriesSpec]}
+                        ask={{ specs: [d.pgSeriesAskSpec] }}
                         loading={d.pgSeries.loading}
                         error={d.pgSeries.error}
                         empty={!d.pgSeries.loading && connRows.length === 0}
                         table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "series", label: "Series", kind: "text" }, { key: "value", label: "Connections", kind: "int" }], rows: connRows, caption: "Connections per interval" }}
-                        summary={`${failedTotal} failed connections on T4.`}
+                        summary={`${
+                            connPeak
+                                ? `T4's active connections peaked at ${formatBeside(connPeak.value, "int", POSTGRES_USABLE_CONNECTIONS)} at ${formatDateTimeUtc(connPeak.at)}, ${atLimit ? "at or above" : "under"} the ${POSTGRES_USABLE_CONNECTIONS} slots clients can use.`
+                                : "No active connections on T4 in this capture."
+                        } Azure Monitor counted ${formatNumber(failedTotal, "int")} failed connection${failedTotal === 1 ? "" : "s"} on T4, which leave out a client refused at the connection limit.`}
                     >
-                        <ChartView hideHeader height={200} spec={{ kind: "line", title: "Connections", rows: connRows, x: "at", y: "value", series: "series", unit: "count" }} colors={{ "T4, failed": "var(--status-fail)" }} dashed={["T4, failed"]} />
+                        <ChartView
+                            hideHeader
+                            height={200}
+                            spec={{ kind: "line", title: "Connections", rows: connRows, x: "at", y: "value", series: "series", unit: "count" }}
+                            colors={{ "T4, failed": "var(--status-fail)" }}
+                            dashed={["T4, failed"]}
+                            annotations={{ thresholds: [{ value: POSTGRES_USABLE_CONNECTIONS, label: `${POSTGRES_USABLE_CONNECTIONS}: the slots clients can use`, tone: "warning" }] }}
+                        />
                     </VisualCard>
 
                     <VisualCard
@@ -602,6 +661,7 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
                         title="What the notebook found"
                         subtitle="The findings of the latest PostgreSQL capture, worst first."
                         specs={[d.pgFindingsSpec]}
+                        ask={{ specs: [] }}
                         loading={d.pgFindings.loading}
                         error={d.pgFindings.error}
                         empty={!d.pgFindings.loading && d.pgFindingRows.length === 0}
@@ -629,7 +689,8 @@ function PostgresDetail({ crumbs, focus }: { crumbs: Array<{ label: string; onCl
 function cosmosRows(capture: CosmosCapture | null, series: Array<[string, string]>): Row[] {
     const out: Row[] = [];
     for (const [metric, label] of series) {
-        for (const p of cosmosSeries(capture, metric)) out.push({ at: iso(p.at), series: label, value: p.value });
+        const points = cosmosSeries(capture, metric);
+        for (const p of ADDITIVE_METRICS.has(metric) ? perMinute(points, capture) : points) out.push({ at: iso(p.at), series: label, value: p.value });
     }
     return out.sort((a, b) => String(a.at).localeCompare(String(b.at)));
 }
@@ -648,7 +709,9 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
     const availability = cosmosSeries(capture, COSMOS_METRICS.availability).map((p) => p.value);
     const lowest = availability.length > 0 ? Math.min(...availability) : null;
     const latency = cosmosSeries(capture, COSMOS_METRICS.latency);
-    const latencyAvg = latency.length > 0 ? latency.reduce((a, p) => a + p.value, 0) / latency.length : null;
+    // Weighted by each interval's length (F35: a window can hold saves at different intervals).
+    const latencyWeight = latency.reduce((a, p) => a + spanMinutes(p, capture?.intervalMinutes ?? 1), 0);
+    const latencyAvg = latency.length > 0 ? latency.reduce((a, p) => a + p.value * spanMinutes(p, capture?.intervalMinutes ?? 1), 0) / latencyWeight : null;
     const latencyPeak = postgresPeak(latency);
     const episodes = throttleEpisodes(d.cosmosFindingsState.data?.rows ?? []);
     const recovery = d.cosmosFindingRows.find((f) => f.id === "cosmosdb.T5.recovery") ?? null;
@@ -663,13 +726,26 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
     const latencyRows = latency.map((p) => ({ at: iso(p.at), "Gateway latency": p.value }));
     const loading = d.cosmosSeriesState.loading || d.cosmosFindingsState.loading;
     const none = !loading && !d.cosmosSeriesState.error && !capture && d.cosmosFindingRows.length === 0;
-    const interval = capture?.intervalMinutes ? `${formatNumber(capture.intervalMinutes, "int")}-minute intervals` : "intervals";
+    const merged = (capture?.saves ?? 1) > 1;
+    const lengths = merged ? [...new Set(ru.map((p) => grainMinutes(p, capture?.intervalMinutes ?? 1)))].sort((a, b) => a - b) : [];
+    const interval =
+        lengths.length > 1
+            ? `${formatNumber(lengths[0], "int")}- to ${formatNumber(lengths[lengths.length - 1], "int")}-minute intervals`
+            : capture?.intervalMinutes
+              ? `${formatNumber(capture.intervalMinutes, "int")}-minute intervals`
+              : "intervals";
 
     return (
         <div className="page">
             <PageHeader
                 title="T5 · Azure Cosmos DB"
-                description={capture ? `${capture.account || "The account"}: the latest capture of Azure Monitor metrics, ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)} in ${interval}, captured ${formatAgo(capture.capturedAt)}.` : "T5, an Azure Cosmos DB for NoSQL account, from Azure Monitor metrics the demo captures at a session's end."}
+                description={
+                    capture
+                        ? merged
+                            ? `${capture.account || "The account"}: Azure Monitor metrics from ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)} in ${interval}, the latest capture's window, captured ${formatAgo(capture.capturedAt)}, ${MERGED_NOTE}.`
+                            : `${capture.account || "The account"}: the latest capture of Azure Monitor metrics, ${formatDateTimeUtc(capture.windowStart)} to ${formatDateTimeUtc(capture.windowEnd)} in ${interval}, captured ${formatAgo(capture.capturedAt)}.`
+                        : "T5, an Azure Cosmos DB for NoSQL account, from Azure Monitor metrics the demo captures at a session's end."
+                }
                 crumbs={crumbs}
                 filter={false}
                 actions={
@@ -690,7 +766,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         <KpiTile label="Account" value={capture?.account || "\u2013"} sub={provisioned !== null ? `Azure Cosmos DB for NoSQL \u00b7 ${formatNumber(provisioned, "int")} RU/s provisioned` : "Azure Cosmos DB for NoSQL"} />
                         <KpiTile
                             label="Normalized RU, peak"
-                            value={formatNumber(ruPeak?.value ?? null, "percent")}
+                            value={formatBeside(ruPeak?.value ?? null, "percent", 100)}
                             status={ruPeak ? (ruPeak.value >= 100 ? "Warning" : "Pass") : null}
                             sub={ruPeak ? `at ${formatDateTimeUtc(ruPeak.at)} \u00b7 100 % throttles` : ""}
                             actions={
@@ -700,7 +776,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                                         visualId="estate.t5.ru"
                                         prompt={`Why did T5's normalized RU consumption reach ${formatNumber(ruPeak.value, "percent")} at ${formatDateTimeUtc(ruPeak.at)}, with ${formatNumber(throttled, "int")} requests throttled (429)? Should I raise the provisioned RU/s, switch to autoscale, or spread a hot partition key?`}
                                         anomaly={{ metric: "Normalized RU consumption", target: "T5", at: ruPeak.at.toISOString(), value: ruPeak.value, unit: "%" }}
-                                        specs={[d.cosmosSeriesSpec]}
+                                        specs={[d.cosmosSeriesAskSpec]}
                                         rows={ruRows}
                                     />
                                 ) : undefined
@@ -713,7 +789,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                             sub={requests > 0 ? `${percent(throttled / requests, 1)} of ${formatNumber(requests, "int")} requests` : "No requests in the capture"}
                         />
                         <KpiTile label="Recovery" value={recovery ? (recovery.status === "Pass" ? "Recovered" : "Not yet") : throttled > 0 ? "\u2013" : "No throttling"} status={recovery?.status ?? (throttled > 0 ? null : "Pass")} sub={recovery ? recovery.text : "Back at baseline before the capture ended"} />
-                        <KpiTile label="Availability, lowest" value={lowest === null ? "\u2013" : formatNumber(lowest, "percent")} status={lowest === null ? null : lowest < 99.99 ? "Warning" : "Pass"} sub="429s aren't availability errors" />
+                        <KpiTile label="Availability, lowest" value={lowest === null ? "\u2013" : formatBeside(lowest, "percent", 99.99)} status={lowest === null ? null : lowest < 99.99 ? "Warning" : "Pass"} sub="429s aren't availability errors" />
                         <KpiTile label="Gateway latency" value={latencyAvg === null ? "\u2013" : formatNumber(latencyAvg, "ms")} sub={latencyPeak ? `average \u00b7 peak ${formatNumber(latencyPeak.value, "ms")}` : "average"} />
                     </section>
 
@@ -723,12 +799,13 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         title="Normalized RU, and when it throttled"
                         subtitle={`The highest normalized RU consumption in each interval: at 100 % the account throttles requests (429).${provisioned !== null ? ` Provisioned throughput stays at ${formatNumber(provisioned, "int")} RU/s.` : ""} Shaded: the intervals that throttled.`}
                         specs={[d.cosmosSeriesSpec, d.cosmosFindingsSpec]}
+                        ask={{ specs: [d.cosmosSeriesAskSpec] }}
                         loading={d.cosmosSeriesState.loading}
                         error={d.cosmosSeriesState.error}
                         empty={!d.cosmosSeriesState.loading && ruRows.length === 0}
                         emptyText="No normalized RU in this capture."
                         table={{ columns: [{ key: "at", label: "Interval (UTC)", kind: "datetime" }, { key: "Normalized RU", label: "Normalized RU (%)", kind: "percent" }], rows: ruRows, caption: "Normalized RU per interval" }}
-                        summary={ruPeak ? `Normalized RU peaked at ${formatNumber(ruPeak.value, "percent")}; ${throttledRuns(capture).length} throttled stretches in ${episodes.length} episodes.` : "No normalized RU."}
+                        summary={ruPeak ? `Normalized RU peaked at ${formatBeside(ruPeak.value, "percent", 100)}; ${throttledRuns(capture).length} throttled stretches in ${episodes.length} episodes.` : "No normalized RU."}
                         askPrompt="Explain T5's normalized RU in this capture: when did it throttle, why, and did it recover?"
                     >
                         <ChartView
@@ -738,7 +815,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                             annotations={{
                                 bands: throttledRuns(capture).map((r) => ({ from: r.from, to: r.to, tone: "incident" as const })),
                                 thresholds: [{ value: 100, label: "100 %: throttling", tone: "warning" }],
-                                markers: ruPeak && ruPeak.value < 100 ? [{ x: ruPeak.at, y: ruPeak.value, label: `peak ${formatNumber(ruPeak.value, "percent")}` }] : [],
+                                markers: ruPeak && ruPeak.value < 100 ? [{ x: ruPeak.at, y: ruPeak.value, label: `peak ${formatBeside(ruPeak.value, "percent", 100)}` }] : [],
                             }}
                         />
                     </VisualCard>
@@ -747,8 +824,9 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         id="estate.t5.requests"
                         className="span-6"
                         title="Requests and 429s"
-                        subtitle="Requests in each interval, and the ones Cosmos DB throttled (429)."
+                        subtitle={`Requests in each interval, and the ones Cosmos DB throttled (429).${merged ? ` ${PER_MINUTE_NOTE}` : ""}`}
                         specs={[d.cosmosSeriesSpec]}
+                        ask={{ specs: [d.cosmosSeriesAskSpec] }}
                         loading={d.cosmosSeriesState.loading}
                         error={d.cosmosSeriesState.error}
                         empty={!d.cosmosSeriesState.loading && requestRows.length === 0}
@@ -764,6 +842,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         title="Gateway latency"
                         subtitle="Server-side latency through the gateway, the average in each interval."
                         specs={[d.cosmosSeriesSpec]}
+                        ask={{ specs: [d.cosmosSeriesAskSpec] }}
                         loading={d.cosmosSeriesState.loading}
                         error={d.cosmosSeriesState.error}
                         empty={!d.cosmosSeriesState.loading && latencyRows.length === 0}
@@ -780,6 +859,7 @@ function CosmosDetail({ crumbs }: { crumbs: Array<{ label: string; onClick?: () 
                         title="What the notebook found"
                         subtitle="The findings of the latest Cosmos DB capture: the throttling, each episode, and the recovery."
                         specs={[d.cosmosFindingsSpec]}
+                        ask={{ specs: [] }}
                         loading={d.cosmosFindingsState.loading}
                         error={d.cosmosFindingsState.error}
                         empty={!d.cosmosFindingsState.loading && d.cosmosFindingRows.length === 0}

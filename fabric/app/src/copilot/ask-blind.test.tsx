@@ -1,0 +1,207 @@
+import { cleanup, fireEvent, screen, waitFor } from "@testing-library/react";
+import type { ComponentType } from "react";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+import EstatePage from "@/pages/EstatePage";
+import FindingsPage from "@/pages/FindingsPage";
+import IncidentsPage from "@/pages/IncidentsPage";
+import LinksPage from "@/pages/LinksPage";
+import ManagePage from "@/pages/ManagePage";
+import MissionControlPage from "@/pages/MissionControlPage";
+import OverviewPage, { OVERVIEW_PROMPT } from "@/pages/OverviewPage";
+import PerformancePage from "@/pages/PerformancePage";
+import ReadinessPage from "@/pages/ReadinessPage";
+import ReplayPage from "@/pages/ReplayPage";
+import ScoreboardPage from "@/pages/ScoreboardPage";
+import TrendsPage from "@/pages/TrendsPage";
+import type { ViewState } from "@/lib/view-state";
+import { windowPhrase } from "@/lib/agent-prompts";
+import { formatDateTimeUtc } from "@/lib/format";
+import { postmortemAsk } from "@/lib/postmortem";
+import { FIXTURES, fakeQueryClient, renderWithApp } from "@/test/render";
+import { answerKeyInContext, faultMinutesInContext, type FaultMinutes } from "@/test/blind";
+import { findIncidentsAsk, triageAsk } from "@/rca/entry";
+import type { AskContext } from "./contract";
+import { checkDax } from "./tools";
+
+// ADR 0031, decision 7 (the coordinator's call, 2026-11-20): the chat is blind, so no page hands it the demo's answer
+// key. Every "Ask Copilot", "Ask why", and Copilot draft passes measured data only, never an answer-key table or a
+// measure that reads one (run_dax would refuse to query it again), never a scenario's name or what was injected. The
+// drill-downs count too, and so does the postmortem's draft. Nor does any Ask aim the chat at a lone incident request's
+// minutes, which are its fault's own: the re-review of ff5753e2 found them in the waits the Asks' DAX read.
+const injected = FIXTURES["incident-windows"].find((r) => r.Scenario) ?? FIXTURES["incident-windows"][0];
+/** A lone incident request on T1, outside any session, beside the fixtures' session. */
+const LONE = { RequestId: "r7", RequestedAt: "2026-10-20T14:59:00", TargetKey: "T1", Profile: "incident:blocking-chain", DurationMin: 30, Intensity: 5, Concurrency: 2, Dispatch: "webhook", Status: "Pass", Message: "", WindowStart: "2026-10-20T15:00:00", WindowEnd: "2026-10-20T15:30:00" };
+const LONE_MINUTES: FaultMinutes[] = [{ target: "T1", start: new Date("2026-10-20T15:00:00Z"), end: new Date("2026-10-20T15:30:00Z") }];
+type Case = { name: string; Page: ComponentType; view?: Partial<ViewState>; postmortem?: boolean; live?: "sample"; lone?: boolean };
+const CASES: Case[] = [
+    { name: "Overview", Page: OverviewPage },
+    { name: "Overview, with Database Hub live", Page: OverviewPage, live: "sample" },
+    { name: "Estate", Page: EstatePage },
+    { name: "Estate, T1", Page: EstatePage, view: { page: "estate", target: "T1" } },
+    { name: "Estate, T2 and its migration assessment", Page: EstatePage, view: { page: "estate", target: "T2" }, live: "sample" },
+    { name: "Estate, T4 and its replica", Page: EstatePage, view: { page: "estate", target: "T4" } },
+    { name: "Estate, T5", Page: EstatePage, view: { page: "estate", target: "T5" } },
+    { name: "Performance", Page: PerformancePage },
+    { name: "Incidents", Page: IncidentsPage },
+    { name: "Incidents, one selected", Page: IncidentsPage, view: { page: "incidents", incident: String(injected.Key) } },
+    { name: "Findings", Page: FindingsPage },
+    { name: "Findings, security, live", Page: FindingsPage, view: { page: "findings", category: "security" }, live: "sample" },
+    { name: "Findings, optimization, live", Page: FindingsPage, view: { page: "findings", category: "optimization" }, live: "sample" },
+    { name: "Readiness", Page: ReadinessPage },
+    { name: "Trends", Page: TrendsPage },
+    { name: "Manage", Page: ManagePage },
+    { name: "Live views", Page: LinksPage },
+    { name: "Mission Control", Page: MissionControlPage, postmortem: true },
+    { name: "Mission Control, a lone incident request in focus", Page: MissionControlPage, view: { session: "r7" }, lone: true },
+    { name: "Scoreboard", Page: ScoreboardPage, postmortem: true },
+    { name: "Scoreboard, a lone incident request among its newest plans", Page: ScoreboardPage, postmortem: true, lone: true },
+    { name: "Session replay", Page: ReplayPage, postmortem: true },
+];
+
+/**
+ * Every file that renders a visual with its Ask (a VisualCard's Ask defaults to its own queries and rows), an Ask why, or
+ * an agent card, or hands Copilot a context itself, with the cases above that click its Asks (the review of 34a9732: Live
+ * views' card had no case).
+ */
+const COVERED: Record<string, string[]> = {
+    "/src/components/AgentPrompts.tsx": ["Incidents, one selected", "Readiness"],
+    "/src/components/AskWhy.tsx": ["Estate, T1", "Incidents, one selected"],
+    "/src/components/Insights.tsx": ["Overview", "Incidents", "Performance", "Readiness"],
+    "/src/components/LiveNow.tsx": ["Overview, with Database Hub live"],
+    "/src/components/MigrationCard.tsx": ["Estate, T2 and its migration assessment", "Findings, optimization, live"],
+    "/src/components/VisualCard.tsx": ["Overview", "Live views"],
+    "/src/mission/PostmortemDialog.tsx": ["Mission Control", "Scoreboard", "Session replay"],
+    "/src/pages/EstatePage.tsx": ["Estate", "Estate, T1", "Estate, T2 and its migration assessment", "Estate, T4 and its replica", "Estate, T5"],
+    "/src/pages/FindingsPage.tsx": ["Findings", "Findings, security, live", "Findings, optimization, live"],
+    "/src/pages/IncidentsPage.tsx": ["Incidents", "Incidents, one selected"],
+    "/src/pages/LinksPage.tsx": ["Live views"],
+    "/src/pages/ManagePage.tsx": ["Manage"],
+    "/src/pages/MissionControlPage.tsx": ["Mission Control"],
+    "/src/pages/OverviewPage.tsx": ["Overview"],
+    "/src/pages/PerformancePage.tsx": ["Performance"],
+    "/src/pages/ReadinessPage.tsx": ["Readiness"],
+    "/src/pages/ReplayPage.tsx": ["Session replay"],
+    "/src/pages/ScoreboardPage.tsx": ["Scoreboard"],
+    "/src/pages/TrendsPage.tsx": ["Trends"],
+    // The Root cause view's own Ask reads only the capture: rca-view.test.tsx clicks it, and the contract's blind scan checks its code.
+    "/src/pages/RcaPage.tsx": [],
+};
+
+/** Every button that hands Copilot a context: "Ask Copilot", "Ask why", the agent cards' "Ask Copilot prompt …", and Overview's own question. */
+const ASKS = new RegExp(`^(Ask\\b|${OVERVIEW_PROMPT.replace(/[?.]/g, "\\$&")}$)`);
+
+afterEach(() => cleanup());
+
+/** Renders a page, waits for its data, and clicks every Ask on it (the postmortem's draft too, when asked): the contexts it handed the chat. */
+async function askAll(Page: ComponentType, options: { view?: Partial<ViewState>; rca?: boolean; postmortem?: boolean; live?: "sample"; lone?: boolean } = {}): Promise<AskContext[]> {
+    const client = options.lone ? fakeQueryClient({ "scenario-runs": [...FIXTURES["scenario-runs"], LONE] }) : undefined;
+    const { copilot } = renderWithApp(<Page />, { view: options.view, rca: options.rca, live: options.live, client });
+    await waitFor(() => expect(document.querySelectorAll('[aria-busy="true"]').length).toBe(0), { timeout: 4000 });
+    for (const button of screen.queryAllByRole("button", { name: ASKS })) {
+        if (!(button as HTMLButtonElement).disabled) fireEvent.click(button);
+    }
+    if (options.postmortem) {
+        const write = await screen.findByRole("button", { name: "Write the postmortem" });
+        await waitFor(() => expect(write).toBeEnabled());
+        fireEvent.click(write);
+        fireEvent.click(await screen.findByRole("button", { name: "Draft with Copilot", hidden: true }));
+        expect(copilot.ask).toHaveBeenCalledWith(expect.objectContaining({ visualId: "postmortem.plan" }));
+    }
+    return vi.mocked(copilot.ask).mock.calls.map(([ctx]) => ctx);
+}
+
+const leaksIn = (contexts: readonly AskContext[]) =>
+    contexts.map((ctx) => ({ visual: ctx.visualId ?? ctx.title ?? "?", leak: answerKeyInContext(ctx) ?? faultMinutesInContext(ctx, LONE_MINUTES) })).filter((x) => x.leak !== null);
+
+/** The contexts whose DAX run_dax would refuse to run again: none may end in a refusal (decision 7), plain ASCII included (the hardening of 9f3d35f). */
+const refusedIn = (contexts: readonly AskContext[]) =>
+    contexts.filter((ctx) => ctx.dax).map((ctx) => ({ visual: ctx.visualId ?? ctx.title ?? "?", refusal: checkDax(ctx.dax) })).filter((x) => x.refusal !== null);
+
+describe("every Ask is blind (ADR 0031)", () => {
+    for (const { name, Page, view, postmortem, live, lone } of CASES) {
+        it(`${name}: hands the chat measured data only, and DAX that run_dax runs`, async () => {
+            const contexts = await askAll(Page, { view, postmortem, live, lone });
+            expect(leaksIn(contexts)).toEqual([]);
+            expect(refusedIn(contexts)).toEqual([]);
+            // The cases with the lone request hand the chat something, so the check above has something to read.
+            if (lone) expect(contexts.length).toBeGreaterThan(0);
+        });
+    }
+
+    it("covers every file that hands Copilot a context, with cases that click its Asks", () => {
+        // A new visual, Ask why, agent card, or call site needs a case above (or its own blind test) before it joins this list.
+        const sources = import.meta.glob(["/src/**/*.{ts,tsx}", "!/src/**/*.test.{ts,tsx}"], { query: "?raw", import: "default", eager: true }) as Record<string, string>;
+        const askers = Object.entries(sources)
+            .filter(([, text]) => /<VisualCard\b|<AskWhy\b|<AgentCard\b|<Insights\b|copilot\.ask\(/.test(text))
+            .map(([path]) => path)
+            .sort();
+        expect(askers).toEqual(Object.keys(COVERED).sort());
+        const names = new Set(CASES.map((c) => c.name));
+        for (const [file, cases] of Object.entries(COVERED)) for (const name of cases) expect(names.has(name), `${file}: ${name}`).toBe(true);
+    });
+});
+
+// The coordinator's call (2026-11-20): the chat's entry points never drop below the release's. Where decision 7 took an
+// Ask away because it had only the answer key to hand over, the card hands the chat a window to investigate instead, once
+// the history has the RCA tables (the investigation tools come with them). Without them, the card has no Ask.
+const BLIND_ENTRIES: Array<{ name: string; Page: ComponentType; view?: Partial<ViewState>; visuals: string[]; tool: "find_incidents" | "triage_window" }> = [
+    { name: "Overview's incidents", Page: OverviewPage, visuals: ["overview.incidents"], tool: "find_incidents" },
+    { name: "Overview's sessions", Page: OverviewPage, visuals: ["overview.sessions"], tool: "triage_window" },
+    { name: "the Incidents timeline and list", Page: IncidentsPage, visuals: ["incidents.timeline", "incidents.list"], tool: "find_incidents" },
+    { name: "a SQL target's incidents", Page: EstatePage, view: { page: "estate", target: "T1" }, visuals: ["estate.target.incidents"], tool: "find_incidents" },
+    { name: "Manage's sessions", Page: ManagePage, visuals: ["manage.sessions"], tool: "triage_window" },
+    { name: "Replay's moments", Page: ReplayPage, visuals: ["replay.events"], tool: "triage_window" },
+    { name: "the scoreboard's faults", Page: ScoreboardPage, visuals: ["scoreboard.faults"], tool: "triage_window" },
+];
+
+describe("the chat's entry points come back blind with the RCA tables (ADR 0031)", () => {
+    for (const { name, Page, view, visuals, tool } of BLIND_ENTRIES) {
+        it(`${name}: a window to investigate with ${tool}, and nothing else; no Ask without the tables`, async () => {
+            const withTables = await askAll(Page, { view, rca: true });
+            expect(leaksIn(withTables)).toEqual([]);
+            for (const visual of visuals) {
+                const ctx = withTables.find((c) => c.visualId === visual);
+                expect(ctx, visual).toBeDefined();
+                expect(ctx!.prompt).toContain(`call ${tool}`);
+                // No rows and no DAX: the chat gets the minutes and finds the rest itself.
+                expect([ctx!.rows, ctx!.dax]).toEqual([undefined, undefined]);
+            }
+            cleanup();
+            const without = await askAll(Page, { view });
+            expect(without.filter((c) => visuals.includes(c.visualId ?? "")).map((c) => c.visualId)).toEqual([]);
+        });
+    }
+
+    it("hands a session's own minutes, and the history's newest minutes otherwise", () => {
+        const from = new Date(Date.UTC(2026, 10, 17, 13, 30));
+        const to = new Date(Date.UTC(2026, 10, 17, 15, 0));
+        expect(triageAsk({ title: "The session's minutes", from, to })).toEqual({
+            title: "The session's minutes",
+            specs: [],
+            table: null,
+            prompt: expect.stringMatching(/^Triage ContosoCare's databases from 2026-11-17 13:30 UTC to 2026-11-17 15:00 UTC: call triage_window with from 2026-11-17T13:30:00Z and to 2026-11-17T15:00:00Z, then explain/),
+        });
+        expect(findIncidentsAsk({ targets: ["T1"] })).toMatchObject({ title: "The history's newest 90 minutes on T1", prompt: expect.stringMatching(/^Find the incidents in ContosoCare's databases in the history's newest 90 minutes on T1 from the signals themselves: call find_incidents/) });
+    });
+});
+
+// The re-review of ab1d2d41: the guard read only ISO times in a prompt or title, so the app's own wordings passed unseen:
+// ff5753e2's leak, a lone request's draft ("from 20 Oct 2026 15:00 to 15:30 UTC"), and agent-prompts' windowPhrase.
+describe("the guard against a lone request's minutes", () => {
+    const [lone] = LONE_MINUTES;
+    const ask = (prompt: string): AskContext => ({ title: "Why?", prompt });
+
+    it("finds them in the app's own wordings, not only in ISO times", () => {
+        const plan = { key: "r7", kind: "request" as const, label: "Deep blocking chain and lock escalation on T1", start: lone.start, end: lone.end, requestedAt: null, status: "Pass", message: "", faults: [] };
+        const draft = postmortemAsk({ plan, scores: [], episodes: [], beat: null, asOf: null, provenance: "history", specs: [], generatedAt: new Date("2026-10-21T21:00:00Z") });
+        expect(draft.title).toBe("Postmortem draft: ContosoCare from 20 Oct 2026 15:00 to 15:30 UTC");
+        expect(faultMinutesInContext(draft, LONE_MINUTES)).toBe("T1's fault minutes in the prompt: 2026-10-20T15:00:00.000Z");
+        expect(faultMinutesInContext({ title: draft.title }, LONE_MINUTES)).toBe("T1's fault minutes in the title: 2026-10-20T15:00:00.000Z");
+        expect(faultMinutesInContext(ask(`What happened ${windowPhrase(lone.start, lone.end)}?`), LONE_MINUTES)).toBe("T1's fault minutes in the prompt: 2026-10-20T15:00:00.000Z");
+        expect(faultMinutesInContext(ask(`What changed after ${formatDateTimeUtc(lone.end)}?`), LONE_MINUTES)).toBe("T1's fault minutes in the prompt: 2026-10-20T15:30:00.000Z");
+        // A session's minutes, the next morning, aren't the request's.
+        const morning = { start: new Date("2026-10-21T09:00:00Z"), end: new Date("2026-10-21T10:30:00Z") };
+        expect(faultMinutesInContext(ask(`What happened ${windowPhrase(morning.start, morning.end)}, from ${formatDateTimeUtc(morning.start)}?`), LONE_MINUTES)).toBeNull();
+    });
+});

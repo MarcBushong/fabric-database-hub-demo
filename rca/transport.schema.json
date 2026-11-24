@@ -1,0 +1,91 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/MarcBushong/fabric-database-hub-demo/rca/transport.schema.json",
+  "title": "Incident RCA transport, version 1 (ADR 0031)",
+  "description": "How evidence documents travel from the VMs into the history: the part lines the runner prints, the bundles the control's runbook writes as earlier versions of dbhub-session-metrics, the rca member of that secret's final version, and the RCA_EVIDENCE document NB_DatabaseHub_LiveActivity reads, inline or from the lakehouse file RCA_EVIDENCE_FILE names. rca/README.md, Transport, gives the encoding and the size limits.",
+  "oneOf": [
+    { "$ref": "#/$defs/bundle" },
+    { "$ref": "#/$defs/bundleIndex" },
+    { "$ref": "#/$defs/parameter" },
+    { "$ref": "#/$defs/exportIndex" }
+  ],
+  "$defs": {
+    "sessionId": { "type": ["string", "null"], "pattern": "^[0-9a-f]{32}$" },
+    "status": { "enum": ["Pass", "Fail", "Warning", "Manual action required", "Not supported", "Not selected"] },
+    "documentRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["documentId", "parts", "sha256"],
+      "properties": {
+        "documentId": { "type": "string", "pattern": "^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}$" },
+        "parts": { "type": "integer", "minimum": 1, "maximum": 99 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "exportIndex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "documents", "status", "message"],
+      "description": "What rca export prints after DBHUBDEMO-RCA-INDEX: the documents it made, for the runbook to fetch part by part.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaExportIndex" },
+        "version": { "const": 1 },
+        "documents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/documentRef" } },
+        "status": { "$ref": "#/$defs/status" },
+        "message": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "partLine": {
+      "type": "string",
+      "maxLength": 3400,
+      "pattern": "^DBHUBDEMO-RCA 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4} [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}$",
+      "description": "DBHUBDEMO-RCA, the part format (1), the documentId, index/count, the SHA-256 of the whole gzip stream, and this part's slice of it in base64, separated by single spaces."
+    },
+    "bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "sessionId", "parts"],
+      "description": "One earlier version of dbhub-session-metrics: at most 6 part lines, at most 24,000 bytes of UTF-8.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaBundle" },
+        "version": { "const": 1 },
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "parts": { "type": "array", "minItems": 1, "maxItems": 6, "items": { "$ref": "#/$defs/partLine" } }
+      }
+    },
+    "bundleIndex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "sessionId", "bundles", "documents", "status", "message"],
+      "description": "The rca member of the metrics document in dbhub-session-metrics' final version: the earlier versions that hold the bundles, and what they should add up to.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaBundleIndex" },
+        "version": { "const": 1 },
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "bundles": { "type": "array", "maxItems": 16, "uniqueItems": true, "items": { "type": "string", "pattern": "^[0-9a-f]{32}$" } },
+        "documents": { "type": "array", "maxItems": 32, "items": { "$ref": "#/$defs/documentRef" } },
+        "status": { "$ref": "#/$defs/status" },
+        "message": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "parameter": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "version", "sessionId", "parts"],
+      "description": "RCA_EVIDENCE, NB_DatabaseHub_LiveActivity's parameter: every part line of a session's documents, in any order.",
+      "properties": {
+        "kind": { "const": "ContosoCare.RcaEvidenceParts" },
+        "version": { "const": 1 },
+        "sessionId": { "$ref": "#/$defs/sessionId" },
+        "parts": { "type": "array", "minItems": 1, "maxItems": 64, "items": { "$ref": "#/$defs/partLine" } },
+        "status": { "$ref": "#/$defs/status" },
+        "message": { "type": "string", "maxLength": 500 }
+      }
+    },
+    "evidenceFile": {
+      "type": "string",
+      "pattern": "^Files/rca/inbox/[A-Za-z0-9][A-Za-z0-9._-]{0,127}\\.json$",
+      "description": "RCA_EVIDENCE_FILE, NB_DatabaseHub_LiveActivity's other parameter: a path in the demo's lakehouse to a file holding exactly one RCA_EVIDENCE document (#/$defs/parameter). The notebook reads it with notebookutils.fs.head and max_bytes 262144, and deletes it once the tables are written."
+    }
+  }
+}

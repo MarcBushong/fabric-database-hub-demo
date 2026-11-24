@@ -193,11 +193,20 @@ export const FIXTURES: Record<string, Row[]> = {    "history-meta": [
             CapturedAt: "2026-11-13T18:06:00",
         },
         {
+            FindingId: "postgresql.T4.connections",
+            TargetKey: "T4",
+            Status: "Pass",
+            StatusSort: 4,
+            Finding: "T4's active connections on pgflex01-test01 peaked at 34 at 2026-11-13 17:05 UTC, under the 35 slots clients can use (max_connections 50, less 15 reserved; a Warning at 35 or more).",
+            Evidence: '{"peak": 34, "usableConnections": 35, "maxConnections": 50, "reservedConnections": 15}',
+            CapturedAt: "2026-11-13T18:06:00",
+        },
+        {
             FindingId: "postgresql.T4.connections_failed",
             TargetKey: "T4",
             Status: "Warning",
             StatusSort: 3,
-            Finding: "Failed connections on T4 (pgflex01-test01): 4 from 2026-11-13 17:00 to 2026-11-13 17:15 UTC, at most 3 in one 5-minute interval (at 2026-11-13 17:05 UTC).",
+            Finding: "Failed connections on T4 (pgflex01-test01): 4 from 2026-11-13 17:00 to 2026-11-13 17:15 UTC, at most 3 in one 5-minute interval (at 2026-11-13 17:05 UTC). They leave out a client refused at the connection limit (too many connections), so T4's active connections show a connection surge.",
             Evidence: '{"total": 4}',
             CapturedAt: "2026-11-13T18:06:00",
         },
@@ -233,6 +242,12 @@ export interface RenderOptions {
     live?: "sample" | "off" | EstateReader;
     /** What dbhub-app.json adds to the runtime, such as t2Migration. */
     runtime?: Partial<AppRuntime>;
+    /** Whether the history model has the Incident RCA's tables (ADR 0031); unknown when absent, as before the model answers. */
+    rca?: boolean | null;
+    /** Why the check of the RCA tables failed, after its retries, whether a Try again is running, and what it calls. */
+    rcaError?: string | null;
+    rcaRetrying?: boolean;
+    retryRca?: () => void;
 }
 
 export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
@@ -259,6 +274,10 @@ export function renderWithApp(ui: ReactElement, options: RenderOptions = {}) {
         reducedMotion: true,
         notify,
         manage: options.manage ?? MANAGE_READ_ONLY,
+        ...(options.rca !== undefined ? { rca: options.rca } : {}),
+        ...(options.rcaError !== undefined ? { rcaError: options.rcaError } : {}),
+        ...(options.rcaRetrying !== undefined ? { rcaRetrying: options.rcaRetrying } : {}),
+        ...(options.retryRca ? { retryRca: options.retryRca } : {}),
     };
     const copilot: CopilotApi = { open: vi.fn(), ask: vi.fn() };
     const client = options.client ?? fakeQueryClient();

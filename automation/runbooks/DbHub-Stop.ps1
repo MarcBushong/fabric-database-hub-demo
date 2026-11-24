@@ -10,8 +10,8 @@ of the two markers below. scripts/setup-activity-control.ps1 publishes it to the
 publishes it to the nightly safety stop's own account in the demo resource group.
 
 - Scope All: started by the one-time schedule dbhub-autostop, which DbHub-Control creates at each run's end plus
-  10 minutes, and start-demo.ps1 creates for its session, 4 hours after its start by default (2026-11-19). It does
-  exactly what Stop now does: removes that schedule and the run's monitoring re-checks,
+  10 minutes, and start-demo.ps1 creates for its session, 4 hours after its start by default (2026-11-19), and by
+  ./scripts/stop-demo.ps1 during a Run all session (2026-11-22, -RequestedBy stop-demo.ps1). It does exactly what Stop now does: removes that schedule and the run's monitoring re-checks,
   deallocates both VMs, stops T4, and deletes T5's container, through Azure Resource Manager only. T5, the Azure Cosmos
   DB account (ADR 0027), has no stop, so its container, whose provisioned throughput bills every hour it exists, lives
   only during a session (2026-11-19): it's deleted when its lifecycle is Session (the demo resource group's
@@ -44,11 +44,23 @@ expired, the same night (2026-11-14).
 
 .PARAMETER Scope
 All (the default), T4, Nightly, or T3Check.
+
+.PARAMETER RequestedBy
+Who asked for a whole stop (Scope All; 2026-11-22): Auto-stop (the default: the one-time schedule dbhub-autostop or its
+backup), or stop-demo.ps1, which hands a Run all session's stop to the session control through Job - Create
+(https://learn.microsoft.com/rest/api/automation/job/create), so a re-check that's exporting the session's evidence stops
+before this stop's export, as with Stop now. The session's status says who stopped it (stoppedBy), and stop-demo.ps1's
+stop never waits for a deploy.ps1 run, which a person asked for now. Its result line has the stop's RCA lines (rcaLines),
+which stop-demo.ps1 prints.
 #>
 param(
     [Parameter(Mandatory = $false)]
     [ValidateSet('All', 'T4', 'Nightly', 'T3Check')]
-    [string] $Scope = 'All'
+    [string] $Scope = 'All',
+
+    [Parameter(Mandatory = $false)]
+    [ValidateSet('Auto-stop', 'stop-demo.ps1')]
+    [string] $RequestedBy = 'Auto-stop'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -68,7 +80,7 @@ $context = $null
 $result = $null
 try {
     $context = Initialize-DbHubContext -Settings (ConvertFrom-DbHubSetting -Json $settingsJson) -JobId $jobId
-    $result = Invoke-DbHubStop -Scope $Scope -Context $context
+    $result = Invoke-DbHubStop -Scope $Scope -Context $context -RequestedBy $RequestedBy
 }
 catch {
     $action = 'stop-' + $Scope.ToLowerInvariant()

@@ -11,7 +11,24 @@ function New-DemoT2GoldenSnapshot {
     2. Policy: the read-only inventory must not deny snapshots or disks (unless -SkipPolicyInventory).
        Then no on-demand run may be active (GOLDEN.CAPTURE.CONTROL, Get-DemoGoldenCaptureControlResult): no
        DbHub-Control or DbHub-Stop job queued or running, and no pending auto-stop, because a run starts and
-       deallocates archost01; otherwise nothing changes (review, 2026-11-04).
+       deallocates archost01; otherwise nothing changes (review, 2026-11-04). Nor may the Incident RCA's evidence that a
+       history save didn't take be listed for T2, which Prepare would delete: this PC's pending list (out/history-pending,
+       Read-DemoRcaPending), or the session control's status (its variable DbHubSessionStatus, read through Azure Resource
+       Manager: Get-DemoGoldenControlRcaPending). GOLDEN.CAPTURE.RCA names the list and the way to save them: the
+       scripts' history save for the first, a Run all session for each session the second lists, at least, since each start
+       fetches one session's on any VM, and the capture again after each (ADR 0031); both save them with the demo
+       workspace's NB_DatabaseHub_LiveActivity, so when its copy is from before the Incident RCA (Get-DemoGoldenRcaNotebookState,
+       read only then), the fix updates it first (./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook
+       NB_DatabaseHub_LiveActivity, which leaves the workspace's other notebook as it is). A status that can't be read
+       captures nothing, and neither does a variable missing from the control's account, which exists (the review of
+       40124992: since 2026-11-23 deploy.ps1 creates it only when it's missing, so a deletion, or a deployment that couldn't
+       create it, can leave it missing while sessions run), with ./scripts/deploy.ps1, which creates it, as the fix; one
+       that's encrypted (a tenant's policy can re-create the variable so, and Resource Manager then
+       returns no value) gets the fix for a governed tenant: Run all sessions, each to its planned end, until one has no
+       RCA.EARLIER line at its start about evidence still left, no RCA.EXPORT line about another session's documents, and
+       no RCA.PENDING line at its end; then, the same day, the variable deleted, deploy.ps1, which creates it again
+       unencrypted and empty (since 2026-11-23 it keeps an existing one as it is, so an update no longer loses what it
+       lists), and the capture, before it's encrypted again (2026-11-23; the review of a57539ed).
     3. Starts archost01 when it's deallocated, and releases an air gap that an interrupted capture left (the
        host's Azure VM ID matches the capture record, so only the guest's network and start action return).
     4. Inspects the host and guest (vm/bootstrap/Invoke-DemoGoldenGuest.ps1 -Action Inspect, read-only) and
@@ -28,7 +45,8 @@ function New-DemoT2GoldenSnapshot {
     6. Prepare: writes the capture marker first (T2's control relay leaves the guest alone while it's there; the
        capture's own Release removes it, at step 3 and in step 9), removes the sign-in data that setup leaves on the
        VM again and checks that none remains, turns IE
-       ESC on, writes the capture record, applies the air gap (the guest's automatic start action Nothing, its
+       ESC on, deletes the Incident RCA's capture in the guest after stopping its workload runner (ADR 0031; anything
+       left means nothing is captured), writes the capture record, applies the air gap (the guest's automatic start action Nothing, its
        network adapter disconnected), and shuts the guest down cleanly. With -WipeFreeSpace, HostCompact then
        compacts the guest's VHDX (Optimize-VHD -Mode Full, mounted read-only), overwrites the host's free space
        with zeros, deletes that file, and trims the host's volume, so the snapshot keeps none of the zeroed
@@ -197,6 +215,97 @@ function New-DemoT2GoldenSnapshot {
         return $results.ToArray()
     }
 
+    # 2c. T2's Incident RCA evidence that a history save didn't take (ADR 0031): Prepare deletes what T2's guest keeps,
+    # where the runner keeps such documents to be fetched again, so a capture now would lose them (the review of 3f6cd14).
+    # Two lists name them, each with its VM, and each has its own way to fetch them: this PC's (out/history-pending),
+    # which the scripts' next history save fetches, and the session control's status, whose next start fetches the
+    # documents its runbooks exported but couldn't fetch (Get-DemoGoldenControlRcaPending). A status that can't be read
+    # captures nothing, as GOLDEN.CAPTURE.CONTROL does.
+    $pending = Read-DemoRcaPending -Config $Config
+    $t2Pending = @(@($pending.Documents) | Where-Object { $null -ne $_ -and [string]$_['vm'] -eq 'archost01' })
+    $controlPending = Get-DemoGoldenControlRcaPending -Config $Config -NowUtc $NowUtc
+    if ($controlPending.Error) {
+        $readFix = 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
+        $readEvidence = [ordered]@{ status = $controlPending.Variable }
+        if ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Missing')) {
+            # Missing from an account that exists (the review of 40124992): deploy.ps1 creates it only when it's missing, so a
+            # deletion, or a deployment that couldn't create it, can leave it so while sessions run, and their stops' lists
+            # are then only in the control vault, which the runbooks can't read back.
+            $readEvidence['missing'] = $true
+            $readFix = 'Run ./scripts/deploy.ps1, which creates it (CONTROL.RESOURCES says so), then ./scripts/capture-t2-golden.ps1 again. Until it exists, the runbooks keep each session''s status only in the control vault, which they can''t read back, so a session''s start doesn''t fetch what the last stop left on the VMs.'
+        }
+        elseif ([bool](Get-DemoMemberValue -InputObject $controlPending -Name 'Encrypted')) {
+            # A tenant's policy can re-create the variable encrypted (2026-11-23): then only the runbooks read it, and since
+            # 2026-11-23 deploy.ps1 keeps an existing variable as it is, so that an update no longer loses what it lists; it
+            # creates one only when there's none. So it reads again only once deleted and created again, empty, which loses
+            # what it lists. Run all prints what's left from the vault's copy of the status: RCA.EARLIER at a start,
+            # RCA.EXPORT's note of another session's documents, which the status then carries for that session, and
+            # RCA.PENDING at the end. A stop before the session's planned end can leave capture that none of them names (O1;
+            # the review of a57539ed).
+            $readEvidence['encrypted'] = $true
+            $controlName = Get-DemoActivityControlName -Config $Config
+            $readFix = 'Running the capture again won''t help by itself: only the control''s runbooks read an encrypted variable, and ./scripts/deploy.ps1 keeps an existing one as it is. To save what it may list first, run sessions with Run all in {0}, each to its planned end, by Run all''s own end or its auto-stop (a stop before it, by STOP_NOW, the Insights app''s Stop now, or ./scripts/stop-demo.ps1, can leave capture that the stop''s lines don''t name), until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, delete it (az rest --method delete --url "https://management.azure.com{1}/variables/DbHubSessionStatus?api-version=2024-10-23", or {2}''s Variables in the Azure portal), run ./scripts/deploy.ps1, which creates it again, unencrypted and empty, and then ./scripts/capture-t2-golden.ps1.' -f $controlPending.Notebook, $controlName.AutomationAccountId, $controlName.AutomationAccount
+        }
+        & $add 'GOLDEN.CAPTURE.RCA' 'Fail' ('The session control''s status ({0}) couldn''t be read ({1}), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.' -f $controlPending.Variable, $controlPending.Error) $readEvidence $readFix
+        return $results.ToArray()
+    }
+    $t2Control = @(@($controlPending.Documents) | Where-Object { $null -ne $_ -and [string]$_['vm'] -eq 'archost01' })
+    # Each start fetches one session's documents, on whichever VM they are: unsaved bundles first, then the earliest to
+    # expire (Get-DbHubRcaEarlier). So every session the status lists counts, and sessions with only unsaved bundles,
+    # which the list doesn't show, can come first: the count is a minimum (the reviews of 0a9fb8d and e716ff8).
+    $statusSessions = @(@($controlPending.Documents) | Where-Object { $null -ne $_ } | ForEach-Object { [string]$_['sessionId'] } | Select-Object -Unique)
+    if ($t2Pending.Count -gt 0 -or $t2Control.Count -gt 0) {
+        $shown = [string]$pending.Path
+        $root = $script:RepoRoot.TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+        if ($shown.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
+            $shown = './' + $shown.Substring($root.Length).Replace('\', '/')
+        }
+        $evidence = [ordered]@{ path = $shown; documents = @($t2Pending | ForEach-Object { [string]$_['documentId'] }); status = $controlPending.Variable; statusDocuments = @($t2Control | ForEach-Object { [string]$_['documentId'] }); statusSessions = $statusSessions.Count }
+        $save = ''
+        if ($t2Pending.Count -gt 0) {
+            $hostPower = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName 'archost01'
+            $evidence['hostPower'] = [string]$hostPower
+            $save = if ($hostPower -eq 'PowerState/running') { './scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity' } else { './scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory' }
+        }
+        # Both ways save them with the demo workspace's NB_DatabaseHub_LiveActivity, which Run all runs too. A copy from
+        # before the Incident RCA, which deploy.ps1 keeps while fabric.importNotebooks is false, saves none of them, so the
+        # scripts' save would fetch them again and again and this refusal would stay (the review of c059878): the fix
+        # updates it first. Read as FABRIC.RCA.EVIDENCE reads it; one that can't be read gets the fix's condition instead.
+        $notebook = Get-DemoGoldenRcaNotebookState -Config $Config
+        $evidence['activityNotebook'] = if (-not $notebook.Known) { 'unknown' } elseif ($notebook.Current) { 'current' } else { 'fromBeforeRca' }
+        $lose = 'and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+        $runAll = 'run a session with Run all in {0} for each session the status lists, at least {1}: each start fetches one session''s documents, and its end saves them with its history.' -f $controlPending.Notebook, [System.Math]::Max(1, $statusSessions.Count)
+        $again = 'Then run ./scripts/capture-t2-golden.ps1 again.'
+        $runAllAgain = 'Run ./scripts/capture-t2-golden.ps1 again after each.'
+        $update = ''
+        $saveLead = 'Save the history first'
+        $runLead = 'First, '
+        $ifOld = ''
+        if ($notebook.Known -and -not $notebook.Current) {
+            $kept = if ([bool](Get-DemoMemberValue -InputObject $Config['fabric'] -Name 'importNotebooks')) { '' } else { ' (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy)' }
+            $update = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them{0}: ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity. ' -f $kept
+            $saveLead = 'Then save the history'
+            $runLead = 'Then '
+        }
+        elseif (-not $notebook.Known) {
+            $ifOld = ' If a save says the demo workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA, run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which updates it, and save again.'
+        }
+        if ($t2Control.Count -eq 0) {
+            $message = '{0} Incident RCA evidence document(s) from T2 aren''t in the history yet ({1} lists them), {2}' -f $t2Pending.Count, $shown, $lose
+            $fix = '{0}{1}: {2}, which fetches them from T2.{3} {4}' -f $update, $saveLead, $save, $ifOld, $again
+        }
+        elseif ($t2Pending.Count -eq 0) {
+            $message = '{0} Incident RCA evidence document(s) from T2 aren''t in the history yet (the session control''s status lists them, in {1}), {2}' -f $t2Control.Count, $controlPending.Variable, $lose
+            $fix = '{0}{1}{2}{3} {4}' -f $update, $runLead, $runAll, $ifOld, $runAllAgain
+        }
+        else {
+            $message = '{0} Incident RCA evidence document(s) from T2 aren''t in the history yet ({1} lists {2}, and the session control''s status, in {3}, lists {4}), {5}' -f ($t2Pending.Count + $t2Control.Count), $shown, $t2Pending.Count, $controlPending.Variable, $t2Control.Count, $lose
+            $fix = '{0}{1}: {2}, which fetches the ones {3} lists. Then {4}{5} {6}' -f $update, $saveLead, $save, $shown, $runAll, $ifOld, $runAllAgain
+        }
+        & $add 'GOLDEN.CAPTURE.RCA' 'Fail' $message $evidence $fix
+        return $results.ToArray()
+    }
+
     # 3. The host running, with a guest an interrupted capture left air-gapped released. The power state it was
     # found in is what GOLDEN.CAPTURE.SOURCE returns it to.
     $foundPower = Get-DemoVmPowerState -SubscriptionId $subscriptionId -ResourceGroupName $resourceGroupName -VmName 'archost01'
@@ -332,11 +441,21 @@ function New-DemoT2GoldenSnapshot {
         }
         $prepared = $prepare.Data
         $prepareEvidence = [ordered]@{}
-        foreach ($name in 'cachesRemoved', 'logFilesRedacted', 'signInCachesLeft', 'setupLogFilesWithToken', 'ieEsc', 'airGap', 'guestState', 'guestShutdownSeconds') {
+        foreach ($name in 'cachesRemoved', 'logFilesRedacted', 'signInCachesLeft', 'setupLogFilesWithToken', 'ieEsc', 'airGap', 'guestState', 'guestShutdownSeconds', 'rcaSpansRemoved', 'rcaSpansNotExported') {
             $prepareEvidence[$name] = Get-DemoMemberValue -InputObject $prepared -Name $name
         }
         $record = Get-DemoMemberValue -InputObject $prepared -Name 'record'
-        & $add 'GOLDEN.CAPTURE.PREPARE' 'Pass' ('The guest passed its own sign-in check again (caches removed: {0}, log files redacted: {1}), and is air-gapped and shut down in {2} seconds.' -f $prepareEvidence['cachesRemoved'], $prepareEvidence['logFilesRedacted'], $prepareEvidence['guestShutdownSeconds']) $prepareEvidence
+        $prepareMessage = 'The guest passed its own sign-in check again (caches removed: {0}, log files redacted: {1}), and is air-gapped and shut down in {2} seconds.' -f $prepareEvidence['cachesRemoved'], $prepareEvidence['logFilesRedacted'], $prepareEvidence['guestShutdownSeconds']
+        # The Incident RCA's capture in the guest, deleted so the snapshot carries none (ADR 0031; the docs review of 0189a4b).
+        $rcaSpans = [int]$prepareEvidence['rcaSpansRemoved']
+        $rcaNotExported = [int]$prepareEvidence['rcaSpansNotExported']
+        if ($rcaSpans -gt 0) {
+            # "Exported" isn't "in the history": a save can fail after an export. Step 2c refused while this PC's pending list
+            # held T2's documents (the review of 3f6cd14).
+            $rcaNote = if ($rcaNotExported -gt 0) { ' The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: {0} observation span(s), {1} of them never fully exported, so that part of T2''s evidence isn''t in the history.' -f $rcaSpans, $rcaNotExported } else { ' The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: {0} observation span(s), each taken by an export, and none of T2''s documents was waiting in this PC''s pending list for a history save.' -f $rcaSpans }
+            $prepareMessage += $rcaNote
+        }
+        & $add 'GOLDEN.CAPTURE.PREPARE' 'Pass' $prepareMessage $prepareEvidence
         if ($WipeFreeSpace) {
             # 6b. With the guest off: its VHDX compacted, then the host's free space zeroed and trimmed.
             $compact = Invoke-DemoDiskWipeAction -Config $Config -Action 'HostCompact'

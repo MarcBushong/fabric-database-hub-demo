@@ -190,15 +190,162 @@ Describe 'VM step runner' {
         (Get-DemoVmState)['steps']['Stubborn']['lastError'] | Should -Match 'check still fails'
     }
 
-    It 'keeps step warnings, such as trust on first use, and reports Warning when Ready' {
+    It 'keeps step warnings, such as trust on first use, each naming its step, and reports Warning when Ready' {
         $root = New-TestRoot
         $steps = @(@{ Name = 'Media'; Test = { $false }; Set = { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' -WarningMessage 'Trusted on first use.' } })
         Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
         $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
         $health.status | Should -Be 'Warning'
-        $health.warnings | Should -Contain 'Trusted on first use.'
+        $health.warnings | Should -Contain 'Media: Trusted on first use.' -Because 'validate.ps1 says which step warned (F24)'
     }
 
+    It 'records a note a new VM''s bootstrap gives by design as information, naming its step, so a Ready VM stays a Pass; a warning beside it sets the status, and the next generation lets the note go (2026-11-23)' {
+        $note = 'SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.'
+        $steps = @(
+            @{ Name = 'SqlAdminAccess'; Test = { $script:recovered }; Set = { $script:recovered = $true; New-DemoVmStepResult -Outcome 'Done' -NoteMessage 'SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.' } }
+            @{ Name = 'Media'; Test = { -not $script:mediaWarns }; Set = { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' -WarningMessage 'Trusted on first use.' } }
+        )
+        # The note alone: a Pass, and health.json still matches its schema.
+        $root = New-TestRoot
+        $script:recovered = $false
+        $script:mediaWarns = $false
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        $health.status | Should -Be 'Pass' -Because 'a note is information, not a warning'
+        @($health.warnings).Count | Should -Be 0
+        @($health.notes) | Should -Be @($note)
+        Test-Json -Json (Get-Content -LiteralPath (Join-Path -Path $root -ChildPath 'health.json') -Raw) -SchemaFile $healthSchema | Should -BeTrue
+
+        # A warning beside it: the warning alone makes the status a Warning, and the note stays a note.
+        $root = New-TestRoot
+        $script:recovered = $false
+        $script:mediaWarns = $true
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        $health.status | Should -Be 'Warning'
+        @($health.warnings) | Should -Be @('Media: Trusted on first use.')
+        @($health.notes) | Should -Be @($note)
+
+        # A new generation clears the note, as it does a one-off warning, and the step passes its Test, so it doesn't come
+        # back; the lasting warning stays.
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        @($health.notes).Count | Should -Be 0
+        @((Get-DemoVmState)['notes']).Count | Should -Be 0
+        @($health.warnings) | Should -Be @('Media: Trusted on first use.')
+    }
+
+    It 'records the generation in which each step''s Set ran, so a step can tell a new VM''s setup from an established VM''s (the review of cb4bc479)' {
+        New-TestRoot | Out-Null
+        $script:built = $false
+        $script:adminDone = $false
+        $script:seen = @()
+        $steps = @(
+            @{ Name = 'Build'; Test = { $script:built }; Set = { $script:built = $true } }
+            @{ Name = 'Admin'; Test = { $script:adminDone }; Set = {
+                    $script:seen += [pscustomobject]@{ Built = (Test-DemoVmStepSetThisGeneration -Name 'Other', 'Build'); First = (Test-DemoVmStepFirstSetup -Name 'Admin') }
+                    $script:adminDone = $true
+                } }
+        )
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        # A later generation: Build stands, so its Test passes, and Admin has something to do again.
+        $script:adminDone = $false
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Should -Be 'Ready'
+        $script:seen.Count | Should -Be 2
+        $script:seen[0].Built | Should -BeTrue -Because 'Build''s Set ran in g1'
+        $script:seen[0].First | Should -BeTrue -Because 'Admin had never completed'
+        $script:seen[1].Built | Should -BeFalse -Because 'Build stood in g2'
+        $script:seen[1].First | Should -BeFalse -Because 'Admin completed in g1'
+        (Get-DemoVmState)['steps']['Build']['setGeneration'] | Should -Be 'g1'
+        (Get-DemoVmState)['steps']['Admin']['setGeneration'] | Should -Be 'g2'
+    }
+
+    It 'keeps a lasting cause''s warning across a generation while its step passes its Test, and lets a one-off note and a fixed cause go (F24 review)' {
+        $root = New-TestRoot
+        $script:restartDone = $false
+        $script:cleanupRan = $false
+        $script:agentFixed = $false
+        $steps = @(
+            # A one-off note: the restart has happened by the next generation.
+            @{ Name = 'Restart'; Test = { $script:restartDone }; Set = { $script:restartDone = $true; New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage 'Setup asked for a restart; the next start completes it.' } }
+            # A lasting cause (GuestFirstBoot: SSAS and SSIS still installed), whose step passes its Test from then on.
+            @{ Name = 'Cleanup'; Test = { $script:cleanupRan }; Set = { $script:cleanupRan = $true; New-DemoVmStepResult -Outcome 'Done' -WarningMessage 'Uninstalling AS,IS didn''t pass; its services stay stopped and disabled.' } }
+            # A cause its step's Set fixes when it runs again: its Test fails until then.
+            @{ Name = 'Agent'; Test = { $script:agentFixed }; Set = { if ($script:agentFixed -eq $false -and $script:agentRuns -ge 1) { $script:agentFixed = $true; return }; $script:agentRuns = 1; New-DemoVmStepResult -Outcome 'InProgress' -WarningMessage 'The agent didn''t restart yet.' } }
+        )
+        $script:agentRuns = 0
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Out-Null
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @('Restart: Setup asked for a restart; the next start completes it.', 'Cleanup: Uninstalling AS,IS didn''t pass; its services stay stopped and disabled.', 'Agent: The agent didn''t restart yet.')
+        # A new generation checks every step again: Restart's and Cleanup's Tests pass, and Agent's Set runs again.
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        @($health.warnings) | Should -Be @('Cleanup: Uninstalling AS,IS didn''t pass; its services stay stopped and disabled.') -Because 'the cause is still there, though Cleanup''s Set didn''t run again'
+        $health.status | Should -Be 'Warning'
+        # The same generation keeps it, and so does the next one.
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g3' | Should -Be 'Ready'
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @('Cleanup: Uninstalling AS,IS didn''t pass; its services stay stopped and disabled.')
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'state.json')).transientWarnings).Count | Should -Be 0
+    }
+
+    It 'lets a one-off note of a bundle from before the step names go at a new generation, and keeps its other warnings (F24 review)' {
+        $root = New-TestRoot
+        $state = Get-DemoVmState
+        $state['generation'] = 'old'
+        $state['warnings'] = @(
+            'SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.',
+            'SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.',
+            'No SHA-256 is pinned for SQL2022-SSEI-Dev.exe; its first download was trusted and recorded as abc. Pin it in config/versions.json.',
+            'Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed"); its services stay stopped and disabled, and Arc''s inventory may list it as another instance.'
+        )
+        Save-DemoVmState -State $state
+        Invoke-DemoVmStateMachine -Step @(@{ Name = 'A'; Test = { $true }; Set = { } }) -Generation 'new' | Should -Be 'Ready'
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @('Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed"); its services stay stopped and disabled, and Arc''s inventory may list it as another instance.')
+    }
+
+    It 'keeps a lasting warning when its step''s Set runs again but <Case>, until a Set that runs to its end says what holds (F24 re-review)' -ForEach @(
+        @{ Case = 'throws (PowerShell Direct broke, #65)'; Again = { throw 'The guest arcsql01 did not answer over PowerShell Direct.' } }
+        @{ Case = 'returns InProgress (the guest is restarting)'; Again = { New-DemoVmStepResult -Outcome 'InProgress' -Message 'The guest arcsql01 is restarting.' } }
+    ) {
+        $root = New-TestRoot
+        $script:phase = 'first'
+        $script:again = $Again
+        $steps = @(@{ Name = 'GuestFirstBoot'; MaxAttempts = 3; Test = { $script:phase -in 'done', 'reachable' }; Set = {
+                    if ($script:phase -eq 'first') { $script:phase = 'done'; return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage 'Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed").') }
+                    & $script:again
+                } })
+        $lasting = 'GuestFirstBoot: Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed").'
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g1' | Should -Be 'Ready'
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @($lasting)
+        # The next deploy.ps1's generation finds the guest unreachable: the Test fails, and the Set runs but can't finish.
+        $script:phase = 'unreachable'
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Out-Null
+        @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be @($lasting) -Because 'SQL Server Analysis and Integration Services are still installed'
+        # Five minutes later, the guest answers, and the Test passes again: the warning stays.
+        $script:phase = 'reachable'
+        Invoke-DemoVmStateMachine -Step $steps -Generation 'g2' | Should -Be 'Ready'
+        $health = Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')
+        @($health.warnings) | Should -Be @($lasting)
+        $health.status | Should -Be 'Warning'
+    }
+
+    It 'names the step of a lasting warning that a bundle from before the step names left, so it goes once its step''s Set ends without it, and shows once while it holds (F24 re-review)' {
+        $legacy = 'Uninstalling AS,IS in arcsql01 didn''t pass (setup C:\setup.exe, exit code 1603, final result "Failed"); its services stay stopped and disabled, and Arc''s inventory may list it as another instance.'
+        foreach ($case in @(
+                @{ Holds = $false; Expect = @() }
+                @{ Holds = $true; Expect = @('GuestFirstBoot: ' + $legacy) }
+            )) {
+            $root = New-TestRoot
+            $state = Get-DemoVmState
+            $state['generation'] = 'old'
+            $state['warnings'] = @($legacy, 'Some other note an older bundle wrote.')
+            Save-DemoVmState -State $state
+            $script:holds = $case.Holds
+            $script:legacy = $legacy
+            $steps = @(@{ Name = 'GuestFirstBoot'; Test = { $false }; Set = { if ($script:holds) { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' -WarningMessage $script:legacy } else { New-DemoVmStepResult -Outcome 'NotSelected' -Message 'x' } } })
+            Invoke-DemoVmStateMachine -Step $steps -Generation 'new' | Should -Be 'Ready'
+            @((Read-TestJson (Join-Path -Path $root -ChildPath 'health.json')).warnings) | Should -Be (@('Some other note an older bundle wrote.') + @($case.Expect)) -Because 'a text no step gives stays as it was, and the step''s Set adds its own last'
+        }
+    }
     It 'writes health.json that matches vm/health/health.schema.json' {
         $root = New-TestRoot
         $steps = @(@{ Name = 'A'; Test = { $true }; Set = { } })

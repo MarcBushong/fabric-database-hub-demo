@@ -32,8 +32,6 @@ export interface AnomalyContext {
     /** The value before it, for comparison. */
     baseline?: number;
     unit?: string;
-    /** The incident window's key, when the anomaly is one. */
-    incidentKey?: string;
 }
 
 /**

@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import { csvFileName, toCsv } from "./csv";
-import { clause, formatAgo, formatCell, formatDateTimeUtc, formatDuration, formatLevel, formatNumber, percent, sentence, toDate } from "./format";
+import { clause, formatAgo, formatBeside, formatCell, formatDateTimeUtc, formatDuration, formatLevel, formatNumber, percent, sentence, toDate } from "./format";
 
 describe("formatNumber", () => {
     it("formats each kind with its unit", () => {
@@ -25,6 +25,16 @@ describe("formatLevel and percent at their ends", () => {
         expect(formatLevel(99.996, "seconds")).toBe("100.0 s");
         expect([3 / 7710, 1560 / 7710, 7709 / 7710, 0, 1].map((s) => percent(s, 1))).toEqual(["less than 0.1 %", "20.2 %", "more than 99.9 %", "0.0 %", "100.0 %"]);
         expect([3 / 1000, 520 / 1000, 999 / 1000, 0, 1].map((s) => percent(s))).toEqual(["less than 1 %", "52 %", "more than 99 %", "0 %", "100 %"]);
+    });
+});
+
+describe("formatBeside: a value beside the status line it's judged by (2026-11-21)", () => {
+    it("never reads as the line from under it, or under the line from at or over it, and is formatNumber otherwise", () => {
+        expect([79.95, 79.996, 80, 80.04, 45.12].map((v) => formatBeside(v, "percent", 80))).toEqual(["79.95 %", "79.996 %", "80.0 %", "80.0 %", "45.1 %"]);
+        // Under 99.99 % availability warns; under 100 % never reads 100 either.
+        expect([99.989, 99.99, 99.996, 100, 98.5].map((v) => formatBeside(v, "percent", 99.99))).toEqual(["99.989 %", "99.99 %", "99.996 %", "100.0 %", "98.5 %"]);
+        expect([59.96, 60, 241.4].map((v) => formatBeside(v, "seconds", 60))).toEqual(["59.96 s", "60.0 s", "241 s"]);
+        expect([formatBeside(79.99999, "percent", 80), formatBeside(99.99999, "percent", 99.99), formatBeside(null, "percent", 80)]).toEqual(["just under 80 %", "just under 100 %", "–"]);
     });
 });
 

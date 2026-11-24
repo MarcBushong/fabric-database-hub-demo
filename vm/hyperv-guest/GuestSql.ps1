@@ -212,16 +212,21 @@ function Clear-DemoGuestSignInResidue {
 
 function Get-DemoSignInStepResult {
     # After a cleanup that passed: Manual action required when a token-shaped value is in a Security log, which
-    # nothing clears on its own; Done with a warning when the cleanup cleared an event log, which endpoint
-    # protection may report; nothing otherwise. Sweep and Label are parallel arrays (one per machine); VmName is the
-    # Azure VM that check-sign-in-data.ps1 reaches them through.
+    # nothing clears on its own; Done when the cleanup cleared an event log, which endpoint protection may report;
+    # nothing otherwise. Sweep and Label are parallel arrays (one per machine); VmName is the Azure VM that
+    # check-sign-in-data.ps1 reaches them through. With -Expected (the caller's step follows Arc onboarding, or a guest's
+    # build, that ran in this generation), a cleared log is a note, as information, since that setup leaves
+    # sign-in data by design; otherwise a one-off warning: a token that reached an established machine's logs since (the
+    # review of cb4bc479, 2026-11-23).
     [CmdletBinding()]
     param(
         [object[]] $Sweep,
 
         [string[]] $Label,
 
-        [string] $VmName = 'archost01'
+        [string] $VmName = 'archost01',
+
+        [switch] $Expected
     )
 
     $security = @()
@@ -251,7 +256,14 @@ function Get-DemoSignInStepResult {
         return (New-DemoVmStepResult -Outcome 'ManualActionRequired' -Message $steps[0] -Instruction $steps)
     }
     if ($cleared.Count -gt 0) {
-        return (New-DemoVmStepResult -Outcome 'Done' -WarningMessage ('The sign-in cleanup cleared {0}, because they held token-shaped values; endpoint protection may report a cleared event log.' -f ($cleared -join ', ')))
+        # What the cleanup did, once, which the next bootstrap generation clears (the F24 review, 2026-11-20): a note, as
+        # information, after the setup that leaves that data by design; a one-off warning otherwise (the expected-notes
+        # decision and the review of cb4bc479, 2026-11-23).
+        $text = 'The sign-in cleanup cleared {0}, because they held token-shaped values; endpoint protection may report a cleared event log.' -f ($cleared -join ', ')
+        if ($Expected) {
+            return (New-DemoVmStepResult -Outcome 'Done' -NoteMessage $text)
+        }
+        return (New-DemoVmStepResult -Outcome 'Done' -TransientWarningMessage $text)
     }
     return $null
 }
@@ -559,7 +571,13 @@ function Invoke-DemoGuestSqlQuery {
 
     return (Invoke-Command -VMName $Name -Credential $Credential -ArgumentList $GuestToolsFolder, $Query, $Database -ErrorAction Stop -ScriptBlock {
             param($Folder, $Text, $DatabaseName)
-            Import-Module -Name (Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1') -Force
+            $manifest = Join-Path -Path $Folder -ChildPath 'module\DbHubDemo.Vm.psd1'
+            # A new guest's first check comes before the database step copies its tools in (Copy-DemoGuestTool): said
+            # plainly, so the step's check can tell it from a failure (2026-11-20).
+            if (-not (Test-Path -LiteralPath $manifest)) {
+                throw ('The guest has no demo tools at {0} yet; the database step copies them in.' -f $Folder)
+            }
+            Import-Module -Name $manifest -Force
             Invoke-DemoVmSql -Query $Text -Database $DatabaseName -TimeoutSeconds 3600
         })
 }

@@ -6,7 +6,7 @@ Estimates demo cost per profile from live Azure retail prices (ADR 0016).
 .DESCRIPTION
 Queries the public Azure Retail Prices API. For each profile it reports running cost per hour, one
 demo-day session, idle cost per month, and a light-use month, and compares them with the ceilings in the
-configuration. The monthly ceiling (monthlyCeilingUsd, 415 USD by default for a new configuration since 2026-11-19) is hard: a light-use month
+configuration. The monthly ceiling (monthlyCeilingUsd: since 2026-11-20, init.ps1 writes a new configuration's from its region's worst case, at least 415 USD) is hard: a light-use month
 above it is Fail and the script exits with code 1. A session above sessionCeilingUsd is a Warning.
 
 T4's 7-day automatic restart: when signed in, the script also reads whether a safety stop is fully in place
@@ -20,8 +20,10 @@ the running hours only when the session control will hold its role. The script s
 T4's read replica (2026-11-13, ADR 0025) exists only during a session: start-demo.ps1 creates it and stop-demo.ps1 deletes
 it, so its compute (at T4's size), storage, and Defender plans are in the running hours (the Replica session column), and
 no automatic restart applies to it. A Burstable T4 has no replica.
-T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has no stop, so its private endpoint and private DNS zone are in the
-idle month. Its container exists only during a session since 2026-11-19, once the session control's role can create it: its
+T5, the Azure Cosmos DB account (2026-11-18, ADR 0027), has no stop, so its private endpoint and private DNS zone, when it
+has them, are in the idle month: since 2026-11-21 a new T5 in public mode has none unless a policy needs them, and when
+signed in the script reads whether the account has them (an upper bound otherwise). Its container exists only during a
+session since 2026-11-19, once the session control's role can create it: its
 400 RU/s of throughput, its storage, and Defender for Azure Cosmos DB when its plan is on Standard are then in the running
 hours. -T5ContainerLifecycle AlwaysOn prices the container all month, as while that role can't create it; when signed in and
 without it, the script reads the environment's own lifecycle. When signed in, the script also reads whether T5 has, or would
@@ -146,6 +148,9 @@ $t3UseFreeLimit = $null
 $goldenSnapshots = @()
 $t4RestartCoverage = $null
 $t5FreeTier = $null
+# Whether T5 has, or gets, its private endpoint and DNS zone (2026-11-21, ADR 0027): $null, unless signed in and told,
+# prices them, an upper bound.
+$t5PrivateEndpoint = $null
 $t5Lifecycle = if ($T5ContainerLifecycle) { $T5ContainerLifecycle } else { '' }
 # Priced all month only because nothing automatic deletes the container after a session (the re-review of 0590bbe): the
 # monthly ceiling is then a Warning, not a Fail, when the month fits with it for the running hours only.
@@ -243,6 +248,12 @@ else {
         if ($null -ne $t5FreeTier) {
             Write-DemoLog -Message ('T5''s free tier: {0} (ADR 0027).' -f $(if ($t5FreeTier) { 'yes, so its throughput costs nothing' } else { 'no, so its throughput is at list price' }))
         }
+        # T5's private endpoint (2026-11-21, ADR 0027): an existing account's own; for a new one only preflight, which reads
+        # the policies, can tell, so it's counted (an upper bound) unless networkMode is public and the account has none.
+        $t5PrivateEndpoint = & $module { param($Settings, $Mode) Get-DemoT5PrivateEndpointStatus -Config $Settings -NetworkMode $Mode } $config ([string]$NetworkMode)
+        if ($null -ne $t5PrivateEndpoint) {
+            Write-DemoLog -Message ('T5''s private endpoint and private DNS zone: {0} (ADR 0027).' -f $(if ($t5PrivateEndpoint) { 'it has them, so they bill all month' } else { 'it has none: T1''s subnet reaches it through its service endpoint' }))
+        }
         # T5's container lifecycle (2026-11-19, ADR 0027), unless -T5ContainerLifecycle gives it: the resource group's
         # DbHubT5Container tag (read-only). AlwaysOn when it says so, while the session control's role can't create the
         # container, and when an existing environment doesn't have the tag yet (deployed before then: nothing deletes it).
@@ -308,6 +319,9 @@ $summary = foreach ($name in $profileNames) {
     }
     if ($null -ne $t5FreeTier) {
         $parameters['T5FreeTier'] = $t5FreeTier
+    }
+    if ($null -ne $t5PrivateEndpoint) {
+        $parameters['T5PrivateEndpoint'] = $t5PrivateEndpoint
     }
     if ($t5Lifecycle) {
         $parameters['T5ContainerLifecycle'] = $t5Lifecycle

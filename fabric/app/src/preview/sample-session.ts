@@ -280,9 +280,10 @@ export function sessionPostgresSeries(): Row[] {
         ["T4", "cpu_percent", (i) => (inCycle(i) >= 10 && inCycle(i) < 20 ? 84 + (i % 3) * 3 : 36 + (i % 4) * 3)],
         ["T4-replica", "cpu_percent", (i) => 9 + (i % 3) * 2],
         ["T4", "memory_percent", (i) => 31 + (i % 2)],
-        ["T4", "active_connections", (i) => (inCycle(i) < 10 ? 58 : 13 + (i % 3))],
+        ["T4", "active_connections", (i) => (inCycle(i) < 10 ? 38 : 13 + (i % 3))],
         ["T4-replica", "active_connections", () => 1],
-        ["T4", "connections_failed", (i) => (i === 1 ? 3 : i === 7 ? 1 : 0)],
+        // As live (F34, 2026-11-21): Azure Monitor's failed connections stay 0 while a connection surge is refused at the limit.
+        ["T4", "connections_failed", () => 0],
     ];
     for (const [target, metric, f] of series) {
         for (let i = 0; i < points; i++) {
@@ -315,7 +316,24 @@ export function sessionPostgresFindings(): Row[] {
             CapturedAt: at,
         },
         { FindingId: "postgresql.T4-replica.lag", TargetKey: "T4-replica", Status: "Warning", StatusSort: 3, Finding: "Read replica lag on pgreplica01-sample peaked at 241.4 s at 14:25 UTC (a Warning at 60 s or more).", Evidence: '{"peakSeconds": 241.4}', CapturedAt: at },
-        { FindingId: "postgresql.T4.connections_failed", TargetKey: "T4", Status: "Warning", StatusSort: 3, Finding: "Failed connections on T4 (pgflex01-sample): 4 from 13:30 to 14:10 UTC.", Evidence: '{"total": 4}', CapturedAt: at },
+        {
+            FindingId: "postgresql.T4.connections",
+            TargetKey: "T4",
+            Status: "Warning",
+            StatusSort: 3,
+            Finding: "T4's active connections on pgflex01-sample peaked at 38 at 13:30 UTC, at or above the 35 slots clients can use (max_connections 50, less 15 reserved; a Warning at 35 or more). At the limit, PostgreSQL refuses a new client (too many connections), and Azure Monitor's failed connections don't count that refusal.",
+            Evidence: '{"peak": 38, "usableConnections": 35, "maxConnections": 50, "reservedConnections": 15}',
+            CapturedAt: at,
+        },
+        {
+            FindingId: "postgresql.T4.connections_failed",
+            TargetKey: "T4",
+            Status: "Pass",
+            StatusSort: 4,
+            Finding: "Azure Monitor counted no failed connections on T4 (pgflex01-sample) from 13:30 to 15:05 UTC. They leave out a client refused at the connection limit (too many connections), so T4's active connections show a connection surge.",
+            Evidence: '{"total": 0}',
+            CapturedAt: at,
+        },
     ];
 }
 

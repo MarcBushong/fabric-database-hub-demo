@@ -22,7 +22,10 @@ function Complete-DemoDeploymentRun {
     and found its demo stopped stops again what it started, through stop-demo.ps1's stop path, unless -KeepRunning or a
     session uses the demo now. DEPLOY.ENDSTOP (Pass, Warning, or Not selected; never NOT DONE) goes into Added, and DONE gets
     one line: what was stopped, or what bills an hour, until when, and how to stop it now. A stopped demo needs no nightly
-    stop tonight, so DONE leaves out DEPLOY.NIGHTLYSTOP's note then. The run's minutes count the stop.
+    stop tonight, so DONE leaves out DEPLOY.NIGHTLYSTOP's note then. The run's minutes count the stop. When that stop waited
+    for T2's first migration assessment and saw it upload, after this run had deployed the Insights app without T2's
+    readiness, the app's step runs once more, after the stop (F18, 2026-11-20; Complete-DemoInsightsAppMigration): its
+    records go into Added too, and replace the earlier ones in deploy.ps1's results (Merge-DemoRunResult).
 
     What an earlier run of this deployment found that this run didn't check again (F10, 2026-11-19; Get-DemoCarriedRunResult):
     a resumed run's DONE and status page still list it (under "Please confirm", in what didn't work, and in DONE's mention of
@@ -222,6 +225,7 @@ function Complete-DemoDeploymentRun {
     $endStop = $null
     $endStopProgress = @{ Phase = ''; Started = '' }
     $endStopEnded = $false
+    $appAgain = @()
     try {
         # What this run found, saved for the next run before the stop at the end, so Ctrl+C there doesn't lose it (F10): DONE's
         # note, the Insights app's and Ask's rows, and DEPLOY.CARRIED, which lists what DONE shows from an earlier run.
@@ -236,6 +240,20 @@ function Complete-DemoDeploymentRun {
             Write-DemoLog -Level Warning -Message ('The stop at the end of this run didn''t run: {0}. ./scripts/stop-demo.ps1 stops the demo now.' -f (Protect-DemoText -Text $_.Exception.Message))
         }
         $endStopEnded = $true
+        # T2's first migration assessment uploaded while the stop waited for it, after this run deployed the Insights app
+        # (F18, 2026-11-20): the app's step once more, now that the VMs are stopped, so its Migration card shows T2's
+        # readiness from this run on. Its records replace the earlier ones (Merge-DemoRunResult); never in DONE's way.
+        if ($null -ne $endStop) {
+            try {
+                $appAgain = @(Complete-DemoInsightsAppMigration -Config $Config -ConfigPath ([string](Get-DemoMemberValue -InputObject $Run -Name 'ConfigPath')) -Result @($Result) -EndStop $endStop.Result -ProgressPath ([string]$Run.ProgressPath))
+            }
+            catch {
+                if ($_.Exception -is [System.Management.Automation.PipelineStoppedException]) {
+                    throw
+                }
+                Write-DemoLog -Level Warning -Message ('The Insights app wasn''t deployed once more with T2''s readiness: {0}. ./scripts/configure-fabric-app.ps1 deploys it now.' -f (Protect-DemoText -Text $_.Exception.Message))
+            }
+        }
     }
     finally {
         # Ctrl+C during the stop at the end (the review of 2026-11-19, finding 2): deploy.ps1 calls this from its finally
@@ -246,6 +264,18 @@ function Complete-DemoDeploymentRun {
         }
         if ($null -ne $endStop -and $null -ne $endStop.Result) {
             $added.Add($endStop.Result)
+            if ([bool]$endStop.Stopped) {
+                # The run stopped the demo itself (item 11, 2026-11-20): DEPLOY.NIGHTLYSTOP says so, as a Pass with no stop to
+                # offer, not the Warning that the demo stops later tonight. -KeepRunning, and a demo the run leaves running,
+                # keep the Warning.
+                for ($index = 0; $index -lt $added.Count; $index++) {
+                    $added[$index] = ConvertTo-DemoBusyMarkerStoppedResult -Record $added[$index]
+                }
+            }
+            # The Insights app's records from its step once more (F18), after the stop's.
+            foreach ($item in @($appAgain | Where-Object { $null -ne $_ })) {
+                $added.Add($item)
+            }
             if ([string]$outcome.Kind -eq 'Done' -and $null -ne $outcome.PSObject.Properties['Notes']) {
                 # Get-DemoMemberValue returns the notes array whole: assigned first, then each note is its own item.
                 $doneNotes = Get-DemoMemberValue -InputObject $outcome -Name 'Notes'

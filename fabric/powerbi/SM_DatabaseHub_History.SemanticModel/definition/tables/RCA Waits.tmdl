@@ -1,0 +1,95 @@
+/// Not written yet: the capture doesn't diff the wait statistics yet, so this table is empty, and its emptiness says nothing about the targets' waits or their Query Store; Telemetry Snapshots holds T1 to T3's waits by category. Its grain, once a later release writes it: one wait type's delta over one phase of a capture episode: the episode itself, or the baseline just before it. The Incident RCA's evidence (ADR 0031), which NB_DatabaseHub_LiveActivity writes from the observer's evidence documents (rca/history-tables.json).
+table 'RCA Waits'
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables.
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The evidence document the row came from (documentId).
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// T1, T2, or T3.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// The observer's capture episode (rca_events kind capture, event_name escalated, code) the row belongs to.
+    column 'Episode ID'
+        dataType: string
+        isHidden
+        sourceColumn: episode_id
+
+    /// baseline (the minutes before the episode) or episode.
+    column Phase
+        dataType: string
+        sourceColumn: phase
+
+    /// Start of the delta's window.
+    column 'Window Start UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: window_start_utc
+
+    /// End of the delta's window.
+    column 'Window End UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: window_end_utc
+
+    /// The wait type.
+    column 'Wait Type'
+        dataType: string
+        sourceColumn: wait_type
+
+    /// Its category from Learn's wait categories mapping table.
+    column 'Wait Category'
+        dataType: string
+        sourceColumn: wait_category
+
+    /// Wait time in the window.
+    column 'Wait (ms)'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: wait_ms
+
+    /// Waits that ended in the window.
+    column 'Waiting Tasks'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: waiting_tasks
+
+    /// Signal wait time in the window.
+    column 'Signal Wait (ms)'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: signal_ms
+
+    /// The longest single wait seen (the cumulative maximum when it rose in the window).
+    column 'Max Wait (ms)'
+        dataType: int64
+        formatString: #,0
+        summarizeBy: none
+        sourceColumn: max_wait_ms
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Waits' = entity
+        mode: directLake
+        source
+            entityName: rca_waits
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

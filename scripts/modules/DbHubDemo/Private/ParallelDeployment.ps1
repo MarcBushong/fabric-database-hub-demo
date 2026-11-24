@@ -674,6 +674,8 @@ function Invoke-DemoParallelDeployment {
         NetworkMode           = $state.NetworkMode
         T3UseFreeLimit        = $state.T3UseFreeLimit
         T3AdminGroupName      = $state.T3AdminGroupName
+        # PREFLIGHT.POLICY.COSMOSPUBLIC's evidence (2026-11-21): $null without preflight, so a new T5 keeps its endpoint.
+        T5Policy              = $null
         T2Source              = ''
         T2SnapshotId          = ''
         ConfigPath            = $ConfigPath
@@ -817,7 +819,8 @@ function Invoke-DemoParallelDeployment {
             Write-DemoLog -Level Warning -Message ('Policy inventory: {0} {1}: {2}' -f $item.checkId, $item.status, $item.message)
         }
     }
-    # The deferred inventory's results replace preflight's placeholders (PREFLIGHT.POLICY.INVENTORY and SQLPUBLIC).
+    # The deferred inventory's results replace preflight's placeholders (PREFLIGHT.POLICY.INVENTORY, SQLPUBLIC, and T5's
+    # COSMOSPUBLIC, 2026-11-21).
     $applyPolicy = {
         param([int] $WaitMinutes = 5)
         & $collectPolicy $WaitMinutes
@@ -825,7 +828,7 @@ function Invoke-DemoParallelDeployment {
             return
         }
         $policy.Applied = $true
-        $kept = @($results | Where-Object { -not ([string]$_.checkId -in 'PREFLIGHT.POLICY.INVENTORY', 'PREFLIGHT.POLICY.SQLPUBLIC' -and [bool](Get-DemoMemberValue -InputObject $_.evidence -Name 'deferred')) })
+        $kept = @($results | Where-Object { -not ([string]$_.checkId -in 'PREFLIGHT.POLICY.INVENTORY', 'PREFLIGHT.POLICY.SQLPUBLIC', 'PREFLIGHT.POLICY.COSMOSPUBLIC' -and [bool](Get-DemoMemberValue -InputObject $_.evidence -Name 'deferred')) })
         $results.Clear()
         & $addAll $kept
         & $addAll @($policy.Items)
@@ -970,6 +973,8 @@ function Invoke-DemoParallelDeployment {
             if ($group) {
                 $context.T3AdminGroupName = $group
             }
+            # Whether a policy needs a new T5's private endpoint (2026-11-21, ADR 0027), for the template step.
+            $context.T5Policy = ($preflight | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'PREFLIGHT.POLICY.COSMOSPUBLIC' } | Select-Object -First 1 | ForEach-Object { $_.evidence })
             # Where T4's fallback starts when preflight already ruled sizes out (Phase 28 and its follow-up; for a size
             # t4SkuName sets, since 2026-11-09): the furthest step any of its checks found.
             $t4StartSku = Select-DemoT4StartSku -Sku @(foreach ($checkId in 'PREFLIGHT.T4.SKU', 'PREFLIGHT.T4.CAPABILITY', 'PREFLIGHT.T4.FALLBACK') { [string](& $pick $checkId 'startSku') }) -Order ([string[]]@(@('') + @(Get-DemoT4FallbackOrder -Config $Config)))
@@ -1082,6 +1087,8 @@ function Invoke-DemoParallelDeployment {
                 ScaleT4                 = $true
                 # The wait for a T4 server Azure refused shows on the Infrastructure and T4 rows (2026-11-09).
                 ProgressPath            = $ProgressPath
+                # A new T5's private endpoint, only when a policy needs it (2026-11-21, ADR 0027).
+                T5Policy                = $context.T5Policy
             }
             if ($context.T2Source -eq 'golden' -and $context.T2SnapshotId) {
                 $deployArguments['T2OsDiskSourceId'] = $context.T2SnapshotId
@@ -1465,7 +1472,7 @@ function Invoke-DemoParallelDeployment {
     # in DONE's way. Without the Fabric track finished (a paused capacity, for example), the next deploy.ps1 does it.
     if (-not $whatIf -and -not $SkipFabric) {
         if (& $trackFinished 'Fabric' 'Fabric') {
-            $controlFabric = @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath)
+            $controlFabric = @(Invoke-DemoControlDeployStep -Config $Config -ConfigPath $ConfigPath -Part Fabric -ProgressPath $ProgressPath -PriorResult $results.ToArray())
             & $addAll $controlFabric
             # The Insights app's Manage runs that notebook (ADR 0029), and the Fabric track deployed the app before the
             # notebook was in Fabric on a first deployment, or an earlier run did: the app's step once more, with its IDs

@@ -191,6 +191,22 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $script:calls = [System.Collections.Generic.List[string]]::new()
         $script:dataDisks = @()
         $script:guestEdition = 'Standard Edition (64-bit)'
+        $script:rcaSpans = 0
+        $script:rcaNotExported = 0
+        # This PC's pending list of the Incident RCA's evidence (out/history-pending): none, unless a test sets some.
+        $script:rcaPending = @()
+        $script:pendingPath = Join-Path -Path $repoRoot -ChildPath 'out/history-pending/rca-pending-rg-dbhub-demo.json'
+        Mock -ModuleName DbHubDemo -CommandName Read-DemoRcaPending -MockWith { [pscustomobject]@{ Path = $script:pendingPath; Found = (@($script:rcaPending).Count -gt 0); Documents = @($script:rcaPending); Expired = 0 } }
+        # The session control's status: read, and listing nothing, unless a test sets some.
+        $script:controlPending = @()
+        $script:controlError = ''
+        $script:controlEncrypted = $false
+        $script:controlMissing = $false
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenControlRcaPending -MockWith { [pscustomobject]@{ Read = -not $script:controlError; Documents = @($script:controlPending); Error = $script:controlError; Encrypted = $script:controlEncrypted; Missing = $script:controlMissing; Variable = 'the variable DbHubSessionStatus of aa-dbhub-control'; Notebook = 'NB_DatabaseHub_Control' } }
+        # The demo workspace's NB_DatabaseHub_LiveActivity, read only when T2's documents are listed: this release's copy,
+        # unless a test sets another.
+        $script:notebookState = [pscustomobject]@{ Known = $true; Current = $true; Error = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoGoldenRcaNotebookState -MockWith { $script:notebookState }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'unexpected Azure CLI call' }
         Mock -ModuleName DbHubDemo -CommandName Start-Sleep -MockWith { }
         Mock -ModuleName DbHubDemo -CommandName Assert-DemoAzContext -MockWith { New-TestResult 'PREFLIGHT.GUARD.CONTEXT' }
@@ -242,7 +258,7 @@ Describe 'New-DemoT2GoldenSnapshot' {
                     if ($script:prepareFails) {
                         return [pscustomobject]@{ Succeeded = $false; Error = 'The guest did not shut down cleanly within 15 minutes (state Running); it was not turned off by force.'; Seconds = 900; Data = [pscustomobject]@{ succeeded = $false } }
                     }
-                    [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 120; Data = [pscustomobject]@{ succeeded = $true; cachesRemoved = 0; logFilesRedacted = 0; guestState = 'Off'; guestShutdownSeconds = 40; record = [pscustomobject]@{ sourceAzureVmId = 'vm-source' } } }
+                    [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 120; Data = [pscustomobject]@{ succeeded = $true; cachesRemoved = 0; logFilesRedacted = 0; guestState = 'Off'; guestShutdownSeconds = 40; rcaSpansRemoved = $script:rcaSpans; rcaSpansNotExported = $script:rcaNotExported; record = [pscustomobject]@{ sourceAzureVmId = 'vm-source' } } }
                 }
             }
         }
@@ -322,6 +338,203 @@ Describe 'New-DemoT2GoldenSnapshot' {
         $create | Should -Not -Match 'deploymentId='
         $script:calls | Should -Contain 'az disk delete --resource-group rg-dbhub-golden --name snap-dbhub-t2golden-202610221230-verify --yes'
         @($script:calls | Where-Object { $_ -match '^az tag update .*dbhubDiskVerifiedUtc=' }).Count | Should -Be 1
+    }
+
+    It 'says when Prepare deleted the Incident RCA''s capture in the guest, and what of it the history doesn''t have (<Case>, the docs review of 0189a4b)' -ForEach @(
+        @{ Case = 'some never fully exported'; Spans = 3; NotExported = 1; Expected = '* The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: 3 observation span(s), 1 of them never fully exported, so that part of T2''s evidence isn''t in the history.' }
+        @{ Case = 'each exported'; Spans = 2; NotExported = 0; Expected = '* The Incident RCA''s capture in the guest was deleted, so the snapshot carries none: 2 observation span(s), each taken by an export, and none of T2''s documents was waiting in this PC''s pending list for a history save.' }
+        @{ Case = 'none in the guest'; Spans = 0; NotExported = 0; Expected = '*and is air-gapped and shut down in 40 seconds.' }
+    ) {
+        $script:rcaSpans = $Spans
+        $script:rcaNotExported = $NotExported
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $prepare = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.PREPARE'
+        $prepare.status | Should -Be 'Pass'
+        $prepare.message | Should -BeLike $Expected
+        $prepare.evidence.rcaSpansRemoved | Should -Be $Spans
+        $prepare.evidence.rcaSpansNotExported | Should -Be $NotExported
+    }
+
+    It 'captures nothing while this PC''s pending list holds T2''s Incident RCA evidence, and says how to save it (<Case>, the review of 3f6cd14)' -ForEach @(
+        @{ Case = 'host deallocated'; Power = 'PowerState/deallocated'; Save = './scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory' }
+        @{ Case = 'host running'; Power = 'PowerState/running'; Save = './scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity' }
+    ) {
+        $script:hostPower = $Power
+        $script:rcaPending = @(
+            [ordered]@{ documentId = 'archost01-20261120T170000Z-1'; parts = 2; sha256 = ('a' * 64); vm = 'archost01'; exportedUtc = '2026-11-20T17:31:00Z' }
+            [ordered]@{ documentId = 'sqlvm01-20261120T170000Z-1'; parts = 1; sha256 = ('b' * 64); vm = 'sqlvm01'; exportedUtc = '2026-11-20T17:31:00Z' }
+        )
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -BeLike '1 Incident RCA evidence document(s) from T2 aren''t in the history yet (./out/history-pending/rca-pending-rg-dbhub-demo.json lists them)*nothing was captured.'
+        $rca.remediation | Should -Be ('Save the history first: {0}, which fetches them from T2. Then run ./scripts/capture-t2-golden.ps1 again.' -f $Save)
+        @($rca.evidence.documents) | Should -Be @('archost01-20261120T170000Z-1')
+        $rca.evidence.activityNotebook | Should -Be 'current'
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+        $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.SNAPSHOT' | Should -BeNullOrEmpty
+    }
+
+    It 'captures as before when the pending list holds only other VMs'' documents (the review of 3f6cd14)' {
+        $script:rcaPending = @([ordered]@{ documentId = 'sqlvm01-20261120T170000Z-1'; parts = 1; sha256 = ('b' * 64); vm = 'sqlvm01'; exportedUtc = '2026-11-20T17:31:00Z' })
+        $script:controlPending = @([ordered]@{ documentId = 'sqlvm01-20261120T190000Z-2'; vm = 'sqlvm01' })
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA' | Should -BeNullOrEmpty
+        ($results | Where-Object checkId -EQ 'GOLDEN.CAPTURE').status | Should -Be 'Pass'
+        $script:calls | Should -Contain 'guest Prepare'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoGoldenRcaNotebookState -Times 0 -Exactly -Because 'the notebook is read only when T2''s documents are listed'
+    }
+
+    It 'captures nothing while the session control''s status lists T2''s documents its runbooks couldn''t fetch, and says to run a session (the review of 3f6cd14)' {
+        $script:controlPending = @([ordered]@{ documentId = 'archost01-20261120T190000Z-2'; vm = 'archost01' }, [ordered]@{ documentId = 'sqlvm01-20261120T190000Z-2'; vm = 'sqlvm01' })
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be '1 Incident RCA evidence document(s) from T2 aren''t in the history yet (the session control''s status lists them, in the variable DbHubSessionStatus of aa-dbhub-control), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+        $rca.remediation | Should -Be 'First, run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 1: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
+        @($rca.evidence.statusDocuments) | Should -Be @('archost01-20261120T190000Z-2')
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+    }
+
+    It 'names both lists, and how to save each, when both hold T2''s documents (the review of 3f6cd14)' {
+        $script:hostPower = 'PowerState/running'
+        $script:rcaPending = @([ordered]@{ documentId = 'archost01-20261120T170000Z-1'; parts = 2; sha256 = ('a' * 64); vm = 'archost01'; exportedUtc = '2026-11-20T17:31:00Z' })
+        $script:controlPending = @([ordered]@{ documentId = 'archost01-20261120T190000Z-2'; vm = 'archost01' }, [ordered]@{ documentId = 'archost01-20261120T190000Z-3'; vm = 'archost01' })
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be '3 Incident RCA evidence document(s) from T2 aren''t in the history yet (./out/history-pending/rca-pending-rg-dbhub-demo.json lists 1, and the session control''s status, in the variable DbHubSessionStatus of aa-dbhub-control, lists 2), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+        $rca.remediation | Should -Be 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. Then run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 1: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
+        $script:calls | Should -Not -Contain 'guest Prepare'
+    }
+
+    It 'asks for at least a Run all session for each session the status lists, on any VM, since each start fetches one session''s, and the capture again after each (<Case>, the reviews of 0a9fb8d and e716ff8)' -ForEach @(
+        @{
+            Case    = 'the status only'; Pc = $false
+            Message = '3 Incident RCA evidence document(s) from T2 aren''t in the history yet (the session control''s status lists them, in the variable DbHubSessionStatus of aa-dbhub-control), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+            Fix     = 'First, run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 3: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
+        }
+        @{
+            Case    = 'both lists'; Pc = $true
+            Message = '4 Incident RCA evidence document(s) from T2 aren''t in the history yet (./out/history-pending/rca-pending-rg-dbhub-demo.json lists 1, and the session control''s status, in the variable DbHubSessionStatus of aa-dbhub-control, lists 3), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+            Fix     = 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. Then run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 3: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
+        }
+    ) {
+        $script:hostPower = 'PowerState/running'
+        if ($Pc) {
+            $script:rcaPending = @([ordered]@{ documentId = 'archost01-20261120T170000Z-1'; parts = 2; sha256 = ('a' * 64); vm = 'archost01'; exportedUtc = '2026-11-20T17:31:00Z' })
+        }
+        # Two sessions' T2 documents, and a third session's on another VM only, which counts too: a start may fetch it first.
+        $script:controlPending = @(
+            [ordered]@{ documentId = 'archost01-20261120T190000Z-2'; vm = 'archost01'; sessionId = ('a' * 32) }
+            [ordered]@{ documentId = 'archost01-20261120T190000Z-3'; vm = 'archost01'; sessionId = ('a' * 32) }
+            [ordered]@{ documentId = 'archost01-20261119T190000Z-4'; vm = 'archost01'; sessionId = ('b' * 32) }
+            [ordered]@{ documentId = 'sqlvm01-20261118T190000Z-5'; vm = 'sqlvm01'; sessionId = ('c' * 32) }
+        )
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be $Message
+        $rca.remediation | Should -Be $Fix
+        $rca.evidence.statusSessions | Should -Be 3 -Because 'session c''s documents on sqlvm01 count too: a start may fetch them first'
+        $script:calls | Should -Not -Contain 'guest Prepare'
+    }
+
+    It 'captures nothing when the session control''s status can''t be read, since it may list T2''s documents (the review of 3f6cd14)' {
+        $script:controlError = 'Forbidden'
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (Forbidden), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
+        $rca.remediation | Should -Be 'Run ./scripts/capture-t2-golden.ps1 again; ./scripts/status.ps1 shows the control (STATUS.CONTROL).'
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+    }
+
+    It 'captures nothing when the session control''s status variable is missing from its account, and names ./scripts/deploy.ps1, which creates it (the review of 40124992)' {
+        # Since 2026-11-23 deploy.ps1 creates the variable only when it's missing, so a deletion, or a deployment that couldn't
+        # create it, can leave it missing while sessions run: their stops' lists are then only in the control vault.
+        $script:controlError = 'it doesn''t exist, though aa-dbhub-control does'
+        $script:controlMissing = $true
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (it doesn''t exist, though aa-dbhub-control does), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
+        $rca.remediation | Should -Be 'Run ./scripts/deploy.ps1, which creates it (CONTROL.RESOURCES says so), then ./scripts/capture-t2-golden.ps1 again. Until it exists, the runbooks keep each session''s status only in the control vault, which they can''t read back, so a session''s start doesn''t fetch what the last stop left on the VMs.'
+        $rca.evidence.missing | Should -BeTrue
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+    }
+
+    It 'captures nothing when a tenant''s policy encrypted the session control''s status, and says how to save what it lists first, since running it again can''t help (2026-11-23)' {
+        $script:controlError = 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
+        $script:controlEncrypted = $true
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be 'The session control''s status (the variable DbHubSessionStatus of aa-dbhub-control) couldn''t be read (it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted), so whether it lists Incident RCA evidence from T2 that the capture would delete isn''t known. Nothing was captured.'
+        $accountId = InModuleScope -ModuleName DbHubDemo -Parameters @{ Config = $config } { (Get-DemoActivityControlName -Config $Config).AutomationAccountId }
+        $accountId | Should -Match '/resourceGroups/rg-dbhub-control/providers/Microsoft\.Automation/automationAccounts/aa-dbhub-control$'
+        $rca.remediation | Should -Be ('Running the capture again won''t help by itself: only the control''s runbooks read an encrypted variable, and ./scripts/deploy.ps1 keeps an existing one as it is. To save what it may list first, run sessions with Run all in NB_DatabaseHub_Control, each to its planned end, by Run all''s own end or its auto-stop (a stop before it, by STOP_NOW, the Insights app''s Stop now, or ./scripts/stop-demo.ps1, can leave capture that the stop''s lines don''t name), until one has no RCA.EARLIER line at its start about evidence still on the VMs or in the control vault, no RCA.EXPORT line that says "document(s) of another session go with that session''s evidence", and no RCA.PENDING line at its end. Then, the same day, before the tenant''s policy encrypts the variable again, delete it (az rest --method delete --url "https://management.azure.com{0}/variables/DbHubSessionStatus?api-version=2024-10-23", or aa-dbhub-control''s Variables in the Azure portal), run ./scripts/deploy.ps1, which creates it again, unencrypted and empty, and then ./scripts/capture-t2-golden.ps1.' -f $accountId) -Because 'since 2026-11-23 deploy.ps1 keeps the variable as it is, so the evidence it lists goes first, including another session''s that a session''s exports found and its status carries, which only RCA.EXPORT''s note counts (the review of a57539ed), and then it''s deleted, to be created again readable'
+        $rca.evidence.encrypted | Should -BeTrue
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+    }
+
+    It 'updates a notebook from before the Incident RCA first, which no history save would take them with (<Case>, the review of c059878)' -ForEach @(
+        @{
+            Case = 'this PC''s list, host running'; Power = 'PowerState/running'; Pc = $true; Status = $false; Import = $false
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity. Then save the history: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches them from T2. Then run ./scripts/capture-t2-golden.ps1 again.'
+        }
+        @{
+            Case = 'this PC''s list, host deallocated, fabric.importNotebooks true'; Power = 'PowerState/deallocated'; Pc = $true; Status = $false; Import = $true
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them: ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity. Then save the history: ./scripts/start-demo.ps1, then ./scripts/stop-demo.ps1 -SaveHistory, which fetches them from T2. Then run ./scripts/capture-t2-golden.ps1 again.'
+        }
+        @{
+            Case = 'the session control''s status'; Power = 'PowerState/deallocated'; Pc = $false; Status = $true; Import = $false
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity. Then run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 1: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
+        }
+        @{
+            Case = 'both lists'; Power = 'PowerState/running'; Pc = $true; Status = $true; Import = $false
+            Fix  = 'First update the demo workspace''s NB_DatabaseHub_LiveActivity, which is from before the Incident RCA (2026-11-20) and so saves none of them (fabric.importNotebooks is false, so ./scripts/deploy.ps1 keeps the workspace''s copy): ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity. Then save the history: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches the ones ./out/history-pending/rca-pending-rg-dbhub-demo.json lists. Then run a session with Run all in NB_DatabaseHub_Control for each session the status lists, at least 1: each start fetches one session''s documents, and its end saves them with its history. Run ./scripts/capture-t2-golden.ps1 again after each.'
+        }
+    ) {
+        $script:hostPower = $Power
+        $config['fabric']['importNotebooks'] = $Import
+        $script:notebookState = [pscustomobject]@{ Known = $true; Current = $false; Error = '' }
+        if ($Pc) {
+            $script:rcaPending = @([ordered]@{ documentId = 'archost01-20261120T170000Z-1'; parts = 2; sha256 = ('a' * 64); vm = 'archost01'; exportedUtc = '2026-11-20T17:31:00Z' })
+        }
+        if ($Status) {
+            $script:controlPending = @([ordered]@{ documentId = 'archost01-20261120T190000Z-2'; vm = 'archost01' })
+        }
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.remediation | Should -Be $Fix
+        $rca.evidence.activityNotebook | Should -Be 'fromBeforeRca'
+        foreach ($step in 'profile off', 'password', 'guest Prepare', 'power Start') {
+            $script:calls | Should -Not -Contain $step
+        }
+    }
+
+    It 'says to update the notebook when a save says it''s from before the Incident RCA, when its definition couldn''t be read (the review of c059878)' {
+        $script:hostPower = 'PowerState/running'
+        $script:notebookState = [pscustomobject]@{ Known = $false; Current = $false; Error = 'Fabric didn''t answer' }
+        $script:rcaPending = @([ordered]@{ documentId = 'archost01-20261120T170000Z-1'; parts = 2; sha256 = ('a' * 64); vm = 'archost01'; exportedUtc = '2026-11-20T17:31:00Z' })
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.remediation | Should -Be 'Save the history first: ./scripts/configure-fabric.ps1 -SkipHubChecks -SkipNotebookImport -RunLiveActivity, which fetches them from T2. If a save says the demo workspace''s NB_DatabaseHub_LiveActivity is from before the Incident RCA, run ./scripts/configure-fabric.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity, which updates it, and save again. Then run ./scripts/capture-t2-golden.ps1 again.'
+        $rca.evidence.activityNotebook | Should -Be 'unknown'
+        $script:calls | Should -Not -Contain 'guest Prepare'
     }
     It 'captures nothing when sign-in data is left on the host or in the guest after the cleanup' {
         $script:sweepPass = $false
@@ -1042,7 +1255,7 @@ Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
         @{ Case = 'a reset copy isn''t released'; Guest = { New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $true; role = 'Copy' }) }; Status = 'Fail'; Match = 'was reset, but it isn''t released yet'; Fix = 'deploy\.ps1' }
         @{ Case = 'the host''s role can''t be read'; Guest = { New-Guest -State 'Off' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Unknown' }) }; Status = 'Fail'; Match = 'can''t tell a source from a copy'; Fix = 'Don''t connect the guest by hand' }
         @{ Case = 'the guest is off without a capture'; Guest = { New-Guest -State 'Off' -Heartbeat '' }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'start of T2 \(Run all in NB_DatabaseHub_Control\), which starts an off guest.*As a last resort, run on archost01: .*Start-VM -Name arcsql01' }
-        @{ Case = 'its adapter is disconnected'; Guest = { New-Guest -Connected 0 }; Status = 'Fail'; Match = 'isn''t connected to DbHubDemoNat'; Fix = "^Run \./scripts/deploy\.ps1; .*\./scripts/destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1\. As a last resort, .*--name archost01 --command-id RunPowerShellScript --scripts 'Connect-VMNetworkAdapter -VMName arcsql01 -SwitchName DbHubDemoNat" }
+        @{ Case = 'its adapter is disconnected'; Guest = { New-Guest -Connected 0 }; Status = 'Fail'; Match = 'isn''t connected to DbHubDemoNat'; Fix = "^Run \./scripts/deploy\.ps1: archost01's GuestNetwork step connects arcsql01's network adapter to DbHubDemoNat again\. If T2\.GUEST\.STATE still says this \(a guest with no adapter, say\), run \./scripts/reset-demo\.ps1 -RebuildGuest, which makes arcsql01 again from Arc Jumpstart's image and onboards it \(about an hour\), or deploy the environment again: \./scripts/destroy\.ps1 -KeepFabric, then \./scripts/deploy\.ps1\. As a last resort, .*--name archost01 --command-id RunPowerShellScript --scripts 'Connect-VMNetworkAdapter -VMName arcsql01 -SwitchName DbHubDemoNat" }
         @{ Case = 'a released capture''s guest is off'; Guest = { New-Guest -State 'Off' -Heartbeat '' -Golden ([pscustomobject]@{ released = $true; reset = $false; role = '' }) }; Status = 'Fail'; Match = 'it''s Off'; Fix = 'Start-VM' }
         @{ Case = 'it won''t start with the host'; Guest = { New-Guest -StartAction 'StartIfRunning' }; Status = 'Warning'; Match = 'doesn''t start with the host \(automatic start action StartIfRunning\)'; Fix = 'AutomaticStartAction Start' }
         @{ Case = 'its heartbeat isn''t OK yet'; Guest = { New-Guest -Heartbeat 'NoContact' }; Status = 'Warning'; Match = 'heartbeat is NoContact'; Fix = 'again in a few minutes' }
@@ -1069,6 +1282,16 @@ Describe 'Get-DemoT2GuestStateResult (T2.GUEST.STATE, 2026-11-03)' {
     It 'never offers to connect a copy that may hold the captured identity' {
         $result = Get-GuestState (New-Guest -State 'Off' -StartAction 'Nothing' -Connected 0 -Golden ([pscustomobject]@{ released = $false; reset = $false; role = 'Copy' }))
         $result.remediation | Should -Not -Match 'Connect-VMNetworkAdapter|run-command'
+    }
+
+    It 'offers reset-demo.ps1 -RebuildGuest only where Arc Jumpstart''s image makes T2 (2026-11-21)' {
+        $productKey = New-TestConfig
+        $productKey['t2SqlInstallMode'] = 'ProductKey'
+        $health = [pscustomobject]@{ status = 'Pass'; state = 'Ready'; currentStep = 'Watchdog'; t2Guest = (New-Guest -Adapters 0 -Connected 0) }
+        $result = & (Get-Module -Name DbHubDemo) { param($c, $h) Get-DemoT2GuestStateResult -Config $c -Health $h } $productKey $health
+        $result.status | Should -Be 'Fail'
+        $result.remediation | Should -Match '^Run \./scripts/deploy\.ps1: archost01''s GuestNetwork step'
+        $result.remediation | Should -Not -Match 'RebuildGuest'
     }
 
     It 'waits for a guest the build hasn''t created yet, fails one a Ready host lost, and says nothing without a Hyper-V read' {
@@ -1210,5 +1433,176 @@ Describe 'Get-DemoGoldenCaptureControlResult (GOLDEN.CAPTURE.CONTROL, review of 
         $config['control'] = @{ enabled = $false }
         (Get-ControlCheck).status | Should -Be 'Pass'
         Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -ParameterFilter { $Url -match '/automationAccounts/aa-dbhub-control/' }
+    }
+}
+
+Describe 'Get-DemoGoldenControlRcaPending (the review of 3f6cd14)' {
+    BeforeEach {
+        $config = New-TestConfig
+        $script:now = [datetime]::new(2026, 11, 21, 6, 0, 0, [System.DateTimeKind]::Utc)
+        $script:variable = $null
+        $script:readFail = ''
+        $script:missing = $false
+        $script:accountMissing = $false
+        $script:accountReadFail = ''
+        $script:url = ''
+        # The variable's properties as Resource Manager returns them, when a test sets them (an encrypted variable's).
+        $script:properties = $null
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -MockWith {
+            if ($Url -notmatch '/variables/') {
+                # The control's account (Automation Account - Get), read only when the variable is missing.
+                if ($script:accountMissing) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
+                if ($script:accountReadFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = $script:accountReadFail } }
+                return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'aa-dbhub-control' }; Error = '' }
+            }
+            $script:url = $Url
+            if ($script:readFail) { return [pscustomobject]@{ Ok = $false; Missing = $false; Value = $null; Error = $script:readFail } }
+            if ($script:missing) { return [pscustomobject]@{ Ok = $false; Missing = $true; Value = $null; Error = 'NotFound' } }
+            if ($null -ne $script:properties) { return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'DbHubSessionStatus'; properties = $script:properties }; Error = '' } }
+            # A variable's value is its JSON, so the runbooks' status JSON comes as a JSON string.
+            $value = if ($script:variable -is [string]) { $script:variable } else { ConvertTo-Json -InputObject (ConvertTo-Json -InputObject $script:variable -Depth 8 -Compress) }
+            return [pscustomobject]@{ Ok = $true; Missing = $false; Value = @{ name = 'DbHubSessionStatus'; properties = @{ value = $value; isEncrypted = $false } }; Error = '' }
+        }
+        function Get-ControlPending {
+            & (Get-Module -Name DbHubDemo) { param($c, $n) Get-DemoGoldenControlRcaPending -Config $c -NowUtc $n } $config $script:now
+        }
+    }
+
+    It 'reads the documents the status lists, each with its VM: its own, a re-check''s handoff, and earlier sessions'' not yet expired' {
+        $script:variable = [ordered]@{
+            sessionId         = 'a' * 32; phase = 'stopped'; updatedUtc = '2026-11-20T19:00:00Z'
+            rca               = [ordered]@{ sessionId = 'a' * 32; pending = @([ordered]@{ documentId = 'doc-own-t2'; parts = 1; sha256 = ('a' * 64); vm = 'archost01' }, [ordered]@{ documentId = 'doc-own-t1'; parts = 1; sha256 = ('b' * 64); vm = 'sqlvm01' }) }
+            rcaHandoff        = @([ordered]@{ documentId = 'doc-handoff-t2'; parts = 1; sha256 = ('c' * 64); vm = 'archost01' })
+            rcaEarlierPending = @(
+                [ordered]@{ sessionId = 'b' * 32; pending = @([ordered]@{ documentId = 'doc-earlier-t2'; parts = 1; sha256 = ('d' * 64); vm = 'archost01' }); leftVms = @(); expiresUtc = '2026-11-25T00:00:00Z' }
+                [ordered]@{ sessionId = 'c' * 32; pending = @([ordered]@{ documentId = 'doc-expired-t2'; parts = 1; sha256 = ('e' * 64); vm = 'archost01' }); leftVms = @(); expiresUtc = '2026-11-20T00:00:00Z' }
+            )
+        }
+        $answer = Get-ControlPending
+        $answer.Read | Should -BeTrue
+        $answer.Error | Should -BeNullOrEmpty
+        @($answer.Documents | ForEach-Object { '{0} {1} {2}' -f $_['documentId'], $_['vm'], $_['sessionId'] }) | Should -Be @(
+            ('doc-own-t2 archost01 ' + ('a' * 32)), ('doc-own-t1 sqlvm01 ' + ('a' * 32)), ('doc-handoff-t2 archost01 ' + ('a' * 32)), ('doc-earlier-t2 archost01 ' + ('b' * 32))
+        ) -Because 'a start fetches one session''s documents, so each keeps its session: the status''s for its own and the handoff, the carry''s for an earlier session''s (the review of 0a9fb8d)'
+        $script:url | Should -Match '/resourceGroups/rg-dbhub-control/providers/Microsoft\.Automation/automationAccounts/aa-dbhub-control/variables/DbHubSessionStatus\?api-version=2024-10-23$'
+        $answer.Variable | Should -Be 'the variable DbHubSessionStatus of aa-dbhub-control'
+        $answer.Notebook | Should -Be 'NB_DatabaseHub_Control'
+    }
+
+    It 'leaves out the status''s own documents 7 days after its last write, when the runner no longer keeps them' {
+        $script:variable = [ordered]@{ sessionId = 'a' * 32; phase = 'stopped'; updatedUtc = '2026-11-13T05:00:00Z'; rca = [ordered]@{ pending = @([ordered]@{ documentId = 'doc-old'; vm = 'archost01' }) }; rcaHandoff = @([ordered]@{ documentId = 'doc-old-handoff'; vm = 'archost01' }) }
+        $answer = Get-ControlPending
+        $answer.Read | Should -BeTrue
+        @($answer.Documents) | Should -BeNullOrEmpty
+    }
+
+    It 'lists nothing for a status the runbooks haven''t written, or a control whose account doesn''t exist, and says when the read failed' {
+        $script:variable = '""'
+        $empty = Get-ControlPending
+        $empty.Read | Should -BeTrue
+        @($empty.Documents) | Should -BeNullOrEmpty
+        $script:missing = $true
+        $script:accountMissing = $true
+        $missing = Get-ControlPending
+        $missing.Read | Should -BeFalse
+        $missing.Missing | Should -BeFalse
+        $missing.Error | Should -BeNullOrEmpty -Because 'a control whose account doesn''t exist has had no session that listed any'
+        $script:missing = $false
+        $script:accountMissing = $false
+        $script:readFail = 'Forbidden'
+        $failed = Get-ControlPending
+        $failed.Read | Should -BeFalse
+        $failed.Error | Should -Be 'Forbidden'
+        $script:readFail = ''
+        $script:variable = '{not json'
+        (Get-ControlPending).Error | Should -Be 'its value isn''t the JSON of a status'
+    }
+
+    It 'fails closed on a variable that''s missing from an account that exists, which sessions can run without (the review of 40124992)' {
+        # Since 2026-11-23 deploy.ps1 creates the variable only when it's missing: a deletion, or a deployment that couldn't
+        # create it, leaves it missing while sessions run, and their stops' lists are then only in the control vault.
+        $script:missing = $true
+        $missing = Get-ControlPending
+        $missing.Read | Should -BeFalse
+        $missing.Missing | Should -BeTrue
+        $missing.Error | Should -Be 'it doesn''t exist, though aa-dbhub-control does'
+        @($missing.Documents) | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoActivityControlArm -Times 1 -Exactly -ParameterFilter { $Method -eq 'get' -and $Url -match '/automationAccounts/aa-dbhub-control\?api-version=2024-10-23$' }
+        $script:accountReadFail = 'Timeout'
+        $unknown = Get-ControlPending
+        $unknown.Missing | Should -BeTrue
+        $unknown.Error | Should -Be 'it doesn''t exist, and whether aa-dbhub-control does couldn''t be read: Timeout'
+    }
+
+    It 'can''t read a variable a tenant''s policy encrypted, which Resource Manager returns with no value, rather than reading it as a status that lists nothing (2026-11-23)' {
+        $script:properties = @{ isEncrypted = $true; description = 'The demo session''s last status (JSON)' }
+        $encrypted = Get-ControlPending
+        $encrypted.Read | Should -BeFalse
+        $encrypted.Encrypted | Should -BeTrue
+        $encrypted.Error | Should -Be 'it''s encrypted, so Azure Resource Manager returns no value: a tenant''s policy can re-create Automation variables encrypted'
+        @($encrypted.Documents) | Should -BeNullOrEmpty
+        # The flag alone decides it: a value that came with it isn't the status the runbooks read.
+        $script:properties = @{ isEncrypted = $true; value = (ConvertTo-Json -InputObject (ConvertTo-Json -InputObject ([ordered]@{ sessionId = 'a' * 32; phase = 'stopped'; updatedUtc = '2026-11-20T19:00:00Z'; rca = [ordered]@{ pending = @([ordered]@{ documentId = 'doc-own-t2'; vm = 'archost01' }) } }) -Depth 8 -Compress)) }
+        $flagged = Get-ControlPending
+        $flagged.Read | Should -BeFalse
+        $flagged.Encrypted | Should -BeTrue
+        $flagged.Error | Should -Match '^it''s encrypted'
+        # No value, and no flag: read as Resource Manager returns an encrypted variable.
+        $script:properties = @{ isEncrypted = $false; description = 'The demo session''s last status (JSON)' }
+        $none = Get-ControlPending
+        $none.Read | Should -BeFalse
+        $none.Encrypted | Should -BeTrue
+        $none.Error | Should -Be 'Azure Resource Manager returned it with no value, as it does for an encrypted variable'
+        # The runbooks' unencrypted copy still reads, with no Error.
+        $script:properties = $null
+        $script:variable = '""'
+        $plain = Get-ControlPending
+        $plain.Read | Should -BeTrue
+        $plain.Encrypted | Should -BeFalse
+        $plain.Error | Should -BeNullOrEmpty
+    }
+}
+
+Describe 'Get-DemoGoldenRcaNotebookState (the review of c059878)' {
+    BeforeEach {
+        $config = New-TestConfig
+        $script:tokenFails = ''
+        $script:resolved = $true
+        $script:definition = [pscustomobject]@{ Known = $true; Has = $false; Error = '' }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoFabricToken -MockWith { if ($script:tokenFails) { throw $script:tokenFails }; [securestring]::new() }
+        Mock -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -MockWith { [pscustomobject]@{ Resolved = $script:resolved; WorkspaceId = $(if ($script:resolved) { 'dddddddd-0000-0000-0000-000000000001' } else { '' }); Config = $Config; Results = @() } }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { $script:definition }
+        function Get-NotebookState {
+            & (Get-Module -Name DbHubDemo) { param($c) Get-DemoGoldenRcaNotebookState -Config $c } $config
+        }
+    }
+
+    It 'reads whether the demo workspace''s NB_DatabaseHub_LiveActivity knows RCA_EVIDENCE_FILE, with the workspace found by name and nothing created' {
+        $old = Get-NotebookState
+        $old.Known | Should -BeTrue
+        $old.Current | Should -BeFalse
+        $old.Error | Should -BeNullOrEmpty
+        Should -Invoke -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -Times 1 -Exactly -ParameterFilter { $WorkspaceId -eq 'dddddddd-0000-0000-0000-000000000001' -and $Name -eq 'NB_DatabaseHub_LiveActivity' -and $Parameter -eq 'RCA_EVIDENCE_FILE' }
+        Should -Invoke -ModuleName DbHubDemo -CommandName Resolve-DemoFabricConfig -Times 1 -Exactly -ParameterFilter { $PesterBoundParameters.ContainsKey('SkipLakehouse') -and -not $PesterBoundParameters.ContainsKey('Create') }
+        $script:definition = [pscustomobject]@{ Known = $true; Has = $true; Error = '' }
+        $current = Get-NotebookState
+        $current.Known | Should -BeTrue
+        $current.Current | Should -BeTrue
+    }
+
+    It 'says why it isn''t known, and never throws: <Case>' -ForEach @(
+        @{ Case = 'no Fabric token'; TokenFails = 'No verified Fabric token is available.'; Resolved = $true; Definition = $null; Why = 'No verified Fabric token is available.' }
+        @{ Case = 'the workspace not resolved'; TokenFails = ''; Resolved = $false; Definition = $null; Why = 'the demo''s Fabric workspace isn''t resolved' }
+        @{ Case = 'the definition not read'; TokenFails = ''; Resolved = $true; Definition = @{ Known = $false; Has = $false; Error = 'NB_DatabaseHub_LiveActivity isn''t in the workspace' }; Why = 'NB_DatabaseHub_LiveActivity isn''t in the workspace' }
+    ) {
+        $script:tokenFails = $TokenFails
+        $script:resolved = $Resolved
+        if ($null -ne $Definition) {
+            $script:definition = [pscustomobject]$Definition
+        }
+        $state = Get-NotebookState
+        $state.Known | Should -BeFalse
+        $state.Current | Should -BeFalse
+        $state.Error | Should -Be $Why
     }
 }

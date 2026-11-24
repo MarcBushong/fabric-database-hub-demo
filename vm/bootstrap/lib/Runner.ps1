@@ -103,6 +103,10 @@ function Invoke-DemoVmStateMachine {
         }
         $state['generation'] = $Generation
         $state['completedUtc'] = $null
+        # The one-off notes go with a new generation, such as a restart that has happened since (F24, 2026-11-20). Every
+        # other warning stays until its step's Set runs again: a step whose cause lasts passes its Test now, so its Set
+        # wouldn't say it again (the F24 review).
+        Clear-DemoVmTransientWarning -State $state -StepName @($Step | ForEach-Object { [string]$_['Name'] })
     }
     if ($state['pendingReboot']) {
         Write-DemoVmLog -Message 'Resuming after a restart.'
@@ -162,9 +166,29 @@ function Invoke-DemoVmStateMachine {
                 Write-DemoVmLog -Step $name -Level 'Warning' -Message ('Could not write the in-progress health.json: {0}' -f $_.Exception.Message)
             }
             Write-DemoVmLog -Step $name -Message 'Converging.'
+            # The generation in which this step's Set last ran (the review of cb4bc479, 2026-11-23): a step that has to
+            # change something in this generation is a new VM's setup, or a rebuilt guest's, where an established VM's
+            # step passes its Test (Test-DemoVmStepSetThisGeneration). The generation's reset keeps it.
+            $record['setGeneration'] = [string]$state['generation']
             $result = Get-DemoVmStepOutcome -Output @(& $definition['Set'] $definition)
+            # A Set that ran to its end says again what still holds, so the step's earlier warnings go then (the F24
+            # reviews, 2026-11-20); one that threw, or stopped early, leaves them.
+            if ($result.Outcome -in 'Done', 'NotSelected') {
+                Remove-DemoVmStepWarning -State $state -Step $name
+            }
             foreach ($warning in @($result.WarningMessage)) {
-                Add-DemoVmWarning -State $state -Message $warning
+                Add-DemoVmWarning -State $state -Message $warning -Step $name
+            }
+            if ($result.PSObject.Properties['TransientWarningMessage']) {
+                foreach ($warning in @($result.TransientWarningMessage)) {
+                    Add-DemoVmWarning -State $state -Message $warning -Step $name -Transient
+                }
+            }
+            # Notes a new VM's bootstrap gives by design, as information: a Ready VM stays a Pass (2026-11-23).
+            if ($result.PSObject.Properties['NoteMessage']) {
+                foreach ($note in @($result.NoteMessage)) {
+                    Add-DemoVmNote -State $state -Message $note -Step $name
+                }
             }
 
             if ($result.Outcome -eq 'Done') {

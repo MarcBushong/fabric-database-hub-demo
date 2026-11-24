@@ -427,12 +427,187 @@ function Get-DemoValidationQuietReason {
     return ''
 }
 
+# The one-off notes a new VM's bootstrap gives by design, and why (F32, 2026-11-22): on a new deployment, health.json's
+# Warning can have no other cause, so validate.ps1 and status.ps1 say these are expected. They're vm/bootstrap/lib/State.ps1's
+# legacy one-off notes, less two that aren't by design: a download without a pinned SHA-256, the repository's to fix, and
+# automatic sign-in left armed, which nothing in the demo does. Since 2026-11-23 a bundle records these as information,
+# in health.json's notes, which leave a Ready VM a Pass (Get-DemoHealthNoteText), but only where they're by design: the
+# cleanup after Arc onboarding, or a guest's or SQL Server's setup, in the same generation, and the restart and the
+# sysadmin recovery on a T1's first setup; on an established VM they're warnings, which nothing calls expected (the review
+# of cb4bc479). An older bundle's are all warnings, and called expected, as F32 did.
+$script:DemoHealthExpectedNote = [ordered]@{
+    '^The sign-in cleanup cleared '                                                             = 'a sign-in cleanup that clears an event log follows T2''s Arc onboarding, on a new host or a rebuilt guest (ADR 0009)'
+    '^SQL Server setup asked for a restart'                                                     = 'SQL Server setup asks for a restart when it removes Analysis Services and Integration Services from a new T1'
+    '^SYSTEM was not a sysadmin, so '                                                           = 'a new T1 needs the sysadmin recovery, because its image''s SQL IaaS Agent least-privilege mode doesn''t make SYSTEM a sysadmin'
+    '^The image has no Content-MD5 here, so it was checked by its length and its pinned SHA-256' = 'Jumpstart''s image has no Content-MD5, so a new T2 host checks it by its length and its pinned SHA-256'
+}
+
+function Get-DemoHealthWarningNote {
+    <#
+    .SYNOPSIS
+    What a VM's health summary says about the warnings that keep a Ready bootstrap's status a Warning (F24, 2026-11-20):
+    Count, Text (a sentence that names each warning shown, each naming the step it came from, and which are expected),
+    Remediation, Known (whether the summary lists them: a VM whose bootstrap bundle predates 2026-11-20 doesn't), and
+    Expected (every warning is a one-off note a new VM's bootstrap gives by design, F32). $null when the bootstrap isn't
+    Ready with a Warning. Pure. Internal.
+
+    .DESCRIPTION
+    health.json's status is a Warning when the state is Ready and it has warnings (vm/health/README.md). Before, the
+    validator's INFRA.HEALTH.<vm> and status.ps1's STATUS.VM_<vm> said only "<vm> reports Ready: Every step is in the
+    desired state." with "The bootstrap is still working or waiting" as the fix (dbhubfn and dbhubfu, 2026-11-20). Since
+    2026-11-20 the bootstrap names each warning's step, a new bootstrap generation clears its one-off notes (the others
+    stay while their cause does), and the summary view prints the first two (warnings, warningCount). Since 2026-11-22
+    (F32: live on dbhubra, a new host's sign-in cleanup was its only cause), a one-off note that a new VM's bootstrap gives
+    by design ($script:DemoHealthExpectedNote) is called expected, with why; when every warning is one, the fix is nothing.
+    Since 2026-11-23 a bundle gives those as notes instead (Get-DemoHealthNoteText), so a warning with an expected note's
+    text from such a bundle is an established VM's, and isn't called expected (the review of cb4bc479). Such a bundle's
+    health.json always has notes, even empty: the full view prints it as it is, and the summary prints notes and noteCount
+    only then (the re-check of ea1ea20f).
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $Health,
+
+        [Parameter(Mandatory)]
+        [string] $VmName
+    )
+
+    if ($null -eq $Health -or [string](Get-DemoMemberValue -InputObject $Health -Name 'state') -ne 'Ready' -or [string](Get-DemoMemberValue -InputObject $Health -Name 'status') -ne 'Warning') {
+        return $null
+    }
+    $full = 'Get-DemoVmHealth -Config $config -VmName {0} -View Full lists them all.' -f $VmName
+    $count = Get-DemoMemberValue -InputObject $Health -Name 'warningCount'
+    $shown = Get-DemoMemberList -InputObject $Health -Name 'warnings'
+    if ($null -eq $count -and $shown.Count -eq 0) {
+        return [pscustomobject]@{
+            Count       = $null
+            Known       = $false
+            Expected    = $false
+            Text        = 'Its bootstrap reported a warning that this VM''s summary doesn''t name (its bootstrap bundle predates 2026-11-20).'
+            Remediation = ('Nothing blocks the demo. Get-DemoVmHealth -Config $config -VmName {0} -View Full lists the warning and its step; the next ./scripts/deploy.ps1 sends {0} the bundle whose summary names it, and checks every step again.' -f $VmName)
+        }
+    }
+    $total = if ($null -ne $count) { [int]$count } else { $shown.Count }
+    $list = (@($shown | ForEach-Object { ([string]$_).Trim().TrimEnd('.') }) -join '; ')
+    $more = if ($total -gt $shown.Count) { ' ({0} more)' -f ($total - $shown.Count) } else { '' }
+    $noun = if ($total -eq 1) { 'a warning' } else { '{0} warnings' -f $total }
+    # Which of them a new VM's bootstrap gives by design, and why (F32, 2026-11-22: live on dbhubra, a new host's sign-in
+    # cleanup was the Warning's only cause, and the result didn't say it was expected). Only for a bundle from before
+    # 2026-11-23: one since gives those as notes, so a warning with the same text is an established VM's, which isn't
+    # expected (the review of cb4bc479). Such a bundle's health.json has notes, even empty, in the full view, and its
+    # summary has notes and noteCount; an older one's has neither, in either view (the re-check of ea1ea20f).
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    $expected = 0
+    $givesNotes = $null -ne (Get-DemoMemberValue -InputObject $Health -Name 'notes') -or $null -ne (Get-DemoMemberValue -InputObject $Health -Name 'noteCount')
+    foreach ($warning in @($shown)) {
+        $reason = if ($givesNotes) { '' } else { Get-DemoHealthExpectedReason -Text ([string]$warning) }
+        if ($reason) {
+            $expected++
+            if (-not $reasons.Contains($reason)) {
+                $reasons.Add($reason)
+            }
+        }
+    }
+    $allExpected = $expected -gt 0 -and $expected -eq $total
+    $expectedText = if ($allExpected) { ' {0} expected: {1}.' -f $(if ($total -eq 1) { 'That''s' } else { 'Those are' }), ($reasons -join '; ') } elseif ($expected -gt 0) { ' {0} of them {1} expected: {2}.' -f $expected, $(if ($expected -eq 1) { 'is' } else { 'are' }), ($reasons -join '; ') } else { '' }
+    $remediation = if ($allExpected) {
+        'Nothing to do: {0} expected, and the next bootstrap generation clears {1}, which the next ./scripts/deploy.ps1 that sends {2} a new bundle starts. {3}' -f $(if ($total -eq 1) { 'it''s' } else { 'they''re' }), $(if ($total -eq 1) { 'it' } else { 'them' }), $VmName, $full
+    }
+    else {
+        'Nothing blocks the demo: each warning starts with the step that gave it and says what happens next. A one-off note, such as a restart that''s pending, goes with the next bootstrap generation, which the next ./scripts/deploy.ps1 that sends {0} a new bundle starts; any other warning stays while its cause does, until its step runs again. {1}' -f $VmName, $full
+    }
+    return [pscustomobject]@{
+        Count       = $total
+        Known       = $true
+        Expected    = $allExpected
+        Text        = ('Its bootstrap has {0}: {1}{2}.{3}' -f $noun, $list, $more, $expectedText)
+        Remediation = $remediation
+    }
+}
+
+function Get-DemoHealthExpectedReason {
+    <#
+    .SYNOPSIS
+    Why a new VM's bootstrap gives a note by design ($script:DemoHealthExpectedNote, F32), for one warning or note of
+    health.json, with or without its step's name ("<Step>: ..."); '' when it isn't one of them. Pure. Internal.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [string] $Text = ''
+    )
+
+    # A warning or a note names its step first ("<Step>: ...", F24); one from an older bundle doesn't.
+    $body = $Text.Trim() -replace '^[A-Za-z0-9]+: ', ''
+    foreach ($pattern in $script:DemoHealthExpectedNote.Keys) {
+        if ($body -match $pattern) {
+            return [string]$script:DemoHealthExpectedNote[$pattern]
+        }
+    }
+    return ''
+}
+
+function Get-DemoHealthNoteText {
+    <#
+    .SYNOPSIS
+    What a Ready VM's health summary says about its notes (the expected-notes decision, 2026-11-23): Count and Text, a
+    sentence that names the notes shown, each with its step, and why each is expected. $null when the bootstrap isn't
+    Ready or has no notes, as with a bundle from before then, whose by-design notes are still warnings
+    (Get-DemoHealthWarningNote). Pure. Internal.
+
+    .DESCRIPTION
+    Since 2026-11-23, a VM's bootstrap records the notes it gives by design as information, in health.json's notes
+    (Add-DemoVmNote): a sign-in cleanup that cleared an event log, the restart SQL Server setup asked for, T1's sysadmin
+    recovery, and Jumpstart's image checked by its pinned SHA-256. They leave a Ready VM's status a Pass, so health.json,
+    validate.ps1's INFRA.HEALTH.<vm>, status.ps1's STATUS.VM_<vm>, and the status page agree; the message still names them.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [AllowNull()]
+        [object] $Health
+    )
+
+    if ($null -eq $Health -or [string](Get-DemoMemberValue -InputObject $Health -Name 'state') -ne 'Ready') {
+        return $null
+    }
+    $shown = Get-DemoMemberList -InputObject $Health -Name 'notes'
+    $count = Get-DemoMemberValue -InputObject $Health -Name 'noteCount'
+    $total = if ($null -ne $count) { [int]$count } else { $shown.Count }
+    if ($total -le 0 -or $shown.Count -eq 0) {
+        return $null
+    }
+    $list = (@($shown | ForEach-Object { ([string]$_).Trim().TrimEnd('.') }) -join '; ')
+    $more = if ($total -gt $shown.Count) { ' ({0} more)' -f ($total - $shown.Count) } else { '' }
+    $reasons = [System.Collections.Generic.List[string]]::new()
+    foreach ($note in @($shown)) {
+        $reason = Get-DemoHealthExpectedReason -Text ([string]$note)
+        if ($reason -and -not $reasons.Contains($reason)) {
+            $reasons.Add($reason)
+        }
+    }
+    $why = if ($reasons.Count -gt 0) { ' {0} expected: {1}.' -f $(if ($total -eq 1) { 'That''s' } else { 'Those are' }), ($reasons -join '; ') } else { '' }
+    return [pscustomobject]@{
+        Count = $total
+        Text  = ('Its bootstrap noted, as information: {0}{1}.{2}' -f $list, $more, $why)
+    }
+}
 function Test-DemoValidationWorkloadBound {
     <#
     .SYNOPSIS
     WORKLOAD.<target>.BOUNDS from the runner's 'status --json' document: every running scenario has a
     deadline within its maximum duration and isn't past it, and an activity profile other than off has an
     end time (ADR 0010). Internal.
+
+    .DESCRIPTION
+    Since 2026-11-20 (F20) it reads the VM relay's compact form when it's there: -Bounds (the running runs, read from the
+    runner's whole output) and -RunnerProfile (the profile, read the same way), since the output the relay keeps is cut
+    from the front once a status lists two or more runs, so during a session the check was a Warning, never a result.
+    Without them (a VM whose bootstrap bundle predates it), it parses -StdOut as before. -BoundsCut: the relay left the
+    bounds out because the status was too long to carry them.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -444,27 +619,52 @@ function Test-DemoValidationWorkloadBound {
         [AllowEmptyString()]
         [string] $StdOut,
 
+        [AllowNull()]
+        [object] $Bounds = $null,
+
+        [AllowNull()]
+        [object] $RunnerProfile = $null,
+
+        [switch] $BoundsCut,
+
         [datetime] $NowUtc = [System.DateTime]::UtcNow
     )
 
     $checkId = 'WORKLOAD.{0}.BOUNDS' -f $Target
     $docUrl = 'https://learn.microsoft.com/sql/relational-databases/system-dynamic-management-views/sys-dm-exec-sessions-transact-sql'
-    $document = $null
-    $start = ([string]$StdOut).IndexOf('{')
-    $end = ([string]$StdOut).LastIndexOf('}')
-    if ($start -ge 0 -and $end -gt $start) {
-        try {
-            $document = $StdOut.Substring($start, $end - $start + 1) | ConvertFrom-Json -Depth 16
-        }
-        catch {
-            $document = $null
-        }
+    $profileNode = $null
+    $running = @()
+    $sessions = 0
+    $source = 'relay'
+    if ($null -ne $Bounds -and $null -ne $RunnerProfile) {
+        $profileNode = $RunnerProfile
+        # Get-DemoMemberList returns its array as one object: assigned, never wrapped in @().
+        $running = Get-DemoMemberList -InputObject $Bounds -Name 'running'
+        $sessions = [int](Get-DemoMemberValue -InputObject $Bounds -Name 'demoSessions')
     }
-    if ($null -eq $document -or $null -eq (Get-DemoMemberValue -InputObject $document -Name 'profile')) {
-        return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status 'Warning' -Message ('The runner''s status for {0} couldn''t be parsed (a Run Command keeps only the last 4,096 bytes of output), so the scenario bounds weren''t checked.' -f $Target) -Remediation ('Run Invoke-DemoWorkloadCommand -Target {0} -ArgumentList status, --runs, 3 and read the deadlines.' -f $Target) -DocUrl $docUrl)
+    else {
+        $source = 'status'
+        $document = $null
+        $start = ([string]$StdOut).IndexOf('{')
+        $end = ([string]$StdOut).LastIndexOf('}')
+        if ($start -ge 0 -and $end -gt $start) {
+            try {
+                $document = $StdOut.Substring($start, $end - $start + 1) | ConvertFrom-Json -Depth 16
+            }
+            catch {
+                $document = $null
+            }
+        }
+        if ($null -eq $document -or $null -eq (Get-DemoMemberValue -InputObject $document -Name 'profile')) {
+            $why = if ($BoundsCut) { 'the VM''s relay left the running runs out because the status was too long to carry them' } else { 'a Run Command keeps only the last 4,096 bytes of output, and this VM''s bootstrap bundle predates the compact bounds validate.ps1 reads since 2026-11-20' }
+            return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status 'Warning' -Message ('The runner''s status for {0} couldn''t be parsed ({1}), so the scenario bounds weren''t checked.' -f $Target, $why) -Evidence ([ordered]@{ boundsCut = [bool]$BoundsCut }) -Remediation ('Run ./scripts/deploy.ps1, which sends the VMs the current bootstrap bundle, then validate.ps1 -Area Workload again; or read the deadlines yourself: Invoke-DemoWorkloadCommand -Target {0} -ArgumentList status, --runs, 3.' -f $Target) -DocUrl $docUrl)
+        }
+        $profileNode = Get-DemoMemberValue -InputObject $document -Name 'profile'
+        $allRuns = Get-DemoMemberList -InputObject $document -Name 'runs'
+        $running = @($allRuns | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'status') -eq 'Running' })
+        $sessions = (Get-DemoMemberList -InputObject $document -Name 'demoSessions').Count
     }
 
-    $profileNode = Get-DemoMemberValue -InputObject $document -Name 'profile'
     $profileName = [string](Get-DemoMemberValue -InputObject $profileNode -Name 'name')
     $expires = ConvertTo-DemoUtcDateTime -Value (Get-DemoMemberValue -InputObject $profileNode -Name 'expiresAt')
     $failures = [System.Collections.Generic.List[string]]::new()
@@ -472,8 +672,6 @@ function Test-DemoValidationWorkloadBound {
     if ($profileName -and $profileName -ne 'off' -and $null -eq $expires) {
         $warnings.Add(('the activity profile ''{0}'' has no end time' -f $profileName))
     }
-    $allRuns = Get-DemoMemberList -InputObject $document -Name 'runs'
-    $running = @($allRuns | Where-Object { [string](Get-DemoMemberValue -InputObject $_ -Name 'status') -eq 'Running' })
     $runEvidence = [System.Collections.Generic.List[object]]::new()
     foreach ($run in $running) {
         $runId = [string](Get-DemoMemberValue -InputObject $run -Name 'runId')
@@ -489,14 +687,16 @@ function Test-DemoValidationWorkloadBound {
         elseif ($deadline -lt $NowUtc.AddMinutes(-5)) {
             $warnings.Add(('run {0} is still Running {1:N0} minutes after its deadline' -f $runId, ($NowUtc - $deadline).TotalMinutes))
         }
-        $runEvidence.Add([ordered]@{ runId = $runId; scenario = [string](Get-DemoMemberValue -InputObject $run -Name 'scenario'); deadlineAt = [string](Get-DemoMemberValue -InputObject $run -Name 'deadlineAt'); maxDurationSeconds = $maximum })
+        $runEvidence.Add([ordered]@{ runId = $runId; scenario = [string](Get-DemoMemberValue -InputObject $run -Name 'scenario'); deadlineAt = $(if ($null -ne $deadline) { $deadline.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { '' }); maxDurationSeconds = $maximum })
     }
     $evidence = [ordered]@{
         profile          = $profileName
         profileExpiresAt = if ($expires) { $expires.ToString('o', [System.Globalization.CultureInfo]::InvariantCulture) } else { $null }
         runningRuns      = $running.Count
         runs             = $runEvidence.ToArray()
-        demoSessions     = (Get-DemoMemberList -InputObject $document -Name 'demoSessions').Count
+        demoSessions     = $sessions
+        # Where the runs came from: the relay's compact bounds (F20), or the status the relay kept.
+        source           = $source
     }
     if ($failures.Count -gt 0) {
         return (New-DemoResult -CheckId $checkId -Area 'workload' -Target $Target -Status 'Fail' -Message ('A scenario on {0} isn''t bounded: {1}.' -f $Target, ($failures -join '; ')) -Evidence $evidence -Remediation ('Stop it: Invoke-DemoWorkloadCommand -Target {0} -ArgumentList stop; then report the run (ADR 0010).' -f $Target) -DocUrl $docUrl)

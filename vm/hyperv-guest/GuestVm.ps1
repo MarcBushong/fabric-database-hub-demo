@@ -732,6 +732,41 @@ function Test-DemoGuestHeldOff {
     }
 }
 
+function Test-DemoGuestCopyUnsettled {
+    # True when the guest may hold another host's Arc identity (2026-11-21): golden\capture.json says released without a
+    # reset (resetUtc), and this host isn't the capture's source (sourceAzureVmId, against its VM ID from IMDS), or that
+    # can't be told. T2's relay refuses such a guest the same way (Get-DemoControlGoldenDecision: CopyNotReset or
+    # VmIdUnknown), and deploy.ps1's T2 track resets it; no repair connects it, and no rebuild deletes it. A record that
+    # can't be read counts. False without a record, and for one that isn't released, which Test-DemoGuestHeldOff holds.
+    # Never throws.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot
+    )
+
+    $capturePath = [System.IO.Path]::Combine($StateRoot, 'golden', 'capture.json')
+    if (-not (Test-Path -LiteralPath $capturePath -PathType Leaf)) {
+        return $false
+    }
+    try {
+        $capture = Read-DemoVmJsonFile -Path $capturePath
+        if ($null -eq $capture) {
+            return $true
+        }
+        if (-not [bool]$capture['released'] -or [string]$capture['resetUtc']) {
+            return $false
+        }
+        $source = [string]$capture['sourceAzureVmId']
+        $vmId = Get-DemoGuestHostVmId
+        return (-not ($vmId -and $source -and [string]::Equals($source, $vmId, [System.StringComparison]::OrdinalIgnoreCase)))
+    }
+    catch {
+        return $true
+    }
+}
+
 function Complete-DemoGuestRecoveryInterrupted {
     <#
     .SYNOPSIS
