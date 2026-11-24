@@ -81,9 +81,11 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
     public static readonly TimeSpan PublishedAfter = TimeSpan.FromMinutes(20);
 
     /// <summary>
-    /// How close to T4's start a window can begin and still be the new lifetime's: Query Store gives a window's start to the
-    /// second (the live check L0c), so the new lifetime's first can show a fraction of a second before the start, while the
-    /// old lifetime's all began before its stop, which comes before the start by the time T4 was down.
+    /// How far a window's start can be from where T4's start, or the window before it, puts it: Query Store gives a window's
+    /// start to the second (the live checks L0c and L0a). The new lifetime's first window can show a fraction of a second
+    /// before T4's start, while the old lifetime's all began before its stop, which comes before the start by the time T4 was
+    /// down. And a window can start a second after the one before it ends, so the second between lies in no window: an
+    /// unshown stretch of no more than this after a window's end may have held nothing that a stop could lose.
     /// </summary>
     public static readonly TimeSpan StartTolerance = TimeSpan.FromSeconds(2);
 
@@ -775,7 +777,11 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         var shown = Newest(read.Statistics, reader.From, null);
         var lostFrom = restart is { } begun ? Newest(read.Statistics, reader.From, begun - StartTolerance) : shown;
         var lostUntil = restart is { } stop && stop < to ? stop : to;
-        var unshownBefore = restart is not null && lostFrom < lostUntil;
+
+        // A window can start a second after the one before it ends (the live check L0a), so a range that ends within
+        // StartTolerance of the old lifetime's newest interval may end in the second between, which no window held: that
+        // stretch isn't called lost.
+        var unshownBefore = restart is not null && lostUntil - lostFrom > StartTolerance;
         if (done && unshownBefore)
         {
             coverage.Gaps.Add(Lost(lostFrom, lostUntil));
