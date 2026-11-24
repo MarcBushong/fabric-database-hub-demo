@@ -738,4 +738,15 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         $adr = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'docs/adr/0031-incident-rca.md'))
         $adr | Should -Match ([regex]::Escape('on SQL Server, a marker in each catalog statement''s text, and, for the first update''s look-back, the earlier runner''s statements without it'))
     }
+
+    It 'says T4''s windows run from the server''s start, not the quarter hours, and that a window keeps its own search_path (L0c)' {
+        # Live on fc (2026-11-23): T4 started at 02:40:15.8 UTC and its windows began at 02:55:16, 03:10:16, and 03:25:17; and
+        # a query on the default path in one window and on the observer's in the next had a row in each.
+        $readme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'README.md'))
+        $readme | Should -Not -Match 'which the live check L0c measures' -Because 'L0c has measured it'
+        $readme | Should -Match ([regex]::Escape('Query Store keeps each window''s own `search_path`'))
+        $readme | Should -Match ([regex]::Escape('One query on both paths in one window, as in an update''s own window, wasn''t measured'))
+        $readme | Should -Match ([regex]::Escape('T4''s windows don''t end on the quarter hours: they run from the server''s start (`pg_postmaster_start_time()`), and a stop and start moves them'))
+        $readme | Should -Match ([regex]::Escape('That changes only when a read comes, never what it takes, which follows the intervals'' own times'))
+    }
 }
