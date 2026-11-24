@@ -40,7 +40,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - **Two network join actions for the session control** (2026-11-23): `Microsoft.Network/virtualNetworks/subnets/join/action` and `Microsoft.Network/privateDnsZones/join/action`, at the demo resource group, for T4's read replica. They let a PostgreSQL server the control creates join `snet-pg`, the only subnet there delegated to PostgreSQL, and use T4's private DNS zone; nothing else it can create joins a network ([permissions](docs/permissions.md)).
 - **zod 4.6.7 in the Insights app's functions** (2026-11-23, Dependabot alert 14, high: [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), "Zod can exhaust memory while validating oversized constrained collections"). The functions' lock, `fabric/app/rayfin/functions/package-lock.json`, resolved zod 4.3.6 at run time through `@microsoft/rayfin-tools-common`, which declares `~4.3.6`, as its newest release, 2.0.1, does too. Their `package.json` now overrides zod to 4.6.7, as the app's already did, and a test checks that no lock in the repository resolves an overridden package below its fix.
 
-## [2026-11-23] - The Incident RCA
+## [2026-11-24] - The Incident RCA
 
 **The Incident RCA, Phase 1:** the first item of the Insights app's Wave 2 ([ADR 0031](docs/adr/0031-incident-rca.md)). The app explains an incident the way a DBA would, from what the demo's own capture recorded and never from what it injected: who blocked whom, head blocker first, with what it ran and who ran it; the errors and deadlocks; and why T4's read replica fell behind; with recommendations and next steps. Its live proof, a new deployment and an update with a full Run all session each, comes before its release ([Phase 1](docs/adr/0031-incident-rca.md#phase-1)).
 
@@ -93,7 +93,7 @@ All notable changes to this project are recorded here. The format follows [Keep 
 - **The bundles stay** as earlier versions of `dbhub-session-metrics` until `destroy.ps1` purges the vault. They hold what the history holds, never a secret, and only those who can already read the history can read them; disabling them would take a new grant ([transport](docs/adr/0031-incident-rca.md#4-transport-into-the-history)).
 - **A T2 golden snapshot carries no capture:** `capture-t2-golden.ps1` stops T2's workload runner and deletes what its observer kept in the guest before the snapshot, and captures nothing while any is left. Otherwise a T2 restored from the snapshot would keep this environment's capture, and its first export would give it to the new environment's session (the docs review of 0189a4b). It also captures nothing while T2 documents a history save didn't take are listed, in this PC's pending list or in the session control's status (`GOLDEN.CAPTURE.RCA`), and starts the runner again when a later step fails (the review of 3f6cd14). A status that a tenant's policy has encrypted, which Azure Resource Manager returns with no value, counts as one it couldn't read, and the fix says how to save what it lists first. When the demo workspace's `NB_DatabaseHub_LiveActivity` is from before the Incident RCA, which no save takes them with, its fix updates that notebook first (the review of c059878). `GOLDEN.CAPTURE.PREPARE` says how much it deleted, and how much of it no export had taken.
 
-## [2026-11-23] - Release follow-ups
+## [2026-11-24] - Release follow-ups
 
 **The release's follow-ups.** Small fixes found during the 2026-11-20 release tests. **How to update:** run `./scripts/deploy.ps1`; your configuration needs no edit.
 
