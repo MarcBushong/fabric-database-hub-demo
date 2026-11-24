@@ -6098,3 +6098,40 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The shared stale wait isn't observable for the earlier evidence:** its fetch begins with the start's RCA step, so its own 90 s and the shared ones end together. It matters for what comes after it.
 - **A re-check's acknowledgements come after its evidence,** within `rca.recheckMinutes`: when the evidence takes the whole bound, the next re-check or the stop sends them.
 - The e058e5fe entry's limit of up to 270 s for a Run Command stuck in Deleting no longer holds: it's 90 s once per start.
+
+### The joint re-check of 9c52bd07 (2026-11-23)
+
+**Why.** The joint re-check of a708cffa..9c52bd07 with T2c-2's notebook side said **SHIP**: the two sides agree, with no High or Medium. It found two Lows, each wanted with a test that fails without it, and an optional wording fix.
+
+- **Low 1: a re-check read its fence before the T2 host's acknowledgement waited, not right before it sent.**
+  - `Invoke-DbHubRcaAck` read the fence once per VM. `Send-DbHubRcaAck` then waited for archost01 for up to the rest of the re-check's bound, and sent with no second look.
+  - When Stop now began during that wait, the acknowledgement could go out beside the stop's own Run Commands there, whose evidence parts don't look at the host again: the overlap of 2026-11-21 that the fence exists for.
+  - **The fix:** `Send-DbHubRcaAck -FenceSessionId` reads the fence (`Test-DbHubRcaRecheckOpen`) at each poll while it waits for the T2 host, and right before its Run Command, as the exports read theirs (`$mayOpen`). Once the stop has begun, it ends with `Fenced`. `Invoke-DbHubRcaAck` passes the fence on, in place of its own read before each VM, and sends nothing more after a `Fenced`. The stop sends them; for any the runner already took, it answers that it acknowledged them before.
+- **Low 2: refinement (c) looked at archost01 once.** When the dispatch ended just after that look, archost01's acknowledgements and sidecars went first, and its evidence waited for a later start.
+  - **The fix:** `Invoke-DbHubRcaEarlierRetry` polls the host (`Test-DbHubRcaHostFree`) until it's free or the bound ends, as the acknowledgement waits there.
+  - **Its reason, kept:** at a cold start whose dispatch runs past the bound, that wait now takes the rest of the time, so T2's acknowledgement found none left and said "no time was left for archost01's in the start's bound", where e058e5fe's test wants what held the host. At a start, an acknowledgement on the T2 host with no time left now looks at the host once and says what holds it, in `Send-DbHubRcaAck`'s words at its deadline (`Get-DbHubRcaAckBusyText`).
+- **The wording:** the stop's "ran out with the evidence" line didn't count the time its acknowledgements took. When the acknowledgements the session's start left had any of the stop's time, and none was left for the sidecars, the line now says "ran out with the evidence and the acknowledgements the session's start left" (`Invoke-DbHubRcaSidecarStop -AfterAcks`, passed on to `Invoke-DbHubRcaSidecarSession`). When the evidence took all of it, the line is as before.
+- **Docs:** three rows of `docs/troubleshooting.md` (RCA.EXPORT's Warning, RCA.SIDECAR.EXPORT's Warning, and RCA.SIDECAR.ACK's Warning), and this entry.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`, with `tests/unit/Automation.Runbooks.Tests.ps1`; `docs/troubleshooting.md`; and this report.
+
+**Validation.** On 9c52bd07 with this commit:
+
+- **The runbook's suite:** under strict mode, with the Azure CLI guard, `Automation.Runbooks` passed: 374 passed, none failed, and the guard saw no unmocked Azure CLI call. Its 4 new tests:
+  - **A re-check whose acknowledgement waits for archost01,** which another Run Command holds for 3 minutes, while Stop now begins at its first look there. It sends none, stops waiting within one poll, and leaves the copy's `rcaAcks` as it was. The stop then sends it, once that Run Command is gone.
+  - **A start whose T2 dispatch ends 15 s after the later fetch's first look:** T2's evidence parts go once the dispatch has ended and before T2's acknowledgement, into `rcaEarlier`, with no carry left.
+  - **The stop's line, both ways:** with archost01 held through the rest of the stop's time, it names the acknowledgements; with the evidence taking all of it, it names the evidence alone.
+- **Mutations,** each alone: all 8 fail at least one test.
+  - **Low 1:** no fence right before the Run Command (1 test: a708cffa's fence test); no fence while it waits (1: the new one); the fence not passed on (2).
+  - **Low 2:** one look at the T2 host (1); the reason with no time left not looking at the host (1: e058e5fe's cold start).
+  - **The wording:** the stop not passing `-AfterAcks` on (1), nor `Invoke-DbHubRcaSidecarStop` (1); the acknowledgements named when the evidence took all the time (1).
+  - Not counted, as equivalent: `Invoke-DbHubRcaAck` going on after a `Fenced`, since each later VM's acknowledgement reads the same fence.
+- **The suites the change reaches:** `Rca.Contract` passed, 78; `DbHubDemo.Cost`, which pins the session control's job minutes, 72; `Repo.FunctionNames` 2, `Repo.Conventions` 123, and `Repo.NeutralWording` 3. The fence's reads and the later fetch's wait stay inside each export's own bound, so the job minutes keep their ceiling.
+- PSScriptAnalyzer, with the repo's settings (Windows PowerShell 5.1's for the runbooks), found nothing in the two PowerShell files this commit changes, which are ASCII-only; markdownlint-cli2 0.23.3 found no issue; and the leak check finds nothing.
+
+**What its live check needs.** As for a708cffa: a cold start with a Burstable T4, where T2's dispatch may still run when the start's RCA step begins; a re-check and a stop after such a start; and T2's time per Run Command, with the status's size against the vault's 25 KB.
+
+**Limits.**
+
+- **At a re-check or the stop, the acknowledgements the start left go before the whole sidecar fetch** (option 2, as decided). archost01's acknowledgement waits while Azure lists any other Run Command there, the export's own last delete included, so one that holds archost01 can take the rest of that export's time, and sqlvm01's sidecars then wait too. Nothing is lost: they stay on the VM for the next export. The start's passes avoid it: sqlvm01's acknowledgements and sidecars first, then archost01's. The same passes at the re-check and the stop (`Invoke-DbHubRcaSidecarSession -OneAtATimeLast -AckWork`) would avoid it there too. That's the coordinator's call, not this commit's.
+- **A fence read just before the stop's mark lands can still send one acknowledgement,** as for the exports. The stop's first Run Command on archost01 waits 60 s after its mark, and then while Azure lists that acknowledgement, an `rca-` name (review of 242a3ef7).
