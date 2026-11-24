@@ -173,7 +173,47 @@
         }
       },
       {
+        "sha256": "4eeb622d1784ec195c03e6fb23c5463e0b707a79e0f59bc13e2deaeff411ace6",
+        "since": "2026-11-24",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
+      },
+      {
+        "sha256": "5096a890d26cdf4094cc96b69514f93c89e6f623800182716f7b0a534ee23df1",
+        "since": "2026-11-24",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
+      },
+      {
+        "sha256": "9eb0a1cc22c3d447284d7e341def28865b1b3952c9d6a220be9779dd0b1b1d8b",
+        "since": "2026-11-24",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
+      },
+      {
         "sha256": "d1d6294aff5c7ac03da910bdd161924fbcf94e94aac1fcea60dc4207ec77b2d5",
+        "since": "2026-11-24",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
+      },
+      {
+        "sha256": "e1cd1790e8aaf940ff880b38dc3dd63bf205958406beb80f7ccf562f95fb2768",
         "since": "2026-11-24",
         "parameters": {
           "WORKSPACE_ID": "",
