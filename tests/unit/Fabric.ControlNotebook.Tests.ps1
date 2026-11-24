@@ -119,6 +119,7 @@ if view_end is not None:
     # the histories it saved (reference runs) or started as jobs, the order of both, and what it printed.
     $script:simulator = Join-Path -Path $TestDrive -ChildPath 'simulate_control.py'
     Set-Content -LiteralPath $script:simulator -Encoding utf8NoBOM -Value @'
+import base64
 import contextlib
 import datetime as real_dt
 import io
@@ -163,9 +164,9 @@ def iso(value):
 SENT, JOBS, REFS, VALIDATORS, ORDER, REFUSED, JOBREADS, STOPS, STATUSREADS, SECRET_URL = [], [], [], [], [], [0], [0], [0], [0], "https://example.webhook.azure-" + "automation.net/webhooks?token=" + "x" * 40
 VAULT = {"dbhub-session-status": "{}", "dbhub-session-metrics": "{}", "dbhub-activity-webhook": SECRET_URL}
 RUNBOOK = {"session": None, "accepted": None, "minutes": 0}
-# The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound", "full", "leftoverjob", and
-# "rcaleftoverjob".
-LAKEHOUSE = "" if scenario in ("unbound", "full", "leftoverjob", "rcaleftoverjob") else "cccccccc-0000-0000-0000-000000000003"
+# The control notebook's default lakehouse, which deploy.ps1 attaches: none in "unbound", "full", "leftoverjob",
+# "rcaleftoverjob", and "sessionqsfull".
+LAKEHOUSE = "" if scenario in ("unbound", "full", "leftoverjob", "rcaleftoverjob", "sessionqsfull") else "cccccccc-0000-0000-0000-000000000003"
 # The Incident RCA (ADR 0031): the metrics secret's earlier versions, which hold the bundles the runbook wrote; the demo
 # lakehouse's files (notebookutils.fs); what the activity notebook found staged; and the versions read.
 VERSIONS, FILES, FOLDERS, STAGED, VAULTREADS = {}, {}, set(), [], []
@@ -173,10 +174,58 @@ VERSIONS, FILES, FOLDERS, STAGED, VAULTREADS = {}, {}, set(), [], []
 # job's state at Run all's look is queued, Completed after its notebook deleted the file, Completed with the file left (a
 # copy from before the Incident RCA), or Failed; or Completed with the staged file's check raising (review of 37a546bc).
 RCA_JOB_SCENARIOS = ("rcajobqueued", "rcajobdone", "rcajobold", "rcajobfailed", "rcajobunchecked")
-RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail", "takenoverrca") + RCA_JOB_SCENARIOS
+RCA_SCENARIOS = ("sessionrca", "sessionrcaold", "earlierrca", "leftoverrca", "bundlefail", "sessionrcalate", "sessionrcapinfail", "takenoverrca") + RCA_JOB_SCENARIOS + ("sessionqs",)
 FIXTURE = json.load(open(sys.argv[4] + "/rca/fixtures/rca-evidence.parameter.json", encoding="utf-8")) if len(sys.argv) > 4 else {"parts": []}
 BUNDLE_PARTS = {"1" * 32: FIXTURE["parts"][:2], "2" * 32: FIXTURE["parts"][2:], "3" * 32: FIXTURE["parts"][:2]}
 DOCUMENT_REFS = [{"documentId": part.split()[2], "parts": int(part.split()[3].split("/")[1]), "sha256": part.split()[4]} for part in FIXTURE["parts"][::2]]
+# The Incident RCA's sidecars on Run all's path (2026-11-23): the stop's sidecar bundle and its index, versions of the
+# metrics secret, and the metrics' rcaSidecars pointer (rca/fixtures); the activity notebook's definition, which declares
+# RCA_SIDECAR_FILE unless it's from before the sidecar ("sessionqsold"); the payloads it read; and its acknowledgements in
+# Files/rca/acks, which it writes as B's notebook does: every sidecar written, one skipped ("sessionqsskip"), or none
+# ("sessionqsnoack"). Its definition is read through Get Item Definition's long-running operation in "sessionqs".
+SIDECAR_STOP_SCENARIOS = ("sessionqs", "sessionqsold", "sessionqsskip", "sessionqsnoack", "sessionqsjob", "sessionqsfull", "sessionqslate", "sessionqslateindex",
+                          "sessionqsbadversion", "sessionqsbadindex", "sessionqsnullindex")
+FIXTURES = (sys.argv[4] + "/rca/fixtures/") if len(sys.argv) > 4 else ""
+SIDECAR_BUNDLE = json.load(open(FIXTURES + "sidecar-bundle.json", encoding="utf-8")) if FIXTURES else {}
+SIDECAR_INDEX = json.load(open(FIXTURES + "sidecar-bundle-index.json", encoding="utf-8")) if FIXTURES else {}
+SIDECAR_POINTER = json.load(open(FIXTURES + "metrics-rca-sidecars-member.json", encoding="utf-8")) if FIXTURES else {}
+SIDECARS, DEFREADS, PUTS = [], [], []
+BASE = "abfss://bbbbbbbb-0000-0000-0000-000000000002@onelake.dfs.fabric.microsoft.com/cccccccc-0000-0000-0000-000000000003/"
+
+
+def sidecar_pointer(session):
+    """The metrics' rcaSidecars pointer that a runbook with Run all's sidecar path writes last, after the sidecar bundle and
+    its index, which it writes as earlier versions of the metrics secret."""
+    VERSIONS[SIDECAR_INDEX["bundles"][0]] = json.dumps(dict(SIDECAR_BUNDLE, sessionId=session))
+    VERSIONS[SIDECAR_POINTER["index"]] = json.dumps(dict(SIDECAR_INDEX, sessionId=session))
+    return dict(SIDECAR_POINTER)
+
+
+def activity_definition(declares):
+    """NB_DatabaseHub_LiveActivity's definition (Items - Get Item Definition): its parameters, RCA_SIDECAR_FILE among them
+    when it's from the sidecar on."""
+    source = 'RCA_EVIDENCE_FILE = ""\nRCA_ONLY = False\n' + ('RCA_SIDECAR_FILE = ""\n' if declares else "")
+    return {"definition": {"parts": [{"path": "notebook-content.py", "payload": base64.b64encode(source.encode("utf-8")).decode("ascii"), "payloadType": "InlineBase64"},
+                                     {"path": ".platform", "payload": base64.b64encode(b"{}").decode("ascii"), "payloadType": "InlineBase64"}]}}
+
+
+def acknowledge(payload, documents):
+    """An acknowledgement in Files/rca/acks (rca/transport.schema.json, ack), as the activity notebook writes it."""
+    FOLDERS.add(BASE + "Files/rca/acks")
+    name = "Files/rca/acks/%s.ack.json" % payload.rsplit("/", 1)[1][:-len(".json")]
+    FILES[BASE + name] = json.dumps({"kind": "ContosoCare.RcaAck", "version": 1, "payload": payload, "runId": "run-1", "documents": [
+        dict({"documentId": document, "kind": "ContosoCare.RcaSidecar", "status": status}, **({"reason": "its SHA-256 doesn't match"} if status == "skipped" else {}))
+        for document, status in documents]})
+    return name
+
+
+def acks_sent_later(result, by):
+    """Option 2 (2026-11-23): the session's next warm export, a re-check's or else the stop's, sends what its start left
+    (T2's host answers by then), and writes rcaAcks again, only moving IDs from left to sent."""
+    sent = list(result["sent"]) + [item for item in result["left"] if item not in result["sent"]]
+    return {"kind": "ContosoCare.RcaAckResult", "version": 1, "sent": sent, "left": [], "status": "Pass",
+            "message": "%d sidecar acknowledgement(s) sent: %d before the start's sidecar fetch, %d at %s." % (
+                len(sent), len(result["sent"]), len(sent) - len(result["sent"]), by)}
 
 
 def rca_bundle_index(session, bundles):
@@ -196,6 +245,8 @@ class FileSystem:
 
     def put(self, path, content, overwrite=False):
         FILES[path] = content
+        if path.startswith(BASE + "Files/rca/inbox/sidecar-"):
+            PUTS.append({"name": path[len(BASE):], "document": json.loads(content)})
         return True
 
     def exists(self, path):
@@ -208,7 +259,15 @@ class FileSystem:
         prefix = path.rstrip("/") + "/"
         return [types.SimpleNamespace(name=name[len(prefix):]) for name in sorted(FILES) if name.startswith(prefix) and "/" not in name[len(prefix):]]
 
+    def head(self, path, max_bytes=102400):
+        if path not in FILES:
+            raise FileNotFoundError(path)
+        return FILES[path][:max_bytes]
+
     def rm(self, path, recurse=False):
+        if scenario == "qsacksrmfail" and path.endswith("/sidecar-20261001T120000Z-runall-1a2b3c4d.ack.json"):
+            # OneLake refuses to delete the acknowledgement more than 30 days old.
+            raise OSError("OneLake refused the delete")
         FILES.pop(path, None)
         return True
 
@@ -343,13 +402,20 @@ def runbook(body):
             VAULT["dbhub-session-status"] = json.dumps({"sessionId": body["sessionId"], "phase": "refused", "message": "A run is already active: it ends at 15:00.",
                                                         "steps": [{"step": "Start", "state": "Fail", "atUtc": iso(Clock.now), "message": "A run is already active: it ends at 15:00.", "fix": "Wait until it ends, or run the notebook's Stop now cell first."}]})
             return
-        RUNBOOK.update(session=body["sessionId"], accepted=Clock.now, minutes=body["durationMinutes"])
+        RUNBOOK.update(session=body["sessionId"], accepted=Clock.now, minutes=body["durationMinutes"], acks=body.get("rcaAcks"))
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": body["sessionId"], "phase": "starting", "acceptedUtc": iso(Clock.now), "steps": []})
+        if scenario == "qsacksearly" and body.get("rcaAcks"):
+            # T2c-1's runbook (a114c727) first writes a result before it sends anything, then the real one with its step.
+            starting = json.loads(VAULT["dbhub-session-status"])
+            starting["rcaAcks"] = {"kind": "ContosoCare.RcaAckResult", "version": 1, "sent": [], "left": body["rcaAcks"]["documents"], "status": "Warning",
+                                   "message": "None of the %d sidecar acknowledgement(s) was sent: not yet: the start sends them before its exports." % len(body["rcaAcks"]["documents"])}
+            VAULT["dbhub-session-status"] = json.dumps(starting)
     elif action == "stop":
         session = body.get("sessionId") or ""
         if not session and scenario in ("takenoverstop", "takenoveragain"):
             # A stop with no session ID writes the stopped status of the session the group names (DbHubSessionId).
             session = json.loads(VAULT["dbhub-session-status"]).get("sessionId") or ""
+        replaced = json.loads(VAULT["dbhub-session-status"])
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "Stop now", "failed": [],
                                                     "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}})
         if (scenario in ("takenover", "takenoverrca") or (scenario == "takenoverstop" and body.get("sessionId"))) and session:
@@ -362,6 +428,14 @@ def runbook(body):
                                                                  "the history's metrics saved to the control vault", "busy marker cleared"],
                                                         "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."},
                                                         "takenOver": {"by": "start-demo", "autoStopUtc": until}})
+        if session and replaced.get("sessionId") == session and replaced.get("rcaAcks"):
+            # The stop keeps the start's acknowledgement result from the status it replaces (Write-DbHubStopStatus), as its
+            # session's re-checks left it; with "qsacksstop" it sends what's still left first (T2's host is warm by then).
+            stopped = json.loads(VAULT["dbhub-session-status"])
+            stopped["rcaAcks"] = replaced["rcaAcks"]
+            if scenario == "qsacksstop":
+                stopped["rcaAcks"] = acks_sent_later(replaced["rcaAcks"], "the stop")
+            VAULT["dbhub-session-status"] = json.dumps(stopped)
         if session and scenario in RCA_SCENARIOS:
             # A runbook with the Incident RCA (ADR 0031): the stop's export, and each target's capture line, for the notebook.
             stopped = json.loads(VAULT["dbhub-session-status"])
@@ -379,7 +453,25 @@ def runbook(body):
                 document["cosmos"] = cosmos_document(session, accepted, Clock.now)
             if scenario in RCA_SCENARIOS and scenario != "leftoverrca":
                 document["rca"] = rca_bundle_index(session, ["1" * 32, "2" * 32])
+            if scenario in SIDECAR_STOP_SCENARIOS:
+                document["rcaSidecars"] = sidecar_pointer(session)
+                # A pointer this notebook can't use: another version, or an index that isn't a version's ID (a trailing line
+                # feed, which the contract's anchors refuse); and one that names no sidecar (a null index).
+                if scenario == "sessionqsbadversion":
+                    document["rcaSidecars"]["version"] = 2
+                if scenario == "sessionqsbadindex":
+                    document["rcaSidecars"]["index"] += "\n"
+                if scenario == "sessionqsnullindex":
+                    document["rcaSidecars"].update(index=None, documents=0, status="Not selected", message="No sidecar this session.")
             VAULT["dbhub-session-metrics"] = json.dumps(document, separators=(",", ":"))
+            if scenario in SIDECAR_STOP_SCENARIOS:
+                # A runbook with Run all's sidecar path names the metrics' final version too ("sessionqslate" and
+                # "sessionqslateindex": the vault refuses it, and the stop's sidecar bundle, or its index, is the latest).
+                pin_metrics("9" * 32)
+                if scenario == "sessionqslate":
+                    VAULT["dbhub-session-metrics"] = VERSIONS[SIDECAR_INDEX["bundles"][0]]
+                if scenario == "sessionqslateindex":
+                    VAULT["dbhub-session-metrics"] = VERSIONS[SIDECAR_POINTER["index"]]
             if scenario in ("sessionrcalate", "sessionrcapinfail"):
                 # A runbook from 2026-11-20 on names the metrics' final version in the stop's status (review of 15ad76d) ...
                 pin_metrics("4" * 32)
@@ -411,6 +503,65 @@ if scenario in ("stoppedlate", "leftoverlate"):
                                                  "endUtc": iso(ended), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
     pin_metrics("5" * 32)
     late_bundle(session)
+if scenario in ("leftoverqs", "stoppedqs", "earlierqs"):
+    # Run all's sidecar path in an earlier session's history: its metrics, with the pointer to its sidecars, kept in the
+    # vault a day ago, saved as a leftover by the pre-check ("leftoverqs", the runbook's status from before 2026-11-14 had
+    # no plan); 5 minutes ago, by Stop now when no session runs ("stoppedqs"); or, without T4's series, so the pre-check
+    # doesn't save its history, with the evidence of an even earlier session that its start exported, saved alone
+    # ("earlierqs").
+    session = ("e" if scenario == "leftoverqs" else "b") * 32
+    ended = Clock.now - (real_dt.timedelta(days=1) if scenario == "leftoverqs" else real_dt.timedelta(minutes=5))
+    if scenario != "leftoverqs":
+        status = stopped_status(session, ended, running_status(session, ended - real_dt.timedelta(minutes=90), 90))
+        if scenario == "earlierqs":
+            status["rcaEarlier"] = rca_bundle_index("d" * 32, ["3" * 32])
+        VAULT["dbhub-session-status"] = json.dumps(status)
+    VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": session, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=100)),
+                                                 "endUtc": iso(ended), "windowMinutes": 100, "intervalMinutes": 1, "servers": [],
+                                                 "series": [] if scenario == "earlierqs" else [{"metric": "cpu_percent"}],
+                                                 "rcaSidecars": sidecar_pointer(session)}, separators=(",", ":"))
+    if scenario != "leftoverqs":
+        pin_metrics("5" * 32)
+# Run all's acknowledgements from earlier saves ("qsacks"), which the next start carries as rcaAcks: one whose sidecars
+# the start sends, one with only a skipped sidecar, one with a sidecar the start's runbook leaves for the next (T2's), one
+# more than 30 days old, the scripts' own, which Run all never reads, and one naming another payload, which counts as
+# missing.
+QS_IDS = ["20261113T140000Z-sqlvm01-0001-sidecar", "20261113T141500Z-sqlvm01-0002-sidecar", "20261113T143000Z-sqlvm01-0003-sidecar",
+          "20261113T144500Z-arcsql01-0001-sidecar", "20261113T150000Z-sqlvm01-0004-sidecar"]
+if scenario in ("qsacks", "qsacksearly", "qsacksrmfail", "qsacksrecheck", "qsacksstop", "qsacksstepped"):
+    acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a1b2c3d.json", [(QS_IDS[0], "written"), (QS_IDS[1], "already"), (QS_IDS[2], "skipped")])
+    acknowledge("Files/rca/inbox/sidecar-20261113T155000Z-runall-6c7d8e9f.json", [(QS_IDS[2], "skipped")])
+    acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-4e5f6a7b.json", [(QS_IDS[1], "already"), (QS_IDS[3], "written")])
+    # More than 30 days old by the time in its name: the runner kept its sidecar no longer, so it goes unsent.
+    acknowledge("Files/rca/inbox/sidecar-20261001T120000Z-runall-1a2b3c4d.json", [("20261001T110000Z-sqlvm01-0009-sidecar", "written")])
+    acknowledge("Files/rca/inbox/sidecar-20261113T170000Z-script-8c9d0e1f.json", [(QS_IDS[4], "written")])
+    other = acknowledge("Files/rca/inbox/sidecar-20261113T180000Z-runall-2a3b4c5d.json", [(QS_IDS[4], "written")])
+    FILES[BASE + other] = FILES[BASE + other].replace("2a3b4c5d", "99999999")
+# Whole acknowledgements, the oldest first ("qsackswhole"): 40 sidecars, then 30, which would pass the 64 a start takes,
+# then 1, which waits behind them. Older than all of them, one that lists 65, more than the contract's 64, of which 3 are
+# written: it doesn't follow the contract, so none of it rides, and it holds nothing back.
+WHOLE_IDS = ["20261113T%02d%02d00Z-sqlvm01-%04d-sidecar" % (10 + n // 60, n % 60, n) for n in range(71)]
+OVER_IDS = ["20261112T%02d%02d00Z-sqlvm01-%04d-sidecar" % (10 + n // 60, n % 60, n) for n in range(65)]
+if scenario == "qsackswhole":
+    acknowledge("Files/rca/inbox/sidecar-20261113T140000Z-runall-0f0f0f0f.json", [(item, "written" if n < 3 else "skipped") for n, item in enumerate(OVER_IDS)])
+    acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a0a0a0a.json", [(item, "written") for item in WHOLE_IDS[:40]])
+    acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-0b0b0b0b.json", [(item, "written") for item in WHOLE_IDS[40:70]])
+    acknowledge("Files/rca/inbox/sidecar-20261113T170000Z-runall-0c0c0c0c.json", [(WHOLE_IDS[70], "written")])
+# A session that stopped with its acknowledgement result final, its T2 ID sent after its start (option 2), outside the
+# follow of a Run all: Stop now 5 minutes later ("stoppedqsacks"), and the next day's Run all ("qsacksprecheck"). Two of
+# Run all's acknowledgements are done by its result, and one, a later save's, rides on the next start.
+if scenario in ("stoppedqsacks", "qsacksprecheck"):
+    session = ("b" if scenario == "stoppedqsacks" else "e") * 32
+    ended = Clock.now - (real_dt.timedelta(minutes=5) if scenario == "stoppedqsacks" else real_dt.timedelta(days=1))
+    earlier_status = stopped_status(session, ended, running_status(session, ended - real_dt.timedelta(minutes=90), 90))
+    earlier_status["rcaAcks"] = acks_sent_later({"sent": [QS_IDS[0], QS_IDS[1]], "left": [QS_IDS[3]]}, "the stop")
+    VAULT["dbhub-session-status"] = json.dumps(earlier_status)
+    if scenario == "stoppedqsacks":
+        VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": session, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=100)),
+                                                     "endUtc": iso(ended), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+    acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a1b2c3d.json", [(QS_IDS[0], "written"), (QS_IDS[1], "already"), (QS_IDS[2], "skipped")])
+    acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-4e5f6a7b.json", [(QS_IDS[1], "already"), (QS_IDS[3], "written")])
+    acknowledge("Files/rca/inbox/sidecar-20261113T190000Z-runall-5d6e7f80.json", [(QS_IDS[4], "written")])
 
 
 # The status a session's start writes when it exported an earlier session's evidence (its rcaEarlier; ADR 0031).
@@ -438,6 +589,19 @@ def vault_read(name):
             if scenario == "earlierrca":
                 # The start exported session dddd...'s evidence, which its own stop didn't (ADR 0031).
                 RUNNING_EARLIER[0] = status["rcaEarlier"] = rca_bundle_index("d" * 32, ["3" * 32])
+            if RUNBOOK.get("acks"):
+                # A runbook with Run all's sidecar path acknowledges them on their VMs before its exports: T2's didn't answer.
+                documents = RUNBOOK["acks"]["documents"]
+                sent, left = [item for item in documents if "-arcsql01-" not in item], [item for item in documents if "-arcsql01-" in item]
+                status["rcaAcks"] = {"kind": "ContosoCare.RcaAckResult", "version": 1, "sent": sent, "left": left, "status": "Warning" if left else "Pass",
+                                     "message": "%d sidecars acknowledged on sqlvm01, before the start's exports%s" % (
+                                         len(sent), ("; %d left: arcsql01 didn't answer." % len(left)) if left else ".")}
+                if scenario in ("qsacksearly", "qsacksstepped"):
+                    # T2c-1's real result comes with its RCA.SIDECAR.ACK step, which the status's steps print.
+                    status["rcaAcks"]["message"] = ("%d of %d sidecar acknowledgement(s) sent before the start's exports (%d on sqlvm01); the rest "
+                                                    "weren't: arcsql01 didn't answer." % (len(sent), len(documents), len(sent)))
+                    status["steps"].append({"step": "RCA.SIDECAR.ACK", "state": status["rcaAcks"]["status"], "atUtc": iso(Clock.now),
+                                            "message": status["rcaAcks"]["message"], "fix": "The control notebook keeps them, and the next Run all's start sends them again."})
             VAULT[name] = json.dumps(status)
         elif scenario == "t2late" and current.get("phase") == "running" and current.get("dispatchPending") \
                 and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=22):
@@ -452,6 +616,12 @@ def vault_read(name):
             # DbHub-Monitor's re-check (2026-11-16): the same status, with the host that stopped, and the new runCommands field.
             current["steps"].append(dict(HOST_WARNING, atUtc=iso(Clock.now)))
             current["runCommands"] = [{"vm": "archost01", "name": "DbHubControl-archost01-x", "targets": ["T2"]}]
+            VAULT[name] = json.dumps(current)
+        elif scenario in ("qsacksrecheck", "qsacksstepped") and current.get("phase") == "running" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=40) \
+                and (current.get("rcaAcks") or {}).get("left"):
+            # Option 2 (2026-11-23): the session's re-check sends what its start left, and writes rcaAcks again, with no step;
+            # in "qsacksstepped", the start's step stays in the status's steps.
+            current["rcaAcks"] = acks_sent_later(current["rcaAcks"], "a re-check")
             VAULT[name] = json.dumps(current)
     return VAULT[name]
 
@@ -489,12 +659,24 @@ class Notebook:
             return ""
         REFS.append({"path": path, "timeout": timeout_seconds, "workspace": workspace, "args": arguments})
         ORDER.append("history:" + str(arguments.get("SESSION_ID", ""))[:8])
-        if scenario == "refail" or scenario in RCA_JOB_SCENARIOS:
+        if scenario in ("refail", "sessionqsjob") or scenario in RCA_JOB_SCENARIOS:
             raise RuntimeError("The referenced notebook's default lakehouse differs from the caller's.")
         if scenario in ("queued", "queuedjob"):
             # Live, 2026-11-16: Fabric's reference run failed on a cell's result, and the job then queued behind this session.
             raise RuntimeError("Unrecognized token 'REDACTED': was expecting (JSON String, Number, Array, Object or token 'null', 'true' or 'false')")
         _sleep(240)
+        sidecar = [name for name in FILES if arguments.get("RCA_SIDECAR_FILE") and name.endswith("/" + arguments["RCA_SIDECAR_FILE"])]
+        if sidecar:
+            # The activity notebook's sidecar cell, before section 3 (B, 2026-11-23): it writes each sidecar once,
+            # acknowledges the payload in Files/rca/acks, and deletes it only when every sidecar is written or already was.
+            document = json.loads(FILES[sidecar[0]])
+            SIDECARS.append({"name": arguments["RCA_SIDECAR_FILE"], "session": arguments.get("SESSION_ID", ""), "document": document})
+            documents = sorted({part.split()[2] for part in document["parts"]})
+            if scenario != "sessionqsnoack":
+                statuses = [(item, "skipped" if scenario == "sessionqsskip" and item == documents[-1] else "written") for item in documents]
+                acknowledge(arguments["RCA_SIDECAR_FILE"], statuses)
+                if all(status != "skipped" for _, status in statuses):
+                    del FILES[sidecar[0]]
         staged = [name for name in FILES if arguments.get("RCA_EVIDENCE_FILE") and name.endswith("/" + arguments["RCA_EVIDENCE_FILE"])]
         if staged:
             # The activity notebook reads the staged evidence; since the Incident RCA it deletes the file and answers with
@@ -552,14 +734,28 @@ def request(method, url, json=None, headers=None, timeout=None):
             return Response(403, {"error": {"code": "Forbidden", "message": "The user doesn't have secrets get permission."}})
         if scenario == "sessionrcapinfail" and version == "4" * 32:
             return Response(403, {"error": {"code": "Forbidden", "message": "The user doesn't have secrets get permission."}})
+        if scenario in ("sessionqslate", "sessionqslateindex") and version == "9" * 32:
+            return Response(403, {"error": {"code": "Forbidden", "message": "The user doesn't have secrets get permission."}})
         return Response(200, {"value": VERSIONS[version], "id": url.split("?")[0]})
     # No capacity call: the control never checks, starts, or pauses the capacity (the user, 2026-11-14).
     assert url.startswith(FABRIC + "/"), url
     if method == "GET" and "/items?type=" in url:
         names = {"Notebook": [("NB_DatabaseHub_LiveActivity", "nb-1")], "Report": [("RPT_DatabaseHub_History", "RPT-1")], "KQLDashboard": []}[url.split("type=")[1]]
         return Response(200, {"value": [{"displayName": name, "id": item} for name, item in names]})
+    if method == "POST" and url == FABRIC + "/workspaces/bbbbbbbb-0000-0000-0000-000000000002/items/nb-1/getDefinition":
+        # Items - Get Item Definition: in "sessionqs" a long-running operation, which runs at its first look.
+        DEFREADS.append("definition")
+        if scenario == "sessionqs":
+            return Response(202, None, FABRIC + "/operations/op-1")
+        return Response(200, activity_definition(scenario != "sessionqsold"))
+    if method == "GET" and url == FABRIC + "/operations/op-1":
+        DEFREADS.append("state")
+        return Response(200, {"status": "Running" if DEFREADS.count("state") < 2 else "Succeeded"})
+    if method == "GET" and url == FABRIC + "/operations/op-1/result":
+        DEFREADS.append("result")
+        return Response(200, activity_definition(True))
     if method == "POST" and url.endswith("/items/nb-1/jobs/instances?jobType=RunNotebook"):
-        if scenario == "full":
+        if scenario in ("full", "sessionqsfull"):
             REFUSED[0] += 1
             return Response(430, {"errorCode": "TooManyRequestsForCapacity", "message": "This Spark job can't be run because you have hit a Spark compute or API rate limit."})
         JOBS.append({key: value["value"] for key, value in json["executionData"]["parameters"].items()})
@@ -567,7 +763,7 @@ def request(method, url, json=None, headers=None, timeout=None):
         return Response(202, None, FABRIC + "/workspaces/x/items/nb-1/jobs/instances/run-%d" % len(JOBS))
     if method == "GET" and "/jobs/instances/run-" in url:
         JOBREADS[0] += 1
-        if scenario in ("queued", "queuedjob", "rcajobqueued"):
+        if scenario in ("queued", "queuedjob", "rcajobqueued", "sessionqsjob"):
             return Response(200, {"status": "NotStarted"})
         if scenario == "rcajobfailed":
             return Response(200, {"status": "Failed", "failureReason": {"message": "Notebook execution failed in cell 4."}})
@@ -602,7 +798,7 @@ with contextlib.redirect_stdout(buffer):
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
                           "takenoverstop": {"STOP_NOW": True}, "takenoveragain": {"STOP_NOW": True}, "nocontrolstop": {"STOP_NOW": True},
-                          "stoppedlate": {"STOP_NOW": True},
+                          "stoppedlate": {"STOP_NOW": True}, "stoppedqs": {"STOP_NOW": True}, "stoppedqsacks": {"STOP_NOW": True},
                           "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False},
                           "askedshort": {"DURATION_MINUTES": 20}, "askedlong": {"DURATION_MINUTES": 150},
                           "askedfraction": {"DURATION_MINUTES": 45.5}, "askednone": {"DURATION_MINUTES": None}, "askedtext": {"DURATION_MINUTES": "abc"},
@@ -615,7 +811,8 @@ with contextlib.redirect_stdout(buffer):
         error = "%s: %s" % (type(failure).__name__, failure)
 printed = buffer.getvalue()
 print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "validators": VALIDATORS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "statusReads": STATUSREADS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed,
-                  "staged": STAGED, "files": sorted(FILES), "vaultReads": VAULTREADS}))
+                  "staged": STAGED, "files": sorted(FILES), "vaultReads": VAULTREADS, "sidecars": SIDECARS, "defReads": DEFREADS, "puts": PUTS,
+                  "acks": {name[len(BASE):]: json.loads(text) for name, text in FILES.items() if name.startswith(BASE + "Files/rca/acks/")}}))
 '@
 
     function Invoke-Simulation([string] $Path, [string] $Scenario, [string] $Start) {
@@ -1902,6 +2099,393 @@ print(json.dumps(out))
         $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'RCA_EVIDENCE_FILE'
         @($report.staged) | Should -BeNullOrEmpty
         @($report.vaultReads) | Should -BeNullOrEmpty
+    }
+
+    It 'passes the Query Store sidecars to the history, and reads what its acknowledgement says, in <Case> (2026-11-23, Run all''s path for the sidecars)' -ForEach @(
+        @{ Case = 'a session''s end: the pointer, the index, and the bundle read by version, staged whole, the payload gone, and the acknowledgement kept for the next start'; Scenario = 'sessionqs' }
+        @{ Case = 'a session''s end whose acknowledgement skips a sidecar: a Warning, and the payload stays'; Scenario = 'sessionqsskip' }
+        @{ Case = 'a session''s end whose activity notebook writes no acknowledgement: a Warning, and the payload stays'; Scenario = 'sessionqsnoack' }
+        @{ Case = 'a session''s end whose history is a queued job: Run all can''t tell yet, and the payload stays for the job'; Scenario = 'sessionqsjob' }
+        @{ Case = 'a session''s end whose history job the capacity refuses: the payload nothing read goes'; Scenario = 'sessionqsfull' }
+        @{ Case = 'an earlier session''s history, which the pre-check saves as a leftover'; Scenario = 'leftoverqs' }
+        @{ Case = 'Stop now after a session that already stopped'; Scenario = 'stoppedqs' }
+        @{ Case = 'an even earlier session''s evidence saved alone, when the pre-check doesn''t save the earlier session''s history'; Scenario = 'earlierqs' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.leaked | Should -BeFalse
+        $report.printed | Should -Not -Match 'Bearer|simulated-keyvault|couldn''t stage'
+        $bundle = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/fixtures/sidecar-bundle.json') -Raw | ConvertFrom-Json
+        $session = switch ($Scenario) { 'leftoverqs' { 'e' * 32 } { $_ -in 'stoppedqs', 'earlierqs' } { 'b' * 32 } default { $report.sent[0].sessionId } }
+        # One payload for the history that took the sidecars: rca/transport.schema.json's sidecarParameter, with every part
+        # line of the stop's sidecar bundle, the session's whole sidecars. Every run that got it got the same one.
+        @($report.puts).Count | Should -Be 1
+        $payload = $report.puts[0].name
+        $payload | Should -Match '^Files/rca/inbox/sidecar-\d{8}T\d{6}Z-runall-[0-9a-f]{8}\.json$'
+        foreach ($run in @(@($report.refs | ForEach-Object args) + @($report.jobs) | Where-Object { $_.PSObject.Properties.Name -contains 'RCA_SIDECAR_FILE' })) {
+            $run.RCA_SIDECAR_FILE | Should -BeExactly $payload
+        }
+        # Every history that ran, or was asked to, got it; the refused job in "sessionqsfull" never started.
+        $got = @(@($report.refs | ForEach-Object args) + @($report.jobs) | Where-Object { $_.PSObject.Properties.Name -contains 'RCA_SIDECAR_FILE' })
+        $got.Count | Should -Be $(if ($Scenario -eq 'sessionqsjob') { 2 } elseif ($Scenario -eq 'sessionqsfull') { 0 } else { 1 })
+        $report.puts[0].document.kind | Should -Be 'ContosoCare.RcaSidecarParts'
+        $report.puts[0].document.sessionId | Should -Be $session
+        @($report.puts[0].document.parts) | Should -Be @($bundle.parts)
+        Test-Json -Json ($report.puts[0].document | ConvertTo-Json -Depth 8 -Compress) -SchemaFile (Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json') | Should -BeTrue
+        $report.printed | Should -Match ('Session {0}''s Query Store evidence: 2 sidecar\(s\) in 3 part\(s\), passed to its history\.' -f $session.Substring(0, 8))
+        @([regex]::Matches($report.printed, '(?m)^RCA\.SIDECAR (Pass|Warning):')).Count | Should -Be 1
+        $inbox = @($report.files | Where-Object { $_ -like '*/Files/rca/inbox/*' })
+        $what = 'session {0}''s 2 Query Store sidecar\(s\)' -f $session.Substring(0, 8)
+        switch ($Scenario) {
+            'sessionqs' {
+                # The metrics' version the stop names, the evidence's bundles as before, then the sidecars' index and the
+                # bundle it lists, each by version.
+                @($report.vaultReads) | Should -Be @('dbhub-session-metrics/99999999', 'dbhub-session-metrics/11111111', 'dbhub-session-metrics/22222222',
+                    'dbhub-session-metrics/a0bd446e', 'dbhub-session-metrics/8af9856a')
+                # The activity notebook's definition, once, through Get Item Definition's long-running operation.
+                @($report.defReads) | Should -Be @('definition', 'state', 'state', 'result')
+                $report.refs[0].args.SESSION_ID | Should -Be $session
+                $report.refs[0].args.RCA_SIDECAR_FILE | Should -BeExactly $payload
+                # The evidence goes with it, exactly as before.
+                $report.refs[0].args.RCA_EVIDENCE_FILE | Should -BeExactly $report.staged[0].name
+                $fixture = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/fixtures/rca-evidence.parameter.json') -Raw | ConvertFrom-Json
+                @($report.staged[0].document.parts) | Should -Be @($fixture.parts)
+                $report.printed | Should -Match ('Session {0}''s RCA evidence: 2 document\(s\) in 4 part\(s\), passed to its history\.\s+Session {0}''s Query Store evidence: 2 sidecar\(s\) in 3 part\(s\), passed to its history\.' -f $session.Substring(0, 8))
+                $report.printed | Should -Match ('Pass: the history is saved; the report and the Insights app show it after their next refresh\.\s+RCA\.EVIDENCE Pass: Wrote 2 evidence document\(s\) from sqlvm01\.\s+RCA\.SIDECAR Pass: the history took {0}: 2 written, 0 already in it\. The next session''s start acknowledges them on the VMs, which then stop offering them\.' -f $what)
+                $inbox | Should -BeNullOrEmpty
+                @($report.acks.PSObject.Properties.Name) | Should -Be @(('Files/rca/acks/{0}.ack.json' -f ($payload -replace '^Files/rca/inbox/|\.json$', '')))
+            }
+            'sessionqsskip' {
+                $report.printed | Should -Match ('RCA\.SIDECAR Warning: the history took 1 of {0} \(1 written, 0 already in it\) and skipped 1: 20261120T170000Z-sqlvm01-0002-sidecar: its SHA-256 doesn''t match\. The skipped ones stay on the VMs, which offer them again at the next session''s exports, and the payload stays until a later run writes them\.' -f $what)
+                $inbox | Should -Be @($report.files | Where-Object { $_ -like ('*/' + $payload) })
+                $inbox.Count | Should -Be 1
+            }
+            'sessionqsnoack' {
+                $report.printed | Should -Match ('RCA\.SIDECAR Warning: NB_DatabaseHub_LiveActivity didn''t acknowledge {0}: it wrote no acknowledgement of them, so they stay pending on the VMs, which offer them again at the next session''s exports, and their payload stays\. Fix: its RCA\.SIDECAR finding in analysis_findings says why; when its copy in the demo workspace is from before the RCA sidecar, \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity -RunLiveActivity updates it\.' -f $what)
+                $inbox.Count | Should -Be 1
+                $inbox[0] | Should -BeLike ('*/' + $payload)
+            }
+            'sessionqsjob' {
+                $report.jobs[0].RCA_SIDECAR_FILE | Should -BeExactly $payload
+                $report.printed | Should -Match ('RCA\.SIDECAR Warning: Run all can''t tell yet whether {0} are saved: the history job is queued until this notebook''s Spark session ends\. Fix: none needed: the next session''s start acknowledges on the VMs those the job''s acknowledgement says it wrote' -f $what)
+                $inbox.Count | Should -Be 1
+                $inbox[0] | Should -BeLike ('*/' + $payload)
+            }
+            'sessionqsfull' {
+                @($report.jobs) | Should -BeNullOrEmpty
+                $report.printed | Should -Match ('RCA\.SIDECAR Warning: {0} weren''t saved: the history didn''t start, so nothing read them, and their payload is deleted\. Fix: none needed: they stay on the VMs, which offer them again at the next session''s exports, and Run all again saves them while their index is in the control vault' -f $what)
+                $inbox | Should -BeNullOrEmpty
+            }
+            'leftoverqs' {
+                @($report.order) | Should -Be @('sent:session', 'history:eeeeeeee', 'validator', 'sent:stop', ('history:{0}' -f $report.sent[0].sessionId.Substring(0, 8)))
+                $report.refs[0].args.RCA_SIDECAR_FILE | Should -BeExactly $payload
+                $report.refs[1].args.PSObject.Properties.Name | Should -Not -Contain 'RCA_SIDECAR_FILE' -Because 'a later history of the same Run all doesn''t pass the same sidecars again'
+                $report.printed | Should -Match ('RCA\.SIDECAR Pass: the history took {0}: 2 written, 0 already in it\.' -f $what)
+            }
+            'stoppedqs' {
+                @($report.order) | Should -Be @('sent:stop', 'history:bbbbbbbb')
+                $report.refs[0].args.SESSION_ID | Should -Be $session
+                $report.refs[0].args.RCA_SIDECAR_FILE | Should -BeExactly $payload
+                @($report.vaultReads) | Should -Be @('dbhub-session-metrics/55555555', 'dbhub-session-metrics/a0bd446e', 'dbhub-session-metrics/8af9856a')
+            }
+            'earlierqs' {
+                # The earlier session's history isn't saved (it has no T4 series), so its sidecars go with the even earlier
+                # session's evidence, saved alone: the activity notebook writes each under its own session.
+                $report.refs[0].args.SESSION_ID | Should -Be ('d' * 32)
+                $report.refs[0].args.RCA_ONLY | Should -BeTrue
+                $report.refs[0].args.RCA_EVIDENCE_FILE | Should -Not -BeNullOrEmpty
+                $report.refs[0].args.RCA_SIDECAR_FILE | Should -BeExactly $payload
+                $report.refs[1].args.PSObject.Properties.Name | Should -Not -Contain 'RCA_SIDECAR_FILE'
+                $report.printed | Should -Match 'RCA\.EVIDENCE Pass: Wrote 1 evidence document\(s\) from sqlvm01\.'
+            }
+        }
+    }
+
+    It 'stages no sidecar when the workspace''s activity notebook doesn''t declare RCA_SIDECAR_FILE, and says how to update it (2026-11-23)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # fabric.importNotebooks false keeps the workspace's copy of the activity notebook, which may be from before the sidecar.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'sessionqsold' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.defReads) | Should -Be @('definition')
+        @($report.puts) | Should -BeNullOrEmpty
+        $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'RCA_SIDECAR_FILE'
+        # Nothing is read for sidecars that no history takes.
+        @($report.vaultReads) | Should -Be @('dbhub-session-metrics/99999999')
+        $report.printed | Should -Match ('RCA\.SIDECAR Warning: session {0}''s Query Store evidence \(2 sidecar\(s\)\) wasn''t passed to its history: NB_DatabaseHub_LiveActivity in the demo workspace doesn''t declare RCA_SIDECAR_FILE, because its copy is from before the RCA sidecar \(fabric\.importNotebooks false keeps it\)\. The sidecars stay on the VMs, which offer them again at the next session''s exports\. Fix: \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_LiveActivity -RunLiveActivity updates it; the next Run all then saves them\.' -f $report.sent[0].sessionId.Substring(0, 8))
+        @([regex]::Matches($report.printed, '(?m)^RCA\.SIDECAR ')).Count | Should -Be 1
+        @($report.files) | Should -BeNullOrEmpty
+    }
+
+    It 'acknowledges on the next start what Run all''s acknowledgements say was written, and deletes each once the start''s status says it sent all of it (2026-11-23)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'qsacks' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $ids = @('20261113T140000Z-sqlvm01-0001-sidecar', '20261113T141500Z-sqlvm01-0002-sidecar', '20261113T144500Z-arcsql01-0001-sidecar')
+        # The start's rcaAcks: written and already, oldest acknowledgement first, each once; never a skipped sidecar, the
+        # scripts' -script- acknowledgement, or one that names another payload.
+        @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+        $report.sent[0].rcaAcks.kind | Should -Be 'ContosoCare.RcaAckRequest'
+        $report.sent[0].rcaAcks.version | Should -Be 1
+        @($report.sent[0].rcaAcks.documents) | Should -Be $ids
+        Test-Json -Json ($report.sent[0].rcaAcks | ConvertTo-Json -Depth 4 -Compress) -SchemaFile (Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json') | Should -BeTrue
+        $report.sent[1].PSObject.Properties.Name | Should -Not -Contain 'rcaAcks'
+        # The start's status sent the first two and left T2's: the acknowledgement it sent all of goes, and so does one with
+        # only a skipped sidecar, which has none to send; the rest stay.
+        $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Warning: 2 sidecars acknowledged on sqlvm01, before the start''s exports; 1 left: arcsql01 didn''t answer\.\s+Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
+        @([regex]::Matches($report.printed, '(?m)^RCA\.SIDECAR\.ACK ')).Count | Should -Be 1
+        # The one more than 30 days old is gone too, unsent.
+        @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
+            'Files/rca/acks/sidecar-20261113T160000Z-runall-4e5f6a7b.ack.json'
+            'Files/rca/acks/sidecar-20261113T170000Z-script-8c9d0e1f.ack.json'
+            'Files/rca/acks/sidecar-20261113T180000Z-runall-2a3b4c5d.ack.json'
+        )
+    }
+
+    It 'shows the session''s acknowledgement result again when a later export sends what its start left, and deletes what it completes: <Case> (option 2, 2026-11-23)' -ForEach @(
+        @{ Case = 'a re-check during the session, which the live view reads'; Scenario = 'qsacksrecheck'; By = 'a re-check'; Kept = 'until this session''s re-checks or its stop, or the next start, send the rest'; First = 'RCA\.SIDECAR\.ACK Warning: 2 sidecars acknowledged on sqlvm01, before the start''s exports; 1 left: arcsql01 didn''t answer\.' }
+        @{ Case = 'the stop, whose status is final'; Scenario = 'qsacksstop'; By = 'the stop'; Kept = 'for the next start'; First = 'RCA\.SIDECAR\.ACK Warning: 2 sidecars acknowledged on sqlvm01, before the start''s exports; 1 left: arcsql01 didn''t answer\.' }
+        @{ Case = 'a re-check after a start whose step said its result, which doesn''t stand for the later one'; Scenario = 'qsacksstepped'; By = 'a re-check'; Kept = 'until this session''s re-checks or its stop, or the next start, send the rest'; First = 'RCA\.SIDECAR\.ACK Warning 2 of 3 sidecar acknowledgement\(s\) sent before the start''s exports \(2 on sqlvm01\); the rest weren''t: arcsql01 didn''t answer\.' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # The start leaves T2's ID (its host didn't answer); the session's next warm export sends it, and writes rcaAcks again,
+        # only moving IDs from left to sent. The stopped status keeps the last result (Write-DbHubStopStatus).
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent[0].rcaAcks.documents) | Should -Be @('20261113T140000Z-sqlvm01-0001-sidecar', '20261113T141500Z-sqlvm01-0002-sidecar', '20261113T144500Z-arcsql01-0001-sidecar')
+        # The start's own result first, as before.
+        $report.printed | Should -Match $First
+        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
+        # Then the later export's, once: the acknowledgement it completes goes, and the stop's copy of it shows nothing new.
+        $later = 'RCA.SIDECAR.ACK Pass: 3 sidecar acknowledgement(s) sent: 2 before the start''s sidecar fetch, 1 at {0}.' -f $By
+        $report.printed | Should -Match ('{0}\s+Run all''s sidecar acknowledgements: 1 done and deleted, 0 kept {1}\.' -f [regex]::Escape($later), [regex]::Escape($Kept))
+        @([regex]::Matches($report.printed, 'RCA\.SIDECAR\.ACK')).Count | Should -Be 2
+        $stop = $report.printed.IndexOf('=== The session''s end: stopping session')
+        $stop | Should -BeGreaterThan 0
+        if ($Scenario -eq 'qsacksstop') {
+            $report.printed.IndexOf($later) | Should -BeGreaterThan $stop -Because 'finish_session reads the stopped status''s result'
+        }
+        else {
+            $report.printed.IndexOf($later) | Should -BeLessThan $stop -Because 'the live view reads the re-check''s result while the session runs'
+        }
+        @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
+            'Files/rca/acks/sidecar-20261113T170000Z-script-8c9d0e1f.ack.json'
+            'Files/rca/acks/sidecar-20261113T180000Z-runall-2a3b4c5d.ack.json'
+        )
+    }
+
+    It 'deletes, quietly, what a stopped session''s final acknowledgement result says was sent, outside that session''s follow: <Case> (option 2, 2026-11-23)' -ForEach @(
+        @{ Case = 'Stop now when the session stopped already'; Scenario = 'stoppedqsacks' }
+        @{ Case = 'the next Run all''s pre-check, before its start carries them again'; Scenario = 'qsacksprecheck' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # The stopped status's rcaAcks is final: its stop sent T2's ID, which its start left. Two of Run all's acknowledgements
+        # are done by it, and a later save's rides on the next start.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $done = 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept for the next start.'
+        $report.printed | Should -Match ([regex]::Escape($done))
+        switch ($Scenario) {
+            'stoppedqsacks' {
+                $report.printed | Should -Not -Match 'RCA\.SIDECAR\.ACK' -Because 'Stop now doesn''t follow that session'
+                @($report.acks.PSObject.Properties.Name) | Should -Be @('Files/rca/acks/sidecar-20261113T190000Z-runall-5d6e7f80.ack.json')
+            }
+            'qsacksprecheck' {
+                # Before this start's request, which then carries only the later save's sidecar; only its result shows.
+                $report.printed.IndexOf($done) | Should -BeLessThan $report.printed.IndexOf(': asking the runbook to start it.')
+                @($report.sent[0].rcaAcks.documents) | Should -Be @('20261113T150000Z-sqlvm01-0004-sidecar')
+                @([regex]::Matches($report.printed, '(?m)^RCA\.SIDECAR\.ACK ')).Count | Should -Be 1
+                $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Pass: 1 sidecars acknowledged on sqlvm01, before the start''s exports\.'
+                # Strict mode refuses .Name on an empty property list, so the names are read one by one.
+                @($report.acks.PSObject.Properties | ForEach-Object -MemberName Name) | Should -BeNullOrEmpty
+            }
+        }
+    }
+
+    It 'sends whole acknowledgements, the oldest first, at most 64 sidecars on a start, and the rest wait in order (2026-11-23)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # Acknowledgements of 40, 30, and 1 sidecars: the 30 would pass 64, and the 1 waits behind them.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'qsackswhole' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $ids = @(0..39 | ForEach-Object { '20261113T10{0:d2}00Z-sqlvm01-{0:d4}-sidecar' -f $_ })
+        @($report.sent[0].rcaAcks.documents) | Should -Be $ids
+        $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Pass: 40 sidecars acknowledged on sqlvm01, before the start''s exports\.\s+Run all''s sidecar acknowledgements: 1 done and deleted, 2 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
+        # The one that lists more than 64 sidecars doesn't follow the contract: none of it rides, it holds nothing back,
+        # and it stays for the activity notebook's sweep.
+        @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
+            'Files/rca/acks/sidecar-20261113T140000Z-runall-0f0f0f0f.ack.json'
+            'Files/rca/acks/sidecar-20261113T160000Z-runall-0b0b0b0b.ack.json'
+            'Files/rca/acks/sidecar-20261113T170000Z-runall-0c0c0c0c.ack.json'
+        )
+    }
+
+    It 'sends the start''s acknowledgements when one more than 30 days old can''t be deleted (2026-11-23)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'qsacksrmfail' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent[0].rcaAcks.documents) | Should -Be @('20261113T140000Z-sqlvm01-0001-sidecar', '20261113T141500Z-sqlvm01-0002-sidecar', '20261113T144500Z-arcsql01-0001-sidecar')
+        $report.printed | Should -Not -Match 'couldn''t be read|weren''t all settled'
+        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
+        # It stays, unsent, for a later read or the activity notebook's sweep.
+        @($report.acks.PSObject.Properties.Name) | Should -Contain 'Files/rca/acks/sidecar-20261001T120000Z-runall-1a2b3c4d.ack.json'
+    }
+
+    It 'waits for the start''s final acknowledgement result: an early one that sent nothing yet says nothing and deletes nothing (review of 90b4718c)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # T2c-1's runbook writes a result with nothing sent ("not yet") before it sends, then the real one with its step.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario 'qsacksearly' -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.printed | Should -Not -Match 'None of the \d+ sidecar acknowledgement'
+        # Once: the real result's step, which the status's steps print; the notebook adds only what it deleted.
+        @([regex]::Matches($report.printed, 'RCA\.SIDECAR\.ACK')).Count | Should -Be 1
+        $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Warning 2 of 3 sidecar acknowledgement\(s\) sent before the start''s exports \(2 on sqlvm01\); the rest weren''t: arcsql01 didn''t answer\.'
+        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
+        @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
+            'Files/rca/acks/sidecar-20261113T160000Z-runall-4e5f6a7b.ack.json'
+            'Files/rca/acks/sidecar-20261113T170000Z-script-8c9d0e1f.ack.json'
+            'Files/rca/acks/sidecar-20261113T180000Z-runall-2a3b4c5d.ack.json'
+        )
+    }
+
+    It 'says when the metrics'' sidecar pointer is one it can''t use, and nothing when it names no sidecar: <Case> (review of 90b4718c)' -ForEach @(
+        @{ Case = 'another version'; Scenario = 'sessionqsbadversion'; Why = 'it''s ContosoCare\.RcaSidecarPointer version 2, not ContosoCare\.RcaSidecarPointer version 1' }
+        @{ Case = 'an index that isn''t a version''s ID'; Scenario = 'sessionqsbadindex'; Why = 'its index isn''t a version''s ID' }
+        @{ Case = 'a null index'; Scenario = 'sessionqsnullindex'; Why = '' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        # Nothing is read for sidecars, staged, or passed.
+        @($report.defReads) | Should -BeNullOrEmpty
+        @($report.puts) | Should -BeNullOrEmpty
+        @($report.vaultReads) | Should -Be @('dbhub-session-metrics/99999999')
+        $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'RCA_SIDECAR_FILE'
+        if ($Why) {
+            $report.printed | Should -Match ('RCA\.SIDECAR Warning: session {0}''s metrics point to its Query Store sidecars in a form this notebook doesn''t read \({1}\), so they weren''t passed to its history\. They stay on the VMs, which offer them again at the next session''s exports\. Fix: \./scripts/deploy\.ps1 updates the runbooks and this notebook together\.' -f $report.sent[0].sessionId.Substring(0, 8), $Why)
+            @([regex]::Matches($report.printed, '(?m)^RCA\.SIDECAR ')).Count | Should -Be 1
+        }
+        else {
+            $report.printed | Should -Not -Match 'RCA\.SIDECAR'
+        }
+    }
+
+    It 'never takes the Query Store sidecars'' <Case> for the metrics: no ContosoCare.Rca* version is (2026-11-23)' -ForEach @(
+        @{ Case = 'bundle'; Scenario = 'sessionqslate' }
+        @{ Case = 'bundle index'; Scenario = 'sessionqslateindex' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # The vault refuses the metrics' version the stop names, and the stop's sidecar bundle, or its index, is the
+        # secret's latest: a control notebook from before the sidecar took it for the metrics.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $report.printed | Should -Match 'Warning: the history''s metrics version 99999999, which the stop wrote, couldn''t be read \(the control vault answered HTTP 403\), so the vault''s latest is used; it''s the Query Store sidecars'' bundle or index, so the history has no T4 or T5 metrics and no RCA evidence\.'
+        $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'POSTGRES_METRICS'
+        $report.refs[0].args.PSObject.Properties.Name | Should -Not -Contain 'RCA_SIDECAR_FILE'
+        @($report.puts) | Should -BeNullOrEmpty
+    }
+
+    It 'builds the start''s rcaAcks within the request''s limits: whole acknowledgements, the oldest first, distinct sidecar IDs, at most 64, and within 4,096 bytes (2026-11-23)' {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        $helpers = Join-Path -Path $TestDrive -ChildPath 'helpers_part1_acks.py'
+        Set-Content -LiteralPath $helpers -Encoding utf8NoBOM -Value (Get-Cell '# Helpers, part 1')
+        $catalogFile = Join-Path -Path $TestDrive -ChildPath 'catalog_acks.json'
+        Set-Content -LiteralPath $catalogFile -Encoding utf8NoBOM -Value $script:catalogJson
+        $driver = Join-Path -Path $TestDrive -ChildPath 'build_acks.py'
+        Set-Content -LiteralPath $driver -Encoding utf8NoBOM -Value @'
+import json, sys
+exec(open(sys.argv[1], encoding="utf-8").read())
+catalog = load_catalog(open(sys.argv[2], encoding="utf-8").read())
+sid = "0123456789abcdef0123456789abcdef"
+ids = ["20261120T%02d%02d00Z-sqlvm01-%04d-sidecar" % (10 + n // 60, n % 60, n) for n in range(80)]
+long_ids = ["20261120T%02d%02d00Z-%s-%04d-sidecar" % (10 + n // 60, n % 60, "x" * 40, n) for n in range(64)]
+out = []
+for kwargs in (dict(rca_acks=[ids[0], ids[1], ids[0]]), dict(rca_acks=ids), dict(rca_acks=long_ids), dict(rca_acks=[]),
+               dict(rca_acks=["20261120T100000Z-sqlvm01-0001"]), dict(rca_acks=json.dumps(ids[:2])),
+               # Acknowledgements go whole, the oldest first: 40, then 30, which would pass 64, so it and the 1 after it wait.
+               dict(rca_acks=[ids[:40], ids[40:70], [ids[70]]]),
+               # One whose sidecars an earlier one already carries adds only the others.
+               dict(rca_acks=[[ids[0], ids[1]], [ids[1], ids[2]]]),
+               # The contract's anchors: a trailing line feed isn't a sidecar ID.
+               dict(rca_acks=[ids[0] + "\n"]),
+               # One too big to fit on its own, by count or by bytes, is skipped, so it holds back none after it.
+               dict(rca_acks=[ids[:70], ids[70:72]]),
+               dict(rca_acks=[long_ids, [ids[0]]])):
+    try:
+        body = build_request("session", catalog=catalog, session_id=sid, duration_minutes=90, **kwargs)
+        out.append({"ok": True, "body": body, "bytes": len(json.dumps(body, separators=(",", ":")).encode("utf-8"))})
+    except ValueError as error:
+        out.append({"ok": False, "error": str(error)})
+try:
+    build_request("stop", catalog=catalog, rca_acks=[ids[0]])
+    out.append({"ok": True})
+except ValueError as error:
+    out.append({"ok": False, "error": str(error)})
+# Run all's part 2 hands the start its pending acknowledgements, each whole, when it's given none.
+pending_rca_acks = lambda: [[ids[5], ids[6]], [ids[7]]]
+out.append({"ok": True, "body": build_request("session", catalog=catalog, session_id=sid, duration_minutes=90)})
+out.append({"ok": True, "body": build_request("stop", catalog=catalog)})
+print(json.dumps(out))
+'@
+        $PSNativeCommandUseErrorActionPreference = $false
+        $output = & $script:python $driver $helpers $catalogFile 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $results = ($output | Select-Object -Last 1) | ConvertFrom-Json
+        @($results | ForEach-Object ok) | Should -Be @($true, $true, $true, $true, $false, $true, $true, $true, $false, $true, $true, $false, $true, $true)
+        $id = { param([int] $Number) '20261120T{0:d2}{1:d2}00Z-sqlvm01-{2:d4}-sidecar' -f (10 + [int][math]::Floor($Number / 60)), ($Number % 60), $Number }
+        @($results[0].body.rcaAcks.documents) | Should -Be @((& $id 0), (& $id 1))
+        @($results[1].body.rcaAcks.documents).Count | Should -Be 64
+        @($results[1].body.rcaAcks.documents)[63] | Should -Be (& $id 63)
+        # Long host names: as many as 4,096 bytes hold, the rest for a later start.
+        $results[2].bytes | Should -BeLessOrEqual 4096
+        @($results[2].body.rcaAcks.documents).Count | Should -BeGreaterThan 40
+        @($results[2].body.rcaAcks.documents).Count | Should -BeLessThan 64
+        $results[3].body.PSObject.Properties.Name | Should -Not -Contain 'rcaAcks'
+        $results[4].error | Should -Match 'rca_acks takes sidecar IDs only'
+        @($results[5].body.rcaAcks.documents) | Should -Be @((& $id 0), (& $id 1))
+        @($results[6].body.rcaAcks.documents) | Should -Be @(0..39 | ForEach-Object { & $id $_ })
+        @($results[7].body.rcaAcks.documents) | Should -Be @((& $id 0), (& $id 1), (& $id 2))
+        $results[8].error | Should -Match 'rca_acks takes sidecar IDs only'
+        @($results[9].body.rcaAcks.documents) | Should -Be @((& $id 70), (& $id 71))
+        @($results[10].body.rcaAcks.documents) | Should -Be @((& $id 0))
+        $results[11].error | Should -Match 'Only a session''s start acknowledges sidecars'
+        @($results[12].body.rcaAcks.documents) | Should -Be @((& $id 5), (& $id 6), (& $id 7))
+        $results[13].body.PSObject.Properties.Name | Should -Not -Contain 'rcaAcks'
+        foreach ($result in @($results | Where-Object { $_.ok -and $_.body -and $_.body.PSObject.Properties.Name -contains 'rcaAcks' })) {
+            Test-Json -Json ($result.body.rcaAcks | ConvertTo-Json -Depth 4 -Compress) -SchemaFile (Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json') | Should -BeTrue
+        }
     }
 
     It 'completes a session''s history that a cancel cut off before scenario_runs, with its plan, and the next Run all doesn''t analyze it again (2026-11-19, needs pandas)' {
