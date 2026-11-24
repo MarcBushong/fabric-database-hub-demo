@@ -402,6 +402,27 @@ Describe 'The Incident RCA contract: transport fixtures (ADR 0031)' {
         $readme | Should -Match ([regex]::Escape('Only the mapped VM''s answer counts.'))
     }
 
+    It 'acknowledges per VM in the start''s sidecar step, leaves the rest to the session''s next export, and only ever moves an ID from left to sent' {
+        # T2c's option 2 (2026-11-23): a held T2 host keeps neither sqlvm01's acknowledgements nor the start from their time,
+        # and what the start leaves isn't lost until the next session. The README and the schema say the same.
+        $readme = Get-Content -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'README.md') -Raw
+        $runAll = [regex]::Match($readme, '(?s)### Run all''s path for the sidecars.*?(?=\r?\n### )').Value
+        $runAll | Should -Not -BeNullOrEmpty
+        $runAll | Should -Not -Match 'Invoke-DbHubRcaEarlier' -Because 'the start acknowledges in its sidecar step, per VM, not in its step for the earlier sessions'' evidence'
+        $runAll | Should -Match ([regex]::Escape('the T2 host last, with what''s left of the bound'))
+        $runAll | Should -Match ([regex]::Escape('the session''s next export that reaches that VM sends'))
+        $runAll | Should -Match ([regex]::Escape('only by moving IDs from `left` to `sent`'))
+        $runAll | Should -Match ([regex]::Escape('the stopped status''s `rcaAcks` is final'))
+        $runAll | Should -Match ([regex]::Escape('or the session''s stopped status does'))
+        $defs = $transportSchema['$defs']
+        foreach ($name in 'ackRequest', 'ackResult') {
+            $defs[$name]['description'] | Should -Not -Match 'step for the earlier sessions' -Because $name
+        }
+        $defs['ackRequest']['description'] | Should -Match ([regex]::Escape('the session''s next export that reaches the VM'))
+        $defs['ackResult']['description'] | Should -Match ([regex]::Escape('only moving IDs from left to sent'))
+        $defs['ackResult']['description'] | Should -Match ([regex]::Escape('the stopped status''s is final'))
+    }
+
     It 'anchors every pattern of the sidecar''s kinds with (?![\s\S]), never $, which lets a trailing line feed through in .NET and Python' {
         $defs = $transportSchema['$defs']
         $sidecarDefs = 'sidecarSessionId', 'sidecarId', 'sidecarPartLine', 'sidecarRef', 'sidecarIndex', 'sidecarParameter', 'sidecarFile', 'ack', 'sidecarBundle', 'sidecarBundleIndex', 'sidecarPointer', 'ackRequest', 'ackResult'

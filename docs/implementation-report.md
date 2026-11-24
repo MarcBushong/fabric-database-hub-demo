@@ -5795,19 +5795,28 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
     - no `ContosoCare.Rca*` kind is ever the metrics;
     - the harness exceptions name one file.
   - **With it:** T1c's `rca ack` exit code and the backfill's timing, and A1's backstop for item 3.
+- **bcc159c4:** T4's `search_path` marker is on every runner connection that isn't a workload session: the observer's, the answer-key recorder's, and the harness's control connections (A2's e8558a9a and dc485240).
+- **33c809d4, T1b's review:** only an export's first page seals and waits for `--final`, so callers may pass it on every page; the sidecar can delay `rca export` by up to 30 s, but never fails it.
+- **f15381c5:** the fixtures', the builders', and RCA-SQL-16's rows match the day's rules; sqlserver.sql has 27 blocks.
+- **f18c0635, T2c-2's re-check:** the activity notebook's sweep leaves a `-runall-` acknowledgement to the control notebook, and deletes it only after 30 days, so a sweep between two sessions doesn't make the next one fetch its sidecars again.
+- **e68b4a2b and 4bb08cfa, A2's 9ac571ed:** after `rca.marker-refused`, a harness control connection that opened without the marker keeps its statements as evidence, except what item 2's rule leaves out.
+- **T2c's option 2** (the coordinator's decision, 2026-11-23 evening): the start acknowledges per VM in its sidecar step, sqlvm01 first and the T2 host last, so a held T2 host keeps nothing else from its time. What it leaves, the session's next export that reaches the VM sends, after that export's evidence and before its sidecar fetch: a re-check's, else the stop's. `rcaAcks` then only moves IDs from `left` to `sent`, the stopped status's is final, and the control notebook deletes an acknowledgement by it too. The kinds, schemas, fixtures, routing, and 64-ID limit don't change; only the README's rule and the two kinds' descriptions do, which a new contract test pins.
 
 **The integration,** `marcbushong-microsoft-qs-evidence-integration`, takes only reviewed heads:
 
-- **B,** the notebook and the model, at e968004d (d6a77fa9), with two of its test expectations fixed (d8207618).
-- **A1,** SQL Server's reads, at f6fcdafa (893a3bf3), then its seam's hardening at 4fbd21b2 (ca66a103), which A2's head needed.
+- **B,** the notebook and the model, at e968004d (d6a77fa9), with two of its test expectations fixed (d8207618), then at 9b28eb81 (9550ed5f), with a one-line `fabric/powerbi/README.md` change. Its activity notebook reports `RCA.SIDECAR` (the history's finding `rca_sidecar`) beside `RCA.EVIDENCE`, which troubleshooting and the README name (20f5d98f).
+- **A1,** SQL Server's reads, at f6fcdafa (893a3bf3), then its seam's hardening at 4fbd21b2 (ca66a103), which A2's head needed. Then its harness statements at 9d7f1690 (7b8d9eea): RCA-SQL-16 and item 3's list, the answer-key recorder's marker and the hash of its earlier reads, and the backstop.
 - **T2a,** the scripts' transport, at 8e2ada18 (d76a028b).
   - It brings the RCA release integration's 83a6fcb1, T2a's approved base.
   - The generated model guide was rebuilt with the app's pinned `tsx`.
   - `published-versions.json` lists the merged notebooks' versions (abd30713).
-- **A2,** PostgreSQL's reads and the holders, at 83344ef0 (41645fa9). Its `TargetObserver.cs` is A1's 3cea6ac9, cherry-picked.
-- **The contract,** through 83c87de2.
+- **A2,** PostgreSQL's reads and the holders, at 83344ef0 (41645fa9). Its `TargetObserver.cs` is A1's 3cea6ac9, cherry-picked. Then at 9ac571ed (17354134): the recorder's T4 read and the harness's T4 control connections marked, a distinct reseed read, the control site's fallback with `rca.marker-refused`, the `OpenAsync` guard, and the receiver resolver.
+- **T1,** the runner's sidecar store, codec, and wiring (T1a, T1b, and T1c), at 79ef6247 (8615f6e7). It brings O1's reviewed 57f7160f, which T1b's wiring needed, so its conflicts were the release's text against O1's: each kept both sides, and the runbook's only code conflict was a help comment.
+- **C,** Query Store in the RCA's tools, at a0afa9eb (f8ea8590): its playbook steps, which match the merged tools; the release's test imports with C's `openView`; the report without the four sections it carried that the integration had; and the model guide, rebuilt.
+- **The contract,** through 4bb08cfa.
 - **INT's own commits:**
-  - the live probes (`tests/integration/rca-query-store.md`): S7's blindness sets, the runner's own statements and the answer-key recorder's reads among them, with a check that no sidecar row names the recorder's table; S10's and S11's review checks; H's checks deployed twice; and S12, the scripts' transport's checks;
+  - the live probes (`tests/integration/rca-query-store.md`): S7's blindness sets, the runner's own statements and the answer-key recorder's reads among them, with a check that no sidecar row names the recorder's table; S10's and S11's review checks, the standby's delay for S11.11, and `rca.marker-refused` for S11.12; H's checks deployed twice; S12, the scripts' transport's checks; and S13, Run all's acknowledgements;
+  - the docs: `RCA.SIDECAR` and `rca.marker-refused` in troubleshooting, the README's upgrade bullet for Query Store's evidence, and its row in the deployment guide's update table;
   - a guard that RCA Query Waits, which has no measure, is totaled nowhere but through the latest read (review-qs-b's caveat);
   - the cost estimate's comment and `docs/cost-management.md`: the sidecars share the export's limits, so the ceiling holds.
 - **H, the harness's marks** (dc5735a8 on `marcbushong-microsoft-harness-marks`), merges after the realistic names' release. Its SQL Server block sits just before `110-demo-control.sql`'s last step, setup's `EXEC demo.usp_release_auto_tuning_hold`, which `SqlScriptTests` pins as the script's end, and counts down with `@remaining`. Its PostgreSQL block follows a `-- @batch` line after `usp_restore_seed`.
@@ -5825,7 +5834,8 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 **Validation.**
 
 - **Pester,** under strict mode with the Azure CLI guard: `Rca.Contract` 78 passed; `DbHubDemo.RcaSidecar` 28 and `DbHubDemo.Cost` 74 passed; `Fabric.PowerBI` 17 passed and 1 skipped; `DbHubDemo.PowerBI` 30 passed; `DbHubDemo.Fabric` 42 passed; `Fabric.Notebooks` 152 of 152 on the integration, its pandas cases in a session-local Python 3.12; `Repo.Conventions` 123 and `Repo.NeutralWording` 3 passed.
-- **The runner,** with SDK 10.0.403, on the integration with A1, A2, and T2a: the whole suite, 961 tests, 940 passed, and the 21 real-engine tests skip without a server, as before. ScriptDom parses every T-SQL block, and the PostgreSQL blocks only read.
+- **The runner,** with SDK 10.0.403, on the integration with A1, A2, and T2a: the whole suite, 961 tests, 940 passed, and the 21 real-engine tests skip without a server, as before. ScriptDom parses every T-SQL block, and the PostgreSQL blocks only read. With T1, C, and A2's 9ac571ed merged (17354134), its 21 RCA, sidecar, PostgreSQL, and status classes: 433 passed and 5 opt-in skipped.
+- **On the integration after T1's merge** (8615f6e7), Pester: `Automation.Runbooks` 353, `DbHubDemo.Golden` 139, `DbHubDemo.ActivityControl` 157, `Vm.WorkloadSteps` 119, and `DbHubDemo.OneCommand` 209 passed; `Repo.Conventions` 123 and `Repo.NeutralWording` 3 with the upgrade docs.
 - **Proven to fail without the change:**
   - the folder guard, with a temporary unscanned folder;
   - the plan rules, on the previous T3 fixture;
@@ -5844,8 +5854,11 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
   - whether stopping T4 keeps the window Query Store still holds in memory;
   - whether `qs_view` keeps each window's `search_path`, or the first one it saw. The catalog-text rule covers the observer's statements either way.
 - **The harness's marks (unit H)** merge after the realistic names' release. H's T-SQL block first runs on an engine at the rehearsal: its opt-in test against a disposable SQL Server, and S10's check after two deployments.
-- **The runner's own ad hoc statements (item 3) wait on A1's build.** Until then RCA-SQL-10 and 14 keep the polled stop check, so the rehearsal's blindness check (S7) needs A1's commit. Which form Query Store keeps for a statement under simple parameterization is proven only by A1's opt-in real-engine test and by S7.
-- **The answer-key recorder's markers wait on A1's and A2's fixes.** Until both are merged, its one read per fault run can reach the sidecar on T1 to T4, so A1's harness head stays out of the integration until its fix is re-checked. S7's `recorder` set and its name check prove it live.
+- **The runner's own ad hoc statements (item 3)** are A1's 9d7f1690, merged. Which form Query Store keeps for a statement under simple parameterization is proven only by A1's opt-in real-engine test and by S7.
+- **The answer-key recorder's markers** are merged on every engine: A1's for T1 to T3 and A2's for T4. S7's `recorder` set and its name check prove them live.
+- **`rca.marker-refused`:** a harness control connection that T4 refuses the marked startup keeps its statements as evidence. L0c shows whether T4 accepts the startup's `options`, and its result names the fix.
+- **RCA-XE-00, Phase 1's (outside this unit):** its join took 8 to 48 s of CPU at an observer start on SQL Server 2022 CU25, enough to miss the event session's 8-second check. The fix reads `sys.dm_xe_object_columns` alone (f16b9cb9, on the RCA release's 963c802f), with the same 40 rows. `RcaIntegrationTests`' blind-capture test expected a module that an idle head blocker can't have; f78458d6 fixes the test. It goes into Tuesday's release, or into tonight's if fc's run shows the event session missing; the integration takes it with main.
+- **Still to run on the integration:** the full runner suite, the static validation, and the app's `npm run verify` after C's merge, which wait for the evening's CPU window.
 - **A Run all session's Query Store evidence** comes through Run all's own path (T2c), which joins this release by the coordinator's decision. If it isn't reviewed by 2026-11-24 18:00, it reaches the history with the next scripts' save until Run all's path ships as its own release.
 - **Two rollback losses are accepted limits:** sidecars more than 30 days old, and a session whose runner was replaced mid-session.
 
