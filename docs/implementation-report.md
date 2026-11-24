@@ -8973,6 +8973,8 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
   - **What else it brings:** #69's secret-scan fix (`.gitleaksignore`'s fingerprints, and `episodeKeyOf` in the RCA's incident tests, beside Query Store's tests), and its service stubs for CI on Linux.
   - **#69's RCA-XE-00 fix, f16b9cb9** (12156f1c), reviewed SHIP, came later: RCA-XE-00 reads `sys.dm_xe_object_columns` alone, since its join took about 8 s of CPU at each observer start on SQL Server 2022 and timed out on a fresh T1. `Rca.Contract`: 32 passed.
   - **C0's test-only fix on it, f78458d6** (afcda8fc), which #69 doesn't take since CI never runs that test: the opt-in SQL Server integration test's head blocker carries the chain's run token, its login, its input buffer, and an open transaction, not a module. It passed end to end on SQL Server 2022 CU25.
+  - **#69's session-window fix, `rca-release` at 4f44a8f0** (9ae9c1cf), after #69 was NO-GO at f16b9cb9: a Run all started with the VMs running lost `sqlvm01`'s first export window, about 30 minutes of capture. Reviewed SHIP with its follow-up, it makes a control session's export start every target's window at the span's last export with no session (9d873f81), and leaves out of its answer key a run that began before that mark (7bc10e89); 4f44a8f0 adds the RCA integration's paragraph. The release takes `rca-release`'s pushed head, so it holds #69's history. The runner's changes touch `Read` and `ExportSpan`, where O1's capture end changed `Export`, and merged without a conflict.
+  - **The review's Low A** (030adbe7), in the coordinator's words: `automation/README.md`'s Limits add that a session run can also lose its answer-key rows when the start's export with no session ran on that VM only after the session's activity reached it, past the start's 3-minute wait or while the store's lock was held.
   - **Main:** main at 4c2c1850 already merges into it without a change.
 
 **Conflicts, and how they were resolved,** besides this report (each merge's message says more):
@@ -8981,6 +8983,7 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - `TrackHelpers.ps1`: the RCA release's condition for the first run's follow-up, with 32e39e6a's `-SnapshotValueForm`; the Tracks test keeps both sides' assertions.
 - The app's playbook and README: 816ae32a's next-step query beside HEAD's F18 text.
 - `snapshot-value.test.ts`: 792e9a19's file.
+- `rca/README.md`'s row for `rca export`: this release's `--end-capture` and its two option sentences, with 9d873f81's window rule after the exit codes.
 
 **Validation, targeted at each step,** with StrictMode and the Azure CLI guard, while this PC was loaded and then in the coordinator's CPU quiet window:
 
@@ -9004,10 +9007,18 @@ The script type-checks with the app's strict settings and lints clean, and `Fabr
 - **Leaks:** no commit since 66cc5326 adds or removes a deployment ID, and gitleaks 8.30.1 finds no leak in the 779 commits that 7f1397de reaches.
 - **Not run, since what they check is unchanged since 66cc5326:** Bicep and PSRule (`infra/` and `azuredeploy.json`), and the Ask relay's tests (`ask-relay/`).
 
+**After the full validation:** #69's session-window fix and the Limits sentence, checked at 030adbe7, at below-normal priority, with StrictMode and the Azure CLI guard. They change no PowerShell, app, or notebook code.
+
+- **The workload generator:** the locked restore, the Release build (no warning), and its tests: 850 passed, 25 skipped (the same opt-in tests), and none failed, 9d873f81's and 7bc10e89's new export tests among them.
+- **Pester:** `Rca.Contract`, `Automation.Runbooks`, and `Repo.NeutralWording`, 388 passed; `Repo.Conventions`' two link checks passed; no call reached the Azure CLI.
+- **PSScriptAnalyzer,** on the 48 PowerShell files changed since 66cc5326: no finding. **markdownlint:** 152 files, no issue.
+- **Leaks:** no deployment ID since 66cc5326, and gitleaks 8.30.1 finds no leak in the 784 commits that 030adbe7 reaches.
+
 **What still needs live proof,** on a new deployment and an update at the final SHA:
 
 - the reference run's time with the kept values before its exit, against the control notebook's 1,800-second limit;
 - a Run all session that `start-demo.ps1` takes over, end to end, with the newer session's capture going on after the older one's end;
 - `stop-demo.ps1`'s kept-value step, and an update from 66cc5326;
 - design A on a real first deployment: the end's switch of the history model to the kept form;
-- the functions on zod 4.6.7 in Fabric: their install and build pass with it in the full validation.
+- the functions on zod 4.6.7 in Fabric: their install and build pass with it in the full validation;
+- #69's session-window fix: a Run all started with the VMs running keeps `sqlvm01`'s first export window, and its answer key holds only the session's runs.
