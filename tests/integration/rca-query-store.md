@@ -236,10 +236,19 @@ SUMMARIZECOLUMNS(
 
 ## T4's live checks (S11)
 
-1. **The `search_path`:** L0c's result, and the catalog-text rule. No `observer-catalog` ID is retained in the first read after the update.
+1. **The `search_path`:**
+   - **L0c passed on fc (2026-11-23):** Query Store keeps each window's own `search_path`. A query that ran on the default path in one window (02:55:16 to 03:10:16 UTC) and on the observer's in the next had a row in each, the second naming `dbhubdemo_rca_observer`, under the same role and `query_id`. The startup packet's path and `set_config`'s went into one row. L0c-2, the fallback's check, found that a role set with `SET ROLE` keys a row too; it isn't needed.
+   - **Not measured:** one query on both paths in one window, as in the update's own window, where the catalog-text rule covers the observer's statements.
+   - **In the rehearsal:** no `observer-catalog` ID is retained in the first read after the update.
 2. **Waits against statistics:** whether a window shows in `pgms_wait_sampling_view` later than in `qs_view`, from when each first lists it.
 3. **RCA-PG-14 and 15's latency** while T4's CPU is under pressure, from the runner's log.
-4. **UTC:** A2's first-read log line: `now() AT TIME ZONE 'UTC'`, `TimeZone`, and the newest `end_time`. Windows end on the quarter hour, in UTC.
+4. **UTC and T4's windows:** A2's first-read log line: `now() AT TIME ZONE 'UTC'`, `TimeZone`, and the newest `end_time`.
+   - **T4's windows run from the server's start, not the UTC quarter hours** (fc, 2026-11-23: a start at 02:40:15.8 UTC gave windows from 02:55:16, 03:10:16, and 03:25:17, a second's drift by the third), and a stop and start moves them. Take a window's times from `qs_view` or from `pg_postmaster_start_time()`, never from the clock.
+   - **Pass:**
+     - `TimeZone` is UTC;
+     - the newest `end_time` less `pg_postmaster_start_time()` is within a minute of a whole number of 15-minute windows;
+     - the sidecar's T4 intervals (`RCA Query Stats`' `Interval Start UTC`) are `qs_view`'s own window starts, never moved to a quarter hour;
+     - every window of the session that holds rows the leave-outs keep is in the history once, the last one pending publication or backfilled.
 5. **The public role:** A2's connection line names the runner's role and `azure_sys`, with no grant beyond `public`'s.
 6. **A NULL `event_type`:** how often it appears, and the waits around it.
 7. **RCA-PG-16:** the routines it lists match H's 13; the harness tables are exactly `demo.scenario_control`, `demo.scenario_runs`, and `demo.scenario_run_events`; and there's **no `unsure` row** (`dynamic_sql`, `no_source`).
