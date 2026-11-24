@@ -27,6 +27,11 @@ public sealed class RcaExportTests : IDisposable
 
     private static readonly string[] T4HeadColumns = ["status", "wait_type", "backend_type", "lock_object", "lock_mode_held", "program_name", "login_name", "is_demo"];
 
+    /// <summary>fc's case (2026-11-23), at 16:00 here: when the session was accepted, and when its start's export with no session ran.</summary>
+    private static readonly DateTimeOffset SessionAccepted = At(16, 24, 29);
+
+    private static readonly DateTimeOffset SessionlessExport = At(16, 25, 20);
+
     private readonly string root = Path.Combine(Path.GetTempPath(), "rca-store-" + Guid.NewGuid().ToString("N"));
 
     public void Dispose()
@@ -259,6 +264,91 @@ public sealed class RcaExportTests : IDisposable
         var view = Decode(store, Assert.Single(result.Documents));
         Assert.Contains("1 row(s) arrived after their window was exported, so they were left out.", (string)Assert.Single(view.Table("rca_coverage"))["gaps"]!, StringComparison.Ordinal);
         Assert.DoesNotContain(view.Table("rca_resource"), r => (DateTimeOffset)r["at_utc"]! < T1From.AddMinutes(5));
+    }
+
+    [Fact]
+    public void ASessionsExportAfterAnExportWithNoSessionStartsEveryTargetThereEvenOneWhoseWatermarkLags()
+    {
+        // fc: Run all started with the VM running, so its start's export had no session, and T3's resource stats, read every
+        // 30 minutes, were complete only to 16:00. The re-check's document began there, and the runbook left all of it out
+        // as from before the session, T1's first half hour of the session with it.
+        var (store, clock, span, exporter) = StartWithTheVmRunning();
+        ReadT3(span, clock, At(16, 0, 15), At(16, 30, 0));
+        WriteSentinel(span, At(16, 25, 30), At(16, 56, 0));
+        Mark(span, clock, "T1", At(16, 56, 0), At(16, 56, 5));
+        clock.Set(At(16, 56, 10));
+
+        var recheck = exporter.Export(Session, final: false, TimeSpan.Zero);
+
+        Assert.Equal("Pass", recheck.Status);
+        var view = Decode(store, Assert.Single(recheck.Documents));
+        Assert.Equal("20261120T162520Z-sqlvm01-0002", view.Root["documentId"]!.GetValue<string>());
+        // The runbook keeps a document of the session's only when it starts at most 2 minutes before the session was accepted.
+        Assert.True(WindowStart(view) >= SessionAccepted.AddMinutes(-2));
+        Assert.Equal(Every(At(16, 25, 30), At(16, 55, 30), 30), ResourceTimes(view, "T1"));
+        Assert.Equal(Every(At(16, 25, 30), At(16, 29, 45), 15), ResourceTimes(view, "T3"));
+
+        // What T3 reads after the re-check is the session's, and none of it is left out.
+        ReadT3(span, clock, At(16, 30, 15), At(17, 0, 0));
+        WriteSentinel(span, At(16, 56, 0), At(17, 26, 0));
+        span.Close(At(17, 26, 0));
+        clock.Set(At(17, 26, 10));
+        var stop = Decode(store, Assert.Single(exporter.Export(Session, final: true, TimeSpan.Zero).Documents));
+        Assert.Equal(Every(At(16, 30, 0), At(17, 0, 0), 15), ResourceTimes(stop, "T3"));
+        Assert.Equal(Every(At(16, 56, 0), At(17, 25, 30), 30), ResourceTimes(stop, "T1"));
+    }
+
+    [Fact]
+    public void InA30MinuteSessionTheStopIsTheFirstExportAndStartsAtTheExportWithNoSession()
+    {
+        // No re-check runs, so the stop's export began at T3's 16:00, and the runbook left out all of the VM's capture.
+        var (store, clock, span, exporter) = StartWithTheVmRunning();
+        ReadT3(span, clock, At(16, 0, 15), At(16, 30, 0));
+        WriteSentinel(span, At(16, 25, 30), At(16, 55, 0));
+        span.Close(At(16, 55, 0));
+        clock.Set(At(16, 55, 10));
+
+        var stop = exporter.Export(Session, final: true, TimeSpan.Zero);
+
+        Assert.Equal("Pass", stop.Status);
+        var view = Decode(store, Assert.Single(stop.Documents));
+        Assert.Equal(SessionlessExport, WindowStart(view));
+        Assert.Equal(Every(At(16, 25, 30), At(16, 54, 30), 30), ResourceTimes(view, "T1"));
+        Assert.Equal(Every(At(16, 25, 30), At(16, 30, 0), 15), ResourceTimes(view, "T3"));
+    }
+
+    [Fact]
+    public void ALaggingTargetWithNothingNewAtTheSessionsFirstExportStartsAtTheExportWithNoSessionAtItsNext()
+    {
+        var (store, clock, span, exporter) = StartWithTheVmRunning();
+        WriteSentinel(span, At(16, 25, 30), At(16, 46, 0));
+        Mark(span, clock, "T1", At(16, 46, 0), At(16, 46, 5));
+        clock.Set(At(16, 46, 10));
+        var recheck = Decode(store, Assert.Single(exporter.Export(Session, final: false, TimeSpan.Zero).Documents));
+        Assert.Empty(ResourceTimes(recheck, "T3"));
+
+        ReadT3(span, clock, At(16, 0, 15), At(16, 50, 0));
+        WriteSentinel(span, At(16, 46, 0), At(17, 16, 0));
+        span.Close(At(17, 16, 0));
+        clock.Set(At(17, 16, 10));
+        var stop = Decode(store, Assert.Single(exporter.Export(Session, final: true, TimeSpan.Zero).Documents));
+
+        Assert.Equal(SessionlessExport, WindowStart(stop));
+        Assert.Equal(Every(At(16, 25, 30), At(16, 50, 0), 15), ResourceTimes(stop, "T3"));
+    }
+
+    [Fact]
+    public void AnExportWithNoSessionStillTakesALaggingTargetFromWhereItsLastWindowEnded()
+    {
+        // The scripts' saves export with no session too: what T3 reads after one of them goes into the next one whole.
+        var (store, clock, span, exporter) = StartWithTheVmRunning();
+        ReadT3(span, clock, At(16, 0, 15), At(16, 30, 0));
+        clock.Set(At(16, 31, 0));
+
+        var save = Decode(store, Assert.Single(exporter.Export(null, final: false, TimeSpan.Zero).Documents));
+
+        Assert.Equal(At(16, 0, 0), WindowStart(save));
+        Assert.Equal(Every(At(16, 0, 15), At(16, 29, 45), 15), ResourceTimes(save, "T3"));
     }
 
     [Fact]
@@ -838,9 +928,64 @@ public sealed class RcaExportTests : IDisposable
         }
     }
 
-    private static CaptureRow Resource(DateTimeOffset at, double value) =>
-        new CaptureRow(RcaContract.Resource, "T1", at, "RCA-SQL-09", sentinel: true)
-            .Set("at_utc", at).Set("target", "T1").Set("source", "RCA-SQL-09").Set("metric", "processes_blocked").Set("value", value).Set("unit", "count");
+    /// <summary>
+    /// fc's start: the observer has captured T1 and T3 since 16:00 for activity outside a Run all session, and T3, whose
+    /// resource stats it reads every 30 minutes, is complete only to 16:00. The session is accepted at 16:24:29, and its
+    /// start's export, with no session because the VM ran before it, takes T1 to its watermark at 16:25:20.
+    /// </summary>
+    private (EvidenceStore Store, ManualTime Clock, SpanWriter Span, Exporter Exporter) StartWithTheVmRunning()
+    {
+        var store = Store(At(16, 0, 0), out var clock);
+        var span = store.Open(At(16, 0, 0));
+        span.Began("T1", At(16, 0, 0));
+        span.Began("T3", At(16, 0, 0));
+        Mark(span, clock, "T3", At(16, 0, 0), At(16, 0, 22));
+        WriteSentinel(span, At(16, 0, 0), At(16, 25, 10));
+        Mark(span, clock, "T1", At(16, 25, 10), At(16, 25, 15));
+        clock.Set(SessionlessExport);
+        var exporter = new Exporter(store, RunnerLog.Null, "1.0.0");
+        Assert.Equal("20261120T160000Z-sqlvm01-0001", Assert.Single(exporter.Export(null, final: false, TimeSpan.Zero).Documents).DocumentId);
+        return (store, clock, span, exporter);
+    }
+
+    /// <summary>Sets a target's watermark with the clock at <paramref name="now"/>, at least 5 s after the span last wrote span.json.</summary>
+    private static void Mark(SpanWriter span, ManualTime clock, string target, DateTimeOffset complete, DateTimeOffset now)
+    {
+        clock.Set(now);
+        span.Watermark(target, complete);
+    }
+
+    /// <summary>One read of T3's resource stats: a row every 15 s from <paramref name="from"/> to <paramref name="to"/>, and T3 complete to <paramref name="to"/> 22 s later.</summary>
+    private static void ReadT3(SpanWriter span, ManualTime clock, DateTimeOffset from, DateTimeOffset to)
+    {
+        foreach (var at in Every(from, to, 15))
+        {
+            span.Write(Resource(at, 0, "T3"));
+        }
+
+        Mark(span, clock, "T3", to, to.AddSeconds(22));
+    }
+
+    private static List<DateTimeOffset> Every(DateTimeOffset from, DateTimeOffset to, int seconds)
+    {
+        var times = new List<DateTimeOffset>();
+        for (var at = from; at <= to; at = at.AddSeconds(seconds))
+        {
+            times.Add(at);
+        }
+
+        return times;
+    }
+
+    private static List<DateTimeOffset> ResourceTimes(EvidenceView view, string target) =>
+        [.. view.Table("rca_resource").Where(r => (string?)r["target"] == target).Select(r => (DateTimeOffset)r["at_utc"]!).Order()];
+
+    private static DateTimeOffset WindowStart(EvidenceView view) =>
+        DateTimeOffset.Parse(view.Root["windowStartUtc"]!.GetValue<string>(), CultureInfo.InvariantCulture);
+
+    private static CaptureRow Resource(DateTimeOffset at, double value, string target = "T1") =>
+        new CaptureRow(RcaContract.Resource, target, at, "RCA-SQL-09", sentinel: true)
+            .Set("at_utc", at).Set("target", target).Set("source", "RCA-SQL-09").Set("metric", "processes_blocked").Set("value", value).Set("unit", "count");
 
     /// <summary>A session blocked by session 60, with a statement of its own: one string the dictionary can't share.</summary>
     private static CaptureRow Blocked(DateTimeOffset at, Random random) =>

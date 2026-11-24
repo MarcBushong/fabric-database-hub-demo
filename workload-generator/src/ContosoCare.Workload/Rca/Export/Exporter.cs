@@ -47,6 +47,8 @@ internal sealed record ExportResult(IReadOnlyList<ExportedDocument> Documents, s
 /// and returns the index. Each target's window starts where its previous one ended, so a host's documents never
 /// overlap for a target. The first export that takes from a span binds it to the caller's session, and later exports
 /// keep that session for it: the runbook exports what an earlier session's stop left behind with that session's ID.
+/// A control session's export starts no target's window before the span's last export with no session (a start's on a
+/// VM that ran before it), so what was captured before that isn't the session's, however far a target's watermark lags.
 /// A control session's documents share its budget over its exports; a sessionless export (<c>--session none</c>) has
 /// the budget to itself. A span that can't be exported is a Warning in the index, and the others still export.
 /// With <c>--final</c> it waits a bounded time for the observer to end its spans, so the session's last capture is in.
@@ -171,7 +173,17 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
     private SpanExported? ExportSpan(SpanInfo span, string? sessionId, bool final, DateTimeOffset now, SessionLedger ledger, int sessionless)
     {
         var session = span.Export.Bound ? span.Export.SessionId : sessionId;
-        var plan = Read(span, now);
+        // A control session's export starts every target's window at the span's last export with no session at the
+        // earliest (the start's, on a VM that ran before it): what was captured before it isn't the session's. Without
+        // that, a target whose watermark lags (T3's resource stats, read every 30 minutes) started the document before the
+        // session began, and the runbook left the whole document out, the session's other targets with it (fc, 2026-11-23).
+        var boundary = sessionId is null ? null : span.Export.SessionlessUtc;
+        var plan = Read(span, now, boundary);
+        if (sessionId is null)
+        {
+            span.Export.SessionlessUtc = now;
+        }
+
         if (plan.Captures.Count == 0 && plan.AnswerKey.Count == 0)
         {
             if (span.Finished)
@@ -180,11 +192,15 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
                 span.Export.LastExportUtc ??= now;
                 EvidenceStore.WriteExport(span);
             }
+            else if (sessionId is null)
+            {
+                EvidenceStore.WriteExport(span);
+            }
 
             return null;
         }
 
-        var captures = plan.Captures.Count > 0 ? plan.Captures : Empty(span, now);
+        var captures = plan.Captures.Count > 0 ? plan.Captures : Empty(span, now, boundary);
         var key = session ?? "none";
         if (!ledger.Sessions.TryGetValue(key, out var use))
         {
@@ -281,15 +297,19 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
     }
 
     /// <summary>A zero-length window for each of the span's targets: a document for answer-key rows that came after the capture.</summary>
-    private static List<TargetCapture> Empty(SpanInfo span, DateTimeOffset now) =>
+    private static List<TargetCapture> Empty(SpanInfo span, DateTimeOffset now, DateTimeOffset? boundary) =>
         [.. span.Span.Targets.Keys.Order(StringComparer.Ordinal).Select(t =>
         {
-            var at = span.Export.Targets.TryGetValue(t, out var state) && state.ThroughUtc is { } through ? through : now;
+            var through = span.Export.Targets.TryGetValue(t, out var state) && state.ThroughUtc is { } exported ? exported : now;
+            var at = boundary is { } cut && cut > through ? cut : through;
             return new TargetCapture(t, at, at, [], [], [], 0, t == "T5");
         })];
 
-    /// <summary>What a span has for this export: each target's window and rows, the new answer-key rows, and how far each file was read.</summary>
-    private static SpanPlan Read(SpanInfo span, DateTimeOffset now)
+    /// <summary>
+    /// What a span has for this export: each target's window and rows, the new answer-key rows, and how far each file was
+    /// read. No window starts before <paramref name="boundary"/>: rows before it are left out, and not counted as late.
+    /// </summary>
+    private static SpanPlan Read(SpanInfo span, DateTimeOffset now, DateTimeOffset? boundary)
     {
         var plan = new SpanPlan();
         var targets = span.Span.Targets.Keys
@@ -313,7 +333,8 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
             }
 
             static DateTimeOffset At(object item) => item is CaptureRow row ? row.At : ((CaptureNote)item).At;
-            var from = exported?.ThroughUtc ?? state.Intervals.FirstOrDefault()?.From ?? span.Span.StartedUtc;
+            var through = exported?.ThroughUtc ?? state.Intervals.FirstOrDefault()?.From ?? span.Span.StartedUtc;
+            var from = boundary is { } cut && cut > through ? cut : through;
             var lastAt = lines.Count == 0 ? (DateTimeOffset?)null : lines.Max(l => At(l.Item));
             DateTimeOffset to;
             if (span.Finished)
@@ -326,7 +347,7 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
                 to = state.WatermarkUtc is { } watermark && watermark < now ? watermark : state.WatermarkUtc is null ? from : now;
             }
 
-            var lateRows = lines.Count(l => exported is not null && l.Start >= exported.ReadBytes && At(l.Item) < from);
+            var lateRows = lines.Count(l => exported is not null && l.Start >= exported.ReadBytes && At(l.Item) < through);
             var inWindow = lines.Where(l => At(l.Item) >= from && At(l.Item) < to).Select(l => l.Item).ToList();
             if (lines.Any(l => At(l.Item) >= to))
             {
