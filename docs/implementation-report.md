@@ -6034,3 +6034,67 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The reserve is always half the start's bound,** whether or not acknowledgements or sidecars wait. A T2 host still held then keeps its evidence for a later start, within the runner's 7 days.
 - **Each later call waits 90 s again for a stuck Run Command in Deleting.** The evidence, the acknowledgement, and the sidecars each wait up to 90 s from their own start, so a stuck one on archost01 can take up to 270 s of the start's 360.
 - **The contract's "When"** (`rca/README.md`, C0's) still names `Invoke-DbHubRcaEarlier` for the acknowledgements. They now go in the start's sidecar step, per VM, sqlvm01 first, and its rule holds: after the evidence, before the fetch, within `rca.startMinutes`, one Run Command at a time on the T2 host.
+
+### The review of a708cffa (2026-11-23)
+
+**Why.** The re-check of e058e5fe..a708cffa said **SHIP**. Before closing T2c-1, the coordinator asked, from the code only, whether on a cold start T2's dispatch holds archost01 through the start's whole time (`rca.startMinutes`, 6 minutes). If it did, every cold start would leave T2's acknowledgements unsent and its earlier evidence pending. Re-checks and stops never acknowledged, so T2's sidecars would be offered again at every stop until they expire at 30 days, and T2's leftover evidence could expire at 7 days unfetched.
+
+- **The answer, from the code:**
+  - **Rare in the default flow.** The start's RCA step comes only after the replica wait (`Complete-DbHubSessionReplica`), about 13 to 16 minutes after T2's dispatch went out, and the dispatch's own waits (heartbeat up to 12 minutes, guest ready up to 20, lock 2, set 5) usually end before then. **Plausible with a Burstable T4,** which has no read replica, so the step comes sooner.
+  - **`onVmReady` fires once archost01 runs,** while T2's guest is still off or booting. The relays of `Rca`, `RcaAck`, and `RcaSidecarExport` don't wait for the guest, so acknowledging there, before the dispatch, wasn't an option.
+  - **A stop's sidecar fetch goes oldest first** (the runner's `Offerable()`), and the session's room fills in that order, so re-offered T2 sidecars could crowd out new ones.
+- **The coordinator's decision: option 2 with refinements (a), (b), and (c), as one commit,** built as it says:
+  1. **Option 2: what a start leaves unacknowledged, the session's next export that reaches that VM sends,** a re-check's, else the stop's.
+     - **When:** after that export's evidence and before its sidecar fetch, within its own bound (`rca.recheckMinutes` or `rca.stopMinutes`), so they take no time of their own.
+     - **How:** one Run Command per VM, the T2 host last, past the export's busy-host check, and the stop's past its mark. A re-check sends none once the stop has begun (`Invoke-DbHubRcaAck -FenceSessionId`, checked before each VM).
+     - **Which:** the start records the VMs still owed in `rcaAckRetry` (`Complete-DbHubRcaAck`): those it didn't settle that have IDs left. A VM is settled when its runner took the IDs, or when its runner or bundle predates the sidecar, which only `./scripts/deploy.ps1` fixes. A request outside the contract leaves none. `Get-DbHubRcaAckRetryWork` routes the left IDs to those VMs again, so an ID whose host no VM has stays in `left`. The stopped status doesn't keep `rcaAckRetry`.
+     - **The write:** the moves go into `rcaAcks` in the same guarded write as `rcaSidecar`, applied to the status as it is at that write (`Move-DbHubRcaAck`): only from `left` to `sent`, never back, and never a new ID. A re-check's go in `Update-DbHubSessionSidecar`'s write, so a re-check that fetched no sidecar still writes them. The stop's go into the stopped status (`Write-DbHubStopStatus`), whose `rcaAcks` is final.
+     - **"Acknowledged before" counts as sent,** so the acknowledgements of a re-check whose write the stop refused come back sent from the stop.
+     - **The message:** "All N sidecar acknowledgement(s) sent: X earlier in the session and Y at its re-check (...)", or "... at the session's stop (...)", or how many were sent and why the rest weren't.
+  2. **(a) A T2 host waiting on its own delete counts as held.** At a start's reserve, a T2 host with parts still queued whose last Run Command Azure is still deleting now yields, as a host held by another Run Command does. Before, that delete kept the host "not idle" past the reserve.
+  3. **(b) One stale wait for the whole start.** The 90 s that a Run Command stuck in Deleting may hold the T2 host now count once, from the start's RCA step (`-StaleUntilUtc`). The earlier evidence's fetch, the acknowledgements, and the sidecar fetch share them, so a stuck one costs the start 90 s, not up to 270 s.
+  4. **(c) T2's held evidence before T2's acknowledgements and sidecars.** After sqlvm01's pass, when the T2 host is free and time is left, the start fetches the earlier session's evidence that the reserve held back (`Invoke-DbHubRcaEarlierRetry`), so no sidecar goes before T2's evidence.
+     - What it fetches joins that session's index (`rcaEarlier`).
+     - Its RCA.EXPORT line counts both fetches and says "archost01's were fetched after the other VMs' acknowledgements and sidecars".
+     - Its RCA.EARLIER line goes, or says what's still left, and so does the carry in `rcaEarlierPending`.
+     - When the pass didn't reach the T2 host, it gets one more try after the sidecar step, before the start's last acknowledgements.
+- **Out of scope, as decided:** re-checks still don't fetch an earlier session's evidence (ADR 0031's handoff), and the `onVmReady` export is unchanged.
+- **The contract** is C0's 00212de6 on `marcbushong-microsoft-rca-query-store-evidence`. This commit builds to its text without merging it; the integrator brings them together. The notebook's side is T2c-2's: its cleanup from the stopped status's `rcaAcks`, and RCA.SIDECAR.ACK printed again when it changed.
+- **A fix the tests found:** after the later fetch, an empty carry stayed in `rcaEarlierPending`, since `@($null).Count` is 1 for a carry without bundles. It now goes, as `ConvertTo-DbHubRcaCarry` drops one.
+- **Docs:** in `docs/troubleshooting.md`, RCA.EXPORT's Warning row ((a), (b), (c)), a new RCA.EXPORT **Info** row for the later fetch's sentence, and RCA.SIDECAR.ACK's Pass row and both Warning rows; and this entry.
+
+**Changed files.** `automation/runbooks/DbHubControl.Common.ps1`, with `tests/unit/Automation.Runbooks.Tests.ps1`; `docs/troubleshooting.md`; and this report.
+
+**Validation.** On a708cffa with this commit:
+
+- **The runbook's suite:** under strict mode, with the Azure CLI guard, `Automation.Runbooks` passed: 370 passed, none failed, and the guard saw no unmocked Azure CLI call. Its 7 new tests:
+  - **A re-check** sends what the start left: sqlvm01's, then T2's (an `arcsql01` ID, through archost01), after the `rca-sqlvm01-x-` export and before the first sidecar page. It moves both from `left` to `sent`, after one sent earlier, and leaves an unknown host's in `left`, valid against `transport.schema.json`. The next re-check sends nothing more, and a re-check that fetches no sidecar still writes what it moved.
+  - **A re-check that the stop's mark interrupts** after sqlvm01's acknowledgement sends none to the T2 host, and its write is refused. The stop then sends both, sqlvm01's coming back acknowledged before, and its `rcaAcks` is Pass.
+  - **A stop** sends T2's after its evidence and before its sidecar fetch, into the stopped status's final `rcaAcks`.
+  - **The move rule,** as a unit: only from `left` to `sent`, never back, and never a new ID; moving again changes nothing; a refused request leaves no later work; and only the VMs the start left IDs on get them again, with the old runner's reason and fix for the rest.
+  - **(a):** a T2 host whose own delete is slow (40 reads) yields at the reserve: one T2 part goes, and sqlvm01's acknowledgement and sidecars complete.
+  - **(b):** with a `DbHubDemo-Bootstrap` that Azure keeps listing as Deleting, T2's acknowledgement goes 90 to 100 s after sqlvm01's, which took 60 s, not 90 s after its own start.
+  - **(c):** a dispatch that ends 15 s after sqlvm01's acknowledgement. T2's evidence parts go after sqlvm01's acknowledgement and before T2's, `rcaEarlier` lists both VMs' documents, its RCA.EXPORT line is Info and says so, and no RCA.EARLIER line or carry is left.
+
+  Five existing tests gained assertions: the cold start's `rcaAckRetry` (archost01); none for a refused request or an old runner; no acknowledgement from a stop without its own switches; and a test of a leftover earlier session now lists the Run Command that Azure is still deleting, as Azure does.
+- **Mutations,** each alone: all 19 fail at least one test.
+  - **Option 2:** the re-check sends nothing the start left (2 tests); the stop sends nothing (2); a later export adds IDs that weren't left (1); the re-check's fence off (1); the stopped status without the stop's moves (2); every left ID sent again, whatever VM the start settled (1); an old runner left for a later export (1); the re-check's acknowledgements after its sidecar fetch (1), and the stop's (1); the re-check's moves not written (1); the stop's acknowledgements without its sidecar tail (1).
+  - **The fence's test, reworked:** it first ran a whole Stop now inside the re-check's acknowledgement, whose deallocation kept the re-check off archost01 even with the fence gone. It now marks the stop begun while the VMs still run, as a stop's export does, and runs the stop after.
+  - **(a):** no hold for the T2 host's own delete (1).
+  - **(b):** the start's sidecar step without the shared stale wait (1); the acknowledgement ignoring it (1).
+  - **(c):** no later fetch in the pass (1); the later fetch not joining `rcaEarlier` (1); no later fetch at all (1); the RCA.EARLIER line kept (1); the empty carry kept (1).
+- **The suites the change reaches:** `Rca.Contract` passed, 78 (00212de6 adds a 79th, on the README's text, when the integrator merges it); `DbHubDemo.Cost`, which pins the session control's job minutes, 72; `Repo.FunctionNames` 2, `Repo.Conventions` 123, and `Repo.NeutralWording` 3. The later acknowledgements run inside the re-check's and the stop's own bounds, and the later fetch inside the start's, so the job minutes keep their ceiling.
+- PSScriptAnalyzer, with the repo's settings (Windows PowerShell 5.1's for the runbooks), found nothing in the two PowerShell files this commit changes, which are ASCII-only; markdownlint-cli2 0.23.3 found no issue; and the leak check finds nothing.
+
+**What its live check needs.**
+
+- **A cold start with a Burstable T4,** where T2's dispatch may still run when the start's RCA step begins: whether T2's held evidence comes in the same start, and whether T2's acknowledgements come at the first re-check;
+- **A re-check and a stop after such a start:** T2's acknowledgement time, inside their bounds;
+- **T2's time per Run Command**, and the status's size with `rcaSidecar`, `rcaAcks`, `rcaAckRetry`, and `rcaLines` together, against the vault's 25 KB, as before.
+
+**Limits.**
+
+- **A VM that's off, or busy at every re-check and at the stop,** still leaves its acknowledgements to the next start, through the notebook's files, as before.
+- **The shared stale wait isn't observable for the earlier evidence:** its fetch begins with the start's RCA step, so its own 90 s and the shared ones end together. It matters for what comes after it.
+- **A re-check's acknowledgements come after its evidence,** within `rca.recheckMinutes`: when the evidence takes the whole bound, the next re-check or the stop sends them.
+- The e058e5fe entry's limit of up to 270 s for a Run Command stuck in Deleting no longer holds: it's 90 s once per start.
