@@ -780,6 +780,10 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         # 8a1b5ae4), so a read that couldn't read T4's start doesn't cut short what a restart no read had found yet lost.
         $pending | Should -Match ([regex]::Escape('- **The range an observation keeps,** open while it runs and closed at its end, starts where its reads had settled when one last found T4''s start'))
         $pending | Should -Match ([regex]::Escape('so its settling doesn''t cut the range short, and the backfill that finds a restart no read had found yet reports the lost part from the end of the old lifetime''s newest interval'))
+        # Before any read found T4's start, the range starts where reads that couldn't read it settled, harmlessly: it records no
+        # start, so no backfill splits it (A2's check of 56bc5f6e).
+        $pending | Should -Not -Match ([regex]::Escape('(before any did, where they had settled)'))
+        $pending | Should -Match ([regex]::Escape('Until a read finds T4''s start, the range starts where the reads had settled and records no start, so no backfill splits it: a stop before then isn''t told apart from time in which nothing ran'))
         $pending | Should -Match ([regex]::Escape('what a later stop inside the range loses, past its split, isn''t told apart from time in which nothing ran'))
         $pending | Should -Match ([regex]::Escape('a window that began up to 2 seconds before the start is still the new lifetime''s'))
         $adr = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'docs/adr/0031-incident-rca.md'))
