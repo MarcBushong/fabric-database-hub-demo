@@ -188,7 +188,8 @@ What the observer captures beyond the evidence document, in documents of their o
   - RCA-SQL-15 every 60 s; RCA-PG-13 with each read.
 - **A row** is one interval's totals for a plan (on PostgreSQL, for a role's query and plan):
   - execution-weighted: each Query Store row's average times its executions, summed; the maximum of maxima;
-  - `first_execution_utc` is when the plan's first execution in the interval ended, as Learn defines it, not the instant a plan changed.
+  - `first_execution_utc` is when the plan's first execution in the interval ended, as Learn defines it, not the instant a plan changed;
+  - on T4, a role's query's sampled waits (RCA-PG-15, from `pgms_wait_sampling_view`) go with its statistics by the interval's start, which the two views share (L0b, 2026-11-24: 12 windows of 12, to the microsecond, the 1-second gap and 5-minute windows included).
 - **The latest read wins.** An interval read twice (open, then closed; or by two sessions' baselines) is in both reads' rows. The notebook writes the latest read of each target, interval, login, query, and plan. The model's measures take the latest read too, so a history written otherwise still counts each interval once.
 - **The top lists:**
   - each interval's top 10 by CPU (on T4, total time), and top 5 by duration, by logical reads (on T4, blocks), and by waits;
