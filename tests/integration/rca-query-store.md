@@ -282,10 +282,12 @@ From T2a's review (9ca9f8ab..8e2ada18). They run on the rehearsal's environment,
 
 From the contract's review (53d0272e..45f947b7, fixed in 83c87de2). They need T2c, and run in the rehearsal's Run all sessions, S1 and S2.
 
-1. **S2's start acknowledges S1's sidecars, a T2 one included:** its status's `rcaAcks` lists every ID S1's `-runall-` acknowledgement says is `written` or `already` as `sent`, with `left` empty.
-   - T2's IDs, which name the guest, went to the T2 host.
-   - `RCA.SIDECAR.ACK` says so.
-   - S2's own sidecar fetch offers none of S1's again.
-   - The notebook deleted S1's acknowledgement file after S2's start.
+1. **S2 acknowledges S1's sidecars, a T2 one included:** by S2's stopped status, which is final, its `rcaAcks` lists every ID S1's `-runall-` acknowledgement says is `written` or `already` as `sent`, with `left` empty. Under T2c's option 2, S2's start sends what its bound reaches, sqlvm01 first and the T2 host last, and leaves the rest to S2's next export that reaches that VM, a re-check's or else the stop's ([Run all's path](../../rca/README.md#run-alls-path-for-the-sidecars)). On a cold start, T2's often go at the first re-check: that's a pass. (Until 2026-11-24 this said the start sends every ID, which option 2 changed.)
+   - S1's save wrote its acknowledgement file before S2's start: the start's request reads the files when it's built, so a file written after it rides only on a later start. S1's file lists at least one ID of T2's guest; without one, the T2 part isn't exercised.
+   - Nothing else acknowledged S1's sidecars between S1's save and S2's start: no scripts' save and no golden capture.
+   - Each ID went to the VM its host segment maps to: T2's, which name the guest, to the T2 host.
+   - `RCA.SIDECAR.ACK` says so, after the start and after the export that sent the rest.
+   - No export of S2's offers S1's sidecars again: each VM's IDs go right before that VM's sidecar fetch.
+   - The control notebook deleted S1's acknowledgement file after the export that sent its last ID, at the status read after it, and not before.
 2. **A second save gets only `already`:** a scripts' save after S1's own (`./scripts/stop-demo.ps1 -SaveHistory`, or `deploy.ps1`'s snapshot) that's offered S1's sidecars again writes nothing. Its acknowledgement says `already` for each, and no table holds a second copy of any document's rows.
 3. **Both paths save at once:** a scripts' save that runs while Run all's control notebook saves the same session. Each path reads only its own acknowledgements (`-script-` or `-runall-`), every document is written once, and each path acknowledges what its own file says.
