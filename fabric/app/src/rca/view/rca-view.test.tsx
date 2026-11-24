@@ -53,9 +53,9 @@ describe("the Root cause view (ADR 0031)", () => {
             // The fixture's chain at its peak: the acquire procedure at its head, 2 branches, 4 levels deep.
             const peak = shapes.find((s) => Math.max(...s.levels) === 4 && s.levels.filter((l) => l === 2).length === 2);
             expect(peak, JSON.stringify(shapes.map((s) => s.levels))).toBeDefined();
-            expect(peak!.items[0].textContent).toContain("usp_scenario_chain_acquire");
+            expect(peak!.items[0].textContent).toContain("usp_assign_work_item");
             // And the escalation's: its table lock at the head.
-            expect(shapes.some((s) => /usp_scenario_chain_escalate/.test(s.items[0].textContent ?? "") && /Holds X/.test(s.items[0].textContent ?? ""))).toBe(true);
+            expect(shapes.some((s) => /usp_bulk_reschedule/.test(s.items[0].textContent ?? "") && /Holds X/.test(s.items[0].textContent ?? ""))).toBe(true);
             for (const name of ["Root cause", "The blocking chain, head blocker first", "Timeline", "Errors in these minutes", "Recommendations", "Next steps"]) {
                 expect(screen.getByRole("heading", { name }), name).toBeInTheDocument();
             }

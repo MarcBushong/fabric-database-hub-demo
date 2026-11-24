@@ -52,12 +52,12 @@ function AgentPanel({ build, lead, warning, visualId }: AgentPanelProps) {
                     </Badge>
                 </li>
                 <li>
-                    <Badge appearance="outline" color="subtle" icon={<ShieldCheckmark16Regular />}>
+                    <Badge appearance="outline" color="informative" icon={<ShieldCheckmark16Regular />}>
                         The agent proposes; you decide the response
                     </Badge>
                 </li>
                 <li>
-                    <Badge appearance="outline" color="subtle" icon={<Eye16Regular />}>
+                    <Badge appearance="outline" color="informative" icon={<Eye16Regular />}>
                         Investigation only: this app never runs anything
                     </Badge>
                 </li>

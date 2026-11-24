@@ -12,7 +12,8 @@ the first 500 characters of message, currentStep, generation, updatedUtc, and fr
 Arc onboarding, the guest's state, and its SQL Server edition. Since 2026-11-20 (F24) it also prints the first two
 warnings, each cut to 240 characters and naming the step it came from, and how many there are (warningCount): a Ready VM
 with warnings reports Warning, and the validator says which step warned. Since 2026-11-23 it prints the notes the same way
-(notes, noteCount): what a new VM's bootstrap gives by design, as information, which leaves a Ready VM a Pass. Since 2026-11-09 it also prints the configured install
+(notes, noteCount): what a new VM's bootstrap gives by design, as information, which leaves a Ready VM a Pass; only when
+health.json has notes, as every bundle since then writes, even empty, so an older bundle's summary has neither. Since 2026-11-09 it also prints the configured install
 mode, whether the configuration names it (modeSource), whether the host kept an existing guest's mode (modeAdopted), the
 guest's own mode (guestMode) and whether a pass saw SQL Server set up in it (guestSetUp), and the last rebuild of an
 unfinished guest, read from guest-rebuild.json itself (guestRebuild: Removing, Removed, or Done once the new guest
@@ -412,8 +413,13 @@ if ($View -eq 'Summary') {
         signInNote     = & $read $health @('details', 'signIn', 'note')
         warningCount   = $allWarnings.Count
         warnings       = $shownWarnings
-        noteCount      = $allNotes.Count
-        notes          = $shownNotes
+    }
+    # The notes, and how many, only from a health.json that has them (the re-check of ea1ea20f, 2026-11-23): every bundle
+    # since 2026-11-23 writes notes, even empty, and an older one never does, so the validator can tell whether a warning
+    # with an expected note's text comes from a bundle that gives those as notes, which makes it an established VM's.
+    if ($null -ne $health.PSObject.Properties['notes']) {
+        $summary['noteCount'] = $allNotes.Count
+        $summary['notes'] = $shownNotes
     }
     if ($null -ne $guestFacts) {
         $summary['t2Guest'] = $guestFacts

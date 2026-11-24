@@ -66,6 +66,8 @@
         'Test-DemoVmNameResolve'
         'Test-DemoVmRunnerChunk'
         'Test-DemoVmRunnerPackage'
+        'Test-DemoVmStepFirstSetup'
+        'Test-DemoVmStepSetThisGeneration'
         'Test-DemoVmT3Enabled'
         'Test-DemoVmT4Enabled'
         'Test-DemoVmWorkloadRecord'

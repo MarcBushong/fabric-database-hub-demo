@@ -132,6 +132,21 @@ describe("ChartView", () => {
         expect(container.querySelectorAll("rect.chart-bar")).toHaveLength(4);
     });
 
+    it("draws a bar chart's hovered category under its bars, so the hovered bars stay in view", () => {
+        const spec: ChartSpec = { kind: "bar", title: "Waits", x: "target", y: ["lock", "io"], unit: "s", rows: [{ target: "T1", lock: 2, io: 5 }, { target: "T2", lock: 1, io: 9 }] };
+        for (const kind of ["bar", "stackedBar"] as const) {
+            const { container, unmount } = render(<ChartView spec={{ ...spec, kind }} />);
+            fireEvent.keyDown(screen.getByRole("group", { name: "Waits" }), { key: "End" });
+            const band = container.querySelector(".chart-cursor rect");
+            expect(band, kind).not.toBeNull();
+            const bars = [...container.querySelectorAll("rect.chart-bar")];
+            expect(bars, kind).toHaveLength(4);
+            // An opaque band drawn after the bars hid the hovered ones: every bar now comes after it, so it's painted over it.
+            for (const bar of bars) expect(band!.compareDocumentPosition(bar) & Node.DOCUMENT_POSITION_FOLLOWING, kind).toBeTruthy();
+            unmount();
+        }
+    });
+
     it("keeps short category labels flat, and rotates long ones, truncated, with the full name as their tooltip", () => {
         const waits = ["PAGEIOLATCH_SH", "SOS_SCHEDULER_YIELD", "RESOURCE_SEMAPHORE_QUERY_COMPILE", "CXPACKET", "LCK_M_X", "WRITELOG", "ASYNC_NETWORK_IO", "THREADPOOL", "PAGELATCH_EX", "HADR_SYNC_COMMIT"];
         const spec: ChartSpec = { kind: "bar", title: "Top waits", x: "wait", y: "seconds", unit: "s", rows: waits.map((wait, i) => ({ wait, seconds: 10 + i })) };

@@ -567,7 +567,12 @@ function Clear-DemoHostGuestSignIn {
     if (-not [bool]$guest.pass -or -not [bool]$local.pass) {
         throw ('Sign-in data is left after the cleanup, so the build stops here (fail closed). {0}' -f $summary)
     }
-    $result = Get-DemoSignInStepResult -Sweep @($guest, $local) -Label @($Context.GuestName, 'archost01')
+    # A note, as information, after the Arc onboarding, or the guest's build or download, that leaves that data by design in
+    # this generation; a one-off warning on an established host, whose onboarding and guest stood (the review of
+    # cb4bc479). Only steps whose Tests don't need the guest running (the re-check of ea1ea20f): GuestVm's Set also starts
+    # a guest that was only off, and SqlSetupWizard's waits for one.
+    $expected = Test-DemoVmStepSetThisGeneration -Name 'ArcOnboarding', 'ArcOnboardingBeforeWizard', 'GuestVhdx', 'GuestImage'
+    $result = Get-DemoSignInStepResult -Sweep @($guest, $local) -Label @($Context.GuestName, 'archost01') -Expected:$expected
     if ($null -ne $result) {
         return $result
     }

@@ -398,6 +398,52 @@ Describe 'Stopped VMs are expected (validation areas)' {
         $mixed.message | Should -Match 'Its bootstrap has a warning: GuestFirstBoot: Uninstalling SSIS in arcsql01 didn''t pass \(setup exit code 1\)\. Its bootstrap noted, as information: GuestSignInCleanup: '
         $mixed.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it'
     }
+
+    It 'calls none of a VM''s warnings expected when its bundle gives the by-design notes as notes, since a warning with their text is an established VM''s (the review of cb4bc479)' {
+        Set-TestAzResponse (Get-TestAzResponse -Power 'running')
+        $cleanup = 'GuestSignInCleanup: The sign-in cleanup cleared Application on archost01, because they held token-shaped values; endpoint protection may report a cleared event log.'
+        $script:summary = [pscustomobject]@{ role = 'host'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; currentStep = ''; warningCount = 1; warnings = @($cleanup); noteCount = 0; notes = @() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { $script:summary }
+        $context = New-TestContext
+        $health = @(InModuleScope -ModuleName DbHubDemo -Parameters @{ X = $context } { param($X) Invoke-DemoValidationInfrastructure -Context $X }) | Where-Object { $_.checkId -eq 'INFRA.HEALTH.ARCHOST01' }
+        $health.status | Should -Be 'Warning'
+        $health.message | Should -Be ('archost01 reports Ready: Every step is in the desired state. Its bootstrap has a warning: {0}' -f $cleanup)
+        $health.remediation | Should -Match '^Nothing blocks the demo: each warning starts with the step that gave it'
+        $health.evidence['warningsExpected'] | Should -BeFalse
+    }
+
+    It 'tells a bundle that gives the by-design notes as notes from an older one by health.json''s notes, in both views, as the real health read prints them (the re-check of ea1ea20f)' {
+        # status.ps1 -Detail reads the full view, which never has noteCount, and the summary had noteCount for an older
+        # health.json too, so neither told the bundles apart: an established T1's later recovery was called expected.
+        $healthScript = Join-Path -Path $repoRoot -ChildPath 'vm/health/Get-DemoHealth.ps1'
+        $recovery = 'SqlAdminAccess: SYSTEM was not a sysadmin, so demoadmin was made one with the documented lockout-recovery procedure.'
+        foreach ($case in @(@{ Format = 'older'; Notes = $false; Expected = $true }, @{ Format = 'newer'; Notes = $true; Expected = $false })) {
+            $root = Join-Path -Path $TestDrive -ChildPath ('health-' + $case.Format)
+            $null = New-Item -ItemType Directory -Path $root -Force
+            $written = [ordered]@{ schemaVersion = 1; role = 'SqlVm'; state = 'Ready'; status = 'Warning'; message = 'Every step is in the desired state.'; warnings = @($recovery); steps = @() }
+            if ($case.Notes) {
+                # Every bundle since 2026-11-23 writes notes, even empty.
+                $written['notes'] = @()
+            }
+            [System.IO.File]::WriteAllText((Join-Path -Path $root -ChildPath 'health.json'), ($written | ConvertTo-Json -Depth 5))
+            foreach ($view in 'Summary', 'Full') {
+                $read = (& $healthScript -Root $root -View $view) | ConvertFrom-Json
+                $note = InModuleScope -ModuleName DbHubDemo -Parameters @{ H = $read } { param($H) Get-DemoHealthWarningNote -Health $H -VmName 'sqlvm01' }
+                $because = 'an {0} bundle''s health.json, read in the {1} view' -f $case.Format, $view
+                $note.Count | Should -Be 1 -Because $because
+                $note.Expected | Should -Be $case.Expected -Because $because
+                if ($case.Expected) {
+                    $note.Text | Should -Match 'That''s expected: a new T1 needs the sysadmin recovery' -Because $because
+                    $note.Remediation | Should -Match '^Nothing to do' -Because $because
+                }
+                else {
+                    $note.Text | Should -Not -Match 'expected' -Because $because
+                    $note.Remediation | Should -Match '^Nothing blocks the demo' -Because $because
+                }
+            }
+        }
+    }
+
     It 'warns, with the extension-update finding, when health.json can''t be read' {
         Set-TestAzResponse (Get-TestAzResponse -Power 'running')
         Mock -ModuleName DbHubDemo -CommandName Get-DemoVmHealth -MockWith { throw 'Reading health.json on sqlvm01 failed (execution state Pending, exit code ).' }

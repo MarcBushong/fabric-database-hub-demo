@@ -640,6 +640,28 @@ Describe 'The Incident RCA contract: blind detection (ADR 0031)' {
             }
         }
     }
+
+    It 'names no retired workload module in the fixtures, the app''s source, or the runner''s RCA tests (ADR 0031, decision 6)' {
+        # The workload's modules have realistic names since 2026-11-23. A branch from before that adds a fixture or a test
+        # with an earlier name: ./tests/Update-RcaFixtures.ps1 -RenameWorkloadModules -Path <its files> renames them and
+        # writes the fixtures' part lines again. Names match in any case, as SQL Server's do.
+        $retired = @('usp_scenario_', 'fn_locking_hot_rows', 'fn_chain_rows', 'fn_idle_rows', 'usp_io_scratch_grow', 'usp_visit_summary_lookup')
+        $files = @(
+            Get-ChildItem -LiteralPath (Join-Path -Path $rcaRoot -ChildPath 'fixtures') -File -Filter '*.json'
+            $appSource = Join-Path -Path $repoRoot -ChildPath 'fabric/app/src'
+            if (Test-Path -LiteralPath $appSource) { Get-ChildItem -LiteralPath $appSource -Recurse -File }
+            $runnerTests = Join-Path -Path $repoRoot -ChildPath 'workload-generator/tests/ContosoCare.Workload.Tests'
+            if (Test-Path -LiteralPath $runnerTests) { Get-ChildItem -LiteralPath $runnerTests -File -Filter 'Rca*.cs' }
+        )
+        $files.Count | Should -BeGreaterThan 0
+        $found = foreach ($file in $files) {
+            $text = [System.IO.File]::ReadAllText($file.FullName)
+            foreach ($name in $retired) {
+                if ($text.IndexOf($name, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { '{0}: {1}' -f $file.FullName.Substring($repoRoot.Length + 1).Replace('\', '/'), $name }
+            }
+        }
+        $found | Should -BeNullOrEmpty -Because 'the workload has realistic module names since 2026-11-23: run ./tests/Update-RcaFixtures.ps1 -RenameWorkloadModules -Path with the files it names'
+    }
 }
 
 Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
@@ -788,5 +810,16 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         $pending | Should -Match ([regex]::Escape('a window that began up to 2 seconds before the start is still the new lifetime''s'))
         $adr = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'docs/adr/0031-incident-rca.md'))
         $adr | Should -Match ([regex]::Escape('A restart while the observer runs, such as maintenance or a scale, is reported the same way from the observer''s next read'))
+    }
+
+    It 'reads the events'' fields from sys.dm_xe_object_columns alone (RCA-XE-00), without the join to sys.dm_xe_objects that took about 8 s of CPU at each observer start' {
+        $catalog = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'capture/sqlserver.sql'))
+        $block = [regex]::Match($catalog, '(?ms)^-- name: RCA-XE-00\r?$(?<body>.*?)(?=^-- name: |\z)').Groups['body'].Value
+        $sql = @($block -split "`n" | Where-Object { $_ -notmatch '^\s*--' }) -join "`n"
+        $sql | Should -Match 'FROM sys\.dm_xe_object_columns AS c'
+        $sql | Should -Not -Match '\bJOIN\b'
+        $sql | Should -Not -Match 'sys\.dm_xe_objects\b'
+        foreach ($name in 'error_reported', 'attention', 'lock_escalation', 'xml_deadlock_report', 'database_xml_deadlock_report') { $sql | Should -Match ("N'{0}'" -f $name) }
+        $sql | Should -Match "c\.column_type = N'data'"
     }
 }

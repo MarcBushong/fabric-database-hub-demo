@@ -2,9 +2,10 @@
   "$schema": "../scenario.schema.json",
   "id": "connection-surge",
   "title": "Connection surge (capacity maxed)",
+  "service": "frontdesk-app",
   "summary": "A burst of application connections fills the server's connection slots: the runner opens a few connections a second until only headroom slots stay free below max_connections, fills that headroom for a few seconds at most so overshoot more attempts are past the limit, which the server refuses as too many connections, frees the headroom again, and holds the rest (each pings now and then, so most sit idle). It releases them all, pauses, and repeats until the run ends. PostgreSQL (T4) only.",
   "orchestration": "workers",
-  "procedure": "demo.usp_scenario_connection_surge",
+  "procedure": "frontdesk.usp_kiosk_heartbeat",
   "duration": { "defaultSeconds": 300, "maxSeconds": 900 },
   "concurrency": { "default": 5, "min": 1, "max": 16, "description": "Connections opened per second while a wave ramps up." },
   "intensity": { "default": 5, "min": 1, "max": 10, "description": "How often each held connection pings: every 15 seconds at 1, every second at 10." },
@@ -34,8 +35,8 @@
   ],
   "queryLevelEvidence": [
     "ContosoCare.Workload status --target T4: connections against max_connections, sessions by state",
-    "pg_stat_activity grouped by application_name and state shows the ContosoCare.Demo/connection-surge sessions",
+    "pg_stat_activity grouped by application_name and state shows the ContosoCare.Demo/frontdesk-app sessions",
     "demo.scenario_run_events records each wave's size and the refused attempts"
   ],
-  "reset": "Every surge connection closes when the run ends or stops; reset ends any leftover ContosoCare.Demo/connection-surge session with pg_terminate_backend. Nothing is written."
+  "reset": "Every surge connection closes when the run ends or stops; reset ends any leftover ContosoCare.Demo/frontdesk-app session with pg_terminate_backend. Nothing is written."
 }

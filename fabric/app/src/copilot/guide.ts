@@ -51,12 +51,12 @@ ${live}
 - When the viewer asks about a visual, the question includes that visual's title, its DAX, and a sample of its rows: use them, and query further when needed.
 
 # DAX that works on this model
-- Measures already pick each bin's latest capture; use them instead of summing 'Telemetry Snapshots'[Value] yourself.
+- Use the measures instead of summing 'Telemetry Snapshots'[Value] yourself: the history keeps every save, so one minute can be in several saves, and the measures take each interval from its finest save once history is resolved.
 - Filter targets with TREATAS ( { "T1", "T3" }, 'Target'[Target Key] ), and days with DATESBETWEEN ( 'Date'[Date], DATE(2026,11,1), DATE(2026,11,7) ).
 - A time series per target:
   EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], 'Target'[Target Key], TREATAS ( { "T1", "T2", "T3" }, 'Target'[Target Key] ), DATESBETWEEN ( 'Date'[Date], <from>, <to> ), "CpuPct", [CPU (%)], "WaitS", [Wait Time (s)] ) ORDER BY 'Telemetry Snapshots'[Bucket UTC]
 - Where the wait time went: EVALUATE SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Metric], 'Target'[Target Key], <filters>, "WaitS", [Wait Time (s)] ) ORDER BY [WaitS] DESC
-- T5 (Azure Cosmos DB): its measures pick its metrics themselves; filter only the target and its latest capture, because two captures of one period both count in sums:
+- T5 (Azure Cosmos DB): its measures pick its metrics themselves; for its latest capture, filter the target and that capture's run:
   EVALUATE VAR LatestCapture = CALCULATE ( MAX ( 'Telemetry Snapshots'[Captured At UTC] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "cosmosdb" ) VAR LatestRun = CALCULATETABLE ( VALUES ( 'Telemetry Snapshots'[Run ID] ), REMOVEFILTERS (), 'Telemetry Snapshots'[Analysis Key] = "cosmosdb", 'Telemetry Snapshots'[Captured At UTC] = LatestCapture ) RETURN SUMMARIZECOLUMNS ( 'Telemetry Snapshots'[Bucket UTC], TREATAS ( { "T5" }, 'Target'[Target Key] ), TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] ), "PeakNormRuPct", [Peak Norm RU (%)], "Throttled429", [Throttled Requests (429s)], "RuConsumed", [RU Consumed] ) ORDER BY 'Telemetry Snapshots'[Bucket UTC]
 - A string column's values: EVALUATE TOPN ( 50, VALUES ( 'Telemetry Snapshots'[Metric] ) ).
 - Return names that are easy to chart: "CpuPct" rather than "[CPU (%)]".

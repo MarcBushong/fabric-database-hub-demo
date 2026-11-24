@@ -37,7 +37,7 @@ internal static partial class CommandLine
 
     public static RootCommand Build()
     {
-        var root = new RootCommand("Contoso Care Operations workload runner for the Fabric Database Hub hybrid demo (ADR 0010). Every session it opens, and every request it sends to T5, is tagged ContosoCare.Demo/<scenario>/<run>, and it works only in the ContosoCare database (contosocare on T4 and T5).");
+        var root = new RootCommand("Contoso Care Operations workload runner for the Fabric Database Hub hybrid demo (ADR 0010). Every session it opens, and every request it sends to T5, is tagged ContosoCare.Demo/<service>/<run> (ContosoCare.Demo/control/<id> for its own bookkeeping), and it works only in the ContosoCare database (contosocare on T4 and T5).");
         root.Options.Add(GlobalOptions.LogFormat);
         root.Options.Add(GlobalOptions.LogFile);
         root.Options.Add(GlobalOptions.Verbose);
@@ -218,7 +218,7 @@ internal static partial class CommandLine
                 var id = parseResult.GetValue(runId);
                 if (id is not null && !SessionNames.IsValidRunId(id))
                 {
-                    throw new ScenarioRequestException("--run-id must be a run ID such as 20261020173000-t1-a1b2c3.");
+                    throw new ScenarioRequestException("--run-id must be a run ID such as 9f2c4e1a7b3d5f60.");
                 }
 
                 // A stamped stop sets the profile off first, and only when no newer request is stored; when one is, it
@@ -252,16 +252,24 @@ internal static partial class CommandLine
                 {
                     var endpoint = target.ResolvePostgres(parseResult);
                     var replica = target.ResolvePostgresReplica(parseResult, endpoint);
+                    IReadOnlyList<RunRecord>? running = null;
                     // As the RCA observer's connections open (PgCaptureConnector.Startup): T4's Query Store evidence leaves out the stop.
                     await using (var pgConnection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("stop"), cancellationToken, silent: PgCaptureConnector.Startup, plainIfRefused: true).ConfigureAwait(false))
                     {
-                        cancelled = await new PgDemoDatabase(pgConnection).StopAsync(scope, id, scenarioId, who, cancellationToken).ConfigureAwait(false);
+                        var database = new PgDemoDatabase(pgConnection);
+                        if (replica is not null && scope == "scenario")
+                        {
+                            // The runs this stop cancels, read first: their sessions on the replica carry the run, never the scenario.
+                            running = await database.GetRunsAsync(100, runningOnly: true, cancellationToken).ConfigureAwait(false);
+                        }
+
+                        cancelled = await database.StopAsync(scope, id, scenarioId, who, cancellationToken).ConfigureAwait(false);
                     }
 
                     // T4's read replica (ADR 0025): the stopped runs' sessions there end too, and a replica that isn't there never fails the stop.
                     if (replica is not null)
                     {
-                        replicaCheck = await PgReplicaSessions.EndAsync(new PgConnectionOpener(replica, log), "replica-sessions-ended", ReplicaSessionScope.ForStop(scope, id, scenarioId), kill: true, TimeProvider.System, cancellationToken).ConfigureAwait(false);
+                        replicaCheck = await PgReplicaSessions.EndAsync(new PgConnectionOpener(replica, log), "replica-sessions-ended", ReplicaSessionScope.ForStop(scope, id, scenarioId, running), kill: true, TimeProvider.System, cancellationToken).ConfigureAwait(false);
                     }
                 }
                 else
@@ -1005,7 +1013,7 @@ internal static partial class CommandLine
             ["target"] = result.Target.ToString(),
             ["status"] = result.Status,
             ["result"] = result.Result,
-            ["applicationName"] = SessionNames.ForRun(result.ScenarioId, result.RunId),
+            ["applicationName"] = ScenarioCatalog.Default.Contains(result.ScenarioId) && SessionNames.IsValidRunId(result.RunId) ? SessionNames.ForRun(ScenarioCatalog.Default.Get(result.ScenarioId).Service, result.RunId) : null,
             ["startedAt"] = result.StartedAt is { } started ? DemoDatabase.Format(started) : null,
             ["endedAt"] = result.EndedAt is { } ended ? DemoDatabase.Format(ended) : null,
             ["deadlineAt"] = result.DeadlineAt is { } deadline ? DemoDatabase.Format(deadline) : null,

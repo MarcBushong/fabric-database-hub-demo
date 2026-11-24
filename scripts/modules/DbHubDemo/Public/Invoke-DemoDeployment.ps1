@@ -44,8 +44,10 @@ function Invoke-DemoDeployment {
        earlier guided stop or session left open (Bastion, a handed-over host password) is cleaned up here too
        (Clear-DemoGuidedStopLeftover; Phase 28 review).
     9. Fabric: configure-fabric.ps1 (the Hub checklist, the Real-Time Dashboard, and the notebook import with
-       -ImportNotebooks or fabric.importNotebooks), then configure-powerbi.ps1 (the history semantic model and
-       report), as the parallel Fabric track imports them (Phase 28 review follow-up), then the Insights app
+       -ImportNotebooks or fabric.importNotebooks), then the history's kept values through Livy (F35, 2026-11-23;
+       Invoke-DemoHistoryKeptValue, DEPLOY.FABRIC.KEPTVALUE, never a Fail), then configure-powerbi.ps1 (the history
+       semantic model, in the form of Snapshot Value that the kept values' step allows, and the report), as the parallel
+       Fabric track does (Phase 28 review follow-up), then the Insights app
        (configure-fabric-app.ps1, part of every deployment since 2026-11-05; Invoke-DemoInsightsAppStep), whose step
        never stops the stage or keeps the run from DONE. Its sign-in starts with the run, alongside the stages
        (Start-DemoFabricAppSignIn), and this stage waits for it until its deadline. Not selected with -SkipFabric.
@@ -58,7 +60,9 @@ function Invoke-DemoDeployment {
     11. The history report's snapshot (2026-11-06, ADR 0014's amendment), after DONE's checks and the switch to the run's
         activity profile, on a run whose validation ran: NB_DatabaseHub_LiveActivity once, analyze-only (CONFIRM false),
         then the history model's refresh (Invoke-DemoHistorySnapshotStep, DEPLOY.FABRIC.HISTORY), as the parallel path
-        does. It never stops the run or keeps it from DONE.
+        does. It never stops the run or keeps it from DONE. Then the kept values of the rows it saved, through Livy (F35,
+        2026-11-23; Invoke-DemoKeptValueEndStep, DEPLOY.FABRIC.KEPTVALUE.END), with the history model in their form when
+        the Fabric stage couldn't deploy it so (design A), never a Fail either.
     12. T4's read replica at the run's end (2026-11-16; Invoke-DemoT4ReplicaDeployEnd, DEPLOY.T4.REPLICA.END), as the
         parallel path does: deleted unless a session uses it now, on a run that stops at a Fail too. Never a Fail.
     13. Not here: once deploy.ps1 judges the run DONE, its ending stops again what the run started when it found the demo
@@ -578,6 +582,7 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Infrastructure' 'Not selected' 'What if: the template''s what-if ran; nothing was deployed, and later stages were skipped.'
                     # Nor is the history report's snapshot taken, which a deployment takes at its end (2026-11-06).
                     $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -WhatIfRun -SkipFabric:$SkipFabric -ProgressPath $ProgressPath))
+                    $results.Add((Invoke-DemoKeptValueEndStep -Config $Config -WhatIfRun -SkipFabric:$SkipFabric -ProgressPath $ProgressPath))
                     return (& $finishEarly)
                 }
                 if (-not $deployment.Succeeded) {
@@ -948,7 +953,10 @@ function Invoke-DemoDeployment {
                     & $stageResult 'Fabric' 'Fail' 'A Fabric or Database Hub check failed.' 'Read the HUB.* and FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
                     return (& $finishEarly)
                 }
-                $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $ConfigPath)
+                # F35 (i): the history's kept values through Livy, before the model's step, as in the parallel Fabric track.
+                $keptValue = Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'DEPLOY.FABRIC.KEPTVALUE' -TimeoutMinutes 30 -ProgressPath $ProgressPath -ProgressId 'Fabric.KeptValues' -RunAgain $script:KeptValueTrackRunAgain -DecidesModelForm
+                $results.Add($keptValue)
+                $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $ConfigPath -SnapshotValueForm (Get-DemoKeptValueForm -Result $keptValue))
                 & $addAll $powerBI
                 if (& $hasStatus $powerBI 'Fail') {
                     & $stageResult 'Fabric' 'Fail' 'The history semantic model or report failed.' 'Read the FABRIC.* results, fix the cause, then run deploy.ps1 -FromStage Fabric.'
@@ -971,6 +979,12 @@ function Invoke-DemoDeployment {
                 $published = Get-DemoInsightsAppManageRecord -Result $app
                 if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') {
                     $published['FabricSha256'] = $fabricContent
+                }
+                # F35, design A, as in the parallel Fabric track: cleared while the model went out in the release's form although
+                # this checkout has the kept one, so the next deploy.ps1, a resume included, runs the stage again. Cleared, not
+                # left out: tags merge, so an earlier run's record of the same content would stay (the re-check of 32e39e6a).
+                if (Test-DemoKeptFormPending -Result $keptValue) {
+                    $published['FabricSha256'] = ''
                 }
                 & $recordStage 'Fabric' $published
                 & $stageResult 'Fabric' 'Pass' ('The Database Hub checklist ran, the Real-Time Dashboard and the history model and report are in the workspace{0}{1}.' -f $(if ($importNotebooks) { ', and the notebooks were imported or updated' } else { '' }), $appText)
@@ -1024,6 +1038,9 @@ function Invoke-DemoDeployment {
     # NB_DatabaseHub_LiveActivity runs once, analyze-only, and the history model is refreshed. Never a Fail.
     if ($validated) {
         $results.Add((Invoke-DemoHistorySnapshotStep -Config $Config -Result $results.ToArray() -Requirement $requirement -DoneChecked:$doneChecked -SkipFabric:$SkipFabric -ActivityProfile $activity -ProgressPath $ProgressPath))
+        # F35 (i): the snapshot's kept values through Livy, as in the parallel path, and the model in their form when the
+        # Fabric stage couldn't deploy it so (design A). Never a Fail.
+        $results.Add((Invoke-DemoKeptValueEndStep -Config $Config -Result $results.ToArray() -SkipFabric:$SkipFabric -ProgressPath $ProgressPath -ConfigPath $ConfigPath))
     }
     # T5's container lifecycle once more, now that the session control is done (2026-11-19, F14), as in the parallel path:
     # only when this run granted the control's role and the first check, right after the grant, didn't see it.

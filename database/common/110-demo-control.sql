@@ -181,6 +181,41 @@ RETURN
     ) AS c (scenario_id, max_duration_seconds);
 GO
 
+-- Which scenario's runs may run each workload module (ADR 0031, decision 6): demo.usp_run_assert_running reads it from
+-- the caller's @@PROCID, so no module names a scenario in its definition. '*' accepts any Running run: the requests the
+-- portal serves are also the normal workload beside other scenarios. Part of the answer key, beside
+-- demo.fn_scenario_catalog (rca/blind-detection.json); a .NET test checks it against every module that calls the check.
+CREATE OR ALTER FUNCTION demo.fn_workload_procedures ()
+RETURNS TABLE
+AS
+RETURN
+    SELECT procedure_name = CAST(p.procedure_name AS nvarchar(300)), scenario_id = CAST(p.scenario_id AS varchar(64))
+    FROM (VALUES
+        (N'frontdesk.usp_process_requests', '*'),
+        (N'billing.usp_reprioritize_queue', 'locking-blocking'),
+        (N'billing.usp_reprioritize_queue_batch', 'locking-blocking'),
+        (N'billing.usp_claim_work_item', 'locking-blocking'),
+        (N'supply.usp_transfer_stock', 'locking-blocking'),
+        (N'scheduling.usp_find_double_bookings', 'cpu-pressure'),
+        (N'records.usp_scan_archive', 'io-pressure'),
+        (N'billing.usp_claims_aging_report', 'missing-index'),
+        (N'frontdesk.usp_find_patient_visits', 'inefficient-query'),
+        (N'reporting.usp_utilization_rollup', 'resource-governance'),
+        (N'billing.usp_import_remittances', 'log-rate-pressure'),
+        (N'scheduling.usp_assign_work_item', 'blocking-chain'),
+        (N'scheduling.usp_route_work_item', 'blocking-chain'),
+        (N'scheduling.usp_bulk_reschedule', 'blocking-chain'),
+        (N'supply.usp_reconcile_stock', 'deadlock-storm'),
+        (N'frontdesk.usp_refresh_dashboard', 'tempdb-contention'),
+        (N'reporting.usp_rank_visits', 'memory-grant-pressure'),
+        (N'reporting.usp_encounter_summary', 'parallel-scans'),
+        (N'frontdesk.usp_log_checkin', 'log-flush-waits'),
+        (N'records.usp_export_visit_history', 'slow-consumer'),
+        (N'reporting.usp_nightly_batch', 'capacity-max'),
+        (N'frontdesk.usp_refresh_visit_summaries', 'plan-regression')
+    ) AS p (procedure_name, scenario_id);
+GO
+
 -- One control row per scenario plus '*', the global cap and stop-all row. An operator can lower a limit here, and a
 -- re-run keeps it: it only lowers a row that's above the catalog value, and never touches a stop request. The one
 -- exception is plan-regression's earlier default, 1200 seconds, which a re-run raises to the catalog's 1800 for the
@@ -279,7 +314,7 @@ BEGIN
 END;
 GO
 
--- Demo sessions in this database: application name ContosoCare.Demo/<scenario>/<run>, never the runner's own
+-- Demo sessions in this database: application name ContosoCare.Demo/<service>/<run>, never the runner's own
 -- control sessions (ContosoCare.Demo/control/...), never the caller. Optionally one run only.
 CREATE OR ALTER FUNCTION demo.fn_demo_sessions (@run_id varchar(64))
 RETURNS TABLE
@@ -491,19 +526,25 @@ BEGIN
 END;
 GO
 
--- Throws unless the run exists, is Running, belongs to @scenario_id (when given), and has no stop request; returns
--- its deadline. Scenario procedures call it first.
+-- Throws unless the run exists, is Running, and has no stop request, and unless its scenario runs the calling module;
+-- returns the run's deadline, and its concurrency and start for the modules that pace by them. Every workload module
+-- calls it first with @procid = @@PROCID, so no module names a scenario (ADR 0031, decision 6): the scenario comes from
+-- demo.fn_workload_procedures(). @scenario_id is the earlier form, which a module that setup hasn't replaced yet still
+-- uses for the few seconds between this script and 120-scenario-procedures.sql.
 CREATE OR ALTER PROCEDURE demo.usp_run_assert_running
     @run_id varchar(64),
     @scenario_id varchar(64) = NULL,
-    @deadline_at datetime2(3) = NULL OUTPUT
+    @deadline_at datetime2(3) = NULL OUTPUT,
+    @procid int = NULL,
+    @concurrency int = NULL OUTPUT,
+    @started_at datetime2(3) = NULL OUTPUT
 AS
 BEGIN
     SET NOCOUNT ON;
 
-    DECLARE @status varchar(20), @run_scenario varchar(64), @message nvarchar(2048);
+    DECLARE @status varchar(20), @run_scenario varchar(64), @module nvarchar(300), @message nvarchar(2048);
 
-    SELECT @status = status, @run_scenario = scenario_id, @deadline_at = deadline_at
+    SELECT @status = status, @run_scenario = scenario_id, @deadline_at = deadline_at, @concurrency = concurrency, @started_at = started_at
     FROM demo.scenario_runs
     WHERE run_id = @run_id;
 
@@ -513,6 +554,15 @@ BEGIN
     BEGIN
         SET @message = CONCAT(N'Run ', @run_id, N' belongs to scenario ''', @run_scenario, N''', not ''', @scenario_id, N'''.');
         THROW 50111, @message, 1;
+    END;
+    IF @procid IS NOT NULL
+    BEGIN
+        SET @module = CONCAT(OBJECT_SCHEMA_NAME(@procid), N'.', OBJECT_NAME(@procid));
+        IF NOT EXISTS (SELECT 1 FROM demo.fn_workload_procedures() AS p WHERE p.procedure_name = @module AND p.scenario_id IN (@run_scenario, '*'))
+        BEGIN
+            SET @message = CONCAT(N'Run ', @run_id, N' doesn''t run ', @module, N'.');
+            THROW 50111, @message, 1;
+        END;
     END;
     IF demo.fn_run_should_stop(@run_id) = 1
         THROW 50112, N'The run isn''t Running, is past its deadline, or has a stop request.', 1;
@@ -823,7 +873,8 @@ BEGIN
        OR EXISTS (
             SELECT 1
             FROM demo.scenario_runs AS r
-            WHERE s.program_name = CONCAT('ContosoCare.Demo/', r.scenario_id, '/', r.run_id)
+            -- By the run alone, as fn_demo_sessions: whatever precedes it (the service, or an older runner's scenario).
+            WHERE s.program_name LIKE CONCAT('ContosoCare.Demo/%/', r.run_id)
               AND (r.status <> 'Running' OR r.deadline_at < SYSUTCDATETIME()));
 
     SET @remaining = @@ROWCOUNT;
@@ -1083,9 +1134,9 @@ BEGIN
     END CATCH;
 
     -- 6b. plan-regression's forced plan (Azure SQL Database, the showcase): a plan that automatic tuning forced for
-    -- demo.usp_visit_summary_lookup is unforced, so the regression can happen again. Nothing else is touched, and a
+    -- frontdesk.usp_visit_summary is unforced, so the regression can happen again. Nothing else is touched, and a
     -- check row appears only when there was something to unforce.
-    IF CAST(SERVERPROPERTY('EngineEdition') AS int) = 5 AND OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') IS NOT NULL
+    IF CAST(SERVERPROPERTY('EngineEdition') AS int) = 5 AND OBJECT_ID(N'frontdesk.usp_visit_summary', N'P') IS NOT NULL
     BEGIN
         SET @unforced = 0;
         BEGIN TRY
@@ -1093,7 +1144,7 @@ BEGIN
             SELECT p.query_id, p.plan_id
             FROM sys.query_store_plan AS p
             INNER JOIN sys.query_store_query AS q ON q.query_id = p.query_id
-            WHERE q.object_id = OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') AND p.is_forced_plan = 1;
+            WHERE q.object_id = OBJECT_ID(N'frontdesk.usp_visit_summary', N'P') AND p.is_forced_plan = 1;
             SET @remaining = @@ROWCOUNT;
             WHILE @remaining > 0
             BEGIN

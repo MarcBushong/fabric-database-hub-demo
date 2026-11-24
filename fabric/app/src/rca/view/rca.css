@@ -403,3 +403,24 @@
         box-shadow: none;
     }
 }
+
+/* The next steps' Query Store queries, each with its Copy button (QueryStoreQueries.tsx). */
+.rca-query {
+    margin: 12px 0 0;
+}
+
+.rca-query-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 4px 8px;
+}
+
+.rca-query .rca-code {
+    margin: 4px 0 0;
+}
+
+.rca-query-more {
+    margin: 8px 0 0;
+}

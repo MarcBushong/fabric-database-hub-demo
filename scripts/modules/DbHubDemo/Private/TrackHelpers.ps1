@@ -891,6 +891,9 @@ function Invoke-DemoDeploymentTrack {
     $recordState = -not [bool](& $option 'NoState' $false)
     # The Fabric content the Fabric step published in full, recorded with the step (2026-11-16); '' otherwise.
     $fabricPublished = ''
+    # Cleared with the step instead, while its history model waits for the kept form (F35, design A): tags merge, so a key
+    # left out keeps an earlier run's record of the same content, and a resume would skip the step (the re-check of 32e39e6a).
+    $fabricUnpublished = $false
     # What the Insights app's Manage has, recorded with the Fabric step when it deployed the app (2026-11-19); @{} otherwise.
     $appManageRecord = @{}
     $handoff = [string](& $option 'HandoffPath' '')
@@ -1850,9 +1853,18 @@ function Invoke-DemoDeploymentTrack {
                     Set-DemoHistoryFirstRunWarning -FirstRun $firstRun
                     & $addAll $fabric
                     & $partDone 'Fabric.Items' $fabric
+                    # F35 (i): the history's kept values, worked out through Livy with this checkout's code before the model's
+                    # step, which deploys the form of Snapshot Value that the step's own answer allows (Get-DemoKeptValueForm).
+                    # Never a Fail, and never in DONE's way: a step that can't run leaves the model on the release's form.
+                    $keptValue = Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'DEPLOY.FABRIC.KEPTVALUE' -TimeoutMinutes ([int](& $option 'KeptValueMinutes' 30)) -ProgressPath $progress -ProgressId 'Fabric.KeptValues' -RunAgain $script:KeptValueTrackRunAgain -DecidesModelForm
+                    & $addAll @($keptValue)
+                    # F35, design A: while the model goes out in the release's form although this checkout has the kept one,
+                    # this step's content isn't recorded as published, so the next deploy.ps1, a resume included, runs it
+                    # again; this run's end deploys the kept form once it has worked out every row (Test-DemoKeptFormPending).
+                    $keptFormPending = Test-DemoKeptFormPending -Result $keptValue
                     # The history semantic model and report (Phase 19), then the Insights app.
                     Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message ''
-                    $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $fabricConfigPath)
+                    $powerBI = @(Invoke-DemoPowerBIStage -Config $Config -ConfigPath $fabricConfigPath -SnapshotValueForm (Get-DemoKeptValueForm -Result $keptValue))
                     # Its refresh found no tables while the first history run hadn't completed: a Warning that says what fills
                     # the model (#68). With the run still queued or running, it's followed now, and the model's step runs again
                     # once it completes, before the Insights app, whose checks read the model.
@@ -1864,7 +1876,7 @@ function Invoke-DemoDeploymentTrack {
                     if (($null -ne $refreshWaiting -or $rcaWaiting) -and $null -ne $firstRun -and $firstRun.Pending) {
                         $waitingNote = if ($null -ne $refreshWaiting) { [string]$refreshWaiting.message } else { 'The history model reads the Incident RCA''s tables once NB_DatabaseHub_LiveActivity, still queued or running, creates them.' }
                         Set-DemoProgressStep -Path $progress -Id 'Fabric.Report' -State 'Running' -Message $waitingNote
-                        $again = @(Invoke-DemoHistoryFirstRunFollowUp -Config $Config -ConfigPath $fabricConfigPath -FirstRun $firstRun -RefreshWarning $refreshWaiting -FollowMinutes $historyFollow -ProgressPath $progress)
+                        $again = @(Invoke-DemoHistoryFirstRunFollowUp -Config $Config -ConfigPath $fabricConfigPath -FirstRun $firstRun -RefreshWarning $refreshWaiting -FollowMinutes $historyFollow -ProgressPath $progress -SnapshotValueForm (Get-DemoKeptValueForm -Result $keptValue))
                         # The follow-up's model step checked the model's data again, so the first step's "Not selected" data
                         # check, from before the model had tables, goes (the review of #68).
                         if (@($again | Where-Object { $null -ne $_ -and [string]$_.checkId -eq 'FABRIC.SEMANTICMODEL.DATA' }).Count -gt 0) {
@@ -1904,6 +1916,10 @@ function Invoke-DemoDeploymentTrack {
                         $appSummary = Get-DemoInsightsAppSummary -Result $appRecords
                         if ($null -ne $appSummary -and [string]$appSummary.State -eq 'Done') {
                             $fabricPublished = $fabricContent
+                        }
+                        if ($keptFormPending) {
+                            $fabricPublished = ''
+                            $fabricUnpublished = $true
                         }
                     }
                 }
@@ -2017,6 +2033,11 @@ function Invoke-DemoDeploymentTrack {
                 if ($fabricPublished) {
                     $record['FabricSha256'] = $fabricPublished
                     $fabricPublished = ''
+                }
+                elseif ($fabricUnpublished) {
+                    # An empty value clears the tag (Set-DemoDeploymentState).
+                    $record['FabricSha256'] = ''
+                    $fabricUnpublished = $false
                 }
                 foreach ($key in @($appManageRecord.Keys)) {
                     $record[$key] = $appManageRecord[$key]

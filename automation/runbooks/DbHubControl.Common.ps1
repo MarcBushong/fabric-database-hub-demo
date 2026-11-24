@@ -2151,9 +2151,10 @@ function Stop-DbHubDemo {
         if ($null -eq $yielded -and (($replicaThere -and $replicaGoes) -or $busy.By -eq 'session')) {
             # The session's evidence for the Incident RCA first (ADR 0031), while the VMs still run: its bundles go into the
             # vault before the metrics' final version, which lists them. Bounded (rca.stopMinutes); what isn't exported by
-            # then stays on the VMs, and the next session's start exports it.
+            # then stays on the VMs, and the next session's start exports it. The stop ends the capture first (O1), since
+            # the workload runs on until the VMs deallocate.
             if ($null -eq $OnlyVm) {
-                $rca = Invoke-DbHubRcaStop -Context $Context -Tags $Tags -SessionId $SessionId
+                $rca = Invoke-DbHubRcaStop -Context $Context -Tags $Tags -SessionId $SessionId -EndCapture
             }
             $rcaIndex = $null
             if ($null -ne $rca) {
@@ -5271,9 +5272,9 @@ function Send-DbHubT4ReplicaCreate {
     makes it: T4's location, delegated subnet, private DNS zone, and storage, General Purpose, no public network access,
     and storage auto-grow off, with the demo's tags and component t4-replica. Returns once Azure answered: Accepted,
     StatusCode, Code (SkuNotAvailable, QuotaExceeded, SourceNotReady, AlreadyExists, NotGranted, or Other), Error, and
-    Refused (the action Azure says the caller doesn't have, or ''). QuotaExceeded is Learn's refusal over the subscription's
-    vCore quota ("exceeding approved {0} Cores quota"; F37, 2026-11-22), which moves the session's size fallback on as
-    SkuNotAvailable does.
+    Refused (the action Azure says the caller doesn't have, or ''). QuotaExceeded is Learn's refusal over the
+    subscription's vCore quota ("exceeding approved {0} Cores quota"; F37, 2026-11-22), which moves the session's size
+    fallback on as SkuNotAvailable does.
     https://learn.microsoft.com/rest/api/postgresql/flexibleserver/servers/create
     https://learn.microsoft.com/azure/postgresql/read-replica/how-to-create-read-replica
     https://learn.microsoft.com/azure/postgresql/troubleshoot/how-to-resolve-capacity-errors#exceeded-quota
@@ -9654,8 +9655,11 @@ function Invoke-DbHubRcaStop {
     bundles and pending documents from its status's copy. Returns State, Index, and Lines (Invoke-DbHubRcaSessionExport),
     or $null without a session or with settings that predate the export. Never throws.
     The stop sends no Run Command to stop the profiles (Stop-DbHubDemo), so the workload runs on until the VMs deallocate:
-    its export asks each runner to end the capture first (-EndCapture; O1, 2026-11-23), so the observer's last minutes go
-    into the session's history with the rest, and a VM where they don't is named (RCA.PENDING).
+    with -EndCapture its export asks each runner to end the capture first (O1, 2026-11-23), so the observer's last minutes go
+    into the session's history with the rest, and a VM where they don't is named (RCA.PENDING). Only Stop-DbHubDemo passes
+    it: a session's end that a start-demo.ps1 session took over (Complete-DbHubTakenOverSession) leaves the VMs to that
+    session, whose capture must go on, and an ended capture keeps a target only when its profile was set after the end, so
+    the newer session's would stop there (the review of the next release's integration).
     #>
     param(
         [Parameter(Mandatory = $true)]
@@ -9667,7 +9671,9 @@ function Invoke-DbHubRcaStop {
         [AllowEmptyString()]
         [string] $SessionId = '',
 
-        [int] $PollSeconds = 10
+        [int] $PollSeconds = 10,
+
+        [switch] $EndCapture
     )
 
     $session = $SessionId
@@ -9699,7 +9705,7 @@ function Invoke-DbHubRcaStop {
                 $hostAfter = $begun.AddSeconds($script:DbHubRcaStopHostDelaySeconds)
             }
         }
-        return (Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StopMinutes -Earlier $earlier -SkipVm $skip -OutsideFromUtc $from -OutsideToUtc $to -PollSeconds $PollSeconds -HostNotBeforeUtc $hostAfter -EndCapture)
+        return (Invoke-DbHubRcaSessionExport -Context $Context -SessionId $session -Final -Minutes $bounds.StopMinutes -Earlier $earlier -SkipVm $skip -OutsideFromUtc $from -OutsideToUtc $to -PollSeconds $PollSeconds -HostNotBeforeUtc $hostAfter -EndCapture:$EndCapture)
     }
     catch {
         Write-DbHubLog -Context $Context -Message ('The session''s evidence wasn''t exported at its stop: {0}' -f $_.Exception.Message)

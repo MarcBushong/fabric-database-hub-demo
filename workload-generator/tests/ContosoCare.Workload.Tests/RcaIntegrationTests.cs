@@ -241,8 +241,17 @@ public sealed class RcaIntegrationTests : IDisposable
         var waiting = sessions.Where(r => r.GetValueOrDefault("blocked_by") is not null && (string?)r.GetValueOrDefault("run_token") == chainToken).ToList();
         Assert.NotEmpty(waiting);
         var blockers = waiting.Select(r => (string)r["blocked_by"]!).ToHashSet(StringComparer.Ordinal);
-        Assert.Contains(sessions, h => h.GetValueOrDefault("blocked_by") is null && blockers.Contains(h["session_id"]!.ToString()!) && (string?)h.GetValueOrDefault("run_token") == chainToken && h.GetValueOrDefault("module_name") is string && h.GetValueOrDefault("login_name") is string);
-        Assert.Contains(waiting, w => ((string?)w.GetValueOrDefault("wait_type") ?? string.Empty).StartsWith("LCK_M_", StringComparison.Ordinal) && w.GetValueOrDefault("statement_text") is string);
+        // The chain's head is the scenario's idle holder, an application that forgot to commit: its last batch was ad hoc
+        // text, so it has no request, and so no statement, and the DMVs give a sleeping session's module only when its last
+        // batch was one. RCA-SQL-01 keeps its input buffer instead: that batch, as SQL Server shows it.
+        var brief = string.Join("; ", sessions.Select(r => string.Create(System.Globalization.CultureInfo.InvariantCulture, $"{r.GetValueOrDefault("session_id")} by {r.GetValueOrDefault("blocked_by") ?? "none"}, {r.GetValueOrDefault("status")}, transactions {r.GetValueOrDefault("open_transactions")}, token {((string?)r.GetValueOrDefault("run_token") == chainToken ? "chain" : r.GetValueOrDefault("run_token") is null ? "none" : "other")}, module {r.GetValueOrDefault("module_name") is string}, statement {r.GetValueOrDefault("statement_text") is string}, buffer {r.GetValueOrDefault("input_buffer") is string}, login {r.GetValueOrDefault("login_name") is string}")));
+        var heads = sessions.Where(h => h.GetValueOrDefault("blocked_by") is null && blockers.Contains(h["session_id"]!.ToString()!) && (string?)h.GetValueOrDefault("run_token") == chainToken).ToList();
+        var headFound = heads.Count > 0;
+        Assert.True(headFound, "No head blocker with the chain's run token: " + brief);
+        var headShown = heads.Exists(h => h.GetValueOrDefault("login_name") is string && h.GetValueOrDefault("input_buffer") is string && Convert.ToInt64(h.GetValueOrDefault("open_transactions") ?? 0, System.Globalization.CultureInfo.InvariantCulture) > 0);
+        Assert.True(headShown, "The chain's head has no login, input buffer, or open transaction: " + brief);
+        var waiterShown = waiting.Exists(w => ((string?)w.GetValueOrDefault("wait_type") ?? string.Empty).StartsWith("LCK_M_", StringComparison.Ordinal) && w.GetValueOrDefault("statement_text") is string);
+        Assert.True(waiterShown, "No waiter in a lock wait with its statement: " + brief);
 
         var events = view.Table("rca_events");
         Assert.Contains(events, e => (string?)e["kind"] == "capture" && (string?)e["event_name"] == "escalated");
@@ -261,6 +270,54 @@ public sealed class RcaIntegrationTests : IDisposable
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT COUNT(*) FROM sys.server_event_sessions WHERE name = N'ContosoCare_RCA';";
         return Convert.ToInt32(await command.ExecuteScalarAsync(token), System.Globalization.CultureInfo.InvariantCulture) > 0;
+    }
+
+    /// <summary>
+    /// RCA-XE-00 reads sys.dm_xe_object_columns alone (2026-11-23): its earlier join to sys.dm_xe_objects took about 8 s
+    /// of CPU at each observer start on SQL Server 2022 CU25. Against a disposable SQL Server (CONTOSOCARE_TEST_SQL_SERVER,
+    /// as SqlIntegrationTests), both forms return the same fields for the five events. CI doesn't set it.
+    /// </summary>
+    [Fact]
+    public async Task OnSqlServerTheEventsFieldsReadAloneAreTheJoinedFormsFields()
+    {
+        await SqlIntegrationTests.PrepareAsync();
+        var token = TestContext.Current.CancellationToken;
+        var alone = await ReadRowsAsync(SqlIntegrationTests.Endpoint, CaptureCatalog.Get("RCA-XE-00"), token);
+        var joined = await ReadRowsAsync(SqlIntegrationTests.Endpoint, JoinedEventFields, token);
+        Assert.Contains(alone, row => row.StartsWith("xml_deadlock_report|xml_report|", StringComparison.Ordinal));
+        Assert.Equal(joined.Order(StringComparer.Ordinal), alone.Order(StringComparer.Ordinal));
+    }
+
+    // RCA-XE-00 as it was until 2026-11-23, joined to sys.dm_xe_objects.
+    private const string JoinedEventFields = """
+        SET NOCOUNT ON;
+        SELECT
+            event_name  = o.name,
+            column_name = c.name,
+            c.type_name,
+            c.column_type
+        FROM sys.dm_xe_objects AS o
+        JOIN sys.dm_xe_object_columns AS c ON c.object_name = o.name AND c.object_package_guid = o.package_guid
+        WHERE o.object_type = N'event'
+          AND o.name IN (N'error_reported', N'attention', N'lock_escalation', N'xml_deadlock_report', N'database_xml_deadlock_report')
+          AND c.column_type = N'data'
+        ORDER BY o.name, c.name;
+        """;
+
+    private static async Task<List<string>> ReadRowsAsync(TargetEndpoint endpoint, string text, CancellationToken token)
+    {
+        await using var connection = await new SqlConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(SessionNames.ForControl("test"), token);
+        await using var command = connection.CreateCommand();
+        command.CommandText = text;
+        command.CommandTimeout = 120;
+        var rows = new List<string>();
+        await using var reader = await command.ExecuteReaderAsync(token);
+        while (await reader.ReadAsync(token))
+        {
+            rows.Add(string.Join('|', Enumerable.Range(0, reader.FieldCount).Select(i => Convert.ToString(reader.GetValue(i), System.Globalization.CultureInfo.InvariantCulture))));
+        }
+
+        return rows;
     }
 
     private sealed class Gate(DemoTarget target = DemoTarget.T4) : IObservationGate

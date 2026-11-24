@@ -9,11 +9,14 @@ import { LAG_METRIC } from "./replica";
 import { monitorTelemetry } from "./sources";
 import { emptyListNote } from "./view/facts";
 import { INVESTIGATION_PLAYBOOK } from "./playbook";
-import { QUERY_STORE_RETENTION_DAYS, queryStoreQuery, type QueryStoreQuery } from "./query-store";
+import { QUERY_STORE_QUERIES_MAX, QUERY_STORE_RETENTION_DAYS, queryStoreQuery, type QueryStoreQuery } from "./query-store";
 import { fixtureEvidence, namesAScenario } from "./testdata/contract";
 import { live, liveSources } from "./testdata/live-rb-2233e0ae";
-import { createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
+import { bounded, createInvestigationTools, EXPLAINED_FAMILIES, INVESTIGATION_TOOL_NAMES, INVESTIGATION_TOOL_SPECS, type Telemetry } from "./tools";
 import { during, emptyEvidence, fromTo, openCountWords, type EventRow, type Evidence, type InvestigationResult, type RcaTarget } from "./types";
+
+/** An episode's key from its target, kind, and start, built at run time: written out whole in a test, the secret scan (gitleaks) reads it as a generic API key. */
+const episodeKeyOf = (target: string, kind: string, start: string): string => `${target}-${kind}-${start}`;
 
 const at = (hms: string) => new Date(`2026-11-20T${hms}Z`);
 const minute = (from: string, n: number) => new Date(at(from).getTime() + n * 60_000);
@@ -136,7 +139,7 @@ describe("incidents, blind", () => {
         const found = await ask("find_incidents", { from: "11:50", to: "12:20" });
         const keys = found.episodes.map((e) => e.key);
         expect(keys).toEqual(expect.arrayContaining(["T1-blocking-20261120T165230Z", "T4-blocking-20261120T170230Z", "T4-replica-replica_lag-20261120T171200Z", "T5-throttling-20261120T165600Z"]));
-        const r = await ask("explain_incident", { episodeKey: "T1-blocking-20261120T165230Z" });
+        const r = await ask("explain_incident", { episodeKey: episodeKeyOf("T1", "blocking", "20261120T165230Z") });
         expect(r.rootCause?.ruleIds).toEqual(["BLK-IDLE-HEAD"]);
         expect((r.details!.episodes as Array<{ text: string }>)[0].text).toMatch(/^T1: blocked processes above zero from 16:52:30 to 17:01:40 UTC, peak 7 processes/);
     });
@@ -151,7 +154,7 @@ describe("incidents, blind", () => {
 
     it("says what it doesn't know: an unknown key, and history saved before the capture existed", async () => {
         const deps = tools();
-        expect(await deps.investigate("explain_incident", { episodeKey: "T1-blocking-20261120T120000Z" })).toMatch(/^No episode/);
+        expect(await deps.investigate("explain_incident", { episodeKey: episodeKeyOf("T1", "blocking", "20261120T120000Z") })).toMatch(/^No episode/);
         const old = await ask("triage_window", { at: "11:56" }, tools({ evidence: emptyEvidence() }));
         expect(old.notCaptured).toContain("T1: no RCA capture recorded for 16:51:00-17:01:00 UTC; only the telemetry (Telemetry Snapshots) is known");
         // T5's throttling is still found: its evidence is Azure Monitor's, which the history has either way.
@@ -166,7 +169,7 @@ describe("incidents, blind", () => {
             ["explain_locking", { at: "12:05" }],
             ["explain_errors", { from: "12:00", to: "12:10" }],
             ["explain_replica_lag", { at: "12:14" }],
-            ["explain_incident", { episodeKey: "T1-blocking-20261120T165230Z" }],
+            ["explain_incident", { episodeKey: episodeKeyOf("T1", "blocking", "20261120T165230Z") }],
         ];
         for (const [name, args] of calls) {
             const out = await deps.run(name, args);
@@ -288,7 +291,7 @@ describe("every family the RCA explains", () => {
             resource: [{ target: "T1", at: at("16:00:00"), source: "RCA-SQL-09", metric: "processes_blocked", value: 2 }],
             coverage: [{ target: "T1", from: at("15:30:00"), to: at("16:30:00"), captured: true, sources: ["RCA-SQL-01", "RCA-SQL-09"], gaps: [] }],
         };
-        const r = await ask("explain_incident", { episodeKey: "T1-blocking-20261120T160000Z" }, tools({ evidence, telemetry: {} }));
+        const r = await ask("explain_incident", { episodeKey: episodeKeyOf("T1", "blocking", "20261120T160000Z") }, tools({ evidence, telemetry: {} }));
         expect(r.rootCause).toBeNull();
         // The sentinel saw it, so it ended before the next chain sample (the review of 4e2c65ed: not "between the sentinel's samples").
         expect(r.notCaptured).toContain(
@@ -316,7 +319,7 @@ describe("every family the RCA explains", () => {
         };
         for (let s = 0; s <= 110; s += 10) for (const [metric, value] of [["connections_total", 30], ["max_connections", 50], ["reserved_connections", 15]] as const) evidence.resource.push({ target: "T4", at: new Date(at("15:00:00").getTime() + s * 1000), source: "RCA-PG-10", metric, value });
         const deps = createInvestigationTools({ load: async (from, to, targets) => ({ ...window(evidence, from, to, targets), cut: [{ table: "RCA Events", until: at("15:01:00") }] }), telemetry: async () => ({}), timeZone: "America/New_York", latestDay: at("00:00:00") });
-        const r = await ask("explain_incident", { episodeKey: "T4-connections-20261120T150000Z" }, deps);
+        const r = await ask("explain_incident", { episodeKey: episodeKeyOf("T4", "connections", "20261120T150000Z") }, deps);
         expect((r.details?.episodes as Array<{ text: string }>)[0].text).toContain("from 15:00:00 UTC (still on at 15:01:00 UTC, where the read stopped)");
         expect(r.rootCause?.statement).toContain("It was still on at 15:01:00 UTC, where the read stopped.");
     });
@@ -328,7 +331,7 @@ describe("every family the RCA explains", () => {
             { at: minute("17:00:00", i), metric: COSMOS_METRICS.throttled, value: 0 },
         ]).flat();
         const cosmos: CosmosCapture = { account: "cosmos01", capturedAt: at("17:20:00"), windowStart: at("17:00:00"), windowEnd: at("17:10:00"), intervalMinutes: 1, points };
-        const r = await ask("explain_incident", { episodeKey: "T5-ru-20261120T170000Z" }, tools({ evidence: emptyEvidence(), telemetry: { cosmos } }));
+        const r = await ask("explain_incident", { episodeKey: episodeKeyOf("T5", "ru", "20261120T170000Z") }, tools({ evidence: emptyEvidence(), telemetry: { cosmos } }));
         expect(r.rootCause).toMatchObject({ ruleIds: ["RU-AT-LIMIT"], confidence: "medium" });
         // 1,000 a minute in 3 intervals (the review of 4e2c65ed: it once counted 5,000, with the minutes past them).
         expect(r.rootCause?.statement).toMatch(/reached 100 % in at least one second of each of the 3 intervals from 17:00 to 17:03 UTC: .* Azure Monitor counted 3000 requests in those intervals, none of them throttled\./);
@@ -345,8 +348,8 @@ describe("every family the RCA explains", () => {
         ]).flat();
         const cosmos: CosmosCapture = { account: "cosmos01", capturedAt: at("16:05:00"), windowStart: at("15:30:00"), windowEnd: at("16:00:00"), intervalMinutes: 1, points };
         const deps = tools({ evidence: emptyEvidence(), telemetry: { cosmos } });
-        expect(await deps.investigate("explain_incident", { episodeKey: "T5-ru-20261120T153500Z" })).toBe('No episode "T5-ru-20261120T153500Z": call find_incidents for the keys.');
-        const storm = await ask("explain_incident", { episodeKey: "T5-ru-20261120T154500Z" }, deps);
+        expect(await deps.investigate("explain_incident", { episodeKey: episodeKeyOf("T5", "ru", "20261120T153500Z") })).toBe('No episode "T5-ru-20261120T153500Z": call find_incidents for the keys.');
+        const storm = await ask("explain_incident", { episodeKey: episodeKeyOf("T5", "ru", "20261120T154500Z") }, deps);
         expect(storm.rootCause?.ruleIds).toEqual(["RU-THROTTLED"]);
         expect(storm.details?.readAs).toBeUndefined();
     });
@@ -365,14 +368,14 @@ describe("every family the RCA explains", () => {
         });
         const listed = (await deps.episodes(at("15:30:00"), at("17:00:00"), ["T2"])).filter((e) => e.family === "cpu").map((e) => e.key);
         expect(listed).toEqual(["T2-cpu-20261120T154900Z", "T2-cpu-20261120T161900Z"]);
-        const r = await ask("explain_incident", { episodeKey: "T2-cpu-20261120T161900Z" }, deps);
-        expect(r.details?.episodes).toMatchObject([{ key: "T2-cpu-20261120T161900Z" }]);
+        const r = await ask("explain_incident", { episodeKey: episodeKeyOf("T2", "cpu", "20261120T161900Z") }, deps);
+        expect(r.details?.episodes).toMatchObject([{ key: episodeKeyOf("T2", "cpu", "20261120T161900Z") }]);
         expect(r.details?.readAs).toBeUndefined();
         // A key a sample before an incident's start reads as that incident, and says so; two samples before, it has none.
-        const early = await ask("explain_incident", { episodeKey: "T2-cpu-20261120T161800Z" }, deps);
-        expect(early.details?.readAs).toEqual({ key: "T2-cpu-20261120T161800Z", as: ["T2-cpu-20261120T161900Z"] });
+        const early = await ask("explain_incident", { episodeKey: episodeKeyOf("T2", "cpu", "20261120T161800Z") }, deps);
+        expect(early.details?.readAs).toEqual({ key: episodeKeyOf("T2", "cpu", "20261120T161800Z"), as: [episodeKeyOf("T2", "cpu", "20261120T161900Z")] });
         expect(early.notCaptured[0]).toBe("T2-cpu-20261120T161800Z: in its own minutes, the history has no incident with this key; it reads as T2-cpu-20261120T161900Z, which starts a sample after its time, so this report is that one's.");
-        expect(await deps.investigate("explain_incident", { episodeKey: "T2-cpu-20261120T161700Z" })).toMatch(/^No episode /);
+        expect(await deps.investigate("explain_incident", { episodeKey: episodeKeyOf("T2", "cpu", "20261120T161700Z") })).toMatch(/^No episode /);
     });
 
     // Final tests' check of ddebd4c3 (F2): T5's coverage rows are marked not captured ("no RCA evidence for"), and a storm
@@ -386,7 +389,7 @@ describe("every family the RCA explains", () => {
         const cosmos: CosmosCapture = { account: "cosmos01", capturedAt: at("16:15:00"), windowStart: at("15:30:00"), windowEnd: at("16:10:00"), intervalMinutes: 1, points };
         const row = (from: string, to: string) => ({ target: "T5" as const, from: at(from), to: at(to), captured: false, sources: [], gaps: [] });
         const evidence: Evidence = { ...emptyEvidence(), coverage: [row("15:27:09", "15:55:03"), row("15:55:03", "16:24:58")] };
-        const r = await ask("explain_incident", { episodeKey: "T5-ru-20261120T154600Z" }, tools({ evidence, telemetry: { cosmos } }));
+        const r = await ask("explain_incident", { episodeKey: episodeKeyOf("T5", "ru", "20261120T154600Z") }, tools({ evidence, telemetry: { cosmos } }));
         expect(r.window).toMatchObject({ fromUtc: "2026-11-20T15:46:00Z", toUtc: "2026-11-20T15:55:00Z" });
         expect(r.notCaptured.filter((line) => line.startsWith("T5: no RCA"))).toEqual(["T5: no RCA evidence for 15:27:09-15:55:03 UTC"]);
     });
@@ -637,12 +640,12 @@ describe("a coarser point a finer save holds part of", () => {
         const listed = await ask("find_incidents", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T16:00:00Z", targets: ["T5"] }, tools);
         const throttling = (listed.episodes ?? []).filter((e) => e.family === "throttling");
         expect(throttling.map((e) => [e.key, e.peak])).toEqual([["T5-throttling-20261120T153000Z", "800 requests"]]);
-        const ru = await ask("explain_incident", { episodeKey: "T5-ru-20261120T153000Z" }, tools);
+        const ru = await ask("explain_incident", { episodeKey: episodeKeyOf("T5", "ru", "20261120T153000Z") }, tools);
         expect(ru.rootCause?.statement).toContain("Azure Monitor keeps the highest in each 15-minute interval) reached 100 % in at least one second of the interval from 15:30 to 15:45 UTC");
         expect(ru.rootCause?.statement).toContain("Azure Monitor counted 9000 requests in that interval, 800 of them throttled (429, 8.9 %)");
         expect(ru.rootCause?.statement).toContain("A finer save holds 15:33 to 15:38 UTC of that interval: 500 requests, none of them throttled.");
         expect(ru.rootCause?.statement).toBe(throughput(ru));
-        const incident = await ask("explain_incident", { episodeKey: "T5-throttling-20261120T153000Z" }, tools);
+        const incident = await ask("explain_incident", { episodeKey: episodeKeyOf("T5", "throttling", "20261120T153000Z") }, tools);
         expect(incident.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(800, 15:30:00 to 15:45:00 UTC, mostly the container's clients\)/);
         expect(incident.findings[0].evidence.map((e) => e.text)).toEqual(["429: 800 throttled requests (429) in the 15 minutes from 15:30 UTC (Azure Monitor; a finer save holds none of them, in 15:33 to 15:38)"]);
         const errors = await ask("explain_errors", { from: "2026-11-20T15:00:00Z", to: "2026-11-20T16:00:00Z", targets: ["T5"] }, tools);
@@ -885,19 +888,32 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         expect(t1).toMatchObject({ target: "T1", language: "tsql", database: "ContosoCare", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" });
         expect(t1.text).toContain("-- Read-only: Query Store's top plans on T1 from 15:40:00 to 15:50:00 UTC, by CPU, then duration, with their plan IDs.");
         expect(t1.text).toContain("DECLARE @from datetimeoffset = '2026-11-20T15:40:00+00:00', @to datetimeoffset = '2026-11-20T15:50:00+00:00';");
-        expect(t1.text).toContain("ORDER BY cpu_ms DESC, duration_ms DESC;");
-        expect(t1.text).toMatch(/\bp\.plan_id\b/);
+        // The episode ends at 15:50:00, its first sample back under the level, so the interval that starts then isn't read
+        // (the review of 0b922f37), and ties go by the plan's ID.
+        expect(t1.text).toContain("WHERE i.end_time > @from AND i.start_time < @to\n");
+        expect(t1.text).toContain("ORDER BY cpu_ms DESC, duration_ms DESC, p.plan_id;");
         expect(t1.text).not.toMatch(/wait_category_desc/);
         const [t2] = await queries("T2", "latch");
-        expect(t2).toMatchObject({ target: "T2", database: "ContosoCare" });
-        expect(t2.text).toContain("AND ws.wait_category_desc = N'Buffer Latch'");
+        expect(t2).toMatchObject({ target: "T2", database: "ContosoCare", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" });
+        // The top plans by their wait time in the category, as its comment now says, not "the same plans'".
+        expect(t2.text).toContain("-- The top plans by their wait time in the Buffer Latch category, in the same intervals.");
+        expect(t2.text).toContain("WHERE i.end_time > @from AND i.start_time < @to AND ws.wait_category_desc = N'Buffer Latch'");
+        expect(t2.text).toContain("ORDER BY wait_ms DESC, p.plan_id;");
+        expect(t2.text).not.toMatch(/same plans/);
         const [t4] = await queries("T4", "cpu");
         expect(t4).toMatchObject({ target: "T4", language: "postgresql", database: "azure_sys", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" });
-        expect(t4.text).toContain("WHERE q.end_time > '2026-11-20 15:40:00' AND q.start_time <= '2026-11-20 15:50:00'");
-        expect(t4.text).toContain("WHERE w.end_time > '2026-11-20 15:40:00' AND w.start_time <= '2026-11-20 15:50:00'");
+        expect(t4.text).toContain("-- Read-only: Query Store's top queries on T4 from 15:40:00 to 15:50:00 UTC, by total time, then their sampled waits, at every size but Burstable.");
+        expect(t4.text).toContain("WHERE q.end_time > '2026-11-20 15:40:00' AND q.start_time < '2026-11-20 15:50:00'");
+        expect(t4.text).toContain("WHERE w.end_time > '2026-11-20 15:40:00' AND w.start_time < '2026-11-20 15:50:00'");
         expect(t4.text).toContain("FROM query_store.qs_view AS q");
         expect(t4.text).toContain("FROM query_store.pgms_wait_sampling_view AS w");
+        expect(t4.text).toContain("ORDER BY total_time_ms DESC, q.query_id\n");
+        expect(t4.text).toContain("ORDER BY samples DESC, w.query_id, w.event_type, w.event\n");
         expect(t4.text).not.toMatch(/query_parameters/);
+        // Each starts with Query Store's state, or T4's capture modes, so an empty result doesn't read as "no query ran".
+        const firstStatement = (q: QueryStoreQuery) => q.text.split("\n").find((line) => !line.startsWith("--"));
+        for (const q of [t1, t2]) expect(firstStatement(q), q.target).toBe("SELECT actual_state_desc, readonly_reason FROM sys.database_query_store_options;");
+        expect(firstStatement(t4)).toBe("SELECT current_setting('pg_qs.query_capture_mode', true) AS query_capture_mode, current_setting('pgms_wait_sampling.query_capture_mode', true) AS wait_sampling_capture_mode;");
         // None where Query Store doesn't record the queries, and none past its retention, as for the next step.
         expect(await queries("T4-replica", "cpu")).toEqual([]);
         expect(await queries("T4", "cpu", toolsAt(new Date("2026-11-28T16:00:00Z")))).toEqual([]);
@@ -918,6 +934,121 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         // An interval that starts at the instant holds it: start_time <= the instant.
         expect(instant?.text).toContain("WHERE q.end_time > '2026-11-20 15:45:00' AND q.start_time <= '2026-11-20 15:45:00'");
         expect(instant?.text).toContain("on T4 at 15:45:00 UTC");
+    });
+
+    // The review of 0b922f37: an episode's end is its first sample back under the level, so "start_time <= its end" read the
+    // interval that starts there too, one more whenever the end falls on an interval's start: about 1 in 15 incidents on
+    // minutes, and every one on 15-minute points.
+    it("reads the intervals up to an episode's end, never the one that starts at it, and the one that starts at its last sample", () => {
+        /** Which of Query Store's 15-minute intervals from 15:15 to 16:15 a query reads, by its own window and operator. */
+        const intervalsRead = (q: QueryStoreQuery | null): string[] => {
+            const text = q?.text ?? "";
+            const sql = /DECLARE @from datetimeoffset = '([^']+)', @to datetimeoffset = '([^']+)';[\s\S]*?WHERE i\.end_time > @from AND i\.start_time (<=?) @to/.exec(text);
+            const pg = /WHERE q\.end_time > '([^']+)' AND q\.start_time (<=?) '([^']+)'/.exec(text);
+            const window = sql ? { from: new Date(sql[1]), to: new Date(sql[2]), op: sql[3] } : pg ? { from: new Date(`${pg[1].replace(" ", "T")}Z`), to: new Date(`${pg[3].replace(" ", "T")}Z`), op: pg[2] } : null;
+            if (!window) return [];
+            return ["15:15", "15:30", "15:45", "16:00"].filter((hhmm) => {
+                const start = new Date(`2026-11-20T${hhmm}:00Z`);
+                const end = new Date(start.getTime() + 15 * 60_000);
+                return end > window.from && (window.op === "<" ? start < window.to : start <= window.to);
+            });
+        };
+        const t = (hhmm: string) => new Date(`2026-11-20T${hhmm}:00Z`);
+        const later = t("17:00");
+        for (const target of ["T1", "T4"] as const) {
+            // Ended at 15:45, its first sample back under the level: 15:30's interval, never 15:45's.
+            const ended = queryStoreQuery({ target, family: "cpu", start: t("15:30"), end: t("15:45"), last: t("15:44") }, later);
+            expect(intervalsRead(ended), target).toEqual(["15:30"]);
+            // No end yet, and its last sample at the level at 15:45: 15:45's interval holds that sample.
+            const lastAt = queryStoreQuery({ target, family: "cpu", start: t("15:30"), end: null, last: t("15:45") }, later);
+            expect(intervalsRead(lastAt), target).toEqual(["15:30", "15:45"]);
+            // Still on where the minutes read end, at 15:45: so does 15:45's.
+            const readTo = queryStoreQuery({ target, family: "cpu", start: t("15:30"), end: null, last: t("15:44"), readEnd: t("15:45") }, later);
+            expect(intervalsRead(readTo), target).toEqual(["15:30", "15:45"]);
+        }
+    });
+
+    // The review of 0b922f37: on T1 to T3, the query up to exactly their 14 days, as for their next step, and none after.
+    it("gives T1 to T3's query up to exactly 14 days after the minutes, and none a second later", async () => {
+        // Each incident ends at 15:50:00 UTC on 2026-11-20.
+        for (const [target, family] of [["T1", "cpu"], ["T2", "latch"], ["T3", "cpu"]] as const) {
+            const kept = await incidentOn(target, family, toolsAt(new Date("2026-12-04T15:50:00Z")));
+            expect(kept.details?.queryStoreQueries, target).toEqual([expect.objectContaining({ target, database: "ContosoCare", fromUtc: "2026-11-20T15:40:00Z", toUtc: "2026-11-20T15:50:00Z" })]);
+            const past = await incidentOn(target, family, toolsAt(new Date("2026-12-04T15:50:01Z")));
+            expect(past.details?.queryStoreQueries, target).toBeUndefined();
+            expect(past.nextSteps.join(" "), target).not.toMatch(/Query Store/);
+        }
+    });
+
+    // The review of 0b922f37: an episode a rule explains (blocking, here from the telemetry's blocked processes) has its
+    // explainer's next steps, and no Query Store query; the CPU in the same minutes still has its own.
+    it("gives no query for an episode a rule explains, such as blocking, and one for the CPU beside it", async () => {
+        const blocked = Array.from({ length: 60 }, (_, m) => ({ ...bin("T1", m), blocked: m >= 40 && m < 50 ? 4 : 0 }));
+        const tools = createInvestigationTools({
+            load: async () => emptyEvidence(),
+            telemetry: async (from, to) => ({ bins: blocked.filter((b) => b.at >= from && b.at <= to) }),
+            timeZone: "America/New_York",
+            latestDay: at("00:00:00"),
+            now: () => at("18:00:00"),
+        });
+        const blocking = await incidentOn("T1", "blocking", tools);
+        expect(EXPLAINED_FAMILIES).toContain("blocking");
+        expect(blocking.details?.queryStoreQueries).toBeUndefined();
+        expect(blocking.details?.queryStoreQueriesLeftOut).toBeUndefined();
+        expect(blocking.nextSteps.join(" ")).not.toMatch(/Query Store/);
+        const both = await ask("explain_incident", { target: "T1", from: "2026-11-20T15:30:00Z", to: "2026-11-20T16:00:00Z" }, tools);
+        expect((both.details?.episodes as Array<{ family: string }>).map((e) => e.family).sort()).toEqual(["blocking", "cpu"]);
+        const queries = both.details?.queryStoreQueries as QueryStoreQuery[];
+        expect(queries).toHaveLength(1);
+        expect(queries[0].text).toContain("-- Read-only: Query Store's top plans on T1 from 15:40:00 to 15:50:00 UTC, by CPU, then duration, with their plan IDs.");
+    });
+
+    // The review of 0b922f37: a window can hold many episodes no rule explains, at 2 to 3 KB a query, and a result cut to fit
+    // kept none of them. At most three, in the order the causes read, the root cause's first, with the others counted.
+    it("gives at most three queries, the root cause's first, counts the others, and keeps them all when the result is cut", async () => {
+        const waits = (on: boolean) => Object.fromEntries(["Buffer Latch", "Memory", "Parallelism", "Network IO"].map((c) => [c, on ? 30 : 0]));
+        const t2 = Array.from({ length: 60 }, (_, m) => ({ ...bin("T2", m, waits(m >= 40 && m < 50)), cpu: busy(m) }));
+        const tools = createInvestigationTools({
+            load: async () => emptyEvidence(),
+            telemetry: async (from, to) => ({ bins: t2.filter((b) => b.at >= from && b.at <= to) }),
+            timeZone: "America/New_York",
+            latestDay: at("00:00:00"),
+            now: () => at("18:00:00"),
+        });
+        const r = await ask("explain_incident", { target: "T2", from: "2026-11-20T15:30:00Z", to: "2026-11-20T16:00:00Z" }, tools);
+        expect((r.details?.episodes as Array<{ family: string }>).map((e) => e.family).sort()).toEqual(["cpu", "latch", "memory", "network", "parallelism"]);
+        const queries = r.details?.queryStoreQueries as QueryStoreQuery[];
+        expect(queries).toHaveLength(QUERY_STORE_QUERIES_MAX);
+        expect(r.details?.queryStoreQueriesLeftOut).toBe(2);
+        // Each query's wait category, or none for the CPU, against each cause's signal: the root cause's, then the others'
+        // as "Also in these minutes" lists them.
+        const category: Record<string, string | null> = { CPU: null, "buffer latch waits": "Buffer Latch", "memory waits": "Memory", "parallelism waits": "Parallelism", "network IO waits": "Network IO" };
+        const signalOf = (text: string) => Object.keys(category).find((s) => text.includes(s));
+        const rootSignal = signalOf(r.rootCause?.evidence[0]?.text ?? "");
+        expect(rootSignal).toBeDefined();
+        const listed = [rootSignal, ...(r.details?.alsoInTheseMinutes as string[]).map(signalOf)].map((s) => category[s!]);
+        expect(queries.map((q) => /ws\.wait_category_desc = N'([^']+)'/.exec(q.text)?.[1] ?? null)).toEqual(listed.slice(0, QUERY_STORE_QUERIES_MAX));
+        // Cut to fit, the result keeps the three and the count.
+        const big: InvestigationResult = { ...r, details: { ...r.details, parts: [{ tool: "explain_locking", details: { trees: "x".repeat(70_000) } }] } };
+        const cut = JSON.parse(bounded(big)) as InvestigationResult;
+        expect(cut.details?.cut).toEqual(expect.any(String));
+        expect(cut.details?.queryStoreQueries).toEqual(queries);
+        expect(cut.details?.queryStoreQueriesLeftOut).toBe(2);
+        // And the chat is told what to do with them, and never to write one of its own.
+        expect(INVESTIGATION_PLAYBOOK).toContain("There are at most three, the root cause's first; details.queryStoreQueriesLeftOut counts the others");
+        expect(INVESTIGATION_PLAYBOOK).toContain("Without a query there, give the next step alone: never write a query yourself.");
+    });
+
+    // The chat's result cut to fit one answer (bounded, the review of 90e9d914) keeps the queries the playbook says to give.
+    it("keeps the next steps' queries when the chat's result is cut to fit", async () => {
+        const r = await incidentOn("T1", "cpu");
+        const queries = r.details?.queryStoreQueries as QueryStoreQuery[];
+        expect(queries).toHaveLength(1);
+        const big: InvestigationResult = { ...r, details: { ...r.details, parts: [{ tool: "explain_locking", details: { trees: "x".repeat(70_000) } }] } };
+        const cut = JSON.parse(bounded(big)) as InvestigationResult;
+        expect(cut.details?.cut).toEqual(expect.any(String));
+        expect(cut.details?.parts).toBeUndefined();
+        expect(cut.details?.queryStoreQueries).toEqual(queries);
     });
 
     it("never says that a target has no Query Store, in any tool's result or in the playbook, and drops the old words", async () => {

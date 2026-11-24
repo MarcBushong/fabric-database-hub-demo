@@ -55,9 +55,9 @@ public sealed class CosmosClientTests
         var account = new FakeCosmosAccount();
         var tokens = new FakeTokens();
         using var client = new CosmosRestClient(Endpoint, tokens, account);
-        var document = CosmosDocuments.Event("hb-ev-3", "p-0042", "vitals", 7, DateTimeOffset.UtcNow, "ContosoCare.Demo/healthy-baseline/20261118160000-t5-a1b2c3", 512);
+        var document = CosmosDocuments.Event("hb-ev-3", "p-0042", "vitals", 7, DateTimeOffset.UtcNow, "ContosoCare.Demo/careportal-api/9f2c4e1a7b3d5f60", 512);
 
-        var response = await client.UpsertAsync("ContosoCare.Demo/healthy-baseline/20261118160000-t5-a1b2c3", "p-0042", document, TestContext.Current.CancellationToken);
+        var response = await client.UpsertAsync("ContosoCare.Demo/careportal-api/9f2c4e1a7b3d5f60", "p-0042", document, TestContext.Current.CancellationToken);
 
         Assert.Equal(200, response.StatusCode);
         Assert.Equal(8.38, response.RequestCharge);
@@ -72,7 +72,7 @@ public sealed class CosmosClientTests
         Assert.Equal("[\"p-0042\"]", request.Header("x-ms-documentdb-partitionkey"));
         Assert.Equal("True", request.Header("x-ms-documentdb-is-upsert"));
         Assert.Equal("application/json", request.Header("Content-Type"));
-        Assert.StartsWith("ContosoCare.Demo/healthy-baseline/20261118160000-t5-a1b2c3 ContosoCare.Workload/", request.Header("User-Agent"), StringComparison.Ordinal);
+        Assert.StartsWith("ContosoCare.Demo/careportal-api/9f2c4e1a7b3d5f60 ContosoCare.Workload/", request.Header("User-Agent"), StringComparison.Ordinal);
         Assert.Null(request.Header("x-ms-documentdb-isquery"));
 
         // The bulk is one top-level, unindexed string; the indexed properties stay at the top level.
@@ -81,7 +81,7 @@ public sealed class CosmosClientTests
         Assert.Equal("p-0042", json.RootElement.GetProperty("patientId").GetString());
         Assert.Equal("vitals", json.RootElement.GetProperty("type").GetString());
         Assert.True(json.RootElement.TryGetProperty("at", out _));
-        Assert.StartsWith("ContosoCare.Demo/healthy-baseline/", json.RootElement.GetProperty("source").GetString(), StringComparison.Ordinal);
+        Assert.StartsWith("ContosoCare.Demo/careportal-api/", json.RootElement.GetProperty("source").GetString(), StringComparison.Ordinal);
         Assert.Equal(512, json.RootElement.GetProperty("payload").GetString()!.Length);
     }
 
@@ -341,7 +341,7 @@ public sealed class CosmosClientTests
     [Fact]
     public void StormDocumentsAreAboutTheirSizeAndTagged()
     {
-        var document = CosmosDocuments.StormReading("storm-01-007", "p-storm-01", 3, 42, DateTimeOffset.UtcNow, "ContosoCare.Demo/ru-storm/r", RuStorm.PayloadLength(4));
+        var document = CosmosDocuments.StormReading("storm-01-007", "p-storm-01", 3, 42, DateTimeOffset.UtcNow, "ContosoCare.Demo/patient-events-ingest/r", RuStorm.PayloadLength(4));
         using var json = JsonDocument.Parse(document);
 
         Assert.InRange(document.Length, 3800, 4200);

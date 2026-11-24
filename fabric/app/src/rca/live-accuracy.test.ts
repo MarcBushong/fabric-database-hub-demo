@@ -6,6 +6,9 @@ import { LIVE_A_KEYS, LIVE_KEYS, live, liveAnswerKey, liveSources } from "./test
 import { createInvestigationTools } from "./tools";
 import type { InvestigationResult } from "./types";
 
+/** An episode's key from its target, kind, and start, built at run time: written out whole in a test, the secret scan (gitleaks) reads it as a generic API key. */
+const episodeKeyOf = (target: string, kind: string, start: string): string => `${target}-${kind}-${start}`;
+
 // Final tests' live findings at 94a17ff7 and its live check of 4e2c65ed (dbhubrb, 2026-11-21), on the history model's own
 // rows (testdata/live-rb-2233e0ae.rows.json, and A's two surges in live-ra-4e2c65ed.rows.json). Finding 1: the RCA view explained the replica's first stall as slow replay at
 // 16:15, from Azure Monitor's 5-minute intervals, while explain_replica_lag found the replay conflict. Finding 2: the
@@ -235,7 +238,7 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         const between = throttledAt((t) => t >= live("15:31:00").getTime() && t < live("15:42:00").getTime() && !at100.has(t));
         expect(between).toBe(1354);
         expect(r.rootCause?.statement).toContain(" In the other 2 intervals, where normalized RU consumption stayed under 100 %, Azure Monitor counted 1354 more throttled requests.");
-        const storm = await ask("explain_incident", { episodeKey: "T5-throttling-20261121T153100Z" });
+        const storm = await ask("explain_incident", { episodeKey: episodeKeyOf("T5", "throttling", "20261121T153100Z") });
         expect(storm.rootCause?.statement).toContain("(14593, 15:31:00 to 15:43:00 UTC,");
         expect(13222 + between + throttledAt((t) => t === live("15:42:00").getTime())).toBe(14593);
         // One note that T5 wasn't captured, the incident's, not its part's too (the coordinator's note on 803f2b1a), in the
@@ -246,7 +249,7 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
     // The re-review of bb70161f: the storm from 15:46 read T5's history from 15:16, so it missed 15:00's hourly provisioned
     // throughput, and said nothing of why a new partition key wouldn't help.
     it("reads the hour's provisioned throughput for the storm 46 minutes into its hour", async () => {
-        const r = await ask("explain_incident", { episodeKey: "T5-ru-20261121T154600Z" });
+        const r = await ask("explain_incident", { episodeKey: episodeKeyOf("T5", "ru", "20261121T154600Z") });
         expect(r.rootCause?.statement).toContain("At 400 RU/s, under the 10,000 RU/s one physical partition serves, the container needs only one physical partition");
         expect(r.notCaptured.join(" ")).not.toMatch(/provisioned throughput/);
         // Final tests' check of ddebd4c3 (F2): its part, reading wider minutes, also said "no RCA evidence for 15:55:03-16:24:58
@@ -269,14 +272,14 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         }
         // A key from an earlier list still reads as the incident that holds its time, and says so where the view and
         // Copilot look (the review of 803f2b1a); a later one only within the interval of the key's own point.
-        const joined = (await tools().investigate("explain_incident", { episodeKey: "T5-ru-20261121T123000Z" })) as InvestigationResult;
-        expect(joined.details?.readAs).toEqual({ key: "T5-ru-20261121T123000Z", as: ["T5-ru-20261121T121500Z"] });
+        const joined = (await tools().investigate("explain_incident", { episodeKey: episodeKeyOf("T5", "ru", "20261121T123000Z") })) as InvestigationResult;
+        expect(joined.details?.readAs).toEqual({ key: episodeKeyOf("T5", "ru", "20261121T123000Z"), as: [episodeKeyOf("T5", "ru", "20261121T121500Z")] });
         expect(joined.rootCause?.ruleIds).toEqual(["RU-THROTTLED"]);
         expect(joined.notCaptured[0]).toBe("T5-ru-20261121T123000Z: in its own minutes, the history has no incident with this key; it reads as T5-ru-20261121T121500Z, which holds its time, so this report is that one's.");
-        const stall = (await tools().investigate("explain_incident", { episodeKey: "T4-replica-replica_lag-20261121T161500Z" })) as InvestigationResult;
-        expect(stall.details?.readAs).toEqual({ key: "T4-replica-replica_lag-20261121T161500Z", as: [LIVE_KEYS.replicaFirst] });
+        const stall = (await tools().investigate("explain_incident", { episodeKey: episodeKeyOf("T4-replica", "replica_lag", "20261121T161500Z") })) as InvestigationResult;
+        expect(stall.details?.readAs).toEqual({ key: episodeKeyOf("T4-replica", "replica_lag", "20261121T161500Z"), as: [LIVE_KEYS.replicaFirst] });
         expect(stall.notCaptured[0]).toContain(`it reads as ${LIVE_KEYS.replicaFirst}, which starts within the interval of its own point`);
-        expect(await tools().investigate("explain_incident", { episodeKey: "T5-ru-20261121T150000Z" })).toMatch(/^No episode /);
+        expect(await tools().investigate("explain_incident", { episodeKey: episodeKeyOf("T5", "ru", "20261121T150000Z") })).toMatch(/^No episode /);
     });
 
     // The review of ebd1c6c3, with the shared finestPerInterval (a390db00): the day save's 34 s at 16:45 fell in 16:57 to
@@ -287,8 +290,8 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
     it("lists the day save's 34 s from 16:57 as its own incident, worded by its own minutes, and reads the old key as it", async () => {
         const listed = await ask("find_incidents", { from: "2026-11-21T11:00:00Z", to: "2026-11-21T20:00:00Z" });
         expect((listed.episodes ?? []).map((e) => e.key)).toContain("T4-replica-replica_lag-20261121T165700Z");
-        const late = await ask("explain_incident", { episodeKey: "T4-replica-replica_lag-20261121T164500Z" });
-        expect(late.details?.readAs).toEqual({ key: "T4-replica-replica_lag-20261121T164500Z", as: ["T4-replica-replica_lag-20261121T165700Z"] });
+        const late = await ask("explain_incident", { episodeKey: episodeKeyOf("T4-replica", "replica_lag", "20261121T164500Z") });
+        expect(late.details?.readAs).toEqual({ key: episodeKeyOf("T4-replica", "replica_lag", "20261121T164500Z"), as: [episodeKeyOf("T4-replica", "replica_lag", "20261121T165700Z")] });
         expect(late.rootCause?.statement).toMatch(
             /^Read Replica Lag \(its highest value in each interval\) reached 34 s in the 3 minutes from 16:57:00 UTC \(1 s, 8 s, 34 s\)\. Azure Monitor's highest value in those 3 minutes can't say whether replay stood still or slowed, and nothing captured says why\.$/,
         );
@@ -298,7 +301,7 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
         expect(late.notCaptured.filter((line) => line.startsWith("T4-replica: no RCA"))).toEqual(["T4-replica: no RCA capture recorded at 16:57:00 UTC; only the telemetry (Telemetry Snapshots) is known"]);
         // The review of c4c63abe: it opened on its one sample because its rule opens on one, not by being far over its level.
         expect((late.details?.episodes as Array<{ text: string }>)[0].text).toContain("peak 34 s at 16:57:00 UTC, in one sample: low confidence (Azure Monitor).");
-        const cpu = await ask("explain_incident", { episodeKey: "T4-cpu-20261121T163500Z" });
+        const cpu = await ask("explain_incident", { episodeKey: episodeKeyOf("T4", "cpu", "20261121T163500Z") });
         expect((cpu.details?.episodes as Array<{ text: string }>)[0].text).toContain("from 16:35:00 to 16:50:00 UTC");
     });
 
@@ -321,7 +324,7 @@ describe("T5's normalized RU and every listed incident (the live check of 4e2c65
     it("gives the 429s' span to the end of the last count's interval", async () => {
         const day = await ask("explain_errors", { from: "2026-11-21T12:10:00Z", to: "2026-11-21T12:50:00Z", targets: ["T5"] });
         expect(day.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(10382, 12:15:00 to 12:45:00 UTC,/);
-        const storm = await ask("explain_incident", { episodeKey: "T5-throttling-20261121T153100Z" });
+        const storm = await ask("explain_incident", { episodeKey: episodeKeyOf("T5", "throttling", "20261121T153100Z") });
         expect(storm.rootCause?.statement).toMatch(/^Most errors were throttled requests \(429\) \(14593, 15:31:00 to 15:43:00 UTC,/);
         expect(storm.findings[0].detail).toContain("on T5 between 15:31:00 and 15:43:00 UTC");
     });

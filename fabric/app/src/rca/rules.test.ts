@@ -33,7 +33,7 @@ describe("blocking (INV-01) on T1's chain", () => {
         expect(a.rootCause?.ruleIds).toEqual(["BLK-IDLE-HEAD"]);
         expect(a.rootCause?.confidence).toBe("high");
         const s = a.rootCause!.statement;
-        for (const fact of ["[demo].[usp_scenario_chain_acquire]", "session 63", "NT AUTHORITY\\SYSTEM", "SQLVM01", "ContosoCare.Demo", "79 s", "[care].[work_queues]", "pk_work_queues", "6 sessions", "2 branches", "4 levels", "58 s", "5 times"]) expect(s).toContain(fact);
+        for (const fact of ["[scheduling].[usp_assign_work_item]", "session 63", "NT AUTHORITY\\SYSTEM", "SQLVM01", "ContosoCare.Demo", "79 s", "[care].[work_queues]", "pk_work_queues", "6 sessions", "2 branches", "4 levels", "58 s", "5 times"]) expect(s).toContain(fact);
         expect(a.chainLines[0]).toMatch(/^HEAD session 63/);
     });
 
@@ -82,7 +82,7 @@ describe("blocking (INV-01) on T4's chain, PostgreSQL", () => {
     it("finds the session idle in transaction at the head, and its three waiters", () => {
         expect(a.rootCause?.ruleIds).toEqual(["BLK-PG-IDLE-IN-TRANSACTION"]);
         const s = a.rootCause!.statement;
-        for (const fact of ["demo.usp_scenario_locking_acquire", "session 20432", "care.work_queues", "3 sessions", "4 times"]) expect(s).toContain(fact);
+        for (const fact of ["billing.usp_reprioritize_queue", "session 20432", "care.work_queues", "3 sessions", "4 times"]) expect(s).toContain(fact);
         expect(a.chainLines.join("\n")).toMatch(/HEAD session 20432[\s\S]*9772[\s\S]*20584[\s\S]*35660/);
         expect(a.recommendations.map((r) => r.id)).toEqual(expect.arrayContaining(["PG-IDLE-TIMEOUT", "PG-LOCK-TIMEOUT"]));
     });
@@ -91,8 +91,8 @@ describe("blocking (INV-01) on T4's chain, PostgreSQL", () => {
 describe("errors by class (INV-12) on T1", () => {
     it("counts the 30 lock timeouts, who hit them, and that their own TRY...CATCH caught every one", () => {
         const r = analyzeErrorsResult(fixtureEvidence("t1").events);
-        expect(r.details).toMatchObject({ classes: [{ class: "lock-timeout", count: 30, intercepted: 30, top: "[demo].[usp_scenario_chain_link]", targets: ["T1"] }] });
-        expect(r.rootCause?.statement).toMatch(/^Most errors were lock timeouts \(30, 16:53:00 to 17:00:00 UTC, mostly \[demo\]\.\[usp_scenario_chain_link\]\)/);
+        expect(r.details).toMatchObject({ classes: [{ class: "lock-timeout", count: 30, intercepted: 30, top: "[scheduling].[usp_route_work_item]", targets: ["T1"] }] });
+        expect(r.rootCause?.statement).toMatch(/^Most errors were lock timeouts \(30, 16:53:00 to 17:00:00 UTC, mostly \[scheduling\]\.\[usp_route_work_item\]\)/);
         expect(r.nextSteps[0]).toMatch(/^explain_locking for T1/);
     });
 });

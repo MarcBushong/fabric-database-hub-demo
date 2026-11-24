@@ -494,14 +494,24 @@ Describe 'Import-DemoFabricNotebook' {
             $script:live = Get-DemoFabricNotebookDefinition -Path $liveNotebook -LakehouseId $otherLakehouseId -LakehouseWorkspaceId $workspaceId
             $script:liveListUri = $listUri
             $script:definitionUri = '^' + [regex]::Escape("$api/workspaces/$workspaceId/items/$itemId/getDefinition?format=ipynb") + '$'
+            # Each notebook file's own values in its parameters cell, which published-versions.json lists with each version.
+            $script:liveParameters = (InModuleScope DbHubDemo -Parameters @{ Text = [System.IO.File]::ReadAllText($liveNotebook) } { Get-DemoNotebookFingerprint -Text $Text }).Bindings
+            $script:deploymentParameters = (InModuleScope DbHubDemo -Parameters @{ Text = [System.IO.File]::ReadAllText($deploymentNotebook) } { Get-DemoNotebookFingerprint -Text $Text }).Bindings
+            # A hand edit of GITHUB_REPOSITORY in the parameters cell.
+            $script:fork = {
+                param($Notebook)
+                $parameters = @($Notebook['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]
+                $parameters['source'] = $parameters['source'] -replace '(?m)^GITHUB_REPOSITORY = "[^"]*"', 'GITHUB_REPOSITORY = "contoso/my-fork"'
+            }
         }
 
         BeforeEach {
             # The versions this repository published: an earlier one of the live-activity notebook is known to the test,
-            # whatever the real file lists.
+            # whatever the real file lists, with its file's own parameter values.
             $script:earlier = $null
+            $script:earlierParameters = $liveParameters
             Mock -ModuleName DbHubDemo -CommandName Get-DemoNotebookPublishedVersion -MockWith {
-                if ($null -ne $earlier) { @([pscustomobject]@{ Sha256 = $earlier; Since = '2026-11-13' }) } else { @() }
+                if ($null -ne $earlier) { @([pscustomobject]@{ Sha256 = $earlier; Since = '2026-11-13'; Parameters = $earlierParameters }) } else { @() }
             }
         }
 
@@ -607,6 +617,115 @@ Describe 'Import-DemoFabricNotebook' {
             $result.status | Should -Be 'Not selected'
             $result.message | Should -Match 'It reads one that''s there first \(POST .+/getDefinition\?format=ipynb\)\.$'
             Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-WebRequest -Times 0 -Exactly
+        }
+
+        It 'keeps <Case> whose GITHUB_REPOSITORY someone edited, which the import doesn''t set while github.repository is the example''s placeholder (the review of 42acec35)' -ForEach @(
+            @{ Case = 'this version'; Earlier = $false }
+            @{ Case = 'an earlier version'; Earlier = $true }
+        ) {
+            # With the placeholder, the import binds the lakehouse alone, and GITHUB_REPOSITORY keeps the file's value.
+            $deployment = Get-DemoFabricNotebookDefinition -Path $deploymentNotebook -LakehouseId $otherLakehouseId -LakehouseWorkspaceId $workspaceId
+            @($deployment.BoundKeys) | Should -Be @('WORKSPACE_ID', 'LAKEHOUSE_ID', 'LAKEHOUSE_NAME')
+            $useEarlier = $Earlier
+            $copy = New-WorkspaceCopy -Notebook $deployment -Change {
+                param($Notebook)
+                if ($useEarlier) {
+                    & $editCode $Notebook
+                }
+                & $fork $Notebook
+            }
+            if ($Earlier) {
+                $script:earlier = (Get-CopyFingerprint -Response $copy).Sha256
+                $script:earlierParameters = $deploymentParameters
+            }
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $liveListUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_Deployment' }) }) }
+                @{ Method = 'Post'; Match = $definitionUri; Responses = @($copy) }
+                @{ Method = 'Post'; Match = $updateUri; Responses = @(New-FabricResponse -Status 200 -Body $null) }
+            )
+            $result = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $deployment -Token $secureToken -KeepEdited -Confirm:$false
+            $result.status | Should -Be 'Not selected'
+            $result.checkId | Should -Be 'FABRIC.IMPORT.NB_DATABASEHUB_DEPLOYMENT'
+            $result.evidence.notebookState | Should -Be 'Edited'
+            @($result.evidence.editedParameters) | Should -Be @('GITHUB_REPOSITORY')
+            $result.message | Should -Match '^Kept notebook ''NB_DatabaseHub_Deployment'' in Fabric workspace .+ as it is: its GITHUB_REPOSITORY isn''t the value the demo publishes there, and this run doesn''t set it, so it counts as an edit\. fabric\.importNotebooks is false'
+            $result.remediation | Should -Match '^To replace it with this version, which drops the edits, run \./scripts/configure-fabric\.ps1 -SkipHubChecks -Notebook NB_DatabaseHub_Deployment'
+            @($requests | Where-Object { $_.Uri -match $updateUri }).Count | Should -Be 0 -Because 'an edited notebook is kept'
+        }
+
+        It 'binds GITHUB_REPOSITORY again when the import sets it, from a github.repository of the configuration''s own' {
+            $deployment = Get-DemoFabricNotebookDefinition -Path $deploymentNotebook -LakehouseId $otherLakehouseId -LakehouseWorkspaceId $workspaceId -GitHubRepository 'contoso/fork'
+            @($deployment.BoundKeys) | Should -Contain 'GITHUB_REPOSITORY'
+            $copy = New-WorkspaceCopy -Notebook $deployment -Change $fork
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $liveListUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_Deployment' }) }) }
+                @{ Method = 'Post'; Match = $definitionUri; Responses = @($copy) }
+                @{ Method = 'Post'; Match = $updateUri; Responses = @(New-FabricResponse -Status 200 -Body $null) }
+            )
+            $result = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $deployment -Token $secureToken -KeepEdited -Confirm:$false
+            $result.status | Should -Be 'Pass'
+            $result.evidence.notebookState | Should -Be 'Rebind'
+            @($requests | Where-Object { $_.Uri -match $updateUri }).Count | Should -Be 1
+        }
+    }
+
+    Context 'with -KeepEdited and the list of versions as deploy.ps1 reads it (the review of 42acec35)' {
+        BeforeAll {
+            $script:live = Get-DemoFabricNotebookDefinition -Path $liveNotebook -LakehouseId $otherLakehouseId -LakehouseWorkspaceId $workspaceId
+            $script:definitionUri = '^' + [regex]::Escape("$api/workspaces/$workspaceId/items/$itemId/getDefinition?format=ipynb") + '$'
+            $script:savedVersionsPath = InModuleScope DbHubDemo { $script:FabricNotebookVersionsPath }
+            $script:versionsFile = Join-Path -Path $TestDrive -ChildPath 'published-versions.json'
+            InModuleScope DbHubDemo -Parameters @{ Path = $versionsFile } { $script:FabricNotebookVersionsPath = $Path }
+            # A live-activity version from before 2026-11-14, whose parameters cell still had the GitHub path that this
+            # version doesn't (ADR 0026), with a code change.
+            $script:before14 = {
+                param($Notebook)
+                & $editCode $Notebook
+                $parameters = @($Notebook['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]
+                $parameters['source'] = $parameters['source'] + 'GITHUB_REPOSITORY = "MarcBushong/fabric-database-hub-demo"' + "`r`n" + 'GITHUB_ENVIRONMENT = "demo"' + "`r`n"
+            }
+        }
+
+        AfterAll {
+            InModuleScope DbHubDemo -Parameters @{ Path = $savedVersionsPath } { $script:FabricNotebookVersionsPath = $Path }
+        }
+
+        It 'updates an earlier version that nobody edited, whose file had parameters this version doesn''t, and keeps one whose GITHUB_REPOSITORY someone edited' {
+            $older = New-WorkspaceCopy -Notebook $live -Change $before14
+            $document = [ordered]@{ notebooks = [ordered]@{ NB_DatabaseHub_LiveActivity = @([ordered]@{
+                            sha256     = (Get-CopyFingerprint -Response $older).Sha256
+                            since      = '2026-11-10'
+                            parameters = [ordered]@{ WORKSPACE_ID = ''; LAKEHOUSE_ID = ''; LAKEHOUSE_NAME = 'LH_DatabaseHub'; GITHUB_REPOSITORY = 'MarcBushong/fabric-database-hub-demo'; GITHUB_ENVIRONMENT = 'demo' }
+                        }) }
+            }
+            [System.IO.File]::WriteAllText($versionsFile, (ConvertTo-Json -InputObject $document -Depth 6))
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $listUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
+                @{ Method = 'Post'; Match = $definitionUri; Responses = @($older) }
+                @{ Method = 'Post'; Match = $updateUri; Responses = @(New-FabricResponse -Status 200 -Body $null) }
+            )
+            $result = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $live -Token $secureToken -KeepEdited -Confirm:$false
+            $result.status | Should -Be 'Pass'
+            $result.evidence.notebookState | Should -Be 'Older'
+            $result.evidence.publishedSince | Should -Be '2026-11-10'
+            @($requests | Where-Object { $_.Uri -match $updateUri }).Count | Should -Be 1
+
+            # The same version, with its GITHUB_REPOSITORY edited by hand, is kept.
+            $forked = New-WorkspaceCopy -Notebook $live -Change {
+                param($Notebook)
+                & $before14 $Notebook
+                $parameters = @($Notebook['cells'] | Where-Object { @($_['metadata']['tags']) -contains 'parameters' })[0]
+                $parameters['source'] = $parameters['source'] -replace '(?m)^GITHUB_REPOSITORY = "[^"]*"', 'GITHUB_REPOSITORY = "contoso/my-fork"'
+            }
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = $listUri; Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
+                @{ Method = 'Post'; Match = $definitionUri; Responses = @($forked) }
+            )
+            $kept = Import-DemoFabricNotebook -WorkspaceId $workspaceId -Notebook $live -Token $secureToken -KeepEdited -Confirm:$false
+            $kept.status | Should -Be 'Not selected'
+            $kept.evidence.notebookState | Should -Be 'Edited'
+            @($kept.evidence.editedParameters) | Should -Be @('GITHUB_REPOSITORY')
+            @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -notmatch $definitionUri }).Count | Should -Be 0
         }
     }
 }
@@ -893,8 +1012,11 @@ Describe 'configure-fabric.ps1' {
         # The deployment notebook is an earlier version of the demo's; the live-activity notebook was edited in Fabric.
         $olderDeployment = New-WorkspaceCopy -Notebook $deployment -Change $editCode
         $script:earlierDeployment = (Get-CopyFingerprint -Response $olderDeployment).Sha256
+        # With the file's own parameter values, as published-versions.json lists them: GITHUB_REPOSITORY, which the example
+        # configuration's placeholder leaves unbound, is the file's (the review of 42acec35).
+        $script:deploymentFileParameters = (InModuleScope DbHubDemo -Parameters @{ Text = [System.IO.File]::ReadAllText($deploymentNotebook) } { Get-DemoNotebookFingerprint -Text $Text }).Bindings
         Mock -ModuleName DbHubDemo -CommandName Get-DemoNotebookPublishedVersion -MockWith {
-            if ($Name -eq 'NB_DatabaseHub_Deployment') { @([pscustomobject]@{ Sha256 = $earlierDeployment; Since = '2026-11-03' }) } else { @() }
+            if ($Name -eq 'NB_DatabaseHub_Deployment') { @([pscustomobject]@{ Sha256 = $earlierDeployment; Since = '2026-11-03'; Parameters = $deploymentFileParameters }) } else { @() }
         }
         Set-FabricMock -Routes @(
             @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_Deployment' }, @{ id = $operationId; displayName = 'NB_DatabaseHub_LiveActivity' }) }) }
@@ -1069,6 +1191,28 @@ Describe 'configure-fabric.ps1' {
         $sent = (Get-RequestBody -Request $run[0]).executionData.parameters
         $sent.RCA_SIDECAR_FILE.value | Should -Be 'Files/rca/inbox/sidecar-20261123T173000Z-script-1a2b3c4d.json'
         $sent.PSObject.Properties.Name | Should -Not -Contain 'RCA_EVIDENCE_FILE'
+    }
+
+    It 'works out the run''s kept values through Livy after -RunLiveActivity''s run completed, with the run''s token, and not after a run that failed (F35, 2026-11-23)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        Mock -CommandName Invoke-DemoHistoryKeptValue -MockWith { New-DemoResult -CheckId $CheckId -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'worked out' }
+        foreach ($job in 'Completed', 'Failed') {
+            Set-FabricMock -Routes @(
+                @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
+                @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = $job }) }
+                @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$itemId/jobs/instances/$operationId" }) }
+            )
+            $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -FabricToken (ConvertTo-TestSecureString -Value $plainToken) -Confirm:$false *>&1
+            $kept = @(Read-ImportResult | Where-Object checkId -EQ 'FABRIC.KEPTVALUE')
+            if ($job -eq 'Completed') {
+                $kept.Count | Should -Be 1
+                $kept[0].status | Should -Be 'Pass'
+            }
+            else {
+                $kept.Count | Should -Be 0 -Because 'a run that failed saved nothing to work out'
+            }
+        }
+        Should -Invoke -CommandName Invoke-DemoHistoryKeptValue -Times 1 -Exactly -ParameterFilter { $CheckId -eq 'FABRIC.KEPTVALUE' -and $null -ne $Token -and [string]$Config['fabric']['workspaceId'] -eq $workspaceId }
     }
 
     It 'adds the PostgreSQL metrics stop-demo.ps1 kept for a paused capacity with -PostgresMetricsPath, then moves the file aside (ADR 0025)' {

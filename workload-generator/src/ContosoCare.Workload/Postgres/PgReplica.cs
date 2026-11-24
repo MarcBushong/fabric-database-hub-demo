@@ -20,24 +20,44 @@ internal enum ReplicaSignal
     Terminate,
 }
 
-/// <summary>Which of the demo's sessions on T4's read replica a stop, a reset, or a run's last check covers.</summary>
-internal sealed record ReplicaSessionScope(string? RunId, string? ScenarioId, string Sessions, string NoneLeft)
+/// <summary>
+/// Which of the demo's sessions on T4's read replica a stop, a reset, or a run's last check covers: all of them, or those of
+/// the given runs. A session's name carries its service and its run (<see cref="SessionNames.ForRun"/>), and services are
+/// shared across scenarios, so only the run says whose session it is (ADR 0031, decision 6).
+/// </summary>
+internal sealed record ReplicaSessionScope(IReadOnlyList<string>? RunIds, string Sessions, string NoneLeft)
 {
-    public static readonly ReplicaSessionScope All = new(null, null, "demo session(s)", "No demo sessions remain");
+    public static readonly ReplicaSessionScope All = new(null, "demo session(s)", "No demo sessions remain");
 
     public static ReplicaSessionScope Run(string runId) => SessionNames.IsValidRunId(runId)
-        ? new(runId, null, "session(s) of run " + runId, "No session of run " + runId + " remains")
+        ? new([runId], "session(s) of run " + runId, "No session of run " + runId + " remains")
         : throw new ArgumentException("Not a run ID.", nameof(runId));
 
-    public static ReplicaSessionScope Scenario(string scenarioId) => scenarioId.Length is > 0 and <= 64 && scenarioId.All(c => c is (>= 'a' and <= 'z') or (>= '0' and <= '9') or '-')
-        ? new(null, scenarioId, scenarioId + " session(s)", "No " + scenarioId + " session remains")
-        : throw new ArgumentException("Not a scenario ID.", nameof(scenarioId));
+    /// <summary>
+    /// A scenario's sessions, by run: those of <paramref name="runIds"/>, the scenario's Running runs, which a stop reads from
+    /// T4 before it cancels them. Never by service: on T4, missing-index and replica-lag share reporting-jobs, so a stop of
+    /// missing-index would end a replica-lag report on the replica.
+    /// </summary>
+    public static ReplicaSessionScope Scenario(string scenarioId, IReadOnlyCollection<string> runIds)
+    {
+        if (scenarioId.Length is 0 or > 64 || !scenarioId.All(c => c is (>= 'a' and <= 'z') or (>= '0' and <= '9') or '-'))
+        {
+            throw new ArgumentException("Not a scenario ID.", nameof(scenarioId));
+        }
 
-    /// <summary>A stop's scope: run, scenario, or all.</summary>
-    public static ReplicaSessionScope ForStop(string scope, string? runId, string? scenarioId) => scope switch
+        return runIds.All(SessionNames.IsValidRunId)
+            ? new([.. runIds.Distinct(StringComparer.Ordinal).Order(StringComparer.Ordinal)], "session(s) of " + scenarioId + "'s stopped run(s)", "No session of " + scenarioId + "'s stopped runs remains")
+            : throw new ArgumentException("Not a run ID.", nameof(runIds));
+    }
+
+    /// <summary>
+    /// A stop's scope: run, scenario (its Running runs among <paramref name="running"/>, which the stop reads from T4 before it
+    /// cancels them), or all.
+    /// </summary>
+    public static ReplicaSessionScope ForStop(string scope, string? runId, string? scenarioId, IEnumerable<RunRecord>? running) => scope switch
     {
         "run" => Run(runId ?? string.Empty),
-        "scenario" => Scenario(scenarioId ?? string.Empty),
+        "scenario" => Scenario(scenarioId ?? string.Empty, [.. (running ?? []).Where(r => r.ScenarioId == scenarioId && r.Status == "Running").Select(r => r.RunId)]),
         _ => All,
     };
 }
@@ -65,13 +85,14 @@ internal static class PgReplicaSessions
           AND a.pid <> pg_backend_pid()
           AND a.application_name LIKE 'ContosoCare.Demo/%'
           AND a.application_name NOT LIKE 'ContosoCare.Demo/control/%'
-          AND (@run_id::text IS NULL OR a.application_name LIKE 'ContosoCare.Demo/%/' || @run_id::text)
-          AND (@scenario_id::text IS NULL OR a.application_name LIKE 'ContosoCare.Demo/' || @scenario_id::text || '/%')
+          AND (@run_ids::text[] IS NULL OR EXISTS (
+                SELECT 1 FROM unnest(@run_ids::text[]) AS r(run_id)
+                WHERE a.application_name LIKE 'ContosoCare.Demo/%/' || r.run_id))
         """;
 
     /// <summary>
-    /// The statement for <paramref name="signal"/>: the demo's sessions on the replica (one run's with @run_id, one
-    /// scenario's with @scenario_id), or one of them, @pid, signalled while it still matches. Pure.
+    /// The statement for <paramref name="signal"/>: the demo's sessions on the replica (those of some runs with @run_ids,
+    /// by the run at the end of their name), or one of them, @pid, signalled while it still matches. Pure.
     /// </summary>
     internal static string Sql(ReplicaSignal signal) => signal switch
     {
@@ -242,8 +263,7 @@ internal static class PgReplicaSessions
         var command = connection.CreateCommand();
         command.CommandText = Sql(signal);
         command.CommandTimeout = 30;
-        command.Parameters.Add(new NpgsqlParameter("run_id", NpgsqlDbType.Text) { Value = (object?)scope.RunId ?? DBNull.Value });
-        command.Parameters.Add(new NpgsqlParameter("scenario_id", NpgsqlDbType.Text) { Value = (object?)scope.ScenarioId ?? DBNull.Value });
+        command.Parameters.Add(new NpgsqlParameter("run_ids", NpgsqlDbType.Array | NpgsqlDbType.Text) { Value = (object?)scope.RunIds?.ToArray() ?? DBNull.Value });
         return command;
     }
 }

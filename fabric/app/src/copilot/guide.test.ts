@@ -376,6 +376,17 @@ describe("the model guide", () => {
         for (const table of ["RCA Sessions", "RCA Events", "RCA Resource", "RCA Replica", "RCA Coverage"]) expect(description(table)).not.toMatch(/^Not written yet/);
         expect(MODEL_GUIDE).not.toMatch(/(?:has no|doesn't have|lacks|without)(?: a| any)? Query Store|Query Store (?:is|was) (?:off|not on)/i);
     });
+
+    // F35 (i): the measures take each interval from its finest save once history is resolved, so overlapping saves no
+    // longer both count in them; a raw sum of Value still does.
+    it("teaches the measures over a raw sum of Value, without saying that overlapping captures both count in them (F35)", () => {
+        const message = buildSystemMessage({ estate: false });
+        const rules = message.slice(0, message.indexOf("# The history model"));
+        expect(rules).toContain("Use the measures instead of summing 'Telemetry Snapshots'[Value] yourself");
+        expect(rules).toContain("the measures take each interval from its finest save once history is resolved");
+        expect(rules).not.toContain("both count in sums");
+        expect(rules).not.toContain("pick each bin's latest capture");
+    });
 });
 
 describe("the conversation", () => {

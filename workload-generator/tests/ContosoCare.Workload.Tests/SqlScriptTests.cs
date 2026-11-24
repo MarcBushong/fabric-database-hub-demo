@@ -87,12 +87,15 @@ public sealed class SqlScriptTests
     [Fact]
     public void EveryScenarioProcedureChecksItsRunAndStopFlag()
     {
+        // ADR 0031, decision 6: the check names the calling module (@@PROCID), never a scenario, and
+        // demo.fn_workload_procedures() says which scenario's runs may run it.
         var problems = new List<string>();
-        foreach (var procedure in Procedures().Where(p => p.Name.StartsWith("demo.usp_scenario_", StringComparison.Ordinal)))
+        var checkedModules = RunCheckedProcedures();
+        foreach (var procedure in checkedModules)
         {
-            if (!procedure.Text.Contains("EXEC demo.usp_run_assert_running", StringComparison.Ordinal))
+            if (!procedure.Text.Contains("EXEC demo.usp_run_assert_running @run_id = @run_id, @procid = @@PROCID, @deadline_at = @deadline OUTPUT", StringComparison.Ordinal))
             {
-                problems.Add($"{procedure.Name} doesn't call demo.usp_run_assert_running first.");
+                problems.Add($"{procedure.Name} doesn't call demo.usp_run_assert_running with its own @@PROCID first.");
             }
 
             if (procedure.HasLoop && !procedure.Text.Contains("demo.fn_run_should_stop(@run_id)", StringComparison.Ordinal))
@@ -102,7 +105,101 @@ public sealed class SqlScriptTests
         }
 
         Assert.True(problems.Count == 0, string.Join(Environment.NewLine, problems));
-        Assert.True(Procedures().Count(p => p.Name.StartsWith("demo.usp_scenario_", StringComparison.Ordinal)) >= 11);
+        Assert.Equal(22, checkedModules.Count);
+    }
+
+    [Fact]
+    public void EveryRunCheckedModuleIsMappedToTheScenariosThatRunIt()
+    {
+        // The T-SQL copy of the answer key's map: one row per module that checks its run, '*' only for the requests the
+        // portal serves (the normal workload beside any scenario), and every row agrees with rca/blind-detection.json.
+        var control = File.ReadAllText(RepositoryPaths.Combine("database", "common", "110-demo-control.sql")).Replace("\r\n", "\n", StringComparison.Ordinal);
+        var function = control[control.IndexOf("CREATE OR ALTER FUNCTION demo.fn_workload_procedures ()", StringComparison.Ordinal)..];
+        function = function[..function.IndexOf("\nGO", StringComparison.Ordinal)];
+        var rows = Regex.Matches(function, @"\(N'(?<module>[a-z]+\.[a-z_]+)', '(?<scenario>[a-z*-]+)'\)").Select(m => (Module: m.Groups["module"].Value, Scenario: m.Groups["scenario"].Value)).ToList();
+        var answerKey = WorkloadNames("tsql");
+
+        Assert.Equal(RunCheckedProcedures().Select(p => p.Name).Order(StringComparer.Ordinal), rows.Select(r => r.Module).Order(StringComparer.Ordinal));
+        Assert.Equal(["frontdesk.usp_process_requests"], rows.Where(r => r.Scenario == "*").Select(r => r.Module));
+        Assert.All(rows.Where(r => r.Scenario != "*"), row => Assert.Contains(row.Scenario, answerKey[row.Module]));
+        Assert.True(control.IndexOf("CREATE OR ALTER FUNCTION demo.fn_workload_procedures", StringComparison.Ordinal) < control.IndexOf("CREATE OR ALTER PROCEDURE demo.usp_run_assert_running", StringComparison.Ordinal));
+    }
+
+    [Fact]
+    public void TheWorkloadModulesHaveRealisticNamesAndTheAnswerKeyMapsEveryOne()
+    {
+        // ADR 0031, decision 6: every module 120-scenario-procedures.sql creates lives in an application schema that the
+        // script creates and lets the runner's role run, and the answer key maps it and forbids it in detection code.
+        var text = Script("120-scenario-procedures.sql");
+        var modules = Regex.Matches(text, @"(?m)^CREATE OR ALTER (?:PROCEDURE|FUNCTION) (?<schema>[a-z]+)\.(?<name>[a-z_]+)").Select(m => (Schema: m.Groups["schema"].Value, Name: m.Groups["name"].Value)).ToList();
+        var forbidden = BlindDetection().RootElement.GetProperty("forbiddenInDetectionCode").GetProperty("identifiers").EnumerateArray().Select(e => e.GetString()!).ToHashSet(StringComparer.Ordinal);
+
+        Assert.Equal(26, modules.Count);
+        Assert.Equal(WorkloadNames("tsql").Keys.Order(StringComparer.Ordinal), modules.Select(m => m.Schema + "." + m.Name).Order(StringComparer.Ordinal));
+        foreach (var schema in ApplicationSchemas)
+        {
+            Assert.Contains($"IF SCHEMA_ID(N'{schema}') IS NULL\n    EXEC (N'CREATE SCHEMA {schema} AUTHORIZATION dbo;');", text, StringComparison.Ordinal);
+            Assert.Contains($"GRANT EXECUTE ON SCHEMA::{schema} TO contosocare_runner;", text, StringComparison.Ordinal);
+        }
+
+        Assert.All(modules, module =>
+        {
+            Assert.Contains(module.Schema, ApplicationSchemas);
+            Assert.DoesNotContain("scenario", module.Name, StringComparison.Ordinal);
+            Assert.Contains(module.Name, forbidden);
+        });
+    }
+
+    [Fact]
+    public void NoStoredModuleNamesAScenario()
+    {
+        // SQL Server stores a module's whole batch, comments before CREATE included, so each header comment is a batch of
+        // its own and every module batch starts at its CREATE. What a DBA reads with sp_helptext names no scenario, and
+        // doesn't narrate its fault (ADR 0031): no regression, no plan A or B, nothing corrected or that didn't start.
+        // The header above the GO, which isn't stored, explains it.
+        var scenarioIds = Directory.GetDirectories(RepositoryPaths.Combine("scenarios")).Select(d => Path.GetFileName(d)!).Where(id => File.Exists(RepositoryPaths.Combine("scenarios", id, "scenario.json"))).ToList();
+        var modules = Sql.SqlScripts.SplitBatches(Script("120-scenario-procedures.sql")).Where(b => Regex.IsMatch(b, @"(?m)^CREATE OR ALTER (PROCEDURE|FUNCTION) ")).ToList();
+        var narration = new Regex(@"(?i:regression|\bcorrected\b|didn'+t start|did not start)|\b[Pp]lan [AB]\b");
+
+        Assert.Equal(26, modules.Count);
+        Assert.All(modules, module =>
+        {
+            Assert.StartsWith("CREATE OR ALTER ", module, StringComparison.Ordinal);
+            Assert.DoesNotContain("scenario", module, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(scenarioIds, id => Regex.IsMatch(module, $@"(?<![A-Za-z0-9_./-]){Regex.Escape(id)}(?![A-Za-z0-9_./-])"));
+            Assert.DoesNotMatch(narration, module);
+        });
+    }
+
+    [Fact]
+    public void TheRetiredNamesAreDroppedOnceAfterEveryReplacementExists()
+    {
+        // The one-click upgrade (ADR 0031, decision 6): setup drops each earlier name, only those, after the last CREATE,
+        // and first unforces any plan automatic tuning forced for the old lookup, so none stays forced for a dropped object.
+        var text = Script("120-scenario-procedures.sql");
+        var drops = Regex.Matches(text, @"(?m)^DROP (?<kind>PROCEDURE|FUNCTION) IF EXISTS (?<name>\S+);$").Select(m => m.Groups["kind"].Value + " " + m.Groups["name"].Value).ToList();
+
+        Assert.Equal(RetiredTSqlNames.Order(StringComparer.Ordinal), drops.Order(StringComparer.Ordinal));
+        Assert.True(text.LastIndexOf("CREATE OR ALTER ", StringComparison.Ordinal) < text.IndexOf("DROP PROCEDURE IF EXISTS", StringComparison.Ordinal), "every replacement exists before the first drop");
+
+        // The unforce of the retired block itself, on Azure SQL Database only, in TRY, and before the first drop: the last
+        // module (frontdesk.usp_refresh_visit_summaries) has an unforce of its own, which mustn't stand in for this one.
+        var retiredStart = text.IndexOf("-- Retired names", StringComparison.Ordinal);
+        Assert.True(retiredStart > text.LastIndexOf("CREATE OR ALTER ", StringComparison.Ordinal), "the retired names come after every module");
+        var retiredBlock = text[retiredStart..text.IndexOf("DROP PROCEDURE IF EXISTS", StringComparison.Ordinal)];
+        var unforce = retiredBlock.IndexOf("EXEC sys.sp_query_store_unforce_plan @query_id = @query_id, @plan_id = @plan_id;", StringComparison.Ordinal);
+        Assert.True(unforce >= 0, "the old lookup's forced plans are unforced before it's dropped");
+        Assert.Contains("IF CAST(SERVERPROPERTY('EngineEdition') AS int) = 5 AND OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') IS NOT NULL", retiredBlock, StringComparison.Ordinal);
+        Assert.Contains("WHERE q.object_id = OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P') AND p.is_forced_plan = 1;", retiredBlock, StringComparison.Ordinal);
+        Assert.True(retiredBlock.IndexOf("BEGIN TRY", StringComparison.Ordinal) is >= 0 and var tryStart && tryStart < unforce && unforce < retiredBlock.IndexOf("END TRY", StringComparison.Ordinal), "a failed unforce never stops setup");
+        foreach (var (path, _, script) in DemoScripts.Value)
+        {
+            Assert.All(RetiredTSqlNames, retired => Assert.DoesNotContain("CREATE OR ALTER " + retired.Split(' ')[0] + " " + retired.Split(' ')[1], script, StringComparison.Ordinal));
+            if (!path.EndsWith("120-scenario-procedures.sql", StringComparison.Ordinal))
+            {
+                Assert.DoesNotContain("DROP PROCEDURE", script, StringComparison.Ordinal);
+            }
+        }
     }
 
     [Fact]
@@ -136,7 +233,7 @@ public sealed class SqlScriptTests
     public void ScenariosNeverCommitChangesToBusinessData()
     {
         var problems = new List<string>();
-        foreach (var procedure in Procedures().Where(p => p.Name.StartsWith("demo.usp_scenario_", StringComparison.Ordinal) && p.Name != "demo.usp_scenario_healthy_baseline"))
+        foreach (var procedure in WorkloadProcedures().Where(p => p.Name != "frontdesk.usp_process_requests"))
         {
             if (procedure.WritesCare && procedure.HasCommit)
             {
@@ -145,7 +242,7 @@ public sealed class SqlScriptTests
         }
 
         Assert.True(problems.Count == 0, string.Join(Environment.NewLine, problems));
-        Assert.Equal(["demo.usp_scenario_log_rate_pressure"], Procedures().Where(p => p.HasCommit && p.Name.StartsWith("demo.usp_scenario_", StringComparison.Ordinal)).Select(p => p.Name));
+        Assert.Equal(["billing.usp_import_remittances"], WorkloadProcedures().Where(p => p.HasCommit).Select(p => p.Name));
     }
 
     [Fact]
@@ -182,9 +279,9 @@ public sealed class SqlScriptTests
         // worker 1 holds it off only after demo.auto_tuning_hold records how it was, and demo.usp_release_auto_tuning_hold
         // puts that back; the response, the run's end, auto-cleanup, a stale run's recovery, reset, and setup call it.
         var withAlter = Procedures().Where(p => p.Text.Contains("ALTER DATABASE", StringComparison.OrdinalIgnoreCase)).Select(p => p.Name).Order(StringComparer.Ordinal).ToList();
-        Assert.Equal(["demo.usp_release_auto_tuning_hold", "demo.usp_scenario_plan_regression"], withAlter);
+        Assert.Equal(["demo.usp_release_auto_tuning_hold", "frontdesk.usp_refresh_visit_summaries"], withAlter);
 
-        var regression = ProcedureText("demo.usp_scenario_plan_regression");
+        var regression = ProcedureText("frontdesk.usp_refresh_visit_summaries");
         Assert.True(regression.IndexOf("INSERT INTO demo.auto_tuning_hold", StringComparison.Ordinal) < regression.IndexOf("FORCE_LAST_GOOD_PLAN = OFF", StringComparison.Ordinal), "the hold is recorded before the option goes off");
         Assert.Equal(1, CountOccurrences(regression, "ALTER DATABASE CURRENT SET AUTOMATIC_TUNING (FORCE_LAST_GOOD_PLAN = OFF)"));
         Assert.Equal(2, CountOccurrences(regression, "EXEC demo.usp_release_auto_tuning_hold @run_id = @run_id"));
@@ -207,7 +304,7 @@ public sealed class SqlScriptTests
         // run's patients, so another worker's lookup that compiled around the switch put plan A back within the same second.
         // The other workers now stay out from 2 seconds before each switch, worker 1 reads the cached plan afterward and
         // switches again at most twice more, and a switch that doesn't hold, or can't be read, is plan-switch-unverified.
-        var regression = ProcedureText("demo.usp_scenario_plan_regression");
+        var regression = ProcedureText("frontdesk.usp_refresh_visit_summaries");
         Assert.Contains("@switch_gap_ms int = 20000, @switch_attempts_max int = 3", regression, StringComparison.Ordinal);
         Assert.Contains("IF @worker > 1 AND @since >= -2000 AND", regression, StringComparison.Ordinal);
         Assert.DoesNotContain("@quiet_until", regression, StringComparison.Ordinal);
@@ -325,6 +422,49 @@ public sealed class SqlScriptTests
 
     /// <summary>The text of one procedure in database/common/1*.sql.</summary>
     public static string ProcedureText(string name) => Procedures().Single(p => p.Name == name).Text;
+
+    /// <summary>The application schemas that hold the workload's modules (ADR 0031, decision 6).</summary>
+    private static readonly string[] ApplicationSchemas = ["billing", "frontdesk", "records", "reporting", "scheduling", "supply"];
+
+    /// <summary>The modules' earlier names, which 120-scenario-procedures.sql drops once their replacements exist.</summary>
+    private static readonly string[] RetiredTSqlNames =
+    [
+        "PROCEDURE demo.usp_scenario_healthy_baseline", "PROCEDURE demo.usp_scenario_locking_acquire", "PROCEDURE demo.usp_scenario_locking_hold",
+        "PROCEDURE demo.usp_scenario_locking_contend", "PROCEDURE demo.usp_scenario_locking_deadlock", "PROCEDURE demo.usp_scenario_cpu_pressure",
+        "PROCEDURE demo.usp_io_scratch_grow", "PROCEDURE demo.usp_scenario_io_pressure", "PROCEDURE demo.usp_scenario_missing_index",
+        "PROCEDURE demo.usp_scenario_inefficient_query", "PROCEDURE demo.usp_scenario_resource_governance", "PROCEDURE demo.usp_scenario_log_rate_pressure",
+        "PROCEDURE demo.usp_scenario_chain_acquire", "PROCEDURE demo.usp_scenario_chain_link", "PROCEDURE demo.usp_scenario_chain_escalate",
+        "PROCEDURE demo.usp_scenario_deadlock_storm", "PROCEDURE demo.usp_scenario_tempdb_contention", "PROCEDURE demo.usp_scenario_memory_grants",
+        "PROCEDURE demo.usp_scenario_parallel_scans", "PROCEDURE demo.usp_scenario_commit_flood", "PROCEDURE demo.usp_scenario_slow_consumer",
+        "PROCEDURE demo.usp_scenario_capacity_max", "PROCEDURE demo.usp_visit_summary_lookup", "PROCEDURE demo.usp_scenario_plan_regression",
+        "FUNCTION demo.fn_locking_hot_rows", "FUNCTION demo.fn_chain_rows",
+    ];
+
+    /// <summary>The procedures of 120-scenario-procedures.sql: the workload's modules.</summary>
+    private static List<ProcedureInfo> WorkloadProcedures()
+    {
+        var (_, script, text) = DemoScripts.Value.Single(s => s.Path.EndsWith("120-scenario-procedures.sql", StringComparison.Ordinal));
+        var visitor = new ProcedureVisitor(text);
+        script.Accept(visitor);
+        return visitor.Procedures;
+    }
+
+    /// <summary>The workload's modules that check their run: each takes @run_id and gets its own deadline (a helper takes its caller's, @deadline_at).</summary>
+    private static List<ProcedureInfo> RunCheckedProcedures() =>
+        [.. WorkloadProcedures().Where(p => p.Parameters.Contains("@run_id") && !p.Parameters.Contains("@deadline_at"))];
+
+    private static string Script(string fileName) =>
+        File.ReadAllText(RepositoryPaths.Combine("database", "common", fileName)).Replace("\r\n", "\n", StringComparison.Ordinal);
+
+    private static JsonDocument BlindDetection() => JsonDocument.Parse(File.ReadAllText(RepositoryPaths.Combine("rca", "blind-detection.json")));
+
+    /// <summary>rca/blind-detection.json's answerKey.workloadNames for one engine: each module and the scenarios it serves.</summary>
+    internal static Dictionary<string, string[]> WorkloadNames(string engine)
+    {
+        using var blind = BlindDetection();
+        return blind.RootElement.GetProperty("answerKey").GetProperty("workloadNames").GetProperty(engine).EnumerateObject()
+            .ToDictionary(p => p.Name, p => p.Value.EnumerateArray().Select(s => s.GetString()!).ToArray(), StringComparer.Ordinal);
+    }
 
     private static List<ProcedureInfo> Procedures()
     {

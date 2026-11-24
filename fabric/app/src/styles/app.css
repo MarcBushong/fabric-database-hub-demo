@@ -924,6 +924,13 @@ button.kpi-main:hover {
     cursor: pointer;
 }
 
+/* A plain link in a table or a definition list (DataGrid's Open, the Links page's Open in Fabric) takes the theme's link
+   color, not the browser's blue. */
+.grid-table a,
+.kv a {
+    color: var(--colorBrandForegroundLink);
+}
+
 .grid-empty,
 .grid-note {
     margin: 0;
@@ -1880,4 +1887,120 @@ button.kpi-main:hover {
     display: grid;
     gap: 6px;
     text-align: left;
+}
+
+/* ---------- High contrast: what sits on a hovered or pressed fill ---------- */
+
+/* Fluent's high contrast theme fills a hovered or pressed row, subtle or transparent button, menu item, or list option in
+   cyan, and pairs the fill with a black foreground. The app's own colors don't switch with it: on the cyan, the statuses,
+   a target's mark, a link's yellow, and the brand's and the captions' white were 1.03:1 to 1.53:1. Here each takes the
+   foreground Fluent pairs with its fill, as the rest of the row, button, menu item, or option does. A target's mark is an
+   inline background, so only !important replaces it, and Ask's buttons draw their text in the brand's color with
+   !important too. A disabled button, menu item, or option keeps no fill, so these leave it alone (:enabled and
+   :not([aria-disabled="true"])), or a disabled Ask Copilot's text went black on black.
+   None of this applies under Windows forced colors: the app picks high contrast there too, with the System choice, but a
+   hovered menu item takes the system's Highlight under forced-color-adjust: none, on which Fluent's black isn't assured
+   (2.78:1 on the Windows Desert theme's Highlight), so the system's colors apply there, as they did. */
+@media (forced-colors: none) {
+    [data-theme="contrast"] .fui-TableRow:hover .status-badge,
+    [data-theme="contrast"] .fui-TableRow:hover .muted,
+    [data-theme="contrast"] .fui-TableRow:hover a,
+    [data-theme="contrast"] button.kpi-main:hover,
+    [data-theme="contrast"] button.kpi-main:hover .kpi-label,
+    [data-theme="contrast"] button.kpi-main:hover .kpi-sub {
+        color: var(--colorNeutralForeground1Hover);
+    }
+
+    [data-theme="contrast"] .fui-TableRow:active .status-badge,
+    [data-theme="contrast"] .fui-TableRow:active .muted,
+    [data-theme="contrast"] .fui-TableRow:active a {
+        color: var(--colorNeutralForeground1Pressed);
+    }
+
+    /* A table's rows, and the Manage page's target list, whose options hold a target's chip. */
+    [data-theme="contrast"] .fui-TableRow:hover .target-chip i,
+    [data-theme="contrast"] .fui-Option:not([aria-disabled="true"]):hover .target-chip i {
+        background: var(--colorNeutralForeground1Hover) !important;
+    }
+
+    [data-theme="contrast"] .fui-TableRow:active .target-chip i,
+    [data-theme="contrast"] .fui-Option:not([aria-disabled="true"]):active .target-chip i {
+        background: var(--colorNeutralForeground1Pressed) !important;
+    }
+
+    /* The target filter's menu. */
+    [data-theme="contrast"] .fui-MenuItemCheckbox:not([aria-disabled="true"]):hover .target-chip i {
+        background: var(--colorNeutralForeground2Hover) !important;
+    }
+
+    [data-theme="contrast"] .fui-MenuItemCheckbox:not([aria-disabled="true"]):active .target-chip i {
+        background: var(--colorNeutralForeground2Pressed) !important;
+    }
+
+    /* The top bar's account chips and their captions ("Fabric", the GitHub plan, "Didn't finish"). */
+    [data-theme="contrast"] .account-chip:enabled:hover,
+    [data-theme="contrast"] .account-chip:enabled:hover .account-text small {
+        color: var(--colorNeutralForeground2Hover);
+    }
+
+    [data-theme="contrast"] .account-chip:enabled:active,
+    [data-theme="contrast"] .account-chip:enabled:active .account-text small {
+        color: var(--colorNeutralForeground2Pressed);
+    }
+
+    [data-theme="contrast"] .ask-copilot:enabled:hover {
+        color: var(--colorNeutralForeground2Hover) !important;
+    }
+
+    [data-theme="contrast"] .ask-copilot:enabled:active {
+        color: var(--colorNeutralForeground2Pressed) !important;
+    }
+
+    [data-theme="contrast"] .ask-why:enabled:hover,
+    [data-theme="contrast"] .copilot-account:enabled:hover .copilot-account-plan {
+        color: var(--colorNeutralForeground2BrandHover) !important;
+    }
+
+    [data-theme="contrast"] .ask-why:enabled:active,
+    [data-theme="contrast"] .copilot-account:enabled:active .copilot-account-plan {
+        color: var(--colorNeutralForeground2BrandPressed) !important;
+    }
+}
+
+/* Under Windows forced colors, Fluent paints a hovered menu item in the system's Highlight under forced-color-adjust: none,
+   so a target's mark in the target filter's menu showed its theme color on it, as low as 1.01:1 on the Night sky theme's
+   Highlight. It takes HighlightText there, the system's own pair for Highlight, in any of the app's themes. Nothing else:
+   a disabled or keyboard-focused item, and a list option, which Fluent leaves without a forced-colors fill, have no
+   Highlight, and their marks are forced to Canvas, as every other mark is. */
+@media (forced-colors: active) {
+    .fui-MenuItemCheckbox:not([aria-disabled="true"]):hover .target-chip i {
+        background: HighlightText !important;
+    }
+
+    /* Pressed, Fluent's own pressed fill and words outrank its Highlight, and stay in the theme's colors, unforced: the
+       mark takes the words' color, as high contrast's group does outside forced colors. HighlightText on that fill was
+       as low as 1.23:1. */
+    .fui-MenuItemCheckbox:not([aria-disabled="true"]):hover:active .target-chip i {
+        background: var(--colorNeutralForeground2Pressed) !important;
+    }
+}
+
+/* A bar chart's hovered category: the cyan band would sit under high contrast's bright bars, so it's a dashed outline,
+   as a line chart's cursor is. Outside the group above, so it holds under Windows forced colors too, where the app's high
+   contrast charts keep their colors and a cyan band would sit under T2's cyan bars. */
+[data-theme="contrast"] .chart-cursor-band rect {
+    fill: none;
+    stroke: var(--colorNeutralStrokeAccessible);
+    stroke-width: 1.5;
+    stroke-dasharray: 3 3;
+}
+
+/* Under Windows forced colors, the browser leaves a chart's own colors as they are, but the card under it takes the
+   system's Canvas, which a light palette makes white, where high contrast's white outline was 1:1, and its line chart's
+   cursor too. They take CanvasText there, the system's pair for Canvas; after the outline's rule above, so it wins. */
+@media (forced-colors: active) {
+    [data-theme="contrast"] .chart-cursor-band rect,
+    [data-theme="contrast"] .chart-cursor line {
+        stroke: CanvasText;
+    }
 }

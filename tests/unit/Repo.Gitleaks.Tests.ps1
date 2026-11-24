@@ -81,12 +81,30 @@ Describe 'gitleaks configuration (Phase 14, ADR 0009)' {
         $line.IsMatch(('"token": "{0}"' -f $hex)) | Should -BeFalse
     }
 
-    It 'ignores one historical finding by its fingerprint, RFC 6455''s sample WebSocket key in commit 60b8ebc''s relay test, and nothing else (2026-11-19)' {
+    It 'ignores only the historical findings it lists by fingerprint, one commit, file, rule, and line each: RFC 6455''s sample WebSocket key in commit 60b8ebc''s relay test (2026-11-19), and eight RCA episode keys in the incident tests (2026-11-23)' {
         $entries = @(Get-Content -LiteralPath (Join-Path -Path $script:repoRoot -ChildPath '.gitleaksignore') | ForEach-Object { $_.Trim() } | Where-Object { $_ -and -not $_.StartsWith('#') })
-        $entries | Should -Be @('60b8ebc8991e731cb980b95bf84b91a5ded9e716:ask-relay/test/server.test.ts:generic-api-key:195') -Because 'one commit, one file, one rule, one line: never a path-wide or rule-wide exception'
+        $entries | Should -Be @(
+            '60b8ebc8991e731cb980b95bf84b91a5ded9e716:ask-relay/test/server.test.ts:generic-api-key:195'
+            '180163098cc2166749165be98710a0f0d9de0483:fabric/app/src/rca/live-accuracy.test.ts:generic-api-key:228'
+            '4667459cdb80df597952cafb56e8bffdbccd1999:fabric/app/src/rca/tools.test.ts:generic-api-key:412'
+            'c4c63abe9767d45c9a955271e353e1252e6c9712:fabric/app/src/rca/live-accuracy.test.ts:generic-api-key:255'
+            'c4c63abe9767d45c9a955271e353e1252e6c9712:fabric/app/src/rca/live-accuracy.test.ts:generic-api-key:256'
+            'c4c63abe9767d45c9a955271e353e1252e6c9712:fabric/app/src/rca/live-accuracy.test.ts:generic-api-key:259'
+            '858c50c2b05360f499a864cadd7bd14b9a44e985:fabric/app/src/rca/live-accuracy.test.ts:generic-api-key:258'
+            '97fdf5ba1e3af14d832d456344aad1449c905dc2:fabric/app/src/rca/live-accuracy.test.ts:generic-api-key:206'
+            '97fdf5ba1e3af14d832d456344aad1449c905dc2:fabric/app/src/rca/live-accuracy.test.ts:generic-api-key:207'
+        ) -Because 'one commit, one file, one rule, one line each: never a path-wide or rule-wide exception'
         $relayTest = Get-Content -LiteralPath (Join-Path -Path $script:repoRoot -ChildPath 'ask-relay/test/server.test.ts') -Raw
         $relayTest | Should -Not -Match 'Sec-WebSocket-Key:\s*[A-Za-z0-9+/]{22}==' -Because 'the test builds its WebSocket key at run time'
         $relayTest | Should -Match 'randomBytes\(16\)\.toString\("base64"\)'
+    }
+
+    It 'keeps the RCA incident tests free of episode keys written out whole: each is built from its target, kind, and start at run time (2026-11-23)' {
+        foreach ($name in 'fabric/app/src/rca/live-accuracy.test.ts', 'fabric/app/src/rca/tools.test.ts') {
+            $text = Get-Content -LiteralPath (Join-Path -Path $script:repoRoot -ChildPath $name) -Raw
+            $text | Should -Not -Match '\b(?:episodeKey|key)\s*:\s*["''`]T[0-9][\w-]*-[0-9]{8}T[0-9]{6}Z["''`]' -Because ('{0} builds its episode keys at run time, so the secret scan never reads one as a generic API key' -f $name)
+            $text | Should -Match 'const episodeKeyOf = \(target: string, kind: string, start: string\): string => `\$\{target\}-\$\{kind\}-\$\{start\}`;' -Because $name
+        }
     }
 
     It 'asks for no newer gitleaks than the one CI and the pre-commit hook pin' {

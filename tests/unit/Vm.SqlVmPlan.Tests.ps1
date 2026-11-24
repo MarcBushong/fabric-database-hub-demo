@@ -180,6 +180,19 @@ Describe 'T1 associated services (Analysis Services and Integration Services)' {
         @((Get-DemoVmState)['notes']) | Should -Be @('AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.')
     }
 
+    It 'warns about the restart on a T1 whose step completed before, where the features came back (the review of cb4bc479)' {
+        $context = New-TestSqlVmContext
+        $step = @(Get-DemoSqlVmStepPlan -Context $context | Where-Object Name -eq 'AssociatedServices')
+        Invoke-DemoVmStateMachine -Step $step -Generation 'g1' | Should -Be 'Ready'
+        (Get-DemoVmState)['steps']['AssociatedServices']['completedUtc'] | Should -Not -BeNullOrEmpty
+        # A later generation finds them installed again, and setup asks for a restart.
+        $script:services['MsDtsServer160'] = @{ Status = 'Running'; StartType = 'Automatic' }
+        $script:uninstallExit = 3010
+        Invoke-DemoVmStateMachine -Step $step -Generation 'g2' | Should -Be 'Ready'
+        @((Get-DemoVmState)['notes'] | Where-Object { $_ }).Count | Should -Be 0
+        @((Get-DemoVmState)['warnings']) | Should -Be @('AssociatedServices: SQL Server setup asked for a restart to finish removing Analysis Services and Integration Services; the nightly shutdown or the next start completes it.')
+    }
+
     It 'warns without trying to uninstall when the image has no setup media' {
         Mock -CommandName Test-Path -ParameterFilter { $LiteralPath -eq 'C:\SQLServerFull\setup.exe' } -MockWith { $false }
         $result = Disable-DemoSqlVmAssociatedService -Context (New-TestSqlVmContext)
@@ -264,6 +277,60 @@ Describe 'Restart-DemoSqlVmIaasAgent' {
     }
 }
 
+Describe 'T1 sysadmin recovery (SqlAdminAccess)' {
+    BeforeAll {
+        # The service cmdlets exist only on Windows: elsewhere (CI on Linux), or where another test file left a narrower
+        # stub, stubs with the parameters the recovery uses are defined before they're mocked, as for the IaaS agent's
+        # restart above, and the earlier definitions come back afterwards.
+        $script:previousRecoveryStubs = @{}
+        foreach ($stub in @(
+                @{ Name = 'Stop-Service'; Parameters = 'param([string] $Name, [switch] $Force)' },
+                @{ Name = 'Start-Service'; Parameters = 'param([string] $Name)' })) {
+            $existing = Get-Command -Name $stub.Name -ErrorAction SilentlyContinue
+            if ($null -eq $existing -or $existing.CommandType -eq 'Function') {
+                $script:previousRecoveryStubs[$stub.Name] = if ($null -ne $existing) { $existing.ScriptBlock } else { $null }
+                Set-Item -Path ('function:global:' + $stub.Name) -Value ([scriptblock]::Create('[CmdletBinding()] ' + $stub.Parameters))
+            }
+        }
+    }
+
+    AfterAll {
+        foreach ($name in $script:previousRecoveryStubs.Keys) {
+            if ($null -ne $script:previousRecoveryStubs[$name]) {
+                Set-Item -Path ('function:global:' + $name) -Value $script:previousRecoveryStubs[$name]
+            }
+            else {
+                Remove-Item -Path ('function:global:' + $name) -ErrorAction SilentlyContinue
+            }
+        }
+    }
+
+    BeforeEach {
+        $script:context = New-TestSqlVmContext -DataDiskTier 'None'
+        Mock -CommandName Stop-Service -MockWith { }
+        Mock -CommandName Start-Service -MockWith { }
+        Mock -CommandName Invoke-DemoVmNativeCommand -MockWith { [pscustomobject]@{ ExitCode = 0; Output = @() } }
+        Mock -CommandName Invoke-DemoVmSql -MockWith { }
+    }
+
+    It 'notes the recovery a new T1 needs by design as information, and warns on a T1 whose step completed before (the review of cb4bc479)' {
+        $text = 'SYSTEM was not a sysadmin, so BUILTIN\Administrators was made one with the documented lockout-recovery procedure.'
+        # A new T1: the step never completed, so the recovery is the image's least-privilege mode, by design.
+        $first = Grant-DemoSqlVmSysadmin -Context $script:context
+        $first.Outcome | Should -Be 'Done'
+        @($first.NoteMessage) | Should -Be @($text)
+        @($first.TransientWarningMessage).Count | Should -Be 0
+        Should -Invoke -CommandName Invoke-DemoVmSql -Times 1 -Exactly -ParameterFilter { $Query -like '*ALTER SERVER ROLE sysadmin ADD MEMBER*' }
+
+        # A T1 that had access, whose step completed in an earlier generation: something took it away, so it's a warning.
+        $state = Get-DemoVmState
+        $state['steps']['SqlAdminAccess'] = [ordered]@{ status = 'Running'; completedUtc = (Get-DemoVmUtcNow) }
+        Save-DemoVmState -State $state
+        $again = Grant-DemoSqlVmSysadmin -Context $script:context
+        @($again.TransientWarningMessage) | Should -Be @($text)
+        @($again.NoteMessage).Count | Should -Be 0
+    }
+}
 Describe 'SQL Server setup summary' {
     It 'reads the final result from setup''s summary' {
         $summary = Join-Path -Path $TestDrive -ChildPath 'Summary.txt'

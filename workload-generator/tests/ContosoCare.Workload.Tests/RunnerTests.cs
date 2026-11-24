@@ -75,6 +75,7 @@ public sealed class RunnerTests
     [InlineData("Refused", "running-run", true)]
     [InlineData("Refused", "run-limit", true)]
     [InlineData("Refused", "connect", true)]
+    [InlineData("Refused", "out-of-step", true)]
     [InlineData("Refused", "sql", false)]
     [InlineData("Refused", "request", false)]
     [InlineData("Failed", "running-run", false)]

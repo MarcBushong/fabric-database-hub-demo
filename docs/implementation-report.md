@@ -6563,11 +6563,10 @@ Whoever merges second reconciles these. The tests catch the follow-ups' totals; 
 - **The T2 golden capture in a tenant that encrypts Automation variables** ([its entry](#a-tenants-encrypted-status-variable-2026-11-23)): `capture-t2-golden.ps1` read the session control's status, once the tenant's policy had encrypted it, as a status that lists nothing, so it would have deleted T2's evidence that the status lists. It now captures nothing then, with a fix line that saves that evidence first. Since the stacked unit below, it reads the lists through the session control's own job instead.
 - **The session control's status kept through updates** ([its entry](#the-session-controls-status-kept-through-updates-2026-11-23)): every update wrote the variable `DbHubSessionStatus` again, empty, so the next start no longer had what the last stop listed of the evidence still on the VMs. The template now creates it only when it's missing, and an update keeps it, encrypted or not.
 - **The organized Root cause** ([ADR 0031, section 7](adr/0031-incident-rca.md#7-the-rca-view); [its entry](#the-organized-root-cause-2026-11-23)), from the owner's feedback that the page read as one big list: facets for severity, category, and server and database, each value with its count; the minutes it reads; the list grouped by category or by server and sorted by severity or by time; and the filters in the address, so a view can be shared. Severity is High, Medium, or Low from each incident's own measurements, with why. The chat's `find_incidents` and `triage_window` take the same filters.
-- **The reviews' fixes,** in each entry ([the latest](#the-review-of-40124992-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
 - **O1: the capture ends at a session's stop** ([its entry](#o1-the-capture-ends-at-a-sessions-stop-2026-11-23)): the control's stop stops nothing on the VMs before they deallocate, so the observer captured on past the stop's export, and the session's last minutes stayed on the VMs, listed nowhere. The stop's export now ends the capture first, in its own Run Command, and takes it whole; a VM where it didn't end is named.
 - **The golden capture reads an encrypted status through the control's job** ([its entry](#the-golden-capture-reads-an-encrypted-status-through-the-controls-job-2026-11-23)): when Azure Resource Manager can't give the status's value, `capture-t2-golden.ps1` starts `DbHub-Control`'s new read-only `pending` action as a job, which reads it with `Get-AutomationVariable`, so the capture no longer needs the variable deleted to check it.
 - **The session control's role joins T4's network again** ([its entry](#the-session-controls-role-joins-t4s-network-again-2026-11-23)): in West Central US, Azure refused Run all's create of T4's read replica because the role didn't have the join of T4's subnet. The role gets both join actions back, an update by someone who isn't an Owner says what waits for the Owner's grant, and a session's status names the action Azure refused.
-- **The reviews' fixes,** in each entry ([the latest](#the-re-check-of-60aacd7b-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
+- **The reviews' fixes,** in each entry (the latest: [the organized Root cause's](#the-review-of-40124992-2026-11-23) and [the stop's and the golden job's](#the-re-check-of-60aacd7b-2026-11-23)). Two of the app's also reach environments without the RCA tables: when the page's filter hides all of a session's faults, the postmortem no longer says that nothing was injected or that the window was empty, and the scoreboard's T4 and T5 rows marked Not supported show the scenario's title as their signal ([the review of 96abcf65](#the-review-of-96abcf65-2026-11-22)).
 
 **What still needs live proof.** All of it but the evaluation set, which reads recorded rows. Each change is unit-tested, and the RCA's answers are checked on B's and A's recorded rows, but none has run on a live environment. Its live check waits for the owner: dbhubrc stays at dbee7d53 for the owner's testing on Monday, 2026-11-23. On an environment deployed or updated from this branch, after a Run all session:
 
@@ -7097,7 +7096,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 **Risks.**
 
 - **Not run live:** that Fabric's ipynb export of an imported notebook gives the repository file's fingerprint. A normalization this doesn't cover makes every copy count as edited, so `deploy.ps1` keeps it, as before this change: safe, but the update then doesn't happen. The live round on an update should see `FABRIC.IMPORT.*` **Pass** "It was the demo's version of ..." for a workspace an earlier version imported, **Pass** "is this version already" on the next run, and **Not selected** after an edit in Fabric.
-- **An edit only to what the fingerprint leaves out,** a cell's metadata or outputs for example, is replaced by an update. An edit to the code is always kept.
+- **An edit only to what the fingerprint leaves out,** a cell's metadata or outputs for example, is replaced by an update. An edit to the code is kept, unless it makes the code exactly a listed version's, a hand edit that undoes a change for example: that copy counts as that version and is updated ([the review's Low](#the-review-of-42acec35-and-cb4bc479-two-mediums-fixed-one-low-narrowed-2026-11-23)).
 - **A notebook changed without the writer** makes copies of its version count as edited; the unit test fails first.
 - **One Get Item Definition per notebook per run,** a long-running operation when Fabric answers 202, bounded by the import's timeout.
 
@@ -7140,7 +7139,7 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The last colors outside the theme:** the Copilot mark's purple-to-blue gradient (`copilot-dock.css`), now `--copilot-mark` (terracotta into plum; high contrast keeps the old gradient); the chart stylesheet's own palette and its incident band, whose `--chart-band` and `--chart-band-ink` are now app tokens, so a chart on the dark stage of the light app takes the stage's band and not the page's; the hard-coded white and gray fallbacks in the dock's and the charts' stylesheets; and the Fabric account's avatar, which took Fluent's "colorful" lavender and now takes the brand's color (`AccountChips.tsx`, its one prop).
 - **High contrast and Windows forced colors are unchanged:** `FLUENT_THEMES.contrast` is still Fluent's `teamsHighContrastTheme`, and the contrast tokens and F22's rules are as they were.
 
-**Measured** (the app's own tokens; before is 2026-11-20's palette):
+**Measured** (the app's own tokens at rest; before is 2026-11-20's palette). [The review of 2b0e46b0](#the-review-of-2b0e46b0-2026-11-23) found three contrast failures, on hovered and pressed fills and under the dark incident band, fixed after it:
 
 | Pair | Needs | Before | After |
 |---|---|---|---|
@@ -7371,6 +7370,44 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **What its live check needs.** As the summary above lists: the facets and their counts on a live session's incidents, 6 and 24 hours, a shared address, the links landing filtered, T4's and T5's names, the severities, and the chat's filters.
 
+### The re-review of bbdcd05c and 8e2cb06b (2026-11-23)
+
+**Why.** The re-review said **SHIP** for both, with one Low: past a target's retention, the note gave the minutes' age rounded down, so for the whole day after the retention ran out it said Query Store "no longer keeps those minutes ... it keeps 7 days, and they're 7 days old". One commit, after 8e2cb06b.
+
+- **The fix** (`rca/query-store.ts`): past the retention, the note says "they're more than 7 days old" (14 on T1 to T3), which holds at any age past it.
+- **Test:** T4's incident at its last kept minute still has its next step, and 7 days and 18 hours after it, its note says "more than 7 days old" and never "7 days old"; T1's and T3's the same around 14 days, one minute apart. It fails at 8e2cb06b.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts` and `rca/tools.test.ts`; ADR 0031 and this report.
+
+**Validation.** On 8e2cb06b with this commit: the type check and lint passed, and so did `src/rca` and `src/copilot`'s 384 tests, one of which, `ask-blind.test.tsx`'s Overview, timed out on this loaded PC and passed when its file ran alone (32 of 32). markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+
+**What its live check needs.** Nothing beyond part 1's and the review's: a T4 incident more than 7 days old reads "more than 7 days old".
+
+### The review of 2b0e46b0 (2026-11-23)
+
+**Why.** An independent review of [the earth tones](#the-insights-app-in-earth-tones-2026-11-23) found contrast at rest, high contrast, theme switching, and Fluent's token contract sound, and said **ship with fixes**: three contrast failures the commit added, one older badge bug, and docs that claimed more than the tests held. The coordinator asked for one follow-up commit, keeping the color-vision distances at or above 2b0e46b0's. One commit, after 2b0e46b0.
+
+- **Medium: in dark, brand and status text fell under 4.5:1 on a hovered row or subtle button** (`colorSubtleBackgroundHover`, `#3F362F`, which every Fluent `TableRow` and subtle button takes on hover): **Ask Copilot** 4.39:1, Fail 4.42:1, and Manual 4.45:1. Now the dark brand's text is the ramp's 120 (`#DAA17D`, 5.27:1), Fail `#EE8C8B` (4.92:1), and Manual `#80ABD8` (4.91:1); the dark danger family's foregrounds take the new Fail too.
+- **Medium: the dark incident band's label was 4.23:1 on a card,** with the band, Fail at 14 %, over it. The band is now at 8 %: its label is 5.15:1 over a card, and 4.62:1 or more over every surface a chart sits on, the stage's included.
+- **Low: pressed fills.** In light, Pass, Warning, and captions fell to 4.12:1, 4.42:1, and 4.49:1 on a pressed row (`colorSubtleBackgroundPressed`, Fluent's pressed gray warmed); a pressed row, subtle button, or button now takes neutral background 4, `#EFE7D7` (4.60:1, 4.94:1, and 5.02:1). In dark, a pressed link was 3.13:1 on a card (Fluent's `colorBrandForegroundLinkPressed`); it's now the ramp's 110 (5.28:1). The app's Fluent Links, which take that pressed color (the Estate page's incidents, the Incidents page's steps), sit on cards: no Fluent Link sits in a row. (DataGrid's **Open** in a URL column is a plain link, in the link color: [the re-check](#the-re-check-of-f28d6320-2026-11-23).)
+- **Low, older than 2b0e46b0: the agent panel's two outline badges were invisible in light** (`components/AgentPrompts.tsx`). Fluent's subtle outline draws its text in the static inverted color, meant for a dark or brand fill: white on a white card before the earth tones, cream on cream since. They now take Fluent's informative color, 5.78:1 in light and 6.30:1 in dark.
+- **Found by testing the hover fills, beyond the review:** in dark, T5's plum in the target filter's menu was 2.89:1 on a hovered menu item, whose fill (`colorNeutralBackground1Hover`, Fluent's two steps above a card) is lighter than a hovered row's. A hovered button or menu item now takes the hovered row's fill, `#3F362F`, so the plum is 3.07:1 there and the statuses keep 4.91:1; the hover is a little subtler than Fluent's. A plum light enough for 3:1 there came closer to the other targets for color-blind viewers, or went gray. And Fluent's dark `colorBrandForegroundLinkSelected`, 4.09:1 on a card, which no Fluent component in 9.75.2 reads, is now the link's own color at rest.
+- **Low: the docs.** ADR 0030, the CHANGELOG, and the app's README said every pair met AA on every surface. They now say which: text at 4.5:1 and marks and controls at 3:1 on cards, the navigation, the page, and the stage, and on the fill of a hovered or pressed row, subtle button, button, or menu item; a pressed or selected link and a hint on cards and panels, where the app shows them; the incident band's label over the band; and every badge the app shows.
+- **The tests:** `APP_TOKENS` now lists each theme's hover and pressed fills (`states`) beside its surfaces at rest, and `src/lib/app.test.ts` holds the statuses, targets, and charts to their contrast on both; Fluent's text, brand text, and links on both, and a pressed or selected link on the surfaces at rest; the band's label with the band composited over each surface a chart sits on; and each badge the app's sources show (a scan of every `<Badge>`, with Fluent's tokens for its appearance and color) on its own fill or the surfaces. Each of the 9 fixes, reverted alone, fails one of them.
+- **Color vision:** the dark statuses' closest pairs are 0.135, 0.110, 0.097, and 0.115 apart (normal, protanopia, deuteranopia, tritanopia; 0.135, 0.114, 0.117, and 0.144 at 2b0e46b0), above the light statuses' 0.096, which are unchanged, as are the targets'. In dark, the brand's text and Fail are 0.067 apart in normal vision and 0.022 under deuteranopia: a status always has its icon and word.
+
+**Found, not changed: high contrast's hover fills.** The app's own **High contrast** theme is Fluent's `teamsHighContrastTheme`, whose hovered and pressed fills are cyan (`#1AEBFF`) under black text, while the app's status words keep their own colors: on a hovered row they're 1.03:1 to 1.53:1. It was so before the earth tones, high contrast is outside this change, and Windows forced colors are unaffected. `APP_TOKENS.contrast.states` is empty, so the tests above don't cover it. It's fixed on its own branch, for the next release: [its entry](#high-contrast-the-apps-colors-on-a-hovered-or-pressed-fill-2026-11-23).
+
+**Changed files.** `fabric/app/src/theme/fluent.ts` and `identity.ts`; `components/AgentPrompts.tsx`; `lib/app.test.ts`; ADR 0030, the CHANGELOG, the app's README, and this report: this entry, and a line in the earth tones' entry.
+
+**Validation.** On 2b0e46b0 with this commit:
+
+- **`npm run verify` passed:** the typecheck, lint, 688 tests in 36 files, the license check (136 production packages), and the build. The main chunk is 945.62 kB (270.33 kB gzip), 0.45 kB more than at 2b0e46b0. Two earlier runs, with this PC at 100 % CPU from other sessions' suites, timed out different tests (an Ask on the Incidents page, the RCA's sources, the Root cause view, and the replay's playback), each of which passed when run alone.
+- **Each fix, reverted alone, fails a test** (`src/lib/app.test.ts`, its themes): the dark brand's text at the ramp's 110, Fail `#E98081`, Manual `#75A3D2`, the band at 14 %, light's pressed fills as Fluent's, dark's pressed link as Fluent's, the badges' subtle outline, dark's button hover as Fluent's, and dark's selected link as Fluent's: 9 of 9 fail.
+- markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+
+**What its live check needs.** The deployed app in dark: hover a row of a table and a subtle button (**Ask Copilot**), open the target filter's menu and hover T5, press a link on the Estate page's incidents, and see an incident band on a chart's card; in light, press a row; and the agent panel's two badges in both themes.
+
 ### The review of 90e9d914 (2026-11-23)
 
 **Why.** The review said SHIP WITH FIXES: the Root cause page is sound, and its blindness, severity rule, counts, and address held. It found two Highs on the chat's side and two Mediums in the address. The coordinator asked for one commit after 90e9d914 before tonight's release.
@@ -7421,6 +7458,25 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **Validation.** Targeted, as asked while this PC is at full load: `catalog.test.ts` and `rules.test.ts` passed (57 tests), and the new test fails with 62e5a18f's catalog. The typecheck and eslint are clean, markdownlint found no issue, and the leak check finds nothing in what this commit adds.
 
+### The re-check of f28d6320 (2026-11-23)
+
+**Why.** The re-check of [the review's fixes](#the-review-of-2b0e46b0-2026-11-23) found them sound, and said **ship with fixes**: one dark token the fixes missed, and docs that still claimed more than the code did. It also confirmed the high contrast finding, which is older than the earth tones and goes in Wednesday's release, on its own branch. One commit, after f28d6320.
+
+- **Low: dark pressed brand text and icons.** The review's item 3 fixed `colorBrandForegroundLinkPressed`, but not the matching `colorNeutralForeground2BrandPressed`, still Fluent's `#AD633B`: a transparent button's pressed text was 3.13:1 on a card (**All findings** on the Estate and Overview pages, **Show me** in an insight, and the Trends page's button), and a subtle button's pressed icon 2.95:1 on its pressed fill (icon-only buttons such as Copy and Close). It's now the ramp's 110, `#D08F68`: 5.28:1 on a card, 4.70:1 on background 6, and 4.98:1 on the pressed fill. The test now holds a transparent button's hovered, pressed, and checked text (`colorNeutralForeground2BrandHover`, `Pressed`, and `Selected`) to 4.5:1 on the surfaces at rest, and a subtle button's icon in the same colors to 3:1 on the hovered and pressed fills.
+- **Low: the docs.** "The app's rows hold no links" (the test's comment and the review's entry) and ADR 0030's "links ... on cards and panels only" were untrue: DataGrid puts an **Open** link in a URL column, as on the Readiness page's Docs. They now say that no Fluent Link sits in a row, which is what the pressed and selected link colors need.
+- **Found with it: two plain links in the browser's blue.** DataGrid's **Open** and the Links page's **Open in Fabric** are plain anchors, which no rule colored, so they took the browser's link color (`#0000EE` in light), a color outside the theme. A rule in `styles/app.css` gives a plain link in a table or a definition list the theme's link color, which the tests hold to 4.5:1 at rest and on a hovered or pressed row: at least 5.69:1 in light and 5.27:1 in dark, on a pressed and a hovered row. The Copilot dock's, the Root cause view's, and the stage's links already had theirs.
+
+**Changed files.** `fabric/app/src/theme/fluent.ts`, `styles/app.css`, and `lib/app.test.ts`; ADR 0030, the CHANGELOG, and this report: this entry, and a line in the review's entry.
+
+**Validation.** On f28d6320 with this commit, with this PC at 100 % CPU from other sessions, so targeted runs only:
+
+- **`src/lib/app.test.ts`, its themes:** 22 passed.
+- **Each fix, reverted alone, fails a test:** dark's `colorNeutralForeground2BrandPressed` as Fluent's, and no rule for the plain links.
+- **The typecheck and lint:** `tsc` found no error, and ESLint none in the two TypeScript files this commit changes.
+- markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+
+**What its live check needs.** The deployed app in dark: press **All findings** on the Overview page and an icon-only button such as a table's Copy; and the Readiness page's **Open** and the Links page's **Open in Fabric** in light and dark.
+
 ### The re-check of 62e5a18f: a shared link's incident (2026-11-23)
 
 **Why.** The re-check said SHIP, with one Low older than 62e5a18f: a shared `#/rca` link without an incident still opened on the recipient's saved incident, because `openView` reset only the filters from the address. A saved older window key, `T1.<from>.<to>`, also became the recipient's filters, since the Root cause page reads such a key's target and minutes as filters when the address has none.
@@ -7432,18 +7488,71 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **Validation.** Targeted: `lib/app.test.ts` and the Root cause view's three suites (`app-rca`, `rca-retry`, `rca-view`) passed, 57 tests, and the new test fails with 96bf9ff7's `openView`. The typecheck and eslint are clean, markdownlint found no issue, and the leak check finds nothing in what this commit adds.
 
-### The re-review of bbdcd05c and 8e2cb06b (2026-11-23)
+### The review of 42acec35 and cb4bc479: two Mediums fixed, one Low narrowed (2026-11-23)
 
-**Why.** The re-review said **SHIP** for both, with one Low: past a target's retention, the note gave the minutes' age rounded down, so for the whole day after the retention ran out it said Query Store "no longer keeps those minutes ... it keeps 7 days, and they're 7 days old". One commit, after 8e2cb06b.
+**Why.** The review of 42acec35 (decision 2a) and cb4bc479 (the expected notes) said ship with fixes: one Medium in each commit, and one Low. The coordinator put both Mediums in today's release, as one commit ahead of the F35 work, and the Low's docs with them.
 
-- **The fix** (`rca/query-store.ts`): past the retention, the note says "they're more than 7 days old" (14 on T1 to T3), which holds at any age past it.
-- **Test:** T4's incident at its last kept minute still has its next step, and 7 days and 18 hours after it, its note says "more than 7 days old" and never "7 days old"; T1's and T3's the same around 14 days, one minute apart. It fails at 8e2cb06b.
+**Work summary.**
 
-**Changed files.** `fabric/app/src/rca/query-store.ts` and `rca/tools.test.ts`; ADR 0031 and this report.
+1. **Medium (2a): a hand edit of `GITHUB_REPOSITORY` was replaced as a rebind.** `configure-fabric.ps1` sets the GitHub values only when `github.repository` isn't the example configuration's placeholder, so with the placeholder, an edit of that line alone read as Rebind and was replaced, and the Older path never compared the values. That broke 2a's promise that an edited notebook is kept. Now:
+   - `Get-DemoFabricNotebookDefinition` returns `BoundKeys`, the parameters it set.
+   - `Get-DemoFabricNotebookState`: another value in a key the run sets is still a rebind, which an update makes. Another value in a key it doesn't set is Edited, with `EditedKeys`, in both paths. An earlier version's values are compared with that version's own, which `fabric/notebooks/published-versions.json` now records (`parameters`, written by the same writer; the 26 versions and their days are unchanged), since the live-activity notebook dropped its GitHub values on 2026-11-14. A version without them counts as edited.
+   - `FABRIC.IMPORT.<notebook>` **Not selected** says "Kept notebook ... as it is: its `GITHUB_REPOSITORY` isn't the value the demo publishes there, and this run doesn't set it, so it counts as an edit", with the fix any edit has, and its evidence names the keys (`editedParameters`).
+2. **Medium (expected notes): the notes weren't limited to a new VM.** Every generation runs every step's Test again, so a token that reached an established host's logs after its setup, or a sysadmin recovery on a T1 that already had access, became a note and a **Pass**, labeled as a new VM's by-design event; before cb4bc479, they were warnings. Now:
+   - The runner records the generation on a step's record before its Set runs (`setGeneration`). `Test-DemoVmStepSetThisGeneration` says whether any named step's Set ran in this generation, and `Test-DemoVmStepFirstSetup` whether a step never completed before. Both read state.json and say false when they can't tell, so a doubt gives a warning.
+   - The sign-in cleanup gives a note only after a setup in this generation (`Get-DemoSignInStepResult -Expected`): on T2's host, Arc onboarding (before or after the wizard), the guest's build, or its setup wizard; on the evaluation-only Arc VM, Arc onboarding or SQL Server's setup. T1's sysadmin recovery and the restart setup asks for give a note only on their step's first setup. Otherwise each is a one-off warning, as before cb4bc479.
+   - The image check needs no condition: its note is about the download its own Set just made.
+   - `Get-DemoHealthWarningNote` doesn't call a warning expected when the summary has `noteCount`: a bundle that records notes gives these events as warnings only on an established VM, where they aren't expected. An older bundle's warnings keep F32's text.
+3. **Low (2a): an edit that reproduces a published version counts as that version and is updated,** a hand edit that undoes one of the live-activity notebook's one-cell changes for example. A later release whose notebook goes back to a listed version would also let an older checkout replace it. That contradicted ADR 0021's "No downgrade" and this report's "An edit to the code is always kept". For today, both state the limit, with the way to keep such an edit (change anything else in the code); the Fabric guide, troubleshooting, and the CHANGELOG say it too. The full fix, recording the version each environment last uploaded, is left for a decision.
 
-**Validation.** On 8e2cb06b with this commit: the type check and lint passed, and so did `src/rca` and `src/copilot`'s 384 tests, one of which, `ask-blind.test.tsx`'s Overview, timed out on this loaded PC and passed when its file ran alone (32 of 32). markdownlint found no issue, and the leak check finds nothing in what this commit adds.
+- **Docs:** [ADR 0021's amendment](adr/0021-fabric-resources-by-name.md#amendment-2026-11-23-an-update-brings-the-notebooks-that-nobody-edited-up-to-date-follow-ups-decision-2a) (the values, the outcome, and "No downgrade, with one limit"), [ADR 0012's amendment](adr/0012-validation-model.md#2026-11-23-a-new-vms-by-design-notes-are-information-so-a-ready-vm-is-a-pass) ("Only a new VM's"), the [Fabric guide](../fabric/README.md#import-or-update-the-notebooks), `vm/health/README.md`, three troubleshooting rows, both CHANGELOG entries, decision 2a's risk above, and this report.
 
-**What its live check needs.** Nothing beyond part 1's and the review's: a T4 incident more than 7 days old reads "more than 7 days old".
+**Changed files.** `scripts/modules/DbHubDemo/Public/Get-DemoFabricNotebookDefinition.ps1`, `Private/FabricNotebookVersionHelpers.ps1`, `Public/Import-DemoFabricNotebook.ps1`, `fabric/notebooks/published-versions.json`, `Private/ValidationHelpers.ps1`; `vm/bootstrap/lib/Runner.ps1`, `vm/bootstrap/lib/State.ps1`, `vm/bootstrap/DbHubDemo.Vm.psm1` and `.psd1`, `vm/bootstrap/HostSteps.ps1`, `vm/bootstrap/Invoke-EvalArcVmBootstrap.ps1`, `vm/bootstrap/Invoke-SqlVmBootstrap.ps1`, `vm/hyperv-guest/GuestSql.ps1`; tests in `tests/unit/DbHubDemo.Fabric.Tests.ps1`, `Fabric.Notebooks.Tests.ps1`, `Vm.StateMachine.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, `Vm.SqlVmPlan.Tests.ps1`, and `DbHubDemo.Validation.Tests.ps1`; the docs above.
+
+**Validation.**
+
+- **New tests:**
+  - `DbHubDemo.Fabric.Tests.ps1`: a `GITHUB_REPOSITORY` changed by hand while the run doesn't set it is kept, in this version and in an earlier one, naming the key; the same value is bound again when the run sets it; and, with the list read as `deploy.ps1` reads it, a version from before 2026-11-14 with its own GitHub values is updated, and the same version with `GITHUB_REPOSITORY` changed is kept.
+  - `Fabric.Notebooks.Tests.ps1`: each listed version has its file's values, and the current one's are the file's.
+  - `Vm.StateMachine.Tests.ps1`: the runner records `setGeneration` for the steps whose Set ran, generation by generation.
+  - `Vm.HostPlan.Tests.ps1`: the host's sign-in cleanup is a note after Arc onboarding or the guest's build in this generation, and a one-off warning when the onboarding ran in an earlier one.
+  - `Vm.SqlVmPlan.Tests.ps1`: the sysadmin recovery is a note on T1's first setup and a one-off warning when the step completed before; the restart is a one-off warning on an established T1.
+  - `DbHubDemo.Validation.Tests.ps1`: a warning with the cleanup's text from a bundle that records notes isn't called expected.
+- **On cb4bc479's code with the new tests:** in the six test files, 10 fail and 321 pass. The 10 are each new or changed test: the four `GITHUB_REPOSITORY` tests, the list's values, the runner's `setGeneration`, the host's sign-in cleanup, T1's restart and its sysadmin recovery, and the warning that isn't called expected.
+- Pester with StrictMode, one run at a time: every `Vm.*.Tests.ps1` with DbHubDemo.Validation, 669 passed, 0 failed; DbHubDemo.Fabric, FabricItem, FabricTrack, FirstRun, HistorySnapshot, Lifecycle, OneCommand, Tracks, and JumpstartStatus with Fabric.Notebooks and Fabric.ControlNotebook, 1,036 passed, 0 failed, 69 skipped; and Repo.Conventions, FunctionNames, LifecycleScripts, NeutralWording, and TestAzGuard, 200 passed, 0 failed; 0 az calls.
+- PSScriptAnalyzer 1.25.0 with the repository's settings: 0 findings on the 18 changed PowerShell files. markdownlint: clean. The PowerShell files are ASCII, every changed file has LF line endings, and the VM files keep to Windows PowerShell 5.1's syntax (`Repo.Conventions`).
+
+**Risks.**
+
+- **Not run live:** a net-new deployment's first `validate.ps1` should show `INFRA.HEALTH.ARCHOST01` and `INFRA.HEALTH.SQLVM01` as **Pass**, naming the notes, and an update with no new setup none. That `deploy.ps1` keeps a notebook whose `GITHUB_REPOSITORY` someone changed needs the 2a live proof first, that Fabric's ipynb export gives the file's fingerprint.
+- **A state.json from before this commit** has no `setGeneration`, so the first bundle with this commit gives the cleanup's event as a warning, not a note, on a host whose onboarding ran before it: the safe side. A new host records it from its first Set.
+- **The Low stays open:** an edit that makes a notebook's code exactly a listed version's is still updated.
+
+### The re-check of ea1ea20f: the notes' bundle told apart by health.json, and the cleanup's gate narrowed (2026-11-23)
+
+**Why.** The re-check of ea1ea20f said ship with fixes: the bindings' Medium and the Low's docs are closed, and two findings remained in the expected notes' gate, both for tonight's release.
+
+**Work summary.**
+
+1. **Medium: `status.ps1 -Detail` still called an established VM's warnings expected.** `Get-DemoHealthWarningNote` told a bundle that gives the by-design notes as notes by the summary's `noteCount`, but that tells the view, not the bundle: `Get-DemoVmHealth` sends the repository's own `Get-DemoHealth.ps1`, whose summary had `noteCount` for an older health.json too, 0, and whose full view, which `status.ps1 -Detail` reads, never has it. So the full view said "That's expected" and "Nothing to do" for an established host's sign-in cleanup and a later T1 sysadmin recovery or restart, and the summary didn't say it for an older bundle's own expected warnings. The reviewer ran the real script over both formats in both views. Now:
+   - `Get-DemoHealth.ps1 -View Summary` prints `notes` and `noteCount` only when health.json has `notes`, which every bundle since cb4bc479 writes, even empty, and an older one never does. It runs from the repository on every read, so this holds for every VM at once.
+   - `Get-DemoHealthWarningNote` takes health.json's `notes`, in the full view, or the summary's `noteCount` as a bundle that records notes.
+2. **Low: the cleanup's gate counted `GuestVm`,** whose Test fails while the guest isn't running with automatic start, so its Set also starts a guest that was only off, on an established host, and a token cleared later in that pass became a note and a **Pass**. The reviewer ran the real runner through three generations. Now the host's gate is Arc onboarding (before or after the wizard), `GuestImage`, and `GuestVhdx`, whose Tests read only files and the Arc marker: their Sets run only on a new host or a rebuilt guest. Two more members had the same flaw, so they're out too: `SqlSetupWizard`, whose Set waits for a guest that's off, which matters on a host that kept a finished `PaygWizard` guest; and, on the evaluation-only Arc VM, `SqlUnattendedInstall` and `SqlSetupWizard`, whose Tests fail while SQL Server's service is stopped. That VM's gate is Arc onboarding alone, which leaves the sign-in data and runs on every new one before the cleanup.
+
+- **Docs:** [ADR 0012's amendment](adr/0012-validation-model.md#2026-11-23-a-new-vms-by-design-notes-are-information-so-a-ready-vm-is-a-pass) ("Only a new VM's"), `vm/health/README.md`, and this report.
+
+**Changed files.** `vm/health/Get-DemoHealth.ps1`, `scripts/modules/DbHubDemo/Private/ValidationHelpers.ps1`, `vm/bootstrap/HostSteps.ps1`, `vm/bootstrap/Invoke-EvalArcVmBootstrap.ps1`, `vm/hyperv-guest/GuestSql.ps1` (a comment); tests in `tests/unit/DbHubDemo.Validation.Tests.ps1`, `Vm.WorkloadSteps.Tests.ps1`, `Vm.HostPlan.Tests.ps1`, and `Vm.EvalArcVm.Tests.ps1`; the docs above.
+
+**Validation.**
+
+- **New tests:** the real `Get-DemoHealth.ps1` over an older health.json and a newer one, in both views, through `Get-DemoHealthWarningNote`: the older bundle's T1 recovery is expected in both, and the newer one's in neither; the summary of an older health.json has no `notes` or `noteCount`, and a newer one's with no notes has `noteCount` 0; the host's cleanup is a warning when only `GuestVm` ran in the generation, and a note when `GuestImage` or `GuestVhdx` did; the evaluation VM's cleanup is a warning when only `SqlUnattendedInstall` ran in it, and a note after its Arc onboarding.
+- **On ea1ea20f's code with the new tests:** in the four test files, 4 fail and 232 pass: each new or changed test.
+- Pester with StrictMode, targeted: Vm.HostPlan, Vm.EvalArcVm, Vm.WorkloadSteps, and DbHubDemo.Validation, 236 passed, 0 failed, 0 az calls.
+- PSScriptAnalyzer 1.25.0 with the repository's settings: 0 findings on the 9 changed PowerShell files. markdownlint: clean. The PowerShell files are ASCII, every changed file has LF line endings, and the VM files keep to Windows PowerShell 5.1's syntax.
+
+**Risks.**
+
+- **Not run live,** as before: a net-new deployment's first `validate.ps1` and `status.ps1 -Detail` should show the notes in a **Pass**, and an established VM's later events as warnings that aren't called expected.
 
 ### The RCA release: the Incident RCA merged onto the release's follow-ups (2026-11-23)
 
@@ -7489,6 +7598,821 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 **A test that the date broke, not the merge.** `Fabric.Notebooks.Tests.ps1`'s "keeps a staged file it wrote nothing from" (73149836) staged its file as `20261120T172500Z-...`, and the activity notebook's inbox sweep deletes a file staged more than 24 hours ago, so the test has failed on any branch since 2026-11-21 17:25 UTC. Its file is now named from the time it runs, as the sweep's own test names its files.
 
 **The upgrade from f780670e.** One `./scripts/deploy.ps1`, as from b059c91 (the RCA's [upgrade matrix](adr/0031-incident-rca.md)): it updates the runner, the bundle, the runbooks (`CONTROL.RUNBOOKS`), the notebooks (when `fabric.importNotebooks` is true, or with the units below, when nobody edited them), the history model's RCA tables once the activity notebook has run (`FABRIC.SEMANTICMODEL.RCA`), and the Insights app. Nothing in the follow-ups changes that path. What the merge changes there: the month's estimate is $0.36 higher, far under every ceiling, and a taken-over session's end exports its evidence once the runbooks are republished; before that, an end from the follow-ups' runbooks says "the control's runbook is from before" the RCA, which the update clears.
+
+**The units merged after it (2026-11-23, before the 2 PM cut-off).** Each is one merge of the reviewed commit the coordinator named, never a branch head with later work on it, and each fix it needed is its own commit after it.
+
+| Unit | Merged as | Conflicts, and how | Interactions |
+|---|---|---|---|
+| Decision 2a and the expected-notes Pass (`marcbushong-microsoft-follow-ups-next` up to cb4bc479: 42acec35, cb4bc479) | ad444490 | `README.md`, `docs/deployment.md`, and `FabricCapacityHelpers.ps1`: the RCA's notes and steps kept, and both sides' fixes through 2a's `Get-DemoLiveNotebookUpdateFix`; the report | 04790b10: the RCA's own fix lines (`FABRIC.RCA.EVIDENCE`, the history snapshot's, and the model plan's) name `./scripts/deploy.ps1` for notebooks nobody edited, as 2a's do. c64fc166: `fabric/notebooks/published-versions.json` written again with `DBHUB_WRITE_NOTEBOOK_VERSIONS=1`, so a workspace deployed from the RCA line counts its notebooks as earlier versions, never as edits. The units' three CHANGELOG lines move to `[Unreleased]`: they ship with this release, not with #67 |
+| The earth-tone theme (2b0e46b0) | ead0ad71 | The report | Every token the Root cause view reads is still defined |
+| Query Store unit 1, parts 1 and 2 (a2f776db, with 319b3ae1) | 5ee866da | `azuredeploy.json`, built again from the merged `infra/main.bicep` with the pinned Bicep 0.47.16 (the follow-ups' `t5PrivateAccess` and `t5WasPublic`, and part 2's `queryStore`); ADR 0019 (F34 and F37, then Query Store, by date); the CHANGELOG; the report | The follow-ups changed no TMDL, so `npm run guide:build` rewrites nothing |
+| The session status kept through updates (af7e8f5b, with 40124992; then its re-check, 369a6dfa) | f76521f1, 61160c57 | `DbHubDemo.ActivityControl.Tests.ps1`: the fake Azure keeps F28's `controlTemplateError` and the unit's variable state, and both sides' cases; troubleshooting; the CHANGELOG; the report | `Invoke-DemoActivityControlTemplate` merged cleanly: the variable is read before the deployment, and F28's quota refusal is still its own **Fail**. An update from f780670e finds the variable, which its `control.bicep` created, and keeps it |
+| Query Store unit 1's review and part 3 (8e2cb06b, with bbdcd05c), and its last fix (e8b93dbd) | 1efdbfc9, 83a6fcb1 | `vm/bootstrap/Invoke-DemoWorkloadControl.ps1`: the relay reads both F20's bounds and part 3's `queryStore` from the runner's whole status; ADR 0012's Workload row; the CHANGELOG; the report | 892891a1: validate.ps1's one status read now carries both in one result line. Query Store's node, under 400 characters, stays; the bounds go first when the line wouldn't fit (`boundsCut`), as F20 had them. A new test pins both cases. Part 3 adds no Run Command, so F31 doesn't apply |
+| The organized Root cause (90e9d914) | 142368c0 | ADR 0031 (the theme's look, with the unit's sentence on the tokens); `fabric/app/README.md` (the unit's Root cause row, the follow-ups' Findings row); `rca/playbook.ts` (the unit's triage step, Query Store's explain step); the report's RCA summary and entries | The theme's contrast tests and the unit's token test pass on the merged stylesheet |
+| The theme's review fix and its last Lows (f28d6320, 6da522e6) | f786375f, 32a2dcac | The report | The theme's, the Root cause view's, and the blind chat's tests pass on the merged stylesheet |
+| The organized Root cause's review fix, its catalog fix, and its shared link fix (62e5a18f, 96bf9ff7, bd8892f6) | e21019ce, c096d5e6, 54a580df | `lib/app.test.ts` (the fix's `openView` import, the theme's imports); `rca/playbook.ts` (the fix's triage step, Query Store's explain step); the report | `rca/tools.ts` merged cleanly with Query Store unit 1's changes, and the typecheck passes |
+| The review fix and the re-check fix for 2a and the expected notes (ea1ea20f, b5c8da4c) | aa858084, 5c03e456 | The CHANGELOG (the rewritten bullets replace the moved copies under `[Unreleased]`); `fabric/notebooks/published-versions.json`, written again by its writer under the fix's version rule, with the RCA line's notebook versions; the report | Merged after the full Pester run below ended, since they change the module and the VM bootstrap that it tested |
+
+**The upgrade from f780670e, with the units.** Still one `./scripts/deploy.ps1`. It now also brings the notebooks up to date when nobody edited them, with `fabric.importNotebooks` false too (2a), and the activity notebook then runs once for the RCA tables; sets T4's two Query Store parameters, which are dynamic, so nothing restarts (not proven live); and keeps the session control's status variable. `validate.ps1`'s `T1.QUERYSTORE` and `T2.QUERYSTORE` read the runner's status, so they say the runner is from before 2026-11-23 until the update has sent the VMs the new runner and relay.
+
+**Validation (2026-11-23, one suite at a time on a PC at 100 % CPU).**
+
+- **Pester:** every file in `tests/unit` (98) in one process, under StrictMode Latest with the Azure CLI guard, at 83a6fcb1: 5,644 passed, 4 skipped, and no call reached the Azure CLI. One failed, Teardown's "stay out of the static run", which fails on this PC on both sides before the merge and passes in CI. The units merged after it ran their suites at their merges; at 5c03e456, the 13 suites the last two units and their neighbors touch (`DbHubDemo.Fabric`, `.Validation`, `.Lifecycle`, `.FirstRun`, and `.HistorySnapshot`, `Fabric.Notebooks`, the `Vm.*` plan, state, workload, and image suites, and `Repo.Conventions`) passed, 1,112 tests. The RCA's contract tests (`Rca.Contract.Tests.ps1`) are in the full run.
+- **The app** (`fabric/app`) at 5c03e456: the typecheck, lint, Vitest (770 tests in 40 files, with `--maxWorkers=3`), the license check (136 production packages), and the build pass. `npm run verify` with Vitest's default workers passed its typecheck and lint, and on this loaded PC timed out 3 of 756 tests at 15 s, which pass alone.
+- **`dotnet test`** (the workload runner): 813 tests, 792 passed and 21 skipped (those that need a live database), none failed.
+- **PSScriptAnalyzer** 1.25.0, with each path's settings, on the 143 PowerShell files changed against either side: no findings.
+- **markdownlint-cli2** 0.23.3: no issues in 152 files.
+- **Bicep** 0.47.16: `azuredeploy.json` matches a build of `infra/main.bicep`, and it and the five standalone templates build and lint.
+- **The leak check** (`git log -G` with the demo's real resource names, b059c91..HEAD) prints nothing.
+
+**On PR #69, after it opened at 32aaac6c (2026-11-23),** each a fast-forward of `rca-release`: 776097fd, the secret scan's fix (the RCA incident tests' episode keys, ignored by fingerprint and built at run time); 963c802f, stubs for the service cmdlets in CI's Linux PowerShell job; f16b9cb9, C0's RCA-XE-00 fix (its join timed out on SQL Server 2022 CU25, so the observer's event session started up to about 15 minutes late on a new T1; it reads `sys.dm_xe_object_columns` alone); 9d873f81, C0's fix for the live proof's NO-GO at f16b9cb9; and 7bc10e89, its review's follow-up: the session's answer key leaves out a run that began before the boundary, the span's last export with no session. The NO-GO: a Run all started with the VMs running lost sqlvm01's first export window, about 30 minutes of T1, T3, T4, and T5 capture, because the start's export had no session and cut each target at its watermark, and T3's, read every 30 minutes, began the first re-check's document before the session, so the runbook left it out. The runner now records when an export with no session last read the span (`SessionlessUtc` in `export.json`), and a control session's export starts every target's window there at the earliest, while exports with no session cut as before; only the runner changes, and `./scripts/deploy.ps1`'s update ships it.
+
+### F35 design (i): a kept value per row, groundwork (2026-11-22)
+
+**Why.** F35's query-time version was withdrawn: on Final tests' long history, the 7-day Performance query took 6.84 times today's, or failed at F4's memory limit ([ADR 0014](adr/0014-notebook-role-and-capacity.md)). Design (i) moves the rule to save time: each row of the history's telemetry snapshots gets the value it keeps, so the model sums kept values and its measure stays simple. The owner decides on (i) on Monday. Until then, the coordinator asked for groundwork only: the rule in Python, reduced to a kept value per row, checked on shared cases against the TypeScript rule (`finest-per-interval.ts`, with `snapshot-value.ts` as the per-row reference), with no notebook, model, or script change.
+
+**Work summary.**
+
+- **`fabric/history/kept_value.py`** (new): the rule, in Python 3's standard library only (no Spark or pandas), so a notebook cell, a Livy statement, and the tests can run the same code. `kept_values(rows)` gives each row its kept value:
+  - a point (a save's rows of a series at one bin) that no finer save's rows reach keeps each row's value;
+  - a point that finer saves' rows cover keeps None in each row;
+  - otherwise a total keeps what's left of it after the finer rows in its interval, never below 0, split over its rows by their values (evenly when they sum to 0), and a maximum or an average keeps each row's value only where it's higher than theirs;
+  - off the bin grid, and for a row with no bin, the newest capture's rows keep their values.
+  `bin_values(rows, kept)` reads them as the model would, per series and bin: the sum for a total, and the highest of each save's sum for a maximum or an average.
+- **The shared cases** (`fabric/history/kept-value-cases.json`, new): `fabric/app/src/data/kept-value-cases.test.ts` writes them from `snapshotValues` with `DBHUB_WRITE_KEPT_VALUE_CASES=1`, and otherwise checks that the file is current. 14 named cases (among them the reviews' and Final tests' probes: 15:15's 810, the replica lag's 34 and 8, the stop save's 4,500, the partial-row bound's 4,320, and the peaks' 30 and 70, each pinned) and 20 seeded random histories: 34 cases, 1,207 bins.
+- **The Python check** (`tests/unit/Fabric.History.Tests.ps1`, new): every bin of the shared cases has the TypeScript rule's value within 1e-9 of the larger, the bin lists match, and Python's lists of analyses and metrics equal TypeScript's; a 2:1 split of a remainder over two files, a covered point's None, and a lone point kept whole; and the times as the app reads them. It's skipped when no Python 3 answers `--version` (`DBHUB_TEST_PYTHON` names one).
+- **Not used yet:** no notebook, model, script, or doc other than this report changes. The design note with the estimate is in the coordinator's material for decision 3.
+
+**Changed files.** New: `fabric/history/kept_value.py`, `fabric/history/kept-value-cases.json`, `fabric/app/src/data/kept-value-cases.test.ts`, and `tests/unit/Fabric.History.Tests.ps1`. This report.
+
+**Validation.**
+
+- vitest: the shared cases' test passes (6 tests), and the app's whole suite passed (392 of 392) before the base moved from 4a6a7b36 to 4e0126d9, which changed no app code; typecheck and lint are clean. Pester with StrictMode: `Fabric.History` passes (3) with Python 3.11.9, and skips all 3 where `python3` and `python` are only the Windows Store's aliases, as on this PC. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped. PSScriptAnalyzer: no findings in the new test file. markdownlint: clean. The new files are ASCII, with LF line endings.
+- **The cases catch the rule's parts** (each changed in a copy of the module): with the older save winning on the same grain, 180 bins differ; with the coarser save winning, 538; with a total's remainder not clamped at 0, 50; with a peak never kept in part, 6. A remainder split evenly instead of by the rows' values changes no bin, since a bin sums its rows; the per-row test catches it.
+- **One part they can't catch:** the dense-cover shortcut (a point whose finer rows fill every slot of its interval is covered without building pieces) changes no bin when removed. It's equivalent to the general path, which reaches the same answer, so it's kept to mirror the TypeScript rule, as an optimization.
+
+**Risks.**
+
+- None for existing deployments: nothing runs this code yet.
+- Python's float sums follow TypeScript's order (rows and inserts as written), so the bins match to 1e-9 of the larger; a notebook that reorders rows before the rule could differ in the last digits.
+
+### F35 design (i) groundwork: the review's fixes (2026-11-22)
+
+**Why.** 201a6666's review of 88ece0f9 found the rule a faithful port, with two Lows and a design note.
+
+- **Times on Python 3.10 and older:** `to_ms` read a fraction of other than 3 or 6 digits as no time, because `datetime.fromisoformat` before Python 3.11 reads only those. Fabric Runtime 1.2 runs Python 3.10. There, "…T17:09:30.1" and .NET's 7-digit "…T17:09:30.1070000Z" read as no time, while the app's `toDate` reads both. It fails silently: a `CapturedAt` read as no time drops that save's rows, and a `Bucket` makes a binned row off the grid.
+- **No case reached a fourth finer save:** the random cases drew 2 to 4 saves, so rank 4 and later (`kept_value.py`'s level 4) never ran.
+- **The cost:** each point read every point and every save of its series, as `snapshotValues` does, so the work grew with the square of a series' history. That's fine for one save's day either side of its window, but not for a backfill over months.
+
+**Work summary.**
+
+- **`to_ms`** pads or cuts a fraction to 6 digits before `fromisoformat`. It cuts as the app's Date does: V8 reads ".9999999" as 999 milliseconds, not the next second (checked with Node 24).
+- **Rank 4 and later:** a named case has four 1-minute saves and a 5-minute one in one day point's 15-minute interval, and 10 random cases (a new seed) have 5 saves each. The first 20 random cases are unchanged, byte for byte: 45 cases and 1,712 bins, where there were 34 and 1,207.
+  - **What the named case shows:** both rules now take each finer save against every earlier one, as `finestPerInterval`, the shared function of part 1, takes each point against every one it kept before: 15:15 to 15:30 totals 900, the minutes' 130 and the day save's 770. As first written here, `snapshotValues` and this rule took the fourth and later saves against the first three only, so where those overlapped each other, a coarse total lost that time twice, and the case totaled 848. `finestPerInterval` never did; [a later section](#f35-design-i-groundwork-every-finer-save-against-every-earlier-one-2026-11-22) changes both rules.
+- **The index:** a series' points are kept by bin (`_Points`), and its saves in the order their rows start (`_Saves`). Each point bisects to the bins in its interval and to the saves that can reach it, instead of reading them all. The pieces keep the rows' order, so every sum adds as before.
+- **Docs:** this report, and the design note's write-time and backfill rows (in the coordinator's material for decision 3).
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/app/src/data/kept-value-cases.test.ts`, `tests/unit/Fabric.History.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **The same answers:** the indexed rule gives exactly 88ece0f9's kept values, every float and every None, on the 45 shared cases and on 2,000 random histories of every kind (387,283 rows: totals, peaks, Azure Monitor with hourly metrics, off the grid, missing values, and two files).
+- **The cost,** one series of a demo's daily mix with 5 % of its finer bins missing (two 90-minute sessions at 1 minute, a 6-hour stop save at 5 minutes, and a day save at 15 minutes), on this PC with Python 3.11:
+
+  | Days | Rows | 88ece0f9 | Indexed |
+  | --- | --- | --- | --- |
+  | 7 | 2,341 | 0.26 s | 0.07 s |
+  | 30 | 10,073 | 5.13 s | 0.26 s |
+  | 90 | 30,172 | 43.85 s | 0.82 s |
+
+  Without the gaps, dense saves take the cover shortcut and the old rule's scan hardly runs (0.03 s for 7 days).
+- **The cases catch the rule's parts** (each changed in a copy of the module): the older save winning on the same grain, 310 bins; the coarser save winning, 675; a remainder not clamped at 0, 98; a peak never kept in part, 7; level 4 and later dropped, 1; and each rank taken against all earlier ones, 1, the named case's 15:15 bin (828 and 780, where this commit's rule gave 728; the later section makes the latter the rule). An even split changes no bin, and the per-row test catches it; the dense-cover shortcut still changes none.
+- **Times:** `Fabric.History` passes on Python 3.11.9 and 3.10.11 (the embeddable package, signed by the Python Software Foundation, outside the repo). On 3.10 with 88ece0f9's rule, the times test fails: ".1", ".1070000Z", and ".9999999+00:00" read as no time.
+- **And:** vitest (7 tests in the cases file), typecheck, and eslint clean; PSScriptAnalyzer, no findings in the test file; the new and changed files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+
+**Risks.**
+
+- None for existing deployments: nothing runs this code yet.
+- The saves' index bounds each point's search by its series' longest save, so one very long save widens every point's search there; the answers stay the same.
+
+### F35 design (i) groundwork: every finer save against every earlier one (2026-11-22)
+
+**Why.** A fresh reviewer of 79a35e57 found the index and `to_ms` clean, with one Low: the section above said the fourth-and-later limit was part 1's too, but `finestPerInterval` takes each point against every one it kept before. Only `snapshotValues` and this rule took the fourth and later finer saves against the first three. The coordinator's decision: remove the divergence, in `snapshotValues` (4944e22d, on the follow-ups branch) and here, so design (i) matches the app's views exactly. (i)'s build still has to make that true: the rules still differ in [the known differences](#f35-design-i-groundwork-two-known-differences-pinned-2026-11-22) that the shared cases pin, which it aligns.
+
+**Work summary.**
+
+- **`kept_value.py`** takes each finer save's rows against every earlier save's rows, as `snapshotValues` now does, for the finer saves whose rows reach the part of the interval that the coarser save's window keeps. [A later section](#f35-design-i-groundwork-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) ranks those whose rows reach only the part it cuts off too.
+- **The shared cases,** written again from the TypeScript rule: only the named case changes, its name and its 15:15 bin, from 728 to 780, so 15:15 to 15:30 totals 900. The other 44 are unchanged, the 10 random cases with 5 saves included: none of them has the double loss.
+- **Parity with `finestPerInterval`,** a new test: each series' total or peak, hour by hour, from `snapshotValues`' bins and from `finestPerInterval`'s kept points, given the rows as `f35Check` gives them. That's 105 hours (76 of totals, 29 of peaks) in 44 cases; the 45th is off the bin grid, which `finestPerInterval` never sees.
+  - The two agree on all but one hour, and that difference isn't about ranks. In `random 11`, the newer of two 900-minute saves holds 3 rows of T2's sessions, 30 minutes apart at their closest, and no other series. `finestPerInterval` reads a save's step from its bins, 30 minutes here, where `snapshotValues` reads the notebook's 15 from its window, so 15:00 to 16:00 peaks at 29 by one and 43 by the other. The test pins that one difference, so any other fails it.
+  - Each of the notebook's analyses is its own capture and shows its step through its own series only. `sessions` and `wait_deltas` hold only bins with activity, so a save with scattered activity can read coarser, as `random 11` does. Until the save's declared grain lands, this affects `f35Check`, not the app's views ([a later section](#f35-design-i-groundwork-what-random-11s-step-difference-comes-from-2026-11-22)).
+  - With the fourth and later saves against the first three, the named case differed too: 3,548 and 3,600 from 15:00 to 16:00.
+- **Docs:** this report, where the section above's named-case bullet now says what each rule does; and the design note's rank paragraph, in the coordinator's material for decision 3.
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/app/src/data/kept-value-cases.test.ts`, and this report.
+
+**Validation.**
+
+- **It fails without the change:** with the previous rule, `Fabric.History` fails on the named case's 15:15 bin, 728 where the cases have 780. With this one, it passes on Python 3.11.9 and 3.10.11.
+- **The same answers, indexed or not:** with the same change in 88ece0f9's unindexed port, the two give exactly the same kept values on the 45 cases and on 2,000 random histories of every kind (387,283 rows, 2 to 8 saves a series). Against the previous indexed rule, only the named case differs; no random history does.
+- **The cases catch the rule's parts** (each changed in a copy of the module): the older save winning on the same grain, 310 bins; the coarser save winning, 675; a remainder not clamped at 0, 98; a peak never kept in part, 7; ranks 4 and later dropped, 1, and the fourth and later against the first three, 1, both at the named case's 15:15 bin (828 and 728, where the rule's is 780). An even split changes no bin, and the per-row test catches it; the dense-cover shortcut changes none.
+- **The cost:** the section above's daily mix, and a busy variant with six 20-minute sessions 5 minutes apart each morning, so up to six 1-minute saves reach one 15-minute interval. Best of 3 runs, in each of two rounds, with Python 3.11 on this PC:
+
+  | Mix, 90 days | Rows | The first three only | Every rank |
+  | --- | --- | --- | --- |
+  | The daily mix | 30,172 | 0.98 s, 1.11 s | 0.79 s, 0.96 s |
+  | Busy | 40,445 | 1.50 s, 1.64 s | 1.53 s, 1.39 s |
+
+  The difference is within the rounds' own spread. The kept values are the same in both mixes: the busy mornings' sessions hold all of each 15-minute interval they reach, so that mix measures the work only.
+- **And:** vitest, the cases file's 8 tests and the app's whole suite, 395 of 395 in 22 files; typecheck and eslint clean; markdownlint clean; the changed code files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+
+**Risks.**
+
+- None for existing deployments: nothing runs this code yet.
+- Where a save's bins don't show its step, as in `random 11`, this rule and `finestPerInterval` read the save differently. Each of the notebook's analyses is its own capture and shows its step through its own series, and `sessions` and `wait_deltas` hold only bins with activity, so a save with scattered activity can read coarser. Until the save's declared grain lands, this affects `f35Check`, not the app's views.
+
+### F35 design (i) groundwork: a finer save where a window cuts the interval off (2026-11-22)
+
+**Why.** The review of 4944e22d and of the section above's change found taking each rank against every earlier one correct in both rules, with two Lows. The first is in both rules, and older than that change: a coarser point ranked only the finer saves whose rows reach the part of its interval that its save's window keeps. So a finer point that straddles the window's cut kept all it held, and the coarser remainder lost the minutes they share twice. [The follow-ups' section](#the-review-of-4944e22d-a-finer-save-where-a-window-cuts-the-interval-off-2026-11-22) has the reviewer's case and when it happens; 67f08e7d changed `snapshotValues` there, and this makes the same change here. The second Low is [the next section's](#f35-design-i-groundwork-what-random-11s-step-difference-comes-from-2026-11-22).
+
+**Work summary.**
+
+- **`kept_value.py`** chooses a coarser point's finer saves by its whole interval: the saves the index finds from its bin to the bin's end, whose rows reach that interval. The check that one finer save covers it, and its own remainder, stay on the part its window keeps, as in `snapshotValues`.
+- **The shared cases,** written again from the TypeScript rule: the reviewer's case, "a finer save only where a coarser save's window cuts its interval off", with a pin: its 15:15 bin is 28, and 15:15 to 15:30 totals 96. The file's diff inserts that case's 33 lines and changes nothing else: 46 cases and 1,720 bins, where there were 45 and 1,712.
+- **Parity with `finestPerInterval`** now covers 106 hours (77 of totals, 29 of peaks) in 45 cases, and still differs only at `random 11`'s hour. The test's comment says what the previous choice gave in the new case: 136 and 156 from 15:00 to 16:00.
+- **This report:** the section above no longer says `kept_value.py` takes every finer save as `snapshotValues` does without that limit. The design note's rank paragraph says so too, in the coordinator's material for decision 3.
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/app/src/data/kept-value-cases.test.ts`, and this report.
+
+**Validation.**
+
+- **It fails without the change:** with 6c9d9b75's `kept_value.py`, `Fabric.History` fails on the new case alone, whose 15:15 bin is 8 where the cases have 28. With this one, it passes on Python 3.11.9 and 3.10.11.
+- **And without 67f08e7d's:** with `snapshotValues`' previous choice, in a scratch copy, the cases test fails three ways: the file (that bin, 8 where it holds 28), the pin, and parity (136 and 156).
+- **The reviewer's checks, in Python:** on the follow-ups' section's 30 histories of the three producers with the review's timing (97,438 rows), `kept_values` and `bin_values` give each of `snapshotValues`' 63,330 bins the same value, where the previous rule differs in 36 bins, in 22 histories. None of the 45 earlier cases' 1,712 bins changes.
+- **The same answers, indexed or not:** with the same change in 88ece0f9's unindexed port, the two give the same kept values on the 46 cases and on 2,000 random histories of every kind (387,283 rows).
+- **The cases catch the rule's parts** (each changed in a copy of the module): the older save winning on the same grain, 310 bins; the coarser save winning, 682, 7 of them in the new case; a remainder not clamped at 0, 98; a peak never kept in part, 7; ranks 4 and later dropped, 1; the fourth and later against the first three, 1; and finer saves chosen by the part a window keeps, 1, the new case's 15:15 bin. An even split changes no bin, and the per-row test catches it; the dense-cover shortcut changes none.
+- **The cost:** the every-rank section's two 90-day mixes, best of 3 runs, in each of five rounds, with Python 3.11 on this PC. The daily mix took 1.03 to 1.26 s, against 0.93 to 1.06 s with the previous choice; the busy one, 1.45 to 1.65 s against 1.34 to 1.79 s. The medians differ by 0.07 s and 0.04 s, within the rounds' spread, and the kept values are the same.
+- **And:** vitest, the cases file's 9 tests and the app's whole suite, 397 of 397 in 22 files; typecheck and eslint clean; markdownlint clean; the changed code files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames: 135 passed, 3 skipped.
+
+**Risks.**
+
+- None for existing deployments: nothing runs this code yet.
+- As in `snapshotValues`, more finer saves are ranked where a window cuts a coarser interval: those whose rows reach the part it cuts off. An answer changes only where one of their rows straddles the cut.
+
+### F35 design (i) groundwork: what random 11's step difference comes from (2026-11-22)
+
+**Why.** The same review's second Low: the parity test's pin of `random 11`'s hour, and [the section on every rank](#f35-design-i-groundwork-every-finer-save-against-every-earlier-one-2026-11-22), said that a save of the notebook's shows its step through its other series, MaxCPU in each bin its targets ran. It doesn't, and the pin's numbers were right: 30 minutes against 15, and 43 against 29.
+
+- `finestPerInterval` reads a step for each capture, the smallest gap in that capture's series, keyed by its capture time and family (`finest-per-interval.ts`). The notebook stamps each analysis with its own capture time: `add_snapshot` reads the clock at each call (`NB_DatabaseHub_LiveActivity.ipynb`). So `cpu`, `sessions`, `wait_deltas`, `gauges`, `counter_deltas`, and `storage_io` are six captures of one run, and MaxCPU sets no other analysis's step.
+- `sessions` keeps only the demo database's active sessions, and `wait_deltas` only the bins with waits (`WaitMs > 0`). So a save whose activity is scattered, like a day save with no session in it, can read coarser, as `random 11` does.
+- The coordinator's decision: reword the three places, change no rule, and keep the pin.
+
+**Work summary.**
+
+- **The pin's comment,** the every-rank section's parity bullet and its risk, and the design note's sentence now say that each analysis is its own capture and shows its step through its own series; that `sessions` and `wait_deltas` hold only bins with activity, so a save with scattered activity can read coarser, as `random 11` does; and that until the save's declared grain lands, this affects `f35Check`, not the app's views.
+- **No rule or test changes:** the pin still holds that one hour, so any other difference fails it.
+
+**Changed files.** `fabric/app/src/data/kept-value-cases.test.ts` (a comment) and this report.
+
+**Validation.** vitest: the cases file's 9 tests pass; typecheck and eslint clean; markdownlint clean; the test file is ASCII, with LF line endings.
+
+**Risks.** None: a comment and this report.
+
+### F35 design (i) groundwork: two known differences, pinned (2026-11-22)
+
+**Why.** The review of 67f08e7d, and of this branch's same change, found the fix correct in both rules, with one Low older than both. A finer row straddles a coarser point's window cut, and part of what's left of it is in the part cut off: `finestPerInterval` splits that across the row's uncovered stretches by length, and both rules here count all of it against the part the window keeps. [The follow-ups' section](#the-review-of-67f08e7d-two-known-differences-pinned-2026-11-22) has the reviewer's two cases, D and A, and how often they happen. The coordinator's decision: no rule change now; pin both beside `random 11`, and align the rules when (i) is built.
+
+**Work summary.**
+
+- **The shared cases:** D and A, each named "a known difference: ...", with a pin of its 15:15 bin and its total from 15:15 to 15:30. For D, 28 and 86, the data's answer; for A, 40 and 68, where the data hold 72. The file's diff inserts their 58 lines and changes nothing else: 48 cases, 1,733 bins.
+- **Parity with `finestPerInterval`** pins three known differences, each in its hour from 15:00 to 16:00: D's 146 and 149, A's 128 and 132, and `random 11`'s 43 and 29. Any other difference fails it; its name and comment say so.
+- **`kept_value.py`'s docstring** says that `snapshotValues` follows `finestPerInterval` but for the two known differences its notes name, which the build aligns. No code changes.
+- **This report:** the every-rank section's "Why", which quotes the coordinator's decision, gets a note that (i)'s build still has to make it true. The design note's build-time item, both rules splitting a straddling row the same way, is in the coordinator's material for decision 3.
+
+**Changed files.** `fabric/app/src/data/kept-value-cases.test.ts`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/history/kept_value.py` (its docstring), and this report.
+
+**Validation.**
+
+- **The pins catch a change in either rule,** each made in a copy:
+  - with 67f08e7d's choice of finer saves reverted in `snapshotValues`, the file, the window-cut case's pin, D's pin, and parity fail (D's hour, 136 and 149);
+  - with `finestPerInterval` splitting a remainder evenly, parity fails (146 and 150).
+- **Python:** `Fabric.History` passes on Python 3.11.9 and 3.10.11, so `kept_value.py` gives D's and A's bins as `snapshotValues` does. The mutations' counts are as before but for the new cases' bins: the coarser save winning, 693; and finer saves chosen by the part a window keeps, 2, the window-cut case's 15:15 and D's.
+- **And:** vitest, the cases file's 11 tests and the app's whole suite, 401 of 401 in 22 files; typecheck and eslint clean; markdownlint clean; the changed files are ASCII, with LF line endings. Repo.Conventions, Repo.NeutralWording, Repo.Gitleaks, and Repo.FunctionNames, with the follow-ups' two commits under it: 135 passed, 3 skipped.
+
+**Risks.** None: nothing runs this code yet, and no rule changes.
+
+### F35 design (i): the declared grain, and a straddling row's split in both rules (2026-11-23)
+
+**Why.** The owner approved design (i) on 2026-11-23, for Wednesday's release: a kept value beside each row of `telemetry_snapshots`, worked out when history is saved, so the model's reads stay as fast as today's, and a bin not worked out yet reads as today's. Two sessions build it at once. This one builds the module's Spark step, the notebook, the save's declared grain, both rules' straddling split, and the model; "F35 Livy steps" builds the Livy client and the column and resolve steps of `deploy.ps1`, `stop-demo.ps1`, and `configure-fabric.ps1`, which send this module to Spark as it is. The groundwork left [two known differences](#f35-design-i-groundwork-two-known-differences-pinned-2026-11-22) for the build: a save whose step the rule reads from its window and `finestPerInterval` from its bins (`random 11`), and a finer row that a coarser point's window cuts through (D and A).
+
+**Work summary.**
+
+- **The declared grain** (`GrainMinutes`, the column `grain_minutes`): each save writes its step with its rows, a whole number of minutes from 1 to 1,440. `finestPerInterval` (`declaredGrain`, new), `snapshotValues`, and `kept_value.py` (`declared_grain`) take it as the save's step, with T5's hourly metrics still at least an hour. A save written before F35 declares none and keeps today's reading, so a step difference like `random 11`'s can only come from those saves.
+- **A straddling row's split,** in `snapshotValues` and `kept_value.py`, as `finestPerInterval` does it: a coarser point's finer rows, finest and then newest first, each keep the stretches that the earlier ones leave uncovered, with a total's remainder split across them by length (in whole numbers when it's one); the coarser point then takes only the stretches that overlap the part its window keeps. `finestPerInterval`'s stretch helpers (`overlapping`, `insert`, `gapsIn`, and `shares`) are exported for `snapshotValues`, and `kept_value.py` has the same four.
+- **The shared cases,** written again from the TypeScript rule: D's 15:15 bin is 31, where the groundwork pinned 28, and 15:15 to 15:30 totals 89, `finestPerInterval`'s split by length, where the data hold 86; A's is 44, where it was 40, and totals 72, the data's. Two new cases declare grains: a hand-set 5-minute bin, which the window alone reads as 1, and a save whose bins don't show its step. That's 50 cases and 1,742 bins, where there were 48 and 1,733.
+- **Parity with `finestPerInterval`** pins one known difference, `random 11`'s hour, an older save's step; with every save given its declared grain (`withDeclaredGrains`), it has none.
+
+**Changed files.** `fabric/app/src/data/finest-per-interval.ts`, `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, `fabric/app/src/data/kept-value-cases.test.ts`, `fabric/history/kept-value-cases.json` (written from the TypeScript rule), `fabric/history/kept_value.py`, `tests/unit/Fabric.History.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **Both rules:** vitest, the cases file's 13 tests and `snapshot-value.test.ts`' 22, among them the declared grain's; `Fabric.History` passes on Python 3.11.9 and 3.10.11, so `kept_value.py` gives every bin of the 50 cases within 1e-9 of `snapshotValues`.
+- **On many histories,** with a scratch script that isn't committed: 1,000 random histories of every kind and 200 days of the three producers with the review's timing (488,921 rows).
+  - `kept_value.py`'s bins equal `snapshotValues`' in all 355,850.
+  - `snapshotValues`' hourly totals and peaks equal `finestPerInterval`'s in 29,830 of 29,843 hours. The 13 others are all in random Azure Monitor histories, in saves that declare no grain, where the rule reads the step from the window and `finestPerInterval` from the bins, as in `random 11`.
+  - With every save declaring its grain, none of 29,842 hours differs, and no bin. The producers' days differ in none either way.
+
+**Risks.**
+
+- A save written before F35 keeps today's reading of its step, so where its bins don't show the step, the kept values and `finestPerInterval` can differ in that save's hours, as in `random 11`. On `dbhubfn`'s real history, no save does ([below](#f35-design-i-the-kept-values-against-the-apps-rule-on-a-real-history-2026-11-23)).
+- Where a finer row straddles a window's cut, `finestPerInterval`'s split by length is an estimate, and both rules now follow it: D totals 89 where the data hold 86.
+
+### F35 design (i): the resolve step, and the notebook's kept values at save time (2026-11-23)
+
+**Why.** The kept values have to be in `telemetry_snapshots` before the model reads them, whichever save wrote the rows: a Run all session (the live-activity notebook), `stop-demo.ps1 -SaveHistory`, or `deploy.ps1`. So the resolve is one Python module, which the notebook runs as a helper cell and "F35 Livy steps" sends to Spark as one Livy statement.
+
+**Work summary.**
+
+- **`kept_value_step(spark, table="telemetry_snapshots", add_columns=True, run_id=None, everything=False)`,** the Spark part of `fabric/history/kept_value.py`. The file has no `__future__` import, so one Livy statement runs it as it is.
+  - It runs `DESCRIBE TABLE`, then adds F35's missing columns with one `ALTER TABLE ... ADD COLUMNS`: `grain_minutes INT`, `kept_value DOUBLE`, and `resolved_at_utc TIMESTAMP`.
+  - **The rows it works out:** those not worked out yet, by default; one run's (`run_id`); or every row (`everything`). Per target and analysis, it reads their bins' days and the day either side, in chunks of at most 7 days and batches of about 400,000 rows, each with every save that has a row there, whole, so each save's extent and step are its own.
+  - **One `MERGE` per batch** writes `kept_value` and `resolved_at_utc` into the rows whose kept value changed, matched on the row's identity (run, capture, target, analysis, metric, bin, resource, instance, database, and value) and pruned to the batch's bins. `resolved_at_utc` is the time just before the batch's read, and the MERGE doesn't overwrite a row that a later step worked out.
+  - **After Delta's concurrent-commit exceptions** (`ConcurrentAppendException` and the others on Fabric's [concurrency control for Delta tables](https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control)), a batch reads and MERGEs again, up to 5 times, with a growing pause.
+  - **Its result,** ready for JSON: `version`, `table`, `exists`, `missing`, `added`, `form` (`Kept` when the three columns are there, which `configure-powerbi.ps1 -SnapshotValueForm` takes, and otherwise `Release`), `scope`, `read`, `resolved`, `pending`, `attempts`, `seconds`, and `error`. It never raises: rows it couldn't work out stay unresolved and read as today's.
+  - **Rows the rule doesn't work out** keep both columns null, and the model reads them by the release's rule: the analyses off the bin grid, rows without a bin, a capture time, or a window, and a `NaN` value.
+- **The notebook** (`NB_DatabaseHub_LiveActivity`):
+  - **Helpers, part 4** is `kept_value.py`, word for word. The module's first line is the cell's header, and a test keeps the two equal and checks that none of the module's names is another cell's.
+  - **Every telemetry row declares its save's step** in `grain_minutes`: the run's bin for the grid's analyses (none off the grid), the capture document's `intervalMinutes` for T4's rows, and each series' for T5's (an hour for its hourly metrics). The PowerShell history helpers already write those intervals (`PostgresHistoryHelpers.ps1` and `CosmosHistoryHelpers.ps1`), so they don't change.
+  - **`telemetry_snapshots`** gains the three columns, before `report_date_utc`, in both notebooks that create it (`NB_DatabaseHub_Deployment` too). An older table gains them with the save's `mergeSchema`, or with the step's `ALTER TABLE`.
+  - **The persist cell's last step,** after the session's `scenario_runs` rows, is `save_kept_values`: `kept_value_step` with this run's ID, so this run's rows and their neighbors are worked out. One line says what it did, and it never stops the run.
+- **For ADR 0014's amendment:** Fabric's Delta tables are Serializable, their only level, and `telemetry_snapshots` has no partitions. So a save appended while a step's MERGE runs makes the MERGE fail, not the append, and the step reads its batch again and MERGEs again. 1786a139's comment had this wrong, and so did what this session first passed to the docs author: they followed Azure Databricks' page, whose default level lets a blind append pass a MERGE, a level Fabric doesn't have. [A later section](#f35-design-i-fabrics-delta-tables-are-serializable-and-the-save-tries-a-concurrent-commit-again-2026-11-23) corrects the code.
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb`, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, `tests/unit/Fabric.History.Tests.ps1`, `tests/unit/Fabric.Notebooks.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **`Fabric.History`'s step tests,** on an in-memory table and through a fake Spark: the columns added, a retry after `ConcurrentAppendException`, chunks, a late save's neighborhood only, a later step's guard, rows off the grid left alone, the release's form, and errors without raising.
+- **`Fabric.Notebooks`:** part 4's text and names, the grains on SQL, T4, and T5 rows, the persist order, and `save_kept_values`' lines and call. 118 of 118 pass on Python 3.10.11 with pandas 2.3.3, and on 3.11.9 with pandas 3.1.1.
+- **Live, on a copy of `dbhubfn`'s history** (Final tests, with "F35 Livy steps"' probe, 2026-11-23, 10:11 to 10:14 ET):
+  - the step added the three columns and worked out 32,402 rows in 21.5 s with one MERGE, leaving none pending, with the form `Kept`;
+  - a second step read and resolved none, in 2.1 s;
+  - the 713 rows off the grid stayed null, the copy was dropped, and `telemetry_snapshots` wasn't touched;
+  - per analysis, the kept values sum to 33 to 75 % of the values: for example, wait_deltas 107.7M of 307.9M, counter_deltas 69.6B of 191.9B, and cosmosdb 2.61M of 7.33M. [The next section but one](#f35-design-i-the-kept-values-against-the-apps-rule-on-a-real-history-2026-11-23) checks them against the app's rule.
+
+**Risks.**
+
+- A save appended while a step runs makes the step's MERGE run again. The save's rows outside the step's batch stay unresolved until its own run's step, or the next, and its bins read as today's until then.
+- Part 4 is a copy of the module: a change to one without the other fails `Fabric.Notebooks`.
+- When Delta still reports a concurrent commit after 5 tries, the step reports its error and leaves those rows to the next step; they read as today's meanwhile.
+
+### F35 design (i): Snapshot Value's kept form, and `configure-powerbi.ps1 -SnapshotValueForm` (2026-11-23)
+
+**Why.** The model's `Snapshot Value` has to read the kept values, and fall back to the release's rule where they aren't worked out yet. A Direct Lake model that reads a column its table lacks can't be framed, so a lakehouse without F35's columns needs the release's form, and `configure-powerbi.ps1` has to deploy the form the lakehouse can take.
+
+**Work summary.**
+
+- **The kept form** (`fabric/powerbi/kept-value/Snapshot Value.tmdl`, new), per target, analysis, metric, and bin:
+  - where every row is worked out (none has a blank `Resolved At UTC`), a total's kept values summed, and a maximum's or an average's highest capture sum of them;
+  - a bin with a row not worked out yet, a row with no bin, and an analysis off the bin grid read by the release's measure, word for word (and every bin while a query filters which saves it sees, since [the review's fixes](#f35-design-i-the-reviews-fixes-a-filter-on-the-saves-and-declared-grains-checked-2026-11-23));
+  - two hidden columns, `Kept Value` and `Resolved At UTC` (`kept_value` and `resolved_at_utc`), and the table's description. Its lists of analyses and metrics are the shared rule's, and a test keeps them so.
+- **`keptFormValues`** (`snapshot-value.ts`): the kept form's reading in TypeScript, the DAX measure's reference for the tests and the live proof.
+- **`Get-DemoFabricSemanticModelDefinition -SnapshotValueForm Kept`** splices the fragment into the table's TMDL, each piece found exactly once or it throws. `Release`, the default, sends the committed TMDL unchanged, so Ask's model guide and the report's fields don't change.
+- **`configure-powerbi.ps1 -SnapshotValueForm`** (`Release` by default) builds and deploys that form, and `FABRIC.SEMANTICMODEL.FORM` says which, once the model's import passes:
+  - **Pass** for the kept form;
+  - a **Warning** for the release's, because the columns weren't there or the step couldn't tell, with `./scripts/deploy.ps1` as the fix;
+  - **Not selected** under `-WhatIf`;
+  - no result with `-SkipModel` or `-CheckModelData`, or when the import fails.
+
+  "F35 Livy steps" passes the form from `DEPLOY.FABRIC.KEPTVALUE`'s `evidence.form`.
+
+**Changed files.** `fabric/powerbi/kept-value/Snapshot Value.tmdl` (new), `scripts/modules/DbHubDemo/Public/Get-DemoFabricSemanticModelDefinition.ps1`, `scripts/configure-powerbi.ps1`, `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, `tests/unit/Fabric.PowerBI.Tests.ps1`, `tests/unit/DbHubDemo.PowerBI.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **Pester:** the kept form's lists equal the shared rule's, its fallback is the release's measure word for word, its columns read the notebooks' `kept_value` and `resolved_at_utc`, and its VAR names pass the names test; both forms deploy end to end with mocks, with their `FABRIC.SEMANTICMODEL.FORM`; and a table or a fragment that doesn't fit is refused.
+- **vitest:** `keptFormValues`' 3 tests: a total's kept values, a peak's highest capture, and a bin not worked out read by the release's rule.
+
+**Risks.**
+
+- **The kept form's DAX hasn't run on an engine yet.** This PC was at full CPU, so the coordinator moved the timing to Final tests, on a real Fabric model: the kept form against the release's, on the 7-day Performance query over a month of synthetic history, before Wednesday's proof. The plan proposes a pass at 1.5 times the release's median or less, with the owner deciding. The same run can check the measure against its reference ([below](#f35-design-i-the-deployed-models-kept-form-against-its-reference-2026-11-23)).
+- The release's form stays the default: a lakehouse that doesn't get the columns keeps today's totals, with the Warning.
+
+### F35 design (i): the kept values against the app's rule on a real history (2026-11-23)
+
+**Why.** On `dbhubfn`'s copy, the kept values brought wait_deltas and counter_deltas down by about 2.8 times, which means three or more overlapping saves in places. The coordinator asked for proof that they match the app's rule on the same rows, not only that they shrink: whole-hour totals of `kept_value` against `finestPerInterval` on the raw rows, as the design's live proof does.
+
+**Work summary.**
+
+- **`fabric/app/scripts/f35-proof.ts`** reads an export of a resolved `telemetry_snapshots`, one JSON object a line (target, analysis, metric, bucket_utc, captured_at_utc, window_start_utc, window_end_utc, value, grain_minutes, kept_value, and resolved_at_utc), and checks three things:
+  - **bins:** every worked-out bin, read from the written kept values as the kept form reads them (`keptFormValues`), against `snapshotValues` on the raw rows;
+  - **hours:** each series' total or peak in each whole hour, from those bins and from `finestPerInterval`'s kept points on the raw rows, with the release's newest-per-bin totals beside them;
+  - **steps:** each save's step in both rules.
+
+  It prints a JSON summary, and exits 1 when a bin or an hour differs.
+- **Final tests' export** (2026-11-23, 10:46 to 10:51 ET): probe bc730bd9 ran the step with `kept_value.py` at 1786a139 on a fresh copy of `dbhubfn`'s history, then paged the copy's 33,115 rows out. The step matched the 10:11 run: 32,402 resolved, none pending, with the same sums.
+
+**Validation.** `npx tsx scripts/f35-proof.ts` on the export exits 0, in 27 s:
+
+- **Bins:** 20,779 compared, all equal, and none left unresolved.
+- **Hours:** 1,551 series-hours, all equal to `finestPerInterval`'s. `finestPerInterval` gives the kept totals to the unit; storage_io differs only in the order of its float sums, at about 1e-16.
+- **Steps:** 151 saves, none declaring a grain (all saved before F35), and both rules read every one's step the same way, so this history has no save like `random 11`'s.
+- **What the release counted twice,** its newest-per-bin totals against the kept ones in the same hours: on T1, wait_deltas 103.8M against 43.3M (2.4 times), counter_deltas 19.98B against 8.01B (2.5 times), and storage_io 4.17M against 1.66M (2.5 times); on T2, 2.3 to 2.4 times; on T3, 2.1 times for wait_deltas, 1.7 for counter_deltas, and 1.0 for storage_io; and T5's cosmosdb totals, 6.05M against 2.59M (2.3 times).
+
+**Still to do,** by Final tests, before Wednesday's proof: the kept form's timing on a real Fabric model, against the release's form on the same model, on the 7-day Performance query over a month of synthetic history (Final tests' method: the real rows copied 30 times, each a day earlier than the last, with the copies' kept values cleared and then worked out by the step), and the same proof on that month's export.
+
+**Risks.** The proof covers one environment's real history, about two days of bins (2026-11-18 20:45 to 2026-11-21 01:23 UTC), with no save declaring its grain yet; the shared cases and the scratch histories above cover the declared grains.
+
+### F35 design (i): the deployed model's kept form against its reference (2026-11-23)
+
+**Why.** No engine has run the kept form's DAX yet. The proof above checks the written kept values through `keptFormValues`, the measure's TypeScript reference, not the measure itself, and the timing on a real model is Final tests'. This lets that run prove the DAX too.
+
+**Work summary.**
+
+- **`fabric/powerbi/kept-value/model-bins.dax`** (new): the deployed model's `Snapshot Value` per target, analysis, metric, and bin, from `BinsFrom` to `BinsTo`, for the Power BI REST API's [Execute Queries](https://learn.microsoft.com/rest/api/power-bi/datasets/execute-queries-in-group). A response holds at most 100,000 rows, about four days of a demo's history.
+- **`f35-proof.ts --model <response.json>`,** with `--from` and `--to`: each of those bins against `keptFormValues` on the export's rows, worked out or not, so it checks the kept branch and the release's fallback. A value that differs, a bin the model lacks, and one it has extra each fail it. It reads Execute Queries' response as saved, a JSON array of its rows, or JSON lines, and matches a bin time finer than a millisecond to within one.
+- **The same table:** the export and the model must read the same version of it, with nothing written between the export and the model's refresh. `keptFormValues` reads each bin's own rows, so this check needs only the compared bins' rows.
+
+**Changed files.** `fabric/powerbi/kept-value/model-bins.dax` (new), `fabric/app/scripts/f35-proof.ts`, and this report.
+
+**Validation.** With a scratch model built from `keptFormValues` on a synthetic 20-day export, over 4 days:
+
+- 2,556 bins equal (exit 0);
+- one value changed, one bin dropped, and one added are each found (exit 1);
+- the same rows as JSON lines read the same;
+- `--model` without `--from` and `--to` exits 2.
+
+The script type-checks with the app's strict settings and lints clean, and `Fabric.PowerBI`'s names and line-ending tests cover the new query.
+
+**Risks.** It checks the model only when Final tests run the query on a deployed kept form; until then, Pester checks the DAX's text only.
+
+### F35 design (i): the review's fixes: a filter on the saves, and declared grains checked (2026-11-23)
+
+**Why.** The review of the five units above confirmed parity in fuzzing: 0 of about 141,000 bins differ against `snapshotValues`, and 0 of 22,500 hours against `finestPerInterval`. It said ship with two fixes:
+
+- **High: the kept form undercounted where a query filters which saves it sees.** A row's kept value is its share against every save, but `WorkedOut` saw only the rows in the filter context. Ask's T5 rule reads `TREATAS ( LatestRun, 'Telemetry Snapshots'[Run ID] )`, and the latest cosmosdb capture is usually the coarse save, so its storm totals went blank or shrank.
+- **Medium: `f35-proof.ts`' step check couldn't fail for a save that declares its grain,** since both sides read the declared grain. The app's T4 and T5 views (`postgresSeriesQuery` and `cosmosSeriesQuery`) select no `grain_minutes`, so they read the step from the bins. A wrongly declared grain would make the pages and the model differ, unseen.
+
+**Work summary.**
+
+- **The kept form** reads every bin by the release's rule while a query filters a column that tells a bin's saves apart (`VAR EverySave`), so a run's own rows read as that run saved them, as before F35:
+  - the review's five: Run ID, Source Notebook, Captured At UTC, Window Start UTC, and Window End UTC;
+  - and Value, Kept Value, and Resolved At UTC, which also differ between a bin's saves.
+
+  Nothing filters those columns from outside: no relationship reaches them, a Date filter selects whole bins (`report_date_utc` is the bin's date), and the report's Run ID and Captured At visuals are Validation Results' and Analysis Findings'. The table's other columns hold the same value in every save's rows of a bin: the bin's keys, the row's resource and unit, and its report date.
+- **`keptFormValues(rows, { savesFiltered })`** is its reference.
+- **`f35-proof.ts`:**
+  - **filtered,** reported and never failing: each target and analysis's newest capture alone, or the rows captured from `--captured-from` to `--captured-to`, read by the release's rule (`run`) and by their kept values (`shares`), with the bins the latter leaves blank;
+  - **modelCaptured,** with `--model-captured`: the deployed model's bins under `model-bins-captured.dax` (new), which filters one range of captures, against the release's rule on those rows;
+  - **steps:** a declared grain against the save's bins. T4's and T5's must be the same. A SQL save's bins must be on its grid; sparser ones were counted per analysis (`declaredSparse`), which [the re-check](#f35-design-i-the-re-checks-two-items-a-declared-grain-finer-than-a-sql-saves-bins-and-the-saves-pauses-2026-11-23) narrows to the analyses that save bins with activity alone. A difference fails the proof. A save with one bin, whose step its bins can't show, is counted (`declaredOneBin`).
+- **Not done, the review's option** of `grain_minutes` in the model and the T4 and T5 queries. The release's form can't have the column, since Direct Lake can't frame a column its table lacks, so the app's queries can't name it while a model may be on that form. The step check catches the difference that leaves.
+
+**Changed files.** `fabric/powerbi/kept-value/Snapshot Value.tmdl`, `fabric/powerbi/kept-value/model-bins-captured.dax` (new), `fabric/app/src/data/snapshot-value.ts`, `fabric/app/src/data/snapshot-value.test.ts`, `fabric/app/scripts/f35-proof.ts`, `tests/unit/Fabric.PowerBI.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **The finding, reproduced:**
+  - vitest, on T5's storm: the latest run alone totals 50,428 by its kept values, with 15:15 and 15:30 blank, and 78,161, the run's own, by the release's rule;
+  - on `dbhubfn`'s export (`filtered`): T5's newest capture would have read 228,046 by its kept values, with 202 of its 444 bins blank, where it saved 1,302,342; and T1's wait_deltas 2.35M, where it saved 22.06M.
+- **The pin:** `Fabric.PowerBI` checks the list, that it gates `WorkedOut`, and that every other column of the table is on the same-in-every-save side, so a new column has to be put on one side. Without the fix, the list is empty, and the test fails.
+- **The checks catch what they're for,** on the synthetic export:
+  - a T5 save declaring 5 minutes over 15-minute bins, and a T1 save declaring 15 over 5-minute bins, each fail;
+  - a T1 save declaring 5 over 15-minute bins is counted as sparser;
+  - a model built as the fixed measure reads passes `--model-captured` (291 bins), and one built as the unfixed measure fails it (9 bins differ, and 90 are missing).
+- **And:** on `dbhubfn`'s export, the proof still exits 0 (20,779 bins, 1,551 hours, and 151 saves, none declared); vitest `snapshot-value`, 23 tests; `Fabric.PowerBI` and `DbHubDemo.PowerBI`, 47 passed and 1 skipped, as before; and the script type-checks strict and lints clean.
+
+**Risks.**
+
+- A query that filters several overlapping saves at once, two runs for example, reads the release's rule among them, so it counts their shared minutes twice, as before F35.
+- The app's T4 and T5 views still read a save's step from its bins: the proof catches a difference from its declared grain, and the app doesn't.
+
+### F35 design (i): Fabric's Delta tables are Serializable, and the save tries a concurrent commit again (2026-11-23)
+
+**Why.** The follow-ups session checked Fabric's [concurrency control for Delta tables](https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control): every Fabric Delta table is Serializable, its only level, where even a blind append can conflict with a MERGE that reads the same partition. The resolve step's comment cited Azure Databricks' page instead, and its WriteSerializable default, where a blind append doesn't conflict. And F35 brings a concurrent writer to `telemetry_snapshots`, while the notebooks' save had no retry.
+
+**Work summary.**
+
+- **The step's comment,** in `kept_value.py` and Helpers, part 4, cites Fabric's page. It says that `telemetry_snapshots` has no partitions, so a save appended while a step's MERGE runs makes the MERGE fail (`ConcurrentAppendException`), not the append. The step reads its batch again, with the save's rows where they're in its days, and MERGEs again; the save's other rows stay for its own run's step, or the next.
+- **`ConcurrentWriteException`,** which Fabric's page lists as a generic conflict, joins the step's list.
+- **The save** (`write_delta`), in both notebooks, since both write `telemetry_snapshots`. The step's MERGE can fail a save's DELETE, and its ALTER TABLE a save's append (`MetadataChangedException`).
+  - The delete and the append now run again together after one of Delta's concurrency exceptions (`DELTA_CONFLICTS`, the step's list): at most 5 tries, after pauses of 1, 2, 4, then 8 seconds, each times 0.5 to 1.5 at random, so 0.5 to 12 seconds.
+  - A failed Delta transaction writes nothing, so they're safe to repeat.
+  - Any other error, and the last try's, stops the cell as before. The save's line says on which try it saved, when it wasn't the first.
+
+**Changed files.** `fabric/history/kept_value.py`, `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb`, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, `tests/unit/Fabric.Notebooks.Tests.ps1`, and this report.
+
+**Validation.**
+
+- **The save's test,** per notebook (`Fabric.Notebooks`):
+  - a delete that meets the MERGE, an append that meets the ALTER TABLE, and an error that names the conflict only in its class each save once, on try 2;
+  - a conflict on every try stops after 5, and any other error stops at once;
+  - the save's list is the step's.
+
+  Against HEAD's notebook, the first conflict stops the save.
+- **And:** `Fabric.Notebooks` 120 of 120 and `Fabric.History` 8 of 8, on Python 3.11.9 and 3.10.11; every code cell of both notebooks compiles; and PSScriptAnalyzer finds nothing in the test file.
+
+**Risks.**
+
+- A save that meets a conflict on all 5 tries stops the cell, as any save error did before.
+- Part 4's new text changes the notebook's fingerprint; the integration writes the versions again.
+
+### F35 design (i): the re-check's two items: a declared grain finer than a SQL save's bins, and the save's pauses (2026-11-23)
+
+**Why.** The re-check of 7dfe34f6, 4f44e7ce, and def8f09b said ship: the kept form reads the release's rule for every filter on the saves that the app, the report, and Ask use, and the save's retry can't lose or duplicate rows. It found two small items:
+
+- **Low:** a SQL save that declares a grain finer than its bins still passed the proof. A 15-minute day save that declares 5 minutes counts the other 10 minutes of each bin twice where another save holds them, and the bins and hours checks still agree, because both rules read the declared grain.
+- **Wording:** `_delta_retrying` said its pauses are 1 to 8 seconds, but with the jitter each is 0.5 to 12 seconds.
+
+**Work summary.**
+
+- **`f35-proof.ts`' step check** fails a SQL save whose bins are farther apart than its declared grain, unless its analysis saves bins with activity alone: `sessions`, which keeps the demo database's sessions, and `wait_deltas`, which keeps the bins with waits (`WaitMs > 0`). The notebook's other SQL queries (CPU, gauges, counter rates, and storage IO) read every sample in the window. `declaredSparse` counts only those two.
+- **`_delta_retrying`'s docstring,** in both notebooks: pauses of 1, 2, 4, then 8 seconds, each times 0.5 to 1.5 at random, so 0.5 to 12 seconds.
+- **This report:** the resolve step's section says plainly where this session had Delta's isolation wrong, the save's section gives its pauses, and the review's section says what 4f44e7ce's step check counted.
+
+**Changed files.** `fabric/app/scripts/f35-proof.ts`, `fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb`, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, and this report.
+
+**Validation.**
+
+- **The negative,** on the synthetic export: a T1 save of 15-minute bins that declares 5 minutes, its kept values worked out again with that grain, so the bins (12,851) and hours (1,443) all agree. def8f09b's script passes it (exit 0), counting `cpu` as sparser; this one fails it (exit 1): "T1|cpu: declares 5 minutes, where its bins are 15 minutes apart". The same save's `wait_deltas` is counted, not failed.
+- **And:** the unchanged synthetic export still passes (86 declared saves); the script type-checks strict and lints clean; every code cell of both notebooks compiles.
+
+**Risks.** A SQL save of a dense analysis whose target ran only in scattered bins would now fail the proof, though its declared grain is right; none of the notebook's saves does that while the targets run.
+
+### F35 design (i): the filtered-saves test's rows typed as rows (2026-11-23)
+
+**792e9a19,** test-only, on 464b542d: 4f44e7ce's filtered-saves test in `fabric/app/src/data/snapshot-value.test.ts` spread T5's rows into objects with `KeptValue` and `ResolvedAt`, which TypeScript typed without the rows' own columns, so `tsc` failed where the test reads `r.CapturedAt` (TS2339), while vitest, which doesn't type-check, passed; the map now returns a `Row`, `tsc --noEmit` is clean, and the file's 23 tests pass (in the next release as 5eebcfa0, in place of the integration's own fix of the same line, 2a356245).
+
+### F35 design (i): the Livy steps (2026-11-23)
+
+**Why.** An existing demo's workspace keeps its old `NB_DatabaseHub_LiveActivity` unless `fabric.importNotebooks`, `-ImportNotebooks`, or `configure-fabric.ps1` updates it, so a fix that lives only in the notebook misses those demos until the owner opts in. The approved design (i) has the PC's scripts work out the history's kept values themselves, through Fabric's Livy API, sending this checkout's `fabric/history/kept_value.py` each time. Learn documents the Livy API for a Microsoft Entra app or a service principal with the `Lakehouse.*` and `Code.*` scopes ([authentication](https://learn.microsoft.com/fabric/data-engineering/get-started-api-livy)), and the Azure CLI's token carries only `user_impersonation`, so a probe checked it first.
+
+**Work summary.**
+
+- **The token probe** (`tests/integration/Invoke-LivyTokenProbe.ps1`, new): after the subscription guard, it starts a Livy session in the demo's lakehouse with the Azure CLI's Fabric token, runs `SELECT 1` and a read of `telemetry_snapshots` in PySpark, and deletes the session in a `finally`. `PROBE.LIVY.TOKEN` is the answer. With `-KeptValueModule`, it smoke-tests a `kept_value.py` on a scratch copy of the history table (`CREATE TABLE ... AS SELECT`, the step, a read-back, a rerun, and the drop); with `-ExportPath` too, it exports the resolved copy as JSON lines for `fabric/app/scripts/f35-proof.ts`, in pages by analysis, day, and hour.
+- **The Livy client** (`FabricLivyHelpers.ps1`, new): `Open-DemoLivySession` creates a session on the workspace's starter pool, once, and waits until it's idle; one that ends or isn't ready in time is deleted before it says so. `Invoke-DemoLivyStatement` runs one statement and cancels it past its time. `Close-DemoLivySession` never throws. Every request goes through `Invoke-DemoFabricRequest` ([session jobs](https://learn.microsoft.com/fabric/data-engineering/get-started-api-livy-session), and the Livy API's Swagger for the states, the output, and cancel).
+- **The step** (`Invoke-DemoHistoryKeptValue`, new and public): the workspace and the lakehouse (resolved, or by name, read-only), a session, `kept_value.py`'s text as one statement, then `kept_value_step(spark)`, whose JSON is the output's last line, by the resolve module's interface. One record, never a Fail or Manual action required: Pass, Not selected (no history table yet, or a `kept_value.py` without `kept_value_step`), or a Warning with its fix (a paused capacity, a refused session, a session that didn't start, a step that failed, ran out of time, or stopped with rows left). One deadline covers the session's start, the module's load, and the step. Evidence `form` is the step's own answer.
+- **Where it runs:**
+  - `deploy.ps1`'s Fabric track, both paths, before the history model's step (`DEPLOY.FABRIC.KEPTVALUE`, row `Fabric.KeptValues`). `Invoke-DemoPowerBIStage` gives `configure-powerbi.ps1` `-SnapshotValueForm Kept` only when that step's form is `Kept` and the script declares the parameter; otherwise the release's form. A Warning's fix is `./scripts/deploy.ps1 -FromStage Fabric`, since a plain rerun skips a Fabric track it recorded as finished.
+  - `deploy.ps1`'s end, right after the history snapshot, when it saved (`DEPLOY.FABRIC.KEPTVALUE.END`, row `Fabric.HistoryKept`).
+  - `stop-demo.ps1 -SaveHistory`, after a run that completed and before any pause (`STOP.FABRIC.KEPTVALUE`; at most 15 minutes in all while Fabric answers, 5 of them for the session; if it stops answering, `Invoke-DemoFabricRequest`'s retries and the session's delete can add up to about 18 more).
+  - `configure-fabric.ps1 -RunLiveActivity`, after a run that passed (`FABRIC.KEPTVALUE`), not after a first run of its own.
+- **DONE:** both rows are non-blocking (`Test-DemoNonBlockingResult`), and DONE's list of what doesn't block it names the kept values while deploy's last step for them is a Warning (`Get-DemoKeptValueItem`).
+- **The review's fixes** (SHIP WITH FIXES for c96f790a and 1eee4187; nothing could damage `telemetry_snapshots`):
+  - **High, the merge order:** a `kept_value.py` without `def kept_value_step(` counts as missing (`NoModule`, Not selected, no request), as the probe already did. The groundwork's module has none, so if this branch merges first, no run fails on a `NameError`.
+  - **StrictMode:** the tests' progress mock reads `$PesterBoundParameters`, since Pester doesn't define an unbound `$Status` under `Set-StrictMode -Version Latest`.
+  - **One deadline:** `-TimeoutMinutes` now covers the session's start, the module's load (which had 300 seconds of its own), and the step, on the module's clock. `stop-demo.ps1`'s step takes at most 15 minutes while Fabric answers, 5 of them for the session; it could take about 20 before. The re-check's Low: each request keeps `Invoke-DemoFabricRequest`'s own retries, and the cancel and the delete run after the deadline, so it's about 21 minutes when Fabric throttles and about 33 when it stalls.
+  - **Cleanup:** `Open-DemoLivySession` deletes the session it created in a `finally`, unless it's idle, so a wait that throws (a network error past the retries, or Ctrl+C) doesn't leave it running.
+  - **HTTP errors during a statement:** `Failed`, with the later-run fix, for 429, 5xx, and anything else past the retries; `Refused` for 401 and 403; `CapacityPaused` for a paused capacity. `StepFailed`, "it's a bug", is now only the code's own error.
+  - **The end's Pass:** the end's step learns from this run's `DEPLOY.FABRIC.KEPTVALUE` whether the history model reads the kept form. When it doesn't, the end's Warnings say the model reads the release's form until the Fabric track runs again, and their fix is `./scripts/deploy.ps1 -FromStage Fabric`. A step that works out every row is then a Warning too (`ModelOnRelease`), and the DONE list keeps the track's Warning.
+  - **And:** tests pin the exact fix lines for `SessionFailed`, `NoColumns`, `NoToken`, `StepFailed`, and the network note.
+- **The first deployment, design A (approved 2026-11-23):** the owner's rule is one click every time, so a new deployment never ends with a Warning that asks for `./scripts/deploy.ps1 -FromStage Fabric` because its history had no rows yet. 25f2ebb8's end gave one (`ModelOnRelease`) when the track's step found no table.
+  - **Which runs the end switches:** this run's track step didn't allow the kept form, for any reason, and this checkout's `configure-powerbi.ps1` takes `-SnapshotValueForm` (`Test-DemoKeptFormPending`, `Test-DemoKeptFormDeployable`). Any reason includes no history yet, or a busy capacity: interactive Spark isn't queued, so Fabric refuses the session with HTTP 430, and the step is `SessionFailed`, not `NoTable`.
+  - **The switch:** once the end's step (`-ModelOnRelease -SwitchModelForm`) works out every row, it deploys the model in the kept form by the track's own step (`Invoke-DemoKeptValueModelSwitch`: `Invoke-DemoPowerBIStage -SnapshotValueForm Kept`), a Pass (`Switched`). The track's Warning, if it was one, becomes a Pass whose evidence keeps what it said (`earlierMessage`), with its row Done, as the #68 follow-up settles the first history run's.
+  - **A failed switch:** the model step's records are folded into the end's one record (their count by status, and the check IDs that didn't pass), so a Fail among them never blocks DONE. A switch that doesn't work is one Warning (`SwitchFailed`).
+  - **With no rows at the end:** a snapshot that saved nothing, or still no table, is Not selected, never a Warning. It says that the next `./scripts/deploy.ps1` deploys the model in the kept form by itself, which holds either way: after a run whose tracks all finished, a plain run is a full one. After an unfinished run, it's a resume that runs the Fabric step again, because that step clears its record of the content it published (`DbHubFabricSha256`) while the model went out in the release's form although this checkout has the kept one; `Get-DemoFabricContentReopen` names that reason. When a later run fixes the track's answer by itself, a Warning from the track's step and the model's record of the release's form then become Not selected with the same fix.
+  - **The track's own text:** its `NoTable` says that `deploy.ps1` deploys the kept form once the history has rows, at this run's end or the next `deploy.ps1`.
+  - **DONE's list** is again the latest step's Warning. After a track Warning without the kept form, the end reaches a Pass only by deploying the model in it, which settles that Warning, or when this checkout has no kept form, which no rerun of the track changes.
+  - **Without the kept form in `configure-powerbi.ps1`** (as on this branch before 0d265be9 merged the notebook and model's work), nothing waits for it: no switch, no model-form texts, and the content is recorded as before.
+  - **Still Warnings, on a first deployment as on an update:** a Livy failure at both the track and the end (the owner wants failures on the status page), rows left at the end (`Partial`: no switch until every row is worked out), and a failed switch.
+  - **`stop-demo.ps1` doesn't switch the model:** that isn't small. It would deploy the history model, which it never does, before the capacity's pause, and it would need a stored record of the form the model is waiting for. The next `deploy.ps1` does it instead.
+  - **#68's follow-up** runs the model step again in the form the track's step allowed. Since c96f790a it had deployed the release's form there, which could undo a kept form without the end seeing it, because the track's step had allowed that form.
+- **The re-check of 32e39e6a** (SHIP WITH FIXES), after 0d265be9 merged the notebook and model's 464b542d (only this report conflicted: both branches added their sections at its end, theirs first now):
+  - **Medium, the model's record of the release's form:** `configure-powerbi.ps1` now records the form it deployed (`FABRIC.SEMANTICMODEL.FORM`). The release's form is a Warning whose fix is `./scripts/deploy.ps1` again. The switch kept its own records out of the results, so after it the run's last lines still gave that fix, and the history report's row still named the release's form. Now, once the model reads the kept form, the end settles every such Warning of the run to Pass: the track's model step's, and #68's follow-up's. Each keeps what it said (`earlierMessage`), with evidence `form` Kept. The switch also sets the history report's row (`Fabric.Report`) from its own records, as the track's step does from its records, but never Failed.
+  - **Low, an earlier run's record of the same content:** tags merge, so a `DbHubFabricSha256` left out kept an earlier run's value. Take a run of this version that recorded the kept form's content. If a later full run's track then couldn't allow that form and ended NOT DONE, its resume would skip the Fabric step and end DONE with the model on the release's form. Both paths now write an empty value, which clears the tag.
+  - **Low, two fixes for one thing:** a busy capacity's Warning at the track asked for `./scripts/deploy.ps1 -FromStage Fabric` in a few minutes, while the end, with no rows to work out, said the next `deploy.ps1` does it by itself. With no rows at the end (a snapshot that saved nothing, or no table), the track's record now gets the end's fix when a later run fixes its answer by itself (see the next item): "Nothing to do now: the next ./scripts/deploy.ps1 works out the history's kept values and deploys the history model in their form by itself."
+  - **Low, a failed switch whose import passed:** `configure-powerbi.ps1` imports the model before its refresh, data check, and report, so a switch can deploy the kept form and fail after it, while its Warning said the model reads the release's form. When the switch's records include the kept form's `FABRIC.SEMANTICMODEL.FORM` Pass, `SwitchFailed` now says the model is deployed in their form and names what failed after it, without that sentence, and the run's Warnings about the release's form are settled as after a switch.
+- **No Warning on the no-rows paths** (the coordinator, after 5411cca1, so they match design A's "no rows at the end is never a Warning"; narrowed after the re-check of 5411cca1): when the end works out no kept values while the model waits for the kept form (its history snapshot saved nothing, so it doesn't run its step, or there was no table), and the track's step answered what a later run fixes by itself (`NoTable`, `SessionFailed`, `TimedOut`, `Failed`, or `NoColumns`), the track's Warning and every `FABRIC.SEMANTICMODEL.FORM` Warning of the release's form become Not selected. Each takes the end's fix and keeps what it said in its evidence (`earlierMessage`). The track's row says the same, and the history report's row is set from the model's records, with that note when nothing else is open. A refusal, a paused capacity, no token, or a bug at the track (`Refused`, `CapacityPaused`, `NoToken`, `StepFailed`, `NoAnswer`) keeps its own fix, since no later run fixes it by itself (`deploy.ps1` never resumes a capacity), and both Warnings stay. So do a Livy failure at both the track and the end, and a switch that doesn't work. The re-check found 5411cca1's form of this, which gave any track Warning the end's fix, dropping "Resume the capacity" and the others. The settled texts say why the end didn't work them out (its snapshot saved nothing, or there was no table), not that the history had no rows: it usually has rows that neither step worked out.
+
+**Changed files.** New: `scripts/modules/DbHubDemo/Private/FabricLivyHelpers.ps1`, `scripts/modules/DbHubDemo/Private/HistoryKeptValueHelpers.ps1`, `scripts/modules/DbHubDemo/Public/Invoke-DemoHistoryKeptValue.ps1`, `tests/integration/Invoke-LivyTokenProbe.ps1`, and `tests/unit/DbHubDemo.HistoryKeptValue.Tests.ps1`. Changed: `DbHubDemo.psd1`, `DeployExperience.ps1`, `DeployHelpers.ps1`, `FabricItemHelpers.ps1`, `HistoryFirstRunHelpers.ps1`, `ParallelDeployment.ps1`, `ProgressHelpers.ps1`, `TrackHelpers.ps1`, `Invoke-DemoDeployment.ps1`, `Stop-DemoEnvironment.ps1`, `scripts/configure-fabric.ps1`, `scripts/stop-demo.ps1`, `tests/integration/README.md`, six unit suites (Fabric, FabricItem, FirstRun, Lifecycle, Progress, Tracks), and this report.
+
+**Validation.**
+
+- **Live, on Final tests' environment:**
+  - **The token (09:49 to 09:51 ET):** the session was idle in about 14 seconds; `SELECT 1` returned 1; the read found 33,115 rows and 16 columns; the session was deleted. The Azure CLI's token is accepted, so the maintenance-notebook route isn't needed.
+  - **The smoke test with the export (10:46 to 10:51 ET, probe bc730bd9, module 1786a139):** the step worked out 32,402 rows in 21.5 seconds, and the rerun found nothing left. The export had 33,115 of 33,115 rows in 17 pages, in about 149 seconds, and the copy was dropped.
+  - **`f35-proof.ts` on that export:** no difference. 20,779 of 20,779 bins equal `snapshotValues`, 1,551 series-hours equal `finestPerInterval`, and 151 saves have no step difference.
+- **Pester with StrictMode, under the Azure CLI guard, no call reached it:** the new suite (35; the review found 33 of them passing under StrictMode, which the fixes below correct), and the suites whose code changed or that run it: Tracks 178, Lifecycle 282, OneCommand 208, ActivityControl 150, FirstRun 102, FabricAppSignIn 90, T4Replica 71, Fabric 41, Progress 35, FabricTrack 28, HistorySnapshot 28, PowerBI 21, Ask 18, TransientRetry 18, GuestRestart 7. Repo.Conventions 123, Repo.FunctionNames 2, and Repo.NeutralWording 3.
+- **The probe** ran against mocked Fabric answers: accepted, refused, a paused capacity, a session that ended, a statement that failed, the smoke test, a module that doesn't load, `-KeepCopy`, a 4-page export, and a short page. PSSA: no findings in the 20 changed PowerShell files. markdownlint: clean. ASCII, with LF line endings.
+- **The review's fixes,** each suite run on its own under `Set-StrictMode -Version Latest`, as `tests/Invoke-StaticValidation.ps1` sets it, and under the Azure CLI guard, with no call reaching it:
+  - HistoryKeptValue: 54 of 54. With the old progress mock, its two tests fail as the review and the trial merge found.
+  - The call sites' suites: Tracks 178, Lifecycle 282, FirstRun 102, Fabric 41, Progress 35, and FabricTrack 28.
+  - Repo.Conventions 123, Repo.FunctionNames 2, and Repo.NeutralWording 3.
+  - **Each fix, reverted alone, fails its tests:** 15 failures in all. The merge-order check fails 1; the old mock, 2; the session's and the load's limits, 1 each; the `finally`, 1; the HTTP mapping, 4; and the end's model form, 5 (2 for the end's flag, and 1 each for the DONE list, `ModelOnRelease`, and the track's message).
+  - PSSA: no findings in the 10 changed PowerShell files, once `-DecidesModelForm` was read in the function's body; `PSReviewUnusedParameter` doesn't count a use in a scriptblock. ASCII, with LF line endings.
+- **Design A,** each suite run on its own the same way, with no call reaching the Azure CLI:
+  - HistoryKeptValue: 65 of 65, including the switch, the settled Warning, a failed switch, the no-history notes, a checkout without the kept form, and five first-deployment paths that end with no kept-value Warning.
+  - The other suites: Tracks 179, Lifecycle 283, FabricItem 32, FirstRun 102, Fabric 41, Progress 35, FabricTrack 28, HistorySnapshot 28, and PowerBI 21. Repo.Conventions 123, Repo.FunctionNames 2, and Repo.NeutralWording 3.
+  - **Each rule, reverted alone, fails its tests:** 17 failures over 11 rules. They are the switch, settling the track, a Fail counted as a failed switch, waiting only with the kept form in this checkout, the no-history note, the DONE list, the track's `NoTable` text, its model texts without the kept form, the content's record in each path, and #68's follow-up's form.
+  - PSSA: no findings in the 12 changed PowerShell files. ASCII, with LF line endings.
+- **The re-check's fixes,** on 0d265be9's merge, each suite run on its own the same way, with no call reaching the Azure CLI:
+  - HistoryKeptValue 68 of 68, Tracks 179, and Lifecycle 283.
+  - **Each fix, reverted alone, fails its tests:** 14 failures over 8 reverts:
+    - not settling the form's Warnings, 5;
+    - no history-report row after the switch, 2;
+    - leaving the tag's key out, 1 in each path;
+    - the track's own fix with no rows at the end, 2, and with no table only, 1;
+    - the release's-form wording after an import that passed, 1, and counting the kept form as deployed only when everything passed, 1.
+  - PSSA: no findings in the 7 changed PowerShell files. ASCII, with LF line endings.
+- **No Warning on the no-rows paths,** the same way: HistoryKeptValue 78 of 78. The no-rows test has six track answers: the three a later run fixes by itself, settled, and a refused session, a paused capacity, and `kept_value_step` raising, which keep their fixes. The first-deployment test covers eleven paths: the seven without a Warning, and the four that keep theirs: a Livy failure at both ends, a failed switch, and a refused session or a paused capacity at the track with nothing saved at the end. Each rule, reverted alone, fails its tests: 23 failures over 6 reverts (the outcome gate 5, `NoColumns` or `NoTable` left out of the list 1 and 2, the track's record 5, the form's 7, and the history report's row 3). PSSA: no findings.
+- **The full static validation** moved to the next release's run on its final head: 887fb1ed is merged into that release (82b9dd73). On 887fb1ed on this PC, PSScriptAnalyzer (401 files), PSRule (302 rules), and markdownlint passed. Bicep's sync check failed with this PC's Bicep 0.49.2, not the pinned 0.47.16 (`infra/` is untouched; CI validates it). FabricApp stopped at a TypeScript error in the notebook and model's `snapshot-value.test.ts`, which went to that session. Pester and DotNet didn't complete here, because of this PC's Pester and SDK paths and then the CPU quiet window.
+
+**Risks.**
+
+- **The Azure CLI's token isn't among Learn's documented ones.** It's accepted today; if Fabric refuses it later, each step is a Warning (`Refused`) and the history reads as before F35, until the maintenance-notebook route is built.
+- **A session can queue** behind a notebook run on a small capacity: it's bounded (10 minutes; 5 in `stop-demo.ps1`), within the step's one deadline (30 minutes in the Fabric track, 15 elsewhere) while Fabric answers, and the step is then a Warning. When Fabric throttles or stalls, each request's own retries and the cancel and delete after the deadline can add more: `stop-demo.ps1`'s step can take about 21 minutes, or about 33.
+- **The model stays on the release's form** after the Fabric track's Warning, until this run's end works out every row and deploys the kept form, or the next `deploy.ps1` does. Its first-run follow-up (#68) now deploys the form the track's step allowed.
+- **The end's switch runs `configure-powerbi.ps1` after DONE is judged:** a few more minutes at such a run's end, within the script's own limits rather than the step's deadline.
+- **After a switch, a later resume publishes the Fabric content once more:** the Fabric step cleared its record, so an unfinished run's next `deploy.ps1` publishes it again in full. It's harmless, and an update publishes new content anyway.
+- **With no rows at the end, a busy capacity's refusal at the track shows as Not selected,** with the end's fix, rather than as a Warning: the next `deploy.ps1` works the kept values out by itself, and its evidence keeps Fabric's answer (`earlierMessage`). A refusal that lasts shows again on that run, as a Warning at both ends. A refused session or a paused capacity at the track stays a Warning with its own fix, since a rerun alone doesn't fix it.
+- **The one-time ALTER and a concurrent save:** the step's `ALTER TABLE ... ADD COLUMNS` changes the table's metadata, so a notebook save that started before it and commits after it fails with Delta's `MetadataChangedException` ([concurrency control for Delta tables](https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control)). The step's updates and a save's `DELETE` of its own run's rows can conflict the same way, but only when both write at the same moment. The step says so (`NoColumns` or `Partial`), and a later run finishes. Recommended for the notebook's session: `write_delta` retries the whole save once or twice on Delta's concurrent-modification exceptions, which is safe because it deletes its own `RUN_ID`'s rows before it appends. Done in def8f09b: the save runs its delete and append again together, at most 5 tries. An older notebook doesn't retry; the next save, or a rerun, writes what that one didn't.
+
+### Realistic names, unit A: procedure and function names on both engines (2026-11-23)
+
+**Why.** The owner approved ADR 0031's decision 6 on 2026-11-23: the workload reads like a real system, so the Incident RCA's evidence, Query Store, and Database Hub don't give away the demo's scenario. The coordinator split it into three units from one design: a base commit with the name mapping as data, unit A (option (c), realistic procedure and function names, on both engines), unit B (option (a'), application names), and unit C (the fixtures, the app's tests, and the docs). This entry is unit A's, two commits after edd01c86.
+
+- **The base (59d9dfb7): the mapping as data.** Each `scenario.json` gets its `service`, the middle segment of its sessions' application name, required by the schema. `rca/blind-detection.json` gets `answerKey.workloadNames`: every service, T-SQL module, PostgreSQL function, and T5 label, with the scenarios each can stand for, for grading only. Every one of those names, and `demo.fn_workload_procedures`, joins `forbiddenInDetectionCode.identifiers`, so the three blind tests fail when detection code names one.
+- **The names.** The 26 T-SQL modules of `database/common/120-scenario-procedures.sql` and the 15 step functions of `database/postgresql/120-scenario-functions.sql` move from `demo.usp_scenario_*` into six application schemas: `billing`, `frontdesk`, `records`, `reporting`, `scheduling`, and `supply`. They're named for what they do, for example `billing.usp_claim_work_item` for the blocked billing clerk and `scheduling.usp_assign_work_item` for the chain's head blocker, with one name per module on both engines. `demo` keeps the control objects and `demo.fn_seed_scale`. The runner's callers and each scenario's entry follow, and the schema's procedure pattern allows only those schemas, plus `events` for T5's label.
+- **No stored definition names a scenario.** SQL Server stores a module's whole batch, header comments included, and a DBA reads it with `sp_helptext`:
+  - Each module checks its run with `@procid = @@PROCID`. `demo.fn_workload_procedures()`, in `110-demo-control.sql` and part of the answer key, says which scenario's runs may run it, so the bound of ADR 0010 holds without a scenario ID in the module.
+  - Each header comment is a batch of its own, before a `GO`, so SQL Server never stores it with the module.
+  - The two modules that read `demo.scenario_runs` take its concurrency and start from `demo.usp_run_assert_running` instead.
+  - The in-body comments, messages, and event details that narrated the fault are neutral: no scenario ID, no "the head blocker", no "the Database Agent beat".
+  - PostgreSQL stores only a function's body, and no body names a scenario.
+- **One click.** `./scripts/deploy.ps1` changes nothing in how it updates the databases. The runner's `setup` applies `110` then `120`, as an administrator, on T1 to T3. On T4, `Enable-DemoT4Workload` runs `setup --target T4`.
+  - **T1 to T3:** `120` creates the schemas, owned by `dbo`, and grants `contosocare_runner` `EXECUTE` on them. It creates the new modules, then drops every earlier name once all of them exist, after it first unforces any Query Store plan forced for `demo.usp_visit_summary_lookup` on Azure SQL Database. `usp_reset` unforces the new lookup's plans.
+  - **T4:** `120` creates the schemas and functions, then drops every function of `demo` that has an earlier name, whatever its argument list. `PgScripts.GrantRunnerAsync` grants `USAGE` and `EXECUTE` on `PgScripts.ApplicationSchemas`. `VerifyScenarioFunctionsAsync` reads each step's schema from its name.
+- **Fail-safe while a runner and its database are out of step.** `deploy.ps1` installs the runner on T1 before it updates T3's and T4's modules:
+  - **A new runner, an old database:** the runner checks the scenario's entry module first. If it's missing, the run is **Refused**, with the reason `out-of-step` and the missing name. Nothing is registered and no session opens, and the profile host tries again, bounded, as for `connect`.
+  - **An old runner, a new database:** its first call to an earlier name fails (error 2812, or SQLSTATE 42883), and its run ends **Failed**. The run check still takes `@scenario_id` for a module that setup hasn't replaced yet.
+
+**Changed files.** `database/common/110-demo-control.sql` and `120-scenario-procedures.sql`; `database/postgresql/110-demo-control.sql` (a comment) and `120-scenario-functions.sql`; each `scenarios/*/scenario.json`'s `service` (base) and `procedure` lines, and `scenarios/scenario.schema.json`; `rca/blind-detection.json` (base); in the runner, `Runs/ScenarioRunner.cs`, `Postgres/PgScenarioRunner.cs`, `Postgres/ReplicaLag.cs`, `Postgres/PgScripts.cs`, and `Sql/SqlScripts.cs`; and the tests `SqlScriptTests`, `CatalogTests`, `PostgresTests`, `ReplicaLagTests`, `RunnerTests`, and `SqlIntegrationTests`.
+
+**Validation.** On edd01c86 with the two commits, on this PC (ARM64, with a .NET 10.0.403 SDK in the session's own folder):
+
+- **The runner's tests:** 817 tests, of which 795 passed, 22 were skipped, and none failed. The skipped ones are the integration tests, which need a disposable SQL Server or PostgreSQL server.
+- **New checks:**
+  - Every module the T-SQL script creates is in the answer key's map and forbidden in detection code.
+  - Every module that checks its run has its row in `demo.fn_workload_procedures()`, which agrees with the map.
+  - No stored module text, and no PostgreSQL function body, names a scenario or says "scenario".
+  - Each retired name is dropped once, after every replacement exists.
+  - The T4 steps live in the schemas that setup grants.
+  - An `out-of-step` refusal is retried.
+  - Two integration tests: the T-SQL upgrade, from earlier names to new ones with the run check following the module, and the refusal, which registers nothing.
+- **Pester:** under strict mode, with the Azure CLI guard, the eight suites that read the scripts or the catalog passed, with none failing: `Rca.Contract`, `Agent.PromptPack`, `Automation.Runbooks`, `DbHubDemo.Lifecycle`, `DbHubDemo.T3`, `DbHubDemo.T3Agent`, `DbHubDemo.T4`, and `DbHubDemo.Workload`, 1,341 in all.
+- **T4's upgrade on a real PostgreSQL 18.6,** a disposable local server in the session's own folder, with trust authentication on 127.0.0.1 only:
+  - The base commit's scripts, seed, and grants, then this branch's scripts and grants, as setup applies them: the 15 earlier functions are gone, the 15 new ones are in their schemas (`billing` 8, `frontdesk` 2, and one each in the others), and `demo.fn_seed_scale` stays. A second setup changes nothing.
+  - As `contosocare_runner`, each of the 13 steps ran under a run of its scenario, and the two helper functions through them. An earlier name failed with SQLSTATE 42883, and a stopped run's step with CC001.
+  - `PostgresTests.SetupRunAndResetAgainstALocalServer` passed: the runner's setup, a baseline run, and reset.
+  - The runner, against a database at the base commit, refused a cpu-pressure run with the out-of-step reason, and registered no run.
+- **The leak check** finds no identifier in what these commits add.
+- **Not run here:** this PC has no SQL Server, so the new T-SQL is checked by the parser (ScriptDom) and the static tests, not by an engine.
+
+**Risks.**
+
+- The T-SQL runs on an engine for the first time in its live check, or under the integration tests on a disposable SQL Server. The PostgreSQL ran on one here.
+- Run IDs keep their form until unit B lands.
+- What's still readable as a demo, though it names no scenario, is listed for a follow-up in the design: the scratch and mark tables, parameter names and values such as `@variant = 'problem'`, PostgreSQL result columns, run-event names, and the `demo.` control helpers inside the bodies.
+
+**What its live check needs.** `./scripts/deploy.ps1` over an environment from before the rename, while its profile host runs.
+
+- `setup` passes on T1 to T4, and no `demo.usp_scenario_*` module is left.
+- In the minutes between the runner's install and T3's and T4's setup, a run on T3 or T4 is refused as `out-of-step`, and tried again after setup.
+- A Run all, then `./scripts/validate.ps1`.
+- On T3, plan-regression's beat runs on `frontdesk.usp_visit_summary`, and reset unforces its plans.
+- Query Store and Database Hub show the new names.
+
+### Realistic names, unit A: the review of 45f37c4c (2026-11-23)
+
+**Why.** The review of 59d9dfb7 and 45f37c4c said ship with fixes. It found nothing that would fail on a real server or on a second run, and asked for two fixes, in one follow-up commit.
+
+- **Medium: the test that guards T3's unforce of the old lookup checked nothing.** It searched from the last `CREATE OR ALTER`, so it found the unforce inside `frontdesk.usp_refresh_visit_summaries` instead of the retired block's, and a missing call, -1, still passed.
+  - **The fix:** the test reads the retired block alone, from `-- Retired names` to the first drop. It requires the unforce there, inside `BEGIN TRY`, under the Azure SQL Database condition, for `OBJECT_ID(N'demo.usp_visit_summary_lookup', N'P')`'s forced plans.
+  - **Proved:** with the block removed from the script, the test fails ("the old lookup's forced plans are unforced before it's dropped"). The script was restored after.
+- **Low: on T4, the runner's check before a run tested that the step existed, not that it could call it.** `setup --target T4` creates the steps in their new schemas before `GrantRunnerAsync` grants the runner's role `USAGE` on them. A run in between would have passed the check, registered, and failed at its first step with SQLSTATE 42501: Failed, where the design says Refused and tried again. T-SQL has no such gap, because `120` grants `EXECUTE` on the schemas before it creates a module.
+  - **The fix:** the runner checks with `PgScripts.FunctionCallableAsync`, which also requires `has_schema_privilege(n.oid, 'USAGE')` and `has_function_privilege(p.oid, 'EXECUTE')` for the signed-in role. Setup's own check stays existence-only, as an administrator's.
+  - **The reason now covers both cases:** "T4's workload modules aren't set up for this runner yet: it can't run scheduling.usp_find_double_bookings. ./scripts/deploy.ps1 sets them up; the run is tried again."
+  - **A new opt-in test,** `PostgresTests.TheRunnersCheckWantsAStepItCanCall`, against a disposable server: a function in a schema the role has no `USAGE` on exists, but isn't callable, until the grant.
+
+**Changed files.** `workload-generator/src/ContosoCare.Workload/Postgres/PgScripts.cs`, `Postgres/PgScenarioRunner.cs`, and `Runs/ScenarioRunner.cs` (the reason's words); `tests/ContosoCare.Workload.Tests/SqlScriptTests.cs` and `PostgresTests.cs`; and this report.
+
+**Validation.**
+
+- **The runner's test classes for these files** (`RunnerTests`, `SqlScriptTests`, `CatalogTests`, `PostgresTests`, `ReplicaLagTests`, `SqlIntegrationTests`, and `RcaBlindTests`): 304 tests, of which 282 passed, 22 were skipped, and none failed. The skipped ones are the integration tests.
+- **The two PostgreSQL opt-in tests** passed against the local PostgreSQL 18.6: `SetupRunAndResetAgainstALocalServer`, and the new `TheRunnersCheckWantsAStepItCanCall`.
+- **In setup's own gap, on the local server:**
+  - The base commit's scripts and grants, then this branch's scripts without their grants: the runner, signed in as `contosocare_runner`, refused a cpu-pressure run with the reason above, and registered no run.
+  - After `GrantRunnerAsync`'s two new grants, the same run completed: 2 workers ran `scheduling.usp_find_double_bookings` 53 times.
+
+**What its live check needs, added to the review's list for Final tests:**
+
+- **On T4:** `./scripts/deploy.ps1` while T4's profile is running. A T4 run in the minutes of its setup is Refused with the reason above and then tried again; none ends Failed with 42501.
+- **On T1 and T2:** the runner's `setup` applies `120`'s comment-only batches, one before each module, with no error.
+- **On T3:** `sp_helptext 'billing.usp_claim_work_item'` shows no header comment and no scenario ID.
+- **The RCA's capture of a 50111:** an `error_reported` event names a module and a run, never a scenario.
+
+### Realistic names, unit B: application names `ContosoCare.Demo/<service>/<run>` (2026-11-23)
+
+**Why.** On 2026-11-23 the owner approved [ADR 0031's decision 6](adr/0031-incident-rca.md#2-names), the realistic workload names, (a′) and (c). A session's application name, which the DMVs, `pg_stat_activity`, and Database Hub's session lists show, named the fault it played: `ContosoCare.Demo/locking-blocking/20261120170200-t1-9b7c1d`. This is unit B, (a′): the name becomes `ContosoCare.Demo/<service>/<run>`, the ContosoCare client service that runs the scenario and an opaque run ID. It builds on unit A's shared base, 59d9dfb7: each `scenario.json`'s `service`, the schema's `service`, and the answer key's `workloadNames`. Unit A renames the modules, (c), and unit C the fixtures and docs. One commit.
+
+- **The run ID says nothing about the run.** `SessionNames.NewRunId()` returns 16 lowercase hex characters, 64 random bits, with no time and no target. `demo.scenario_runs`, or T5's run store, maps it to its scenario, target, and times, as before. It fits `IsValidRunId`, `demo.usp_run_begin`'s rule on both engines, which an older runner's IDs (`20261120170200-t1-9b7c1d`) still fit. The observer hashes a name's last segment and the answer key hashes the run ID, so they still agree, and nothing under `Rca/**` changes.
+- **The middle segment is the service.** `ScenarioDefinition.Service` is required. The catalog refuses a service that isn't lowercase words joined by hyphens, 32 characters at most; `control`, which would hide a run's sessions from the session tools; and one that names a scenario, whole or as hyphen-separated words (`cpu-pressure-api`). `SessionNames.ForRun(service, runId)` refuses the same services, and a run ID with a LIKE wildcard, since the session tools now match by the run alone. The three runners name runs `ForRun(plan.Scenario.Service, runId)`: on T5 that's each request's User-Agent prefix and each document's `source`. The run command's JSON `applicationName` says the same.
+- **The kill tools match a run's sessions by the run ID alone.** `demo.usp_kill_demo_sessions`' past-deadline match, on both engines, built `ContosoCare.Demo/<scenario_id>/<run_id>`, which a new name never equals. It's `LIKE 'ContosoCare.Demo/%/' + run_id` now, as `demo.fn_demo_sessions` already was. A run ID has no LIKE wildcard, so the match is exact, and it matches an older runner's names too.
+  - **Out of step** (the design's 5.2): the runner's watchdog, reset, and stop call the kill tool by run with `past_deadline_only` off, which goes through `fn_demo_sessions`' match, so a new runner on an old database, and an older runner on a new one, still end their runs' sessions.
+  - **Unchanged:** the prefix filters, `ContosoCare.Demo/control/`, and ADR 0010's bounds.
+- **T4's read replica: a scenario stop matches by run, not by service.** The design proposed the service, with a by-run match as the alternative if the service could reach another run's session. It can: on T4, missing-index and replica-lag share `reporting-jobs`, so a stop of missing-index would end a replica-lag report on the replica. The coordinator accepted the by-run match.
+  - **How:** with a replica, `stop --target T4 --scenario <id>` reads T4's Running runs before it stops them, then ends the replica's sessions of that scenario's runs among them (`ReplicaSessionScope.ForStop`; the statements take `@run_ids`, matched through `unnest`). A run's own last check, by its run, and reset, of all, are as before.
+  - **What changes:** a scenario stop no longer ends a replica session of that scenario's run that had already ended. The run's own last check ends those, and reset ends them all. A run that begins between the read and the stop is stopped but isn't in the replica scope: its runner ends its sessions within seconds of the stop, and its last check ends any left.
+- **Readers:** the agent prompts that picked the workload's sessions by a scenario segment (`blocking-chain`, `locking-blocking`, `deadlock-storm`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`) pick a run's sessions instead: they read its `run_id` from `demo.scenario_runs` and match the sessions whose names start with `ContosoCare.Demo/` and end with it (corrected by [the review of e21c3431](#realistic-names-unit-b-the-review-of-e21c3431-2026-11-23), below: at e21c3431, four of them read every `ContosoCare.Demo/` session). The deployment notebook's Workload paragraph, the runner's root description, and `stop --run-id`'s example say the new form.
+- **Left to the other units, as agreed with the coordinator:** the comments in `database/postgresql/120-scenario-functions.sql` that still say `ContosoCare.Demo/<scenario>/<run>` and `ContosoCare.Demo/replica-lag` (A); and the docs, scenario READMEs, and `scenario.json` prose that quote a tag (C). A's `SqlIntegrationTests` still pass a scenario ID as the service in two `ForRun` calls, which now stand for an older runner's names; the kill tools match them by run.
+
+**Changed files.**
+
+- **Runner:** `Sql/TargetEndpoint.cs` (`SessionNames`), `Catalog/ScenarioCatalog.cs`, `Runs/ScenarioRunner.cs`, `Postgres/PgScenarioRunner.cs`, `Cosmos/CosmosScenarioRunner.cs`, `Cosmos/CosmosRestClient.cs` (a comment), `Postgres/PgReplica.cs`, and `Cli/CommandLine.cs`.
+- **Scripts:** the kill tool's run match, with a comment, and the `fn_demo_sessions` header in `database/common/110-demo-control.sql` and `database/postgresql/110-demo-control.sql`.
+- **Tests:** `ConnectionTests`; `CatalogTests`' service cases, the refusals and the answer key (every service in `workloadNames.services` with exactly its scenarios, and in `forbiddenInDetectionCode`); `CosmosClientTests`; `CosmosRunnerTests`; `ReplicaLagTests`; `RcaSimulation`'s application names, whose middle segment only changes, since C's fixtures bind their run segments; and two lines of `PostgresTests`, agreed with A.
+- **Readers:** the seven agent prompts above, `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`, and this report.
+
+**Validation.** On 59d9dfb7 with this commit, on this PC:
+
+- **The runner's tests** (`dotnet test` in `workload-generator`): 828, none failed, 21 skipped, the opt-in integration tests that need a disposable SQL Server or PostgreSQL. At 59d9dfb7: 808, none failed, 21 skipped. The build has no warning.
+- **The new tests fail without the change:** with five mutations in one build (the old exact kill-tool match on both engines, the replica's scenario scope by service, no scenario check of a service in the catalog, no checks in `ForRun`, and T5's tag by scenario), 16 of the 21 targeted cases fail, each on its own mutation. The other 5 are the catalog's format cases, which no mutation touches. Restored, the 12 test classes that cover what changed pass: 529, with 2 skipped.
+- **The replica's statements parse:** PostgreSQL 17's parser (libpg_query) parses `PgReplicaSessions.Sql`'s three statements, with the positional parameters Npgsql sends, and reads the kill tool's match as `LIKE ('ContosoCare.Demo/%/' || r.run_id)`. No test runs them offline; the live check does.
+- **Pester,** under strict mode with the Azure CLI guard, one suite at a time:
+  - `Agent.PromptPack`: 472 passed, none failed.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - `Fabric.Notebooks`, for the deployment notebook: 121 passed, 1 failed, 8 skipped, as at 59d9dfb7 without this commit. The failure is a date bomb in `NB_DatabaseHub_LiveActivity`'s staged evidence case (`stagedOtherSession`): the test stages a file named for 2026-11-20 17:25 UTC, and the notebook's inbox sweep deletes a file staged more than 24 hours earlier, so the test has failed on every branch since 2026-11-21 17:25 UTC. The RCA release's integration fixes the test in 5633c574, with no notebook change. With 5633c574 applied, the suite passes: 122, with 8 skipped.
+  - The guard saw no Azure CLI call in any of them.
+- markdownlint found no issue in 152 files. The notebook parses, 31 cells, with one line changed.
+- No PowerShell changed, so PSScriptAnalyzer has nothing new to read.
+- The leak check prints nothing.
+
+**Risks.**
+
+- Run IDs lose their readable time and target. No code parses them: the design checked the runner, scripts, runbooks, notebooks, and app, and a search here found no slice or split of a run ID. Wherever a run ID is shown, its scenario, target, and start are shown with it.
+- A scenario stop on T4's replica covers that scenario's Running runs only (above).
+
+**What its live check needs.** In the Final tests session, with A and C:
+
+- A Run all, with the runs' sessions in `sys.dm_exec_sessions` and `pg_stat_activity` as `ContosoCare.Demo/<service>/<16 hex characters>`, and T5's requests' User-Agent and documents' `source` the same.
+- A run's sessions ended at its deadline or stop on every target, including a run an older runner started before the update (the design's 5.2).
+- `stop --target T4 --scenario replica-lag` during a replica-lag run: `replica-sessions-ended` passes, with the report's sessions ended. And `stop --target T4 --scenario missing-index` during one leaves the report running.
+
+### Realistic names, unit B: the review of e21c3431 (2026-11-23)
+
+**Why.** A fresh reviewer said to ship e21c3431 with fixes: the bounds, the kill tools, the run IDs, the names' lengths, and the replica's scenario stop are sound, with one Medium, in the agent prompts. The coordinator asked for its fix in a follow-up commit.
+
+- **Medium: four incident prompts read every demo session, not their incident's run.** e21c3431 took the scenario out of their prompt 3's filter, a `program_name` that starts with `ContosoCare.Demo/` and the scenario, and put no run in its place: `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`.
+  - **The effect:** each also read the healthy baseline's sessions and those of any incident at the same time, and the showcase runs exactly these with another (`scenarios/activity-profiles.json`): memory-grant-pressure with cpu-pressure on T2, parallel-scans and tempdb-contention with io-pressure, and slow-consumer with locking-blocking on T3. An agent would have reported another run's plans, grants, or waits as the incident's, such as a blocking incident's `LCK_M_*` in the slow client's answer. And memory-grant-pressure's way to judge the answer asked for the run's `run_id`, which none of its prompts read.
+  - **The fix:** each prompt 3 first reads the `run_id` of the scenario's latest row in `demo.scenario_runs`, then reads only that run's sessions: those whose `program_name` starts with `ContosoCare.Demo/` and ends with that `run_id`, as blocking-chain's and locking-blocking's prompt 4 match them. It tells the agent why, since other runs can be active at the same time, and to say so when it can't read the row, instead of reading other sessions. memory-grant-pressure's prompt 4 reads that run's statement, and each file's way to judge the answer says the sessions are the run's.
+  - **slow-consumer by its run, not by its `session_ids`:** the reviewer offered the `session_ids` that its prompt 2 reads. But `demo.usp_run_end` writes them when the run ends, so they're empty while the incident runs, when prompt 3 reads its live sessions; and once the run's sessions close, another session can take one of their IDs.
+  - **Front matter:** memory-grant-pressure and parallel-scans now read the scenario record, so their `dataSources` add `scenario-record`, and their `capability` says they read the run's sessions. Their `permission` stays the other scenario-record prompts'. `reviewed` stays as it was, since it dates a check of the prompt's sources too, which this didn't redo.
+  - **A test,** in `Agent.PromptPack`: a prompt block that names `ContosoCare.Demo/` reads `demo.scenario_runs` and matches a session's name by its end, the run. It fails for exactly the four prompts as e21c3431 left them, and passes with the fix.
+- **The review's live checks,** which the coordinator gives to Final tests, beside the entry above's:
+  - the past-deadline kill, `EXEC demo.usp_kill_demo_sessions;` with its defaults, on T1 to T3, with a session of each name form and a run past its deadline, and no collation conflict (Msg 468) between `program_name` and `run_id`;
+  - T4's, `SELECT * FROM demo.usp_kill_demo_sessions(NULL, true, 'check')`;
+  - the replica's statements through Npgsql, with an empty, a null, and a one-element run list;
+  - an older runner's session, ended by the new runner's watchdog and by reset.
+
+**Changed files.** The four prompts above, `tests/unit/Agent.PromptPack.Tests.ps1`, and this report: the entry above's Readers, and this entry.
+
+**Validation.** On 7c8272ba with this commit:
+
+- **The sweep:** every prompt block that names `ContosoCare.Demo/` reads `demo.scenario_runs` and matches the run: blocking-chain's, locking-blocking's, and the four above.
+- **Pester,** under strict mode with the Azure CLI guard:
+  - `Agent.PromptPack`: 512 passed, none failed, the new test's 40 cases among them. With the four prompts as 7c8272ba has them and the new test copied in, 4 failed, the new test on each of the four prompts, and nothing else.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - The guard saw no Azure CLI call.
+- PSScriptAnalyzer, with the repo's settings for tests, found nothing in the changed test file, which is ASCII-only, and markdownlint found no issue.
+- No runner code or SQL changed, so the runner's tests stand as at e21c3431.
+- The leak check prints nothing.
+
+**What its live check needs.** A presenter's rehearsal, since an agent runs the prompts, not a script: during the showcase, prompt 3 of memory-grant-pressure on T2 while cpu-pressure runs there, and of slow-consumer on T3 while locking-blocking runs, each reading only its own run's sessions.
+
+### Realistic names, unit B: the re-check of e0966579 (2026-11-23)
+
+**Why.** The re-check of e0966579 said to ship it, with one improvement, which the coordinator asked for as a quick commit. The prompts read "the latest" row of `demo.scenario_runs` without saying which column decides. An older runner's run IDs began with their time, so even a sort by `run_id` found the latest run, but the random run IDs of unit B's entry above don't. An agent that sorts by `run_id` would pick any run, find none of its sessions, and could report mid-incident that no grant is waiting.
+
+- **The fix:** every prompt that reads the latest row of `demo.scenario_runs` says it's the latest by `started_at`. That's the four of [the review's entry](#realistic-names-unit-b-the-review-of-e21c3431-2026-11-23), blocking-chain's and locking-blocking's prompt 4, and two more that the guard found, deadlock-storm's and log-flush-waits' reads of the record: ten prompts in eight files. The showcase's and the wrap-up's reads of the record pick their rows by the incident window and by the run concluded on, not the latest, so they stay.
+- **The guard,** in `Agent.PromptPack`: wherever a prompt block that reads `demo.scenario_runs` picks the latest, most recent, or newest row or run, it says `by started_at`. It fails for exactly the eight files as e0966579 left them, and passes with the fix.
+
+**Changed files.** The eight prompts above (`blocking-chain`, `deadlock-storm`, `locking-blocking`, `log-flush-waits`, `memory-grant-pressure`, `parallel-scans`, `slow-consumer`, and `tempdb-contention`, all `.skills.md`), `tests/unit/Agent.PromptPack.Tests.ps1`, and this report.
+
+**Validation.** On e0966579 with this commit:
+
+- **Pester,** under strict mode with the Azure CLI guard:
+  - `Agent.PromptPack`: 552 passed, none failed, the new test's 40 cases among them. With the prompts as e0966579 has them and the new test copied in, 8 failed: the new test on each of the eight files, and nothing else.
+  - The suites that read the docs, `Repo.Conventions`, `Repo.NeutralWording`, `Repo.Gitleaks`, `Docs.Walkthrough`, and `Rca.Contract`: 231 passed, none failed, and 3 skipped because this PC lacks gitleaks.
+  - The guard saw no Azure CLI call.
+- PSScriptAnalyzer, with the repo's settings for tests, found nothing in the changed test file, which is ASCII-only, and markdownlint found no issue.
+- The leak check prints nothing.
+
+**What its live check needs.** Nothing new: the rehearsal in the entry above checks the run each prompt picks.
+
+### Realistic names, unit C: the readers and the docs (2026-11-23)
+
+**Why.** Unit C of ADR 0031's decision 6, which the owner approved on 2026-11-23: what reads the workload's names, besides the code. It was built from the design's tables on the shared base (59d9dfb7) and checked against units A's and B's heads (186dfccb and d53e62d0). Two commits after the base: the change, and its docs following A's and B's review fixes.
+
+- **The RCA fixtures carry the new module names.** Only their string dictionaries change, so every row, index, and fact stays:
+  - **T1's document:** `[scheduling].[usp_assign_work_item]`, the head blocker, whose last call is now `scheduling.usp_assign_work_item;1`; `[scheduling].[usp_route_work_item]`; `[scheduling].[usp_bulk_reschedule]`; and `[frontdesk].[usp_process_requests]`.
+  - **T4's document:** `billing.usp_reprioritize_queue` and `billing.usp_claim_work_item`, with their top-level statements.
+  - **The transport forms, regenerated:** each document's compact JSON, as the runner wrote it in the committed parts, with the same renames, was checked equal to the edited document. It was then gzipped at `SmallestSize` and cut into 2,400-byte parts, as `PartCodec` does, and each document still has 2 parts. `rca-evidence.parameter.json` and `metrics-bundle.json` carry the new lines, and `export-index.json` and `metrics-rca-member.json` the new SHA-256s.
+  - **The run IDs and their tokens stay,** as the coordinator settled with unit B: `RcaSimulation`'s application names keep their run segments, which `RcaExportTests` binds to the fixtures' tokens, and an older runner's run ID is still a valid one. The fixtures' README says so.
+- **The runner's RCA tests:** `RcaSimulation` and `RcaObserverTests` give and expect the new module names, input buffer, and Extended Events statements. Their synthetic deadlock frame is `supply.usp_transfer_stock`, since `demo` now keeps only the control plane.
+- **The app:** the evaluation set's `mustContain` for P01, P02, and P04, and the rules', postmortem's, Root cause view's, and Mission Control's tests. The preview's T4 evidence, `pg-local.evidence.json`, a real capture, has its four module strings renamed in place, and its code comment says so. The preview's sample finding names a service.
+- **The docs:**
+  - **`scenarios/`:** every scenario page's sessions and procedures; every `scenario.json`'s prose, never its `procedure` line, which is unit A's; and the scenarios README, with a new rule, **Named as an application's**, and its SSMS example.
+  - **`rca/README.md`'s Names:** the observer drops the service with the run segment. It said that it would keep a per-service name, which decision 6 leaves for later. Its deadlock example names `[supply].[usp_transfer_stock]`.
+  - **The ADRs:** ADR 0031's §2 and decision 6, now decided, with what changed and what still reads as a demo; ADR 0010's amendment, with the tagging, the schemas, the match by run, and the upgrade; and ADRs 0019 and 0025's tags.
+  - **The rest:** `workload-generator/README.md`; the `database/common`, `database/postgresql`, and `database/cosmosdb` READMEs; `docs/architecture.md`; `docs/security-model.md`; `docs/deployment.md`, with the upgrade's row and the schemas; `docs/demo-walkthrough.md`, whose cheat sheet now names each scenario's service, so a presenter can tell whose sessions are whose; the report spec's option D; and the CHANGELOG.
+  - **Left as history:** earlier CHANGELOG entries, this report's earlier entries, and ADR 0010's dated phase notes, which name the tags and procedures as they were then.
+- **Rerunnable** (the coordinator asked for it, since the Query Store work adds fixtures that still name the earlier modules, such as `t3-plan-regression.sidecar.json`'s `[demo].[usp_visit_summary_lookup]`):
+  - **`./tests/Update-RcaFixtures.ps1 -RenameWorkloadModules -Path <files>`** renames every retired module name in the fixture documents and in the files given, with the design's 33 old and new pairs. It then writes the part lines of each document whose parts no longer decode to it, evidence and sidecar alike, and puts the new lines and SHA-256 in the other fixture files. A second run changes nothing.
+  - **Checked both ways:** from the base, it reproduces this commit's fixtures byte for byte, SHA-256s included. On the Query Store branch's dabe263c, it renamed the plan-regression sidecar, wrote its part again, and updated `sidecar-index.json` and `rca-sidecar.parameter.json`, and that branch's own `Rca.Contract` passed, 59 tests.
+  - **A new contract test,** in `Rca.Contract.Tests.ps1`, fails while a fixture, an app RCA test or its data, the preview's data, or a runner `Rca*` test names a retired module. It fails at the base and passes here.
+- **Honest detection holds:** no detection file changed. The evaluation set's questions still name no scenario; its `mustContain` names the modules a DBA reads, and only its `key` names a scenario, for grading.
+
+**Changed files.** In `rca/fixtures/`: both documents and their parts, `rca-evidence.parameter.json`, `metrics-bundle.json`, `metrics-rca-member.json`, `export-index.json`, and the README; and `rca/README.md`. In the runner's tests, `RcaSimulation.cs` and `RcaObserverTests.cs`. In `fabric/app/src`: `rca/testdata/eval-set.ts`, `rca/rules.test.ts`, `rca/postmortem.test.ts`, `rca/view/rca-view.test.tsx`, `pages/mission.test.tsx`, `lib/mission.test.ts`, `preview/data/pg-local.evidence.json`, `preview/sample-data.ts`, and `preview/sample-rca.ts`, a comment. Every scenario README, every `scenario.json`'s prose, and `scenarios/README.md`. The docs above, `CHANGELOG.md`, and this entry. New: `tests/Update-RcaFixtures.ps1`, and one test in `tests/unit/Rca.Contract.Tests.ps1`.
+
+**Validation.** On 59d9dfb7 with these commits, on this PC (ARM64, with a .NET 10.0.403 SDK and an npm cache in the session's own folder):
+
+- **The runner's tests:** 808, of which 787 passed, 21 were skipped, and none failed. The skipped ones are the integration tests, which need a disposable SQL Server or PostgreSQL server.
+- **The app's suites that read what changed,** in one process with one worker, as the coordinator asked until 2 PM: 13 files and 281 tests, all passed.
+- **Pester,** under strict mode, with the Azure CLI guard, none failing:
+  - `Rca.Contract`, whose 31 include the fixtures' blind checks, their parts' decode, and the new test of retired names, with the doc suites `Repo.Conventions` (every relative link and fragment), `Repo.NeutralWording`, and `Docs.Walkthrough`: 225 passed.
+  - The fixtures' other readers, `DbHubDemo.HistorySnapshot`, `Vm.WorkloadSteps`, `Automation.Runbooks`, `Fabric.ControlNotebook`, and `Fabric.Notebooks`: 582 passed and 88 skipped, the notebook cases that need Python with pandas, which this PC lacks.
+- **markdownlint** found no issue, and PSScriptAnalyzer, with the repo's settings, found nothing in `tests/Update-RcaFixtures.ps1` or the changed test file, both ASCII-only.
+- **Merges:** `git merge-tree` of these commits with A's head and with B's head conflicts only at this report's end, where each unit appends its own entry: keep both. `RcaSimulation.cs` and the `scenario.json` files, which A or B change too, merge by hunk.
+- **The leak check** prints nothing.
+
+**Risks.**
+
+- The fixtures' module names postdate their 2026-11-20 session, and their run IDs are in the earlier form; their README says both.
+- A module renamed again in unit A's review means the same rename here: one more pair in `Update-RcaFixtures.ps1`'s table and in the contract test's list, then the script. The Query Store session's fixtures and app tests take the script as they are, whichever branch lands second.
+- The docs describe A's and B's behavior as of their heads above: the refusal `out-of-step`, which on T4 also covers a step the runner's role can't run yet; setup's drops; the match by run; and the prompts that read an incident's sessions by its run. A review that changes one changes its sentence here.
+
+**What its live check needs.** Nothing of its own: the fixtures and tests are offline. A's and B's live round shows what the docs describe: Database Hub's sessions as `ContosoCare.Demo/<service>/<run>`, Query Store's modules in the application schemas, and the cheat sheet's services matching what Database Hub shows.
+
+### Realistic names, unit C: the review of 25df4696 (2026-11-23)
+
+**Why.** The review of 25df4696 and 2c1d2411 was **ship with fixes**. 2c1d2411 had already fixed the four doc contradictions it found, and its High concerns the merge into the release, which unit A resolves. The coordinator asked for the other three fixes on 2c1d2411, in one commit.
+
+- **Medium: the rename tool half-renamed the forms it didn't know, and succeeded.** Its bare-name fallback renamed an old name inside a qualified one and kept `demo` as the schema:
+  - `\\[demo\\]\\.\\[usp_scenario_chain_acquire\\]`, the evaluation set's form, became `\\[demo\\]\\.\\[usp_assign_work_item\\]`;
+  - `"demo"."usp_scenario_cpu_pressure"` became `"demo"."usp_find_double_bookings"`;
+  - and it didn't see an old name in upper case.
+  - **Now one form renames every name that `demo` qualifies,** whatever quotes, brackets, backticks, backslashes, or spaces stand around its dot, to its new schema and name. The bare form takes only a name that nothing qualifies, and both match in any case.
+  - **And it stops, before writing anything,** naming the file and the text, when an old name is left, qualified some other way, or a new name is still qualified by `demo`, half renamed by hand.
+- **Low: a run that stopped left a state the tool couldn't repair.** It wrote each document's parts as it went, so when a later document's part count changed, the earlier documents' parts were already written while their indexes and parameters kept the old lines and SHA-256, and a rerun found those documents unchanged. Now it plans every rename, part, and reference in memory, and checks every document: its part count, and that its new parts decode to it. Only then does it write.
+- **Low: the contract test** scans all of `fabric/app/src`, not only `rca` and `preview`, and matches in any case. It's clean today.
+- **Tests:** `tests/unit/Rca.UpdateFixtures.Tests.ps1`, new, runs the tool on copies of the fixtures under `TestDrive`, through its new `-RepositoryRoot`:
+  - the two forms the review found, with eight more, in any case;
+  - five ways it stops, each writing nothing, though a fixture and another file held names it would have renamed;
+  - a scenario.json's procedure line, left as it is;
+  - `-Path` without `-RenameWorkloadModules`, which it refuses;
+  - and a part count that would change. That run writes nothing; once the change is undone, the next run writes every part, index, and parameter, and a run after it changes nothing.
+
+**Changed files.** `tests/Update-RcaFixtures.ps1`; `tests/unit/Rca.UpdateFixtures.Tests.ps1`, new; `tests/unit/Rca.Contract.Tests.ps1`; `rca/fixtures/README.md`; and this entry.
+
+**Validation.** On 2c1d2411 with this commit:
+
+- **Pester,** under strict mode, with the Azure CLI guard: `Rca.UpdateFixtures` and `Rca.Contract`, 40 passed, none failed.
+- **Each new test fails without its fix:** four mutations of the tool each fail the tests aimed at them:
+  - without the two checks for what's left, the five tests of where it stops;
+  - matching only in lower case, the forms test and the upper-case stop;
+  - the earlier bare form, the stop for an old name that another schema qualifies;
+  - writing each document's parts as it goes, the part-count test.
+- **The widened contract test** fails on an upper-case old name in `fabric/app/src/lib`, outside the two folders it scanned before.
+- **On this branch,** the tool changes nothing.
+- **On the Query Store branch's aafee3e2,** it renamed 42 names: 10 in its 3 fixture documents, 18 in 7 app files, and 14 in 2 runner tests. It wrote the parts of the T1, T4, and T3 sidecar documents again, and put the new lines and SHA-256s in its indexes and parameters. No old name was left there in any case, a second run changed nothing, and that branch's own `Rca.Contract` passed: 63 tests.
+- **Static checks:** `Repo.Conventions` and `Repo.NeutralWording`, under strict mode with the Azure CLI guard, passed: 126 tests. PSScriptAnalyzer, with the repo's settings, found nothing in the three PowerShell files, which are ASCII-only, and markdownlint found no issue. The leak check prints nothing.
+
+**Risks.** None new. Unchanged: a part count that would change still needs its indexes, parameters, and messages edited by hand, which the tool now refuses before it writes anything.
+
+### Realistic names: merged with the RCA release, and plan-regression's stored text (2026-11-23)
+
+**Why.** Wednesday's release takes the names as one branch, `marcbushong-microsoft-names-integration`: units A, B, and C merged onto the RCA release. The release's checked switch for plan-regression (F26) came with the old names and wording, after unit A had made every stored module neutral.
+
+- **The merge's resolutions** (0bf5d4cd, onto the release's 32a2dcac; the release's later heads merged with no conflict):
+  - **`120-scenario-procedures.sql`:** the release's checked switch, without `@quiet_until`, under unit A's names. Its retry block, which merged with no conflict marker, ran the dropped `demo.usp_visit_summary_lookup`; it runs `frontdesk.usp_visit_summary` now.
+  - **The release's test,** `SqlScriptTests.PlanRegressionsSwitchIsQuietCheckedAndTriedAgainBounded`, reads `frontdesk.usp_refresh_visit_summaries`.
+  - **Eight docs** keep the release's text with the renames, and the walkthrough's cheat sheet keeps its service column. `Agent.PromptPack.Tests.ps1` keeps both sides.
+- **Unit C's review fixes** (517db85c, re-checked ship) merged with a conflict only at this report's end, where both entries stay. Their contract test, which now reads all of `fabric/app/src`, passes with the release's app files: none names a retired module.
+- **The stored text no longer narrates the fault** (the resolution re-check's one Low). SQL Server stores the procedure's whole body, where a DBA or Database Agents reads it in `sys.sql_modules`, and the release's comments and event details there said "plan A", "plan B", "the regression runs", "ran and was corrected", and "didn't start". The RCA strips comments and literals, so its evidence wasn't affected.
+  - **The comments:** their explanations moved to the header above the `GO`, which isn't stored. The body's comments say "attempt", "the seek plan", and "the scan plan".
+  - **The event details say what the check read:** "The lookup's cached plan scans care.appointments (attempt 1 of 3).", "... still seeks ix_appointments_patient after 3 attempts. The next run tries again.", or "... couldn't be read: ...".
+  - **The event names stay:** `plan-switch`, `plan-switch-retry`, and `plan-switch-unverified`. The control notebook reads the last, and ADR 0031 leaves event names to a follow-up.
+  - **The test:** `SqlScriptTests.NoStoredModuleNamesAScenario` also refuses "regression", "plan A" or "plan B", "corrected", and "didn't start" in every stored module. It failed on 0bf5d4cd's text, at "the regression runs", and passes here. PostgreSQL's function bodies have none of these words.
+
+**Changed files.** `database/common/120-scenario-procedures.sql`, `workload-generator/tests/ContosoCare.Workload.Tests/SqlScriptTests.cs`, and this report.
+
+**Validation.** Before 2 PM, targeted, one suite at a time, as the coordinator asked:
+
+- **The runner's tests that read the script:** `SqlScriptTests`, 33 passed, with ScriptDom's parse of every script; `CatalogTests`, 160 passed; `RcaBlindTests`, 4 passed. `SqlIntegrationTests`' 19 were skipped: they need a disposable SQL Server.
+- **After unit C's fixes merged,** Pester under strict mode with the Azure CLI guard: `Rca.Contract`, 31 passed, and `Rca.UpdateFixtures`, 9 passed. PSScriptAnalyzer, with the repo's settings for each file, found nothing in their three scripts.
+- **markdownlint** found no issue in this report, and the leak check prints nothing.
+
+**Risks.** The details' new words reach `demo.scenario_run_events` only, and nothing parses them: the control notebook reads the event's name, and the plan-regression README and the troubleshooting page say what the events mean, not their words.
+
+**What its live check needs.** T3's plan-regression run in Wednesday's proof: its `plan-switch` event reads as above, and `sp_helptext 'frontdesk.usp_refresh_visit_summaries'` shows none of the header.
 
 ### O1: the capture ends at a session's stop (2026-11-23)
 
@@ -7738,12 +8662,35 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 
 **What its live check needs.** Nothing more than O1's: these paths take a failed write of the store.
 
+### F35 design (i): integrated (2026-11-23)
+
+**Why.** The coordinator's go: integrate F35's reviewed units on the groundwork branch, with the docs, for the next release, whose cut-off moved to Tuesday noon.
+
+**Work summary.**
+
+- **The units, merged as they were reviewed** (`marcbushong-microsoft-f35-save-time`, on the groundwork's 27d9e8d1): the notebook and model at def8f09b (re-check SHIP), then its follow-up 464b542d (the proof's grain fix, the save's retry docstring, and that session's report sections); the Livy steps at 25f2ebb8 (its review's fixes, with the tests' StrictMode mock). No code changed in the merges.
+- **The docs** as reviewed at 45b3effc, as one commit with the same changes, then matched to the merged code: the save's bounded retry (def8f09b), a query that filters which saves it sees reading the release's rule (4f44e7ce), and 25f2ebb8's one deadline per step, `Refused` for a refused statement, `Failed` for HTTP errors past the retries, `NoModule` for a module without `kept_value_step`, and `DEPLOY.FABRIC.KEPTVALUE.END`'s `ModelOnRelease` ([ADR 0014](adr/0014-notebook-role-and-capacity.md#amendment-2026-11-23-overlapping-saves-resolved-when-history-is-saved-f35-design-i), [limitations](limitations.md#the-history-models-overlapping-saves-f35), [troubleshooting](troubleshooting.md#the-historys-kept-values-f35)).
+- **This report:** both sessions' sections, the notebook's first, since the Livy steps build on its module; the Livy section's last risk says that def8f09b added the save's retry, and cites Fabric's concurrency page.
+- **The notebooks' versions file** (`fabric/notebooks/published-versions.json`, follow-ups decision 2a) isn't on this branch: the writer runs where F35 meets 2a, in the next release's integration.
+
+**Validation.**
+
+- Pester with StrictMode and the Azure CLI guard, targeted, one run at a time on a PC at 100 % CPU: DbHubDemo.HistoryKeptValue, DbHubDemo.PowerBI, Fabric.PowerBI, Fabric.History, Fabric.Notebooks, DbHubDemo.Progress, DbHubDemo.Fabric, Repo.Conventions, Repo.FunctionNames, and Repo.NeutralWording: 425 passed, 0 failed, 9 skipped, 0 az calls. The suites only the Livy steps changed (Lifecycle, Tracks, FirstRun, FabricTrack, LifecycleScripts) run in the next release's full validation.
+- With Python 3.11.9 and pandas 3.1.1 (`DBHUB_TEST_PYTHON`), so Fabric.History's module tests and Fabric.Notebooks' helper tests ran rather than skipped.
+- vitest: kept-value-cases, snapshot-value, and Ask's guide, 49 passed.
+- markdownlint: clean on the changed docs. The leak check is clean.
+
+**Risks.**
+
+- **Two changes still to come,** each merged when it's reviewed: the Livy steps' first deployment, whose end step deploys the kept form itself instead of warning, and the notebook session's report-only commit with its validation.
+- **Not proven live,** as ADR 0014's amendment lists: a net-new deployment and an update at the release's final SHA, and the deployed model's kept form against its reference, in Tuesday's timing run.
+
 ### A ready-to-run Query Store query in the RCA's next step (2026-11-23, for the release after the RCA's)
 
 **Why.** The coordinator, for Wednesday's release: the capture's Query Store evidence (unit 2) can't ship before about December 1, so meanwhile the chat's next step should be query-level, a ready-to-run, read-only query for the target and those minutes, built only from the incident's measured target and times, never from the answer key, with a copy button in the app.
 
 - **The query** (`rca/query-store.ts`, `queryStoreQuery`), for each `TELEMETRY-ONLY` episode while its target's Query Store keeps its minutes (the retention rule of [the review of 319b3ae1](#the-review-of-319b3ae1-and-a2f776db-2026-11-23)):
-  - **T1 to T3,** T-SQL in ContosoCare: `sys.query_store_runtime_stats` with `sys.query_store_runtime_stats_interval`, the plan, query, and text, for the intervals that overlap the incident's minutes (`end_time > @from AND start_time <= @to`, with `datetimeoffset` literals in UTC), the top 20 plans by CPU, then duration, with their query and plan IDs, executions, module, and the first 300 characters of their text. For a wait class, those plans' waits in its category (`sys.query_store_wait_stats`, `wait_category_desc`, the names the detector's wait families map to).
+  - **T1 to T3,** T-SQL in ContosoCare: `sys.query_store_runtime_stats` with `sys.query_store_runtime_stats_interval`, the plan, query, and text, for the intervals that overlap the incident's minutes (`end_time > @from AND start_time <= @to`, with `datetimeoffset` literals in UTC; `<` where the episode has an end, since [the review of 0b922f37](#the-review-of-0b922f37-2026-11-23)), the top 20 plans by CPU, then duration, with their query and plan IDs, executions, module, and the first 300 characters of their text. For a wait class, the top 20 plans by their wait time in its category (`sys.query_store_wait_stats`, `wait_category_desc`, the names the detector's wait families map to).
   - **T4,** PostgreSQL in `azure_sys`: `query_store.qs_view` for ContosoCare's database and no system queries, the top 20 queries by total time, with calls, the longest run, blocks read, and their text; then `query_store.pgms_wait_sampling_view`'s samples by query and event. Never `query_parameters`, which can hold a parameter's values. Its comment says the times are the server's, UTC unless its TimeZone was changed, and that an interval shows once it has ended, as Learn says.
   - **None** for T4's read replica, whose queries Query Store doesn't record, for T5, or past the retention.
 - **Where it goes:** `explain_incident`'s `details.queryStoreQueries` (the target, language, database, the minutes in UTC, and the text), and the playbook's step 3 tells the chat to give it as is, in a code block, naming its target, database, and minutes. **The Root cause view's copy button** waits for the reorganized page, which owns `rca/view/**` today.
@@ -7754,6 +8701,328 @@ One commit, after edd01c86. Before-and-after screenshots of the page, in light a
 **Validation.** `npm run verify`'s steps, one at a time on a PC at 100 % CPU: the typecheck, lint, license check, and build pass, and the tests (vitest with two workers) 686 of 687; the one failure is a `waitFor` timeout in `pages/mission.test.tsx`'s Session replay, which this change doesn't touch, and it passes run alone (3 of 3). `rca/tools.test.ts` alone, after blank lines between its tests: 42 of 42; ESLint on the four files: clean. markdownlint: no issues. Pester in strict mode with the Azure CLI guard: `Repo.Conventions.Tests.ps1`, with the documents' links and their fragments, 123 of 123; `Repo.NeutralWording.Tests.ps1` and `Repo.Gitleaks.Tests.ps1`, 10 passed, and the 3 that need gitleaks installed skipped. The leak check prints nothing.
 
 **What its live check needs.** The query, copied from a CPU incident's next step on T1 and on T4 in a live history, runs in SQL Server Management Studio on ContosoCare and in `azure_sys` (from T1, as the runner signs in), and lists those minutes' queries.
+
+### The ready-to-run query's Copy button in the Root cause view (2026-11-23, for the release after the RCA's)
+
+**Why.** The coordinator's item for Wednesday's release: the app shows the next step's ready-to-run query with a copy button. It builds on the Root cause page's reorganization and its review fix (62e5a18f), merged into this branch (cfd529b6), as the coordinator asked.
+
+- **The view** (`rca/view/QueryStoreQueries.tsx`, under the next steps in `RcaReport.tsx`): each of `explain_incident`'s `details.queryStoreQueries` as the tools built it, in a code block, under a line that names the target's Query Store, its database, and the minutes in the viewer's time and UTC (`bothTimes`, as the rest of the report gives them), with **Copy**. Copy uses the app's `copyText`, says "Query copied: run it in ContosoCare on T1", and reads **Copied** for two seconds; when the Fabric portal's frame blocks the clipboard, it asks the viewer to select the query and press Ctrl+C, as the Database Agent prompts do. The view adds no fact of its own: it shows only entries with the tools' fields (a target, T-SQL or PostgreSQL, a database, two times that parse, and a text), and nothing in place of anything else.
+- **A result cut to fit the chat's answer keeps them:** `bounded` (62e5a18f) keeps `details.queryStoreQueries` among the details it keeps however it cuts (`KEPT_DETAILS`), since the playbook's step 3 tells the chat to give them as they are.
+- **Its CSS** is layout only, at the end of `rca.css` (`.rca-query`, `.rca-query-head`): no color, so the theme's tokens stay the theme's.
+- **Tests** (`rca/view/next-step-query.test.tsx`, and one in `rca/tools.test.ts`):
+  - the queries shown exactly as built, in their order, each with its target, database, and times in the viewer's zone and UTC, and one instant "at" it;
+  - Copy writes exactly that query, says so, and reads **Copied**, while the other still reads **Copy**;
+  - a blocked clipboard asks for a copy by hand;
+  - entries that aren't the tools' queries show nothing, and the next steps stay;
+  - no scenario's name in the section;
+  - a result cut to fit keeps the queries, which fails without `KEPT_DETAILS`' entry.
+
+**Changed files.** `fabric/app/src/rca/view/QueryStoreQueries.tsx` (new), `rca/view/RcaReport.tsx`, `rca/view/rca.css`, `rca/view/next-step-query.test.tsx` (new), `rca/tools.ts` (`KEPT_DETAILS` and `bounded`'s comment), and `rca/tools.test.ts`; ADR 0031, `CHANGELOG.md`, `fabric/app/README.md`, and this report.
+
+**Validation.** On a PC at 100 % CPU, where Wednesday's work runs targeted tests until 2 PM: the typecheck passes; ESLint on the five changed files: clean; the tests under `src/rca` (vitest with two workers): 264 of 264, the new file's 4 among them; the bounded test fails with `KEPT_DETAILS`' entry taken out. markdownlint: no issues. Pester in strict mode with the Azure CLI guard: `Repo.Conventions.Tests.ps1`, with the documents' links and their fragments, 123 of 123. The leak check prints nothing.
+
+**What its live check needs.** In the Root cause view on a live history, a CPU incident's next steps on T1 and on T4 show their queries, and **Copy** puts each on the clipboard inside the Fabric portal's frame, or says to copy it by hand.
+
+### The review of 0b922f37 (2026-11-23)
+
+**Why.** The independent review of 0b922f37, the ready-to-run query's tools side, said **SHIP WITH FIXES**. It found that the queries only read, take no unsafe input, and use nothing the demo planned. Its fixes are in one commit after the merge of 62e5a18f (cfd529b6), as the coordinator asked.
+
+- **The window's end (Medium).**
+  - **The problem:** an episode's `end` is its first sample back under the level (`rca/types.ts`), so `start_time <= @to` also read the interval that starts there. That's one interval too many whenever the end falls on an interval's start: about 1 in 15 incidents on 1-minute bins, and every one on 15-minute points.
+  - **The fix:** with an end, the queries read `start_time < @to`. `<=` stays where the minutes end at the last sample at the level, or at `readEnd`, where the minutes read ended with the incident still on (the detector sets `readEnd` only when there's no end): the interval that starts there holds some of the incident.
+- **Kept when cut, and capped (Medium).**
+  - **Kept:** 7462a151 already added `queryStoreQueries` to what `bounded` keeps however it cuts (`KEPT_DETAILS`).
+  - **Capped:** the list now holds at most three (`QUERY_STORE_QUERIES_MAX`, in `rca/query-store.ts`), in the order the causes read, the root cause's first. `details.queryStoreQueriesLeftOut` counts the others, and `bounded` keeps it too.
+  - **Step 3** of the playbook says so, says that `explain_incident` with each one's key gives its query, and says that without a query the chat gives the next step alone and never writes a query itself.
+  - **The Root cause view** says how many more aren't shown, the rare time there are any; it asks for one incident at a time.
+- **The wait query's words (Low):** it's the top 20 plans by their wait time in the category, which is the better query. Its comment, ADR 0031, the CHANGELOG, and this report's entry now say that, not "the same plans' waits".
+- **Ties (Low):** `p.plan_id` last in both T-SQL queries' order, `q.query_id` in `qs_view`'s, and `w.query_id`, `w.event_type`, `w.event` in the wait sampling's.
+- **An empty result (Low):** it read as "no query ran". Each query now starts with a read-only line:
+  - on T1 to T3, `actual_state_desc` and `readonly_reason` from [`sys.database_query_store_options`](https://learn.microsoft.com/sql/relational-databases/system-catalog-views/sys-database-query-store-options-transact-sql), with a comment that `READ_WRITE` records and `READ_ONLY` doesn't;
+  - on T4, `pg_qs.query_capture_mode` and `pgms_wait_sampling.query_capture_mode` through [`current_setting` with `missing_ok`](https://www.postgresql.org/docs/current/functions-admin.html#FUNCTIONS-ADMIN-SET), which gives null rather than an error for a setting the server doesn't know.
+  - T4's header now says "at every size but Burstable", as its next step does.
+- **Tests,** each failing without its fix:
+  - `rca/tools.test.ts`:
+    - the intervals a query reads, from its own window and operator, around an end at 15:45 on T1 and T4: 15:30's interval and not 15:45's, but 15:45's too for a last sample or a `readEnd` at 15:45;
+    - T1's, T2's, and T4's queries with `<`, the wait query's words, the tie-breakers, and their first statements;
+    - T1, T2, and T3 with a query at exactly 14 days, and none a second later;
+    - a blocking episode with no query, and the CPU beside it in one window with one;
+    - five episodes no rule explains on T2 with three queries, matched to the root cause's signal and then to "Also in these minutes", the other two counted, all kept by `bounded`, and step 3's words.
+  - `rca/view/next-step-query.test.tsx`: the count of the others, one and two, and nothing for anything but a whole count.
+  - Mutations, one at a time: `<=` at every end; no cap; the count left out of `KEPT_DETAILS`; and queries for every episode. Each fails its test.
+
+**Changed files.** `fabric/app/src/rca/query-store.ts`, `rca/tools.ts`, `rca/playbook.ts`, `rca/view/QueryStoreQueries.tsx`, `rca/view/rca.css`, `rca/tools.test.ts`, and `rca/view/next-step-query.test.tsx`; ADR 0031, `CHANGELOG.md`, and this report.
+
+**Validation.** On a PC at 100 % CPU, before 2 PM, when Wednesday's work runs targeted tests: the typecheck passes; ESLint on the six changed source and test files: clean; the tests under `src/rca` (vitest with two workers): 269 of 269; the four mutations each fail their test. markdownlint: no issues. Pester in strict mode with the Azure CLI guard: `Repo.Conventions.Tests.ps1`, with the documents' links and their fragments, and `Repo.NeutralWording.Tests.ps1`: 126 of 126. The leak check prints nothing. The full `npm run verify` runs after 2 PM.
+
+**What its live check needs** (on Tuesday's list):
+
+- each query, copied from a live incident's next step, runs on T1 and T2 in SQL Server Management Studio, on T3, and on T4 in `azure_sys`;
+- each query's first result is Query Store's state, or T4's capture modes;
+- T4's `qs_view` times are UTC.
+
+### High contrast: the app's colors on a hovered or pressed fill (2026-11-23)
+
+**Why.** [The review of 2b0e46b0](#the-review-of-2b0e46b0-2026-11-23) found, and [its re-check](#the-re-check-of-f28d6320-2026-11-23) confirmed, that in the app's own **High contrast** theme, Fluent's `teamsHighContrastTheme`, a hovered or pressed row, subtle or transparent button, or menu item takes a cyan fill (`#1AEBFF`: `colorSubtleBackgroundHover` and `Pressed`, `colorNeutralBackground1Hover` and `Pressed`, `colorTransparentBackgroundHover` and `Pressed`), which Fluent pairs with a black foreground (14.37:1), while the app's own colors don't switch. It's older than the earth tones: the same at b059c91, with the same Fluent (9.75.2) and the same contrast tokens. The coordinator put it in Wednesday's release, on its own branch, `marcbushong-microsoft-insights-app-high-contrast-hover`, after 6da522e6, with the reviewer's smallest fix: one high contrast group in `styles/app.css`, outside the forced-colors blocks.
+
+- **What was on the cyan, and at what contrast:**
+  - a table row's status words (`.status-badge`, the statuses' high contrast colors), 1.03:1 to 1.53:1;
+  - its target marks (`.target-chip i`, an inline background), 1.03:1 to 1.36:1, and so the target filter's marks on a hovered menu item;
+  - its plain **Open** link, in the link's yellow, 1.36:1, and its captions (`.muted`, white), 1.46:1;
+  - a KPI tile's text (white), 1.46:1, the tile's own hover rule filling it with `colorSubtleBackgroundHover`;
+  - the **Ask Copilot** and **Ask why** buttons, whose text is the brand's white with `!important`, 1.46:1;
+  - and the Copilot account button's plan (`.copilot-account-plan`, white), 1.46:1.
+- **The fix:** a `[data-theme="contrast"]` group at the end of `styles/app.css` gives each of those, on a hovered or pressed row, button, or menu item, the foreground Fluent pairs with that fill: `colorNeutralForeground1Hover` and `Pressed` in a row and a KPI tile, `colorNeutralForeground2Hover` and `Pressed` in a menu item and a subtle button, and `colorNeutralForeground2BrandHover` and `Pressed` in a transparent button, all black, 14.37:1 on the cyan. A target's mark takes it as its background, with `!important` over the inline color, and Ask's buttons with `!important` over their own. The rest of the row, button, or menu item already took it from Fluent. Light and dark don't match `[data-theme="contrast"]`, and the forced-colors blocks are untouched. [Its review](#the-review-of-cc1fe148-and-6a2de30d-2026-11-23) added the account chips and the Manage page's target list, left disabled controls alone, and put the group in `@media (forced-colors: none)`.
+- **What's left as it was:** a KPI tile's status rail, at its edge, keeps its color beside the cyan, as the tile's status is also its word; and Fluent's components keep their own high contrast pairs.
+- **Found with it: a bar chart's hover hides its bar.** `ChartView` drew its cursor's band (`.chart-cursor rect`, `colorSubtleBackgroundHover`) over a bar chart's bars, not under them, and the fill is opaque, so the hovered band's bars disappeared while the tooltip showed their values: in every theme, and in high contrast as a cyan band. It's older than the earth tones. Fixed in a commit of its own: [its entry](#a-bar-charts-hovered-bars-stay-in-view-2026-11-23).
+
+**Changed files.** `fabric/app/src/styles/app.css` (the group), `theme/fluent.ts` (the comment on high contrast's `states`), and `lib/app.test.ts`; ADR 0030, the CHANGELOG, the app's README, and this report: this entry, and a line in the review's entry.
+
+**Validation.** On 6da522e6 with this commit, with this PC at 100 % CPU from other sessions, so targeted runs only until 2 PM:
+
+- **`src/lib/app.test.ts`, its themes:** 23 passed, the forced-colors tests (F22) among them. The new test holds each place the app colors on high contrast's hover and pressed fill (19, in a row, a menu item, a KPI tile, Ask's buttons, and the Copilot account button; 25 since [its review](#the-review-of-cc1fe148-and-6a2de30d-2026-11-23)) to the foreground Fluent pairs with that fill, at 4.5:1 for text and 3:1 for a mark, with `!important` where it's needed.
+- **It fails without the fix:** with the group removed, with a row's target mark without its `!important`, and with the **Ask Copilot** hover rule removed: 3 of 3 fail it.
+- **The typecheck and lint:** `tsc` found no error, and ESLint none in the two TypeScript files this commit changes.
+- markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+- **Checked in the browser after 2 PM** ([the browser check](#the-browser-check-of-the-high-contrast-branch-2026-11-23)): in the sample preview's high contrast theme, each rule wins over Fluent's and the inline colors; every place reads black on the cyan, 14.37:1, hovered and pressed.
+
+**What its live check needs.** The deployed app in its **High contrast** theme, not Windows forced colors: hover and press a row on the Findings and Readiness pages, the target filter's items, a KPI tile on Findings, **Ask Copilot** on a card and **Ask why** on the Estate page, and the Copilot account in the dock.
+
+### A bar chart's hovered bars stay in view (2026-11-23)
+
+**Why.** Found with [the high contrast fix](#high-contrast-the-apps-colors-on-a-hovered-or-pressed-fill-2026-11-23): `ChartView`, the one chart component every page and the Copilot dock use, drew a bar chart's hovered category, a band in `colorSubtleBackgroundHover`, after the bars, and the fill is opaque, so the bars you pointed at disappeared while the tooltip showed their values. In every theme, since the chart was written; in high contrast, as a cyan band. The coordinator put the fix in the same release, as a commit of its own on the high contrast branch, after cc1fe148.
+
+- **The fix:** `ChartView` draws the band first, under the incident bands, the grid, and the bars (`chart-cursor chart-cursor-band`), so every bar is painted over it. A line chart's cursor, a dashed line with a dot on each series, stays on top of its lines. In light and dark, the bars keep 3:1 on the band, as on any hovered fill ([the review of 2b0e46b0](#the-review-of-2b0e46b0-2026-11-23)): its fill is the hovered row's.
+- **High contrast:** a cyan band under high contrast's bright bars would leave them at 1.03:1 to 1.36:1, so there the band has no fill and a dashed outline in `colorNeutralStrokeAccessible`, white on the chart's black, as a line chart's cursor is: one rule in the high contrast group of `styles/app.css`. The forced-colors blocks are untouched.
+- **Tests:** `src/visuals/ChartView.test.tsx` draws a grouped and a stacked bar chart, moves to a category with the keyboard, and finds every bar after the band in the document, so painted over it; `src/lib/app.test.ts`'s high contrast test finds the band's outline, with no fill, at 3:1 or more on black. Each fails without its fix: with the band drawn after the bars again, and without the high contrast rule.
+
+**Changed files.** `fabric/app/src/visuals/ChartView.tsx`, `visuals/chart-view.css` (a comment), and `styles/app.css`, with `visuals/ChartView.test.tsx` and `lib/app.test.ts`; the CHANGELOG, and this report: this entry, and a line in the high contrast entry.
+
+**Validation.** On cc1fe148 with this commit, targeted runs only until 2 PM:
+
+- `src/visuals/ChartView.test.tsx`: 15 passed; `src/lib/app.test.ts`, its themes: 23 passed.
+- **Each fix, reverted alone, fails a test:** the band drawn after the bars, and no high contrast outline: 2 of 2.
+- `tsc` found no error, and ESLint none in the three TypeScript files this commit changes; markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+- **Checked in the browser after 2 PM** ([the browser check](#the-browser-check-of-the-high-contrast-branch-2026-11-23)): on the Estate page's waits, the scoreboard's times per engine, and the Readiness page's checks by area, in light, dark, and high contrast, by pointer and by the arrow keys, the band is drawn first, every hovered bar is on top of it, the app's colors keep 3.13:1 or more on it in light and 4.91:1 in dark, high contrast's band is an outline, and the tooltip shows, in view, at 11.61:1 or more. The full `npm run verify` passed.
+
+**What its live check needs.** The deployed app: hover a bar on the Estate page's "Where the wait time went" and the scoreboard's "Times per engine", in light, dark, and high contrast.
+
+### The review of cc1fe148 and 6a2de30d (2026-11-23)
+
+**Why.** An independent review of [the high contrast fix](#high-contrast-the-apps-colors-on-a-hovered-or-pressed-fill-2026-11-23) and [the bar chart's band](#a-bar-charts-hovered-bars-stay-in-view-2026-11-23) found 6a2de30d clean, and said **ship with fixes** for cc1fe148: two more places on the cyan, disabled controls the rules blacked out, a change under Windows forced colors that the docs said didn't happen, and a count that didn't match. One commit, after 6a2de30d, before the browser check and the full `npm run verify`.
+
+- **Medium: the top bar's account chips** (`shell/AccountChips.tsx`) are subtle buttons, cyan on hover, and their captions (**Fabric**, the GitHub plan, and **Didn't finish**) are white through `.account-text small`: 1.46:1. The captions take Fluent's subtle button's hover and pressed foreground now, and so does the chip itself, since `.account-chip.muted` sets its color with the same specificity as Fluent's hover.
+- **Medium: the Manage page's Target list** (`pages/ManagePage.tsx`): each option holds a target's chip, and a hovered or pressed option is cyan (`colorNeutralBackground1Hover` and `Pressed`), so its marks were 1.03:1 to 1.36:1. They take the option's foreground there, `colorNeutralForeground1Hover` and `Pressed`, with `!important` over the inline color.
+- **Low: disabled controls lost their content on hover.** Fluent leaves a disabled button, menu item, or option without a hover fill, so the black made a disabled **Ask Copilot** (`LiveNow.tsx`, `VisualCard.tsx`) black on black, and took the mark of the target filter's last item, disabled so that the filter keeps one target (`GlobalFilter.tsx`). The button rules now need `:enabled`, and the menu item and option rules `:not([aria-disabled="true"])`.
+- **Low: Windows forced colors did change.** With the System choice, the app picks high contrast under forced colors too (`AppThemeProvider.tsx`), and Fluent's hovered menu item sets `forced-color-adjust: none` with the system's Highlight, so the filter menu's marks took Fluent's black on it: 2.78:1 on the Desert theme's `#903909`. The group is now in `@media (forced-colors: none)`, so under forced colors the system's colors apply, as before. The bar chart's band rule stays outside it: the app's high contrast charts keep their colors under forced colors, where a cyan band would sit under T2's cyan bars.
+- **Low: the docs.** The report said 16 places, where cc1fe148's test had 19; the test now has 25, with the account chips (4) and the Manage list (2). The CHANGELOG, ADR 0030, the app's README, and this report list them, and say what happens under forced colors instead of "unchanged".
+- **Found, then fixed: the target filter's marks under Windows forced colors.** On a hovered filter item under forced colors, the marks kept high contrast's own colors on the system's Highlight, as before cc1fe148: 4.05:1 to 7.05:1 on Desert's `#903909`, but 1.01:1 to 1.66:1 on Night sky's `#D6B4FD`. They take `HighlightText` now, 7.96:1 and 7.00:1, in [their own commit](#forced-colors-a-hovered-filter-items-target-marks-2026-11-23).
+
+**Changed files.** `fabric/app/src/styles/app.css` and `lib/app.test.ts`; the CHANGELOG, ADR 0030, the app's README, and this report: this entry, and two lines in the high contrast entry.
+
+**Validation.** On 6a2de30d with this commit, targeted runs only until 2 PM:
+
+- `src/lib/app.test.ts`, its themes, and `src/visuals/ChartView.test.tsx`'s bar tests: 25 passed. The test reads which `@media` block each rule sits in, with a small parser of the stylesheet.
+- **Each fix, reverted alone, fails the high contrast test:** no account chip rules, no option rules, the **Ask Copilot** rules without `:enabled`, the filter menu's without `:not([aria-disabled="true"])`, and the group outside `@media (forced-colors: none)`: 5 of 5.
+- `tsc` found no error, and ESLint none in `lib/app.test.ts`; markdownlint found no issue, and the leak check finds no identifier in what this commit adds. The literal-color test caught a hex color in the new comment, which now names it in words.
+- **Checked after 2 PM** ([the browser check](#the-browser-check-of-the-high-contrast-branch-2026-11-23)): in high contrast, the rows on Findings and Readiness, the target filter and its disabled item, the Manage list, KPI tiles, Ask's buttons and a disabled **Ask Copilot**, the account chips, and the Copilot account, 33 checks, all passed; the hovered bars in all three themes, by pointer and by the arrow keys; and Chromium's emulated forced colors, where it found [a pressed item's marks](#forced-colors-a-pressed-filter-items-target-marks-2026-11-23). The full `npm run verify` passed: 692 tests.
+
+### Forced colors: a hovered filter item's target marks (2026-11-23)
+
+**Why.** [The review of cc1fe148 and 6a2de30d](#the-review-of-cc1fe148-and-6a2de30d-2026-11-23) found it, and the coordinator asked for the fix in the same release, as its own commit after 8fc540c5. Under Windows forced colors, Fluent fills a hovered menu item with the system's `Highlight` and sets `forced-color-adjust: none` on it, which what's in it inherits, so the target filter's marks showed the app's colors on the system's selection color. Measured from `APP_TOKENS`: on the Night sky theme's `#D6B4FD`, as low as 1.01:1 in high contrast, which the app picks under forced colors with the System choice, 2.10:1 in light, and 1.05:1 in dark; on Desert's `#903909`, 1.16:1 in light and 1.97:1 in dark (4.05:1 or more in high contrast).
+
+**What changed.**
+
+- **One rule** in `src/styles/app.css`, in its own `@media (forced-colors: active)` block after the high contrast group: an enabled, hovered item of the target filter gives its marks the system's `HighlightText`, with `!important` over the inline color: 7.96:1 on Night sky's Highlight and 7.00:1 on Desert's, as the item's name has. No `data-theme` scopes it, so it holds when the viewer picked light or dark too. A press keeps `:hover`, but isn't Highlight: the browser check found it, and [the next entry](#forced-colors-a-pressed-filter-items-target-marks-2026-11-23) fixes it.
+- **Only there.** A disabled item has no Highlight under forced colors: Fluent gives it `Canvas` and `forced-color-adjust: auto`. Fluent's list option has no forced-colors fill, only a disabled option's `GrayText`, so a hovered option on the Manage page is `Canvas`, where `HighlightText` would be 1.48:1 (Night sky) and 1.04:1 (Desert); its marks stay forced to `Canvas`, as every mark at rest is, beside the target's name. The app's other menus hold Fluent's icons and words, which Fluent pairs with `HighlightText` already, and the current page, scene, and incident hold words that F22's rules color.
+- F22's rules and the high contrast group are unchanged.
+
+**Changed files.** `fabric/app/src/styles/app.css` and `src/lib/app.test.ts`; the CHANGELOG, ADR 0030, the app's README, and this report: this entry and one line in the entry before it.
+
+**Validation.** On 8fc540c5 with this commit, targeted runs only until 2 PM:
+
+- **A test in `src/lib/app.test.ts`** reads the rule and its `@media` block: it sits in `@media (forced-colors: active)`, gives the mark `HighlightText` with `!important`, and is the only forced-colors rule on a target mark. It fails without the rule, outside the block, without `!important`, with `Highlight`, with the list options added, and without `:not([aria-disabled="true"])`: 6 of 6. The themes in `src/lib/app.test.ts`: 24 passed.
+- `tsc` found no error, and ESLint none in `lib/app.test.ts`; markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+- **Checked in the browser after 2 PM** ([the browser check](#the-browser-check-of-the-high-contrast-branch-2026-11-23)): under Chromium's emulated forced colors with a light and a dark palette, with the System choice and with light or dark picked, every enabled filter item, hovered, has `HighlightText` marks on Highlight (15.13:1 and 14.37:1), from the computed style and on screen, and a hovered option on the Manage page is `Canvas`, its marks forced to it. A pressed item wasn't covered: [the next entry](#forced-colors-a-pressed-filter-items-target-marks-2026-11-23) fixes it. Night sky's and Desert's palettes can't be emulated, so their ratios above are computed from those themes' colors.
+
+### Forced colors: a pressed filter item's target marks (2026-11-23)
+
+**Why.** The browser check after 2 PM found it, under Chromium's emulated forced colors: [the hovered item's rule](#forced-colors-a-hovered-filter-items-target-marks-2026-11-23) held on every hovered item, but not on a pressed one. Fluent's pressed menu item (`:hover:active`) outranks its own forced-colors Highlight and keeps that rule's `forced-color-adjust: none`, so a pressed item shows the app theme's own pressed fill and words, unforced. `HighlightText` on them was 1.23:1 (white on the light theme's `#EFE7D7`, with a light palette), 1.35:1 (black on the dark theme's `#2A221D`, with a dark palette), and 1.46:1 (white on high contrast's cyan, with a light palette). Before 320bacb9, the light and dark themes' marks kept their own colors there, at 3:1 or more, so that commit made a press worse; it hasn't shipped.
+
+**What changed.**
+
+- **One more rule** in the same `@media (forced-colors: active)` block: a pressed, enabled item of the target filter gives its marks `colorNeutralForeground2Pressed`, the color Fluent gives its words, with `!important` over the inline color and a selector that outranks the hovered one: 10.08:1 on the light theme's pressed fill, 12.91:1 on the dark theme's, and 14.37:1 on high contrast's. High contrast's pressed marks were 1.03:1 to 1.36:1 under forced colors before 320bacb9 too, since the high contrast group stays out of forced colors.
+- A hovered item keeps `HighlightText`, and the Manage page's options stay forced to `Canvas`, pressed too.
+
+**Changed files.** `fabric/app/src/styles/app.css` and `src/lib/app.test.ts`; the CHANGELOG, ADR 0030, and this report: this entry and one line in the entry before it.
+
+**Validation.**
+
+- **The forced-colors test in `src/lib/app.test.ts`** reads the pressed rule too: in `@media (forced-colors: active)`, `colorNeutralForeground2Pressed` with `!important`, at 3:1 or more on `colorNeutralBackground1Pressed` in each theme, and the two rules are the only forced-colors rules on a mark. It fails without the pressed rule, with `HighlightText` or the hover color in it, without its `!important`, on `:active` alone, or outside the block, and still with each of the hovered rule's five: 11 of 11. The themes in `src/lib/app.test.ts`: 24 passed.
+- **In the browser**, under Chromium's emulated forced colors with a light and a dark palette, with the System choice and with light or dark picked: each enabled item of the target filter, hovered, has `HighlightText` marks on Highlight (14.37:1 with the dark palette, 15.13:1 with the light one); the first one, pressed, has marks in its words' color on the theme's pressed fill (10.08:1, 12.91:1, and 14.37:1), read from the computed style and from the screenshot's pixels; a disabled item and a hovered or pressed option on the Manage page show no Highlight, `Canvas` on screen.
+- `tsc` found no error, and ESLint none in `lib/app.test.ts`; markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+
+### Forced colors: a bar chart's band outline (2026-11-23)
+
+**Why.** The browser check after 2 PM found it, as expected from Chromium's own stylesheet, which gives `svg` `forced-color-adjust: preserve-parent-color`: under forced colors, the browser leaves a chart's own colors as they are, while the card under it takes the system's `Canvas`. With a light palette and the System choice, which picks high contrast under forced colors, [the band's dashed outline](#a-bar-charts-hovered-bars-stay-in-view-2026-11-23), high contrast's accessible stroke, white, sat on a white `Canvas`: hovering changed no pixel of its edges (1.00:1). With a dark palette it was white on black, 21:1.
+
+**What changed.** One rule in `src/styles/app.css`, in its own `@media (forced-colors: active)` block after the outline's: high contrast's band outline takes the system's `CanvasText`, its pair for `Canvas`. Measured on screen: 21:1 against the white `Canvas` of a light palette, where 502 pixels of its edges changed on the hover, and the same white-on-black 21:1 with a dark palette. In light and dark, the band stays a fill: it doesn't depend on the system's colors.
+
+**Changed files.** `fabric/app/src/styles/app.css` and `src/lib/app.test.ts`; the CHANGELOG, ADR 0030, and this report.
+
+**Validation.**
+
+- **The high contrast test in `src/lib/app.test.ts`** reads the rule: in `@media (forced-colors: active)`, `stroke: CanvasText`, after the outline's own rule, which stays outside any `@media` block. It fails without the rule, with the theme's stroke in it, outside its block, or before the outline's rule: 4 of 4. The themes in `src/lib/app.test.ts`: 24 passed.
+- **In the browser,** under Chromium's emulated forced colors with a light and a dark palette and the System choice: the outline at 21:1 against what was under it, in both, read from the pixels of a screenshot before and after the hover.
+- **Found, not changed: the charts' own colors on the system's Canvas.** The same check measured the Estate page's waits chart under forced colors. Where the app's theme and the system's palette differ in lightness, its bars and axis labels keep colors made for the other background: with a light palette, high contrast's bars are 1.87:1 and its labels 1.00:1 on the white `Canvas` (the System choice), and the dark theme's 1.51:1 and 2.15:1; with a dark palette, the light theme's labels are 3.05:1. A line chart's dashed cursor, in the theme's stroke too, was measured after: high contrast's, white, was 1.04:1 with a light palette, fixed in [its own entry](#forced-colors-a-line-charts-cursor-2026-11-23); the light and dark themes' are 1.78:1 (the dark theme with a light palette) and 2.29:1 (the light theme with a dark one). It was so before this branch. Two ways out, for a decision: under forced colors, the System choice could pick high contrast only with a dark palette, and the light theme with a light one, which leaves a theme the viewer picks; or the chart's plot could keep its theme's own background, with `forced-color-adjust: none`, so its colors sit on the surface they were made for.
+- `tsc` found no error, and ESLint none in `lib/app.test.ts`; markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+
+### Forced colors: a line chart's cursor (2026-11-23)
+
+**Why.** The review of ca9be32c asked for it: a line chart's dashed cursor is high contrast's accessible stroke, white, like the band's outline, so under forced colors with a light palette and the System choice it sat on the white `Canvas` too. The browser check measured it before the fix: of a strip along it, 6 pixels changed on the hover, at 1.04:1 at most.
+
+**What changed.** The cursor's selector, `[data-theme="contrast"] .chart-cursor line`, joins [the band outline's](#forced-colors-a-bar-charts-band-outline-2026-11-23) forced-colors rule, so it takes the system's `CanvasText` too; its own rule in `src/visuals/chart-view.css` has less specificity. Measured on screen after: 108 pixels changed along it, at up to 9.89:1 against the white `Canvas`, and with a dark palette 11.06:1, as before. The light and dark themes' cursors keep their theme's stroke, with the charts' other colors (found, not changed, in the band's entry).
+
+**Changed files.** `fabric/app/src/styles/app.css` and `src/lib/app.test.ts`; the CHANGELOG, ADR 0030, and this report: this entry and a line in the band's entry.
+
+**Validation.** The high contrast test in `src/lib/app.test.ts` reads the cursor's selector in the forced-colors rule; it fails without it and with it in a rule of its own outside forced colors (2 of 2). The themes in `src/lib/app.test.ts`: 24 passed. In the browser, the check above, before and after, with both palettes. `tsc` found no error, and ESLint none in `lib/app.test.ts`; markdownlint found no issue, and the leak check finds no identifier in what this commit adds.
+
+### The browser check of the high contrast branch (2026-11-23)
+
+**What.** The check deferred until after 2 PM, of cc1fe148, 6a2de30d, 8fc540c5, and 320bacb9 and the fixes it led to, in the sample preview through headless Edge and the DevTools protocol: computed styles, and where forced colors repaint, the pixels of screenshots, before and after a hover. Chromium's emulated forced colors have one light and one dark palette (a white `Canvas` with a purple Highlight, and a black `Canvas` with a cyan one); Windows' Night sky and Desert themes can't be emulated, so their ratios in these entries are computed from their colors. The full run, on ca9be32c: 155 checks, 146 passed, none failed, and 9 findings that predate the branch. The charts under forced colors again with 27f1bec6's fix, the line chart's cursor among them: 24 checks, 17 passed, none failed, and 7 findings.
+
+**Results.**
+
+- **High contrast, hovered and pressed** (33 checks, all passed): a row's status and target mark on Findings; a row's **Open** link, muted dash, and status on Readiness (no sample check lacks a next step, so the check added the dash the page shows for one, and the stylesheet's own rule colored it); a KPI tile's value, label, and line; **Ask Copilot** and **Ask why**; the target filter's items; the Manage page's target list; both account chips and their captions; and the Copilot account's plan: black on the cyan, 14.37:1, every one. A disabled **Ask Copilot** under the pointer (Live now's, while its first read is out) keeps Fluent's disabled colors, 21:1, and the filter's disabled item keeps its mark, 19.56:1.
+- **A bar chart's hovered bars** (the Estate page's waits, the scoreboard's times per engine, and the Readiness page's checks by area; light, dark, and high contrast; by pointer and by the arrow keys; 40 checks): the band is drawn first, and every hovered bar is on top of it; the app's colors keep 3.13:1 or more on it in light and 4.91:1 or more in dark; high contrast's band is an outline; and the tooltip shows, in view, at 11.61:1 or more (21:1 in high contrast).
+- **Emulated forced colors** (64 checks, all passed): the app picks high contrast with the System choice and keeps a light or dark theme the viewer picked, and the high contrast group's media doesn't match; each enabled filter item, hovered, has `HighlightText` marks on Highlight (14.37:1 with the dark palette, 15.13:1 with the light one), and pressed, after [its fix](#forced-colors-a-pressed-filter-items-target-marks-2026-11-23), marks in its words' color on the theme's pressed fill (10.08:1, 12.91:1, and 14.37:1), from the computed style and on screen; a disabled item has no Highlight, and a hovered or pressed option on the Manage page is `Canvas` on screen; a hovered row keeps the system's colors.
+- **The charts under forced colors:** high contrast's band outline and line chart cursor, after their fixes ([the outline](#forced-colors-a-bar-charts-band-outline-2026-11-23), [the cursor](#forced-colors-a-line-charts-cursor-2026-11-23)), 21:1 and up to 9.89:1 against what was under them with a light palette, and 21:1 and up to 11.06:1 with a dark one.
+- **Found, not changed (older than this branch):**
+  - the Readiness chart's **Not supported** and **Not selected** series, in Fluent's divider strokes since ec51ec3b (2026-11-18): 1.29:1 to 1.48:1 on a light card and 1.73:1 to 2.33:1 on a dark one at rest, and 1.15:1 and 1.44:1 on the hover's band; the chart's legend, tooltip, and table say the same in words;
+  - under forced colors, the charts' own colors on a `Canvas` of the other lightness: bars, axis labels, and the light and dark themes' line cursors, from 1.00:1 (high contrast's labels with a light palette), with two ways out, in [the band's entry](#forced-colors-a-bar-charts-band-outline-2026-11-23).
+- **The check's own fixes,** before its results counted: Edge's DevTools port is read from `DevToolsActivePort` (fixed ports fell in ranges Windows reserves); each page starts without the app's saved view and theme (one page's one-target filter had carried over to the next, so a chart had no data); and a chart is found by its title once drawn.
+
+**`npm run verify`** on 27f1bec6's code: the typecheck, ESLint, 692 tests in 36 files, the license check (136 production packages), and the build, all passed.
+
+### The next release's integration: the review of its merges (2026-11-23)
+
+**Why.** An independent review of the next release's integration merges (66cc5326..07dc860c) said **SHIP WITH FIXES**: a High that comes from the integration itself, a Low, and an optional fix for a test that fails under load. The coordinator asked for each as a fix-up commit on the release branch, with a test that fails without it.
+
+- **High: a taken-over session's end stopped the newer session's Incident RCA capture.**
+  - **The cause:** stop-tail's O1 (d06899f6) made `Invoke-DbHubRcaStop` always pass `-EndCapture`, and the RCA release's takeover (adc2ca16) calls it at a taken-over session's end (`Complete-DbHubTakenOverSession`). Neither side's review could see it, since stop-tail's base has no takeover.
+  - **What happened:** that end stops nothing and leaves the VMs to the `start-demo.ps1` session, but its export made each runner record the capture's end (`capture-end.json`). The observer then captures a target only when its profile was set after the end (`ProfileHost.IsActiveAfter`), and the `start-demo.ps1` session set its profiles before it, so its capture stopped there, silently, for the rest of the session.
+  - **The fix:** `-EndCapture` is a switch on `Invoke-DbHubRcaStop` that only `Stop-DbHubDemo` passes, so the takeover's end exports as it did at 66cc5326.
+  - **The test:** the takeover flow's test asserts that none of its exports carries `endCapture`. The stop's own test still asserts that each of its exports does.
+  - **Docs:** O1's CHANGELOG entry, `rca/README.md`'s runbook, ADR 0031's capture's end, and ADR 0026's takeover.
+- **Low: the kept form's measure count couldn't fail.**
+  - **The cause:** `DbHubDemo.PowerBI.Tests.ps1` compared the two forms' `Evidence.measures`, which `Get-DemoFabricSemanticModelDefinition` counts from the model's folder, the same for both.
+  - **The fix:** the test counts the `measure` lines in the table parts actually sent, with `Get-DemoTmdlMeasure`'s pattern. It holds the release form's count to `Evidence.measures`, and the kept form's to the release form's.
+- **Optional, test-only: a check that failed about 1 in 6 under load.** `CosmosRunnerTests.RuStormAlternatesWavesAndCalmsCountsIts429sAndDeletesItsDocuments` (unchanged since edd01c86) took each storm write's time from the fake account's receipt, with 2 seconds' allowance after a wave, on a clock 40 times real time: 50 ms of real time. A busy machine delays a write's arrival longer, so it fell in a calm ("A storm write at 33.7 s fell in a calm."). The test now takes each write's start from its document's `at`, the run's time at which the runner checked the phase, to the millisecond.
+
+**Changed files.**
+
+- **High:** `automation/runbooks/DbHubControl.Common.ps1`, `tests/unit/Automation.Runbooks.Tests.ps1`, the CHANGELOG, `rca/README.md`, ADR 0026, ADR 0031, and this report.
+- **Low:** `tests/unit/DbHubDemo.PowerBI.Tests.ps1`, and this report.
+- **The flaky check:** `workload-generator/tests/ContosoCare.Workload.Tests/CosmosRunnerTests.cs`, and this report.
+
+**Validation.** Pester with StrictMode and the Azure CLI guard, targeted, with 0 az calls; PSScriptAnalyzer found nothing on the changed files, and markdownlint is clean.
+
+- **High:** on `Automation.Runbooks.Tests.ps1`, the takeover flow's test passed, and all 29 of the capture's tests (`*capture*`), the stop's own `endCapture` among them. With only the runbook's change stashed, the takeover flow's test fails: both of its exports carry `endCapture`.
+- **Low:** `DbHubDemo.PowerBI.Tests.ps1`, 32 passed. With an extra measure inside the kept fragment's measure block, which every other assertion lets through to the parts sent, the new count fails (121 expected, 122 sent), and the test as it was passes.
+- **The flaky check:** `dotnet test`, the `CosmosRunnerTests` class, 51 passed. With each storm write's arrival delayed 120 ms of real time, about 5 seconds on the run's clock, as a busy machine can, the test as it was fails as the review saw it ("A storm write at 34.0 s fell in a calm."), and the fixed test passes.
+
+**The re-check (SHIP), and its two optional nits.** The re-check found both functions that call `Invoke-DbHubRcaStop`, and saw the takeover assertion fail on 07dc860c. Its nits: `automation/README.md` now names a taken-over session's end among the exports that never end the capture, and the ru-storm test counts the waves by each write's start too. `CosmosRunnerTests` passed, 51 of 51.
+
+### Zod in the functions' lock: Dependabot alert 14 (2026-11-23)
+
+**Why.** Dependabot alert 14 is high: [GHSA-mrhx-c7xc-m3w5](https://github.com/advisories/GHSA-mrhx-c7xc-m3w5), "Zod can exhaust memory while validating oversized constrained collections", in zod before 4.6.6. `fabric/app/rayfin/functions/package-lock.json` resolved zod 4.3.6, which the app's functions load at run time through `@microsoft/fabric-user-data-functions` 1.36.2 and `@microsoft/rayfin-tools-common` 1.36.2. That package declares `~4.3.6`, and so does its newest release, 2.0.1, so `npm update` can't reach the fix. The app's own `package.json` already overrides zod to 4.6.7 (`config/versions.json`), but an override reaches only its own package's lock.
+
+**The fix.**
+
+- `fabric/app/rayfin/functions/package.json` overrides zod to 4.6.7, the version the app's override pins.
+- Its lock's zod entry is the app's lock's 4.6.7 entry, from registry.npmjs.org with SHA-512: npm on this PC reaches only a feed proxy, and the public registry refused its TLS handshake. `npm install --package-lock-only` then found the lock up to date and changed nothing.
+- `config/versions.json`'s note on the overrides records the functions' override.
+- **The test** (`DbHubDemo.FabricApp.Tests.ps1`): no `package-lock.json` in the repository resolves an overridden package below its fix, and every `package.json`'s override is recorded there, at its version.
+
+**Changed files.** `fabric/app/rayfin/functions/package.json` and `package-lock.json`, `config/versions.json`, `tests/unit/DbHubDemo.FabricApp.Tests.ps1`, the CHANGELOG, and this report.
+
+**Validation.** `DbHubDemo.FabricApp.Tests.ps1` with StrictMode and the Azure CLI guard: 115 passed, 0 az calls. With the functions' `package.json` and lock as they were, the new test fails: "fabric/app/rayfin/functions/package-lock.json: node_modules/zod@4.3.6, below GHSA-mrhx-c7xc-m3w5's fix (4.6.6)". The functions' `npm ci` and build, the app's license check, and the vitest files that run the functions' code wait for the end of the coordinator's CPU quiet window, in the release's full validation.
+
+### The next release's integration (2026-11-23)
+
+**Why.** The coordinator's assignment: integrate the release after the Incident RCA's, first planned for Wednesday, now cut off Tuesday noon, with its live proof overnight and the owner's test Tuesday morning. Each piece is merged as its reviewed head arrives, on `marcbushong-microsoft-next-release-integration`, built on the RCA release's final head, 66cc5326.
+
+**What it holds,** each merge with the head it took:
+
+- **F35 design (i):** the integrated branch at 305df261 (663aa367) and its report entry, 4a3039e8 (07dc860c); the Livy steps' design A at 887fb1ed (82b9dd73) and its report line, 19af416e (12a5497d); and the F35 session's typecheck fix, 792e9a19 (5eebcfa0).
+  - In the notebook, F35's kept values are the helpers' part 5, after the Incident RCA's part 4, and the persist cell works them out before the reference run's exit, since that exit ends the run. The notebooks' versions file was written again after each merge that changed a notebook.
+  - With the Livy steps, the first history run's follow-up keeps the RCA release's wider condition (the model waiting for the Incident RCA's tables too) and deploys the form the track's step allowed.
+- **The realistic names,** ee9cb224 (75f370be).
+- **Stop-tail:** O1 and the golden job at d06899f6 (5232b77e), then the role's network join actions and the Lows at 57f7160f (e107ed8a).
+- **Query Store on's ready-to-run query,** 816ae32a (59db48dd).
+- **High contrast and the chart's hover band,** a02516a1 (c63b155b).
+- **The integration's own commits:**
+  - the CHANGELOG's `[Unreleased]`, and each dated release named (d78bb1f0, the coordinator's decision);
+  - [the review of the merges](#the-next-releases-integration-the-review-of-its-merges-2026-11-23): fff65c3b, d4154fde, and 1582e482, then the re-check's nits (ef551956);
+  - the app's typecheck (2a356245), replaced by F35's own fix, and [that fix's entry](#f35-design-i-the-filtered-saves-tests-rows-typed-as-rows-2026-11-23) in this report (7f1397de);
+  - F35's docs for the Livy steps' design A (243ba79b);
+  - [zod 4.6.7 in the functions](#zod-in-the-functions-lock-dependabot-alert-14-2026-11-23) (c0d61282).
+- **The CHANGELOG:** every piece's entries are under this release's own section, `[Unreleased]` until the release was dated (below), and the RCA release's section reads as 66cc5326 has it. Two merges had put theirs there: stop-tail's Fixed and Security entries, and High contrast's Fixed entries with an edit of the RCA's earth tones entry, which ships as it is.
+- **#69's head, 963c802f** (92bd73fa), merged ahead of main, as the review of 1582e482..c63b155b asked (SHIP WITH FIXES, one Low). #69 dates each heading at its merge, so a later merge of main would have put this release's entries under a second Incident RCA heading, without `[Unreleased]`.
+  - **The CHANGELOG** is this branch's, with #69's date for the Ignite updates, 2026-11-23. From the Incident RCA's heading on, it's #69's byte for byte.
+  - **What else it brings:** #69's secret-scan fix (`.gitleaksignore`'s fingerprints, and `episodeKeyOf` in the RCA's incident tests, beside Query Store's tests), and its service stubs for CI on Linux.
+  - **#69's RCA-XE-00 fix, f16b9cb9** (12156f1c), reviewed SHIP, came later: RCA-XE-00 reads `sys.dm_xe_object_columns` alone, since its join took about 8 s of CPU at each observer start on SQL Server 2022 and timed out on a fresh T1. `Rca.Contract`: 32 passed.
+  - **C0's test-only fix on it, f78458d6** (afcda8fc), which #69 doesn't take since CI never runs that test: the opt-in SQL Server integration test's head blocker carries the chain's run token, its login, its input buffer, and an open transaction, not a module. It passed end to end on SQL Server 2022 CU25.
+  - **#69's session-window fix, `rca-release` at 4f44a8f0** (9ae9c1cf), after #69 was NO-GO at f16b9cb9: a Run all started with the VMs running lost `sqlvm01`'s first export window, about 30 minutes of capture. Reviewed SHIP with its follow-up, it makes a control session's export start every target's window at the span's last export with no session (9d873f81), and leaves out of its answer key a run that began before that mark (7bc10e89); 4f44a8f0 adds the RCA integration's paragraph. The release takes `rca-release`'s pushed head, so it holds #69's history. The runner's changes touch `Read` and `ExportSpan`, where O1's capture end changed `Export`, and merged without a conflict.
+  - **The review's Low A** (030adbe7), in the coordinator's words: `automation/README.md`'s Limits add that a session run can also lose its answer-key rows when the start's export with no session ran on that VM only after the session's activity reached it, past the start's 3-minute wait or while the store's lock was held.
+  - **The dates,** after the checks at 030adbe7: each release is dated by its merge to main, and #69 and this release merge on Tuesday. So `rca-release`'s fe558fa0 dates #69's two sections `[2026-11-24]` (merged as 4330802b), and this release's `[Unreleased]` becomes `[2026-11-24] - Kept values and realistic names`, after its two lead items. Only `CHANGELOG.md` and this report change.
+  - **Main:** main at 4c2c1850 already merges into it without a change.
+
+**Conflicts, and how they were resolved,** besides this report (each merge's message says more):
+
+- `Send-DbHubT4ReplicaCreate`'s help: F37's `QuotaExceeded` and 061db648's `Refused`, both; the code merged without a conflict.
+- `TrackHelpers.ps1`: the RCA release's condition for the first run's follow-up, with 32e39e6a's `-SnapshotValueForm`; the Tracks test keeps both sides' assertions.
+- The app's playbook and README: 816ae32a's next-step query beside HEAD's F18 text.
+- `snapshot-value.test.ts`: 792e9a19's file.
+- `rca/README.md`'s row for `rca export`: this release's `--end-capture` and its two option sentences, with 9d873f81's window rule after the exit codes.
+
+**Validation, targeted at each step,** with StrictMode and the Azure CLI guard, while this PC was loaded and then in the coordinator's CPU quiet window:
+
+- Query Store: the app's typecheck (then failing on F35's test alone), lint, and vitest on `src/rca` and `src/copilot`, 422 passed.
+- Stop-tail: Pester on the runbook, ActivityControl, Golden, and OneCommand, 856 passed; the RCA lane's and export's tests, 47 passed.
+- The Livy steps: Pester on HistoryKeptValue, Tracks, Lifecycle, FabricItem, FirstRun, and FabricTrack, 721 passed.
+- The typecheck: `npm run typecheck` clean, and `snapshot-value.test.ts` 23 passed.
+- High contrast: `src/lib/app.test.ts` and `src/visuals/ChartView.test.tsx`, 61 passed.
+- #69's head: `Repo.Gitleaks` with the pinned gitleaks on PATH, 11 passed, none skipped; `Vm.SqlVmPlan`, 24 passed; vitest on `tools.test.ts` and `live-accuracy.test.ts`, 78 passed; `npm run typecheck` clean.
+- gitleaks 8.30.1, as CI pins it, checksum checked: the range's 69 commits, and its net diff, found no leak.
+- markdownlint is clean on every commit.
+
+**The full validation,** once, at 7f1397de, after the quiet window (18:06 to 18:49 ET), in a clean worktree, with StrictMode and the Azure CLI guard:
+
+- **Pester,** every file in `tests/unit` in one run, with Python 3.11 and gitleaks on the path: 5,814 passed, 1 failed, 78 skipped, and no call reached the Azure CLI, in 34 minutes. The failure is this PC's alone: Teardown's check that the live teardown tests skip runs them in a child `pwsh`, which loads Pester 5.9.1 from this PC's OneDrive copy, one without `Pester.ps1`. Its test file is unchanged since 66cc5326.
+- **PSScriptAnalyzer,** on the 48 PowerShell files changed since 66cc5326, each with its path's settings: no finding, and each file is ASCII with LF and parses.
+- **The Insights app:** the type check, lint, vitest (804 tests in 42 files, on 3 workers), the license check (136 production packages), and the build pass.
+- **The app's functions:** `npm ci` installs zod 4.6.7 from their lock, and `tsc --build` passes.
+- **The workload generator:** the locked restore, the Release build (no warning), and its tests: 844 passed, 25 skipped (the opt-in tests that need a SQL Server or PostgreSQL engine), and none failed.
+- **markdownlint:** 152 files, no issue.
+- **Leaks:** no commit since 66cc5326 adds or removes a deployment ID, and gitleaks 8.30.1 finds no leak in the 779 commits that 7f1397de reaches.
+- **Not run, since what they check is unchanged since 66cc5326:** Bicep and PSRule (`infra/` and `azuredeploy.json`), and the Ask relay's tests (`ask-relay/`).
+
+**After the full validation:** #69's session-window fix and the Limits sentence, checked at 030adbe7, at below-normal priority, with StrictMode and the Azure CLI guard. They change no PowerShell, app, or notebook code.
+
+- **The workload generator:** the locked restore, the Release build (no warning), and its tests: 850 passed, 25 skipped (the same opt-in tests), and none failed, 9d873f81's and 7bc10e89's new export tests among them.
+- **Pester:** `Rca.Contract`, `Automation.Runbooks`, and `Repo.NeutralWording`, 388 passed; `Repo.Conventions`' two link checks passed; no call reached the Azure CLI.
+- **PSScriptAnalyzer,** on the 48 PowerShell files changed since 66cc5326: no finding. **markdownlint:** 152 files, no issue.
+- **Leaks:** no deployment ID since 66cc5326, and gitleaks 8.30.1 finds no leak in the 784 commits that 030adbe7 reaches.
+
+**What still needs live proof,** on a new deployment and an update at the final SHA:
+
+- the reference run's time with the kept values before its exit, against the control notebook's 1,800-second limit;
+- a Run all session that `start-demo.ps1` takes over, end to end, with the newer session's capture going on after the older one's end;
+- `stop-demo.ps1`'s kept-value step, and an update from 66cc5326;
+- design A on a real first deployment: the end's switch of the history model to the kept form;
+- the functions on zod 4.6.7 in Fabric: their install and build pass with it in the full validation;
+- #69's session-window fix: a Run all started with the VMs running keeps `sqlvm01`'s first export window, and its answer key holds only the session's runs.
 
 ### Query Store's evidence: the sidecar's contract (2026-11-23)
 

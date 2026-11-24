@@ -77,6 +77,9 @@ function Stop-DemoEnvironment {
       Query Store's evidence) are fetched right after that export (Invoke-DemoRcaSidecarFetch) and go with the run as
       RCA_SIDECAR_FILE; what the run writes is acknowledged at the next export with each VM running, since they're
       deallocated by then, and the rest waits on the VMs (STOP.RCA.SIDECAR, Complete-DemoRcaSidecarSave).
+      After a run that completed, the kept values of the rows it saved are worked out through Livy with this checkout's
+      code, before any pause (F35, 2026-11-23; STOP.FABRIC.KEPTVALUE, Invoke-DemoHistoryKeptValue): never a Fail, and
+      one that can't run leaves the history reading as before.
     Run Command needs a running VM: a password rotation on a deallocated host reports Manual action required
     with the steps, and a profile on a VM that isn't running is already inactive (Not selected).
 
@@ -472,6 +475,7 @@ function Stop-DemoEnvironment {
                 }
             }
             try {
+                $saved = $null
                 $saved = Save-DemoFabricHistory -Config $Config -WindowMinutes $SaveHistoryWindowMinutes -PostgresMetrics $(if ($null -ne $postgresHistory) { [string]$postgresHistory.Json } else { '' }) -CosmosMetrics $(if ($null -ne $cosmosHistory) { [string]$cosmosHistory.Json } else { '' }) -RcaEvidence $(if ($null -ne $rcaExport) { [string]$rcaExport.Evidence } else { '' }) -RcaSidecar $rcaSidecar
                 if ($handedOff -and $null -ne $saved.Result -and ([string]$saved.Result.status -in 'Pass', 'Warning' -or [bool]$saved.StillRunning)) {
                     # The control's stop exported the session's evidence into the control vault, which this save can't read
@@ -500,6 +504,12 @@ function Stop-DemoEnvironment {
             $sidecarLine = Complete-DemoRcaSidecarSave -Config $Config -Sidecar $rcaSidecar -Why 'the session''s history wasn''t saved (STOP.FABRIC.SAVEHISTORY says why)'
             if ($null -ne $sidecarLine) {
                 $results.Add($sidecarLine)
+            }
+            # F35 (i, 2026-11-23): the kept values of the rows the save wrote, worked out through Livy with this checkout's code
+            # while the capacity still runs (Invoke-DemoHistoryKeptValue). Only after a run that completed: one still going
+            # writes after it. Never a Fail.
+            if ($null -ne $saved -and -not $historyRunning -and [string](Get-DemoMemberValue -InputObject (Get-DemoMemberValue -InputObject $saved.Result -Name 'evidence') -Name 'jobStatus') -eq 'Completed') {
+                $results.Add((Invoke-DemoHistoryKeptValue -Config $Config -CheckId 'STOP.FABRIC.KEPTVALUE' -TimeoutMinutes 15 -SessionTimeoutMinutes 5))
             }
             # T4's read replica is deleted by now, and its metrics with it (ADR 0025): when the run that would have added them
             # to the history didn't (a paused capacity, for example), they're kept in out/history-pending, with the command

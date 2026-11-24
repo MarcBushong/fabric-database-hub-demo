@@ -745,19 +745,19 @@ JOIN sys.database_files AS df ON df.file_id = vfs.file_id;
 -- name: RCA-XE-00
 -- Before RCA-XE-01 or RCA-XE-03: the fields each event carries, from the documented catalog (Learn's CREATE EVENT
 -- SESSION page points to sys.dm_xe_object_columns for them; Learn has no field reference for error_reported). The
--- runner reads only fields this lists, and records a missing one as "not captured" instead of failing.
+-- runner reads only fields this lists, and records a missing one as "not captured" instead of failing. It reads
+-- sys.dm_xe_object_columns alone, by the events' names and their data columns: its earlier join to sys.dm_xe_objects
+-- returned the same fields, and took about 8 s of CPU at each observer start on SQL Server 2022 CU25 (2026-11-23).
 SET NOCOUNT ON;
 SELECT /* dbhubdemo:rca-observer */
-    event_name  = o.name,
+    event_name  = c.object_name,
     column_name = c.name,
     c.type_name,
     c.column_type
-FROM sys.dm_xe_objects AS o
-JOIN sys.dm_xe_object_columns AS c ON c.object_name = o.name AND c.object_package_guid = o.package_guid
-WHERE o.object_type = N'event'
-  AND o.name IN (N'error_reported', N'attention', N'lock_escalation', N'xml_deadlock_report', N'database_xml_deadlock_report')
+FROM sys.dm_xe_object_columns AS c
+WHERE c.object_name IN (N'error_reported', N'attention', N'lock_escalation', N'xml_deadlock_report', N'database_xml_deadlock_report')
   AND c.column_type = N'data'
-ORDER BY o.name, c.name;
+ORDER BY c.object_name, c.name;
 
 -- name: RCA-XE-01
 -- T1, T2: the observer's Extended Events session, created when the observer starts and dropped at the session's end

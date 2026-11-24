@@ -123,8 +123,9 @@ export const EARTH_ACCENTS: { light: Accents; dark: Accents } = {
 
 /**
  * The ADR 0012 statuses, earth-toned: brick for Fail, ochre for Warning, pine for Pass, and slate for Manual action
- * required, each with its icon and word (StatusBadge). Text, so 4.5:1 on every surface; and apart from each other under
- * every color-vision deficiency the tests simulate, by lightness as well as hue.
+ * required, each with its icon and word (StatusBadge). Text, so 4.5:1 on each surface, at rest and in a hovered or
+ * pressed row, button, or menu item; and apart from each other under every color-vision deficiency the tests simulate,
+ * by lightness as well as hue.
  */
 export interface StatusColors {
     fail: string;
@@ -135,7 +136,7 @@ export interface StatusColors {
 
 export const EARTH_STATUS: { light: StatusColors; dark: StatusColors } = {
     light: { fail: "#7F211B", warning: "#925303", pass: "#3C715D", manual: "#314770" },
-    dark: { fail: "#E98081", warning: "#F1C364", pass: "#A1D9C2", manual: "#75A3D2" },
+    dark: { fail: "#EE8C8B", warning: "#F1C364", pass: "#A1D9C2", manual: "#80ABD8" },
 };
 
 /** One of Fluent's status families (message bars, badges, field states), as fluent.ts maps it onto Fluent's tokens. */
@@ -160,7 +161,7 @@ export const EARTH_STATUS_FAMILIES: { light: Record<"danger" | "warning" | "succ
         success: { background1: "#EBF8F0", background2: "#BEE4CE", background3: "#336A54", foreground1: "#336A54", foreground2: "#1E4C3A", foreground3: "#336A54", foregroundInverted: "#9DD2BA", borderActive: "#336A54", border1: "#ACDAC0", border2: "#336A54" },
     },
     dark: {
-        danger: { background1: "#402624", background2: "#5C332F", background3: "#A04038", foreground1: "#E98081", foreground2: "#F2B6B5", foreground3: "#E98081", foregroundInverted: "#A04038", borderActive: "#E98081", border1: "#824844", border2: "#E98081" },
+        danger: { background1: "#402624", background2: "#5C332F", background3: "#A04038", foreground1: "#EE8C8B", foreground2: "#F2B6B5", foreground3: "#EE8C8B", foregroundInverted: "#A04038", borderActive: "#EE8C8B", border1: "#824844", border2: "#EE8C8B" },
         warning: { background1: "#3A2B16", background2: "#523B18", background3: "#E2B75C", foreground1: "#F1C364", foreground2: "#F6DFAC", foreground3: "#F1C364", foregroundInverted: "#895618", borderActive: "#F1C364", border1: "#755421", border2: "#F1C364" },
         success: { background1: "#193429", background2: "#1B4A38", background3: "#397059", foreground1: "#A1D9C2", foreground2: "#C7EBDA", foreground3: "#A1D9C2", foregroundInverted: "#397059", borderActive: "#A1D9C2", border1: "#25694F", border2: "#A1D9C2" },
     },

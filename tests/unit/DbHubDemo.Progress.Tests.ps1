@@ -77,8 +77,8 @@ Describe 'The progress model (Phase 28, brief item 11)' {
     It 'shows the history report''s snapshot after the validation, where it happens, as not blocking DONE, and leaves it out with -SkipFabric (2026-11-06)' {
         $model = New-TestModel
         # The busy marker's Nightly stop row (2026-11-14), then the session control's (ADR 0026), then the stop at the end of an
-        # update (2026-11-19), come last, with or without Fabric.
-        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History', 'NightlyStop', 'Control', 'EndStop')
+        # update (2026-11-19), come last, with or without Fabric. The snapshot's kept values (F35, 2026-11-23) follow it.
+        @(($model['tracks'] | Where-Object { $_['name'] -eq 'Validation' })['steps'] | ForEach-Object { $_['id'] }) | Should -Be @('Validation', 'Fabric.History', 'Fabric.HistoryKept', 'NightlyStop', 'Control', 'EndStop')
         $history = Get-TestStep -Model $model -Id 'Fabric.History'
         $history['nonBlocking'] | Should -BeTrue
         $history['state'] | Should -Be 'Pending'
@@ -114,12 +114,17 @@ Describe 'The progress model (Phase 28, brief item 11)' {
         $history = Get-TestStep -Model $model -Id 'Fabric.History'
         $history['state'] | Should -Be 'Pending'
         $history['message'] | Should -BeNullOrEmpty
+        # The kept values (F35, 2026-11-23): the Fabric track's step with its track, and the snapshot's with the snapshot.
+        (Get-TestStep -Model $model -Id 'Fabric.KeptValues')['message'] | Should -Be 'Finished in an earlier run.'
+        (Get-TestStep -Model $model -Id 'Fabric.HistoryKept')['state'] | Should -Be 'Pending'
 
         $path = New-TestModelFile
         InModuleScope DbHubDemo -Parameters @{ Path = $path } { Set-DemoProgressPlan -Path $Path -Plan (Resolve-DemoTrackPlan -StopAfter 'Infrastructure') }
-        $history = Get-TestStep -Model (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20) -Id 'Fabric.History'
+        $model = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable -Depth 20
+        $history = Get-TestStep -Model $model -Id 'Fabric.History'
         $history['state'] | Should -Be 'Skipped'
         $history['message'] | Should -Be 'Not part of this run.'
+        (Get-TestStep -Model $model -Id 'Fabric.HistoryKept')['message'] | Should -Be 'Not part of this run.'
     }
 
     It 'maps each ADR 0012 status onto one friendly state, and keeps the status underneath' -ForEach @(

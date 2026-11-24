@@ -61,6 +61,44 @@ public sealed partial class CatalogTests
     }
 
     [Theory]
+    [InlineData("control")]
+    [InlineData("Billing-worker")]
+    [InlineData("billing_worker")]
+    [InlineData("billing-worker-")]
+    [InlineData("a23456789012345678901234567890123")]
+    [InlineData("cpu-pressure")]
+    [InlineData("cpu-pressure-api")]
+    [InlineData("scheduling-cpu-pressure")]
+    public void TheCatalogRefusesAServiceThatNamesAScenarioOrIsntOne(string service)
+    {
+        // ADR 0031, decision 6: a session's name never says which fault it plays, and 'control' would hide a run's
+        // sessions from the session tools.
+        var definitions = ScenarioCatalog.Default.All.Select(s => s.Id == "blocking-chain" ? s with { Service = service } : s).ToList();
+
+        var error = Assert.Throws<InvalidOperationException>(() => new ScenarioCatalog(definitions));
+
+        Assert.Contains("'blocking-chain'", error.Message, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void EveryServiceIsInTheAnswerKeyAndForbiddenInDetectionCode()
+    {
+        using var blind = JsonDocument.Parse(File.ReadAllText(RepositoryPaths.Combine("rca", "blind-detection.json")));
+        var answerKey = blind.RootElement.GetProperty("answerKey").GetProperty("workloadNames").GetProperty("services").EnumerateObject()
+            .ToDictionary(p => p.Name, p => p.Value.EnumerateArray().Select(e => e.GetString()!).Order(StringComparer.Ordinal).ToList(), StringComparer.Ordinal);
+        var forbidden = blind.RootElement.GetProperty("forbiddenInDetectionCode").GetProperty("identifiers").EnumerateArray().Select(e => e.GetString()!).ToHashSet(StringComparer.Ordinal);
+        var catalog = ScenarioCatalog.Default.All.GroupBy(s => s.Service, StringComparer.Ordinal)
+            .ToDictionary(g => g.Key, g => g.Select(s => s.Id).Order(StringComparer.Ordinal).ToList(), StringComparer.Ordinal);
+
+        Assert.Equal(catalog.Keys.Order(StringComparer.Ordinal), answerKey.Keys.Order(StringComparer.Ordinal));
+        foreach (var (service, scenarios) in catalog)
+        {
+            Assert.Equal(scenarios, answerKey[service]);
+            Assert.Contains(service, forbidden);
+        }
+    }
+
+    [Theory]
     [MemberData(nameof(ScenarioIds))]
     public void EveryIncidentRunsOnEveryTarget(string id)
     {
@@ -315,6 +353,37 @@ public sealed partial class CatalogTests
         }
     }
 
+    [Fact]
+    public void TheAnswerKeyMapsEveryScenariosEntryModuleToIt()
+    {
+        // ADR 0031, decision 6: an entry module is named for what it does, never for its scenario, and only the answer key
+        // (rca/blind-detection.json) ties it back, on every engine the scenario runs on.
+        var tsql = SqlScriptTests.WorkloadNames("tsql");
+        var postgresql = SqlScriptTests.WorkloadNames("postgresql");
+        var labels = SqlScriptTests.WorkloadNames("labels");
+
+        foreach (var scenario in ScenarioCatalog.Default.All)
+        {
+            Assert.DoesNotContain(scenario.Id.Replace('-', '_'), scenario.Procedure, StringComparison.Ordinal);
+            Assert.DoesNotContain("scenario", scenario.Procedure, StringComparison.Ordinal);
+            var sqlTarget = scenario.AppliesTo(DemoTarget.T1) || scenario.AppliesTo(DemoTarget.T2) || scenario.AppliesTo(DemoTarget.T3);
+            if (sqlTarget)
+            {
+                Assert.Contains(scenario.Id, tsql[scenario.Procedure]);
+            }
+
+            if (scenario.AppliesTo(DemoTarget.T4))
+            {
+                Assert.Contains(scenario.Id, postgresql[scenario.Procedure]);
+            }
+
+            if (!sqlTarget && !scenario.AppliesTo(DemoTarget.T4))
+            {
+                Assert.Contains(scenario.Id, labels[scenario.Procedure]);
+            }
+        }
+    }
+
     [Theory]
     [MemberData(nameof(ScenarioIds))]
     public void ProceduresAndTheirParametersExist(string id)
@@ -358,18 +427,19 @@ public sealed partial class CatalogTests
     public void SetupChecksTheProcedureEachScenarioNames(string targetName)
     {
         // Phase 25d, live: setup checked demo.usp_scenario_<id> for every row of demo.fn_scenario_catalog(), so
-        // blocking-chain, memory-grant-pressure, and log-flush-waits, whose entry procedures have other names, failed
-        // setup on T1, T2, and T3. It now checks the procedure each scenario that runs on the target names.
+        // blocking-chain, memory-grant-pressure, and log-flush-waits, whose entry procedures had other names, failed
+        // setup on T1, T2, and T3. It checks the procedure each scenario that runs on the target names, which since
+        // ADR 0031's decision 6 never follows the scenario's ID.
         var target = Enum.Parse<DemoTarget>(targetName);
         var expected = ContosoCare.Workload.Sql.SqlScripts.ExpectedProcedures(ScenarioCatalog.Default, target);
         var defined = SqlScriptTests.ProcedureParameters();
 
         Assert.Equal(ScenarioCatalog.Default.All.Where(s => s.AppliesTo(target)).Select(s => s.Procedure).Distinct(StringComparer.OrdinalIgnoreCase).Count(), expected.Count);
         Assert.All(expected, procedure => Assert.True(defined.ContainsKey(procedure), $"setup would report {procedure} missing on {target}: it isn't defined in database/common."));
-        Assert.Contains("demo.usp_scenario_chain_link", expected);
-        Assert.Contains("demo.usp_scenario_memory_grants", expected);
-        Assert.Contains("demo.usp_scenario_commit_flood", expected);
-        Assert.DoesNotContain("demo.usp_scenario_blocking_chain", expected);
+        Assert.Contains("scheduling.usp_route_work_item", expected);
+        Assert.Contains("reporting.usp_rank_visits", expected);
+        Assert.Contains("frontdesk.usp_log_checkin", expected);
+        Assert.DoesNotContain(expected, procedure => procedure.Contains("usp_scenario_", StringComparison.Ordinal));
         Assert.DoesNotContain(ScenarioCatalog.Default.Get("connection-surge").Procedure, expected);
     }
 
@@ -387,12 +457,12 @@ public sealed partial class CatalogTests
     }
 
     [Theory]
-    [InlineData("demo.usp_scenario_chain_acquire", new[] { "@run_id" })]
-    [InlineData("demo.usp_scenario_chain_link", new[] { "@run_id", "@level", "@branch" })]
-    [InlineData("demo.usp_scenario_chain_escalate", new[] { "@run_id", "@rows", "@hold_seconds", "@every_seconds" })]
-    [InlineData("demo.usp_scenario_deadlock_storm", new[] { "@run_id", "@pair", "@side", "@intensity" })]
-    [InlineData("demo.usp_scenario_capacity_max", new[] { "@run_id", "@worker", "@intensity", "@role" })]
-    [InlineData("demo.usp_scenario_slow_consumer", new[] { "@run_id", "@worker", "@rows" })]
+    [InlineData("scheduling.usp_assign_work_item", new[] { "@run_id" })]
+    [InlineData("scheduling.usp_route_work_item", new[] { "@run_id", "@level", "@branch" })]
+    [InlineData("scheduling.usp_bulk_reschedule", new[] { "@run_id", "@rows", "@hold_seconds", "@every_seconds" })]
+    [InlineData("supply.usp_reconcile_stock", new[] { "@run_id", "@pair", "@side", "@intensity" })]
+    [InlineData("reporting.usp_nightly_batch", new[] { "@run_id", "@worker", "@intensity", "@role" })]
+    [InlineData("records.usp_export_visit_history", new[] { "@run_id", "@worker", "@rows" })]
     public void TheProceduresTheRunnerCallsByNameTakeItsParameters(string procedure, string[] parameters)
     {
         var procedures = SqlScriptTests.ProcedureParameters();
@@ -402,16 +472,16 @@ public sealed partial class CatalogTests
     }
 
     [Theory]
-    [InlineData("blocking-chain", "escalationRows", "demo.usp_scenario_chain_escalate", "@rows")]
-    [InlineData("blocking-chain", "escalationHoldSeconds", "demo.usp_scenario_chain_escalate", "@hold_seconds")]
-    [InlineData("blocking-chain", "escalationEverySeconds", "demo.usp_scenario_chain_escalate", "@every_seconds")]
-    [InlineData("deadlock-storm", "maxRounds", "demo.usp_scenario_deadlock_storm", "@max_rounds")]
-    [InlineData("tempdb-contention", "rowsPerTable", "demo.usp_scenario_tempdb_contention", "@rows_per_table")]
-    [InlineData("memory-grant-pressure", "grantPercent", "demo.usp_scenario_memory_grants", "@grant_percent")]
-    [InlineData("parallel-scans", "maxdop", "demo.usp_scenario_parallel_scans", "@maxdop")]
-    [InlineData("log-flush-waits", "maxRows", "demo.usp_scenario_commit_flood", "@max_rows")]
-    [InlineData("slow-consumer", "rowsPerQuery", "demo.usp_scenario_slow_consumer", "@rows")]
-    [InlineData("capacity-max", "scratchMb", "demo.usp_scenario_capacity_max", "@scratch_mb")]
+    [InlineData("blocking-chain", "escalationRows", "scheduling.usp_bulk_reschedule", "@rows")]
+    [InlineData("blocking-chain", "escalationHoldSeconds", "scheduling.usp_bulk_reschedule", "@hold_seconds")]
+    [InlineData("blocking-chain", "escalationEverySeconds", "scheduling.usp_bulk_reschedule", "@every_seconds")]
+    [InlineData("deadlock-storm", "maxRounds", "supply.usp_reconcile_stock", "@max_rounds")]
+    [InlineData("tempdb-contention", "rowsPerTable", "frontdesk.usp_refresh_dashboard", "@rows_per_table")]
+    [InlineData("memory-grant-pressure", "grantPercent", "reporting.usp_rank_visits", "@grant_percent")]
+    [InlineData("parallel-scans", "maxdop", "reporting.usp_encounter_summary", "@maxdop")]
+    [InlineData("log-flush-waits", "maxRows", "frontdesk.usp_log_checkin", "@max_rows")]
+    [InlineData("slow-consumer", "rowsPerQuery", "records.usp_export_visit_history", "@rows")]
+    [InlineData("capacity-max", "scratchMb", "reporting.usp_nightly_batch", "@scratch_mb")]
     public void TheTSqlRangeMatchesTheScenarioRange(string id, string parameter, string procedure, string sqlParameter)
     {
         // The T-SQL refuses what the catalog refuses, so a run that bypasses the runner keeps the same bounds (ADR 0010).

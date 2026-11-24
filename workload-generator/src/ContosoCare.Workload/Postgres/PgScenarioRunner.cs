@@ -49,8 +49,8 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
     public async Task<RunResult> RunAsync(RunPlan plan, CancellationToken cancellationToken)
     {
-        var runId = SessionNames.NewRunId(time.GetUtcNow(), plan.Target);
-        var applicationName = SessionNames.ForRun(plan.Scenario.Id, runId);
+        var runId = SessionNames.NewRunId();
+        var applicationName = SessionNames.ForRun(plan.Scenario.Service, runId);
         var parameters = plan.Parameters.ToDictionary(p => p.Key, p => p.Value.ToString(), StringComparer.Ordinal);
         log.Info(
             "run.planned",
@@ -104,6 +104,11 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
             RunRegistration registration;
             try
             {
+                if (!await PgScripts.FunctionCallableAsync(control, plan.Scenario.Procedure, cancellationToken).ConfigureAwait(false))
+                {
+                    return Refused(plan, runId, parameters, OutOfStep.Reason(plan.Target, plan.Scenario.Procedure), checks, OutOfStep.RefusalReason);
+                }
+
                 if (plan.ResetBefore)
                 {
                     var reset = await database.ResetAsync(new ResetOptions(plan.RequestedBy, 30, KillSessions: true, KeepProfile: true, UndoRemediation: false, Reseed: false), time, cancellationToken).ConfigureAwait(false);
@@ -379,7 +384,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                 1,
                 async (c, t) =>
                 {
-                    var metrics = await QueryRowAsync(c, "SELECT rows_added, scratch_mb FROM demo.usp_scenario_io_pressure_grow(@run_id, @scratch_mb, 32);", t, ("run_id", context.RunId), ("scratch_mb", scratchMb)).ConfigureAwait(false);
+                    var metrics = await QueryRowAsync(c, "SELECT rows_added, scratch_mb FROM records.usp_load_archive_batch(@run_id, @scratch_mb, 32);", t, ("run_id", context.RunId), ("scratch_mb", scratchMb)).ConfigureAwait(false);
                     return metrics.TryGetValue("rows_added", out var added) && added is int rows && rows == 0 ? throw new StepLoopDoneException() : metrics;
                 },
                 _ => TimeSpan.Zero,
@@ -392,7 +397,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                 context,
                 "worker",
                 index,
-                (c, t) => QueryRowAsync(c, "SELECT pages_read, pages_updated, elapsed_ms FROM demo.usp_scenario_io_pressure(@run_id, @worker, @scratch_mb);", t, ("run_id", context.RunId), ("worker", index), ("scratch_mb", scratchMb)),
+                (c, t) => QueryRowAsync(c, "SELECT pages_read, pages_updated, elapsed_ms FROM records.usp_scan_archive(@run_id, @worker, @scratch_mb);", t, ("run_id", context.RunId), ("worker", index), ("scratch_mb", scratchMb)),
                 Pause(plan.Intensity, 3000, 0),
                 TimeSpan.FromSeconds(2)));
         }
@@ -421,7 +426,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                     context,
                     "holder",
                     1,
-                    (c, t) => QueryRowAsync(c, "SELECT run_id, locked_rows FROM demo.usp_scenario_locking_acquire(@run_id, @rows);", t, ("run_id", context.RunId), ("rows", hotRows)),
+                    (c, t) => QueryRowAsync(c, "SELECT run_id, locked_rows FROM billing.usp_reprioritize_queue(@run_id, @rows);", t, ("run_id", context.RunId), ("rows", hotRows)),
                     holdSeconds,
                     pauseSeconds,
                     isolation: null),
@@ -434,7 +439,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                 context,
                 "contender",
                 index,
-                (c, t) => InRolledBackTransactionAsync(c, "SELECT updates, waited_ms FROM demo.usp_scenario_locking_contend(@run_id, @worker, @rows);", t, ("run_id", context.RunId), ("worker", index), ("rows", hotRows)),
+                (c, t) => InRolledBackTransactionAsync(c, "SELECT updates, waited_ms FROM billing.usp_claim_work_item(@run_id, @worker, @rows);", t, ("run_id", context.RunId), ("worker", index), ("rows", hotRows)),
                 _ => TimeSpan.FromSeconds(1),
                 TimeSpan.FromSeconds(2)));
         }
@@ -566,7 +571,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                     {
                         try
                         {
-                            await QueryRowAsync(connection, "SELECT facilities FROM demo.usp_scenario_connection_surge(@run_id, 0);", context.Abort, ("run_id", context.RunId)).ConfigureAwait(false);
+                            await QueryRowAsync(connection, "SELECT facilities FROM frontdesk.usp_kiosk_heartbeat(@run_id, 0);", context.Abort, ("run_id", context.RunId)).ConfigureAwait(false);
                             pings++;
                         }
                         catch (PostgresException ex) when (ex.SqlState == RunEndedState)
@@ -631,7 +636,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                 context,
                 "idle",
                 index,
-                (c, t) => QueryRowAsync(c, "SELECT locked_rows FROM demo.usp_scenario_idle_in_transaction(@run_id, @worker, @rows);", t, ("run_id", context.RunId), ("worker", index), ("rows", rows)),
+                (c, t) => QueryRowAsync(c, "SELECT locked_rows FROM billing.usp_open_claims_review(@run_id, @worker, @rows);", t, ("run_id", context.RunId), ("worker", index), ("rows", rows)),
                 holdSeconds,
                 pauseSeconds,
                 IsolationLevel.RepeatableRead));
@@ -645,7 +650,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                 context,
                 "writer",
                 index,
-                (c, t) => InRolledBackTransactionAsync(c, "SELECT updates, waited_ms FROM demo.usp_scenario_idle_writer(@run_id, @worker, @rows);", t, ("run_id", context.RunId), ("worker", idleWorker), ("rows", rows)),
+                (c, t) => InRolledBackTransactionAsync(c, "SELECT updates, waited_ms FROM billing.usp_update_claim_status(@run_id, @worker, @rows);", t, ("run_id", context.RunId), ("worker", idleWorker), ("rows", rows)),
                 _ => TimeSpan.FromSeconds(1),
                 TimeSpan.FromSeconds(3)));
         }
@@ -1096,7 +1101,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         }
     }
 
-    /// <summary>The head blocker as one active call per cycle: demo.usp_scenario_locking_hold locks and waits; the runner rolls back.</summary>
+    /// <summary>The head blocker as one active call per cycle: billing.usp_reprioritize_queue_batch locks and waits; the runner rolls back.</summary>
     private async Task<WorkerOutcome> RunActiveHolderAsync(RunContext context, int hotRows, int holdSeconds, int pauseSeconds)
     {
         var cycles = 0;
@@ -1112,7 +1117,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
                 IReadOnlyDictionary<string, object?> metrics;
                 try
                 {
-                    metrics = await InRolledBackTransactionAsync(connection, "SELECT run_id, locked_rows, held_ms FROM demo.usp_scenario_locking_hold(@run_id, @rows, @hold_seconds);", context.Abort, ("run_id", context.RunId), ("rows", hotRows), ("hold_seconds", holdSeconds)).ConfigureAwait(false);
+                    metrics = await InRolledBackTransactionAsync(connection, "SELECT run_id, locked_rows, held_ms FROM billing.usp_reprioritize_queue_batch(@run_id, @rows, @hold_seconds);", context.Abort, ("run_id", context.RunId), ("rows", hotRows), ("hold_seconds", holdSeconds)).ConfigureAwait(false);
                 }
                 catch (PostgresException ex) when (ex.SqlState == RunEndedState)
                 {
@@ -1164,9 +1169,9 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
 
                 try
                 {
-                    await QueryRowAsync(connection, "SELECT locked_inventory_id FROM demo.usp_scenario_locking_deadlock(@run_id, @side, 1);", context.Abort, ("run_id", context.RunId), ("side", side)).ConfigureAwait(false);
+                    await QueryRowAsync(connection, "SELECT locked_inventory_id FROM supply.usp_transfer_stock(@run_id, @side, 1);", context.Abort, ("run_id", context.RunId), ("side", side)).ConfigureAwait(false);
                     await WaitUntilAsync(time.GetUtcNow() + TimeSpan.FromSeconds(2), context).ConfigureAwait(false);
-                    await QueryRowAsync(connection, "SELECT locked_inventory_id FROM demo.usp_scenario_locking_deadlock(@run_id, @side, 2);", context.Abort, ("run_id", context.RunId), ("side", side)).ConfigureAwait(false);
+                    await QueryRowAsync(connection, "SELECT locked_inventory_id FROM supply.usp_transfer_stock(@run_id, @side, 2);", context.Abort, ("run_id", context.RunId), ("side", side)).ConfigureAwait(false);
                     completed++;
                 }
                 catch (PostgresException ex) when (ex.SqlState == DeadlockDetectedState)
@@ -1265,10 +1270,10 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
     }
 
     private static Task<IReadOnlyDictionary<string, object?>> BaselineStepAsync(NpgsqlConnection connection, RunContext context, int worker, CancellationToken cancellationToken) =>
-        QueryRowAsync(connection, "SELECT statements, rows_read, rows_written FROM demo.usp_scenario_healthy_baseline(@run_id, @worker, @intensity);", cancellationToken, ("run_id", context.RunId), ("worker", worker), ("intensity", context.Plan.Intensity));
+        QueryRowAsync(connection, "SELECT statements, rows_read, rows_written FROM frontdesk.usp_process_requests(@run_id, @worker, @intensity);", cancellationToken, ("run_id", context.RunId), ("worker", worker), ("intensity", context.Plan.Intensity));
 
     private static Task<IReadOnlyDictionary<string, object?>> CpuStepAsync(NpgsqlConnection connection, RunContext context, int worker, string variant, CancellationToken cancellationToken) =>
-        QueryRowAsync(connection, "SELECT executions, pairs_compared, overlap_pairs, elapsed_ms FROM demo.usp_scenario_cpu_pressure(@run_id, @worker, @variant);", cancellationToken, ("run_id", context.RunId), ("worker", worker), ("variant", variant));
+        QueryRowAsync(connection, "SELECT executions, pairs_compared, overlap_pairs, elapsed_ms FROM scheduling.usp_find_double_bookings(@run_id, @worker, @variant);", cancellationToken, ("run_id", context.RunId), ("worker", worker), ("variant", variant));
 
     /// <summary>
     /// missing-index on T4 (2026-11-04): the SQL Server targets' two lookups, claims aging by payer since a date and visits
@@ -1280,7 +1285,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
     /// </summary>
     private static async Task<IReadOnlyDictionary<string, object?>> MissingIndexStepAsync(NpgsqlConnection connection, RunContext context, int worker, int turn, DateTimeOffset now, CancellationToken cancellationToken)
     {
-        await QueryRowAsync(connection, "SELECT checked FROM demo.usp_scenario_missing_index(@run_id);", cancellationToken, ("run_id", context.RunId)).ConfigureAwait(false);
+        await QueryRowAsync(connection, "SELECT checked FROM billing.usp_claims_aging_report(@run_id);", cancellationToken, ("run_id", context.RunId)).ConfigureAwait(false);
         var (sql, parameters) = MissingIndexLookup(worker, turn, now);
         return await QueryRowAsync(connection, sql, cancellationToken, parameters).ConfigureAwait(false);
     }

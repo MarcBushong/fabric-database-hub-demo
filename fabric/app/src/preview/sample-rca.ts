@@ -1,8 +1,9 @@
 // The local preview's Incident RCA (ADR 0031), answering the RCA's own DAX the way the history model would, with the
 // model's column names: T1 from the contract's fixture (shifted into the sample session's second blocking beat), and T4
 // with its replica from a real capture (data/pg-local.evidence.json: the repo's runner against a local PostgreSQL 18.6
-// primary and hot standby on 2026-11-20, a chain, a deadlock, and a replay stall, found blind), shifted onto the sample's
-// replica lag. Preview only: Vite builds only index.html, so none of this ships; vite.config.ts lets it read rca/fixtures.
+// primary and hot standby on 2026-11-20, a chain, a deadlock, and a replay stall, found blind; its module names since
+// renamed to the workload's realistic ones, ADR 0031 decision 6), shifted onto the sample's replica lag. Preview only:
+// Vite builds only index.html, so none of this ships; vite.config.ts lets it read rca/fixtures.
 
 import t1Text from "../../../../rca/fixtures/t1-blocking-chain.evidence.json?raw";
 import pgText from "./data/pg-local.evidence.json?raw";

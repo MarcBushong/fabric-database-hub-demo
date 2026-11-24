@@ -88,28 +88,43 @@ function statusTokens(base: Theme, families: Record<"danger" | "warning" | "succ
 }
 
 const lightBase = createLightTheme(APP_BRAND);
+const lightWarm = warmTheme(lightBase, WARM_NEUTRALS.light, WARM_SHADOW.light);
 const light: Theme = {
-    ...warmTheme(lightBase, WARM_NEUTRALS.light, WARM_SHADOW.light),
+    ...lightWarm,
     ...statusTokens(lightBase, EARTH_STATUS_FAMILIES.light, OCHRE_FILL.light),
+    // A pressed row or button takes neutral background 4, a step under its hover: on Fluent's pressed gray, warmed, Pass,
+    // Warning, and captions fell under 4.5:1 (the review of 2b0e46b0).
+    colorSubtleBackgroundPressed: lightWarm.colorNeutralBackground4,
+    colorNeutralBackground1Pressed: lightWarm.colorNeutralBackground4,
     // A danger button's hover and press: a deeper brick under the same cream text.
     colorStatusDangerBackground3Hover: "#87291F",
     colorStatusDangerBackground3Pressed: "#74221A",
 };
 const darkBase: Theme = {
     ...createDarkTheme(APP_BRAND),
-    colorBrandForeground1: APP_BRAND[110],
+    // Brand text a step lighter than Fluent's, so it keeps 4.5:1 on a hovered row or button too; a pressed link, and a
+    // transparent button's pressed text and a subtle button's pressed icon, one step darker than at rest (Fluent's own were
+    // 3.1:1 on a card), and a selected link as at rest (the review of 2b0e46b0 and its re-check).
+    colorBrandForeground1: APP_BRAND[120],
     colorBrandForeground2: APP_BRAND[120],
     colorBrandForegroundLink: APP_BRAND[120],
     colorBrandForegroundLinkHover: APP_BRAND[130],
+    colorBrandForegroundLinkPressed: APP_BRAND[110],
+    colorBrandForegroundLinkSelected: APP_BRAND[120],
     colorCompoundBrandForeground1: APP_BRAND[110],
     colorCompoundBrandStroke: APP_BRAND[110],
     colorNeutralForeground2BrandHover: APP_BRAND[110],
+    colorNeutralForeground2BrandPressed: APP_BRAND[110],
     colorNeutralForeground2BrandSelected: APP_BRAND[110],
     colorSubtleBackgroundSelected: "#383838",
 };
+const darkWarm = warmTheme(darkBase, WARM_NEUTRALS.dark, WARM_SHADOW.dark);
 const dark: Theme = {
-    ...warmTheme(darkBase, WARM_NEUTRALS.dark, WARM_SHADOW.dark),
+    ...darkWarm,
     ...statusTokens(darkBase, EARTH_STATUS_FAMILIES.dark, OCHRE_FILL.dark),
+    // A hovered button or menu item takes a hovered row's fill, a step above a card: on Fluent's, two steps above, T5's mark
+    // in the target filter's menu fell under 3:1.
+    colorNeutralBackground1Hover: darkWarm.colorSubtleBackgroundHover,
     // A danger button's hover and press: a deeper brick under the same cream text.
     colorStatusDangerBackground3Hover: "#8C352E",
     colorStatusDangerBackground3Pressed: "#7A2D27",
@@ -120,13 +135,16 @@ export const FLUENT_THEMES: Record<ThemeId, Theme> = { light, dark, contrast: te
 export const THEME_LABELS: Record<ThemeChoice, string> = { system: "Use the system setting", light: "Light", dark: "Dark", contrast: "High contrast" };
 
 /**
- * The app's tokens per theme, as CSS custom properties on <html data-theme>. `surfaces` are the solid colors text sits
- * on; every `text` token must reach 4.5:1 on each (WCAG 2.2 AA), and every `graphic` token 3:1 (WCAG 1.4.11). `decor`
- * carries no information on its own: the chart's incident band behind its label, and the Copilot mark's fill under its
- * glyph (`--copilot-mark-ink`, which the tests hold to 3:1 on both of the fill's stops).
+ * The app's tokens per theme, as CSS custom properties on <html data-theme>. `surfaces` are the solid colors text and
+ * marks sit on at rest, and `states` the fills under them in a hovered or pressed row, subtle button, button, or menu
+ * item; every `text` token must reach 4.5:1 on each (WCAG 2.2 AA), and every `graphic` token 3:1 (WCAG 1.4.11). `decor`
+ * carries no information on its own: the chart's incident band behind its label (`--chart-band-ink`, which the tests hold
+ * to 4.5:1 with the band over each surface), and the Copilot mark's fill under its glyph (`--copilot-mark-ink`, which the
+ * tests hold to 3:1 on both of the fill's stops).
  */
 export interface AppTokens {
     surfaces: string[];
+    states: string[];
     text: Record<string, string>;
     graphic: Record<string, string>;
     decor: Record<string, string>;
@@ -158,10 +176,13 @@ function accentTokens(a: Accents): Record<string, string> {
 const rgbOf = (hex: string) => `${channel(hex, 0)}, ${channel(hex, 1)}, ${channel(hex, 2)}`;
 /** The Copilot mark's fill, terracotta into a deep plum, in both themes. */
 const copilotMark = (from: string) => `linear-gradient(135deg, ${from} 0%, ${EARTH_ACCENTS.light.plum} 100%)`;
+/** A hovered or pressed row or subtle button (Fluent's subtle fills), then a hovered or pressed button or menu item. */
+const statesOf = (t: Theme) => [...new Set([t.colorSubtleBackgroundHover, t.colorSubtleBackgroundPressed, t.colorNeutralBackground1Hover, t.colorNeutralBackground1Pressed])];
 
 export const APP_TOKENS: Record<ThemeId, AppTokens> = {
     light: {
         surfaces: [light.colorNeutralBackground1, light.colorNeutralBackground2, light.colorNeutralBackground3],
+        states: statesOf(light),
         text: {
             "--status-fail": EARTH_STATUS.light.fail,
             "--status-manual": EARTH_STATUS.light.manual,
@@ -179,6 +200,7 @@ export const APP_TOKENS: Record<ThemeId, AppTokens> = {
     },
     dark: {
         surfaces: [dark.colorNeutralBackground2, dark.colorNeutralBackground1, dark.colorNeutralBackground6],
+        states: statesOf(dark),
         text: {
             "--status-fail": EARTH_STATUS.dark.fail,
             "--status-manual": EARTH_STATUS.dark.manual,
@@ -189,13 +211,17 @@ export const APP_TOKENS: Record<ThemeId, AppTokens> = {
         },
         graphic: accentTokens(EARTH_ACCENTS.dark),
         decor: {
-            "--chart-band": `rgba(${rgbOf(EARTH_STATUS.dark.fail)}, 0.14)`,
+            // Faint enough that its label keeps 4.5:1 with the band over a card: at 0.14 it fell to 4.2:1 (the review of 2b0e46b0).
+            "--chart-band": `rgba(${rgbOf(EARTH_STATUS.dark.fail)}, 0.08)`,
             "--copilot-mark": copilotMark(APP_BRAND[70]),
             "--copilot-mark-ink": dark.colorNeutralForegroundOnBrand,
         },
     },
     contrast: {
         surfaces: ["#000000"],
+        // High contrast keeps Fluent's own hover and pressed fills, cyan under black: what the app colors itself takes that
+        // black on them (styles/app.css), so none of these colors sits on them.
+        states: [],
         text: {
             "--status-fail": "#FF8C8C",
             "--status-manual": "#00FFFF",

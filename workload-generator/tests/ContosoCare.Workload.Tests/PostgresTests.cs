@@ -115,14 +115,71 @@ public sealed partial class PostgresTests
         foreach (Match function in functions)
         {
             var name = function.Groups["name"].Value;
-            if (!name.StartsWith("usp_scenario_", StringComparison.Ordinal))
+            if (!name.StartsWith("usp_", StringComparison.Ordinal))
             {
                 continue;
             }
 
             var body = function.Groups["body"].Value;
-            Assert.True(body.Contains("demo.usp_run_assert_running(p_run_id)", StringComparison.Ordinal), $"demo.{name} doesn't check its run first.");
+            Assert.True(body.Contains("demo.usp_run_assert_running(p_run_id)", StringComparison.Ordinal), $"{function.Groups["schema"].Value}.{name} doesn't check its run first.");
         }
+    }
+
+    [Fact]
+    public void TheStepsHaveRealisticNamesAndTheAnswerKeyMapsEveryOne()
+    {
+        // ADR 0031, decision 6: every step lives in an application schema that the script creates and setup grants the
+        // runner's role (PgScripts.ApplicationSchemas), and the answer key maps it and forbids it in detection code. demo
+        // keeps only the seeding helper.
+        var text = PgScripts.Read("120-scenario-functions.sql");
+        var functions = FunctionPattern().Matches(text).Select(m => (Schema: m.Groups["schema"].Value, Name: m.Groups["name"].Value)).ToList();
+        using var blind = System.Text.Json.JsonDocument.Parse(File.ReadAllText(RepositoryPaths.Combine("rca", "blind-detection.json")));
+        var forbidden = blind.RootElement.GetProperty("forbiddenInDetectionCode").GetProperty("identifiers").EnumerateArray().Select(e => e.GetString()!).ToHashSet(StringComparer.Ordinal);
+        var steps = functions.Where(f => f is not { Schema: "demo", Name: "fn_seed_scale" }).ToList();
+
+        Assert.Equal(16, functions.Count);
+        Assert.Equal(SqlScriptTests.WorkloadNames("postgresql").Keys.Order(StringComparer.Ordinal), steps.Select(f => f.Schema + "." + f.Name).Order(StringComparer.Ordinal));
+        Assert.All(steps, step =>
+        {
+            Assert.Contains(step.Schema, PgScripts.ApplicationSchemas);
+            Assert.DoesNotContain("scenario", step.Name, StringComparison.Ordinal);
+            Assert.Contains(step.Name, forbidden);
+        });
+        Assert.Equal(PgScripts.ApplicationSchemas, Regex.Matches(text, @"(?m)^CREATE SCHEMA IF NOT EXISTS (?<schema>[a-z]+);$").Select(m => m.Groups["schema"].Value));
+        Assert.True(text.IndexOf("CREATE SCHEMA IF NOT EXISTS", StringComparison.Ordinal) < text.IndexOf("CREATE OR REPLACE FUNCTION", StringComparison.Ordinal), "the schemas exist before the first function");
+    }
+
+    [Fact]
+    public void NoStepBodyNamesAScenario()
+    {
+        // PostgreSQL stores a function's body, never the comments before it; what a DBA reads there names no scenario.
+        var scenarioIds = Directory.GetDirectories(RepositoryPaths.Combine("scenarios")).Select(d => Path.GetFileName(d)!).Where(id => File.Exists(RepositoryPaths.Combine("scenarios", id, "scenario.json"))).ToList();
+
+        foreach (Match function in FunctionPattern().Matches(PgScripts.Read("120-scenario-functions.sql")))
+        {
+            var body = function.Groups["body"].Value;
+            Assert.DoesNotContain("scenario", body, StringComparison.OrdinalIgnoreCase);
+            Assert.DoesNotContain(scenarioIds, id => Regex.IsMatch(body, $@"(?<![A-Za-z0-9_./-]){Regex.Escape(id)}(?![A-Za-z0-9_./-])"));
+        }
+    }
+
+    [Fact]
+    public void TheRetiredStepsAreDroppedInDemoOnceEveryReplacementExists()
+    {
+        // The one-click upgrade (ADR 0031, decision 6): setup drops every function of demo that has one of the steps'
+        // earlier names, whatever its argument list, after the last CREATE, and nothing else.
+        var text = PgScripts.Read("120-scenario-functions.sql");
+        var retire = text[text.LastIndexOf("DO $$", StringComparison.Ordinal)..];
+        var names = Regex.Match(retire, @"AND p\.proname IN \((?<names>[^)]*)\)").Groups["names"].Value.Split(", ").Select(n => n.Trim('\'')).ToList();
+
+        Assert.Equal(
+            ["fn_idle_rows", "fn_locking_hot_rows", "usp_scenario_connection_surge", "usp_scenario_cpu_pressure", "usp_scenario_healthy_baseline", "usp_scenario_idle_in_transaction", "usp_scenario_idle_writer", "usp_scenario_io_pressure", "usp_scenario_io_pressure_grow", "usp_scenario_locking_acquire", "usp_scenario_locking_contend", "usp_scenario_locking_deadlock", "usp_scenario_locking_hold", "usp_scenario_missing_index", "usp_scenario_replica_lag"],
+            names.Order(StringComparer.Ordinal));
+        Assert.Contains("WHERE n.nspname = 'demo'", retire, StringComparison.Ordinal);
+        Assert.Contains("EXECUTE format('DROP FUNCTION IF EXISTS %s', v_function);", retire, StringComparison.Ordinal);
+        Assert.True(text.LastIndexOf("CREATE OR REPLACE FUNCTION", StringComparison.Ordinal) < text.LastIndexOf("DO $$", StringComparison.Ordinal));
+        Assert.All(names, name => Assert.DoesNotContain("FUNCTION demo." + name + "(", text, StringComparison.Ordinal));
+        Assert.Single(Regex.Matches(text, "DROP FUNCTION").Cast<Match>());
     }
 
     [Fact]
@@ -181,11 +238,11 @@ public sealed partial class PostgresTests
     [Fact]
     public void EveryT4ApplicationNameFitsInSixtyThreeCharacters()
     {
-        var runId = SessionNames.NewRunId(new DateTimeOffset(2026, 10, 23, 23, 59, 59, TimeSpan.Zero), DemoTarget.T4);
+        var runId = SessionNames.NewRunId();
 
         foreach (var scenario in ScenarioCatalog.Default.All.Where(s => s.AppliesTo(DemoTarget.T4)))
         {
-            Assert.True(SessionNames.ForRun(scenario.Id, runId).Length <= PgConnectionOpener.MaximumApplicationNameLength, scenario.Id);
+            Assert.True(SessionNames.ForRun(scenario.Service, runId).Length <= PgConnectionOpener.MaximumApplicationNameLength, scenario.Id);
         }
 
         Assert.True(SessionNames.ForControl(runId).Length <= PgConnectionOpener.MaximumApplicationNameLength);
@@ -334,6 +391,45 @@ public sealed partial class PostgresTests
         Assert.Contains(reset, c => c.CheckId == "workload-rows-removed" && c.Status == "Pass");
     }
 
+    /// <summary>
+    /// The runner's check before a run (ADR 0031, decision 6) wants a step it can call, not one that only exists: setup
+    /// creates the steps in their new schemas before it grants the runner's role USAGE on them, so a run in between is
+    /// refused and tried again, never registered and failed at its first step. Against the same disposable server, whose
+    /// user may create a role (a superuser, as in the local container).
+    /// </summary>
+    [Fact]
+    public async Task TheRunnersCheckWantsAStepItCanCall()
+    {
+        var server = Environment.GetEnvironmentVariable(ServerVariable);
+        Assert.SkipUnless(server is not null, $"Set {ServerVariable}, {PgEndpoint.UserVariable}, and {PgEndpoint.PasswordVariable} to a disposable PostgreSQL server to run this test.");
+        var token = TestContext.Current.CancellationToken;
+        var endpoint = PgEndpoint.Create(server, null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        await using var connection = await new PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(SessionNames.ForControl("test-callable"), token, PgSessionLimits.Setup);
+
+        async Task ExecuteAsync(string sql)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            await command.ExecuteNonQueryAsync(token);
+        }
+
+        await ExecuteAsync("DROP SCHEMA IF EXISTS zz_callable_probe CASCADE; CREATE SCHEMA zz_callable_probe; CREATE FUNCTION zz_callable_probe.usp_probe() RETURNS integer LANGUAGE sql AS 'SELECT 1'; DO $$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_catalog.pg_roles WHERE rolname = 'zz_callable_probe_role') THEN CREATE ROLE zz_callable_probe_role NOLOGIN; END IF; END $$;");
+        try
+        {
+            await ExecuteAsync("SET ROLE zz_callable_probe_role;");
+            Assert.True(await PgScripts.FunctionExistsAsync(connection, "zz_callable_probe.usp_probe", token));
+            Assert.False(await PgScripts.FunctionCallableAsync(connection, "zz_callable_probe.usp_probe", token));
+            Assert.False(await PgScripts.FunctionCallableAsync(connection, "zz_callable_probe.usp_not_there", token));
+
+            await ExecuteAsync("RESET ROLE; GRANT USAGE ON SCHEMA zz_callable_probe TO zz_callable_probe_role; SET ROLE zz_callable_probe_role;");
+            Assert.True(await PgScripts.FunctionCallableAsync(connection, "zz_callable_probe.usp_probe", token));
+        }
+        finally
+        {
+            await ExecuteAsync("RESET ROLE; DROP SCHEMA IF EXISTS zz_callable_probe CASCADE; DROP ROLE IF EXISTS zz_callable_probe_role;");
+        }
+    }
+
     private static PgEndpoint Endpoint() => PgEndpoint.Create("pgflex01-abc123", null, passwordFromEnvironment: false, managedIdentityClientId: null);
 
     [Theory]
@@ -363,6 +459,6 @@ public sealed partial class PostgresTests
         Assert.False(result.CanRetryRefusal);
     }
 
-    [GeneratedRegex(@"CREATE OR REPLACE FUNCTION demo\.(?<name>[a-z_]+)\((?<signature>[^)]*)\)(?<body>.*?)\$\$;", RegexOptions.Singleline)]
+    [GeneratedRegex(@"CREATE OR REPLACE FUNCTION (?<schema>[a-z_]+)\.(?<name>[a-z_]+)\((?<signature>[^)]*)\)(?<body>.*?)\$\$;", RegexOptions.Singleline)]
     private static partial Regex FunctionPattern();
 }

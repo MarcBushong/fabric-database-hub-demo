@@ -112,14 +112,21 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
         $script:versionsPath = Join-Path -Path $notebookFolder -ChildPath 'published-versions.json'
         $script:names = @(Get-ChildItem -Path $notebookFolder -Filter '*.ipynb' -File | Sort-Object -Property Name | ForEach-Object BaseName)
         $script:current = @{}
+        $script:currentParameters = @{}
+        # A version's parameter values as one text, whatever the order of its keys.
+        $script:parameterText = { param($Map) (@($Map.Keys | ForEach-Object { [string]$_ } | Sort-Object -CaseSensitive | ForEach-Object { '{0}={1}' -f $_, [string]$Map[$_] }) -join ';') }
         foreach ($name in $names) {
             $text = [System.IO.File]::ReadAllText((Join-Path -Path $notebookFolder -ChildPath "$name.ipynb"))
-            $current[$name] = (InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }).Sha256
+            $fingerprint = InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }
+            $current[$name] = $fingerprint.Sha256
+            $currentParameters[$name] = $fingerprint.Bindings
         }
 
         # DBHUB_WRITE_NOTEBOOK_VERSIONS=1 writes the file: what it lists, every version of each notebook in this checkout's
         # git history (when git answers, with the day each first appeared), and the current one (today, when it's new),
-        # oldest first. CI never sets it; a change to a notebook needs it once, and the file committed with the change.
+        # oldest first, each with its file's values in the parameters the fingerprint leaves out (the review of 42acec35:
+        # deploy.ps1 counts a copy with another value in a parameter it doesn't set as edited). CI never sets it; a change to
+        # a notebook needs it once, and the file committed with the change.
         if ($env:DBHUB_WRITE_NOTEBOOK_VERSIONS -eq '1') {
             $known = @{}
             foreach ($name in $names) {
@@ -130,7 +137,7 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
                 foreach ($name in $names) {
                     foreach ($entry in @($existing['notebooks'][$name])) {
                         if ($entry) {
-                            $known[$name][[string]$entry['sha256']] = [string]$entry['since']
+                            $known[$name][[string]$entry['sha256']] = @{ since = [string]$entry['since']; parameters = $entry['parameters'] }
                         }
                     }
                 }
@@ -149,13 +156,26 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
                         if ($LASTEXITCODE -ne 0 -or -not $text) {
                             continue
                         }
-                        $sha = (InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }).Sha256
-                        if ($sha -and (-not $known[$name].ContainsKey($sha) -or [string]::CompareOrdinal($day, $known[$name][$sha]) -lt 0)) {
-                            $known[$name][$sha] = $day
+                        $fingerprint = InModuleScope -ModuleName DbHubDemo -Parameters @{ Text = $text } { Get-DemoNotebookFingerprint -Text $Text }
+                        $sha = $fingerprint.Sha256
+                        if (-not $sha) {
+                            continue
+                        }
+                        $values = & $parameterText $fingerprint.Bindings
+                        if (-not $known[$name].ContainsKey($sha)) {
+                            $known[$name][$sha] = @{ since = $day; parameters = $fingerprint.Bindings }
+                            continue
+                        }
+                        if ($null -ne $known[$name][$sha]['parameters'] -and (& $parameterText $known[$name][$sha]['parameters']) -cne $values) {
+                            throw ('{0}''s version {1} has other parameter values at {2} than elsewhere in the history: list it by hand, with each.' -f $name, $sha, $commit)
+                        }
+                        $known[$name][$sha]['parameters'] = $fingerprint.Bindings
+                        if ([string]::CompareOrdinal($day, [string]$known[$name][$sha]['since']) -lt 0) {
+                            $known[$name][$sha]['since'] = $day
                         }
                     }
                     if (-not $known[$name].ContainsKey($current[$name])) {
-                        $known[$name][$current[$name]] = [DateTime]::UtcNow.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture)
+                        $known[$name][$current[$name]] = @{ since = [DateTime]::UtcNow.ToString('yyyy-MM-dd', [System.Globalization.CultureInfo]::InvariantCulture); parameters = $currentParameters[$name] }
                     }
                 }
             }
@@ -163,13 +183,13 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
                 [Console]::OutputEncoding = $consoleEncoding
             }
             $document = [ordered]@{
-                about     = 'Every version of the demo''s notebooks in this repository''s history, oldest first, by fingerprint: each cell''s type and code, without outputs, metadata, line endings, trailing spaces, or the workspace, lakehouse, and GitHub values the import sets (Get-DemoNotebookFingerprint). deploy.ps1 brings a workspace''s copy that matches one of them up to date, since nobody edited it, and keeps one that matches none, while fabric.importNotebooks is false. Written by tests/unit/Fabric.Notebooks.Tests.ps1 with DBHUB_WRITE_NOTEBOOK_VERSIONS=1; don''t edit.'
+                about     = 'Every version of the demo''s notebooks in this repository''s history, oldest first, by fingerprint: each cell''s type and code, without outputs, metadata, line endings, trailing spaces, or the workspace, lakehouse, and GitHub values the import sets (Get-DemoNotebookFingerprint), with the values its file has there (parameters). deploy.ps1 brings a workspace''s copy that matches one of them up to date, since nobody edited it, and keeps one that matches none, or that has another value in a parameter the import doesn''t set, while fabric.importNotebooks is false. Written by tests/unit/Fabric.Notebooks.Tests.ps1 with DBHUB_WRITE_NOTEBOOK_VERSIONS=1; don''t edit.'
                 notebooks = [ordered]@{}
             }
             foreach ($name in $names) {
-                $document['notebooks'][$name] = @($known[$name].GetEnumerator() | Sort-Object -Property @{ Expression = { $_.Value } }, @{ Expression = { $_.Key } } | ForEach-Object { [ordered]@{ sha256 = $_.Key; since = $_.Value } })
+                $document['notebooks'][$name] = @($known[$name].GetEnumerator() | Sort-Object -Property @{ Expression = { [string]$_.Value['since'] } }, @{ Expression = { $_.Key } } | ForEach-Object { [ordered]@{ sha256 = $_.Key; since = [string]$_.Value['since']; parameters = $_.Value['parameters'] } })
             }
-            $json = (ConvertTo-Json -InputObject $document -Depth 5) -replace "`r`n", "`n"
+            $json = (ConvertTo-Json -InputObject $document -Depth 6) -replace "`r`n", "`n"
             [System.IO.File]::WriteAllText($versionsPath, $json + "`n", [System.Text.UTF8Encoding]::new($false))
         }
     }
@@ -184,11 +204,19 @@ Describe 'The versions of the notebooks the demo published (fabric/notebooks/pub
             foreach ($entry in $entries) {
                 [string]$entry['sha256'] | Should -Match '^[0-9a-f]{64}$'
                 [string]$entry['since'] | Should -Match '^\d{4}-\d{2}-\d{2}$'
+                # Each version's own values in the parameters the import may set, which deploy.ps1 compares a copy's with
+                # where this run doesn't set them (the review of 42acec35).
+                $entry['parameters'] | Should -BeOfType [System.Collections.IDictionary] -Because 'deploy.ps1 counts a version without them as edited'
+                foreach ($key in @($entry['parameters'].Keys)) {
+                    $key | Should -BeIn @('WORKSPACE_ID', 'LAKEHOUSE_ID', 'LAKEHOUSE_NAME', 'GITHUB_REPOSITORY', 'GITHUB_ENVIRONMENT')
+                }
             }
             @($entries | ForEach-Object { [string]$_['sha256'] } | Select-Object -Unique).Count | Should -Be $entries.Count -Because 'each version is listed once'
             $days = @($entries | ForEach-Object { [string]$_['since'] })
             ($days -join ' ') | Should -BeExactly ((@($days | Sort-Object -CaseSensitive) -join ' ')) -Because 'the versions go oldest first'
             @($entries | ForEach-Object { [string]$_['sha256'] }) | Should -Contain $current[$name] -Because ('{0}''s current version must be listed, or deploy.ps1 counts a copy of it as edited: run this test with DBHUB_WRITE_NOTEBOOK_VERSIONS=1, and commit the file' -f $name)
+            $listed = @($entries | Where-Object { [string]$_['sha256'] -eq $current[$name] })[0]
+            (& $parameterText $listed['parameters']) | Should -BeExactly (& $parameterText $currentParameters[$name]) -Because 'the current version lists its own file''s values'
         }
     }
 
@@ -396,6 +424,161 @@ Describe 'Notebook <_>' -ForEach $notebookNames {
             $nb.Cells[$index - 1].Source | Should -Match '\*\*Resource-changing cell\.\*\*'
         }
         $flagged | Should -BeGreaterThan 0
+    }
+
+    It 'saves again, the delete and the append together, after Delta reports a concurrent commit, at most 5 times (F35, needs pandas)' {
+        # Fabric's Delta tables are Serializable (https://learn.microsoft.com/fabric/data-engineering/delta-lake-concurrency-control),
+        # and F35's kept-value step MERGEs into telemetry_snapshots and adds its columns while a save may run: its MERGE can
+        # fail a save's DELETE, and its ALTER TABLE a save's append. A failed Delta transaction writes nothing.
+        $python = $pandasPython
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & $python -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath ('save_retry_{0}.py' -f $name)
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, importlib.util, io, json, sys, types
+import pandas as pd
+
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+spark_types = types.ModuleType("pyspark.sql.types")
+for type_name in ("StringType", "BooleanType", "TimestampType", "DoubleType", "LongType", "IntegerType", "DateType"):
+    setattr(spark_types, type_name, type(type_name, (), {}))
+spark_types.StructField = lambda field, kind, nullable: field
+spark_types.StructType = list
+pyspark_sql = types.ModuleType("pyspark.sql")
+pyspark_sql.types = spark_types
+sys.modules.update({"pyspark": types.ModuleType("pyspark"), "pyspark.sql": pyspark_sql, "pyspark.sql.types": spark_types})
+
+code = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+with contextlib.redirect_stdout(io.StringIO()):
+    for cell in code:
+        if cell.startswith(("# Parameters", "# Helpers")):
+            exec(cell, ns)
+sleeps = []
+real_time = ns["time"]
+ns["time"] = types.SimpleNamespace(**{key: getattr(real_time, key) for key in dir(real_time) if not key.startswith("_")})
+ns["time"].sleep = sleeps.append
+spec = importlib.util.spec_from_file_location("kept_value", sys.argv[2])
+kept_value = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(kept_value)
+
+
+class ConcurrentAppendException(Exception):
+    """Delta's errors name their Java exception in their class or in their text."""
+
+
+class Session:
+    """The default lakehouse's telemetry_snapshots with this run's rows, whose delete or append fails as queued."""
+
+    def __init__(self, failures):
+        self.failures, self.log, self.rows = list(failures), [], []
+        self.catalog = types.SimpleNamespace(tableExists=lambda table: True)
+
+    def fail(self, step):
+        if self.failures and self.failures[0][0] == step:
+            self.log.append(step + " failed")
+            error = self.failures.pop(0)[1]
+            raise error if isinstance(error, Exception) else RuntimeError(error)
+
+    def sql(self, statement):
+        assert statement == "DELETE FROM telemetry_snapshots WHERE run_id = '%s'" % ns["RUN_ID"], statement
+        self.fail("delete")
+        self.log.append("delete")
+        self.rows = []
+        return types.SimpleNamespace(collect=lambda: [])
+
+    def createDataFrame(self, data, schema):
+        session = self
+
+        class Writer:
+            def format(self, name):
+                return self
+
+            def mode(self, name):
+                return self
+
+            def option(self, key, value):
+                return self
+
+            def saveAsTable(self, table):
+                session.fail("append")
+                session.log.append("append %d" % len(data))
+                session.rows.extend(data)
+
+        return types.SimpleNamespace(coalesce=lambda count: types.SimpleNamespace(write=Writer()))
+
+
+ROWS = [{"run_id": ns["RUN_ID"], "analysis": "cpu", "target": "T1", "metric": "AvgCPU", "value": float(value), "grain_minutes": 1,
+         "bucket_utc": pd.Timestamp("2026-11-23T14:00:00Z") + pd.Timedelta(minutes=minute)} for minute, value in enumerate((20, 85, 90))]
+MERGE = "[DELTA_CONCURRENT_DELETE_READ] ConcurrentDeleteReadException: This transaction attempted to read one or more files that were deleted by a concurrent update."
+ALTER = "[DELTA_METADATA_CHANGED] MetadataChangedException: The metadata of the Delta table has been changed by a concurrent update."
+OTHER = "[TABLE_OR_VIEW_NOT_FOUND] The table or view `telemetry_snapshots` cannot be found."
+
+
+def run(failures):
+    session = Session(failures)
+    ns.update(_spark=lambda: session, runtime_context=lambda: {"defaultLakehouseId": "lakehouse"})
+    del sleeps[:]
+    printed, error, saved = io.StringIO(), None, None
+    with contextlib.redirect_stdout(printed):
+        try:
+            saved = ns["write_delta"]("telemetry_snapshots", ROWS)
+        except Exception as caught:
+            error = str(caught)
+    return {"saved": saved, "log": session.log, "rows": len(session.rows), "sleeps": len(sleeps),
+            "printed": printed.getvalue().strip().splitlines(), "error": error}
+
+
+print(json.dumps({
+    "first": run([]),
+    "merge": run([("delete", MERGE)]),
+    "alter": run([("append", ALTER)]),
+    "named": run([("append", ConcurrentAppendException("Files were added to the root of the table by a concurrent update."))]),
+    "always": run([("append", ALTER)] * 5),
+    "other": run([("append", OTHER)]),
+    "runId": ns["RUN_ID"],
+    "attempts": ns["SAVE_ATTEMPTS"],
+    "conflicts": list(ns["DELTA_CONFLICTS"]),
+    "stepConflicts": list(kept_value._CONCURRENT_WRITES),
+}))
+'@
+        $output = & $python $script $nb.Path (Join-Path -Path $repoRoot -ChildPath 'fabric/history/kept_value.py') 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+        $saved = 'telemetry_snapshots: saved 3 row(s) for run {0}' -f $report['runId']
+        @($report['first']['log']) | Should -Be @('delete', 'append 3')
+        @($report['first']['printed']) | Should -Be @("$saved.")
+        $report['first']['sleeps'] | Should -Be 0
+        # The step's MERGE fails the save's delete, and its ALTER TABLE the append: either way, both run again, once.
+        @($report['merge']['log']) | Should -Be @('delete failed', 'delete', 'append 3')
+        @($report['alter']['log']) | Should -Be @('delete', 'append failed', 'delete', 'append 3')
+        @($report['named']['log']) | Should -Be @('delete', 'append failed', 'delete', 'append 3')
+        foreach ($case in 'merge', 'alter', 'named') {
+            $report[$case]['saved'] | Should -Be 3 -Because $case
+            $report[$case]['rows'] | Should -Be 3 -Because $case
+            $report[$case]['sleeps'] | Should -Be 1 -Because $case
+            @($report[$case]['printed']) | Should -Be @("$saved, on try 2 after another writer's commit.") -Because $case
+        }
+        # At most SAVE_ATTEMPTS tries, then the last error stops the cell, as any other error does at once.
+        $report['attempts'] | Should -Be 5
+        @($report['always']['log']) | Should -Be @(1..5 | ForEach-Object { 'delete', 'append failed' })
+        $report['always']['sleeps'] | Should -Be 4
+        $report['always']['saved'] | Should -BeNullOrEmpty
+        $report['always']['error'] | Should -Match 'MetadataChangedException'
+        @($report['other']['log']) | Should -Be @('delete', 'append failed')
+        $report['other']['sleeps'] | Should -Be 0
+        $report['other']['error'] | Should -Match 'TABLE_OR_VIEW_NOT_FOUND'
+        # The kept-value step's conflicts (fabric/history/kept_value.py), ConcurrentWriteException among them.
+        @($report['conflicts']) | Should -Be @($report['stepConflicts'])
+        @($report['conflicts']) | Should -Contain 'ConcurrentWriteException'
     }
 
     It 'sends requests only to documented hosts' {
@@ -866,6 +1049,143 @@ print(json.dumps(report))
         $persist | Should -Match 'write_delta\("analysis_findings"'
         $persist.IndexOf('prepare_report_tables()') | Should -BeLessThan $persist.IndexOf('write_delta("scenario_runs"')
         $persist | Should -Match 'write_delta\("scenario_runs", SESSION_ROWS\)'
+        # F35's kept values only change telemetry_snapshots' two columns, after the session's row says its history is saved.
+        $persist.IndexOf('write_delta("scenario_runs"') | Should -BeLessThan $persist.IndexOf('save_kept_values()')
+    }
+
+    It 'holds fabric/history/kept_value.py word for word as helpers part 5, after part 4, with no name another cell defines (F35)' {
+        $module = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'fabric/history/kept_value.py')).Replace("`r`n", "`n")
+        $cells = @($nb.Cells)
+        # Part 5 since the Incident RCA's evidence took part 4 (ADR 0031), in the release that merges both.
+        $partFive = @($cells | Where-Object { $_.Type -eq 'code' -and $_.Source.StartsWith('# Helpers, part 5') })
+        $partFive.Count | Should -Be 1
+        ($partFive[0].Source + "`n") | Should -BeExactly $module
+        $partFour = @($cells | Where-Object { $_.Type -eq 'code' -and $_.Source.StartsWith('# Helpers, part 4') })[0]
+        [array]::IndexOf($cells, $partFive[0]) | Should -Be ([array]::IndexOf($cells, $partFour) + 1)
+        # Its top-level names (functions, classes, and constants) and the other cells' don't meet, so running it after them
+        # changes none of theirs.
+        $names = {
+            param([string] $Source)
+            @([regex]::Matches($Source, '(?m)^(?:def|class) (\w+)|^(\w+)(?:, \w+)* = ') | ForEach-Object { if ($_.Groups[1].Success) { $_.Groups[1].Value } else { $_.Groups[2].Value } })
+        }
+        $own = @(& $names $partFive[0].Source)
+        $own | Should -Contain 'kept_value_step'
+        $others = @($nb.Code | Where-Object { $_ -ne $partFive[0] } | ForEach-Object { & $names $_.Source })
+        @($own | Where-Object { $others -contains $_ }) | Should -BeNullOrEmpty
+    }
+
+    It 'declares each binned row''s grain: the run''s bin for the grid''s analyses, and none off it (F35, needs pandas)' {
+        $python = $pandasPython
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & $python -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'grains.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, sys, types
+import pandas as pd
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+code = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+report = {}
+for bin_minutes in (0, 5):
+    ns = {}
+    exec(code[0], ns)
+    ns["BIN_MINUTES"] = bin_minutes
+    with contextlib.redirect_stdout(io.StringIO()):
+        for cell in code:
+            if cell.startswith("# Helpers, part"):
+                exec(cell, ns)
+    at = pd.Timestamp("2026-11-21T15:00:00Z")
+    ns["add_snapshot"]("cpu", pd.DataFrame({"Target": ["T1", "T1"], "Bucket": [at, at + pd.Timedelta(minutes=5)], "MaxCPU": [40.0, 50.0]}), at, at, metrics=["MaxCPU"])
+    ns["add_snapshot"]("wait_profile", pd.DataFrame({"Target": ["T1"], "Bucket": [None], "WaitCategory": ["Lock"], "WaitSeconds": [3.0]}), at, at, metric_column="WaitCategory", value_column="WaitSeconds")
+    ns["add_snapshot"]("memory_clerks", pd.DataFrame({"Target": ["T1"], "Bucket": [at], "Clerk": ["MEMORYCLERK_SQLBUFFERPOOL"], "MB": [2048.0]}), at, at, metric_column="Clerk", value_column="MB")
+    report[str(bin_minutes)] = {"bin": ns["BIN"], "grains": {row["analysis"]: row["grain_minutes"] for row in ns["SNAPSHOT_ROWS"]},
+                                "columns": [name for name, _ in ns["TABLE_COLUMNS"]["telemetry_snapshots"]]}
+print(json.dumps(report))
+'@
+        $output = & $python $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+        # The default window of 60 minutes bins every minute; a hand-set BIN_MINUTES of 5 every 5 minutes.
+        $report['0']['bin'] | Should -Be 1
+        $report['0']['grains']['cpu'] | Should -Be 1
+        $report['5']['grains']['cpu'] | Should -Be 5
+        foreach ($run in '0', '5') {
+            $report[$run]['grains']['wait_profile'] | Should -BeNullOrEmpty
+            $report[$run]['grains']['memory_clerks'] | Should -BeNullOrEmpty
+        }
+        @($report['0']['columns'])[-4..-1] | Should -Be @('grain_minutes', 'kept_value', 'resolved_at_utc', 'report_date_utc')
+    }
+
+    It 'works out this run''s kept values with kept_value_step and its run ID, says so in one line, and never stops the run (F35, needs pandas)' {
+        $python = $pandasPython
+        if (-not $python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $PSNativeCommandUseErrorActionPreference = $false
+        $null = & $python -c 'import pandas' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            Set-ItResult -Skipped -Because 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
+            return
+        }
+        $script = Join-Path -Path $TestDrive -ChildPath 'kept_values.py'
+        Set-Content -LiteralPath $script -Encoding utf8NoBOM -Value @'
+import contextlib, io, json, sys, types
+sys.modules.setdefault("requests", types.SimpleNamespace(RequestException=Exception))
+code = ["".join(cell["source"]) for cell in json.load(open(sys.argv[1], encoding="utf-8"))["cells"] if cell["cell_type"] == "code"]
+ns = {}
+exec(code[0], ns)
+with contextlib.redirect_stdout(io.StringIO()):
+    for cell in code:
+        if cell.startswith("# Helpers, part"):
+            exec(cell, ns)
+calls, spark = [], object()
+def run(result, session=spark, lakehouse="lakehouse"):
+    def step(session_arg, **kwargs):
+        calls.append({"same": session_arg is spark, **kwargs})
+        return dict(result)
+    ns.update(_spark=lambda: session, runtime_context=lambda: {"defaultLakehouseId": lakehouse}, kept_value_step=step)
+    printed = io.StringIO()
+    with contextlib.redirect_stdout(printed):
+        returned = ns["save_kept_values"]()
+    return {"printed": printed.getvalue().strip().splitlines(), "returned": returned}
+done = {"version": 1, "exists": True, "resolved": 1520, "read": 9041, "seconds": 12.25, "pending": 0, "error": None}
+report = {
+    "done": run(done),
+    "pending": run(dict(done, pending=30172)),
+    "error": run(dict(done, error="AnalysisException: [DELTA_CONCURRENT_APPEND] ConcurrentAppendException: Files were added")),
+    "missing": run(dict(done, exists=False)),
+    "noSpark": run(done, session=None),
+    "noLakehouse": run(done, lakehouse=None),
+    "calls": calls,
+    "runId": ns["RUN_ID"],
+}
+print(json.dumps(report))
+'@
+        $output = & $python $script $nb.Path 2>&1
+        $LASTEXITCODE | Should -Be 0 -Because ($output -join "`n")
+        $report = ($output | Select-Object -Last 1) | ConvertFrom-Json -AsHashtable
+        # Four calls, each with this session and this run's ID: none without Spark or a default lakehouse.
+        @($report['calls']).Count | Should -Be 4
+        foreach ($call in $report['calls']) {
+            $call['same'] | Should -BeTrue
+            $call['run_id'] | Should -Be $report['runId']
+            @($call.Keys | Sort-Object) | Should -Be @('run_id', 'same')
+        }
+        @($report['done']['printed']) | Should -Be @('Kept values: 1520 row(s) worked out from 9041 read, in 12.2 s; 0 row(s) of the history still to work out.')
+        @($report['pending']['printed']) | Should -Be @('Kept values: 1520 row(s) worked out from 9041 read, in 12.2 s; 30172 row(s) of the history still to work out (the next history step works them out).')
+        @($report['error']['printed']).Count | Should -Be 1
+        @($report['error']['printed'])[0] | Should -Match '^Kept values: not all worked out \(AnalysisException: .*ConcurrentAppendException.*\)\. Those rows read as before until the next history step works them out\.$'
+        @($report['missing']['printed']) | Should -Be @('Kept values: telemetry_snapshots isn''t there, so there''s nothing to work out.')
+        @($report['noSpark']['printed']) | Should -Be @('Kept values: Spark or the default lakehouse isn''t available, so none were worked out. Attach LH_DatabaseHub.')
+        @($report['noLakehouse']['printed']) | Should -Be $report['noSpark']['printed']
     }
 
     It 'saves a demo session once: the next run completes a save that a cancel cut off, table by table, and a first save is unchanged (R907)' {
@@ -1473,7 +1793,7 @@ def summary(ns, printed):
         "printed": printed.strip().splitlines(),
         "rows": [{"target": row["target"], "resource": row["resource_name"], "type": row["resource_type"], "metric": row["metric"],
                   "bucket": text(row["bucket_utc"]), "value": row["value"], "unit": row["unit"], "windowStart": text(row["window_start_utc"]),
-                  "windowEnd": text(row["window_end_utc"]), "reportDate": str(ns["report_date"]("telemetry_snapshots", row))} for row in rows],
+                  "windowEnd": text(row["window_end_utc"]), "reportDate": str(ns["report_date"]("telemetry_snapshots", row)), "grain": row["grain_minutes"]} for row in rows],
         "findings": {item["finding_id"]: {"status": item["status"], "finding": item["finding"], "target": item["target"],
                                           "reportDate": str(ns["report_date"]("analysis_findings", item))}
                      for item in ns["FINDINGS"] if item["analysis"] == "postgresql"},
@@ -1510,6 +1830,8 @@ print(json.dumps({
 
         $full = $result['full']
         $full['rows'].Count | Should -Be 15 -Because 'one row per point the collector kept'
+        # Each row declares the document's interval as its save's step (grain_minutes, F35).
+        @($full['rows'] | ForEach-Object { $_['grain'] } | Sort-Object -Unique) | Should -Be @(5)
         @($full['rows'] | ForEach-Object { $_['target'] } | Sort-Object -Unique) | Should -Be @('T4', 'T4-replica')
         @($full['rows'] | ForEach-Object { $_['type'] } | Sort-Object -Unique) | Should -Be @('flexibleServers')
         $lag = @($full['rows'] | Where-Object { $_['metric'] -eq 'physical_replication_delay_in_seconds' })
@@ -1674,7 +1996,7 @@ def summary(ns, printed):
         "printed": printed.strip().splitlines(),
         "rows": [{"target": row["target"], "resource": row["resource_name"], "type": row["resource_type"], "metric": row["metric"],
                   "bucket": text(row["bucket_utc"]), "value": row["value"], "unit": row["unit"], "windowStart": text(row["window_start_utc"]),
-                  "windowEnd": text(row["window_end_utc"]), "reportDate": str(ns["report_date"]("telemetry_snapshots", row))} for row in rows],
+                  "windowEnd": text(row["window_end_utc"]), "reportDate": str(ns["report_date"]("telemetry_snapshots", row)), "grain": row["grain_minutes"]} for row in rows],
         "findings": {item["finding_id"]: {"status": item["status"], "finding": item["finding"], "target": item["target"],
                                           "start": text(item["window_start_utc"]), "end": text(item["window_end_utc"]),
                                           "reportDate": str(ns["report_date"]("analysis_findings", item))}
@@ -1711,6 +2033,10 @@ print(json.dumps({
         # 19 points of each one-minute signal, the 429s filled with 0 in the 16 minutes with requests and none throttled,
         # and one hourly point of each hourly signal.
         $full['rows'].Count | Should -Be 97
+        # Each row declares its series' interval as its save's step (grain_minutes, F35): the hourly metrics' is an hour.
+        @($full['rows'] | ForEach-Object { '{0}={1}' -f $_['metric'], $_['grain'] } | Sort-Object -Unique) | Should -Be @(
+            'NormalizedRUConsumption=1', 'ProvisionedThroughput=60', 'ServerSideLatencyGateway=1', 'ServiceAvailability=60', 'ThrottledRequests=1',
+            'TotalRequests=1', 'TotalRequestUnits=1')
         @($full['rows'] | ForEach-Object { $_['target'] } | Sort-Object -Unique) | Should -Be @('T5')
         @($full['rows'] | ForEach-Object { $_['type'] } | Sort-Object -Unique) | Should -Be @('databaseAccounts')
         @($full['rows'] | ForEach-Object { $_['resource'] } | Sort-Object -Unique) | Should -Be @('cosmos01-abc123')
@@ -2436,12 +2762,13 @@ Describe 'Report tables for the Power BI history report (Phase 19)' {
         }
     }
 
-    It 'prepares the report tables in the persist cell, after the RCA evidence and both writes, and only when SAVE_RESULTS is True' {
+    It 'prepares the report tables in the persist cell, after the RCA evidence and both writes, and only when SAVE_RESULTS is True, then works out the kept values before a reference run''s exit (F35)' {
         $persist = @($live.Code | Where-Object { $_.Source -match '^# Persist:' })
         $persist.Count | Should -Be 1
-        # The RCA evidence first, so its RCA.EVIDENCE finding is saved with the others (ADR 0031); a reference run that was
-        # passed evidence ends with RCA.EVIDENCE as its exit value, after the session's rows.
-        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+#[^\n]*\n\s+save_rca_evidence\(\)\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS\)\s+if REFERENCE_RUN and RCA_STATE\["passed"\] and _notebookutils\(\) is not None:\s+#[^\n]*\n\s+_notebookutils\(\)\.notebook\.exit\(rca_exit_value\(\)\)\s+else:'
+        # The RCA evidence first, so its RCA.EVIDENCE finding is saved with the others (ADR 0031). The kept values come after
+        # the session's rows (F35), and before a reference run that was passed evidence ends with RCA.EVIDENCE as its exit
+        # value, since the exit ends the run.
+        $persist[0].Source | Should -Match '(?s)if SAVE_RESULTS:\s+#[^\n]*\n\s+save_rca_evidence\(\)\s+write_delta\("telemetry_snapshots", SNAPSHOT_ROWS\)\s+write_delta\("analysis_findings", FINDINGS\)\s+REPORT_TABLES = prepare_report_tables\(\)\s+#[^\n]*\n\s+SESSION_ROWS = [^\n]*\n\s+if SESSION_ROWS:\s+write_delta\("scenario_runs", SESSION_ROWS\)\s+#[^\n]*\n\s+KEPT_VALUES = save_kept_values\(\)\s+if REFERENCE_RUN and RCA_STATE\["passed"\] and _notebookutils\(\) is not None:\s+#[^\n]*\n\s+_notebookutils\(\)\.notebook\.exit\(rca_exit_value\(\)\)\s+else:'
     }
 
     It 'creates missing tables, adds and backfills report_date_utc in UTC, and compacts tables with many files' {
@@ -2607,7 +2934,7 @@ print(json.dumps({profile: list(signals("incident:" + profile)) for profile in (
 Describe 'The Incident RCA''s sidecar in NB_DatabaseHub_LiveActivity (2026-11-23, rca/README.md, The sidecar)' {
     BeforeAll {
         $live = Get-Notebook -Name 'NB_DatabaseHub_LiveActivity'
-        $part5 = @($live.Code | Where-Object { $_.Source -match '^# Helpers, part 5' })
+        $part6 = @($live.Code | Where-Object { $_.Source -match '^# Helpers, part 6' })
         $saveCell = @($live.Code | Where-Object { $_.Source -match '^# The Incident RCA''s sidecar' })
         $contract = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json -AsHashtable
         $transportPath = Join-Path -Path $repoRoot -ChildPath 'rca/transport.schema.json'
@@ -3290,10 +3617,10 @@ print(json.dumps(report, default=str))
     }
 
     It 'has one helpers cell and one cell that saves it before section 3, which make no network call and read no secret' {
-        $part5.Count | Should -Be 1
+        $part6.Count | Should -Be 1
         $saveCell.Count | Should -Be 1
-        # Part 4, then part 5, then the cell that saves the sidecar, then section 3, which can end the run.
-        $order = foreach ($pattern in '^# Helpers, part 4', '^# Helpers, part 5', '^# The Incident RCA''s sidecar', '^# This session') {
+        # Part 4, then part 5 (F35's kept values), then part 6, then the cell that saves the sidecar, then section 3, which can end the run.
+        $order = foreach ($pattern in '^# Helpers, part 4', '^# Helpers, part 5', '^# Helpers, part 6', '^# The Incident RCA''s sidecar', '^# This session') {
             $found = -1
             for ($index = 0; $index -lt $live.Code.Count -and $found -lt 0; $index++) {
                 if ($live.Code[$index].Source -match $pattern) { $found = $index }
@@ -3302,15 +3629,15 @@ print(json.dumps(report, default=str))
         }
         @($order | Where-Object { $_ -lt 0 }) | Should -BeNullOrEmpty
         @($order) | Should -Be @($order | Sort-Object)
-        @($order | Select-Object -Unique).Count | Should -Be 4
+        @($order | Select-Object -Unique).Count | Should -Be 5
         $saveCell[0].Source | Should -Match '(?m)^save_rca_sidecar\(\)$'
         # RCA_SIDECAR_FILE, which the scripts look for before they stage a file (Test-DemoFabricNotebookParameter), empty by
         # default, and read as transport.schema.json's sidecarFile says.
         @($live.Code | Where-Object { @($_.Metadata['tags']) -contains 'parameters' })[0].Source | Should -Match '(?m)^RCA_SIDECAR_FILE = ""$'
         $pattern = $transport['$defs']['sidecarFile']['pattern']
-        $part5[0].Source | Should -Match ('(?m)^RCA_SIDECAR_FILE_PATTERN = re\.compile\(r"{0}"\)$' -f [regex]::Escape($pattern.TrimStart('^').TrimEnd('$')))
-        $part5[0].Source | Should -Match 'utils\.fs\.head\(_rca_path\(RCA_SIDECAR_FILE\), RCA_LIMITS\["fileBytes"\]\)'
-        foreach ($source in $part5[0].Source, $saveCell[0].Source) {
+        $part6[0].Source | Should -Match ('(?m)^RCA_SIDECAR_FILE_PATTERN = re\.compile\(r"{0}"\)$' -f [regex]::Escape($pattern.TrimStart('^').TrimEnd('$')))
+        $part6[0].Source | Should -Match 'utils\.fs\.head\(_rca_path\(RCA_SIDECAR_FILE\), RCA_LIMITS\["fileBytes"\]\)'
+        foreach ($source in $part6[0].Source, $saveCell[0].Source) {
             $source | Should -Not -Match 'requests\.|get_token\(|getToken\(|getSecret\(|KEY_VAULT|vault\.azure\.net'
             foreach ($url in [regex]::Matches($source, 'https://[^\s)"]+')) {
                 $url.Value | Should -Match '^https://learn\.microsoft\.com/'
