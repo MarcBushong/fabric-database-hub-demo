@@ -53,6 +53,13 @@ internal sealed class SpanExport
 
     public DateTimeOffset? LastExportUtc { get; set; }
 
+    /// <summary>
+    /// When an export with no control session (<c>--session none</c>) last read the span: a start's on a VM that ran
+    /// before it, or a script's. A control session's export starts no target's window before it, so nothing captured
+    /// before goes to that session, however far a target's watermark lags. Null until such an export reads the span.
+    /// </summary>
+    public DateTimeOffset? SessionlessUtc { get; set; }
+
     /// <summary>True when the span is closed (or its process is gone) and the export took all of it: retention may delete it 7 days later.</summary>
     public bool Complete { get; set; }
 
