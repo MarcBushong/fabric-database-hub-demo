@@ -161,6 +161,26 @@
           "LAKEHOUSE_NAME": "LH_DatabaseHub",
           "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
         }
+      },
+      {
+        "sha256": "f585bb19dfd030746fd1aa9b984a10bfaaa4798ff2fd65266a2499c9c12e14f2",
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
+      },
+      {
+        "sha256": "d1d6294aff5c7ac03da910bdd161924fbcf94e94aac1fcea60dc4207ec77b2d5",
+        "since": "2026-11-24",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub",
+          "GITHUB_REPOSITORY": "MarcBushong/fabric-database-hub-demo"
+        }
       }
     ],
     "NB_DatabaseHub_LiveActivity": [
@@ -389,7 +409,43 @@
         }
       },
       {
+        "sha256": "13b015f5685623377fbe7c63e24554099580737a0af657a529e7081edecb1063",
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
+      },
+      {
         "sha256": "243a97687514dff7bb60042a333cde84875774824cd02fb4b316303d2affe179",
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
+      },
+      {
+        "sha256": "2702aa62df8cdd7715c0b073793576e39e328a383624d63007b2d7f97be082dc",
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
+      },
+      {
+        "sha256": "29c31004dcab7587d312eaa6b1d4c93c90f22a1cd1741bbf7073f481c90a5675",
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
+      },
+      {
+        "sha256": "2fc58b811bb5ccddd71de201430978b446a4902ef9fef02ab272d5e714440e02",
         "since": "2026-11-23",
         "parameters": {
           "WORKSPACE_ID": "",
@@ -425,8 +481,53 @@
         }
       },
       {
+        "sha256": "80968228655973218e652b8c289db63546e9b4ece73190a5fbaa813f64a6ec09",
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
+      },
+      {
+        "sha256": "81cbdcea27d8f6954eadc560ddfa9c9d4bb5edd3fc53958d5fd95a7eb89ab12b",
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
+      },
+      {
+        "sha256": "82874b33fcbda0efc89f7e9890052b645285e769fe79f797c325910b30657e92",
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
+      },
+      {
+        "sha256": "e7787dab49faea783d1f0a07765d2cbba9e7ee53c215cd3bed8d9160ce7ddfbc",
+        "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
+      },
+      {
         "sha256": "edbe64cefe3e224f0f3e3b2eb5fa90f0b7f850536f50c1e96ca5526003145cbc",
         "since": "2026-11-23",
+        "parameters": {
+          "WORKSPACE_ID": "",
+          "LAKEHOUSE_ID": "",
+          "LAKEHOUSE_NAME": "LH_DatabaseHub"
+        }
+      },
+      {
+        "sha256": "c7a5c49ff726b8056fa9573644371169706803903c11a7b33b33b4c38b3a0da5",
+        "since": "2026-11-24",
         "parameters": {
           "WORKSPACE_ID": "",
           "LAKEHOUSE_ID": "",
