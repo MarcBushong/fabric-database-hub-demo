@@ -273,9 +273,10 @@ public sealed class RcaIntegrationTests : IDisposable
     }
 
     /// <summary>
-    /// RCA-XE-00 reads sys.dm_xe_object_columns alone (2026-11-23): its earlier join to sys.dm_xe_objects took about 8 s
-    /// of CPU at each observer start on SQL Server 2022 CU25. Against a disposable SQL Server (CONTOSOCARE_TEST_SQL_SERVER,
-    /// as SqlIntegrationTests), both forms return the same fields for the five events. CI doesn't set it.
+    /// RCA-XE-00 reads sys.dm_xe_object_columns alone (2026-11-23): its earlier join to sys.dm_xe_objects ran about 46 s
+    /// on SQL Server 2022 CU25, so the observer's 30-second timeout for a long statement cut it short at each start.
+    /// Against a disposable SQL Server (CONTOSOCARE_TEST_SQL_SERVER, as SqlIntegrationTests), both forms return the same
+    /// fields for the five events. CI doesn't set it.
     /// </summary>
     [Fact]
     public async Task OnSqlServerTheEventsFieldsReadAloneAreTheJoinedFormsFields()

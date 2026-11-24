@@ -812,7 +812,7 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         $adr | Should -Match ([regex]::Escape('A restart while the observer runs, such as maintenance or a scale, is reported the same way from the observer''s next read'))
     }
 
-    It 'reads the events'' fields from sys.dm_xe_object_columns alone (RCA-XE-00), without the join to sys.dm_xe_objects that took about 8 s of CPU at each observer start' {
+    It 'reads the events'' fields from sys.dm_xe_object_columns alone (RCA-XE-00), without the join to sys.dm_xe_objects that the observer''s 30-second timeout cut short at each start' {
         $catalog = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'capture/sqlserver.sql'))
         $block = [regex]::Match($catalog, '(?ms)^-- name: RCA-XE-00\r?$(?<body>.*?)(?=^-- name: |\z)').Groups['body'].Value
         $sql = @($block -split "`n" | Where-Object { $_ -notmatch '^\s*--' }) -join "`n"

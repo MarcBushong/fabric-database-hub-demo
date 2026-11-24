@@ -747,7 +747,9 @@ JOIN sys.database_files AS df ON df.file_id = vfs.file_id;
 -- SESSION page points to sys.dm_xe_object_columns for them; Learn has no field reference for error_reported). The
 -- runner reads only fields this lists, and records a missing one as "not captured" instead of failing. It reads
 -- sys.dm_xe_object_columns alone, by the events' names and their data columns: its earlier join to sys.dm_xe_objects
--- returned the same fields, and took about 8 s of CPU at each observer start on SQL Server 2022 CU25 (2026-11-23).
+-- returned the same fields, but its plan read sys.dm_xe_objects again for each column row: on SQL Server 2022 CU25 it
+-- ran about 46 s when let finish, so the observer's 30-second timeout for a long statement cut it short at each start,
+-- after about 30 s of CPU (2026-11-23).
 SET NOCOUNT ON;
 SELECT /* dbhubdemo:rca-observer */
     event_name  = c.object_name,
