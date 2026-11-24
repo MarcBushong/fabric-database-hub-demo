@@ -484,7 +484,8 @@ Describe 'The Incident RCA''s sidecars in the guest: the store isn''t deleted be
         $result.sealed | Should -Be 1
         @($result.sidecars) | Should -Be @($script:sidecarId)
         $result.ledger | Should -Be 'read'
-        $result.error | Should -Be 'it holds Incident RCA sidecars that aren''t in the history yet (1 sidecar(s) the runner''s ledger doesn''t mark acknowledged)'
+        $result.error | Should -Be 'it holds Incident RCA sidecars not yet acknowledged (1 sidecar(s) the runner''s ledger doesn''t mark acknowledged)'
+        $result.error | Should -Not -Match 'in the history yet' -Because 'a Run all session''s sidecars are in the history before the next Run all''s start acknowledges them (the review of 2782e731)'
         $result.taskStopped | Should -BeFalse -Because 'the runner runs again'
         Should -Invoke -CommandName Stop-ScheduledTask -Times 1 -Exactly -Because 'it counts with the runner stopped, so nothing is sealed between the count and the delete'
         Should -Invoke -CommandName Start-ScheduledTask -Times 1 -Exactly -ParameterFilter { $TaskName -eq 'DbHubDemo-Workload' }

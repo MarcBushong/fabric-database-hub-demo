@@ -773,9 +773,10 @@ describe("a coarser point a finer save holds part of", () => {
 });
 
 // The owner, 2026-11-23: the chat read "the CPU's cause (Query Store's plans, waits per query) isn't captured yet" as "T1
-// doesn't have Query Store". A cause the capture doesn't explain yet says what this history lacks, per target, and never
-// what the target lacks, with where the target's own Query Store has it as its next step.
-describe("Query Store, in the words of a cause the capture doesn't explain yet", () => {
+// doesn't have Query Store". Tools made without the sidecar's reader (only tests: the app always passes it, client.ts)
+// explain a cause without Query Store's evidence: they say what they don't read, per target, never what the target lacks,
+// nor that the history lacks it, with where the target's own Query Store has it as the next step.
+describe("Query Store, in the words of a cause the tools explain without its evidence", () => {
     /** A claim that a target has no Query Store, or that it's off. */
     const LACKS = /(?:has no|hasn't got|doesn't have|does not have|lacks|without)(?: a| any| its)? Query Store|Query Store (?:is|was) (?:off|disabled|not (?:on|enabled|turned on))|Query Store (?:isn't|wasn't) (?:on|enabled|turned on)|no Query Store/i;
     const busy = (m: number) => (m >= 40 && m < 50 ? 95 : 10);
@@ -812,23 +813,23 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
     const SQL_LEARN = "https://learn.microsoft.com/sql/relational-databases/performance/monitoring-performance-by-using-the-query-store";
     const PG_LEARN = "https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store";
 
-    it("says on T1 to T3 that this history doesn't hold Query Store's statistics yet, the capture's limit, and where the target's own has them", async () => {
+    it("says on T1 to T3, without the sidecar's reader, that the app doesn't read Query Store's evidence, its limit, and where the target's own has it", async () => {
         for (const target of ["T1", "T3"] as const) {
             const r = await incidentOn(target, "cpu");
             expect(r.rootCause?.ruleIds).toEqual(["TELEMETRY-ONLY"]);
-            expect(r.rootCause?.statement).toMatch(new RegExp(`UTC\\b.*Which queries drove it isn't in this history: the capture doesn't collect Query Store's per-query statistics yet, a limit of the capture, not of ${target}\\.$`));
-            expect(r.notCaptured).toContain(`${target}: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not ${target}'s: Query Store on ${target} keeps those minutes' plans and per-query CPU, duration, and waits for 14 days (less when it fills up), and validate.ps1's ${target}.QUERYSTORE says whether it's on.`);
+            expect(r.rootCause?.statement).toMatch(new RegExp(`UTC\\b.*Which queries drove it isn't known here: this app doesn't read Query Store's evidence, a limit of the app, not of ${target}\\.$`));
+            expect(r.notCaptured).toContain(`${target}: which queries drove the CPU isn't known here, because this app doesn't read Query Store's evidence. That's the app's limit, not ${target}'s: Query Store on ${target} keeps those minutes' plans and per-query CPU, duration, and waits for 14 days (less when it fills up), and validate.ps1's ${target}.QUERYSTORE says whether it's on.`);
             expect(r.nextSteps).toContain(`Read Query Store on ${target} for the queries and plans that used the CPU from 15:40:00 to 15:50:00 UTC: its Top Resource Consuming Queries and Regressed Queries reports on ContosoCare in SQL Server Management Studio, or sys.query_store_runtime_stats for the intervals that hold those minutes (${SQL_LEARN}).`);
         }
         const latch = await incidentOn("T2", "latch");
-        expect(latch.notCaptured).toContain("T2: which queries drove the buffer latch waits isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T2's: Query Store on T2 keeps those minutes' plans and per-query CPU, duration, and waits for 14 days (less when it fills up), and validate.ps1's T2.QUERYSTORE says whether it's on.");
+        expect(latch.notCaptured).toContain("T2: which queries drove the buffer latch waits isn't known here, because this app doesn't read Query Store's evidence. That's the app's limit, not T2's: Query Store on T2 keeps those minutes' plans and per-query CPU, duration, and waits for 14 days (less when it fills up), and validate.ps1's T2.QUERYSTORE says whether it's on.");
         expect(latch.nextSteps).toContain(`Read Query Store on T2 for the queries that waited on Buffer Latch from 15:40:00 to 15:50:00 UTC: its Query Wait Statistics report on ContosoCare in SQL Server Management Studio, or sys.query_store_wait_stats and sys.query_store_runtime_stats for the intervals that hold those minutes (${SQL_LEARN}).`);
     });
 
     it("says the same on T4, in its azure_sys database at every size but Burstable, and that a read replica's queries are in neither", async () => {
         const t4 = await incidentOn("T4", "cpu");
-        expect(t4.rootCause?.statement).toMatch(/Which queries drove it isn't in this history: the capture doesn't collect Query Store's per-query statistics yet, a limit of the capture, not of T4\.$/);
-        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T4's: at every size but Burstable, where Learn advises against it, Query Store on T4 keeps those minutes' per-query statistics and wait samples in its azure_sys database for 7 days, and validate.ps1's T4.QUERYSTORE says whether it's on.");
+        expect(t4.rootCause?.statement).toMatch(/Which queries drove it isn't known here: this app doesn't read Query Store's evidence, a limit of the app, not of T4\.$/);
+        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't known here, because this app doesn't read Query Store's evidence. That's the app's limit, not T4's: at every size but Burstable, where Learn advises against it, Query Store on T4 keeps those minutes' per-query statistics and wait samples in its azure_sys database for 7 days, and validate.ps1's T4.QUERYSTORE says whether it's on.");
         expect(t4.nextSteps).toContain(`Read Query Store on T4 for the queries that took the most time from 15:40:00 to 15:50:00 UTC, at every size but Burstable: query_store.qs_view in its azure_sys database, and query_store.pgms_wait_sampling_view for what they waited on, for the intervals that hold those minutes (${PG_LEARN}).`);
         const replica = await incidentOn("T4-replica", "cpu");
         expect(replica.rootCause?.statement).toMatch(/Which queries drove it is in neither this history nor Query Store, which doesn't record a read replica's queries\.$/);
@@ -842,13 +843,13 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         // 8 days later: T4 keeps 7, T1 14.
         const week = toolsAt(new Date("2026-11-28T16:00:00Z"));
         const t4 = await incidentOn("T4", "cpu", week);
-        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T4's: Query Store on T4 no longer keeps those minutes either: it keeps 7 days, and they're more than 7 days old. validate.ps1's T4.QUERYSTORE says whether it's on.");
+        expect(t4.notCaptured).toContain("T4: which queries drove the CPU isn't known here, because this app doesn't read Query Store's evidence. That's the app's limit, not T4's: Query Store on T4 no longer keeps those minutes either: it keeps 7 days, and they're more than 7 days old. validate.ps1's T4.QUERYSTORE says whether it's on.");
         expect(t4.nextSteps.join(" ")).not.toMatch(/Query Store/);
         const t1 = await incidentOn("T1", "cpu", week);
         expect(t1.nextSteps).toEqual(expect.arrayContaining([expect.stringMatching(/^Read Query Store on T1 for the queries and plans that used the CPU from 15:40:00 to 15:50:00 UTC/)]));
         // 15 days later: past T1's too.
         const later = await incidentOn("T1", "cpu", toolsAt(new Date("2026-12-05T16:00:00Z")));
-        expect(later.notCaptured).toContain("T1: which queries drove the CPU isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not T1's: Query Store on T1 no longer keeps those minutes either: it keeps 14 days (less when it fills up), and they're more than 14 days old. validate.ps1's T1.QUERYSTORE says whether it's on.");
+        expect(later.notCaptured).toContain("T1: which queries drove the CPU isn't known here, because this app doesn't read Query Store's evidence. That's the app's limit, not T1's: Query Store on T1 no longer keeps those minutes either: it keeps 14 days (less when it fills up), and they're more than 14 days old. validate.ps1's T1.QUERYSTORE says whether it's on.");
         expect(later.nextSteps.join(" ")).not.toMatch(/Query Store/);
     });
 
@@ -1060,6 +1061,8 @@ describe("Query Store, in the words of a cause the capture doesn't explain yet",
         const text = JSON.stringify(results);
         expect(text).not.toMatch(LACKS);
         expect(text).not.toMatch(/isn't captured yet|plans and waits per query|plans, waits per query/);
+        // Since the sidecar, the capture collects Query Store's statistics (the review of 2782e731).
+        expect(text).not.toMatch(/doesn't collect Query Store's|isn't in this history, because the capture/);
         expect(namesAScenario(text)).toEqual([]);
         // The playbook says it only as what never to say, and for the documented exception: Azure Cosmos DB has none.
         const sentences = INVESTIGATION_PLAYBOOK.split(/(?<=[.:])\s+/).filter((s) => LACKS.test(s));

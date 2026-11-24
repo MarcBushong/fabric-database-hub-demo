@@ -3138,7 +3138,7 @@ function Complete-DemoRcaSidecarSave {
         $sentences.Add(('{0} sidecar(s) wait on the VMs, which keep them: {1} ({2} lists them).' -f $pending.Count, $said, (Get-DemoRcaShownPath -Path ([string]$list.Paths.Pending))))
     }
     if ($expired.Count -gt 0) {
-        $sentences.Add(('{0} sidecar(s) expired unread: the runner keeps one 30 days after its sealing, and wasn''t told in time that the history has it.' -f $expired.Count))
+        $sentences.Add(('{0} sidecar(s) on the PC''s list are past the runner''s 30 days: deleted unread, unless a Run all saved and acknowledged them first.' -f $expired.Count))
     }
     if ($Sidecar.Error) {
         $sentences.Add($Sidecar.Error)

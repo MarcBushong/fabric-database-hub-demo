@@ -119,7 +119,7 @@ describe("explain_incident's CPU and wait classes, from Query Store's evidence",
         // A coverage row, and no query in what it read: said as such.
         const read = { ...emptySidecar(), coverage: fixtureSidecar("t3").coverage };
         expect((await cpuIncident(toolsWith(read).tools)).rootCause?.statement).toMatch(/ Which queries drove it isn't in this history: Query Store's evidence of those minutes holds no query\.$/);
-        for (const r of [older, none]) expect(r.notCaptured.join(" ")).not.toMatch(/doesn't collect Query Store's per-query statistics yet|not captured|didn't read/);
+        for (const r of [older, none]) expect(r.notCaptured.join(" ")).not.toMatch(/this app doesn't read Query Store's evidence|doesn't collect Query Store's|not captured|didn't read/);
     });
 
     it("says a read that failed couldn't be read, never that nothing was recorded, and still answers with the telemetry", async () => {

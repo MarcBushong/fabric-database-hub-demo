@@ -213,6 +213,8 @@ Describe 'New-DemoT2GoldenSnapshot' {
         # sidecar that isn't in the history, unless a test sets some.
         $script:sidecarAcks = [ordered]@{}
         $script:guestSidecars = [ordered]@{ spans = 0; sealed = 0; unsealed = 0; ledger = 'none'; sidecars = @() }
+        # A guest whose answer about its sidecars can't be read, when a test sets why.
+        $script:guestSidecarError = ''
         $script:ackOutcome = 'Pass'
         Mock -ModuleName DbHubDemo -CommandName Read-DemoRcaSidecarList -MockWith { [pscustomobject]@{ Paths = [pscustomobject]@{ Pending = (Join-Path -Path $repoRoot -ChildPath 'out/history-pending/rca-sidecar-pending-rg-dbhub-demo.json'); Acks = (Join-Path -Path $repoRoot -ChildPath 'out/history-pending/rca-sidecar-acks-rg-dbhub-demo.json') }; Pending = [ordered]@{}; Acks = $script:sidecarAcks; Writable = @{ Pending = $true; Acks = $true }; Problems = [System.Collections.Generic.List[string]]::new() } }
         Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaSidecarList -MockWith { $script:calls.Add(('save acks {0}' -f @($List.Acks.Keys).Count)); @() }
@@ -259,7 +261,10 @@ Describe 'New-DemoT2GoldenSnapshot' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoGoldenGuestAction -MockWith {
             $script:calls.Add('guest ' + $Action)
             switch ($Action) {
-                'RcaSidecars' { [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 30; Data = [pscustomobject]@{ succeeded = $true; rca = [pscustomobject]$script:guestSidecars } } }
+                'RcaSidecars' {
+                    if ($script:guestSidecarError) { [pscustomobject]@{ Succeeded = $false; Error = $script:guestSidecarError; Seconds = 900; Data = $null } }
+                    else { [pscustomobject]@{ Succeeded = $true; Error = ''; Seconds = 30; Data = [pscustomobject]@{ succeeded = $true; rca = [pscustomobject]$script:guestSidecars } } }
+                }
                 'Release' { [pscustomobject]@{ Succeeded = $true; Data = [pscustomobject]@{ succeeded = $true; captured = $false }; Error = ''; Seconds = 5 } }
                 'Inspect' {
                     [pscustomobject]@{
@@ -407,6 +412,18 @@ Describe 'New-DemoT2GoldenSnapshot' {
         ($results | Where-Object checkId -EQ 'GOLDEN.CAPTURE').status | Should -Be 'Pass'
         $script:calls | Should -Contain 'guest Prepare'
         Should -Invoke -ModuleName DbHubDemo -CommandName Get-DemoGoldenRcaNotebookState -Times 0 -Exactly -Because 'the notebook is read only when T2''s documents are listed'
+    }
+
+    It 'captures nothing when whether T2''s guest holds a sidecar can''t be read, and says what wasn''t known (the review of 2782e731)' {
+        $script:hostPower = 'PowerState/running'
+        $script:guestSidecarError = 'PowerShell Direct into the guest failed.'
+        $results = @(New-DemoT2GoldenSnapshot -Config $config -NowUtc ([datetime]::new(2026, 11, 23, 18, 0, 0, [System.DateTimeKind]::Utc)) -Confirm:$false)
+        $rca = $results | Where-Object checkId -EQ 'GOLDEN.CAPTURE.RCA'
+        $rca.status | Should -Be 'Fail'
+        $rca.message | Should -Be 'Whether T2''s guest holds Incident RCA sidecars, which its runner keeps until it''s told the history has them, couldn''t be read (PowerShell Direct into the guest failed), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.'
+        # Run all saves its sessions' sidecars, so one the runner wasn't told about can be in the history already.
+        $rca.message | Should -Not -Match 'in the history yet'
+        $script:calls | Should -Not -Contain 'guest Prepare'
     }
 
     It 'captures nothing while T2''s guest holds a sidecar that isn''t in the history, its only pending evidence, and deletes nothing (2026-11-23)' {

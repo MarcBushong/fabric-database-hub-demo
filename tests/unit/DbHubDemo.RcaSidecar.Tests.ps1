@@ -709,8 +709,8 @@ Describe 'The Incident RCA''s sidecars from the scripts (2026-11-23, rca/README.
         $save = Invoke-TestSave -Now
         @((Read-TestList 'pending')['sidecars'] | ForEach-Object { '{0}: {1}' -f $_['documentId'], $_['reason'] }) | Should -Be @('20261121T170000Z-arcsql01-0002-sidecar: not fetched: archost01 isn''t running, so what its observer captured stays on it until the next export.')
         $save.Line.status | Should -Be 'Warning'
-        $save.Line.message | Should -Match '2 sidecar\(s\) expired unread: the runner keeps one 30 days after its sealing, and wasn''t told in time that the history has it\.'
-        $save.Line.message | Should -Not -Match 'no save took it' -Because 'a save can have written it, Run all''s or a stop''s whose acknowledgement waited, without the runner being told'
+        $save.Line.message | Should -Match '2 sidecar\(s\) on the PC''s list are past the runner''s 30 days: deleted unread, unless a Run all saved and acknowledged them first\.'
+        $save.Line.message | Should -Not -Match 'no save took it|wasn''t told in time' -Because 'the PC can''t know whether a Run all saved and acknowledged them (the review of 2782e731)'
         $save.Line.evidence.expired | Should -Be 2
         $save.Line.remediation | Should -Match 'stop-demo\.ps1 -SaveHistory'
     }

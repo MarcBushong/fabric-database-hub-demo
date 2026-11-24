@@ -24,7 +24,7 @@ Actions:
   removes the sign-in data that setup leaves on the VM again and
   checks that none remains, turns IE ESC back on when it's off, deletes the Incident RCA's capture in the guest
   (C:\ProgramData\DbHubDemo\rca, after stopping the workload runner, which the next boot starts again) so the
-  snapshot carries none, unless it holds sidecars that aren't in the history yet (2026-11-23; then nothing is
+  snapshot carries none, unless it holds sidecars not yet acknowledged (2026-11-23; then nothing is
   captured), writes the capture record
   C:\ProgramData\DbHubDemo\golden\capture.json (the snapshot name, this host's Azure VM ID, and the guest's
   Arc identity), applies the air gap (the guest's automatic start action becomes Nothing, and its network
@@ -642,7 +642,7 @@ $script:GuestRcaClearBlock = {
     # CheckOnly, the block only counts them, and changes nothing.
     param($StoreRoot, $RuntimeRoot, $WaitSeconds, $CheckOnly)
     $ErrorActionPreference = 'Continue'
-    # The runner's names for what isn't in the history yet (T1a's hand-off and the contract's 61eced5d, 2026-11-23): a
+    # The runner's names for what isn't acknowledged yet (T1a's hand-off and the contract's 61eced5d, 2026-11-23): a
     # span's unsealed rows, sidecar-<target>.rows (the one constant for them; a span's *.jsonl is evidence, never a
     # sidecar), a sealed sidecar's file in sidecars\ (<documentId>.json.gz), and the ledger beside them (ledger.json, with
     # its lock and the copies the runner keeps aside, all ledger.*).
@@ -687,7 +687,7 @@ $script:GuestRcaClearBlock = {
         return $answer
     }
     function Get-SidecarState {
-        # The sidecars in the store that aren't in the history yet: sealed ones the ledger doesn't mark acknowledged (any
+        # The sidecars in the store not yet acknowledged: sealed ones the ledger doesn't mark acknowledged (any
         # other file in sidecars\ counts as one), and the spans whose rows aren't sealed yet.
         param([string] $Root)
         $pattern = $sidecarIdPattern
@@ -802,7 +802,7 @@ $script:GuestRcaClearBlock = {
         if ([string]$sidecars['ledger'] -eq 'unreadable') {
             $what += 'a ledger that can''t be read'
         }
-        $text = 'it holds Incident RCA sidecars that aren''t in the history yet ({0})' -f ($what -join ', ')
+        $text = 'it holds Incident RCA sidecars not yet acknowledged ({0})' -f ($what -join ', ')
         $result['error'] = $text.Substring(0, [Math]::Min(200, $text.Length))
         if ($task) {
             Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
@@ -1109,7 +1109,7 @@ function Invoke-GoldenInspect {
 
 function Invoke-GoldenRcaSidecarCheck {
     # Read-only (2026-11-23, the capture's guard for the Incident RCA's sidecars, rca/README.md, The sidecar): the sidecars
-    # in the guest's store that aren't in the history yet, over PowerShell Direct, counted as Prepare's RCA step counts them
+    # in the guest's store not yet acknowledged, over PowerShell Direct, counted as Prepare's RCA step counts them
     # before it deletes the store (GuestRcaClearBlock with CheckOnly), with nothing stopped or changed.
     param([hashtable] $Setting)
     $result = [ordered]@{ action = 'RcaSidecars'; succeeded = $false }

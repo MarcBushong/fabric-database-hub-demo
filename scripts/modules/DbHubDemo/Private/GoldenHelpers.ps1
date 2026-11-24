@@ -1387,7 +1387,7 @@ function Test-DemoGoldenRcaSidecar {
     if (-not [bool](Get-DemoMemberValue -InputObject $check -Name 'Succeeded') -or $null -eq $rca) {
         $why = [string](Get-DemoMemberValue -InputObject $check -Name 'Error')
         $answer.Refused = $true
-        $answer.Results = @(& $result 'Fail' ('Whether T2''s guest holds Incident RCA sidecars that aren''t in the history yet couldn''t be read ({0}), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.' -f $(if ($why) { $why.TrimEnd('.') } else { 'the guest didn''t answer' })) $evidence 'Run ./scripts/capture-t2-golden.ps1 again once T2''s guest runs; ./scripts/status.ps1 shows it (T2.GUEST.STATE).')
+        $answer.Results = @(& $result 'Fail' ('Whether T2''s guest holds Incident RCA sidecars, which its runner keeps until it''s told the history has them, couldn''t be read ({0}), and the capture would delete them with the rest of what T2''s guest keeps, so nothing was captured.' -f $(if ($why) { $why.TrimEnd('.') } else { 'the guest didn''t answer' })) $evidence 'Run ./scripts/capture-t2-golden.ps1 again once T2''s guest runs; ./scripts/status.ps1 shows it (T2.GUEST.STATE).')
         return $answer
     }
     $sealed = [int](Get-DemoMemberValue -InputObject $rca -Name 'sealed')

@@ -1,10 +1,11 @@
-// What the RCA says about Query Store while the capture doesn't collect its statistics (ADR 0031): that this history
-// doesn't hold them, which is the capture's limit, never that a target has no Query Store. Live, the chat read "the CPU's
-// cause (Query Store's plans, waits per query) isn't captured yet" as "T1 doesn't have Query Store" (the owner,
-// 2026-11-23), though the demo keeps Query Store on in ContosoCare on T1 to T3 (database/*/030-configure.sql) and, since
-// then, on T4 at every size but Burstable (infra/modules/pgflex01.bicep). Whether it's on is validate.ps1's to say
-// (<target>.QUERYSTORE), never this history's. Query Store doesn't record a read replica's queries, and T5, Azure Cosmos
-// DB, has none.
+// What the RCA says about Query Store where it reads none of Query Store's evidence (ADR 0031): tools made without the
+// sidecar's reader, which the Insights app always passes (client.ts), so only tests reach those words; a read replica,
+// whose queries Query Store doesn't record; and T5, Azure Cosmos DB, which has none. Where the history holds Query Store's
+// evidence, explain-queries.ts and queries.ts say what it shows. Never that a target has no Query Store: live, the chat
+// read "the CPU's cause (Query Store's plans, waits per query) isn't captured yet" as "T1 doesn't have Query Store" (the
+// owner, 2026-11-23), though the demo keeps Query Store on in ContosoCare on T1 to T3 (database/*/030-configure.sql) and,
+// since then, on T4 at every size but Burstable (infra/modules/pgflex01.bicep). Whether it's on is validate.ps1's to say
+// (<target>.QUERYSTORE), never this history's.
 
 import { fromTo, type Episode, type RcaTarget } from "./types";
 
@@ -34,12 +35,12 @@ const WAIT_CATEGORY: Readonly<Record<string, string>> = {
     network: "Network IO",
 };
 
-/** The last sentence of the cause of an episode no rule explains by query yet (TELEMETRY-ONLY). */
+/** The last sentence of a TELEMETRY-ONLY cause that reads no Query Store evidence: without the sidecar's reader, a read replica, or T5. */
 export function unexplainedByQuery(e: Pick<Episode, "target">): string {
     switch (queryStoreKind(e.target)) {
         case "sql":
         case "postgresql":
-            return `Which queries drove it isn't in this history: the capture doesn't collect Query Store's per-query statistics yet, a limit of the capture, not of ${e.target}.`;
+            return `Which queries drove it isn't known here: this app doesn't read Query Store's evidence, a limit of the app, not of ${e.target}.`;
         case "replica":
             return "Which queries drove it is in neither this history nor Query Store, which doesn't record a read replica's queries.";
         default:
@@ -66,10 +67,10 @@ export function queryStoreAge(e: Pick<Episode, "target" | "end" | "last" | "read
     return { kept: ageMs <= retentionDays * DAY_MS, days: Math.max(0, Math.floor(ageMs / DAY_MS)), retentionDays };
 }
 
-/** What wasn't captured, in words that say what this history lacks and never what the target lacks. */
+/** What tools without the sidecar's reader don't read, in words that say so and never what the target lacks. */
 export function queryStoreNote(e: Pick<Episode, "target" | "signal" | "end" | "last" | "readEnd">, now: Date): string {
     const t = e.target;
-    const lacks = `${t}: which queries drove the ${e.signal} isn't in this history, because the capture doesn't collect Query Store's per-query statistics yet. That's the capture's limit, not ${t}'s:`;
+    const lacks = `${t}: which queries drove the ${e.signal} isn't known here, because this app doesn't read Query Store's evidence. That's the app's limit, not ${t}'s:`;
     const age = queryStoreAge(e, now);
     const gone = age && !age.kept ? ` Query Store on ${t} no longer keeps those minutes either: it keeps ${age.retentionDays} days${queryStoreKind(t) === "sql" ? " (less when it fills up)" : ""}, and they're more than ${age.retentionDays} days old.` : "";
     switch (queryStoreKind(t)) {
