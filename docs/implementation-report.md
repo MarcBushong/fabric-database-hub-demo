@@ -5901,8 +5901,8 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 **Risks and what its live check needs.**
 
 - **T2c-1's runbook must accept `rcaAcks`:** d06899f6's refuses a request field it doesn't know. `-runall-` acknowledgements exist only once a runbook with the sidecar path has written a pointer, so only runbooks published again from an older checkout would refuse a start, and `./scripts/deploy.ps1` fixes that. After T2c-1 merges, INT adds a start with `rcaAcks` to `Test-DbHubControlRequest`'s cross-check here.
-- **`RCA.SIDECAR.ACK`:** the start's final result carries it as a step, which the status's steps print; without that step, the notebook prints it once the start has ended, so it shows once either way ([the review](#the-review-of-90b4718c-2026-11-23)).
-- **The activity notebook's sweep** deletes a `-runall-` acknowledgement a day after its payload is gone. A save between a session's history and the next start more than a day later can take one before it's sent: those sidecars stay pending on the VMs, and the next session's exports fetch them again and its save answers `already`.
+- **`RCA.SIDECAR.ACK`:** the notebook prints it from the status's `rcaAcks`, each time the result changes once the start has ended, so a later export's result shows too ([option 2](#t2c-option-2-the-sessions-later-exports-2026-11-23)); a step that says the same stands for it, so it shows once either way ([the review](#the-review-of-90b4718c-2026-11-23)).
+- **The activity notebook's sweep** leaves a `-runall-` acknowledgement for 30 days since the contract's f18c0635, which B's notebook follows, so a gap of more than a day between sessions no longer takes one before the next start sends it. A copy of the activity notebook from before that deletes one a day after its payload is gone; those sidecars then stay pending on the VMs, and the next session's exports fetch them again and its save answers `already`.
 - **The live run (S1 and S2) shows:**
   - Get Item Definition with the notebook user's `pbi` token, which needs read and write on the activity notebook;
   - `notebookutils.fs.head` on an acknowledgement;
@@ -5931,3 +5931,30 @@ Medium 1 changes none of them: B's and A's minutes each fall in one UTC day.
 - **The expiry's delete:** a failed delete of an acknowledgement more than 30 days old leaves it for a later read, and the start still carries the others. Before, the failure ended the read, and the start went with no `rcaAcks`.
 
 **Validation.** `Fabric.ControlNotebook`: 92 passed, none failed or skipped. The new case: a start whose delete of an expired acknowledgement fails. Two cases grew: the whole acknowledgements, with an older one listing 65 sidecars, of which 3 are written; and `build_request`'s limits, with one too big on its own by count, and one by bytes. Mutations, each alone, each failing its test: an acknowledgement of more than 64 accepted; one too big on its own holding back the rest; the delete unwrapped; and, again, a later one let ahead of an older one that doesn't fit. PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
+
+### T2c option 2: the session's later exports (2026-11-23)
+
+**Why.** The coordinator's decision on T2c-1, option 2, in the contract since 00212de6: a start can leave acknowledgements unsent, for example while T2's dispatch holds the T2 host through the start's bound. The session's next export that reaches that VM, a re-check's or else the stop's, sends them, and writes `rcaAcks` again, only moving IDs from `left` to `sent`; the stopped status's is final. On 0c3840e8, with the contract through 00212de6 (0057aa24).
+
+- **Each result shows:** `settle_rca_acks` no longer shows a session's result once only. It shows it again each time it changes (its status, message, `sent`, or `left`), once the start has ended: a re-check's, which the live view reads every 5 minutes, and the stop's, which `finish_session` reads as it follows the stop. The stop's copy of an unchanged result shows nothing new. A step stands for a result only when it says the same, so a start's step never stands for a later result; T2c-1's runbook writes no step now (a708cffa), so the notebook prints each.
+- **What a result completes goes,** at every read, as before: the contract makes acting on any copy safe, since an ID once sent stays sent.
+- **The stopped status's word, outside the session's follow:** `stopped_metrics`, which reads each stopped status for its metrics, now settles it too, quietly, with no `RCA.SIDECAR.ACK` line for a session this Run all doesn't follow:
+  - the next Run all's pre-check deletes what the earlier session's later exports completed, before its own start carries any of it again;
+  - so does Stop now after a session stopped already.
+
+  `finish_session` already deleted with the stopped status's result, as `follow_status` reads it; it now also says when that result changed.
+- **The deletion's summary** says what a kept acknowledgement waits for: "until this session's re-checks or its stop, or the next start, send the rest" while the session runs, and "for the next start" once it stopped.
+
+**Changed files.** `fabric/control/NB_DatabaseHub_Control.ipynb` (cell 5), `tests/unit/Fabric.ControlNotebook.Tests.ps1`, and this report.
+
+**Validation.** `Fabric.ControlNotebook`: 97 passed, none failed or skipped, at below-normal priority. The simulator's stop now keeps the start's result, as `Write-DbHubStopStatus` does. The 5 new cases:
+
+- a re-check's result, which the live view reads;
+- the stop's, which `finish_session` reads;
+- a re-check's after a start whose step said its result;
+- Stop now after a session stopped already;
+- the next Run all's pre-check, whose start then carries only a later save's acknowledgement.
+
+The four acknowledgement cases from before now expect the summary's new words. Mutations, each alone, each failing its tests: the first result latching the session (3 of 3); no settling of a stopped status (2 of 2); a stopped status settled aloud (2 of 2); a start's step standing for a later result (1 of 3); and "for the next start" while the session runs (3 of 3). `Rca.Contract` passed: 79. PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
+
+**What its live check needs.** A session whose T2 host is busy through the start: the live view's `RCA.SIDECAR.ACK` line after the re-check that sends T2's acknowledgement, or the stop's, and the acknowledgement file gone after it.
