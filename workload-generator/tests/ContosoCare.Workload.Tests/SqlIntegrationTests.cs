@@ -1,4 +1,5 @@
 using System.Data;
+using System.Text.RegularExpressions;
 using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Runs;
@@ -475,6 +476,66 @@ public sealed class SqlIntegrationTests
             await SetAsync("plan-regression", 1800);
             await SetAsync("cpu-pressure", 1800);
         }
+    }
+
+    [Fact]
+    public async Task SetupMarksExactlyTheHarnessModulesAsTheRcaReadsThem()
+    {
+        // Unit 2's Query Store leave-out (ADR 0031): the control script marks every module it creates, and only those, with
+        // the extended property dbhubdemo.role = harness. Setup runs twice, the first adding a mark that's missing and the
+        // second setting the marks again; then they're read as RCA-SQL-10 and 14 read them. A typo in the property's name,
+        // its value, its level, or its schema leaves a module out, or marks something else.
+        await PrepareAsync();
+        var token = TestContext.Current.CancellationToken;
+        var created = Regex.Matches(SqlScripts.Read("110-demo-control.sql"), @"(?m)^CREATE OR ALTER (?:PROCEDURE|FUNCTION) (?<name>demo\.[a-z_]+)")
+            .Select(m => m.Groups["name"].Value).Order(StringComparer.Ordinal).ToList();
+        Assert.Equal(21, created.Count);
+
+        await using var connection = await OpenAsync(SessionNames.ForControl("setup"));
+        await using (var unmark = connection.CreateCommand())
+        {
+            unmark.CommandText =
+                """
+                IF EXISTS (SELECT 1 FROM sys.extended_properties WHERE class = 1 AND major_id = OBJECT_ID(N'demo.usp_reset') AND minor_id = 0 AND name = N'dbhubdemo.role')
+                    EXEC sys.sp_dropextendedproperty @name = N'dbhubdemo.role', @level0type = 'SCHEMA', @level0name = N'demo', @level1type = 'PROCEDURE', @level1name = N'usp_reset';
+                """;
+            await unmark.ExecuteNonQueryAsync(token);
+        }
+
+        for (var setup = 0; setup < 2; setup++)
+        {
+            foreach (var script in SqlScripts.DemoObjects)
+            {
+                await SqlScripts.ApplyAsync(connection, script, RunnerLog.Null, token);
+            }
+        }
+
+        var marked = new List<string>();
+        await using (var read = connection.CreateCommand())
+        {
+            // RCA-SQL-10's and 14's harness: an object's own property (class 1, minor_id 0), by its name and its value.
+            read.CommandText =
+                """
+                SELECT OBJECT_SCHEMA_NAME(ep.major_id) + N'.' + OBJECT_NAME(ep.major_id)
+                FROM sys.extended_properties AS ep
+                WHERE ep.class = 1
+                  AND ep.minor_id = 0
+                  AND ep.name = N'dbhubdemo.role'
+                  AND CAST(ep.value AS nvarchar(100)) = N'harness';
+                """;
+            await using var reader = await read.ExecuteReaderAsync(token);
+            while (await reader.ReadAsync(token))
+            {
+                marked.Add(reader.GetString(0));
+            }
+        }
+
+        Assert.Equal(created, marked.Order(StringComparer.Ordinal));
+
+        // Nothing else: the property is on those modules only, at no other level and with no other value.
+        await using var any = connection.CreateCommand();
+        any.CommandText = "SELECT COUNT(*) FROM sys.extended_properties WHERE name = N'dbhubdemo.role';";
+        Assert.Equal(created.Count, Convert.ToInt32(await any.ExecuteScalarAsync(token), System.Globalization.CultureInfo.InvariantCulture));
     }
 
     /// <summary>Creates or reuses the instance's ContosoCare database, set up and seeded; skips the test without an instance. The RCA tests share it.</summary>

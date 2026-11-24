@@ -499,3 +499,38 @@ BEGIN
     DELETE FROM demo.scenario_runs AS r WHERE r.status <> 'Running' AND r.started_at < clock_timestamp() - interval '90 days';
 END;
 $$;
+-- @batch
+
+-- The harness's marks (ADR 0031, the sidecar's leave-out): every routine this script creates carries the comment
+-- dbhubdemo:harness, which the Incident RCA's Query Store reads leave out: RCA-PG-16 lists the marked routines and the
+-- tables only they write, and RCA-PG-14 leaves out their calls and the statements that touch only those tables. No other
+-- script sets it. The list sits here, beside the routines, and tests/unit/Database.HarnessMarks.Tests.ps1 checks it
+-- against them. Every deployment runs it again; CREATE OR REPLACE keeps a routine's comment anyway.
+DO $$
+DECLARE
+    routine regprocedure;
+BEGIN
+    FOR routine IN
+        SELECT p.oid::regprocedure
+        FROM pg_catalog.pg_proc AS p
+        JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'demo'
+          AND p.proname = ANY (ARRAY[
+              'fn_scenario_catalog',
+              'fn_run_stop_requested',
+              'fn_run_should_stop',
+              'usp_run_assert_running',
+              'fn_demo_sessions',
+              'usp_recover_stale_runs',
+              'usp_run_begin',
+              'usp_run_event',
+              'usp_run_end',
+              'usp_stop',
+              'usp_kill_demo_sessions',
+              'usp_cleanup_scenario',
+              'usp_restore_seed'])
+    LOOP
+        EXECUTE format('COMMENT ON ROUTINE %s IS %L', routine, 'dbhubdemo:harness');
+    END LOOP;
+END
+$$;
