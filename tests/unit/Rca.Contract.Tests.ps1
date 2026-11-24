@@ -719,4 +719,23 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
         }
         @($unmarked) | Should -BeNullOrEmpty
     }
+
+    It 'leaves out on T1 to T3 the observer''s statements from before its marker by their text, as T4''s catalog rule does there' {
+        # The first read after an update looks back 2 hours, into windows where the release's runner sent its catalog
+        # unmarked; T1's Query Store kept RCA-XE-00's join form there, at about 30 s of CPU a run (fc, 2026-11-23).
+        $readme = [System.IO.File]::ReadAllText((Join-Path -Path $rcaRoot -ChildPath 'README.md'))
+        $rule = [regex]::Match($readme, '(?m)^   - \*\*The observer before 2026-11-23, on T1 to T3:\*\*.*$').Value
+        $rule | Should -Not -BeNullOrEmpty -Because 'item 1 says how T1 to T3 leave out the observer''s unmarked statements'
+        $sent = [regex]::Match($rule, 'SQL Server blocks that runner sends \(([^)]*)\)').Groups[1].Value
+        $sent | Should -Be 'RCA-SQL-01, 02, 09, and 12, RCA-AZ-01, and RCA-XE-00 to 05'
+        foreach ($id in 'RCA-SQL-01', 'RCA-SQL-02', 'RCA-SQL-09', 'RCA-SQL-12', 'RCA-AZ-01', 'RCA-XE-00', 'RCA-XE-01', 'RCA-XE-02', 'RCA-XE-03', 'RCA-XE-04', 'RCA-XE-05') {
+            $id | Should -BeIn $blocks -Because 'the rule matches the earlier forms of blocks today''s catalog still has'
+        }
+        $rule | Should -Match ([regex]::Escape('edd01c86''s join to `sys.dm_xe_objects`'))
+        $rule | Should -Match ([regex]::Escape('f16b9cb9''s form'))
+        $rule | Should -Match 'Item 3 matches them too, by their normalized text, which drops comments'
+        $readme | Should -Match ([regex]::Escape('the observer''s own SQL Server statements as it sent them before its marker'))
+        $adr = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'docs/adr/0031-incident-rca.md'))
+        $adr | Should -Match ([regex]::Escape('on SQL Server, a marker in each catalog statement''s text, and, for the first update''s look-back, the earlier runner''s statements without it'))
+    }
 }
