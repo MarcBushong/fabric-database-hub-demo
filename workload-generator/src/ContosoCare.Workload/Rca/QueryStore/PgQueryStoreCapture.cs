@@ -658,16 +658,30 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
         DateTimeOffset? restart = started is { } start && range.ServerStartedUtc is { } before && start > before ? start : null;
         var settledAt = (restart is { } after && after > to ? after : to) + schedule.Interval + PublishedAfter;
         var done = read.Failure is null && read.Complete && (started is not null || range.ServerStartedUtc is null) && now >= settledAt;
-        var shown = read.Through is { } reached && reached > reader.From ? reached : reader.From;
+
+        // What Query Store shows: of the old lifetime, to the newest interval that began before T4's start; of the range, to
+        // the newest interval of all. T4's windows run from its start (the live check L0c): the new lifetime's first window
+        // begins at the start, so what it shows never covers the old lifetime's last minutes.
+        var shown = Newest(read.Statistics, reader.From, null);
+        var lostFrom = restart is { } begun ? Newest(read.Statistics, reader.From, begun) : shown;
         var lostUntil = restart is { } stop && stop < to ? stop : to;
-        if (done && restart is not null && shown < lostUntil)
+        var unshownBefore = restart is not null && lostFrom < lostUntil;
+        if (done && unshownBefore)
         {
-            coverage.Gaps.Add(Lost(shown, lostUntil));
+            coverage.Gaps.Add(Lost(lostFrom, lostUntil));
         }
-        else if (!done && shown < to)
+        else if (!done)
         {
-            coverage.Pending = (shown, to);
-            coverage.Gaps.Add(PgQueryStoreRows.PendingGap(Target, shown, to));
+            // What it doesn't show yet of either part: before the start, from the old lifetime's newest interval; from the
+            // start on (all of a range without one), from the newest interval it shows, or the start.
+            var since = restart is { } restartedAt && restartedAt < to && shown < restartedAt ? restartedAt : shown;
+            var from = unshownBefore ? lostFrom : since;
+            var until = since < to ? to : lostUntil;
+            if (from < until)
+            {
+                coverage.Pending = (from, until);
+                coverage.Gaps.Add(PgQueryStoreRows.PendingGap(Target, from, until));
+            }
         }
 
         sink.Write(PgQueryStoreRows.Coverage(Target, coverage));
@@ -678,6 +692,25 @@ internal sealed class PgQueryStoreCapture(ISidecarAccess access, PgQueryStoreSou
 
         return true;
     }
+
+    /// <summary>
+    /// The newest end of the intervals in <paramref name="statistics"/> that began before <paramref name="before"/> (of all
+    /// of them when it's null), or <paramref name="floor"/> when none ends after it.
+    /// </summary>
+    private static DateTimeOffset Newest(IReadOnlyList<CaptureValues> statistics, DateTimeOffset floor, DateTimeOffset? before)
+    {
+        var newest = floor;
+        foreach (var row in statistics)
+        {
+            if (row.Time("interval_start_utc") is { } start && row.Time("interval_end_utc") is { } end && (before is null || start < before) && end > newest)
+            {
+                newest = end;
+            }
+        }
+
+        return newest;
+    }
+
     /// <summary>
     /// Writes a read's statistics and waits to <paramref name="sink"/>: a row it wrote before for the same interval only
     /// when it changed, since a later read of an interval holds the same counts or more. The coverage takes every row read.
