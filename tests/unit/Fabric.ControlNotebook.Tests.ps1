@@ -218,6 +218,15 @@ def acknowledge(payload, documents):
     return name
 
 
+def acks_sent_later(result, by):
+    """Option 2 (2026-11-23): the session's next warm export, a re-check's or else the stop's, sends what its start left
+    (T2's host answers by then), and writes rcaAcks again, only moving IDs from left to sent."""
+    sent = list(result["sent"]) + [item for item in result["left"] if item not in result["sent"]]
+    return {"kind": "ContosoCare.RcaAckResult", "version": 1, "sent": sent, "left": [], "status": "Pass",
+            "message": "%d sidecar acknowledgement(s) sent: %d before the start's sidecar fetch, %d at %s." % (
+                len(sent), len(result["sent"]), len(sent) - len(result["sent"]), by)}
+
+
 def rca_bundle_index(session, bundles):
     """The rca member the runbook writes (rca/transport.schema.json, bundleIndex), for the bundles given."""
     for version in bundles:
@@ -388,8 +397,17 @@ def runbook(body):
             VAULT["dbhub-session-status"] = json.dumps(starting)
     elif action == "stop":
         session = body.get("sessionId") or ""
+        replaced = json.loads(VAULT["dbhub-session-status"])
         VAULT["dbhub-session-status"] = json.dumps({"sessionId": session, "phase": "stopped", "stoppedBy": "Stop now", "failed": [],
                                                     "done": ["T4's read replica deleted", "T4 stopped", "sqlvm01 deallocated"], "metrics": {"status": "Pass", "message": "Azure Monitor metrics for the history."}})
+        if session and replaced.get("sessionId") == session and replaced.get("rcaAcks"):
+            # The stop keeps the start's acknowledgement result from the status it replaces (Write-DbHubStopStatus), as its
+            # session's re-checks left it; with "qsacksstop" it sends what's still left first (T2's host is warm by then).
+            stopped = json.loads(VAULT["dbhub-session-status"])
+            stopped["rcaAcks"] = replaced["rcaAcks"]
+            if scenario == "qsacksstop":
+                stopped["rcaAcks"] = acks_sent_later(replaced["rcaAcks"], "the stop")
+            VAULT["dbhub-session-status"] = json.dumps(stopped)
         if session and scenario in RCA_SCENARIOS:
             # A runbook with the Incident RCA (ADR 0031): the stop's export, and each target's capture line, for the notebook.
             stopped = json.loads(VAULT["dbhub-session-status"])
@@ -482,7 +500,7 @@ if scenario in ("leftoverqs", "stoppedqs", "earlierqs"):
 # missing.
 QS_IDS = ["20261113T140000Z-sqlvm01-0001-sidecar", "20261113T141500Z-sqlvm01-0002-sidecar", "20261113T143000Z-sqlvm01-0003-sidecar",
           "20261113T144500Z-arcsql01-0001-sidecar", "20261113T150000Z-sqlvm01-0004-sidecar"]
-if scenario in ("qsacks", "qsacksearly", "qsacksrmfail"):
+if scenario in ("qsacks", "qsacksearly", "qsacksrmfail", "qsacksrecheck", "qsacksstop", "qsacksstepped"):
     acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a1b2c3d.json", [(QS_IDS[0], "written"), (QS_IDS[1], "already"), (QS_IDS[2], "skipped")])
     acknowledge("Files/rca/inbox/sidecar-20261113T155000Z-runall-6c7d8e9f.json", [(QS_IDS[2], "skipped")])
     acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-4e5f6a7b.json", [(QS_IDS[1], "already"), (QS_IDS[3], "written")])
@@ -501,6 +519,21 @@ if scenario == "qsackswhole":
     acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a0a0a0a.json", [(item, "written") for item in WHOLE_IDS[:40]])
     acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-0b0b0b0b.json", [(item, "written") for item in WHOLE_IDS[40:70]])
     acknowledge("Files/rca/inbox/sidecar-20261113T170000Z-runall-0c0c0c0c.json", [(WHOLE_IDS[70], "written")])
+# A session that stopped with its acknowledgement result final, its T2 ID sent after its start (option 2), outside the
+# follow of a Run all: Stop now 5 minutes later ("stoppedqsacks"), and the next day's Run all ("qsacksprecheck"). Two of
+# Run all's acknowledgements are done by its result, and one, a later save's, rides on the next start.
+if scenario in ("stoppedqsacks", "qsacksprecheck"):
+    session = ("b" if scenario == "stoppedqsacks" else "e") * 32
+    ended = Clock.now - (real_dt.timedelta(minutes=5) if scenario == "stoppedqsacks" else real_dt.timedelta(days=1))
+    earlier_status = stopped_status(session, ended, running_status(session, ended - real_dt.timedelta(minutes=90), 90))
+    earlier_status["rcaAcks"] = acks_sent_later({"sent": [QS_IDS[0], QS_IDS[1]], "left": [QS_IDS[3]]}, "the stop")
+    VAULT["dbhub-session-status"] = json.dumps(earlier_status)
+    if scenario == "stoppedqsacks":
+        VAULT["dbhub-session-metrics"] = json.dumps({"version": 1, "sessionId": session, "capturedUtc": iso(ended), "startUtc": iso(ended - real_dt.timedelta(minutes=100)),
+                                                     "endUtc": iso(ended), "windowMinutes": 100, "intervalMinutes": 1, "servers": [], "series": [{"metric": "cpu_percent"}]}, separators=(",", ":"))
+    acknowledge("Files/rca/inbox/sidecar-20261113T150000Z-runall-0a1b2c3d.json", [(QS_IDS[0], "written"), (QS_IDS[1], "already"), (QS_IDS[2], "skipped")])
+    acknowledge("Files/rca/inbox/sidecar-20261113T160000Z-runall-4e5f6a7b.json", [(QS_IDS[1], "already"), (QS_IDS[3], "written")])
+    acknowledge("Files/rca/inbox/sidecar-20261113T190000Z-runall-5d6e7f80.json", [(QS_IDS[4], "written")])
 
 
 # The status a session's start writes when it exported an earlier session's evidence (its rcaEarlier; ADR 0031).
@@ -530,7 +563,7 @@ def vault_read(name):
                 status["rcaAcks"] = {"kind": "ContosoCare.RcaAckResult", "version": 1, "sent": sent, "left": left, "status": "Warning" if left else "Pass",
                                      "message": "%d sidecars acknowledged on sqlvm01, before the start's exports%s" % (
                                          len(sent), ("; %d left: arcsql01 didn't answer." % len(left)) if left else ".")}
-                if scenario == "qsacksearly":
+                if scenario in ("qsacksearly", "qsacksstepped"):
                     # T2c-1's real result comes with its RCA.SIDECAR.ACK step, which the status's steps print.
                     status["rcaAcks"]["message"] = ("%d of %d sidecar acknowledgement(s) sent before the start's exports (%d on sqlvm01); the rest "
                                                     "weren't: arcsql01 didn't answer." % (len(sent), len(documents), len(sent)))
@@ -542,6 +575,12 @@ def vault_read(name):
             # DbHub-Monitor's re-check (2026-11-16): the same status, with the host that stopped, and the new runCommands field.
             current["steps"].append(dict(HOST_WARNING, atUtc=iso(Clock.now)))
             current["runCommands"] = [{"vm": "archost01", "name": "DbHubControl-archost01-x", "targets": ["T2"]}]
+            VAULT[name] = json.dumps(current)
+        elif scenario in ("qsacksrecheck", "qsacksstepped") and current.get("phase") == "running" and Clock.now - RUNBOOK["accepted"] >= real_dt.timedelta(minutes=40) \
+                and (current.get("rcaAcks") or {}).get("left"):
+            # Option 2 (2026-11-23): the session's re-check sends what its start left, and writes rcaAcks again, with no step;
+            # in "qsacksstepped", the start's step stays in the status's steps.
+            current["rcaAcks"] = acks_sent_later(current["rcaAcks"], "a re-check")
             VAULT[name] = json.dumps(current)
     return VAULT[name]
 
@@ -709,7 +748,7 @@ with contextlib.redirect_stdout(buffer):
         exec(code[0], namespace)
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
-                          "stoppedlate": {"STOP_NOW": True}, "stoppedqs": {"STOP_NOW": True},
+                          "stoppedlate": {"STOP_NOW": True}, "stoppedqs": {"STOP_NOW": True}, "stoppedqsacks": {"STOP_NOW": True},
                           "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
@@ -1878,7 +1917,7 @@ print(json.dumps(out))
         $report.sent[1].PSObject.Properties.Name | Should -Not -Contain 'rcaAcks'
         # The start's status sent the first two and left T2's: the acknowledgement it sent all of goes, and so does one with
         # only a skipped sidecar, which has none to send; the rest stay.
-        $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Warning: 2 sidecars acknowledged on sqlvm01, before the start''s exports; 1 left: arcsql01 didn''t answer\.\s+Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept for the next start\.'
+        $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Warning: 2 sidecars acknowledged on sqlvm01, before the start''s exports; 1 left: arcsql01 didn''t answer\.\s+Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
         @([regex]::Matches($report.printed, '(?m)^RCA\.SIDECAR\.ACK ')).Count | Should -Be 1
         # The one more than 30 days old is gone too, unsent.
         @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
@@ -1886,6 +1925,71 @@ print(json.dumps(out))
             'Files/rca/acks/sidecar-20261113T170000Z-script-8c9d0e1f.ack.json'
             'Files/rca/acks/sidecar-20261113T180000Z-runall-2a3b4c5d.ack.json'
         )
+    }
+
+    It 'shows the session''s acknowledgement result again when a later export sends what its start left, and deletes what it completes: <Case> (option 2, 2026-11-23)' -ForEach @(
+        @{ Case = 'a re-check during the session, which the live view reads'; Scenario = 'qsacksrecheck'; By = 'a re-check'; Kept = 'until this session''s re-checks or its stop, or the next start, send the rest'; First = 'RCA\.SIDECAR\.ACK Warning: 2 sidecars acknowledged on sqlvm01, before the start''s exports; 1 left: arcsql01 didn''t answer\.' }
+        @{ Case = 'the stop, whose status is final'; Scenario = 'qsacksstop'; By = 'the stop'; Kept = 'for the next start'; First = 'RCA\.SIDECAR\.ACK Warning: 2 sidecars acknowledged on sqlvm01, before the start''s exports; 1 left: arcsql01 didn''t answer\.' }
+        @{ Case = 'a re-check after a start whose step said its result, which doesn''t stand for the later one'; Scenario = 'qsacksstepped'; By = 'a re-check'; Kept = 'until this session''s re-checks or its stop, or the next start, send the rest'; First = 'RCA\.SIDECAR\.ACK Warning 2 of 3 sidecar acknowledgement\(s\) sent before the start''s exports \(2 on sqlvm01\); the rest weren''t: arcsql01 didn''t answer\.' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # The start leaves T2's ID (its host didn't answer); the session's next warm export sends it, and writes rcaAcks again,
+        # only moving IDs from left to sent. The stopped status keeps the last result (Write-DbHubStopStatus).
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        @($report.sent[0].rcaAcks.documents) | Should -Be @('20261113T140000Z-sqlvm01-0001-sidecar', '20261113T141500Z-sqlvm01-0002-sidecar', '20261113T144500Z-arcsql01-0001-sidecar')
+        # The start's own result first, as before.
+        $report.printed | Should -Match $First
+        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
+        # Then the later export's, once: the acknowledgement it completes goes, and the stop's copy of it shows nothing new.
+        $later = 'RCA.SIDECAR.ACK Pass: 3 sidecar acknowledgement(s) sent: 2 before the start''s sidecar fetch, 1 at {0}.' -f $By
+        $report.printed | Should -Match ('{0}\s+Run all''s sidecar acknowledgements: 1 done and deleted, 0 kept {1}\.' -f [regex]::Escape($later), [regex]::Escape($Kept))
+        @([regex]::Matches($report.printed, 'RCA\.SIDECAR\.ACK')).Count | Should -Be 2
+        $stop = $report.printed.IndexOf('=== The session''s end: stopping session')
+        $stop | Should -BeGreaterThan 0
+        if ($Scenario -eq 'qsacksstop') {
+            $report.printed.IndexOf($later) | Should -BeGreaterThan $stop -Because 'finish_session reads the stopped status''s result'
+        }
+        else {
+            $report.printed.IndexOf($later) | Should -BeLessThan $stop -Because 'the live view reads the re-check''s result while the session runs'
+        }
+        @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
+            'Files/rca/acks/sidecar-20261113T170000Z-script-8c9d0e1f.ack.json'
+            'Files/rca/acks/sidecar-20261113T180000Z-runall-2a3b4c5d.ack.json'
+        )
+    }
+
+    It 'deletes, quietly, what a stopped session''s final acknowledgement result says was sent, outside that session''s follow: <Case> (option 2, 2026-11-23)' -ForEach @(
+        @{ Case = 'Stop now when the session stopped already'; Scenario = 'stoppedqsacks' }
+        @{ Case = 'the next Run all''s pre-check, before its start carries them again'; Scenario = 'qsacksprecheck' }
+    ) {
+        if (-not $script:python) {
+            Set-ItResult -Skipped -Because 'Python 3 is not installed'
+            return
+        }
+        # The stopped status's rcaAcks is final: its stop sent T2's ID, which its start left. Two of Run all's acknowledgements
+        # are done by it, and a later save's rides on the next start.
+        $report = Invoke-Simulation -Path (Get-FilledNotebook -Zone 'UTC') -Scenario $Scenario -Start '2026-11-14T14:00:00Z'
+        $report.error | Should -BeNullOrEmpty
+        $done = 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept for the next start.'
+        $report.printed | Should -Match ([regex]::Escape($done))
+        switch ($Scenario) {
+            'stoppedqsacks' {
+                $report.printed | Should -Not -Match 'RCA\.SIDECAR\.ACK' -Because 'Stop now doesn''t follow that session'
+                @($report.acks.PSObject.Properties.Name) | Should -Be @('Files/rca/acks/sidecar-20261113T190000Z-runall-5d6e7f80.ack.json')
+            }
+            'qsacksprecheck' {
+                # Before this start's request, which then carries only the later save's sidecar; only its result shows.
+                $report.printed.IndexOf($done) | Should -BeLessThan $report.printed.IndexOf(': asking the runbook to start it.')
+                @($report.sent[0].rcaAcks.documents) | Should -Be @('20261113T150000Z-sqlvm01-0004-sidecar')
+                @([regex]::Matches($report.printed, '(?m)^RCA\.SIDECAR\.ACK ')).Count | Should -Be 1
+                $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Pass: 1 sidecars acknowledged on sqlvm01, before the start''s exports\.'
+                @($report.acks.PSObject.Properties.Name) | Should -BeNullOrEmpty
+            }
+        }
     }
 
     It 'sends whole acknowledgements, the oldest first, at most 64 sidecars on a start, and the rest wait in order (2026-11-23)' {
@@ -1898,7 +2002,7 @@ print(json.dumps(out))
         $report.error | Should -BeNullOrEmpty
         $ids = @(0..39 | ForEach-Object { '20261113T10{0:d2}00Z-sqlvm01-{0:d4}-sidecar' -f $_ })
         @($report.sent[0].rcaAcks.documents) | Should -Be $ids
-        $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Pass: 40 sidecars acknowledged on sqlvm01, before the start''s exports\.\s+Run all''s sidecar acknowledgements: 1 done and deleted, 2 kept for the next start\.'
+        $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Pass: 40 sidecars acknowledged on sqlvm01, before the start''s exports\.\s+Run all''s sidecar acknowledgements: 1 done and deleted, 2 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
         # The one that lists more than 64 sidecars doesn't follow the contract: none of it rides, it holds nothing back,
         # and it stays for the activity notebook's sweep.
         @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
@@ -1917,7 +2021,7 @@ print(json.dumps(out))
         $report.error | Should -BeNullOrEmpty
         @($report.sent[0].rcaAcks.documents) | Should -Be @('20261113T140000Z-sqlvm01-0001-sidecar', '20261113T141500Z-sqlvm01-0002-sidecar', '20261113T144500Z-arcsql01-0001-sidecar')
         $report.printed | Should -Not -Match 'couldn''t be read|weren''t all settled'
-        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept for the next start\.'
+        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
         # It stays, unsent, for a later read or the activity notebook's sweep.
         @($report.acks.PSObject.Properties.Name) | Should -Contain 'Files/rca/acks/sidecar-20261001T120000Z-runall-1a2b3c4d.ack.json'
     }
@@ -1934,7 +2038,7 @@ print(json.dumps(out))
         # Once: the real result's step, which the status's steps print; the notebook adds only what it deleted.
         @([regex]::Matches($report.printed, 'RCA\.SIDECAR\.ACK')).Count | Should -Be 1
         $report.printed | Should -Match 'RCA\.SIDECAR\.ACK Warning 2 of 3 sidecar acknowledgement\(s\) sent before the start''s exports \(2 on sqlvm01\); the rest weren''t: arcsql01 didn''t answer\.'
-        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept for the next start\.'
+        $report.printed | Should -Match 'Run all''s sidecar acknowledgements: 2 done and deleted, 1 kept until this session''s re-checks or its stop, or the next start, send the rest\.'
         @($report.acks.PSObject.Properties.Name | Sort-Object) | Should -Be @(
             'Files/rca/acks/sidecar-20261113T160000Z-runall-4e5f6a7b.ack.json'
             'Files/rca/acks/sidecar-20261113T170000Z-script-8c9d0e1f.ack.json'
