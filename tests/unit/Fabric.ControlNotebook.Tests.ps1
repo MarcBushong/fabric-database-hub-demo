@@ -310,32 +310,47 @@ def cold_start_steps(status, accepted):
     return json.dumps(cold, sort_keys=True)
 
 
-# The cold starts (2026-11-24), and those whose T2 guest never sends telemetry (the review of 40ff59bb): checked again once
-# its first 15 minutes have passed ("coldstartfail"), also when the status can't be read then ("coldstartunread"); with a
-# live view that ends before then ("coldstartshort"), a session the app stops before then ("coldstartstopped"), a validator
-# that fails that time ("coldstartrecheckfail"), or an answer of a kind this notebook doesn't know ("coldstartforeign").
+# The cold starts (2026-11-24): T2's guest never sends telemetry (the review of 40ff59bb) in COLD_SCENARIOS but "coldstart",
+# where it reports at once, and the three in T2_FIRST_SAMPLE. Its checks again come at 14:30 and 14:40 for a session from
+# 14:00 (20 and 30 minutes after T2's dispatch at 14:10, the review of d6d69832): in "coldstartfail"; also when the status
+# can't be read at the first ("coldstartunread"); with a live view that ends too soon ("coldstartshort"), a session the
+# app stops first ("coldstartstopped"), a validator that fails each time ("coldstartrecheckfail"), or an answer of a kind
+# this notebook doesn't know ("coldstartforeign"); in a 30-minute session, once, at its end ("coldstart30"); with checks
+# again that hold the live view up almost 5 minutes each ("coldstartslow"); and both in a 33-minute session, whose first
+# check again, at 14:30, runs past its end at 14:33, when the one that decides is due ("coldstart33").
 COLD_SCENARIOS = ("coldstart", "coldstartfail", "coldstartunread", "coldstartshort", "coldstartstopped", "coldstartrecheckfail", "coldstartforeign",
-                  "coldstartrefused", "coldstartwording")
-T2_SILENT = ("coldstartfail", "coldstartunread", "coldstartshort", "coldstartstopped", "coldstartrecheckfail", "coldstartforeign", "coldstartrefused")
+                  "coldstartrefused", "coldstartwording", "coldstartgrace", "coldstartlate", "coldstart30", "coldstartslow", "coldstart33")
+# When T2's first sample shows, in minutes after the session's start, where it's late but healthy: before the first check
+# again ("coldstartgrace"), and after it, before the one that decides ("coldstartlate"; the review of d6d69832).
+T2_FIRST_SAMPLE = {"coldstartgrace": 25, "coldstartlate": 35}
+
+
+def t2_reports():
+    """Whether T2's guest has sent telemetry since the session's start, by now."""
+    if scenario not in COLD_SCENARIOS or scenario == "coldstart":
+        return True
+    first = T2_FIRST_SAMPLE.get(scenario)
+    return first is not None and Clock.now >= RUNBOOK["accepted"] + real_dt.timedelta(minutes=first)
 
 
 def validator_answer(arguments):
     """NB_DatabaseHub_Deployment's answer to Run all (notebookutils.notebook.exit, since 2026-11-24), as its per-target cell
-    decides it: a target that the session's start brought up less than 15 minutes ago, with no telemetry since, is a Warning
-    that Run all checks again once its 15 minutes have passed. T2's guest never reports in T2_SILENT; the others do."""
+    decides it: a target that the session's start brought up, with no telemetry since, is a Warning, not known yet, until
+    TELEMETRY_DECIDE_UTC, and a Fail from then (the review of d6d69832). T1 and T3 report; T2 as t2_reports says."""
     cold = json.loads(arguments.get("COLD_START_UTC") or "{}")
-    telemetry, recheck = {}, {}
+    decide = arguments.get("TELEMETRY_DECIDE_UTC") or ""
+    decide = real_dt.datetime.fromisoformat(decide.replace("Z", "+00:00")) if decide else None
+    telemetry, pending = {}, []
     for target in ("T1", "T2", "T3"):
-        start = real_dt.datetime.fromisoformat(cold[target].replace("Z", "+00:00")) if target in cold else None
-        if target != "T2" or scenario not in T2_SILENT:
+        if target != "T2" or t2_reports():
             telemetry[target] = {"status": "Pass", "message": "%s reports performance telemetry from 3 tables." % target}
-        elif start is not None and Clock.now - start < real_dt.timedelta(minutes=15):
+        elif target in cold and decide is not None and Clock.now < decide:
             telemetry[target] = {"status": "Warning", "message": "No telemetry from T2 arcsql01 since this session's cold start yet, so whether it reports can't be known yet."}
-            recheck[target] = iso(start + real_dt.timedelta(minutes=15))
+            pending.append(target)
         else:
             telemetry[target] = {"status": "Fail", "message": "No telemetry from T2 arcsql01 in the last 60 minutes."}
     return json.dumps({"kind": "DbHubDemo.Other" if scenario == "coldstartforeign" else "DbHubDemo.Readiness", "version": 1, "runId": "run-%d" % len(VALIDATORS),
-                       "telemetry": telemetry, "recheckUtc": recheck})
+                       "telemetry": telemetry, "pending": pending})
 
 
 def with_t5(status, dispatch, minutes=75):
@@ -601,8 +616,8 @@ def vault_read(name):
     if name == "dbhub-session-status":
         STATUSREADS[0] += 1
     if name == "dbhub-session-status" and scenario == "coldstartunread" and RUNBOOK["accepted"] \
-            and real_dt.timedelta(minutes=15, seconds=20) <= Clock.now - RUNBOOK["accepted"] < real_dt.timedelta(minutes=17):
-        # The control vault doesn't answer while T2's first 15 minutes end, so the status can't say the session ended.
+            and real_dt.timedelta(minutes=29, seconds=30) <= Clock.now - RUNBOOK["accepted"] < real_dt.timedelta(minutes=31, seconds=30):
+        # The control vault doesn't answer at T2's first check again, so the status can't say the session ended.
         raise RuntimeError("Key Vault didn't answer.")
     if name == "dbhub-session-status" and RUNBOOK["session"]:
         current = json.loads(VAULT[name])
@@ -657,8 +672,10 @@ class Credentials:
 
 class Notebook:
     """notebookutils.notebook: a reference run takes 4 minutes, in "refail" it fails as Fabric's lakehouse check would.
-    The validator (NB_DatabaseHub_Deployment) takes 70 seconds and answers (validator_answer): in "valfail" it fails, in
-    "valslow" it passes its timeout, and in "coldstartrecheckfail" it fails when it's run again."""
+    The validator (NB_DatabaseHub_Deployment) takes 70 seconds and answers (validator_answer) as of its start, since it
+    decides in its per-target cell, before its summary and its save: in "valfail" it fails, in "valslow" it passes its
+    timeout, in "coldstartrecheckfail" it fails when it's run again, and in "coldstartslow" and "coldstart33" it takes 290
+    seconds when it's run again."""
     def run(self, path, timeout_seconds=90, arguments=None, workspace=""):
         arguments = dict(arguments or {})
         if path == "NB_DatabaseHub_Deployment":
@@ -669,8 +686,10 @@ class Notebook:
             if scenario == "valslow":
                 _sleep(timeout_seconds)
                 raise RuntimeError("The notebook run didn't finish in %d seconds." % timeout_seconds)
-            _sleep(70)
-            return validator_answer(arguments) if "COLD_START_UTC" in arguments else ""
+            answer = validator_answer(arguments) if "COLD_START_UTC" in arguments else ""
+            _sleep(290 if scenario in ("coldstartslow", "coldstart33") and len(VALIDATORS) > 1 else 70)
+            VALIDATORS[-1]["ended"] = iso(Clock.now)
+            return answer
         REFS.append({"path": path, "timeout": timeout_seconds, "workspace": workspace, "args": arguments})
         ORDER.append("history:" + str(arguments.get("SESSION_ID", ""))[:8])
         if scenario in ("refail", "sessionqsjob") or scenario in RCA_JOB_SCENARIOS:
@@ -804,7 +823,19 @@ sys.modules["pandas"] = types.ModuleType("pandas")
 namespace = {"notebookutils": types.SimpleNamespace(credentials=Credentials(), notebook=Notebook(), session=types.SimpleNamespace(stop=stop_session), fs=FileSystem(),
                                                    runtime=types.SimpleNamespace(context={"currentWorkspaceId": "dddddddd-0000-0000-0000-000000000004", "defaultLakehouseId": LAKEHOUSE,
                                                                                           "isForInteractive": scenario != "queuedjob"}))}
-buffer = io.StringIO()
+class Printed(io.StringIO):
+    """What the notebook prints, with the simulated time of each line about a beat or readiness (the review of d6d69832)."""
+    def __init__(self):
+        super().__init__()
+        self.timed = []
+
+    def write(self, text):
+        if text.startswith(("Now:", "Readiness", "Warning: the telemetry", "Warning: no ", "  HUB.TELEMETRY", "  Not known yet")):
+            self.timed.append([iso(Clock.now), text])
+        return super().write(text)
+
+
+buffer = Printed()
 error = ""
 with contextlib.redirect_stdout(buffer):
     try:
@@ -812,7 +843,8 @@ with contextlib.redirect_stdout(buffer):
         namespace.update({"stopnow": {"STOP_NOW": True}, "stoppedend": {"STOP_NOW": True}, "stoppedold": {"STOP_NOW": True}, "endedrunning": {"STOP_NOW": True},
                           "stoppedplan": {"STOP_NOW": True}, "stoppedplannometrics": {"STOP_NOW": True}, "stoppedstart": {"STOP_NOW": True}, "stoppedlost": {"STOP_NOW": True},
                           "stoppedlate": {"STOP_NOW": True}, "stoppedqs": {"STOP_NOW": True}, "stoppedqsacks": {"STOP_NOW": True},
-                          "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}, "coldstartshort": {"WAIT_FOR_END": False, "WATCH_MINUTES": 5}}.get(scenario, {}))
+                          "check": {"MODE": "check"}, "nowait": {"WAIT_FOR_END": False}, "coldstartshort": {"WAIT_FOR_END": False, "WATCH_MINUTES": 5},
+                          "coldstart30": {"DURATION_MINUTES": 30}, "coldstart33": {"DURATION_MINUTES": 33}}.get(scenario, {}))
         for index, source in enumerate(code[1:], start=1):
             exec(source, namespace)
             if index == 2:
@@ -821,7 +853,7 @@ with contextlib.redirect_stdout(buffer):
         error = "%s: %s" % (type(failure).__name__, failure)
 printed = buffer.getvalue()
 print(json.dumps({"sent": SENT, "jobs": JOBS, "refs": REFS, "validators": VALIDATORS, "order": ORDER, "refused": REFUSED[0], "jobReads": JOBREADS[0], "stops": STOPS[0], "statusReads": STATUSREADS[0], "vaultMetrics": VAULT["dbhub-session-metrics"], "printed": printed, "error": error, "leaked": SECRET_URL.split("token=")[1] in printed,
-                  "staged": STAGED, "files": sorted(FILES), "vaultReads": VAULTREADS, "sidecars": SIDECARS, "defReads": DEFREADS, "puts": PUTS, "coldStart": COLD_START[0],
+                  "staged": STAGED, "files": sorted(FILES), "vaultReads": VAULTREADS, "sidecars": SIDECARS, "defReads": DEFREADS, "puts": PUTS, "coldStart": COLD_START[0], "timed": buffer.timed,
                   "acks": {name[len(BASE):]: json.loads(text) for name, text in FILES.items() if name.startswith(BASE + "Files/rca/acks/")}}))
 '@
 
@@ -1410,7 +1442,7 @@ print(json.dumps(out))
         $run.workspace | Should -Be 'bbbbbbbb-0000-0000-0000-000000000002'
         $run.timeout | Should -Be 300
         # Read-only: its results saved, its cleanup off, and this environment's names rather than the validator's defaults.
-        @($run.args.PSObject.Properties.Name | Sort-Object) | Should -Be @('COLD_START_UTC', 'CONFIRM', 'LAKEHOUSE_ID', 'PURGE_DEMO_TABLES', 'RESOURCE_GROUP', 'SAVE_RESULTS', 'T1_VM_NAME', 'T2_MACHINE_NAME', 'T3_SERVER_PREFIX', 'TELEMETRY_WAIT_UNTIL_UTC', 'WARM_START_TARGETS', 'WORKSPACE_ID')
+        @($run.args.PSObject.Properties.Name | Sort-Object) | Should -Be @('COLD_START_UTC', 'CONFIRM', 'LAKEHOUSE_ID', 'PURGE_DEMO_TABLES', 'RESOURCE_GROUP', 'SAVE_RESULTS', 'T1_VM_NAME', 'T2_MACHINE_NAME', 'T3_SERVER_PREFIX', 'TELEMETRY_DECIDE_UTC', 'TELEMETRY_RECHECK_UTC', 'TELEMETRY_WAIT_UNTIL_UTC', 'WARM_START_TARGETS', 'WORKSPACE_ID')
         $run.args.SAVE_RESULTS | Should -BeTrue
         $run.args.CONFIRM | Should -BeFalse
         $run.args.PURGE_DEMO_TABLES | Should -BeFalse
@@ -1423,6 +1455,8 @@ print(json.dumps(out))
         $run.args.COLD_START_UTC | Should -BeExactly '{}'
         $run.args.WARM_START_TARGETS | Should -BeExactly 'T1,T2,T3'
         $run.args.TELEMETRY_WAIT_UNTIL_UTC | Should -BeExactly ''
+        $run.args.TELEMETRY_RECHECK_UTC | Should -BeExactly ''
+        $run.args.TELEMETRY_DECIDE_UTC | Should -BeExactly ''
         $line = 'Readiness: NB_DatabaseHub_Deployment ran its read-only checks in 1 minute; the Insights app''s Readiness page shows each one, worst first, after its next refresh.'
         $report.printed | Should -Match ([regex]::Escape($line))
         $report.printed.IndexOf('Pass: the session runs until') | Should -BeLessThan $report.printed.IndexOf($line)
@@ -1464,18 +1498,18 @@ print(json.dumps(out))
         BeforeAll {
             # Live, 2026-11-24 on dbhubfb: a cold start's readiness ran 6.5 minutes after the session started the VMs, before
             # T2's nested guest sent its first sample, and printed Fail HUB.TELEMETRY.T2. Here the runbook's start brings
-            # sqlvm01 and T2's host up (its Start steps) and starts T4, which isn't a VM; T3 resumes at its activity's dispatch.
-            # The review of 40ff59bb: T2's guest never reports ("coldstartfail"), also with a status that can't be read when its
-            # 15 minutes end ("coldstartunread"), with a live view that ends first ("coldstartshort"), a session the app stops
-            # first ("coldstartstopped"), a validator that fails when it's run again ("coldstartrecheckfail"), or one that
-            # answers in a kind this notebook doesn't know ("coldstartforeign"); Azure refuses the T2 host's start and T3's
-            # activity isn't sent ("coldstartrefused"); and Start steps in words this notebook doesn't know ("coldstartwording").
+            # sqlvm01 and T2's host up (its Start steps) and starts T4, which isn't a VM; T1's and T3's activity goes out at
+            # 14:04, and T2's at 14:10, once its host runs. The simulator's COLD_SCENARIOS say what each scenario adds: T2's
+            # guest never reports, or reports late, and what can keep Run all from checking it again (the reviews of 40ff59bb
+            # and d6d69832).
+            $script:hiso = { param($Value) if ($Value -is [datetime]) { ([DateTimeOffset]$Value).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') } else { [string]$Value } }
             $script:coldRuns, $script:coldChecks, $script:coldSkip = @{}, $null, 'Python 3 is not installed'
             if (-not $script:python) {
                 return
             }
             $hfilled = Get-FilledNotebook -Zone 'UTC'
-            foreach ($hscenario in 'coldstart', 'coldstartfail', 'coldstartunread', 'coldstartshort', 'coldstartstopped', 'coldstartrecheckfail', 'coldstartforeign', 'coldstartrefused', 'coldstartwording') {
+            foreach ($hscenario in 'coldstart', 'coldstartfail', 'coldstartunread', 'coldstartshort', 'coldstartstopped', 'coldstartrecheckfail', 'coldstartforeign',
+                'coldstartrefused', 'coldstartwording', 'coldstartgrace', 'coldstartlate', 'coldstart30', 'coldstartslow', 'coldstart33') {
                 $script:coldRuns[$hscenario] = Invoke-Simulation -Path $hfilled -Scenario $hscenario -Start '2026-11-14T14:00:00Z'
             }
             $script:coldSkip = 'pandas is not installed for that Python (set DBHUB_TEST_PYTHON to a Python 3 with pandas)'
@@ -1487,13 +1521,16 @@ print(json.dumps(out))
             # NB_DatabaseHub_Deployment's own parameters, helpers, per-target, and summary cells, with a clock, a telemetry
             # endpoint whose rows each target's model gives for the time of the query (Kusto v1, through the notebook's
             # kusto_frame), and notebookutils for its answer to Run all. Unless a case says otherwise, the session started T1 at
-            # 10:00:00, T2's host at 10:00:10, and T3 at 10:04:00, and the checks start at 10:06:30. The control cases take what
-            # Run all passed in the simulations above.
+            # 10:00:00, T2's host at 10:00:10, and T3 at 10:04:00, the checks start at 10:06:30, and Run all checks again at
+            # 10:24:10 and 10:34:10, the last deciding. The control cases take what Run all passed in the simulations above.
             $hcontrol = Join-Path -Path $TestDrive -ChildPath 'cold-start.json'
             $hpassed = [ordered]@{}
-            foreach ($hscenario in 'coldstart', 'coldstartrefused', 'coldstartwording') {
-                $hargs = $script:coldRuns[$hscenario].validators[0].args
-                $hpassed[$hscenario] = [ordered]@{ COLD_START_UTC = [string]$hargs.COLD_START_UTC; WARM_START_TARGETS = [string]$hargs.WARM_START_TARGETS }
+            foreach ($hscenario in 'coldstartfail', 'coldstartrefused', 'coldstartwording') {
+                $hrun = $script:coldRuns[$hscenario].validators[0]
+                $hpassed[$hscenario] = [ordered]@{ at = & $script:hiso $hrun.at }
+                foreach ($hname in 'COLD_START_UTC', 'WARM_START_TARGETS', 'TELEMETRY_RECHECK_UTC', 'TELEMETRY_DECIDE_UTC') {
+                    $hpassed[$hscenario][$hname] = & $script:hiso $hrun.args.$hname
+                }
             }
             [System.IO.File]::WriteAllText($hcontrol, (ConvertTo-Json -InputObject $hpassed -Depth 4), [System.Text.UTF8Encoding]::new($false))
             $harness = Join-Path -Path $TestDrive -ChildPath 'cold_start_validator.py'
@@ -1509,6 +1546,7 @@ SUMMARY = next(cell for cell in cells if cell.startswith("# Validation summary")
 FROM_CONTROL = json.load(open(sys.argv[2], encoding="utf-8"))
 NAMES = {"T1": ("virtualMachines", "sqlvm01"), "T2": ("machines", "arcsql01"), "T3": ("servers/databases", "azuresql01-abc123/ContosoCare")}
 CPU, CONNECTIONS = "SqlServerCPUUtilization", "SqlServerConnections"
+RECHECK, DECIDE = "2026-11-24T10:24:10Z,2026-11-24T10:34:10Z", "2026-11-24T10:34:10Z"
 
 
 def at(text):
@@ -1539,11 +1577,12 @@ def connections(now):
     return [(CONNECTIONS, now - real_dt.timedelta(seconds=60))]
 
 
-def run(cold, wait_seconds, samples, now="2026-11-24T10:06:30Z", fail_after=None, warm="", reference=True):
+def run(cold, wait_seconds, samples, now="2026-11-24T10:06:30Z", fail_after=None, warm="", reference=True, recheck=RECHECK, decide=DECIDE):
     clock, slept, queries, timeouts, exits = [at(now)], [0.0], [], [], []
     ns = {}
     exec(PARAMS, ns)
     ns.update(COLD_START_UTC=cold, WARM_START_TARGETS=warm, SAVE_RESULTS=False, T3_SERVER_PREFIX="azuresql01-",
+              TELEMETRY_RECHECK_UTC=recheck, TELEMETRY_DECIDE_UTC=decide,
               TELEMETRY_WAIT_UNTIL_UTC="" if wait_seconds is None else iso(clock[0] + real_dt.timedelta(seconds=wait_seconds)))
     buffer = io.StringIO()
     with contextlib.redirect_stdout(buffer):
@@ -1577,13 +1616,14 @@ def run(cold, wait_seconds, samples, now="2026-11-24T10:06:30Z", fail_after=None
 
 
 def control(name, silent):
-    """What Run all passed in a simulation, run 2 minutes after the latest start it names (14:06 without one), with the
-    silent targets sending nothing and the others reporting."""
+    """What Run all passed in a simulation, run 2 minutes after the latest start it names (when it ran there, without one),
+    with the silent targets sending nothing and the others reporting."""
     passed = FROM_CONTROL[name]
     starts = [at(value) for value in json.loads(passed["COLD_START_UTC"]).values()]
-    when = max(starts) + real_dt.timedelta(minutes=2) if starts else at("2026-11-14T14:06:00Z")
+    when = iso(max(starts) + real_dt.timedelta(minutes=2)) if starts else passed["at"]
     samples = {target: never if target in silent else steady for target in ("T1", "T2", "T3")}
-    return run(passed["COLD_START_UTC"], None, samples, now=iso(when), warm=passed["WARM_START_TARGETS"])
+    return run(passed["COLD_START_UTC"], None, samples, now=when, warm=passed["WARM_START_TARGETS"],
+               recheck=passed["TELEMETRY_RECHECK_UTC"], decide=passed["TELEMETRY_DECIDE_UTC"])
 
 
 def post_timeouts():
@@ -1614,18 +1654,24 @@ T1T2 = json.dumps({"T1": "2026-11-24T10:00:00Z", "T2": "2026-11-24T10:00:10Z"})
 print(json.dumps({
     "arrives": run(COLD, 120, {"T1": steady, "T2": arrives("2026-11-24T10:07:30Z"), "T3": steady}),
     "late": run(COLD, 120, {"T1": steady, "T2": never, "T3": steady}),
-    "recheck": run(COLD, None, {"T1": steady, "T2": never, "T3": steady}, now="2026-11-24T10:15:40Z"),
+    "look": run(COLD, None, {"T1": steady, "T2": never, "T3": steady}, now="2026-11-24T10:24:10Z", recheck="2026-11-24T10:34:10Z"),
+    "settle": run(COLD, None, {"T1": steady, "T2": never, "T3": steady}, now="2026-11-24T10:34:10Z", recheck=""),
+    "latepass": run(COLD, None, {"T1": steady, "T2": arrives("2026-11-24T10:30:00Z"), "T3": steady}, now="2026-11-24T10:34:10Z", recheck=""),
+    "two": run(COLD, None, {"T1": never, "T2": never, "T3": steady}),
+    "unreachable": run(COLD, None, {"T1": steady, "T2": never, "T3": steady}, recheck="", decide="2026-11-24T10:40:10Z"),
     "notreference": run(COLD, None, {"T1": steady, "T2": never, "T3": steady}, reference=False),
     "t1stale": run(T1T2, None, {"T1": only("2026-11-24T09:20:00Z"), "T2": steady, "T3": steady}),
     "t1edition": run(T1T2, None, {"T1": connections, "T2": steady, "T3": steady}),
     "flaky": run(COLD, 120, {"T1": steady, "T2": never, "T3": steady}, fail_after=1),
-    "warm": run("{}", None, {"T1": steady, "T2": never, "T3": never}, warm="T1,T2,T3"),
+    "warm": run("{}", None, {"T1": steady, "T2": never, "T3": never}, warm="T1,T2,T3", recheck="", decide=""),
     "refused": run(json.dumps({"T1": "2026-11-24T10:00:00Z"}), None, {"T1": steady, "T2": never, "T3": never}),
-    "badwarm": run("{}", None, {"T1": steady, "T2": never, "T3": steady}, warm="T2,T9"),
-    "expired": run(json.dumps({"T2": "2026-11-24T09:45:00Z"}), 120, {"T1": steady, "T2": never, "T3": steady}),
-    "manual": run("", None, {"T1": steady, "T2": never, "T3": steady}, warm="T1,T2,T3"),
+    "badwarm": run("{}", None, {"T1": steady, "T2": never, "T3": steady}, warm="T2,T9", recheck="", decide=""),
+    "expired": run(json.dumps({"T2": "2026-11-24T09:45:00Z"}), 120, {"T1": steady, "T2": never, "T3": steady}, recheck="", decide="2026-11-24T10:05:00Z"),
+    "manual": run("", None, {"T1": steady, "T2": never, "T3": steady}, warm="T1,T2,T3", recheck="", decide=""),
     "garbage": run("T2 at ten", 120, {"T1": steady, "T2": never, "T3": steady}, warm="T2"),
-    "control": control("coldstart", ("T2",)),
+    "baddecide": run(COLD, 120, {"T1": steady, "T2": never, "T3": steady}, decide="soon"),
+    "badrecheck": run(COLD, 120, {"T1": steady, "T2": never, "T3": steady}, recheck="10:24"),
+    "control": control("coldstartfail", ("T2",)),
     "controlrefused": control("coldstartrefused", ("T2", "T3")),
     "controlwording": control("coldstartwording", ("T2",)),
     "postTimeouts": post_timeouts(),
@@ -1638,7 +1684,7 @@ print(json.dumps({
             $script:coldChecks = ($output | Select-Object -Last 1) | ConvertFrom-Json
         }
 
-        It 'tells the validator what the session''s start did to each target''s VM, and gives it 2 minutes to wait for a first sample' {
+        It 'tells the validator what the session''s start did, and when Run all checks again a target that hasn''t reported: 20 and 30 minutes after the later of its VM''s start and its activity''s dispatch (review of d6d69832)' {
             if (-not $script:coldRuns['coldstart']) {
                 Set-ItResult -Skipped -Because $script:coldSkip
                 return
@@ -1650,11 +1696,28 @@ print(json.dumps({
             $report.coldStart | Should -Match '^\{"T1": "2026-11-14T14:00:05Z", "T2": "2026-11-14T14:00:20Z", "T3": "2026-11-14T14:04:00Z"\}$'
             $run.args.COLD_START_UTC | Should -BeExactly $report.coldStart
             $run.args.WARM_START_TARGETS | Should -BeExactly ''
+            # T2's activity went out at 14:10, once its host ran, after its host's start at 14:00:20: Run all checks it again 20
+            # minutes after that, and 30, which decides (FIRST_SAMPLE_MINUTES).
+            $run.args.TELEMETRY_RECHECK_UTC | Should -BeExactly '2026-11-14T14:30:00Z,2026-11-14T14:40:00Z'
+            & $script:hiso $run.args.TELEMETRY_DECIDE_UTC | Should -Be '2026-11-14T14:40:00Z'
             # Within the validator's 5 minutes: its other checks and its save come after the wait.
             (([DateTimeOffset]$run.args.TELEMETRY_WAIT_UNTIL_UTC) - ([DateTimeOffset]$run.at)).TotalSeconds | Should -Be 120
             $run.timeout | Should -Be 300
             $report.printed | Should -Match ([regex]::Escape('Readiness: NB_DatabaseHub_Deployment ran its read-only checks in 1 minute; the Insights app''s Readiness page shows each one, worst first, after its next refresh.' + "`n"))
             @($report.sent | ForEach-Object action) | Should -Be @('session', 'stop')
+            # T1 with its own anchor: Azure refused the T2 host's start, and T3's activity wasn't sent, so T1's activity at 14:04,
+            # after sqlvm01's start at 14:00:05, sets the times.
+            $refused = $script:coldRuns['coldstartrefused'].validators[0].args
+            $refused.TELEMETRY_RECHECK_UTC | Should -BeExactly '2026-11-14T14:24:00Z,2026-11-14T14:34:00Z'
+            & $script:hiso $refused.TELEMETRY_DECIDE_UTC | Should -Be '2026-11-14T14:34:00Z'
+            # A 30-minute session: its live view ends at 14:30, before the 30 minutes, so its one check again then decides.
+            $half = $script:coldRuns['coldstart30'].validators[0].args
+            & $script:hiso $half.TELEMETRY_RECHECK_UTC | Should -Be '2026-11-14T14:30:00Z'
+            & $script:hiso $half.TELEMETRY_DECIDE_UTC | Should -Be '2026-11-14T14:30:00Z'
+            # A live view that ends at 14:06, before the 20 minutes: no check again, and a check by hand after the 30.
+            $none = $script:coldRuns['coldstartshort'].validators[0].args
+            $none.TELEMETRY_RECHECK_UTC | Should -BeExactly ''
+            & $script:hiso $none.TELEMETRY_DECIDE_UTC | Should -Be '2026-11-14T14:40:00Z'
         }
 
         It 'makes a cold-started target that hasn''t reported a Warning that says it can''t be known yet, or a Pass when it reports within the wait (needs pandas)' {
@@ -1668,127 +1731,195 @@ print(json.dumps({
             $hv.arrives.slept | Should -Be 60
             $hv.arrives.queries | Should -Be 3
             $hv.arrives.printed | Should -Match ([regex]::Escape('Waiting at most 120 seconds for the first telemetry sample since this session''s cold start: T2 arcsql01.'))
-            # It doesn't come before the wait's end: a Warning, not known yet, with when Run all checks it again; nothing says
-            # there's nothing to do (the review of 40ff59bb).
+            # It doesn't come before the wait's end: a Warning, not known yet, with when its first sample is due, and when Run
+            # all checks it again; nothing says there's nothing to do (the reviews of 40ff59bb and d6d69832).
             $hv.late.slept | Should -Be 110
             $hv.late.queries | Should -Be 5
             $hv.late.results.T2.status | Should -Be 'Warning'
-            $hv.late.results.T2.message | Should -BeExactly 'No telemetry from T2 arcsql01 since this session''s cold start yet, so whether it reports can''t be known yet: the session started T2''s host VM 8 minutes ago, and T2''s nested guest usually sends its first sample within about 15 minutes. This check waited 110 seconds for it.'
-            $hv.late.results.T2.remediation | Should -BeExactly 'Run all in NB_DatabaseHub_Control checks it again at 10:15 UTC, once those minutes have passed, and saves its Pass or Fail here. If Run all doesn''t get there, run this notebook, or ./scripts/validate.ps1 -Area Telemetry -Target T2, after 10:15 UTC while the session runs.'
-            $hv.late.results.T2.evidence | Should -BeExactly '{"coldStartUtc": "2026-11-24T10:00:10+00:00", "firstSampleMinutes": 15, "minutesSinceColdStart": 8, "recheckUtc": "2026-11-24T10:15:10+00:00", "waitedSeconds": 110}'
+            $hv.late.results.T2.message | Should -BeExactly 'No telemetry from T2 arcsql01 since this session''s cold start yet, so whether it reports can''t be known yet: the session started T2''s host VM 8 minutes ago, and its first sample is due by 10:34 UTC. This check waited 110 seconds for it.'
+            $hv.late.results.T2.remediation | Should -BeExactly 'Run all in NB_DatabaseHub_Control checks it again at 10:24 UTC, and at 10:34 UTC if it hasn''t reported by then, which decides, and saves its Pass or Fail here. If Run all doesn''t get there, run this notebook, or ./scripts/validate.ps1 -Area Telemetry -Target T2, after 10:34 UTC while the session runs.'
+            $hv.late.results.T2.evidence | Should -BeExactly '{"coldStartUtc": "2026-11-24T10:00:10+00:00", "decideUtc": "2026-11-24T10:34:10+00:00", "minutesSinceColdStart": 8, "recheckUtc": ["2026-11-24T10:24:10+00:00", "2026-11-24T10:34:10+00:00"], "waitedSeconds": 110}'
             foreach ($case in 'arrives', 'late') {
                 $hv.$case.results.T1.status | Should -Be 'Pass'
                 $hv.$case.results.T3.status | Should -Be 'Pass'
             }
+            # Run all's live view ends too soon to check it again: the Warning says so, with when to check it by hand.
+            $hv.unreachable.results.T2.status | Should -Be 'Warning'
+            $hv.unreachable.results.T2.remediation | Should -BeExactly 'Run all''s live view ends too soon to check it again: run this notebook, or ./scripts/validate.ps1 -Area Telemetry -Target T2, after 10:40 UTC while the session runs.'
             # T1 too: a sample from before the session started its VM, and none since, is the cold start's Warning, not a stale VM's.
             $hv.t1stale.results.T1.status | Should -Be 'Warning'
-            $hv.t1stale.results.T1.message | Should -BeExactly 'No telemetry from T1 sqlvm01 since this session''s cold start yet, so whether it reports can''t be known yet: the session started T1''s VM 6 minutes ago, and T1 usually sends its first sample within about 15 minutes.'
+            $hv.t1stale.results.T1.message | Should -BeExactly 'No telemetry from T1 sqlvm01 since this session''s cold start yet, so whether it reports can''t be known yet: the session started T1''s VM 6 minutes ago, and its first sample is due by 10:34 UTC.'
             $hv.t1stale.results.T2.status | Should -Be 'Pass'
-            # A T1 that sends only client connections since its start has reported: its edition's Warning, as before, and nothing
-            # to check again (the review of 40ff59bb).
+            # A T1 that sends only client connections since its start has reported: its edition's Warning, as before, and
+            # nothing to check again (the review of 40ff59bb).
             $hv.t1edition.results.T1.status | Should -Be 'Warning'
             $hv.t1edition.results.T1.message | Should -BeExactly 'T1 sqlvm01 sends only SqlServerConnections, not performance data. On Azure VMs, Developer, Express, and Evaluation editions send only client connections; T1 needs Standard or Enterprise.'
-            @($hv.t1edition.answers[0].recheckUtc.PSObject.Properties.Name) | Should -BeNullOrEmpty
+            @($hv.t1edition.answers[0].pending) | Should -BeNullOrEmpty
             # The endpoint fails the wait's first look: the first answer stands for every target, and the wait ends.
             $hv.flaky.slept | Should -Be 30
             $hv.flaky.queries | Should -Be 2
             $hv.flaky.results.T1.status | Should -Be 'Pass'
             $hv.flaky.results.T2.message | Should -Match 'This check waited 30 seconds for it\.$'
-            # What Run all passes on its cold start reads as one: T2's host, which it started 5 minutes before, isn't a Fail.
-            $hv.control.results.T2.status | Should -Be 'Warning'
-            $hv.control.results.T2.message | Should -Match '^No telemetry from T2 arcsql01 since this session''s cold start yet, so whether it reports can''t be known yet: the session started T2''s host VM 5 minutes ago'
-            ([DateTimeOffset]$hv.control.answers[0].recheckUtc.T2).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') | Should -Be '2026-11-14T14:15:20Z'
-            $hv.control.results.T1.status | Should -Be 'Pass'
-            $hv.control.results.T3.status | Should -Be 'Pass'
         }
 
-        It 'checks a target it waited for again once its first 15 minutes have passed, so one that never reports is a Fail in the same session (review of 40ff59bb, needs pandas)' {
+        It 'names in each saved Warning the times Run all checks it again at, and keeps to them (review of d6d69832, needs pandas)' {
             if (-not $script:coldChecks) {
                 Set-ItResult -Skipped -Because $script:coldSkip
                 return
             }
-            # The validator's side: at readiness, T2 is a Warning, and its answer to Run all says when to check it again ...
+            $hv = $script:coldChecks
+            # Two targets without telemetry, whose own starts differ: both Warnings name the same times, Run all's.
+            foreach ($target in 'T1', 'T2') {
+                $hv.two.results.$target.status | Should -Be 'Warning'
+                $hv.two.results.$target.remediation | Should -BeExactly ('Run all in NB_DatabaseHub_Control checks it again at 10:24 UTC, and at 10:34 UTC if it hasn''t reported by then, which decides, and saves its Pass or Fail here. If Run all doesn''t get there, run this notebook, or ./scripts/validate.ps1 -Area Telemetry -Target {0}, after 10:34 UTC while the session runs.' -f $target)
+            }
+            @($hv.two.answers[0].pending) | Should -Be @('T1', 'T2')
+            # At the first check again, the Warning names the one left, which decides.
+            $hv.look.results.T2.message | Should -BeExactly 'No telemetry from T2 arcsql01 since this session''s cold start yet, so whether it reports can''t be known yet: the session started T2''s host VM 24 minutes ago, and its first sample is due by 10:34 UTC.'
+            $hv.look.results.T2.remediation | Should -BeExactly 'Run all in NB_DatabaseHub_Control checks it again at 10:34 UTC, which decides, and saves its Pass or Fail here. If Run all doesn''t get there, run this notebook, or ./scripts/validate.ps1 -Area Telemetry -Target T2, after 10:34 UTC while the session runs.'
+            # Run all: the Warning that its readiness saved names the times it then checks T2 again at, to the second.
+            $hfail = $script:coldRuns['coldstartfail'].validators
+            @($hfail).Count | Should -Be 3
+            & $script:hiso $hfail[1].at | Should -Be '2026-11-14T14:30:00Z'
+            & $script:hiso $hfail[2].at | Should -Be '2026-11-14T14:40:00Z'
+            $hv.control.results.T2.status | Should -Be 'Warning'
+            $hv.control.results.T2.remediation | Should -BeExactly 'Run all in NB_DatabaseHub_Control checks it again at 14:30 UTC, and at 14:40 UTC if it hasn''t reported by then, which decides, and saves its Pass or Fail here. If Run all doesn''t get there, run this notebook, or ./scripts/validate.ps1 -Area Telemetry -Target T2, after 14:40 UTC while the session runs.'
+            $script:coldRuns['coldstartfail'].printed | Should -Match ([regex]::Escape('Not known yet: T2, with no telemetry since this session''s cold start, so its check is a Warning for now. Run all checks it again at 14:30 (UTC), and at 14:40 if it hasn''t reported by then, which decides, and saves its Pass or Fail there.'))
+            $hv.control.results.T1.status | Should -Be 'Pass'
+            $hv.control.results.T3.status | Should -Be 'Pass'
+        }
+
+        It 'checks a target it waited for again at those times: a Pass as soon as it has reported, and a Fail only at the last, which decides (reviews of 40ff59bb and d6d69832, needs pandas)' {
+            if (-not $script:coldChecks) {
+                Set-ItResult -Skipped -Because $script:coldSkip
+                return
+            }
+            # The validator's side: until the time that decides, a target without telemetry is a Warning, which its answer to
+            # Run all lists; from then, it's a Fail, and a late but healthy one is a Pass.
             $hv = $script:coldChecks
             @($hv.late.answers).Count | Should -Be 1
             $answer = $hv.late.answers[0]
             $answer.kind | Should -BeExactly 'DbHubDemo.Readiness'
             $answer.version | Should -Be 1
             $answer.runId | Should -Match '^\d{8}T\d{6}Z-[0-9a-f]{8}$'
-            @($answer.recheckUtc.PSObject.Properties.Name) | Should -Be @('T2')
-            ([DateTimeOffset]$answer.recheckUtc.T2).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') | Should -Be '2026-11-24T10:15:10Z'
+            @($answer.pending) | Should -Be @('T2')
             $answer.telemetry.T2.status | Should -Be 'Warning'
             $answer.telemetry.T2.message | Should -BeExactly $hv.late.results.T2.message
             $answer.telemetry.T1.status | Should -Be 'Pass'
-            # ... and run again then, with the same COLD_START_UTC and no wait, a T2 that never reported is a Fail, with nothing
-            # left to check again.
-            $hv.recheck.slept | Should -Be 0
-            $hv.recheck.results.T2.status | Should -Be 'Fail'
-            $hv.recheck.results.T2.message | Should -BeExactly 'No telemetry from T2 arcsql01 in the last 60 minutes. This session started T2''s host VM 15 minutes ago, and T2''s nested guest usually sends its first sample within about 15 minutes, so this is past a cold start''s usual delay.'
-            $hv.recheck.answers[0].telemetry.T2.status | Should -Be 'Fail'
-            @($hv.recheck.answers[0].recheckUtc.PSObject.Properties.Name) | Should -BeNullOrEmpty
+            $hv.settle.slept | Should -Be 0
+            $hv.settle.results.T2.status | Should -Be 'Fail'
+            $hv.settle.results.T2.message | Should -BeExactly 'No telemetry from T2 arcsql01 in the last 60 minutes. This session started T2''s host VM 34 minutes ago, and its first sample was due by 10:34 UTC.'
+            $hv.settle.answers[0].telemetry.T2.status | Should -Be 'Fail'
+            @($hv.settle.answers[0].pending) | Should -BeNullOrEmpty
+            $hv.latepass.results.T2.status | Should -Be 'Pass'
             # It answers only Run all's reference run: not a run by hand, nor one outside a reference run.
             @($hv.notreference.answers).Count | Should -Be 0
             $hv.notreference.results.T2.status | Should -Be 'Warning'
             @($hv.manual.answers).Count | Should -Be 0
 
-            # Run all's side: it runs the validator again once T2's 15 minutes have passed, in the live view, with no wait, and
-            # prints its Fail; the validator saves it to validation_results, which the Readiness page shows.
+            # Run all's side: T2 never reports, so a Warning at its first check again, and a Fail at the one that decides, each
+            # with no wait, the parameters it passed at readiness, and the times left.
             $report = $script:coldRuns['coldstartfail']
             $report.error | Should -BeNullOrEmpty
-            @($report.validators).Count | Should -Be 2
-            $first, $again = $report.validators
-            $again.args.TELEMETRY_WAIT_UNTIL_UTC | Should -BeExactly ''
-            $first.args.TELEMETRY_WAIT_UNTIL_UTC | Should -Not -BeNullOrEmpty
-            foreach ($name in $first.args.PSObject.Properties.Name | Where-Object { $_ -ne 'TELEMETRY_WAIT_UNTIL_UTC' }) {
-                $again.args.$name | Should -Be $first.args.$name -Because $name
+            $first, $look, $decide = $report.validators
+            & $script:hiso $look.args.TELEMETRY_RECHECK_UTC | Should -Be '2026-11-14T14:40:00Z'
+            $decide.args.TELEMETRY_RECHECK_UTC | Should -BeExactly ''
+            foreach ($again in $look, $decide) {
+                $again.args.TELEMETRY_WAIT_UNTIL_UTC | Should -BeExactly ''
+                foreach ($name in $first.args.PSObject.Properties.Name | Where-Object { $_ -notin 'TELEMETRY_WAIT_UNTIL_UTC', 'TELEMETRY_RECHECK_UTC' }) {
+                    $again.args.$name | Should -Be $first.args.$name -Because $name
+                }
             }
-            $since = (([DateTimeOffset]$again.at) - ([DateTimeOffset]'2026-11-14T14:15:20Z')).TotalSeconds
-            $since | Should -BeGreaterOrEqual 0
-            $since | Should -BeLessOrEqual 60
-            $report.printed | Should -Match ([regex]::Escape('Not known yet: T2, with no telemetry since this session''s cold start, so its check is a Warning for now. Run all checks it again at 14:15 (UTC), once its first 15 minutes have passed, and saves its Pass or Fail.'))
-            $report.printed | Should -Match ([regex]::Escape(("Readiness again, now that 15 minutes have passed since this session's cold start of T2 (NB_DatabaseHub_Deployment; the Insights app's Readiness page shows each check, with its fix, after its next refresh):`n" +
+            $report.printed | Should -Match ([regex]::Escape(("Readiness again at 14:30 (UTC), for the telemetry of T2 since this session's cold start (NB_DatabaseHub_Deployment; the Insights app's Readiness page shows each check, with its fix, after its next refresh):`n" +
+                        "  HUB.TELEMETRY.T2 Warning: No telemetry from T2 arcsql01 since this session's cold start yet, so whether it reports can't be known yet.`n" +
+                        '  Not known yet: T2. Run all checks it again at 14:40 (UTC), which decides.')))
+            $report.printed | Should -Match ([regex]::Escape(("Readiness again at 14:40 (UTC), for the telemetry of T2 since this session's cold start (NB_DatabaseHub_Deployment; the Insights app's Readiness page shows each check, with its fix, after its next refresh):`n" +
                         '  HUB.TELEMETRY.T2 Fail: No telemetry from T2 arcsql01 in the last 60 minutes.')))
-            @($report.order) | Should -Be @('sent:session', 'validator', 'validator', 'sent:stop', ('history:{0}' -f $report.sent[0].sessionId.Substring(0, 8)))
+            @($report.order) | Should -Be @('sent:session', 'validator', 'validator', 'validator', 'sent:stop', ('history:{0}' -f $report.sent[0].sessionId.Substring(0, 8)))
             $report.printed | Should -Match 'Pass: the history is saved'
-            # A status it can't read then doesn't say the session ended: it checks T2 again all the same.
+            # A late but healthy T2, whose first sample shows at 14:35: still a Warning at 14:30, and a Pass at 14:40.
+            $late = $script:coldRuns['coldstartlate']
+            $late.error | Should -BeNullOrEmpty
+            @($late.validators).Count | Should -Be 3
+            $late.printed | Should -Match ([regex]::Escape(("Readiness again at 14:40 (UTC), for the telemetry of T2 since this session's cold start (NB_DatabaseHub_Deployment; the Insights app's Readiness page shows each check, with its fix, after its next refresh):`n" +
+                        '  HUB.TELEMETRY.T2 Pass: T2 reports performance telemetry from 3 tables.')))
+            $late.printed | Should -Not -Match 'HUB\.TELEMETRY\.T2 Fail'
+            # Its first sample shows at 14:25: a Pass at 14:30, and no check after that.
+            $grace = $script:coldRuns['coldstartgrace']
+            $grace.error | Should -BeNullOrEmpty
+            @($grace.validators).Count | Should -Be 2
+            $grace.printed | Should -Match ([regex]::Escape(("Readiness again at 14:30 (UTC), for the telemetry of T2 since this session's cold start (NB_DatabaseHub_Deployment; the Insights app's Readiness page shows each check, with its fix, after its next refresh):`n" +
+                        '  HUB.TELEMETRY.T2 Pass: T2 reports performance telemetry from 3 tables.')))
+            $grace.printed | Should -Not -Match 'Readiness again at 14:40'
+            # A status it can't read at 14:30 doesn't say the session ended: it checks T2 again all the same.
             $unread = $script:coldRuns['coldstartunread']
             $unread.error | Should -BeNullOrEmpty
-            @($unread.validators).Count | Should -Be 2
+            @($unread.validators).Count | Should -Be 3
             $unread.printed | Should -Match ([regex]::Escape('  HUB.TELEMETRY.T2 Fail: No telemetry from T2 arcsql01 in the last 60 minutes.'))
         }
 
-        It 'says when a target it waited for couldn''t be checked again: a live view that ends first, a session that ended first, or a validator that fails (review of 40ff59bb)' {
+        It 'fits a short session: one check again at the end of a 30-minute session''s live view, which decides; and the one that decides runs even when the check before it ends past the live view''s end (review of d6d69832)' {
+            if (-not $script:coldRuns['coldstart30']) {
+                Set-ItResult -Skipped -Because $script:coldSkip
+                return
+            }
+            $report = $script:coldRuns['coldstart30']
+            $report.error | Should -BeNullOrEmpty
+            @($report.validators).Count | Should -Be 2
+            & $script:hiso $report.validators[1].at | Should -Be '2026-11-14T14:30:00Z'
+            $report.validators[1].args.TELEMETRY_RECHECK_UTC | Should -BeExactly ''
+            $report.printed | Should -Match ([regex]::Escape('Run all checks it again at 14:30 (UTC), which decides, and saves its Pass or Fail there.'))
+            $report.printed | Should -Match ([regex]::Escape(("Readiness again at 14:30 (UTC), for the telemetry of T2 since this session's cold start (NB_DatabaseHub_Deployment; the Insights app's Readiness page shows each check, with its fix, after its next refresh):`n" +
+                        '  HUB.TELEMETRY.T2 Fail: No telemetry from T2 arcsql01 in the last 60 minutes.')))
+            @($report.order) | Should -Be @('sent:session', 'validator', 'validator', 'sent:stop', ('history:{0}' -f $report.sent[0].sessionId.Substring(0, 8)))
+            $report.printed | Should -Match 'Pass: the history is saved'
+            # A 33-minute session: its checks again at 14:30 and at its end, 14:33, which decides. The first takes until 14:34:50,
+            # past the live view's end, and the one that decides still runs then, before the session's end.
+            $over = $script:coldRuns['coldstart33']
+            $over.error | Should -BeNullOrEmpty
+            $over.validators[0].args.TELEMETRY_RECHECK_UTC | Should -BeExactly '2026-11-14T14:30:00Z,2026-11-14T14:33:00Z'
+            @($over.validators).Count | Should -Be 3
+            & $script:hiso $over.validators[2].at | Should -Be (& $script:hiso $over.validators[1].ended)
+            $over.printed | Should -Match ([regex]::Escape('  HUB.TELEMETRY.T2 Fail: No telemetry from T2 arcsql01 in the last 60 minutes.'))
+            @($over.order) | Should -Be @('sent:session', 'validator', 'validator', 'validator', 'sent:stop', ('history:{0}' -f $over.sent[0].sessionId.Substring(0, 8)))
+        }
+
+        It 'says when a target it waited for can''t be checked again: a live view that ends too soon, a session that ended first, a validator that fails, or an answer it can''t read (reviews of 40ff59bb and d6d69832)' {
             if (-not $script:coldRuns['coldstartshort']) {
                 Set-ItResult -Skipped -Because $script:coldSkip
                 return
             }
-            # WAIT_FOR_END False and WATCH_MINUTES 5: the live view ends before T2's 15 minutes, and the session goes on.
+            # WAIT_FOR_END False and WATCH_MINUTES 5: the live view ends at 14:06, before 14:30, and the session goes on.
             $short = $script:coldRuns['coldstartshort']
             $short.error | Should -BeNullOrEmpty
             @($short.validators).Count | Should -Be 1
-            $short.printed | Should -Match ([regex]::Escape('Warning: the telemetry of T2 wasn''t checked again: the live view ended before 14:15 (UTC), 15 minutes after this session''s cold start, so its check stays a Warning on the Insights app''s Readiness page. Fix: run NB_DatabaseHub_Deployment, or ./scripts/validate.ps1 -Area Telemetry -Target T2, after then while the session runs.'))
+            $short.printed | Should -Match ([regex]::Escape('Warning: no check again is scheduled for T2: the live view ends at 14:06 (UTC), before Run all would check it again. Fix: run NB_DatabaseHub_Deployment, or ./scripts/validate.ps1 -Area Telemetry -Target T2, after 14:40 (UTC) while the session runs.'))
             @($short.sent | ForEach-Object action) | Should -Be @('session')
             # The app stopped the session 10 minutes in: T2's result can't be known, so no check again and no Fail.
             $stopped = $script:coldRuns['coldstartstopped']
             $stopped.error | Should -BeNullOrEmpty
             @($stopped.validators).Count | Should -Be 1
-            $stopped.printed | Should -Match ([regex]::Escape('Readiness: the telemetry of T2 wasn''t checked again: the session ended before 14:15 (UTC), 15 minutes after its cold start, so its check stays a Warning on the Insights app''s Readiness page; the next session''s readiness checks it.'))
+            $stopped.printed | Should -Match ([regex]::Escape('Readiness: the telemetry of T2 wasn''t checked again: the session ended before 14:30 (UTC), so its check stays a Warning on the Insights app''s Readiness page; the next session''s readiness checks it.'))
             $stopped.printed | Should -Not -Match 'Readiness again'
-            # The validator fails when it's run again: a Warning with the fix, and the session goes on to its end and its history.
+            # The validator fails each time it's run again: a Warning with the time left, then one with the fix, and the
+            # session goes on to its end and its history.
             $failed = $script:coldRuns['coldstartrecheckfail']
             $failed.error | Should -BeNullOrEmpty
-            @($failed.validators).Count | Should -Be 2
+            @($failed.validators).Count | Should -Be 3
+            $failed.printed | Should -Match ([regex]::Escape('Warning: the telemetry of T2 wasn''t checked again at 14:30 (UTC): NB_DatabaseHub_Deployment didn''t finish in this session (RuntimeError: Notebook execution failed in cell 12: the telemetry endpoint didn''t answer). Run all checks it again at 14:40, which decides.'))
             $failed.printed | Should -Match ([regex]::Escape('Warning: the telemetry of T2 wasn''t checked again: NB_DatabaseHub_Deployment didn''t finish in this session (RuntimeError: Notebook execution failed in cell 12: the telemetry endpoint didn''t answer), so its check stays a Warning on the Insights app''s Readiness page. The session goes on. Fix: run NB_DatabaseHub_Deployment, or ./scripts/validate.ps1 -Area Telemetry -Target T2, while the session runs.'))
             @($failed.sent | ForEach-Object action) | Should -Be @('session', 'stop')
             $failed.printed | Should -Match 'Pass: the history is saved'
-            # An answer of a kind this notebook doesn't know says nothing to check again: one run, and no line about it.
+            # Its first answer can't be read (a kind this notebook doesn't know): no check again, and a line that says so
+            # instead of the promise its Warnings hold (the review of d6d69832).
             $foreign = $script:coldRuns['coldstartforeign']
             $foreign.error | Should -BeNullOrEmpty
             @($foreign.validators).Count | Should -Be 1
-            $foreign.printed | Should -Not -Match 'Not known yet|checked again'
+            $foreign.printed | Should -Match ([regex]::Escape('Warning: no check again is scheduled: NB_DatabaseHub_Deployment''s answer couldn''t be read, so Run all doesn''t know whether T1, T2 and T3, which this session''s start brought up, had reported. Fix: if the Insights app''s Readiness page shows a HUB.TELEMETRY check of T1, T2 and T3 as a Warning, run NB_DatabaseHub_Deployment, or ./scripts/validate.ps1 -Area Telemetry -Target T1, T2, T3, after 14:40 (UTC) while the session runs.'))
+            $foreign.printed | Should -Not -Match 'Not known yet|Readiness again'
         }
 
-        It 'keeps a warm start''s Fail, and says a VM was already running only of a target whose activity the session sent to it: not after a refused start, a skipped T3, or Start steps it can''t read (review of 40ff59bb, needs pandas)' {
+        It 'keeps a warm start''s Fail, and says a VM was already running only of a target whose activity the session sent to it, without saying more: not after a refused start, a skipped T3, or Start steps it can''t read (reviews of 40ff59bb and d6d69832, needs pandas)' {
             if (-not $script:coldChecks) {
                 Set-ItResult -Skipped -Because $script:coldSkip
                 return
@@ -1809,12 +1940,12 @@ print(json.dumps({
             }
             $hv.controlrefused.results.T3.message | Should -BeExactly $missing.T3
             $hv.controlrefused.results.T1.status | Should -Be 'Pass'
-            # The validator's side: a warm start's Fail stays a Fail, and says the VM was already running; T3's says so without
-            # concluding, since T3 resumes from auto-pause on a VM that already ran too.
+            # The validator's side: a warm start's Fail stays a Fail, and says the VM was already running, and no more: one
+            # that ./scripts/start-demo.ps1 started minutes before counts as already running too (the review of d6d69832).
             $hv.warm.slept | Should -Be 0
             $hv.warm.queries | Should -Be 1
             $hv.warm.results.T2.status | Should -Be 'Fail'
-            $hv.warm.results.T2.message | Should -BeExactly ($missing.T2 + ' This session didn''t start T2''s host VM: it was already running, so this isn''t a cold start''s delay.')
+            $hv.warm.results.T2.message | Should -BeExactly ($missing.T2 + ' This session didn''t start T2''s host VM: it was already running.')
             $hv.warm.results.T3.status | Should -Be 'Fail'
             $hv.warm.results.T3.message | Should -BeExactly ($missing.T3 + ' This session didn''t start T1''s VM, which runs T3''s activity: it was already running.')
             # Neither cold nor warm, after a refused start and a skipped T3: no note. WARM_START_TARGETS it can't read: none.
@@ -1822,18 +1953,21 @@ print(json.dumps({
             $hv.refused.results.T3.message | Should -BeExactly $missing.T3
             $hv.badwarm.results.T2.message | Should -BeExactly $missing.T2
             $hv.badwarm.printed | Should -Match 'WARM_START_TARGETS isn''t a list of T1, T2, and T3, so no target counts as already running\.'
-            # Started longer ago than its first sample takes: a Fail, without waiting.
+            # Its first sample was due before this check: a Fail, without waiting.
             $hv.expired.slept | Should -Be 0
             $hv.expired.results.T2.status | Should -Be 'Fail'
-            $hv.expired.results.T2.message | Should -BeExactly ($missing.T2 + ' This session started T2''s host VM 21 minutes ago, and T2''s nested guest usually sends its first sample within about 15 minutes, so this is past a cold start''s usual delay.')
-            # The notebook run by hand, or with a COLD_START_UTC it can't read: today's Fail, word for word, whatever
-            # WARM_START_TARGETS says.
-            foreach ($case in 'manual', 'garbage') {
+            $hv.expired.results.T2.message | Should -BeExactly ($missing.T2 + ' This session started T2''s host VM 21 minutes ago, and its first sample was due by 10:05 UTC.')
+            # The notebook run by hand, or with a COLD_START_UTC, TELEMETRY_DECIDE_UTC, or TELEMETRY_RECHECK_UTC it can't read:
+            # today's Fail, word for word, whatever WARM_START_TARGETS says.
+            foreach ($case in 'manual', 'garbage', 'baddecide', 'badrecheck') {
                 $hv.$case.slept | Should -Be 0
                 $hv.$case.results.T2.status | Should -Be 'Fail'
-                $hv.$case.results.T2.message | Should -BeExactly $missing.T2
+                $hv.$case.results.T2.message | Should -BeExactly $missing.T2 -Because $case
             }
             $hv.garbage.printed | Should -Match 'COLD_START_UTC isn''t JSON of targets and UTC times, so telemetry is checked as usual\.'
+            foreach ($case in 'baddecide', 'badrecheck') {
+                $hv.$case.printed | Should -Match ('TELEMETRY_DECIDE_UTC or TELEMETRY_RECHECK_UTC isn''t a UTC time, so the targets the session''s start brought up are checked as usual\.') -Because $case
+            }
         }
 
         It 'ends each look at the telemetry by the wait''s deadline, within Run all''s 5 minutes for the validator (review of 40ff59bb, needs pandas)' {
@@ -1851,6 +1985,25 @@ print(json.dumps({
             @($hv.arrives.timeouts[1..2]) | Should -Be @(90, 60)
             # The notebook's own _post_kql gives the request the timeout it's given, and 180 seconds otherwise, as before.
             @($hv.postTimeouts) | Should -Be @(12.5, 180)
+        }
+
+        It 'announces every beat that began while a check again held the live view up, as soon as it ends: no sleep after one (review of d6d69832)' {
+            if (-not $script:coldRuns['coldstartslow']) {
+                Set-ItResult -Skipped -Because $script:coldSkip
+                return
+            }
+            # Each check again takes 290 seconds here: from 14:30:00 to 14:34:50, and from 14:40:00 to 14:44:50.
+            $report = $script:coldRuns['coldstartslow']
+            $report.error | Should -BeNullOrEmpty
+            @($report.validators).Count | Should -Be 3
+            $printedAt = {
+                param([string] $Start)
+                @($report.timed | Where-Object { $_[1].StartsWith($Start) } | ForEach-Object { & $script:hiso $_[0] })
+            }
+            foreach ($beat in 'Now: T2 Parallelism waits, until 14:39', 'Now: T1 Deep blocking chain and lock escalation, until 14:44', 'Now: T3 Plan regression (automatic plan correction), until 15:04') {
+                & $printedAt $beat | Should -Be @(& $script:hiso $report.validators[1].ended) -Because $beat
+            }
+            & $printedAt 'Now: T2 CPU pressure, until 14:54' | Should -Be @(& $script:hiso $report.validators[2].ended)
         }
     }
 

@@ -6088,3 +6088,62 @@ The four acknowledgement cases from before now expect the summary's new words. M
 - A cold start whose T2 reports late: the **Warning** at readiness, then "Readiness again" with a **Pass**, and the Readiness page's latest run.
 - One whose T2 doesn't report: a **Fail** in the same session.
 - How long the check again takes in the live view.
+
+### Readiness on a cold start: when Run all decides (the review of d6d69832, 2026-11-24)
+
+**Why.** The re-check of 40ff59bb..d6d69832, **SHIP WITH FIXES**:
+
+- **Medium: the check again could Fail a healthy T2, for good.** It ran 15 minutes after Azure accepted the host's start, the top of the docs' 3–15 minutes, with no margin, and the night's only data point was "nothing at 6.5 minutes, fresh at 16". A first sample at minute 16 would have been the session's final **Fail**: last night's false Fail, only later.
+- **Low: the warm Fail claimed more than it knew.** "So this isn't a cold start's delay": a VM that `./scripts/start-demo.ps1` started minutes before Run all counts as already running.
+- **Low: beats were lost.** A check again holds the live view up to 5 minutes, then the loop still slept a whole refresh, and a beat printed only within two refreshes of its start.
+- **Low: the promises.** Each **Warning** named its own target's time, while Run all checked at the latest one; and when the first answer couldn't be read, the **Warning**'s promise stood, with no check again.
+
+**What changed.**
+
+- **The anchor, and a margin, with the numbers in one place.** The control notebook's `FIRST_SAMPLE_MINUTES = {"grace": 20, "limit": 30}`: minutes after each cold-started target's anchor, the later of its VM's start and its activity's dispatch (`dispatchUtc`; T2's goes out once its host runs), T1 and T3 with their own.
+  - The live view checks a target that hadn't reported again at the latest anchor's grace, and at its limit, which decides: a **Pass** as soon as it has reported, and a **Fail** only at the limit, so a late but healthy T2 ends as a **Pass**.
+  - In a session whose live view ends sooner, as a 30-minute one's does, the check at its end decides, but never before the grace; when the live view ends before the grace, there's no check again, and a **Warning** says so, with when to check by hand.
+  - The validator has no minutes of its own any more: Run all passes the times it uses, `TELEMETRY_RECHECK_UTC` (its checks again, the last deciding) and `TELEMETRY_DECIDE_UTC` (from when a target without telemetry is a **Fail**). They replace `TELEMETRY_FIRST_SAMPLE_MINUTES`; times it can't read give the usual checks.
+  - The live view wakes at each time, to the second, and past its end goes on only for a time that came due during a check again, so the one that decides runs even when the check before it ends past the live view's end.
+- **Each Warning names Run all's times:** "its first sample is due by 10:34 UTC", and "Run all in NB_DatabaseHub_Control checks it again at 10:24 UTC, and at 10:34 UTC if it hasn't reported by then, which decides". At the first check again, it names the one left. Run all's readiness line names the same times, and the validator's answer lists the targets still not known (`pending`), replacing its own times.
+- **No promise without a check again:** when the validator's first answer can't be read, "Warning: no check again is scheduled", with the fix; a later answer that can't be read says no further check is scheduled. A check again whose validator fails says so, and when the next one is, or the fix.
+- **The warm Fail says what it knows:** "This session didn't start T2's host VM: it was already running.", the same for T1; T3's was already so. A cold-started target's **Fail** says "its first sample was due by" the time that decided.
+- **Beats:** after the live view's first pass, every beat that began since the pass before is announced, however long a check again held it up, and there's no sleep after a check again, so the next pass comes at once.
+
+**Changed files.**
+
+- `fabric/control/NB_DatabaseHub_Control.ipynb`: cells 0, 6, 10, and 12.
+- `fabric/notebooks/NB_DatabaseHub_Deployment.ipynb`: cells 2, 7, 16, 17, 23, 24, and 25.
+- `fabric/control/README.md`, `docs/troubleshooting.md`, `tests/unit/Fabric.ControlNotebook.Tests.ps1`, and this report.
+
+**Validation.** All at below-normal priority, with `DBHUB_TEST_PYTHON` set and no working Python on PATH.
+
+- **`Fabric.ControlNotebook`:** 106 passed, none failed or skipped.
+  - The cold-start Context has 9 cases over 14 simulations and one run of the validator's own cells. The simulator's validator answers as of its start, as the real one decides in its per-target cell, and its output carries the simulated time of each line about a beat or readiness.
+  - New in it:
+    - Run all's times: T2's from its dispatch (14:30 and 14:40 for a session from 14:00); T1's own, when only T1 is cold (14:24 and 14:34); a 30-minute session's one, at 14:30; none for a live view that ends at 14:06.
+    - Each **Warning** names those times, for two targets alike, and Run all checks at them, to the second.
+    - A **Pass** at the first check, a late but healthy T2's **Pass** at the second, and a silent T2's **Fail** only there.
+    - A 33-minute session whose first check runs past its end: the one that decides still runs.
+    - An unreadable first answer's **Warning**, and the warm **Fail**'s note with no conclusion.
+    - The beats that began during a 290-second check again, announced the second it ends.
+- **Without the change, each fails:** with the validator from d6d69832, 4 of the 13 readiness cases; with the control notebook from d6d69832, 7.
+- **Mutations, each alone: all 46 make a case fail.**
+  - In the validator (20), among them: a target pending past the decide time, the warm clause back, each **Warning** naming its own time, the answer listing nothing pending, and the decide time missing from the **Fail**.
+  - In the control notebook (26), among them: the anchor without the dispatch, the times from the earliest anchor, no cap at the live view's end, none for a live view that ends too soon, no line for an unreadable answer, a sleep after a check again, only recent beats after one, no pass at a check again's time, and a stop while one is due. The live view's loop also has a one-second floor on its nap, so it can't spin in place.
+- **Other suites:**
+  - `Fabric.Notebooks`: 128 passed, and the same 2 failures as at bdd1da89.
+  - `Repo.Conventions` 123, `DbHubDemo.Fabric` 42, and `DbHubDemo.HubReadiness` 18 passed.
+  - PSScriptAnalyzer and markdownlint found nothing, and the leak check prints nothing.
+
+**Risks.**
+
+- **The checks again:** at most two more validator runs, about a minute each, held in the live view; one when the first check finds the target.
+- **The anchor comes from `dispatchUtc`:** a target whose activity wasn't sent keeps its VM's start.
+- **`published-versions.json`:** the validator changed again, so the integration runs the versions' writer after the merge.
+
+**What its live check needs.**
+
+- T2's real first-sample minutes after its dispatch, against `FIRST_SAMPLE_MINUTES` (20 and 30).
+- A late T2 ending as a **Pass** at a check again, and a silent one as a **Fail** at the last.
+- The beats around a check again, in the live view.
