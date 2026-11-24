@@ -754,7 +754,7 @@ Describe 'The Incident RCA contract: the capture catalog (ADR 0031)' {
             $id | Should -BeIn $blocks -Because 'the rule matches the earlier forms of blocks today''s catalog still has'
         }
         $rule | Should -Match ([regex]::Escape('edd01c86''s join to `sys.dm_xe_objects`'))
-        $rule | Should -Match ([regex]::Escape('f16b9cb9''s form'))
+        $rule | Should -Match ([regex]::Escape('f16b9cb9''s form, which the release of 2026-11-24 sends: today''s block without its marker'))
         $rule | Should -Match 'Item 3 matches them too, by their normalized text, which drops comments'
         $readme | Should -Match ([regex]::Escape('the observer''s own SQL Server statements as it sent them before its marker'))
         $adr = [System.IO.File]::ReadAllText((Join-Path -Path $repoRoot -ChildPath 'docs/adr/0031-incident-rca.md'))
