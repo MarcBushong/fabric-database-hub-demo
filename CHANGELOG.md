@@ -2,7 +2,7 @@
 
 All notable changes to this project are recorded here. The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and each release is a dated merge to `main`.
 
-## [Unreleased]
+## [2026-11-24] - Query-level evidence
 
 **Query-level evidence for the Incident RCA** ([ADR 0031's amendment](docs/adr/0031-incident-rca.md#amendment-2026-11-23-query-stores-evidence-in-a-sidecar)): investigating in the Insights app's chat, the owner was told that T1 had no Query Store, so the chat couldn't go further. T1 to T3 had it on; the capture never read it. Now the workload runner's observer reads Query Store on T1 to T4, and the RCA names the queries and plans behind an incident from what the capture saved. The evidence document stays version 1, byte for byte: Query Store's evidence travels in sidecars of its own, which a part of the demo that predates them never meets ([the sidecar](rca/README.md#the-sidecar)).
 
