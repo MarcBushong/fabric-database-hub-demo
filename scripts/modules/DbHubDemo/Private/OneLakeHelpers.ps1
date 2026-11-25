@@ -103,10 +103,16 @@ function Invoke-DemoOneLakeRequest {
         $request['ContentType'] = 'application/octet-stream'
     }
     $response = Invoke-DemoTransientRetry -Send { param([hashtable] $Call) Invoke-WebRequest @Call } -State $request -Target ([uri]$uri).Host -NotIdempotent:$NotIdempotent
+    # A file's content (Path - Read) comes back as bytes unless its content type is text: as UTF-8 text here (2026-11-23,
+    # the RCA sidecar's acknowledgement), never as a list of byte values.
+    $content = $response.Content
+    if ($content -is [byte[]]) {
+        $content = [System.Text.Encoding]::UTF8.GetString($content)
+    }
     [pscustomobject]@{
         StatusCode = [int]$response.StatusCode
         Headers    = $response.Headers
-        Content    = [string]$response.Content
+        Content    = [string]$content
     }
 }
 
@@ -292,17 +298,26 @@ function Remove-DemoOneLakeFile {
 function Get-DemoRcaHistoryTable {
     <#
     .SYNOPSIS
-    The Incident RCA's eight history tables (rca/history-tables.json, version 1): Name (the lakehouse's) and Model (the
-    history model's), in the contract's order. Pure (reads the repository's file). Internal.
+    The Incident RCA's history tables (rca/history-tables.json): Name (the lakehouse's), Model (the history model's), Role,
+    and Document (the document that carries it), in the contract's order. All fourteen by default, the evidence document's
+    eight and the sidecar's six, which the history model reads since the sidecar's notebook (2026-11-23, rca/README.md, The
+    sidecar); -Document evidence or sidecar for one document's. Pure (reads the repository's file). Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
     param(
-        [string] $Path = (Join-Path -Path $script:RepoRoot -ChildPath 'rca/history-tables.json')
+        [string] $Path = (Join-Path -Path $script:RepoRoot -ChildPath 'rca/history-tables.json'),
+
+        [ValidateSet('all', 'evidence', 'sidecar')]
+        [string] $Document = 'all'
     )
 
     $contract = Get-Content -LiteralPath $Path -Raw | ConvertFrom-Json -Depth 16
     foreach ($table in @($contract.tables)) {
-        [pscustomobject]@{ Name = [string]$table.name; Model = [string]$table.model; Role = [string]$table.role }
+        # A contract from before the sidecar names no document: every table is the evidence document's.
+        $carrier = if ($table.PSObject.Properties['document']) { [string]$table.document } else { 'evidence' }
+        if ($Document -eq 'all' -or $carrier -eq $Document) {
+            [pscustomobject]@{ Name = [string]$table.name; Model = [string]$table.model; Role = [string]$table.role; Document = $carrier }
+        }
     }
 }

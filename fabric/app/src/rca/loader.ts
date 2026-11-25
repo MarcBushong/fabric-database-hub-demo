@@ -3,9 +3,12 @@
 // Detection reads only the detection tables and the telemetry: never the answer key (rca/blind-detection.json).
 
 import { isMissingInModel, retryHint } from "@/data/retry";
-import { ROW_MAPPERS, toDate } from "./rows";
-import { PHASE_1_TABLES, RCA_SPEC, TARGET_KEY, type RcaTableKey } from "./spec";
+import { ROW_MAPPERS, toDate, type Get } from "./rows";
+import { emptySidecar, PLAN_LAG_MINUTES, SIDECAR_MAPPERS, SIDECAR_MEMBER, type SidecarEvidence } from "./sidecar";
+import { PHASE_1_TABLES, RCA_SPEC, SIDECAR_SPEC, SIDECAR_TABLES, TARGET_KEY, type RcaTableKey, type SidecarTableKey, type TableSpec } from "./spec";
 import { emptyEvidence, type Evidence, type RcaTarget } from "./types";
+
+export { PLAN_LAG_MINUTES };
 
 /** Rows of one DAX query, keyed by the model's column names (src/data/query-client.ts normalizes them). */
 export type RunDax = (query: string, rowLimit: number) => Promise<Array<Record<string, unknown>>>;
@@ -56,29 +59,81 @@ export interface DaxLog {
 const daxTime = (d: Date) =>
     `DATE ( ${d.getUTCFullYear()}, ${d.getUTCMonth() + 1}, ${d.getUTCDate()} ) + TIME ( ${d.getUTCHours()}, ${d.getUTCMinutes()}, ${d.getUTCSeconds()} )`;
 
-/** One table's rows for the window and targets, oldest first. A table of intervals (RCA Coverage, RCA Waits) keeps every
- *  interval that overlaps the window: a session exported once has one coverage row from its start to its end. */
-export function rcaDax(key: RcaTableKey, from: Date, to: Date, targets: readonly RcaTarget[]): string {
-    const spec = RCA_SPEC[key];
-    const fields = spec.fields as Record<string, { model: string }>;
-    const time = fields[spec.time].model;
-    const t = `'${spec.model}'[${time}]`;
-    const end = spec.time === "from" && fields.to ? `'${spec.model}'[${fields.to.model}]` : null;
+/** A read's other bounds than the window's, for RCA Query Plans (planDaxQueries); Phase 1's tables take none, so their DAX is as it was. */
+export interface TableDaxOptions {
+    /** Every row up to the window's end, with no lower bound on the table's time. */
+    unbounded?: boolean;
+    /** More filters: DAX boolean expressions on one of the table's columns each. */
+    filters?: readonly string[];
+    /** Newest first, so a read at its row limit keeps the newest rows. */
+    newestFirst?: boolean;
+}
+
+/**
+ * One table's rows for the window and targets, oldest first. A table of intervals (its spec's `end`: RCA Coverage, RCA
+ * Waits, RCA Query Stats) keeps every interval that overlaps the window: a session exported once has one coverage row from
+ * its start to its end; a table with more spans (RCA Query Coverage) keeps a row when any of them does. A table with
+ * 64-bit IDs (spec.ts's id) returns them as text, converted in DAX ([CONVERT](https://learn.microsoft.com/dax/convert-function-dax)),
+ * since the connector's JSON would round them to a JavaScript number.
+ */
+export function tableDax(spec: TableSpec, from: Date, to: Date, targets: readonly RcaTarget[], options: TableDaxOptions = {}): string {
+    const col = (field: string) => `'${spec.model}'[${spec.fields[field].model}]`;
+    const t = col(spec.time);
     const list = targets.map((target) => `"${target}"`).join(", ");
-    return [
-        "EVALUATE",
-        "CALCULATETABLE (",
-        `    '${spec.model}',`,
-        end ? `    ${end} >= ${daxTime(from)},` : `    ${t} >= ${daxTime(from)},`,
-        `    ${t} <= ${daxTime(to)},`,
-        `    TREATAS ( { ${list} }, '${TARGET_KEY.table}'[${TARGET_KEY.column}] )`,
-        ")",
-        `ORDER BY ${t}`,
-    ].join("\n");
+    const overlaps = (start: string, end: string) => `( ${col(end)} >= ${daxTime(from)} && ${col(start)} <= ${daxTime(to)} )`;
+    const lower = options.unbounded ? [] : [spec.end ? `    ${col(spec.end)} >= ${daxTime(from)},` : `    ${t} >= ${daxTime(from)},`];
+    const bounds = spec.spans?.length
+        ? [`    FILTER ( '${spec.model}', ${[[spec.time, spec.end ?? spec.time] as const, ...spec.spans].map(([start, end]) => overlaps(start, end)).join(" || ")} ),`]
+        : [...lower, `    ${t} <= ${daxTime(to)},`];
+    const table = ["CALCULATETABLE (", `    '${spec.model}',`, ...bounds, ...(options.filters ?? []).map((filter) => `    ${filter},`), `    TREATAS ( { ${list} }, '${TARGET_KEY.table}'[${TARGET_KEY.column}] )`, ")"];
+    const order = options.newestFirst ? " DESC" : "";
+    const fields = Object.values(spec.fields);
+    if (!fields.some((field) => field.kind === "id")) return ["EVALUATE", ...table, `ORDER BY ${t}${order}`].join("\n");
+    const columns = fields.map((field, i) => {
+        const ref = `'${spec.model}'[${field.model}]`;
+        return `    "${field.model}", ${field.kind === "id" ? `CONVERT ( ${ref}, STRING )` : ref}${i < fields.length - 1 ? "," : ""}`;
+    });
+    return ["EVALUATE", "SELECTCOLUMNS (", ...table.map((line, i) => `    ${line}${i === table.length - 1 ? "," : ""}`), ...columns, ")", `ORDER BY [${spec.fields[spec.time].model}]${order}`].join("\n");
+}
+
+/** One RCA table's rows for the window and targets, oldest first (tableDax). */
+export function rcaDax(key: RcaTableKey, from: Date, to: Date, targets: readonly RcaTarget[]): string {
+    return tableDax(RCA_SPEC[key], from, to, targets);
+}
+
+/** One sidecar table's rows for the window and targets, oldest first (tableDax). */
+export function sidecarDax(key: SidecarTableKey, from: Date, to: Date, targets: readonly RcaTarget[]): string {
+    return tableDax(SIDECAR_SPEC[key], from, to, targets);
+}
+
+/** The most query IDs one plans read names (planDaxQueries): past them, the plans are read in reads of that many each. */
+export const PLAN_QUERY_IDS = 400;
+
+/**
+ * The reads of the plans of the window's queries (RCA Query Plans), each newest first, up to `to`, with no lower bound: a
+ * plan's row is written when a read first returns it, and again when it changes (rca/README.md, Query Store), so a plan that
+ * never changed has only its first read's row, from however long before (the review of d441fe13: read from the window's
+ * start, such a plan dropped out). One read per PLAN_QUERY_IDS of the given queries, by their IDs (as DAX's 64-bit
+ * integers), and none when they name none: a plan is used only for a query the statistics or events name, and a read by no
+ * ID took the targets' whole plan history, up to RCA_MAX_ROWS rows, none of them used (the re-check of fc430a78).
+ */
+export function planDaxQueries(from: Date, to: Date, targets: readonly RcaTarget[], queryIds: readonly string[]): string[] {
+    const ids = [...new Set(queryIds)].filter((id) => /^-?\d{1,19}$/.test(id));
+    const spec = SIDECAR_SPEC.queryPlans;
+    return Array.from({ length: Math.ceil(ids.length / PLAN_QUERY_IDS) }, (_, i) => {
+        const some = ids.slice(i * PLAN_QUERY_IDS, (i + 1) * PLAN_QUERY_IDS);
+        return tableDax(spec, from, to, targets, { unbounded: true, filters: [`'${spec.model}'[${spec.fields.queryId.model}] IN { ${some.join(", ")} }`], newestFirst: true });
+    });
 }
 
 /** Whether the model has the RCA tables: the app offers the RCA view and its tools only when it does. */
 export const RCA_PRESENCE_DAX = `EVALUATE ROW ( "Rows", COUNTROWS ( '${RCA_SPEC.coverage.model}' ) )`;
+
+/**
+ * Whether the model has the sidecar's tables, Query Store's evidence: the chat gets their guide only when it does. One query
+ * names all six, so a model without one of them answers that it doesn't know it, which loadSidecar reads as missing.
+ */
+export const SIDECAR_PRESENCE_DAX = `EVALUATE ROW ( ${SIDECAR_TABLES.map((key) => `"${key}", COUNTROWS ( '${SIDECAR_SPEC[key].model}' )`).join(", ")} )`;
 
 /** The Azure Monitor targets: T4, its read replica, and T5, whose metrics the history keeps as analyses postgresql and cosmosdb. */
 export const MONITOR_TARGETS = ["T4", "T4-replica", "T5"] as const satisfies readonly RcaTarget[];
@@ -155,7 +210,7 @@ export async function loadEvidence(runDax: RunDax, from: Date, to: Date, targets
             const started = Date.now();
             try {
                 const rows = await runDax(query, limit);
-                const map = ROW_MAPPERS[key] as (get: (field: string) => unknown) => unknown;
+                const map = ROW_MAPPERS[key] as (get: Get) => unknown;
                 const mapped = rows.map((row) => map((field) => (fields[field] ? row[fields[field].model] : undefined))).filter((r) => r !== null);
                 (evidence[key] as unknown[]).push(...mapped);
                 // Rows come oldest first: one at the limit read up to its last row's time, whose rows may be only some of them
@@ -170,4 +225,56 @@ export async function loadEvidence(runDax: RunDax, from: Date, to: Date, targets
     );
     if (failed.length > 0) throw new RcaReadError(failed);
     return evidence;
+}
+
+export interface SidecarLoadOptions {
+    tables?: readonly SidecarTableKey[];
+    onDax?: (log: DaxLog) => void;
+}
+
+/**
+ * The window's sidecar rows from the history model: Query Store's statistics and waits of every interval that overlaps the
+ * window, its events, the coverage rows whose window, intervals read, or pending publication overlap it, and T4's
+ * connection groups; then the plans of the queries those statistics and events name, as their latest rows up to
+ * PLAN_LAG_MINUTES past the window showed them, however long before it they were first read (planDaxQueries), and no plan
+ * when they name no query. As loadEvidence: a table the model doesn't have is left empty and named in `missing` (a model
+ * from before the sidecar, which is never "none"); any other read that fails fails the load (RcaReadError).
+ */
+export async function loadSidecar(runDax: RunDax, from: Date, to: Date, targets: readonly RcaTarget[], options: SidecarLoadOptions = {}): Promise<SidecarEvidence> {
+    const sidecar = emptySidecar();
+    const failed: Array<{ table: string; error: unknown }> = [];
+    const keys = options.tables ?? SIDECAR_TABLES;
+    /** One read of a table, up to `end`; whether it read, as a table the model doesn't have or a failure didn't. */
+    const read = async (key: SidecarTableKey, query: string, end: Date): Promise<boolean> => {
+        const spec = SIDECAR_SPEC[key];
+        const limit = rcaRowLimit(from, end);
+        const fields = spec.fields as Record<string, { model: string }>;
+        const started = Date.now();
+        try {
+            const rows = await runDax(query, limit);
+            const map = SIDECAR_MAPPERS[key] as (get: Get) => unknown;
+            const mapped = rows.map((row) => map((field) => (fields[field] ? row[fields[field].model] : undefined))).filter((r) => r !== null);
+            (sidecar[SIDECAR_MEMBER[key]] as unknown[]).push(...mapped);
+            // The plans come newest first: one at the limit read back to its last row's time, and not before it.
+            if (rows.length >= limit) (sidecar.cut ??= []).push({ table: spec.model, until: toDate(rows[rows.length - 1][fields[spec.time].model]) ?? end, ...(key === "queryPlans" ? { newestFirst: true } : {}) });
+            options.onDax?.({ table: spec.model, query, rows: rows.length, ms: Date.now() - started });
+            return true;
+        } catch (err) {
+            options.onDax?.({ table: spec.model, query, rows: 0, error: err instanceof Error ? err.message : String(err), ms: Date.now() - started });
+            if (isMissingInModel(err)) sidecar.missing.push(spec.model);
+            else failed.push({ table: spec.model, error: err });
+            return false;
+        }
+    };
+    await Promise.all(keys.filter((key) => key !== "queryPlans").map((key) => read(key, sidecarDax(key, from, to, targets), to)));
+    // The plans once the statistics and events name their queries, a read per PLAN_QUERY_IDS of them, one after another: none
+    // when they name none, and none after a read that failed, which fails the load.
+    if (keys.includes("queryPlans") && failed.length === 0) {
+        const end = new Date(to.getTime() + PLAN_LAG_MINUTES * 60_000);
+        const ids = [...sidecar.stats, ...sidecar.events].flatMap((r) => (r.queryId ? [r.queryId] : []));
+        for (const query of planDaxQueries(from, end, targets, ids)) if (!(await read("queryPlans", query, end))) break;
+    }
+    if (failed.length > 0) throw new RcaReadError(failed);
+    sidecar.missing.sort();
+    return sidecar;
 }

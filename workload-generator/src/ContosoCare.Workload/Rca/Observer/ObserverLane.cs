@@ -85,9 +85,11 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                     // the host stops, so a target that doesn't answer can't hold the span open past the export's wait.
                     using var bound = end is null ? null : CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
                     bound?.CancelAfter(settings.EndTimeout);
+                    // Released where the evidence's own end was done (EndAsync's hook), before a sidecar reader's end reads.
+                    DateTimeOffset? ended = null;
                     try
                     {
-                        await observer.EndAsync(now, bound?.Token ?? cancellationToken).ConfigureAwait(false);
+                        await observer.EndAsync(now, bound?.Token ?? cancellationToken, at => ended = at, time).ConfigureAwait(false);
                     }
                     catch (OperationCanceledException) when (bound?.IsCancellationRequested == true && !cancellationToken.IsCancellationRequested)
                     {
@@ -95,7 +97,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
                     }
                     finally
                     {
-                        Release(observer.Target, time.GetUtcNow(), end);
+                        Release(observer.Target, ended ?? time.GetUtcNow(), end);
                     }
                 }
                 else if (!wanted && observer.BeginsOnConnect)
@@ -136,9 +138,10 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
         {
             // The host is stopping: the last reads and the event session's drop, bounded.
             using var bound = new CancellationTokenSource(settings.EndTimeout);
+            DateTimeOffset? ended = null;
             try
             {
-                await observer.EndAsync(time.GetUtcNow(), bound.Token).ConfigureAwait(false);
+                await observer.EndAsync(time.GetUtcNow(), bound.Token, at => ended = at, time).ConfigureAwait(false);
             }
             catch (Exception ex) when (ex is not OutOfMemoryException)
             {
@@ -146,7 +149,7 @@ internal sealed class ObserverLane(IReadOnlyList<TargetObserver> observers, IRea
             }
             finally
             {
-                Release(observer.Target, time.GetUtcNow());
+                Release(observer.Target, ended ?? time.GetUtcNow());
             }
         }
     }

@@ -189,6 +189,10 @@ lakehouse gets the tables; that first run waits up to -HistoryRunWaitMinutes, si
 for longer than 10 minutes (#68). With -RunLiveActivity and the Azure CLI's sign-in (not -FabricToken), the run also
 takes the Incident RCA's evidence (2026-11-20, ADR 0031): the runners' export on the VMs that run, with what an earlier
 save didn't take, staged as RCA_EVIDENCE_FILE (FABRIC.RCA.EXPORT, FABRIC.RCA.CAPTURE.<target>, FABRIC.RCA.PENDING).
+Its sidecars (2026-11-23, Query Store's evidence) follow it: the acknowledgements an earlier stop deferred go to the
+VMs first, then the sidecars they offer are fetched, staged as RCA_SIDECAR_FILE, taken by at most 3 runs in all (the
+later ones RCA_ONLY, within 15 minutes), and acknowledged on the VMs at once (FABRIC.RCA.SIDECAR); run it again while
+that line says sidecars wait.
 
 .PARAMETER HistoryRunWaitMinutes
 How long the first history run (step 5 by itself, above) is waited for while it's queued on the capacity or runs
@@ -757,23 +761,32 @@ if ($RunLiveActivity -or $firstRun) {
         # The Incident RCA's evidence (2026-11-20, ADR 0031), with -RunLiveActivity after the subscription guard: the runners'
         # export, not a session's last, with what an earlier save didn't take, staged for the run as RCA_EVIDENCE_FILE, as
         # deploy.ps1's snapshot does it (FABRIC.RCA.EXPORT, FABRIC.RCA.CAPTURE.<target>); what the run doesn't take stays
-        # listed in out/history-pending for the next save (FABRIC.RCA.PENDING).
+        # listed in out/history-pending for the next save (FABRIC.RCA.PENDING). Its sidecars (2026-11-23) after it: fetched
+        # (Invoke-DemoRcaSidecarFetch), staged with the run as RCA_SIDECAR_FILE, more runs for what's left while the VMs run
+        # (Invoke-DemoRcaSidecarDrain), and acknowledged on the VMs at once (FABRIC.RCA.SIDECAR).
         $rcaExport = $null
+        $rcaSidecar = $null
         if ($RunLiveActivity -and $azGuarded) {
             $rcaExport = & $module { param($Configuration) Invoke-DemoRcaScriptExport -Config $Configuration -CheckPrefix FABRIC } $config
             foreach ($item in @($rcaExport.Results)) {
                 $results.Add($item)
             }
+            $rcaSidecar = & $module { param($Configuration) Invoke-DemoRcaSidecarFetch -Config $Configuration -CheckPrefix FABRIC -Runs 3 } $config
         }
         $rcaRun = $null
         $rcaPending = $null
+        $sidecarLine = $null
         try {
-            if ($null -ne $rcaExport -and [string]$rcaExport.Evidence) {
-                $rcaRun = & $module { param($Configuration, $Parameters, $Token, $Evidence, $Minutes, $Options) Invoke-DemoRcaNotebookRun -Config $Configuration -Parameter $Parameters -Token $Token -Evidence $Evidence -TimeoutMinutes $Minutes -RunOption $Options } $config $notebookParameters $runToken ([string]$rcaExport.Evidence) $runTimeout $runProgress
+            $hasEvidence = $null -ne $rcaExport -and [string]$rcaExport.Evidence
+            $hasSidecar = $null -ne $rcaSidecar -and @($rcaSidecar.Fetched.Keys).Count -gt 0
+            if ($hasEvidence -or $hasSidecar) {
+                $rcaRun = & $module { param($Configuration, $Parameters, $Token, $Evidence, $Minutes, $Options, $Sidecar) Invoke-DemoRcaNotebookRun -Config $Configuration -Parameter $Parameters -Token $Token -Evidence $Evidence -TimeoutMinutes $Minutes -RunOption $Options -Sidecar $Sidecar } $config $notebookParameters $runToken $(if ($hasEvidence) { [string]$rcaExport.Evidence } else { '' }) $runTimeout $runProgress $rcaSidecar
                 $run = $rcaRun.Run
-                if (-not [bool]$rcaRun.RcaSent) {
+                if ($hasEvidence -and -not [bool]$rcaRun.RcaSent) {
                     $results.Add((New-DemoResult -CheckId 'FABRIC.RCA.EVIDENCE' -Area 'fabric' -Target 'fabric' -Status 'Warning' -Message ('The RCA evidence wasn''t sent with the run: {0}.' -f [string]$rcaRun.RcaNote) -Remediation $(if ([string]$rcaRun.RcaNote -notmatch 'from before the Incident RCA') { 'Run this command again: it stages the evidence again.' } elseif ([bool]$fabric['importNotebooks']) { 'Run ./scripts/deploy.ps1, or this script with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook; then this command again sends the evidence.' } else { 'Run ./scripts/deploy.ps1, which updates the notebook unless someone edited it, or this script with -Notebook NB_DatabaseHub_LiveActivity in place of -SkipNotebookImport, which updates that notebook alone, edited or not; then this command again sends the evidence.' }) -DocUrl 'https://learn.microsoft.com/fabric/onelake/onelake-access-api'))
                 }
+                # The sidecars the first run couldn't take, while the VMs run (F9).
+                & $module { param($Configuration, $Sidecar, $Token, $Parameters) Invoke-DemoRcaSidecarDrain -Config $Configuration -Sidecar $Sidecar -Token $Token -Parameter $Parameters } $config $rcaSidecar $runToken $notebookParameters
             }
             else {
                 $run = Invoke-DemoFabricNotebookRun -Config $config -Name 'NB_DatabaseHub_LiveActivity' -Parameter $notebookParameters -Token $runToken -TimeoutMinutes $runTimeout @runProgress
@@ -787,10 +800,17 @@ if ($RunLiveActivity -or $firstRun) {
                 $rcaWhy = if ($null -ne $rcaRun -and [string]$rcaRun.RcaNote) { [string]$rcaRun.RcaNote } else { 'the run didn''t complete' }
                 $rcaPending = & $module { param($Configuration, $Export, $Saved, $Why) Save-DemoRcaPending -Config $Configuration -CheckPrefix FABRIC -Export $Export -Saved:$Saved -Why $Why -Confirm:$false } $config $rcaExport $rcaSaved $rcaWhy
             }
+            # The sidecars: acknowledged on the VMs at once, since they run; the rest waits on them (FABRIC.RCA.SIDECAR).
+            if ($null -ne $rcaSidecar) {
+                $sidecarLine = & $module { param($Configuration, $Sidecar) Complete-DemoRcaSidecarSave -Config $Configuration -Sidecar $Sidecar -Now -Why 'the run didn''t complete' } $config $rcaSidecar
+            }
         }
         $results.Add($run)
         if ($null -ne $rcaPending) {
             $results.Add($rcaPending)
+        }
+        if ($null -ne $sidecarLine) {
+            $results.Add($sidecarLine)
         }
         if ($PostgresMetricsPath -and [string]$run.status -eq 'Pass' -and -not $postgresWithheld) {
             # Added to the history: the file moves aside, so it isn't sent again by mistake.

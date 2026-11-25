@@ -472,7 +472,9 @@ function Save-DemoFabricHistory {
     (2026-11-20, ADR 0031; -RcaEvidence, from Invoke-DemoRcaScriptExport) is staged in the lakehouse and passed as
     RCA_EVIDENCE_FILE (Invoke-DemoRcaNotebookRun), only to a copy of the notebook that knows it; otherwise the run is a
     Warning that says why, and the caller keeps the documents' list for the next save (Save-DemoRcaPending); so is a run
-    that completed without writing it (the notebook left the staged file; review of 3b1348a). Returns Result,
+    that completed without writing it (the notebook left the staged file; review of 3b1348a). The save's RCA sidecars
+    (2026-11-23, -RcaSidecar) go with the run as RCA_SIDECAR_FILE, for a copy of the notebook that declares it; the caller
+    reads what came of them in -RcaSidecar and says so in STOP.RCA.SIDECAR. Returns Result,
     StillRunning (the run hadn't finished when the wait ended, so the capacity mustn't be paused under it),
     PostgresDropped, CosmosDropped, RcaSaved (the evidence was passed, the run completed, and the notebook wrote it), and
     RcaNote (why not).
@@ -502,7 +504,12 @@ function Save-DemoFabricHistory {
         # One RCA_EVIDENCE document (2026-11-20, ADR 0031; Invoke-DemoRcaScriptExport), staged for the notebook's
         # RCA_EVIDENCE_FILE; '' stages none.
         [AllowEmptyString()]
-        [string] $RcaEvidence = ''
+        [string] $RcaEvidence = '',
+
+        # The save's RCA sidecars (2026-11-23, Invoke-DemoRcaSidecarFetch), staged for the notebook's RCA_SIDECAR_FILE
+        # (Invoke-DemoRcaNotebookRun -Sidecar); the caller finishes them (Complete-DemoRcaSidecarSave).
+        [AllowNull()]
+        [object] $RcaSidecar = $null
     )
 
     $checkId = 'STOP.FABRIC.SAVEHISTORY'
@@ -587,7 +594,7 @@ function Save-DemoFabricHistory {
             $parameters['COSMOS_METRICS'] = $CosmosMetrics
         }
     }
-    $rcaRun = Invoke-DemoRcaNotebookRun -Config $resolved -Parameter $parameters -Token $token -Evidence $RcaEvidence -TimeoutMinutes $TimeoutMinutes
+    $rcaRun = Invoke-DemoRcaNotebookRun -Config $resolved -Parameter $parameters -Token $token -Evidence $RcaEvidence -TimeoutMinutes $TimeoutMinutes -Sidecar $RcaSidecar
     $run = $rcaRun.Run
     $jobStatus = [string](Get-DemoMemberValue -InputObject $run.evidence -Name 'status')
     $stillRunning = $run.status -eq 'Warning' -and $jobStatus -notin 'Completed', 'Failed', 'Cancelled', 'Deduped', ''

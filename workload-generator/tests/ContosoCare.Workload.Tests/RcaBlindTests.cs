@@ -70,10 +70,29 @@ public sealed partial class RcaBlindTests
     }
 
     [Fact]
+    public void TheCaptureNeverReadsTheAnswerKeyList()
+    {
+        // The capture leaves out its own statements and the harness's by fixed rules (rca/README.md, What the capture leaves
+        // out), never by the answer key: the runner doesn't embed rca/blind-detection.json, and no source reads it, so editing
+        // it can't change a captured byte.
+        Assert.DoesNotContain(typeof(CaptureCatalog).Assembly.GetManifestResourceNames(), n => n.Contains("blind-detection", StringComparison.OrdinalIgnoreCase));
+        var source = RepositoryPaths.Combine("workload-generator", "src", "ContosoCare.Workload");
+        var reading = Directory.GetFiles(source, "*.*", SearchOption.AllDirectories)
+            .Where(f => (f.EndsWith(".cs", StringComparison.Ordinal) || f.EndsWith(".csproj", StringComparison.Ordinal))
+                && !f.Contains($"{Path.DirectorySeparatorChar}obj{Path.DirectorySeparatorChar}", StringComparison.Ordinal)
+                && !f.Contains($"{Path.DirectorySeparatorChar}bin{Path.DirectorySeparatorChar}", StringComparison.Ordinal))
+            .Where(f => Regex.IsMatch(File.ReadAllText(f), "\"[^\"\\n]*blind-detection[^\"\\n]*\"|Include=\"[^\"]*blind-detection"))
+            .Select(f => Path.GetRelativePath(RepositoryPaths.Root, f))
+            .ToList();
+        Assert.Empty(reading);
+        Assert.All(CaptureCatalog.All, b => Assert.DoesNotContain("@leave_out", b.Value, StringComparison.Ordinal));
+    }
+
+    [Fact]
     public void EveryTSqlBlockParsesAndOnlyReadsOrManagesItsOwnEventSession()
     {
         var blocks = CaptureCatalog.All.Where(b => !b.Key.StartsWith("RCA-PG-", StringComparison.Ordinal)).ToList();
-        Assert.Equal(24, blocks.Count);
+        Assert.Equal(27, blocks.Count);
 
         var findings = new List<string>();
         foreach (var (id, text) in blocks.Append(new("RCA-XE-05 (T3, database-scoped)", CaptureCatalog.DatabaseScopedDrop())))
@@ -100,7 +119,7 @@ public sealed partial class RcaBlindTests
     public void EveryPostgresBlockOnlyReads()
     {
         var blocks = CaptureCatalog.All.Where(b => b.Key.StartsWith("RCA-PG-", StringComparison.Ordinal)).ToList();
-        Assert.Equal(12, blocks.Count);
+        Assert.Equal(17, blocks.Count);
 
         foreach (var (id, text) in blocks)
         {
@@ -115,10 +134,16 @@ public sealed partial class RcaBlindTests
         var files = new List<string>();
         foreach (var pattern in runner.GetProperty("include").EnumerateArray().Select(p => p.GetString()!))
         {
-            // The contract's runner patterns are <folder>/**/<file pattern>.
+            // The contract's runner patterns are <folder>/**/<file pattern>. A folder a builder hasn't created yet has no
+            // files to scan; Rca.Contract.Tests.ps1 checks that every folder under Rca/ is scanned or exempt.
             var split = pattern.Split("/**/");
             Assert.Equal(2, split.Length);
             var folder = Path.Combine(RepositoryPaths.Root, split[0].Replace('/', Path.DirectorySeparatorChar));
+            if (!Directory.Exists(folder))
+            {
+                continue;
+            }
+
             files.AddRange(Directory.GetFiles(folder, split[1], SearchOption.AllDirectories).Select(f => Path.GetRelativePath(RepositoryPaths.Root, f).Replace('\\', '/')));
         }
 

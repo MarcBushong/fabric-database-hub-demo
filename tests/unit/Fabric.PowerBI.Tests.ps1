@@ -80,17 +80,18 @@ BeforeAll {
 }
 
 Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
-    It 'is a TMDL folder: definition.pbism, compatibility level 1702, en-US, implicit measures off, 18 tables' {
+    It 'is a TMDL folder: definition.pbism, compatibility level 1702, en-US, implicit measures off, 24 tables' {
         Test-Path -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition.pbism') | Should -BeTrue
         Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/database.tmdl') -Raw | Should -Match 'compatibilityLevel: 1702'
         $model = Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/model.tmdl') -Raw
         $model | Should -Match 'culture: en-US'
         $model | Should -Match 'discourageImplicitMeasures'
-        # The ten tables before the Incident RCA, and its eight (ADR 0031), each with a ref in model.tmdl.
-        $tableFiles.Count | Should -Be 18
-        @([regex]::Matches($model, '(?m)^ref table ')).Count | Should -Be 18
-        @($script:measures).Count | Should -Be 121
-        ([regex]::Matches((Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/relationships.tmdl') -Raw), '(?m)^relationship ')).Count | Should -Be 32
+        # The ten tables before the Incident RCA, and its fourteen (ADR 0031): the evidence document's eight and the sidecar's
+        # six (2026-11-23), each with a ref in model.tmdl.
+        $tableFiles.Count | Should -Be 24
+        @([regex]::Matches($model, '(?m)^ref table ')).Count | Should -Be 24
+        @($script:measures).Count | Should -Be 128
+        ([regex]::Matches((Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/relationships.tmdl') -Raw), '(?m)^relationship ')).Count | Should -Be 44
     }
 
     It 'commits no real ID: the only GUIDs are the all-zero OneLake placeholder, twice' {
@@ -102,7 +103,7 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
         Get-Content -LiteralPath (Join-Path -Path $modelRoot -ChildPath 'definition/expressions.tmdl') -Raw | Should -Match ([regex]::Escape("https://onelake.dfs.fabric.microsoft.com/$zero/$zero"))
     }
 
-    It 'reads only the thirteen notebook tables, from schema dbo, through the Direct Lake expression' {
+    It 'reads only the notebooks'' tables, from schema dbo, through the Direct Lake expression' {
         $text = ($tableFiles | ForEach-Object { [System.IO.File]::ReadAllText($_.FullName) }) -join "`n"
         $entities = @([regex]::Matches($text, '(?m)^\s+entityName:\s*(\S+)\s*$') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
         $rca = (Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json).tables.name
@@ -111,14 +112,16 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
         @([regex]::Matches($text, "(?m)^\s+expressionSource:\s*(.+?)\s*$") | ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique) | Should -Be @("'DirectLake - LH_DatabaseHub'")
     }
 
-    It 'models the Incident RCA''s eight tables as rca/history-tables.json says: columns, types, hidden ones, formats, measures, and Target and Date relationships (ADR 0031)' {
+    It 'models the Incident RCA''s tables as rca/history-tables.json says: columns, types, hidden ones, formats, measures, and Target and Date relationships (ADR 0031)' {
         $contract = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'rca/history-tables.json') -Raw | ConvertFrom-Json -AsHashtable
+        # The evidence document's eight and the sidecar's six (rca/README.md, The sidecar).
+        $modelTables = @($contract['tables'])
         $relationships = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/relationships.tmdl'))
         $notebook = @{}
         foreach ($column in $contract['notebookColumns']) {
             $notebook[$column['name']] = $column
         }
-        foreach ($table in $contract['tables']) {
+        foreach ($table in $modelTables) {
             $name = $table['model']
             $file = Join-Path -Path $modelRoot -ChildPath ('definition/tables/{0}.tmdl' -f $name)
             Test-Path -LiteralPath $file | Should -BeTrue -Because $name
@@ -164,8 +167,45 @@ Describe 'Semantic model SM_DatabaseHub_History (Phase 19)' {
         $head | Should -Match "CONTAINSSTRING \( \[WaiterBlockers\], HeadId \)"
         $head | Should -Match "\[WaiterTarget\] = HeadTarget && \[WaiterTime\] = HeadTime"
         $head | Should -Match "DIVIDE \( MAXX \( Blockers, 'RCA Sessions'\[Idle \(ms\)\] \), 1000 \)"
-        # The notebook's RCA.EVIDENCE finding has its row in the Analysis dimension.
-        [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Analysis.tmdl')) | Should -Match '\{ "rca_evidence", "Incident RCA evidence", "Readiness", "Per run", 20 \}'
+        # The notebook's RCA.EVIDENCE and RCA.SIDECAR findings have their rows in the Analysis dimension.
+        $analysis = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/Analysis.tmdl'))
+        $analysis | Should -Match '\{ "rca_evidence", "Incident RCA evidence", "Readiness", "Per run", 20 \}'
+        $analysis | Should -Match '\{ "rca_sidecar", "Incident RCA sidecar", "Readiness", "Per run", 21 \}'
+        $notebook = Get-Content -LiteralPath (Join-Path -Path $repoRoot -ChildPath 'fabric/notebooks/NB_DatabaseHub_LiveActivity.ipynb') -Raw | ConvertFrom-Json -AsHashtable -Depth 64
+        (@($notebook['cells'] | ForEach-Object { @($_['source']) -join '' }) -join "`n") | Should -Match ([regex]::Escape('add_finding("rca_sidecar", "all", status, "RCA.SIDECAR: "'))
+        # The sidecar's measures take each interval's latest read, so two reads of one interval count once (rca/README.md,
+        # Query Store), and so does a history written before the notebook kept only the latest.
+        $stats = [System.IO.File]::ReadAllText((Join-Path -Path $modelRoot -ChildPath 'definition/tables/RCA Query Stats.tmdl'))
+        foreach ($name in 'Query CPU (ms)', 'Query Duration (ms)', 'Query Executions', 'Query Wait (ms)') {
+            $body = [regex]::Match($stats, ("(?ms)^ {{4}}measure '{0}' =.*?(?=^ {{4}}\S|\z)" -f [regex]::Escape($name))).Value
+            $body | Should -Match ([regex]::Escape("SUMMARIZE ( 'RCA Query Stats', 'RCA Query Stats'[Target Key], 'RCA Query Stats'[Interval Start UTC], 'RCA Query Stats'[Login], 'RCA Query Stats'[Query ID], 'RCA Query Stats'[Plan ID] )")) -Because $name
+            $body | Should -Match ([regex]::Escape("'RCA Query Stats'[Captured At UTC] = latest")) -Because $name
+        }
+    }
+
+    It 'totals RCA Query Waits nowhere, since no measure of it takes the latest read (review-qs-b)' {
+        # Its rows hold every read of an interval, so a sum over them counts an interval read twice. The app totals them
+        # through latestReads (fabric/app/src/rca), and the chat's guide says so.
+        $tables = Join-Path -Path $modelRoot -ChildPath 'definition/tables'
+        $waits = [System.IO.File]::ReadAllLines((Join-Path -Path $tables -ChildPath 'RCA Query Waits.tmdl'))
+        @($waits | Where-Object { $_ -match '^\s+measure ' }) | Should -BeNullOrEmpty
+        $column = $null
+        $numbers = [System.Collections.Generic.Dictionary[string, string]]::new()
+        foreach ($line in $waits) {
+            if ($line -match "^\s+column '?([^'=]+?)'?\s*$") { $column = $Matches[1] }
+            elseif ($column -and $line -match '^\s+dataType:\s*(int64|double|decimal)\s*$') { $numbers[$column] = '' }
+            elseif ($column -and $line -match '^\s+summarizeBy:\s*(\S+)') { if ($numbers.ContainsKey($column)) { $numbers[$column] = $Matches[1] } }
+        }
+        $numbers.Count | Should -BeGreaterThan 3
+        @($numbers.GetEnumerator() | Where-Object { $_.Value -ne 'none' } | ForEach-Object { $_.Key }) | Should -BeNullOrEmpty -Because 'a number column that summarizes sums every read of an interval in a visual'
+        $readers = foreach ($file in Get-ChildItem -LiteralPath $tables -Filter '*.tmdl' | Where-Object { $_.Name -ne 'RCA Query Waits.tmdl' }) {
+            foreach ($line in [System.IO.File]::ReadAllLines($file.FullName)) {
+                if ($line -notmatch '^\s*///' -and $line.Contains("'RCA Query Waits'")) { '{0}: {1}' -f $file.Name, $line.Trim() }
+            }
+        }
+        @($readers) | Should -BeNullOrEmpty -Because 'no measure or calculated column reads it'
+        $report = Join-Path -Path $repoRoot -ChildPath 'fabric/powerbi/RPT_DatabaseHub_History.Report'
+        @(Get-ChildItem -LiteralPath $report -Recurse -File | Where-Object { [System.IO.File]::ReadAllText($_.FullName).Contains('RCA Query Waits') } | ForEach-Object { $_.Name }) | Should -BeNullOrEmpty -Because 'no report visual reads it'
     }
 
     It 'gives every measure a /// description' {

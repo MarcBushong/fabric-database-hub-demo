@@ -9,11 +9,47 @@ namespace ContosoCare.Workload.Rca.Observer;
 /// test role), with the observer's own application name, a 1-second lock_timeout, and a 10-second statement_timeout.
 /// Every block runs after pg_stat_clear_snapshot() in the same round trip, so no statistics view repeats an earlier
 /// snapshot (rca/capture/postgresql.sql; https://www.postgresql.org/docs/18/monitoring-stats.html#MONITORING-STATS-FUNCTIONS).
+/// Every connection opens silently (<see cref="Startup"/>): its search_path, which names <see cref="ObserverSchema"/>,
+/// and its limits come in its startup packet, and Npgsql loads no types for it (each block returns PostgreSQL's built-in
+/// types only), so it sends nothing but the catalog's blocks and the snapshot clear before each. Query Store records each
+/// statement's search_path (query_store.qs_view), and RCA-PG-14 leaves out the observer's own statements by it, and by
+/// their text (rca/README.md, What the capture leaves out).
 /// </summary>
-internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : ICaptureConnector
+internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log, PgSessionLimits? limits = null) : ICaptureConnector
 {
     /// <summary>The observer never waits behind what it observes: a 1-second lock timeout, 10 seconds per statement.</summary>
     internal static readonly PgSessionLimits Limits = new(10_000, 1_000, 60_000);
+
+    /// <summary>azure_sys's reads aggregate Query Store's intervals: 30 seconds per statement, still a 1-second lock timeout.</summary>
+    internal static readonly PgSessionLimits QueryStoreLimits = new(30_000, 1_000, 60_000);
+
+    /// <summary>The database where Query Store's views are (https://learn.microsoft.com/azure/postgresql/monitor/concepts-query-store).</summary>
+    public const string QueryStoreDatabase = "azure_sys";
+
+    /// <summary>
+    /// A schema that exists nowhere, last in the observer's search_path, so names resolve as before (PostgreSQL ignores a
+    /// schema that doesn't exist: https://www.postgresql.org/docs/18/runtime-config-client.html#GUC-SEARCH-PATH).
+    /// </summary>
+    public const string ObserverSchema = "dbhubdemo_rca_observer";
+
+    /// <summary>
+    /// The observer's search_path, a server option in its connections' startup packet (Npgsql's Options, libpq's options):
+    /// the server's default, <c>"$user", public</c>, with <see cref="ObserverSchema"/> last. The runner's T4 control
+    /// connections open the same way (<see cref="Startup"/>), so RCA-PG-14 leaves out their statements too; its workload
+    /// sessions never do. A space in a value is escaped with a backslash
+    /// (https://www.postgresql.org/docs/18/libpq-connect.html#LIBPQ-CONNECT-OPTIONS).
+    /// </summary>
+    internal const string SearchPathOption = """-c search_path="$user",\ public,\ """ + ObserverSchema;
+
+    /// <summary>
+    /// How every observer connection, and the runner's T4 control connections, open: <see cref="SearchPathOption"/> and their
+    /// limits in the startup packet, and no type loading. A control connection whose startup the server refuses opens once
+    /// more without them, after a Warning (rca.marker-refused); the observer's and the answer key's never do.
+    /// </summary>
+    internal static readonly PgSilentStartup Startup = new(SearchPathOption);
+
+    /// <summary>What every block runs after, in the same round trip, so no statistics view repeats an earlier snapshot.</summary>
+    internal const string ClearSnapshot = "SELECT pg_stat_clear_snapshot()";
 
     // insufficient_privilege.
     private static readonly HashSet<string> PermissionStates = ["42501"];
@@ -24,12 +60,16 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : I
 
     public string Description => endpoint.Describe();
 
+    /// <summary>T4's azure_sys, for Query Store's reads (RCA-PG-14 and 15): the same server, sign-in, and application name.</summary>
+    public static PgCaptureConnector QueryStore(PgEndpoint endpoint, RunnerLog log) =>
+        new(endpoint with { Database = QueryStoreDatabase }, log, QueryStoreLimits);
+
     public async Task<ICaptureConnection> OpenAsync(CancellationToken cancellationToken)
     {
         try
         {
             // One attempt: the observer's own loop tries again later, so a replica that doesn't exist yet costs one connect.
-            var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(ApplicationNames.Observer, cancellationToken, Limits, retry: false).ConfigureAwait(false);
+            var connection = await new PgConnectionOpener(endpoint, log).OpenAsync(ApplicationNames.Observer, cancellationToken, limits ?? Limits, retry: false, Startup).ConfigureAwait(false);
             return new PgCaptureConnection(connection);
         }
         catch (Exception ex) when (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested)
@@ -56,17 +96,27 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : I
 
     private sealed class PgCaptureConnection(NpgsqlConnection connection) : ICaptureConnection
     {
-        public async Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken)
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken) =>
+            // RCA-PG-11's $1: a positional parameter, so the block runs exactly as the catalog has it.
+            RunAsync(text, parameter is null ? CaptureParameters.None : CaptureParameters.Positional(parameter), timeout, cancellationToken);
+
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken) =>
+            parameters.IsNamed
+                ? throw new NotSupportedException($"{blockId} is PostgreSQL's, whose parameters are bound by position.")
+                : RunAsync(text, parameters, timeout, cancellationToken);
+
+        public ValueTask DisposeAsync() => connection.DisposeAsync();
+
+        private async Task<IReadOnlyList<CaptureValues>> RunAsync(string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken)
         {
             try
             {
                 await using var batch = new NpgsqlBatch(connection) { Timeout = Math.Max(1, (int)Math.Ceiling(timeout.TotalSeconds)) };
-                batch.BatchCommands.Add(new NpgsqlBatchCommand("SELECT pg_stat_clear_snapshot()"));
+                batch.BatchCommands.Add(new NpgsqlBatchCommand(ClearSnapshot));
                 var command = new NpgsqlBatchCommand(text);
-                if (parameter is not null)
+                foreach (var parameter in parameters)
                 {
-                    // RCA-PG-11's $1: a positional parameter, so the block runs exactly as the catalog has it.
-                    command.Parameters.Add(new NpgsqlParameter { Value = parameter });
+                    command.Parameters.Add(new NpgsqlParameter { Value = parameter.Value is DateTimeOffset time ? time.ToUniversalTime() : parameter.Value ?? DBNull.Value });
                 }
 
                 batch.BatchCommands.Add(command);
@@ -95,7 +145,5 @@ internal sealed class PgCaptureConnector(PgEndpoint endpoint, RunnerLog log) : I
                 throw Translate(ex, connecting: false);
             }
         }
-
-        public ValueTask DisposeAsync() => connection.DisposeAsync();
     }
 }

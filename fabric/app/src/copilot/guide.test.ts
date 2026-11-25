@@ -11,13 +11,79 @@ import { contextPrompt, endedWithoutAnswer, hasAnswer, NO_ANSWER, recap, reduceC
 import { buildSystemMessage } from "./guide";
 import { closeOpenMarks } from "./markdown-blocks";
 import { relayRegion } from "./messages";
-import { ANSWER_KEY_MEASURES, MODEL_GUIDE } from "./model-guide.generated";
+import { ANSWER_KEY_MEASURES, MODEL_GUIDE, SIDECAR_GUIDE } from "./model-guide.generated";
+import { formatSidecarGuide, SIDECAR_GUIDE_TABLES, sidecarGuideProblems, sidecarModelTables, type ContractColumn, type HistoryContract } from "./sidecar-guide";
 import { COSMOS_PROBE_DAX } from "./starters";
 import { parseRelationships, parseTable, reachesAnswerKey, tableMembers, tableOfRef, toDaxRef } from "./tmdl";
 
 describe("the model guide", () => {
     it("matches the history model's TMDL (run npm run guide:build after changing the model)", () => {
         expect(readFileSync(OUTPUT, "utf8").replace(/\r\n/g, "\n")).toBe(buildGuideSource());
+    });
+
+    // The coordinator's decision after review-qs-b: Query Store's six tables took about 20,000 of the always-on guide's
+    // 57,000 characters. They get a compact section instead, which a conversation gets only when the model has them.
+    it("leaves a sidecar table and its relationships out of the always-on guide", () => {
+        const dir = mkdtempSync(join(tmpdir(), "dbhub-model-"));
+        try {
+            cpSync(MODEL_DIR, dir, { recursive: true });
+            // A sidecar table as the model would hold it: an RCA table's shape under a sidecar table's name, related to Target.
+            const resource = readFileSync(join(dir, "tables", "RCA Resource.tmdl"), "utf8");
+            writeFileSync(join(dir, "tables", "RCA Query Stats.tmdl"), resource.replace("table 'RCA Resource'", "table 'RCA Query Stats'"), "utf8");
+            const relationships = join(dir, "relationships.tmdl");
+            writeFileSync(relationships, `${readFileSync(relationships, "utf8")}\nrelationship 'RCA Query Stats to Target'\n    fromColumn: 'RCA Query Stats'.'Target Key'\n    toColumn: Target.'Target Key'\n`, "utf8");
+            const source = buildGuideSource(dir);
+            const guide = JSON.parse(/export const MODEL_GUIDE = (".*");/.exec(source)![1]) as string;
+            expect(guide).not.toContain("'RCA Query Stats'");
+            expect(guide).toContain("'RCA Resource'[At UTC]");
+            expect(source).toBe(readFileSync(OUTPUT, "utf8").replace(/\r\n/g, "\n"));
+        } finally {
+            rmSync(dir, { recursive: true, force: true });
+        }
+    });
+
+    it("gives the sidecar's tables a compact section from the contract: the columns to group or filter by, the measures, and the rule", () => {
+        const contract = readContract<HistoryContract & { notebookColumns: ContractColumn[] }>("history-tables.json");
+        const sidecar = sidecarModelTables(contract);
+        expect([...sidecar].sort()).toEqual(["RCA Connections", "RCA Query Coverage", "RCA Query Events", "RCA Query Plans", "RCA Query Stats", "RCA Query Waits"]);
+        for (const table of sidecar) {
+            expect(MODEL_GUIDE).not.toContain(`'${table}'`);
+            expect(SIDECAR_GUIDE).toContain(`- '${table}', `);
+        }
+        const measures = contract.measures.filter((m) => sidecar.includes(m.table));
+        expect(measures).toHaveLength(7);
+        for (const m of measures) expect(SIDECAR_GUIDE).toContain(`- [${m.name}] on '${m.table}': ${m.description}`);
+        for (const g of SIDECAR_GUIDE_TABLES) for (const [column] of g.columns) expect(SIDECAR_GUIDE).toContain(`[${column}]`);
+        expect(SIDECAR_GUIDE).toContain("use these measures, which take each interval's latest read, and never sum the tables' numeric columns");
+        // No hidden column, and no source view.
+        const hidden = [...contract.notebookColumns, ...contract.tables.filter((t) => sidecar.includes(t.model)).flatMap((t) => t.columns)].filter((c) => c.model.hidden).map((c) => c.model.column);
+        expect(hidden).toEqual(expect.arrayContaining(["Run ID", "Document ID", "Report Date UTC", "Target Key", "Run Token"]));
+        const columns = SIDECAR_GUIDE.slice(SIDECAR_GUIDE.indexOf("Columns to group or filter by:"));
+        for (const column of hidden) {
+            expect(columns).not.toContain(`[${column}]`);
+            for (const table of sidecar) expect(SIDECAR_GUIDE).not.toContain(`'${table}'[${column}]`);
+        }
+        expect(SIDECAR_GUIDE).not.toMatch(/lakehouse table|dbo\./);
+        expect(SIDECAR_GUIDE.length).toBeGreaterThan(3000);
+        expect(SIDECAR_GUIDE.length).toBeLessThan(5000);
+        expect(SIDECAR_GUIDE).not.toMatch(/scenario|inject|fixed minutes|incident window/i);
+        expect(namesAScenario(SIDECAR_GUIDE)).toEqual([]);
+    });
+
+    it("writes no sidecar section for a contract its tables and columns don't match", () => {
+        const contract = readContract<HistoryContract>("history-tables.json");
+        expect(sidecarGuideProblems(contract)).toEqual([]);
+        const changed = structuredClone(contract);
+        const stats = changed.tables.find((t) => t.model === "RCA Query Stats")!;
+        stats.columns.find((c) => c.model.column === "Module")!.model.column = "Object";
+        stats.columns.find((c) => c.model.column === "Login")!.model.hidden = true;
+        changed.tables.push({ ...stats, name: "rca_query_more", model: "RCA Query More" });
+        expect(sidecarGuideProblems(changed)).toEqual([
+            "'RCA Query More' is a sidecar table the guide doesn't describe.",
+            "'RCA Query Stats'[Login] is hidden in the model.",
+            "'RCA Query Stats'[Module] isn't in the contract.",
+        ]);
+        expect(() => formatSidecarGuide(changed)).toThrow(/doesn't match rca\/history-tables\.json/);
     });
 
     it("names the model's tables, measures, and target keys exactly as DAX needs them", () => {
@@ -265,6 +331,14 @@ describe("the model guide", () => {
         expect(new TextEncoder().encode(rca).length).toBeLessThan(96 * 1024);
     });
 
+    it("adds Query Store's compact guide only when the model has the RCA tables and the sidecar's, before the playbook", () => {
+        const both = buildSystemMessage({ estate: false, rca: true, sidecar: true });
+        expect(both).toContain(`${MODEL_GUIDE}\n\n${SIDECAR_GUIDE}\n\n${INVESTIGATION_PLAYBOOK}`);
+        expect(both.endsWith(INVESTIGATION_PLAYBOOK)).toBe(true);
+        expect(new TextEncoder().encode(both).length).toBeLessThan(96 * 1024);
+        for (const message of [buildSystemMessage({ estate: false, rca: true }), buildSystemMessage({ estate: false, sidecar: true })]) expect(message).not.toContain(SIDECAR_GUIDE);
+    });
+
     // R925: the model ended a turn with suggest_followups and no answer, and said "401" to the audience.
     it("tells Copilot to finish with a written answer, never with codes or routes, and what to do when the live view isn't available", () => {
         const message = buildSystemMessage({ estate: true });
@@ -292,11 +366,14 @@ describe("the model guide", () => {
         expect(COSMOS_PROBE_DAX).toContain("[Has Cosmos DB Bins]");
     });
 
-    // The owner, 2026-11-23: the chat said "T1 doesn't have Query Store". The tables no capture writes yet say so, and that
-    // their emptiness says nothing about a target, so the chat can't read an empty RCA Queries as a target without one.
-    it("says the RCA tables no capture writes yet are empty for that reason, never because a target has no Query Store", () => {
+    // The owner, 2026-11-23: the chat said "T1 doesn't have Query Store". The tables no capture writes say why they're
+    // empty, and that their emptiness says nothing about a target, so the chat can't read an empty RCA Queries as a target
+    // without one. Since the sidecar, RCA Queries says where Query Store's statistics are: the guide that the chat reads with
+    // the sidecar's own (SIDECAR_GUIDE) must not say the capture doesn't collect them.
+    it("says the RCA tables no capture writes are empty for that reason, never because a target has no Query Store", () => {
         const description = (table: string) => MODEL_GUIDE.split(`## '${table}' (lakehouse table dbo.`)[1].split("\n")[1];
-        expect(description("RCA Queries")).toMatch(/^Not written yet: the capture doesn't collect Query Store's statistics yet, so this table is empty, and its emptiness says nothing about a target's Query Store: never that a target has none \(validate\.ps1's T1\.QUERYSTORE to T3\.QUERYSTORE say whether it's on\)\. /);
+        expect(description("RCA Queries")).toMatch(/^Not written: Query Store's statistics are in the sidecar's tables since 2026-11-23 \(RCA Query Stats, RCA Query Waits, and RCA Query Plans, when the model has them\), so this table from the RCA's first design stays empty, and its emptiness says nothing about a target's Query Store: never that a target has none \(validate\.ps1's T1\.QUERYSTORE to T3\.QUERYSTORE say whether it's on\)\. /);
+        expect(MODEL_GUIDE).not.toMatch(/the capture doesn't collect Query Store's/);
         expect(description("RCA Waits")).toMatch(/^Not written yet: the capture doesn't diff the wait statistics yet, so this table is empty, and its emptiness says nothing about the targets' waits or their Query Store; Telemetry Snapshots holds T1 to T3's waits by category\. /);
         // The tables the capture writes don't say it.
         for (const table of ["RCA Sessions", "RCA Events", "RCA Resource", "RCA Replica", "RCA Coverage"]) expect(description(table)).not.toMatch(/^Not written yet/);

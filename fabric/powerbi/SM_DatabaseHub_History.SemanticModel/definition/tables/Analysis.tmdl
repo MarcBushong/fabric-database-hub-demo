@@ -59,6 +59,7 @@ table Analysis
                         { "postgresql", "PostgreSQL (Azure Monitor)", "PostgreSQL", "Per bin", 17 },
                         { "database_agent", "Database Agent loop", "Incidents", "Per agent beat", 18 },
                         { "cosmosdb", "Azure Cosmos DB (Azure Monitor)", "Cosmos DB", "Per bin", 19 },
-                        { "rca_evidence", "Incident RCA evidence", "Readiness", "Per run", 20 }
+                        { "rca_evidence", "Incident RCA evidence", "Readiness", "Per run", 20 },
+                        { "rca_sidecar", "Incident RCA sidecar", "Readiness", "Per run", 21 }
                     }
                 )

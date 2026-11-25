@@ -149,6 +149,10 @@ Describe 'Invoke-DemoHistorySnapshotStep (2026-11-06)' {
         # The Incident RCA's export (2026-11-20) has its own tests below; here it finds nothing, as on a demo without a runner.
         $script:rcaExport = [pscustomobject]@{ Evidence = ''; Documents = @(); Pending = @(); PendingFound = $false; Results = @(New-DemoResult -CheckId 'DEPLOY.RCA.EXPORT' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message 'No workload runner was deployed, so there''s no RCA evidence to export.') }
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaScriptExport -MockWith { $script:rcaExport }
+        # The sidecars (2026-11-23): none fetched, unless a test says otherwise.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $null }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarDrain -MockWith { }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarSave -MockWith { $null }
 
         $script:progress = Join-Path -Path $TestDrive -ChildPath ('progress-' + [guid]::NewGuid().ToString('N') + '.json')
         InModuleScope DbHubDemo -Parameters @{ Path = $script:progress } { Initialize-DemoProgress -Path $Path -Model (New-DemoProgressModel -Catalog (Get-DemoProgressCatalog)) -Confirm:$false }
@@ -906,6 +910,37 @@ Describe 'deploy.ps1''s history snapshot with the Incident RCA''s evidence (2026
         $script:invoke = {
             InModuleScope DbHubDemo -Parameters @{ Arguments = @{ Config = $script:config; Result = $script:done; Requirement = $script:requirement; DoneChecked = $true; Environment = [pscustomobject]@{ GitHubActions = $false } } } { Invoke-DemoHistorySnapshotStep @Arguments }
         }
+        # The sidecars (2026-11-23): none fetched, and no line, unless a test says otherwise. A switch that isn't passed isn't a
+        # variable in a mock under strict mode, so it's read from $PesterBoundParameters.
+        $script:sidecarState = $null
+        $script:sidecarLine = $null
+        $script:order = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $script:order.Add(('fetch {0} {1} {2}' -f $CheckPrefix, [bool]$PesterBoundParameters['Final'], $PesterBoundParameters['Runs'])); $script:sidecarState }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarDrain -MockWith { $script:order.Add('drain') }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarSave -MockWith { $script:order.Add(('complete {0}' -f [bool]$PesterBoundParameters['Now'])); $script:sidecarLine }
+    }
+
+    It 'fetches the sidecars after the evidence''s export, sends them with the run, drains, acknowledges at once, and says so in its record (2026-11-23)' {
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaSidecarBatch -MockWith { $script:order.Add('stage'); [pscustomobject]@{ Number = 1; Path = 'Files/rca/inbox/sidecar-20261123T173000Z-script-1a2b3c4d.json'; Ids = @('20261123T100000Z-sqlvm01-0001-sidecar'); Parts = 1; Bytes = 900; Ack = $null; Note = '' } }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarBatch -MockWith { $script:order.Add('read ack') }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -MockWith { $script:order.Add('run'); New-DemoResult -CheckId 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY' -Area 'fabric' -Target 'fabric' -Status 'Pass' -Message 'ran' -Evidence ([ordered]@{ status = 'Completed'; seconds = 140 }) }
+        $script:sidecarState = [pscustomobject]@{ Fetched = [ordered]@{ '20261123T100000Z-sqlvm01-0001-sidecar' = @('DBHUBDEMO-RCAS 1 x') }; NotebookOld = $false }
+        $script:sidecarLine = New-DemoResult -CheckId 'DEPLOY.RCA.SIDECAR' -Area 'workload' -Target 'subscription' -Status 'Warning' -Message '1 RCA sidecar(s) fetched from sqlvm01. 1 sidecar(s) wait on the VMs, which keep them: 1 skipped by the notebook (a reason).' -Remediation 'The next history save takes what waits.'
+        $record = & $script:invoke
+        @($script:order) | Should -Be @('fetch DEPLOY False 3', 'stage', 'run', 'read ack', 'drain', 'complete True') -Because 'the VMs run, so the drain may run, and the acknowledgements go at once'
+        Should -Invoke -ModuleName DbHubDemo -CommandName Invoke-DemoFabricNotebookRun -Times 1 -Exactly -ParameterFilter { $Parameter['RCA_SIDECAR_FILE'] -eq 'Files/rca/inbox/sidecar-20261123T173000Z-script-1a2b3c4d.json' -and $Parameter['RCA_EVIDENCE_FILE'] }
+        $record.evidence.parameters.RCA_SIDECAR_FILE | Should -Be 'sent'
+        $record.status | Should -Be 'Warning' -Because 'DEPLOY.RCA.SIDECAR''s Warning makes a Pass a Warning'
+        $record.evidence.outcome | Should -Be 'Saved'
+        $record.evidence.rca.sidecar | Should -Be 'Warning'
+        $record.message | Should -Match '1 RCA sidecar\(s\) fetched from sqlvm01\. 1 sidecar\(s\) wait on the VMs, which keep them: 1 skipped by the notebook \(a reason\)\.$'
+        $record.remediation | Should -Be 'The next history save takes what waits.'
+
+        # A Pass line is said, and keeps the record a Pass.
+        $script:sidecarLine = New-DemoResult -CheckId 'DEPLOY.RCA.SIDECAR' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message '1 RCA sidecar(s) fetched from sqlvm01, 1 sent with 1 history run(s): 1 written, 0 already in the history.'
+        $record = & $script:invoke
+        $record.status | Should -Be 'Pass'
+        $record.message | Should -Match '1 written, 0 already in the history\.$'
     }
 
     It 'exports the evidence, not as a session''s last, passes it as RCA_EVIDENCE_FILE, and says so' {

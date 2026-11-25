@@ -430,6 +430,73 @@ public sealed partial class PostgresTests
         }
     }
 
+    /// <summary>
+    /// Unit 2's Query Store leave-out (ADR 0031): the control script marks every routine it creates, every overload and
+    /// only those, with COMMENT ON ROUTINE ... IS 'dbhubdemo:harness'. Setup runs twice against the disposable server, the
+    /// first adding a mark that's missing and the second setting the marks again; then they're read as RCA-PG-16 reads them.
+    /// A typo in the comment, the schema, or the list leaves a routine out, or marks something else.
+    /// </summary>
+    [Fact]
+    public async Task SetupMarksExactlyTheHarnessRoutinesAsTheRcaReadsThem()
+    {
+        var server = Environment.GetEnvironmentVariable(ServerVariable);
+        Assert.SkipUnless(server is not null, $"Set {ServerVariable}, {PgEndpoint.UserVariable}, and {PgEndpoint.PasswordVariable} to a disposable PostgreSQL server to run this test.");
+        var token = TestContext.Current.CancellationToken;
+        var created = Regex.Matches(PgScripts.Read("110-demo-control.sql"), @"(?m)^CREATE OR REPLACE FUNCTION (?<name>demo\.[a-z_]+)\(")
+            .Select(m => m.Groups["name"].Value).Distinct().Order(StringComparer.Ordinal).ToList();
+        Assert.Equal(13, created.Count);
+
+        var endpoint = PgEndpoint.Create(server, null, passwordFromEnvironment: true, managedIdentityClientId: null);
+        await using var connection = await new PgConnectionOpener(endpoint, RunnerLog.Null).OpenAsync(SessionNames.ForControl("test-marks"), token, PgSessionLimits.Setup);
+
+        async Task<List<string>> ReadAsync(string sql, string[]? names = null)
+        {
+            await using var command = connection.CreateCommand();
+            command.CommandText = sql;
+            if (names is not null)
+            {
+                command.Parameters.AddWithValue("names", names);
+            }
+
+            var rows = new List<string>();
+            await using var reader = await command.ExecuteReaderAsync(token);
+            while (await reader.ReadAsync(token))
+            {
+                rows.Add(reader.GetString(0));
+            }
+
+            return rows;
+        }
+
+        foreach (var script in PgScripts.BaseSchema.Concat(PgScripts.DemoObjects))
+        {
+            await PgScripts.ApplyAsync(connection, script, RunnerLog.Null, token);
+        }
+
+        await using (var unmark = connection.CreateCommand())
+        {
+            unmark.CommandText = "DO $$ DECLARE routine regprocedure; BEGIN FOR routine IN SELECT p.oid::regprocedure FROM pg_catalog.pg_proc AS p WHERE p.pronamespace = 'demo'::regnamespace AND p.proname = 'usp_restore_seed' LOOP EXECUTE format('COMMENT ON ROUTINE %s IS NULL', routine); END LOOP; END $$;";
+            await unmark.ExecuteNonQueryAsync(token);
+        }
+
+        Assert.DoesNotContain("demo.usp_restore_seed", await ReadAsync("SELECT n.nspname || '.' || p.proname FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace WHERE obj_description(p.oid, 'pg_proc') = 'dbhubdemo:harness';"));
+        for (var setup = 0; setup < 2; setup++)
+        {
+            foreach (var script in PgScripts.DemoObjects)
+            {
+                await PgScripts.ApplyAsync(connection, script, RunnerLog.Null, token);
+            }
+        }
+
+        // RCA-PG-16's harness: the routines whose comment, by obj_description, is the mark.
+        var marked = await ReadAsync("SELECT DISTINCT n.nspname || '.' || p.proname FROM pg_catalog.pg_proc AS p JOIN pg_catalog.pg_namespace AS n ON n.oid = p.pronamespace WHERE obj_description(p.oid, 'pg_proc') = 'dbhubdemo:harness';");
+        Assert.Equal(created, marked.Order(StringComparer.Ordinal));
+
+        // Every overload of a listed routine, and nothing else: no other object, in this database or shared, has the comment.
+        Assert.Empty(await ReadAsync("SELECT p.oid::regprocedure::text FROM pg_catalog.pg_proc AS p WHERE p.pronamespace = 'demo'::regnamespace AND p.proname = ANY (@names) AND obj_description(p.oid, 'pg_proc') IS DISTINCT FROM 'dbhubdemo:harness';", created.Select(name => name["demo.".Length..]).ToArray()));
+        Assert.Empty(await ReadAsync("SELECT d.classoid::regclass::text FROM pg_catalog.pg_description AS d WHERE d.description = 'dbhubdemo:harness' AND d.classoid <> 'pg_catalog.pg_proc'::regclass UNION ALL SELECT s.classoid::regclass::text FROM pg_catalog.pg_shdescription AS s WHERE s.description = 'dbhubdemo:harness';"));
+    }
+
     private static PgEndpoint Endpoint() => PgEndpoint.Create("pgflex01-abc123", null, passwordFromEnvironment: false, managedIdentityClientId: null);
 
     [Theory]

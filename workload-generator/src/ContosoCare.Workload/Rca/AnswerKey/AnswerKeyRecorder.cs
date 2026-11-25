@@ -118,7 +118,8 @@ internal sealed class AnswerKeyRecorder(EvidenceStore store, IReadOnlyDictionary
         await using var command = connection.CreateCommand();
         command.CommandType = CommandType.Text;
         command.CommandTimeout = 30;
-        command.CommandText = "SELECT TOP (200) event_time, event_name, session_id, detail FROM demo.scenario_run_events WHERE run_id = @run_id ORDER BY event_time;";
+        // The observer's marker, after the first keyword: Query Store's reads leave it out (rca/README.md, What the capture leaves out, 1).
+        command.CommandText = "SELECT /* dbhubdemo:rca-observer */ TOP (200) event_time, event_name, session_id, detail FROM demo.scenario_run_events WHERE run_id = @run_id ORDER BY event_time;";
         command.Parameters.Add("@run_id", SqlDbType.VarChar, 64).Value = runId;
         var events = new List<RunEvent>();
         await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
@@ -134,10 +135,15 @@ internal sealed class AnswerKeyRecorder(EvidenceStore store, IReadOnlyDictionary
         return events;
     }
 
-    /// <summary>The same on T4.</summary>
+    /// <summary>
+    /// The same on T4, on a connection that opens as the observer's do (<see cref="PgCaptureConnector.Startup"/>): its
+    /// search_path names dbhubdemo_rca_observer, so RCA-PG-14 leaves this statement out of Query Store's evidence on any
+    /// role (rca/README.md, What the capture leaves out), and it sends nothing else (its limits in the startup packet, no
+    /// type loading: every column is a built-in type).
+    /// </summary>
     internal static async Task<IReadOnlyList<RunEvent>> ReadPgAsync(PgConnectionOpener opener, string runId, CancellationToken cancellationToken)
     {
-        await using var connection = await opener.OpenAsync(SessionNames.ForControl("rca-key"), cancellationToken).ConfigureAwait(false);
+        await using var connection = await opener.OpenAsync(SessionNames.ForControl("rca-key"), cancellationToken, silent: PgCaptureConnector.Startup).ConfigureAwait(false);
         await using var command = connection.CreateCommand();
         command.CommandText = "SELECT event_time, event_name, session_id, detail FROM demo.scenario_run_events WHERE run_id = @run_id ORDER BY event_time LIMIT 200;";
         command.Parameters.Add(new Npgsql.NpgsqlParameter("run_id", runId));

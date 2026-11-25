@@ -132,7 +132,10 @@ function Invoke-DemoHistorySnapshotRun {
        ADR 0031): the runners' export (Invoke-DemoRcaScriptExport, not a session's last), staged for the run as
        RCA_EVIDENCE_FILE (Invoke-DemoRcaNotebookRun); the record's evidence rca and its message say what it did, the
        documents the run didn't take stay listed for the next save (Save-DemoRcaPending), and an export or a save that
-       didn't work makes a Pass a Warning (ConvertTo-DemoRcaSnapshotNote).
+       didn't work makes a Pass a Warning (ConvertTo-DemoRcaSnapshotNote). Its sidecars (2026-11-23) follow it: fetched
+       (Invoke-DemoRcaSidecarFetch), staged with the run as RCA_SIDECAR_FILE, more runs for what's left
+       (Invoke-DemoRcaSidecarDrain), and acknowledged on the VMs at once; DEPLOY.RCA.SIDECAR goes into the record's message
+       and evidence (rca.sidecar), and its Warning makes a Pass a Warning too.
     4. The refresh (Find-DemoSemanticModel, Invoke-DemoSemanticModelRefresh with -TableRetryMinutes 0, at most
        -RefreshTimeoutSeconds): Direct Lake framing, so the report shows the new rows now. Pass (Saved) when it passed;
        otherwise a Warning (SavedNotRefreshed): the snapshots are saved, and Direct Lake picks them up by itself (Keep
@@ -246,16 +249,21 @@ function Invoke-DemoHistorySnapshotRun {
 
     # The Incident RCA's evidence (2026-11-20, ADR 0031): the runners' export, not a session's last (the activity goes on),
     # staged for the run as RCA_EVIDENCE_FILE (Invoke-DemoRcaNotebookRun); what the run doesn't take stays listed for the
-    # next save (Save-DemoRcaPending).
+    # next save (Save-DemoRcaPending). Its sidecars (2026-11-23), after it: fetched (Invoke-DemoRcaSidecarFetch), staged
+    # with the run as RCA_SIDECAR_FILE, more runs for what's left while the VMs run (Invoke-DemoRcaSidecarDrain, F9), and
+    # acknowledged on the VMs at once (Complete-DemoRcaSidecarSave -Now: DEPLOY.RCA.SIDECAR, in this record).
     $export = Invoke-DemoRcaScriptExport -Config $Config -CheckPrefix DEPLOY
+    $sidecar = Invoke-DemoRcaSidecarFetch -Config $Config -CheckPrefix DEPLOY -Runs 3
     $rcaRun = $null
     try {
-        $rcaRun = Invoke-DemoRcaNotebookRun -Config $resolved -Parameter $Parameter -Token $token -Evidence ([string]$export.Evidence) -TimeoutMinutes $TimeoutMinutes -RunOption @{ PollSeconds = $PollSeconds }
+        $rcaRun = Invoke-DemoRcaNotebookRun -Config $resolved -Parameter $Parameter -Token $token -Evidence ([string]$export.Evidence) -TimeoutMinutes $TimeoutMinutes -RunOption @{ PollSeconds = $PollSeconds } -Sidecar $sidecar
+        Invoke-DemoRcaSidecarDrain -Config $resolved -Sidecar $sidecar -Token $token -Parameter $Parameter -PollSeconds $PollSeconds
     }
     finally {
         $why = if ($null -ne $rcaRun -and [string]$rcaRun.RcaNote) { [string]$rcaRun.RcaNote } else { 'the history run didn''t complete' }
         $pending = Save-DemoRcaPending -Config $Config -CheckPrefix DEPLOY -Export $export -Saved:($null -ne $rcaRun -and [bool]$rcaRun.RcaSaved) -Why $why -Confirm:$false
-        $rca = ConvertTo-DemoRcaSnapshotNote -Config $Config -Export $export -Run $rcaRun -Pending $pending
+        $sidecarResult = Complete-DemoRcaSidecarSave -Config $Config -Sidecar $sidecar -Now -Why 'the history run didn''t complete'
+        $rca = ConvertTo-DemoRcaSnapshotNote -Config $Config -Export $export -Run $rcaRun -Pending $pending -Sidecar $sidecarResult
     }
     $run = $rcaRun.Run
     $runEvidence = Get-DemoMemberValue -InputObject $run -Name 'evidence'
@@ -334,7 +342,8 @@ function ConvertTo-DemoRcaSnapshotNote {
     (DEPLOY.FABRIC.HISTORY's evidence rca: the export's status, the documents, whether they were sent and saved, how many
     are pending, and each target's capture), Note (a sentence for its message: the export's own, and the pending list's;
     '' when nothing was exported and nothing is pending), Warning (the export, or the save of what it exported, didn't
-    work), and Fix. Pure. Internal.
+    work), and Fix. Since 2026-11-23 also the sidecars' DEPLOY.RCA.SIDECAR (-Sidecar, Complete-DemoRcaSidecarSave): its
+    sentence when it isn't Not selected, its status in the evidence's sidecar, and its Warning and fix. Pure. Internal.
     #>
     [CmdletBinding()]
     [OutputType([pscustomobject])]
@@ -349,7 +358,10 @@ function ConvertTo-DemoRcaSnapshotNote {
         [object] $Run,
 
         [AllowNull()]
-        [object] $Pending
+        [object] $Pending,
+
+        [AllowNull()]
+        [object] $Sidecar = $null
     )
 
     $resultList = Get-DemoMemberValue -InputObject $Export -Name 'Results'
@@ -386,6 +398,18 @@ function ConvertTo-DemoRcaSnapshotNote {
                 $fix = '{0}; the next history save then adds them.' -f (Get-DemoLiveNotebookUpdateFix -Config $Config)
             }
         }
+    }
+    # The sidecars (2026-11-23): DEPLOY.RCA.SIDECAR's sentence, and its fix after the evidence document's.
+    $sidecarStatus = [string](Get-DemoMemberValue -InputObject $Sidecar -Name 'status')
+    if ($sidecarStatus) {
+        $evidence['sidecar'] = $sidecarStatus
+    }
+    if ($sidecarStatus -in 'Pass', 'Warning') {
+        $notes.Add((ConvertTo-DemoPlainText -Value $Sidecar.message))
+    }
+    if ($sidecarStatus -eq 'Warning') {
+        $warning = $true
+        $fix = ('{0} {1}' -f $fix, (ConvertTo-DemoPlainText -Value (Get-DemoMemberValue -InputObject $Sidecar -Name 'remediation'))).Trim()
     }
     return [pscustomobject]@{ Evidence = $evidence; Note = ($notes -join ' '); Warning = $warning; Fix = $fix }
 }
@@ -523,8 +547,10 @@ function Invoke-DemoHistorySnapshotStep {
         }
     }
     $answer.Evidence['parameters'] = $sent
-    # Staged by the run itself (Invoke-DemoRcaNotebookRun, 2026-11-20), which adds it to the same parameters.
+    # Staged by the run itself (Invoke-DemoRcaNotebookRun, 2026-11-20), which adds it to the same parameters; the sidecars'
+    # file too (2026-11-23).
     $sent['RCA_EVIDENCE_FILE'] = if ($parameters.Contains('RCA_EVIDENCE_FILE')) { 'sent' } else { '' }
+    $sent['RCA_SIDECAR_FILE'] = if ($parameters.Contains('RCA_SIDECAR_FILE')) { 'sent' } else { '' }
     $item = & $record $answer
     $state = switch ([string]$item.status) {
         'Pass' { 'Done' }

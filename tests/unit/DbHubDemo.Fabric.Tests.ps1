@@ -1118,6 +1118,8 @@ Describe 'configure-fabric.ps1' {
         Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Path = 'Files/rca/inbox/20261120T173000Z-script-1a2b3c4d.json'; Error = '' } }
         Mock -ModuleName DbHubDemo -CommandName Remove-DemoRcaEvidenceFile -MockWith { [pscustomobject]@{ Deleted = $true; Found = $false } }
         Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -MockWith { $null }
+        # The RCA sidecars (2026-11-23): none here.
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $null }
         Set-FabricMock -Routes @(
             @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
             @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = 'Completed' }) }
@@ -1153,6 +1155,42 @@ Describe 'configure-fabric.ps1' {
         Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaNotebookRun -MockWith { throw 'The Fabric API didn''t answer.' }
         { $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -Confirm:$false *>&1 } | Should -Throw '*didn''t answer*'
         Should -Invoke -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -Times 1 -Exactly -ParameterFilter { -not $Saved -and $Why -eq 'the run didn''t complete' -and $CheckPrefix -eq 'FABRIC' }
+    }
+
+    It 'with -RunLiveActivity, fetches the RCA sidecars after the evidence''s export, sends them as RCA_SIDECAR_FILE with no evidence, runs again for the rest, and acknowledges at once (2026-11-23)' {
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoAzCli -MockWith { throw 'no Azure CLI calls expected' }
+        Mock -CommandName Assert-DemoAzContext -MockWith { New-DemoResult -CheckId 'PREFLIGHT.GUARD.CONTEXT' -Area 'preflight' -Target 'subscription' -Status 'Pass' -Message 'ok' }
+        Mock -CommandName Get-DemoFabricToken -MockWith { [securestring]::new() }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoPostgresHistoryCapture -MockWith { $null }
+        Mock -ModuleName DbHubDemo -CommandName Get-DemoCosmosHistoryCapture -MockWith { $null }
+        Mock -ModuleName DbHubDemo -CommandName Test-DemoFabricNotebookParameter -MockWith { [pscustomobject]@{ Known = $true; Has = $true; Error = '' } }
+        # Unqualified in the mocks, as Set-FabricMock's are: configure-fabric.ps1 runs in its own script scope.
+        $sidecarOrder = [System.Collections.Generic.List[string]]::new()
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaScriptExport -MockWith { $sidecarOrder.Add('Export'); [pscustomobject]@{ Evidence = ''; Documents = @(); Pending = @(); PendingFound = $false; Results = @(New-DemoResult -CheckId 'FABRIC.RCA.EXPORT' -Area 'workload' -Target 'subscription' -Status 'Not selected' -Message 'Nothing was captured since the last export.') } }
+        Mock -ModuleName DbHubDemo -CommandName Save-DemoRcaPending -MockWith { $sidecarOrder.Add('Pending'); $null }
+        $sidecarState = [pscustomobject]@{ Fetched = [ordered]@{ '20261120T170000Z-sqlvm01-0001-sidecar' = @('DBHUBDEMO-RCAS 1 x') }; NotebookOld = $false }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarFetch -MockWith { $sidecarOrder.Add(('Fetch:{0}:{1}:{2}' -f $CheckPrefix, $Runs, [bool]$PesterBoundParameters['Final'])); $sidecarState }
+        Mock -ModuleName DbHubDemo -CommandName Send-DemoRcaSidecarBatch -MockWith { $sidecarOrder.Add('Stage'); [pscustomobject]@{ Path = 'Files/rca/inbox/sidecar-20261123T173000Z-script-1a2b3c4d.json' } }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarBatch -MockWith { $sidecarOrder.Add('Ack') }
+        Mock -ModuleName DbHubDemo -CommandName Invoke-DemoRcaSidecarDrain -MockWith { $sidecarOrder.Add(('Drain:{0}' -f [object]::ReferenceEquals($Sidecar, $sidecarState))) }
+        Mock -ModuleName DbHubDemo -CommandName Complete-DemoRcaSidecarSave -MockWith { $sidecarOrder.Add(('Complete:{0}' -f [bool]$PesterBoundParameters['Now'])); New-DemoResult -CheckId 'FABRIC.RCA.SIDECAR' -Area 'workload' -Target 'subscription' -Status 'Pass' -Message 'acknowledged' }
+        Set-FabricMock -Routes @(
+            @{ Method = 'Get'; Match = [regex]::Escape('/items?type=Notebook'); Responses = @(New-FabricResponse -Status 200 -Body @{ value = @(@{ id = $itemId; displayName = 'NB_DatabaseHub_LiveActivity'; type = 'Notebook' }) }) }
+            @{ Method = 'Get'; Match = '/jobs/instances/'; Responses = @(New-FabricResponse -Status 200 -Body @{ status = 'Completed' }) }
+            @{ Method = 'Post'; Match = [regex]::Escape('/jobs/instances?jobType=RunNotebook'); Responses = @(New-FabricResponse -Status 202 -Body $null -Headers @{ Location = "$api/workspaces/$workspaceId/items/$itemId/jobs/instances/$operationId" }) }
+        )
+        $null = & $configureFabric -ConfigPath $idConfigPath -OutputPath $outputPath -SkipHubChecks -SkipNotebookImport -RunLiveActivity -Confirm:$false *>&1
+        $LASTEXITCODE | Should -Be 0
+        $sidecarOrder | Should -Be @('Export', 'Fetch:FABRIC:3:False', 'Stage', 'Ack', 'Drain:True', 'Pending', 'Complete:True') -Because 'the VMs run, so what the notebook wrote is acknowledged on them at once'
+        $results = Read-ImportResult
+        ($results | Where-Object checkId -EQ 'FABRIC.NOTEBOOKRUN.NB_DATABASEHUB_LIVEACTIVITY').status | Should -Be 'Pass'
+        ($results | Where-Object checkId -EQ 'FABRIC.RCA.SIDECAR').status | Should -Be 'Pass'
+        $results | Where-Object checkId -EQ 'FABRIC.RCA.EVIDENCE' | Should -BeNullOrEmpty -Because 'there was no evidence to send'
+        $run = @($requests | Where-Object { $_.Method -eq 'Post' -and $_.Uri -like '*jobType=RunNotebook' })
+        $run.Count | Should -Be 1
+        $sent = (Get-RequestBody -Request $run[0]).executionData.parameters
+        $sent.RCA_SIDECAR_FILE.value | Should -Be 'Files/rca/inbox/sidecar-20261123T173000Z-script-1a2b3c4d.json'
+        $sent.PSObject.Properties.Name | Should -Not -Contain 'RCA_EVIDENCE_FILE'
     }
 
     It 'works out the run''s kept values through Livy after -RunLiveActivity''s run completed, with the run''s token, and not after a run that failed (F35, 2026-11-23)' {

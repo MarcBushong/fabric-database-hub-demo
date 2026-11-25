@@ -50,10 +50,20 @@ Actions:
   lockSeconds }: the Incident RCA's evidence export (ADR 0031): 'rca export' or 'rca part' with the runner on sqlvm01,
   or in T2's guest over PowerShell Direct, which it never starts or restarts. It prints the result line, then the
   runner's own line (rca/README.md, Transport), last, so the instance view's 4 KB keeps it whole. endCapture (a
-  session's stop, 2026-11-23) adds --end-capture, and a runner from before it gets the export without it.
+  session's stop, 2026-11-23) adds --end-capture, and a runner from before it gets the export without it. A Query Store
+  sidecar's parts come through 'part' too (2026-11-23): a documentId that's a sidecar's takes only the runner's
+  'DBHUBDEMO-RCAS 1 ...' line, and an evidence document's only 'DBHUBDEMO-RCA 1 ...'.
+- RcaSidecarExport (sqlvm01, and archost01 for T2's guest) { sessionId, final, page, timeoutSeconds, lockSeconds }: the
+  Query Store sidecar's index (rca/README.md, The sidecar; 2026-11-23): 'rca sidecar-export --session <id or none>
+  [--final] [--page <n>]', run where and as the Rca action runs. It prints the result line, then the runner's
+  'DBHUBDEMO-RCAS-INDEX <json>' line, whole, last. The runner's exit code 2 (nothing to fetch) is Not selected, or a
+  Warning when the index it still prints is one (sidecars that expired unread).
+- RcaAck (sqlvm01, and archost01 for T2's guest) { documentIds[], timeoutSeconds, lockSeconds }: 'rca ack --document
+  <id>[,<id>...]' for 1 to 64 sidecar IDs, so the runner stops offering them; then the runner's own line, last. For
+  both, a runner that predates the sidecar is Not supported, with oldRunner in the evidence.
 
 .PARAMETER Action
-EnableT3, EnableT4, Runner, StopGuest, or Rca.
+EnableT3, EnableT4, Runner, StopGuest, Rca, RcaSidecarExport, or RcaAck.
 
 .PARAMETER RequestBase64
 The request as Base64-encoded UTF-8 JSON.
@@ -88,6 +98,11 @@ $script:ControlReplicaFqdnPattern = '^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]\.postgres\
 $script:ControlRcaPartPattern = '^DBHUBDEMO-RCA 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4} [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}$'
 $script:ControlRcaDocumentPattern = '^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}$'
 $script:ControlRcaSessionPattern = '^[0-9a-f]{32}$'
+# The Query Store sidecar (rca/README.md, The sidecar; 2026-11-23): rca/transport.schema.json's sidecarPartLine and
+# sidecarId, at most 88 characters (sidecar.schema.json). Its own marker, so the part pattern above never takes a
+# sidecar's line, and this one never takes an evidence document's.
+$script:ControlRcaSidecarPartPattern = '^DBHUBDEMO-RCAS 1 [0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar [1-9][0-9]?/[1-9][0-9]? [0-9a-f]{64} [A-Za-z0-9+/]+={0,2}(?![\s\S])'
+$script:ControlRcaSidecarIdPattern = '^[0-9]{8}T[0-9]{6}Z-[a-z0-9]+(-[a-z0-9]+)*-[0-9]{4}-sidecar(?![\s\S])'
 Import-Module -Name (Join-Path -Path $PSScriptRoot -ChildPath 'DbHubDemo.Vm.psd1') -Force
 
 function Write-DemoControlLine {
@@ -1795,11 +1810,27 @@ function Invoke-DemoControlStopGuest {
     Write-DemoControlResult -ActionName 'StopGuest' -Status 'Warning' -Message ('{0} was still {1} after {2} minutes. Deallocating the host shuts it down through its automatic stop action (ShutDown).' -f $guestName, $state, $minutes) -Evidence @{ guest = $guestName; state = $state; seconds = [int]$clock.Elapsed.TotalSeconds }
 }
 
+function Test-DemoControlRcaSidecarId {
+    # Whether a value is a Query Store sidecar's documentId (rca/transport.schema.json, sidecarId; at most 88 characters,
+    # sidecar.schema.json). An evidence document's ID never is one: it doesn't end in -sidecar. The pattern ends where the
+    # value does, as the schema's does ((?![\s\S]), not .NET's $, which matches before a final line feed), and a value with
+    # a line feed anywhere is refused.
+    [CmdletBinding()]
+    [OutputType([bool])]
+    param(
+        [AllowNull()]
+        [object] $Value
+    )
+
+    return ($Value -is [string] -and $Value.Length -le 88 -and -not $Value.Contains("`n") -and $Value -cmatch $script:ControlRcaSidecarIdPattern)
+}
+
 function Get-DemoControlRcaArgument {
     <#
     .SYNOPSIS
     The runner arguments of an Rca request (ADR 0031, rca/README.md, The runner's commands), from validated values only:
-    'rca export --session <id or none> [--final] [--end-capture]', or 'rca part --document <documentId> --part <index>'.
+    'rca export --session <id or none> [--final] [--end-capture]', or 'rca part --document <documentId> --part <index>',
+    an evidence document's part or a Query Store sidecar's (2026-11-23).
     Throws on a request that isn't one of them. Returns Arguments, Command, DocumentId, Part, TimeoutSeconds, and, for an
     export with endCapture (a session's stop, 2026-11-23), EndCapture and Fallback: the same arguments without
     --end-capture, for a runner that predates it.
@@ -1837,8 +1868,10 @@ function Get-DemoControlRcaArgument {
     }
     elseif ($command -ceq 'part') {
         $documentId = if ($Request.Contains('documentId')) { [string]$Request['documentId'] } else { '' }
-        if ($documentId -cnotmatch $script:ControlRcaDocumentPattern) {
-            throw 'The request''s documentId isn''t an evidence document''s ID (rca/README.md, The evidence document).'
+        # A sidecar's parts come through here too (2026-11-23): its own ID, whose line has its own marker
+        # (Get-DemoControlRcaLine).
+        if ($documentId -cnotmatch $script:ControlRcaDocumentPattern -and -not (Test-DemoControlRcaSidecarId -Value $documentId)) {
+            throw 'The request''s documentId isn''t an evidence document''s ID or a sidecar''s (rca/README.md, The evidence document, and The sidecar).'
         }
         $part = 0
         if ($Request.Contains('part') -and $null -ne $Request['part'] -and [string]$Request['part'] -match '^[0-9]{1,2}$') {
@@ -1864,7 +1897,9 @@ function Get-DemoControlRcaLine {
     .SYNOPSIS
     The one line the runner printed for an Rca request, checked against the contract (rca/transport.schema.json): the
     export's 'DBHUBDEMO-RCA-INDEX <json>', or the part's 'DBHUBDEMO-RCA 1 <documentId> <index>/<count> <sha256> <base64>'
-    for the document and part asked for. At most 3,400 ASCII characters. '' when the output has no such line.
+    for the document and part asked for; a sidecar's part, 'DBHUBDEMO-RCAS 1 ...' (sidecarPartLine), when the document is
+    a sidecar, so a request takes only its own kind's line. At most 3,400 ASCII characters. '' when the output has no
+    such line.
     #>
     [CmdletBinding()]
     [OutputType([string])]
@@ -1884,6 +1919,10 @@ function Get-DemoControlRcaLine {
     )
 
     $found = ''
+    $partPattern = $script:ControlRcaPartPattern
+    if (Test-DemoControlRcaSidecarId -Value $DocumentId) {
+        $partPattern = $script:ControlRcaSidecarPartPattern
+    }
     foreach ($raw in ([string]$Text -split '\r?\n')) {
         $line = $raw.Trim()
         if ($line.Length -gt 3400 -or $line -match '[^\x20-\x7E]') {
@@ -1895,7 +1934,7 @@ function Get-DemoControlRcaLine {
             }
             continue
         }
-        if ($line -cmatch $script:ControlRcaPartPattern) {
+        if ($line -cmatch $partPattern) {
             $fields = $line.Split(' ')
             if ($fields[2] -ceq $DocumentId -and [int]($fields[3].Split('/')[0]) -eq $Part) {
                 $found = $line
@@ -2021,6 +2060,261 @@ function Invoke-DemoControlRca {
     Write-DemoControlLine -Line $line
 }
 
+function Get-DemoControlRcaSidecarArgument {
+    <#
+    .SYNOPSIS
+    The runner arguments of a Query Store sidecar action (rca/README.md, The runner's commands; 2026-11-23), from
+    validated values only: RcaSidecarExport's 'rca sidecar-export --session <id or none> [--final] [--page <n>]', or
+    RcaAck's 'rca ack --document <id>[,<id>...]' for the request's documentIds: 1 to 64 sidecar IDs
+    (Test-DemoControlRcaSidecarId), each sent once. Throws on a request that isn't one of them. Returns Arguments,
+    Command, Documents (how many IDs the ack sends), and TimeoutSeconds.
+    #>
+    [CmdletBinding()]
+    [OutputType([pscustomobject])]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('RcaSidecarExport', 'RcaAck')]
+        [string] $ActionName,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Request
+    )
+
+    $documents = 0
+    if ($ActionName -eq 'RcaSidecarExport') {
+        $command = 'sidecar-export'
+        $timeout = 600
+        $session = if ($Request.Contains('sessionId') -and $null -ne $Request['sessionId']) { [string]$Request['sessionId'] } else { '' }
+        # The pattern's $ also matches before a final line feed, as in Test-DemoControlRcaSidecarId.
+        if ($session -and ($session -cnotmatch $script:ControlRcaSessionPattern -or $session.Contains("`n"))) {
+            throw 'The request''s sessionId must be a control session''s ID (32 lowercase hex characters) or empty.'
+        }
+        if (-not $session) {
+            $session = 'none'
+        }
+        $arguments = @('rca', 'sidecar-export', '--session', $session)
+        if ($Request.Contains('final') -and $Request['final'] -is [bool] -and $Request['final']) {
+            $arguments += '--final'
+        }
+        if ($Request.Contains('page') -and $null -ne $Request['page']) {
+            $page = 0
+            if ([string]$Request['page'] -match '^[0-9]{1,3}$') {
+                $page = [int]$Request['page']
+            }
+            if ($page -lt 1) {
+                throw 'The request''s page must be a whole number from 1 to 999.'
+            }
+            $arguments += @('--page', [string]$page)
+        }
+    }
+    else {
+        $command = 'ack'
+        $timeout = 120
+        $given = if ($Request.Contains('documentIds')) { $Request['documentIds'] } else { $null }
+        # One ID may arrive as a string: a list of one, unrolled on its way into the request.
+        $list = @()
+        if ($given -is [string] -or $given -is [System.Collections.IList]) {
+            $list = @($given)
+        }
+        if ($list.Count -lt 1 -or $list.Count -gt 64) {
+            throw 'The request''s documentIds must list 1 to 64 sidecar IDs.'
+        }
+        $ids = New-Object -TypeName 'System.Collections.Generic.List[string]'
+        foreach ($item in $list) {
+            if (-not (Test-DemoControlRcaSidecarId -Value $item)) {
+                throw 'The request''s documentIds must all be sidecars'' IDs (rca/transport.schema.json, sidecarId).'
+            }
+            if (-not $ids.Contains([string]$item)) {
+                $ids.Add([string]$item)
+            }
+        }
+        $documents = $ids.Count
+        $arguments = @('rca', 'ack', '--document', ($ids -join ','))
+    }
+    if ($Request.Contains('timeoutSeconds') -and $null -ne $Request['timeoutSeconds'] -and [int]$Request['timeoutSeconds'] -ge 30) {
+        $timeout = [System.Math]::Min(900, [int]$Request['timeoutSeconds'])
+    }
+    return [pscustomobject]@{ Arguments = $arguments; Command = $command; Documents = $documents; TimeoutSeconds = $timeout }
+}
+
+function Get-DemoControlRcaSidecarLine {
+    <#
+    .SYNOPSIS
+    The one line the runner printed for a Query Store sidecar action: rca sidecar-export's 'DBHUBDEMO-RCAS-INDEX <json>'
+    (rca/transport.schema.json, sidecarIndex), the last one; or rca ack's result line, whose form the contract leaves to
+    the runner, so its last line, unless it looks like this script's own result line. At most 3,400 printable ASCII
+    characters. '' when the output has no such line.
+    #>
+    [CmdletBinding()]
+    [OutputType([string])]
+    param(
+        [AllowEmptyString()]
+        [AllowNull()]
+        [string] $Text,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('sidecar-export', 'ack')]
+        [string] $Command
+    )
+
+    $found = ''
+    $last = ''
+    foreach ($raw in ([string]$Text -split '\r?\n')) {
+        $line = $raw.Trim()
+        if (-not $line) {
+            continue
+        }
+        $last = $line
+        if ($line.Length -le 3400 -and $line -notmatch '[^\x20-\x7E]' -and $line.StartsWith('DBHUBDEMO-RCAS-INDEX {', [System.StringComparison]::Ordinal) -and $line.EndsWith('}', [System.StringComparison]::Ordinal)) {
+            $found = $line
+        }
+    }
+    if ($Command -eq 'ack') {
+        if ($last.Length -le 3400 -and $last -notmatch '[^\x20-\x7E]' -and -not $last.StartsWith($script:ControlMarker, [System.StringComparison]::Ordinal)) {
+            return $last
+        }
+        return ''
+    }
+    return $found
+}
+
+function Invoke-DemoControlRcaSidecar {
+    <#
+    .SYNOPSIS
+    The Query Store sidecar's two actions (rca/README.md, The sidecar, and Acknowledgement; 2026-11-23), which the
+    operator's scripts run through managed Run Commands as they run the Rca action: RcaSidecarExport runs 'rca
+    sidecar-export', and RcaAck 'rca ack'. On sqlvm01 with its runner; on archost01 in T2's guest over PowerShell Direct,
+    as the Rca action does, without making the guest ready or restarting it.
+
+    .DESCRIPTION
+    It prints the result line (DBHUBDEMO-WORKLOAD, with an ADR 0012 status), then the runner's own line, last, so the
+    4 KB of output that the instance view keeps always holds it whole: the index line of up to 3,400 characters, which
+    the Runner action's 1,800-character stdout tail would cut
+    (https://learn.microsoft.com/azure/virtual-machines/windows/run-command-managed). The runner's exit code goes into the
+    evidence as it gave it: 0, or 2 from rca sidecar-export when nothing is offerable (Not selected, or a Warning with the
+    index's message when its status is one: sidecars that expired unread). A runner from before the sidecar refuses the
+    command before it runs anything (System.CommandLine's parse error): Not supported,
+    with oldRunner, which the scripts report as OldRunner, a Warning naming ./scripts/deploy.ps1, while the evidence
+    document's export goes on. A request outside the contract is a Fail, and nothing runs.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [ValidateSet('RcaSidecarExport', 'RcaAck')]
+        [string] $ActionName,
+
+        [Parameter(Mandatory = $true)]
+        [string] $StateRoot,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Request,
+
+        [Parameter(Mandatory = $true)]
+        [System.Collections.IDictionary] $Settings
+    )
+
+    $role = [string]$Settings['role']
+    try {
+        $sidecar = Get-DemoControlRcaSidecarArgument -ActionName $ActionName -Request $Request
+    }
+    catch {
+        Write-DemoControlResult -ActionName $ActionName -Status 'Fail' -Message $_.Exception.Message -Evidence ([ordered]@{ host = $role })
+        return
+    }
+    $label = 'runner rca {0}' -f $sidecar.Command
+    $evidence = [ordered]@{ host = $role; command = $sidecar.Command }
+    if ($sidecar.Command -eq 'ack') {
+        $evidence['documents'] = $sidecar.Documents
+    }
+    if ($role -eq 'SqlVm') {
+        $install = Read-DemoVmJsonFile -Path (Get-DemoVmWorkloadPath -Root $StateRoot).InstallRecord
+        if ($null -eq $install) {
+            Write-DemoControlResult -ActionName $ActionName -Status 'Not selected' -Message 'The workload runner is not installed on T1 yet, so it holds no sidecar.' -Evidence $evidence
+            return
+        }
+        $run = Invoke-DemoVmRunnerProcess -DotNetExe ([string]$install['dotnetExe']) -RunnerDll ([string]$install['runnerDll']) -ArgumentList $sidecar.Arguments -TimeoutSeconds $sidecar.TimeoutSeconds
+    }
+    elseif ($role -eq 'ArcHost') {
+        $guest = Import-PowerShellDataFile -Path ([System.IO.Path]::Combine($script:ControlBundleRoot, 'vm', 'dsc', 'guest.psd1'))
+        $guestName = [string]$guest.Name
+        if ($Settings.Contains('guest') -and $null -ne $Settings['guest'] -and $Settings['guest']['name']) {
+            $guestName = [string]$Settings['guest']['name']
+        }
+        $evidence['guest'] = $guestName
+        $lockSeconds = 30
+        if ($Request.Contains('lockSeconds') -and $null -ne $Request['lockSeconds']) {
+            $lockSeconds = [int][System.Math]::Max(0, [System.Math]::Min(600, [int]$Request['lockSeconds']))
+        }
+        try {
+            $run = (Invoke-DemoControlT2Attempt -StateRoot $StateRoot -GuestName $guestName -Guest $guest -Arguments $sidecar.Arguments -TimeoutSeconds $sidecar.TimeoutSeconds -Activity $false -LockSeconds $lockSeconds).Run
+        }
+        catch {
+            $text = [string]$_.Exception.Message
+            $status = 'Fail'
+            if ($text -match 'isn''t set up yet|not installed in the guest yet') {
+                $status = 'Not selected'
+            }
+            Write-DemoControlResult -ActionName $ActionName -Status $status -Message ('{0} in {1}: {2}' -f $label, $guestName, (Get-DemoControlTail -Text $text -Length 400)) -Evidence $evidence
+            return
+        }
+    }
+    else {
+        Write-DemoControlResult -ActionName $ActionName -Status 'Fail' -Message ('The Query Store sidecar runs on sqlvm01 (T1, T3, T4, and its read replica) and on archost01 (T2''s guest), not with role {0}.' -f $role) -Evidence $evidence
+        return
+    }
+
+    $evidence['exitCode'] = [int]$run.ExitCode
+    $line = Get-DemoControlRcaSidecarLine -Text $run.StdOut -Command $sidecar.Command
+    $errorText = Get-DemoControlTail -Text $run.StdErr -Length 300
+    if ($run.ExitCode -ne 0 -and ([string]$run.StdErr + [string]$run.StdOut) -match 'Unrecognized command or argument|Required command was not provided') {
+        $evidence['oldRunner'] = $true
+        $what = if ($sidecar.Command -eq 'ack') { 'nothing was acknowledged' } else { 'nothing was fetched' }
+        Write-DemoControlResult -ActionName $ActionName -Status 'Not supported' -Message ('{0}: this VM''s runner predates the Query Store sidecar, so {1}; ./scripts/deploy.ps1 updates it.' -f $label, $what) -Evidence $evidence
+        return
+    }
+    if ($sidecar.Command -eq 'sidecar-export' -and $run.ExitCode -eq 2) {
+        # Nothing is offerable, new or pending, but the index's own status stands (rca/README.md, The runner's commands):
+        # a Warning that counts sidecars expired unread is reported with exit code 2 too, so it's this result's.
+        $status = 'Not selected'
+        $message = '{0}: there is no sidecar to fetch.' -f $label
+        if ($line) {
+            try {
+                $index = $line.Substring('DBHUBDEMO-RCAS-INDEX '.Length) | ConvertFrom-Json
+                if ($null -ne $index.PSObject.Properties['status'] -and [string]$index.status -ceq 'Warning') {
+                    $status = 'Warning'
+                    if ($null -ne $index.PSObject.Properties['message']) {
+                        $message = '{0} {1}' -f $message, [string]$index.message
+                    }
+                }
+            }
+            catch {
+                $status = 'Not selected'
+            }
+        }
+        Write-DemoControlResult -ActionName $ActionName -Status $status -Message $message -Evidence $evidence
+        if ($line) {
+            Write-DemoControlLine -Line $line
+        }
+        return
+    }
+    if ($run.ExitCode -ne 0 -or ($sidecar.Command -eq 'sidecar-export' -and -not $line)) {
+        $why = if ($run.ExitCode -ne 0) { 'exit code {0}' -f $run.ExitCode } else { 'no line the contract allows' }
+        Write-DemoControlResult -ActionName $ActionName -Status 'Fail' -Message ('{0}: {1}. {2}' -f $label, $why, $errorText).Trim() -Evidence $evidence
+        return
+    }
+    $message = '{0}: its line follows.' -f $label
+    if ($sidecar.Command -eq 'ack') {
+        $message = '{0}: {1} sidecar(s) acknowledged.' -f $label, $sidecar.Documents
+        if ($line) {
+            $message = '{0}: {1} sidecar(s) acknowledged; its line follows.' -f $label, $sidecar.Documents
+        }
+    }
+    Write-DemoControlResult -ActionName $ActionName -Status 'Pass' -Message $message -Evidence $evidence
+    if ($line) {
+        Write-DemoControlLine -Line $line
+    }
+}
+
 function Invoke-DemoWorkloadControl {
     [CmdletBinding()]
     param(
@@ -2070,8 +2364,14 @@ function Invoke-DemoWorkloadControl {
         'Rca' {
             Invoke-DemoControlRca -StateRoot $StateRoot -Request $body -Settings $settings
         }
+        'RcaSidecarExport' {
+            Invoke-DemoControlRcaSidecar -ActionName 'RcaSidecarExport' -StateRoot $StateRoot -Request $body -Settings $settings
+        }
+        'RcaAck' {
+            Invoke-DemoControlRcaSidecar -ActionName 'RcaAck' -StateRoot $StateRoot -Request $body -Settings $settings
+        }
         default {
-            Write-DemoControlResult -ActionName ([string]$ActionName) -Status 'Fail' -Message 'Unknown action; use EnableT3, EnableT4, Runner, StopGuest, or Rca.'
+            Write-DemoControlResult -ActionName ([string]$ActionName) -Status 'Fail' -Message 'Unknown action; use EnableT3, EnableT4, Runner, StopGuest, Rca, RcaSidecarExport, or RcaAck.'
         }
     }
 }

@@ -2,14 +2,15 @@
 // their lakehouse columns. The app reads the history through DAX (loader.ts); this is for the tests, which read the
 // contract's fixtures, and the local preview's sample.
 
-import { ROW_MAPPERS } from "./rows";
-import { RCA_SPEC, type RcaTableKey } from "./spec";
+import { ROW_MAPPERS, type Get } from "./rows";
+import { RCA_SPEC, type RcaTableKey, type TableSpec } from "./spec";
 import { emptyEvidence, type Evidence } from "./types";
 
 export const EVIDENCE_KIND = "ContosoCare.RcaEvidence";
 export const EVIDENCE_VERSION = 1;
 
-interface ColumnarTable {
+/** One table of a document: its row count and its columns, each an array of values (rca/README.md, The evidence document). */
+export interface ColumnarTable {
     rows: number;
     columns: Record<string, unknown[]>;
 }
@@ -39,14 +40,15 @@ function isDocument(value: unknown): value is EvidenceDocument {
     return Boolean(doc && typeof doc === "object" && typeof doc.epochUtc === "string" && Array.isArray(doc.strings) && doc.tables && typeof doc.tables === "object");
 }
 
-/** One table's rows as typed evidence rows; a column's strings come from the dictionary, its times from the epoch. */
-function readTable(doc: EvidenceDocument, key: RcaTableKey, epoch: number): unknown[] {
-    const spec = RCA_SPEC[key];
+/**
+ * One table of a document (an evidence document's or a sidecar's) as typed rows: a column's strings come from the
+ * dictionary, its times from the epoch, and an ID keeps its digits (spec.ts's id). A missing table has no rows.
+ */
+export function readColumnarTable<T>(doc: { strings: string[]; tables: Record<string, ColumnarTable> }, spec: TableSpec, map: (get: Get) => T | null, epoch: number): T[] {
     const table = doc.tables[spec.lake];
     if (!table) return [];
-    const fields = spec.fields as Record<string, { lake: string; kind: string }>;
-    const map = ROW_MAPPERS[key] as (get: (field: string) => unknown) => unknown;
-    const out: unknown[] = [];
+    const fields = spec.fields;
+    const out: T[] = [];
     for (let i = 0; i < table.rows; i++) {
         const get = (field: string) => {
             const def = fields[field];
@@ -54,12 +56,18 @@ function readTable(doc: EvidenceDocument, key: RcaTableKey, epoch: number): unkn
             if (raw === null || raw === undefined) return undefined;
             if (def.kind === "string") return typeof raw === "number" ? doc.strings[raw] : undefined;
             if (def.kind === "timestamp") return typeof raw === "number" ? new Date(epoch + raw) : undefined;
+            if (def.kind === "id") return typeof raw === "string" ? raw : typeof raw === "number" && Number.isSafeInteger(raw) ? String(raw) : undefined;
             return raw;
         };
         const row = map(get);
         if (row) out.push(row);
     }
     return out;
+}
+
+/** One table's rows as typed evidence rows. */
+function readTable(doc: EvidenceDocument, key: RcaTableKey, epoch: number): unknown[] {
+    return readColumnarTable(doc, RCA_SPEC[key], ROW_MAPPERS[key] as (get: Get) => unknown, epoch);
 }
 
 /** The evidence in a document, or an EvidenceFormatError when it isn't one this version reads. */

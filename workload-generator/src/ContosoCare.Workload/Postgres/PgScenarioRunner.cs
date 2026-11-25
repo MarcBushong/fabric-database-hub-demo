@@ -3,6 +3,7 @@ using System.Data;
 using System.Globalization;
 using ContosoCare.Workload.Catalog;
 using ContosoCare.Workload.Diagnostics;
+using ContosoCare.Workload.Rca.Observer;
 using ContosoCare.Workload.Runs;
 using ContosoCare.Workload.Sql;
 using Npgsql;
@@ -18,7 +19,9 @@ namespace ContosoCare.Workload.Postgres;
 /// seconds after the deadline. Layer 3, the watchdog: sessions still open 15 seconds later are ended with
 /// pg_terminate_backend through demo.usp_kill_demo_sessions, which touches this run's sessions only. With
 /// <paramref name="replica"/>, T4's read replica (ADR 0025): replica-lag's report runs there, and reset ends the demo's
-/// sessions there too.
+/// sessions there too. The run's control connection and reset's open as the RCA observer's do
+/// (<see cref="PgCaptureConnector.Startup"/>), so T4's Query Store evidence leaves out their bookkeeping; the run's tagged
+/// sessions, the measured workload, don't.
 /// </summary>
 internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log, TimeProvider time, PgConnectionOpener? replica = null) : IScenarioExecutor
 {
@@ -88,7 +91,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
         NpgsqlConnection control;
         try
         {
-            control = await opener.OpenAsync(SessionNames.ForControl(runId), cancellationToken).ConfigureAwait(false);
+            control = await opener.OpenAsync(SessionNames.ForControl(runId), cancellationToken, silent: PgCaptureConnector.Startup, plainIfRefused: true).ConfigureAwait(false);
         }
         catch (Exception ex) when (ex is NpgsqlException or InvalidOperationException or ScenarioRequestException or ArgumentException or Azure.Identity.AuthenticationFailedException or Azure.Identity.CredentialUnavailableException)
         {
@@ -146,7 +149,7 @@ internal sealed class PgScenarioRunner(PgConnectionOpener opener, RunnerLog log,
     public async Task<IReadOnlyList<CheckRecord>> ResetAsync(ResetOptions options, CancellationToken cancellationToken)
     {
         List<CheckRecord> checks;
-        await using (var connection = await opener.OpenAsync(SessionNames.ForControl("reset"), cancellationToken).ConfigureAwait(false))
+        await using (var connection = await opener.OpenAsync(SessionNames.ForControl("reset"), cancellationToken, silent: PgCaptureConnector.Startup, plainIfRefused: true).ConfigureAwait(false))
         {
             checks = [.. await new PgDemoDatabase(connection).ResetAsync(options, time, cancellationToken).ConfigureAwait(false)];
         }

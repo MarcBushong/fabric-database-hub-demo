@@ -1,0 +1,88 @@
+/// One change in Query Store or in automatic tuning that the capture saw on one target: a plan forced or unforced, Query Store's state changing, automatic tuning's option, or a tuning recommendation's state. The Incident RCA's sidecar (ADR 0031): Query Store's evidence, which the observer beside the workload read and NB_DatabaseHub_LiveActivity writes from its sidecar documents, each under its own session's run (rca/history-tables.json).
+table 'RCA Query Events'
+
+    /// Plans the capture saw forced in context, manually or by automatic plan correction.
+    measure 'Plan Forcings (captured)' = CALCULATE ( COUNTROWS ( 'RCA Query Events' ), 'RCA Query Events'[Kind] = "forced" )
+        formatString: #,0
+        displayFolder: RCA
+
+    /// The notebook's RUN_ID: session-<SESSION_ID> for a control session, as the other history tables. A sidecar's rows take their own session's, session-<sessionId>, whichever run wrote them (rca/README.md, The sidecar).
+    column 'Run ID'
+        dataType: string
+        isHidden
+        sourceColumn: run_id
+
+    /// The document the row came from (documentId): an evidence document's, or a sidecar's.
+    column 'Document ID'
+        dataType: string
+        isHidden
+        sourceColumn: document_id
+
+    /// When the capture first saw the change (UTC): within one read's period after it happened (RCA-SQL-15 every 60 s, RCA-AZ-03 and 04 every 30 s, RCA-PG-13 with each Query Store read); time_from_utc says since when it could have happened.
+    column 'Event Time UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: event_time_utc
+
+    /// The read before the one that saw the change: the change happened after it (UTC).
+    column 'Time From UTC'
+        dataType: dateTime
+        formatString: yyyy-mm-dd hh:nn:ss
+        sourceColumn: time_from_utc
+
+    /// T1, T2, T3, or T4.
+    column 'Target Key'
+        dataType: string
+        isHidden
+        sourceColumn: target
+
+    /// forced, unforced, state (Query Store's actual state or capture mode changed), or tuning (automatic tuning's option, or a recommendation's state).
+    column Kind
+        dataType: string
+        sourceColumn: kind
+
+    /// The query whose plan was forced or unforced, or whose recommendation changed; null for a state change.
+    column 'Query ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: query_id
+
+    /// The plan forced or unforced; null for a state change.
+    column 'Plan ID'
+        dataType: int64
+        summarizeBy: none
+        sourceColumn: plan_id
+
+    /// MANUAL or AUTO for a forcing (plan_forcing_type_desc): forced by a person (sys.sp_query_store_force_plan) or by automatic plan correction.
+    column 'Forcing Type'
+        dataType: string
+        sourceColumn: forcing_type
+
+    /// The state after the change: Query Store's actual state (READ_WRITE, READ_ONLY, OFF, ERROR) or capture mode on PostgreSQL (top, all, none), automatic tuning's actual state, or the recommendation's state.
+    column State
+        dataType: string
+        sourceColumn: state
+
+    /// The state the read before saw; null when a recommendation first appears.
+    column 'Previous State'
+        dataType: string
+        sourceColumn: previous_state
+
+    /// The change in plain words, normalized: for READ_ONLY, its readonly_reason in words (for example, the storage limit); for a recommendation, its reason.
+    column Detail
+        dataType: string
+        sourceColumn: detail
+
+    /// The UTC date of the row's primary time; relates the table to Date, as the other history tables.
+    column 'Report Date UTC'
+        dataType: dateTime
+        isHidden
+        formatString: yyyy-mm-dd
+        sourceColumn: report_date_utc
+
+    partition 'RCA Query Events' = entity
+        mode: directLake
+        source
+            entityName: rca_query_events
+            schemaName: dbo
+            expressionSource: 'DirectLake - LH_DatabaseHub'

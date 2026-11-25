@@ -36,7 +36,8 @@ public sealed class RcaIntegrationTests : IDisposable
     /// Against a disposable PostgreSQL primary (CONTOSOCARE_TEST_PG_SERVER) and its hot standby (CONTOSOCARE_TEST_PG_REPLICA,
     /// application_name t4-replica), both reached as CONTOSOCARE_PG_USER (a member of pg_read_all_stats, as T4's setup
     /// grants it) with CONTOSOCARE_PG_PASSWORD: locking-blocking with a deadlock round, and one replica-lag cycle, while
-    /// the observer lane runs at shortened cadences. CI doesn't set them.
+    /// the observer lane runs at shortened cadences. CI doesn't set them. The standby's max_standby_streaming_delay must be
+    /// 60 seconds or more (or -1): replica-lag's report holds its lock 45 seconds, and the default, 30, cancels it first.
     /// </summary>
     [Fact]
     public async Task OnALocalPrimaryAndStandbyTheBlindCaptureFindsTheChainTheDeadlockAndTheReplayStall()
@@ -47,6 +48,14 @@ public sealed class RcaIntegrationTests : IDisposable
         var token = TestContext.Current.CancellationToken;
         var primary = PgEndpoint.Create(server, null, passwordFromEnvironment: true, managedIdentityClientId: null);
         var replica = primary.Replica(standby)!;
+        await using (var check = await new PgConnectionOpener(replica, RunnerLog.Null).OpenAsync(SessionNames.ForControl("test-check"), token, retry: false))
+        await using (var command = check.CreateCommand())
+        {
+            command.CommandText = "SELECT setting::integer FROM pg_settings WHERE name = 'max_standby_streaming_delay';";
+            var delayMs = await command.ExecuteScalarAsync(token) is int setting ? setting : 0;
+            Assert.True(delayMs is -1 or >= 60_000, $"The standby's max_standby_streaming_delay is {delayMs} ms: replica-lag's report holds its lock 45 seconds, so the standby would cancel it before the replay stall shows. Set it to 60s or more on the standby (ALTER SYSTEM SET max_standby_streaming_delay = '60s'; SELECT pg_reload_conf();) and run the test again.");
+        }
+
         var opener = new PgConnectionOpener(primary, RunnerLog.Null);
         await using (var setup = await opener.OpenAsync(SessionNames.ForControl("test-setup"), token, PgSessionLimits.Setup))
         {
@@ -264,9 +273,10 @@ public sealed class RcaIntegrationTests : IDisposable
     }
 
     /// <summary>
-    /// RCA-XE-00 reads sys.dm_xe_object_columns alone (2026-11-23): its earlier join to sys.dm_xe_objects took about 8 s
-    /// of CPU at each observer start on SQL Server 2022 CU25. Against a disposable SQL Server (CONTOSOCARE_TEST_SQL_SERVER,
-    /// as SqlIntegrationTests), both forms return the same fields for the five events. CI doesn't set it.
+    /// RCA-XE-00 reads sys.dm_xe_object_columns alone (2026-11-23): its earlier join to sys.dm_xe_objects ran about 46 s
+    /// on SQL Server 2022 CU25, so the observer's 30-second timeout for a long statement cut it short at each start.
+    /// Against a disposable SQL Server (CONTOSOCARE_TEST_SQL_SERVER, as SqlIntegrationTests), both forms return the same
+    /// fields for the five events. CI doesn't set it.
     /// </summary>
     [Fact]
     public async Task OnSqlServerTheEventsFieldsReadAloneAreTheJoinedFormsFields()

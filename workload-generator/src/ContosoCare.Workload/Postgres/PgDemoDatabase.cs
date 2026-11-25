@@ -379,10 +379,19 @@ internal sealed class PgDemoDatabase(NpgsqlConnection connection)
         return (reader.GetInt32(0), reader.GetInt32(1), reader.GetInt32(2));
     }
 
+    /// <summary>
+    /// The completed seed's scale, or null when there's none. It reads the status with the scale and checks it here, so the
+    /// statement has a shape no workload statement has: demo.fn_seed_scale(), which the workload calls every step, reads
+    /// the same row with the status in its WHERE, and Query Store keeps one row per role and query ID, with one search_path,
+    /// so RCA-PG-14 could leave the workload's reads out with this marked connection's.
+    /// </summary>
     public async Task<int?> GetSeedScaleAsync(CancellationToken cancellationToken)
     {
-        await using var command = Command("SELECT scale FROM demo.seed_state WHERE seed_state_id = 1 AND status = 'Completed';");
-        return await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false) is int scale ? scale : null;
+        await using var command = Command("SELECT scale, status FROM demo.seed_state WHERE seed_state_id = 1;");
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        return await reader.ReadAsync(cancellationToken).ConfigureAwait(false) && string.Equals(reader.GetString(1), "Completed", StringComparison.Ordinal)
+            ? reader.GetInt32(0)
+            : null;
     }
 
     private NpgsqlCommand Command(string sql)

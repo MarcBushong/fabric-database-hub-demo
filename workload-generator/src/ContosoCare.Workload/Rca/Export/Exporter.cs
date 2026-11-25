@@ -57,8 +57,14 @@ internal sealed record ExportResult(IReadOnlyList<ExportedDocument> Documents, s
 /// that ended by the end, so that wait sees the spans end with those runs in. A second stop of the same session keeps the
 /// end its first recorded. When a span still doesn't end, the index's message says so first
 /// (<see cref="StillCapturing"/>), and the runbook names that VM's tail.
+/// Every path past the export's lock reaches one commit point (<see cref="Commit"/>): the spans' sidecar rows sealed
+/// (<paramref name="sealSidecars"/>), then retention. Sealing prints nothing, so the export's output stays as it was.
 /// </summary>
-internal sealed class Exporter(EvidenceStore store, RunnerLog log, string producerVersion)
+/// <param name="store">The local evidence store.</param>
+/// <param name="log">The runner's log.</param>
+/// <param name="producerVersion">The runner's version, which each document names.</param>
+/// <param name="sealSidecars">Seals every span's new sidecar rows (rca/README.md, The sidecar), or null for none.</param>
+internal sealed class Exporter(EvidenceStore store, RunnerLog log, string producerVersion, Action? sealSidecars = null)
 {
     /// <summary>A host that observes several targets (T1's VM) aims at 64 KiB a session, one that observes one (T2's guest) at 32 KiB: 96 KiB in all.</summary>
     public const int MultiTargetBudget = 64 * 1024;
@@ -85,8 +91,9 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
     public ExportResult Export(string? sessionId, bool final, TimeSpan finalWait, bool endCapture = false)
     {
         final |= endCapture;
-        if (!endCapture && (!Directory.Exists(store.Root) || store.Spans().Count == 0))
+        if (!endCapture && !Directory.Exists(store.Root))
         {
+            // Nothing on this host at all: no span to seal, and nothing to clean up.
             return new ExportResult([], "Not selected", NothingCaptured);
         }
 
@@ -99,13 +106,13 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
             notes.Add("The capture's end couldn't be recorded, so the observer may go on capturing until the VM stops.");
         }
 
+        var capturing = final && !store.WaitForSpans(finalWait);
+        Commit(store.Time.GetUtcNow());
         if (store.Spans().Count == 0)
         {
             return new ExportResult([], endFailed ? "Warning" : "Not selected", Message(NothingCaptured, notes, []));
         }
 
-        store.Cleanup(now, log);
-        var capturing = final && !WaitForSpans(finalWait);
         List<string> lead = capturing ? [StillCapturing] : [];
 
         now = store.Time.GetUtcNow();
@@ -325,24 +332,27 @@ internal sealed class Exporter(EvidenceStore store, RunnerLog log, string produc
         return message.Length <= 500 ? message : message[..497] + "...";
     }
 
-    /// <summary>Waits until every span is closed or its process is gone, at most <paramref name="wait"/>; false when one is still open.</summary>
-    private bool WaitForSpans(TimeSpan wait)
+    /// <summary>
+    /// The export's one commit point, which every path past the lock reaches: the spans' new sidecar rows sealed first, then
+    /// retention, which never deletes a span whose sidecar rows wait unsealed (EvidenceStore.Cleanup). Sealing prints
+    /// nothing, so the export's output stays as it was; a sealing that fails is logged, and its rows wait for the next.
+    /// </summary>
+    private void Commit(DateTimeOffset now)
     {
-        var deadline = store.Time.GetUtcNow() + wait;
-        while (true)
+        if (sealSidecars is not null)
         {
-            if (store.Spans().All(s => s.Export.Complete || s.Finished))
+            try
             {
-                return true;
+                sealSidecars();
             }
-
-            if (store.Time.GetUtcNow() >= deadline)
+            catch (Exception ex) when (ex is not OutOfMemoryException)
             {
-                return false;
+                log.Warn("rca.sidecar-seal-failed", "Couldn't seal the spans' sidecar rows at this export; they wait for the next sealing, and their spans stay.", ("error", Redactor.Redact(ex.GetType().Name + ": " + ex.Message)));
+                log.Debug("rca.sidecar-seal-failed-detail", ex.ToString());
             }
-
-            Thread.Sleep(TimeSpan.FromMilliseconds(500));
         }
+
+        store.Cleanup(now, log);
     }
 
     /// <summary>A zero-length window for each of the span's targets: a document for answer-key rows that came after the capture.</summary>

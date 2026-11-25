@@ -50,16 +50,74 @@ internal sealed record ObserverOptions
 }
 
 /// <summary>
+/// A sidecar reader's block as it came back (rca/README.md, The sidecar): its rows, or why it has none, which the reader
+/// says in the sidecar's own coverage. None of it reaches the evidence document.
+/// </summary>
+internal sealed record QuietResult(IReadOnlyList<CaptureValues>? Rows, CaptureFailureKind? Failure, string? Message)
+{
+    public bool Succeeded => Rows is not null;
+
+    /// <summary>
+    /// The failure in its own words: <see cref="Message"/> without the observer's fix that a refusal's message ends with,
+    /// so a reader can give a block its own fix (a block that needs a permission the target's general fix doesn't give).
+    /// </summary>
+    public string? Error { get; init; }
+
+    public static QuietResult Of(IReadOnlyList<CaptureValues> rows) => new(rows, null, null);
+
+    public static QuietResult Failed(CaptureFailureKind kind, string message) => new(null, kind, message) { Error = message };
+
+    /// <summary>A refusal: its error, and in <see cref="Message"/> the observer's fix after it.</summary>
+    public static QuietResult Refused(string error, string fix) => new(null, CaptureFailureKind.Permission, $"{error} {fix}") { Error = error };
+}
+
+/// <summary>
+/// What a sidecar reader (Query Store's, T4's connection holders') may use of its target's observer: its one connection,
+/// run quietly, and its self-throttling's state, which the reader follows. Nothing the reader does through it changes
+/// the evidence document: a failure comes back to the reader and never becomes an RCA Coverage gap or an
+/// RCA.CAPTURE.&lt;target&gt; Warning; a block's time never feeds the self-throttling; and it never opens a connection,
+/// so when the observer connects, and what the evidence says about it, stay the evidence capture's.
+/// </summary>
+internal interface ISidecarAccess
+{
+    /// <summary>The target's key, as the evidence has it.</summary>
+    string Target { get; }
+
+    /// <summary>The self-throttling's factor: 1, or 2, 4, or 8 while samples are slow, by which the sentinel's interval is multiplied.</summary>
+    int Factor { get; }
+
+    /// <summary>True once three slow samples in a row stopped detail capture for the rest of the observation.</summary>
+    bool DetailStopped { get; }
+
+    /// <summary>
+    /// Runs one catalog block with its parameters and a timeout of its own (at least 1 s, at most the long statement
+    /// timeout), on the observer's open connection. A failure is the result's, never an exception, but the observer's
+    /// cancellation.
+    /// </summary>
+    Task<QuietResult> RunAsync(string blockId, DateTimeOffset now, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken);
+}
+
+/// <summary>
 /// One target's observer: one connection, one statement at a time, the sentinel for the whole session, and the detail
 /// capture its triggers start. Blind (ADR 0031): it sees what a DBA's tools see, and its cadence follows what it sees.
 /// </summary>
 internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureConnector connector, ObserverOptions options, RunnerLog log, string fix)
 {
     private readonly Dictionary<string, DateTimeOffset> refusedUntil = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, DateTimeOffset> quietRefusedUntil = new(StringComparer.Ordinal);
     private readonly Dictionary<string, DateTimeOffset> noted = new(StringComparer.Ordinal);
     private ICaptureConnection? connection;
     private DateTimeOffset nextConnect;
     private bool connectFailing;
+    private QuietAccess? sidecarAccess;
+
+    // A connection a sidecar read found lost and closed: the evidence capture's next block notes it (RunCoreAsync).
+    private CaptureException? quietLoss;
+
+    // EndAsync's hook and the lane's clock, and whether the evidence's own end has run (EvidenceEnded).
+    private Action<DateTimeOffset>? evidenceEndedHook;
+    private TimeProvider? evidenceEndClock;
+    private bool evidenceEndDone;
 
     /// <summary>The target's key in the evidence: T1, T2, T3, T4, or T4-replica.</summary>
     public string Target { get; } = target;
@@ -85,6 +143,9 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
 
     protected DateTimeOffset ObservingSince { get; private set; }
 
+    /// <summary>What a sidecar reader of this target may use of its observer: see <see cref="ISidecarAccess"/>.</summary>
+    protected ISidecarAccess SidecarAccess => sidecarAccess ??= new QuietAccess(this);
+
     /// <summary>Starts observing: the sink of the current span, then the target's own setup.</summary>
     public async Task BeginAsync(ICaptureSink sink, DateTimeOffset now, CancellationToken cancellationToken)
     {
@@ -93,6 +154,8 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
         Ids = new EpisodeIds(Target);
         ObservingSince = now;
         refusedUntil.Clear();
+        quietRefusedUntil.Clear();
+        quietLoss = null;
         noted.Clear();
         nextConnect = now;
         Log.Info("rca.observing", "The RCA observer is capturing this target for the session.", ("target", Target), ("connector", connector.Description));
@@ -108,19 +171,65 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
     /// <summary>Closes a connection a probe opened when observing never began (the session ended first).</summary>
     public Task ReleaseAsync() => DisconnectAsync();
 
-    /// <summary>Ends observing: the last reads, open episodes closed, the event session dropped, the connection closed.</summary>
-    public async Task EndAsync(DateTimeOffset now, CancellationToken cancellationToken)
+    /// <summary>
+    /// Ends observing: the last reads, open episodes closed, the event session dropped, the connection closed. When the
+    /// evidence's own end is done, before a sidecar reader's end reads, which may take a while (Query Store's, up to their
+    /// bound), or else as the evidence's end returns, its end time is taken once: <paramref name="clock"/>'s, the lane's,
+    /// or else <paramref name="now"/>. The evidence's last watermark is written at it and <paramref name="evidenceEnded"/>
+    /// gets it, each once, whichever of them fails. The lane releases the target at it once this returns, so the span's
+    /// end, its watermark, and RCA Coverage's window are the evidence's own, as without a sidecar, and a sidecar's last
+    /// rows still have their span. The lane passes its clock with the hook: the end's event read keeps events up to when
+    /// it ran, after <paramref name="now"/>.
+    /// </summary>
+    public async Task EndAsync(DateTimeOffset now, CancellationToken cancellationToken, Action<DateTimeOffset>? evidenceEnded = null, TimeProvider? clock = null)
     {
+        evidenceEndedHook = evidenceEnded;
+        evidenceEndClock = clock;
+        evidenceEndDone = false;
         try
         {
             await StopAsync(now, cancellationToken).ConfigureAwait(false);
         }
         finally
         {
-            Sink.Watermark(Target, now);
-            await DisconnectAsync().ConfigureAwait(false);
-            Log.Info("rca.observed", "The RCA observer stopped capturing this target.", ("target", Target));
-            Sink = NullSink.Instance;
+            try
+            {
+                EvidenceEnded(now);
+            }
+            finally
+            {
+                evidenceEndClock = null;
+                await DisconnectAsync().ConfigureAwait(false);
+                Log.Info("rca.observed", "The RCA observer stopped capturing this target.", ("target", Target));
+                Sink = NullSink.Instance;
+            }
+        }
+    }
+
+    /// <summary>
+    /// The evidence's own end is done (StopAsync's evidence part): its end time, taken once (EndAsync's clock, or else
+    /// <paramref name="now"/>); its last watermark at it; then EndAsync's hook with it, in a finally, so each runs once
+    /// whichever fails, and a failure follows them (the hook's, when both fail). A subclass calls it before its sidecar
+    /// reads' end, so they don't move the span's end; EndAsync calls it otherwise.
+    /// </summary>
+    protected void EvidenceEnded(DateTimeOffset now)
+    {
+        if (evidenceEndDone)
+        {
+            return;
+        }
+
+        evidenceEndDone = true;
+        var hook = evidenceEndedHook;
+        evidenceEndedHook = null;
+        var end = evidenceEndClock?.GetUtcNow() ?? now;
+        try
+        {
+            Sink.Watermark(Target, end);
+        }
+        finally
+        {
+            hook?.Invoke(end);
         }
     }
 
@@ -133,10 +242,31 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
     /// RCA.CAPTURE.&lt;target&gt; Warning with its fix and isn't tried again for a while; a lost connection is reopened
     /// later. With <paramref name="timed"/>, its duration feeds the self-throttling.
     /// </summary>
-    protected async Task<IReadOnlyList<CaptureValues>?> RunAsync(string blockId, DateTimeOffset now, CancellationToken cancellationToken, int[]? parameter = null, bool timed = true, bool longRunning = false, string? text = null)
+    protected Task<IReadOnlyList<CaptureValues>?> RunAsync(string blockId, DateTimeOffset now, CancellationToken cancellationToken, int[]? parameter = null, bool timed = true, bool longRunning = false, string? text = null) =>
+        RunCoreAsync(blockId, now, (open, statement, timeout) => open.QueryAsync(blockId, statement, parameter, timeout, cancellationToken), timed, longRunning, text, cancellationToken);
+
+    /// <summary>
+    /// Runs one catalog block with its parameters (T-SQL's by name, PostgreSQL's by position), as the other RunAsync runs
+    /// one: the sidecar's Query Store reads take a since, a flag, and lists (rca/capture/README.md).
+    /// </summary>
+    protected Task<IReadOnlyList<CaptureValues>?> RunAsync(string blockId, DateTimeOffset now, CaptureParameters parameters, CancellationToken cancellationToken, bool timed = true, bool longRunning = false, string? text = null) =>
+        RunCoreAsync(blockId, now, (open, statement, timeout) => open.QueryAsync(blockId, statement, parameters, timeout, cancellationToken), timed, longRunning, text, cancellationToken);
+
+    private async Task<IReadOnlyList<CaptureValues>?> RunCoreAsync(string blockId, DateTimeOffset now, Func<ICaptureConnection, string, TimeSpan, Task<IReadOnlyList<CaptureValues>>> query, bool timed, bool longRunning, string? text, CancellationToken cancellationToken)
     {
         if (refusedUntil.TryGetValue(blockId, out var until) && now < until)
         {
+            return null;
+        }
+
+        if (quietLoss is { } lost && connection is null)
+        {
+            // A sidecar read found the connection lost and closed it (RunQuietlyAsync). This block notes the loss and waits
+            // to reconnect exactly as it would have had it found the connection lost itself, as it would without the
+            // sidecar's reads: the evidence never shows that a sidecar read came first.
+            quietLoss = null;
+            GapOnce(now, "connection:" + blockId, $"{Target} didn't answer {blockId}: {lost.Message}");
+            nextConnect = now + Options.Reconnect;
             return null;
         }
 
@@ -149,7 +279,7 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
         var started = System.Diagnostics.Stopwatch.GetTimestamp();
         try
         {
-            var rows = await open.QueryAsync(blockId, text ?? CaptureCatalog.Get(blockId), parameter, longRunning ? Options.LongStatementTimeout : Options.StatementTimeout, cancellationToken).ConfigureAwait(false);
+            var rows = await query(open, text ?? CaptureCatalog.Get(blockId), longRunning ? Options.LongStatementTimeout : Options.StatementTimeout).ConfigureAwait(false);
             if (timed)
             {
                 Throttle(blockId, System.Diagnostics.Stopwatch.GetElapsedTime(started), now);
@@ -185,6 +315,50 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
     }
 
     protected void Write(CaptureRow row) => Sink.Write(row);
+
+    /// <summary>
+    /// Runs one catalog block for a sidecar reader (<see cref="ISidecarAccess"/>), on the connection the evidence capture
+    /// opened, and never opens one. Its failure goes back to the reader, with no RCA Coverage gap and no RCA.CAPTURE
+    /// Warning: a refusal with the fix, and the block isn't tried again for a while (apart from the evidence's blocks); a
+    /// lost connection is closed, and the evidence capture's next block notes the loss as if it had found it.
+    /// </summary>
+    private async Task<QuietResult> RunQuietlyAsync(string blockId, DateTimeOffset now, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken)
+    {
+        if (quietRefusedUntil.TryGetValue(blockId, out var until) && now < until)
+        {
+            return QuietResult.Refused(string.Create(CultureInfo.InvariantCulture, $"it was refused a permission on {Target}, so it's tried again at {until:HH:mm:ss} UTC."), fix);
+        }
+
+        if (connection is not { } open)
+        {
+            return QuietResult.Failed(CaptureFailureKind.Connection, $"{Target} had no open connection then: the evidence capture reconnects, and the read waits for it.");
+        }
+
+        try
+        {
+            var bounded = timeout < TimeSpan.FromSeconds(1) ? TimeSpan.FromSeconds(1) : timeout > Options.LongStatementTimeout ? Options.LongStatementTimeout : timeout;
+            return QuietResult.Of(await open.QueryAsync(blockId, CaptureCatalog.Get(blockId), parameters, bounded, cancellationToken).ConfigureAwait(false));
+        }
+        catch (CaptureException ex)
+        {
+            switch (ex.Kind)
+            {
+                case CaptureFailureKind.Permission:
+                    quietRefusedUntil[blockId] = now + Options.PermissionRetry;
+                    return QuietResult.Refused(ex.Message, fix);
+                case CaptureFailureKind.Connection:
+                    await DisconnectAsync().ConfigureAwait(false);
+                    quietLoss = ex;
+                    break;
+            }
+
+            return QuietResult.Failed(ex.Kind, ex.Message);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException && (ex is not OperationCanceledException || !cancellationToken.IsCancellationRequested))
+        {
+            return QuietResult.Failed(CaptureFailureKind.Other, Redactor.Redact(ex.GetType().Name + ": " + ex.Message));
+        }
+    }
 
     protected void Gap(DateTimeOffset at, string text) => Sink.Note(new CaptureNote(NoteKind.Gap, Target, at, TextNormalizer.Detail(text) ?? "A gap the observer couldn't describe."));
 
@@ -355,6 +529,19 @@ internal abstract class TargetObserver(string target, DemoTarget gate, ICaptureC
                 Log.Debug("rca.disconnect-failed", Redactor.Redact(ex.Message), ("target", Target));
             }
         }
+    }
+
+    /// <summary>A sidecar reader's access to this observer: its quiet run, and its self-throttling's state as it is now.</summary>
+    private sealed class QuietAccess(TargetObserver owner) : ISidecarAccess
+    {
+        public string Target => owner.Target;
+
+        public int Factor => owner.Cadence.Factor;
+
+        public bool DetailStopped => owner.Cadence.DetailStopped;
+
+        public Task<QuietResult> RunAsync(string blockId, DateTimeOffset now, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken) =>
+            owner.RunQuietlyAsync(blockId, now, parameters, timeout, cancellationToken);
     }
 
     private sealed class NullSink : ICaptureSink

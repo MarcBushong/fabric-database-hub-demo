@@ -7,6 +7,7 @@ using ContosoCare.Workload.Cosmos;
 using ContosoCare.Workload.Diagnostics;
 using ContosoCare.Workload.Postgres;
 using ContosoCare.Workload.Profiles;
+using ContosoCare.Workload.Rca.Observer;
 using ContosoCare.Workload.Runs;
 using ContosoCare.Workload.Sql;
 using Microsoft.Data.SqlClient;
@@ -252,7 +253,8 @@ internal static partial class CommandLine
                     var endpoint = target.ResolvePostgres(parseResult);
                     var replica = target.ResolvePostgresReplica(parseResult, endpoint);
                     IReadOnlyList<RunRecord>? running = null;
-                    await using (var pgConnection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("stop"), cancellationToken).ConfigureAwait(false))
+                    // As the RCA observer's connections open (PgCaptureConnector.Startup): T4's Query Store evidence leaves out the stop.
+                    await using (var pgConnection = await new PgConnectionOpener(endpoint, log).OpenAsync(SessionNames.ForControl("stop"), cancellationToken, silent: PgCaptureConnector.Startup, plainIfRefused: true).ConfigureAwait(false))
                     {
                         var database = new PgDemoDatabase(pgConnection);
                         if (replica is not null && scope == "scenario")

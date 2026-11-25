@@ -7,8 +7,12 @@
 -- the runner's identity (SYSTEM, a sysadmin through BUILTIN\Administrators in the default JumpstartImage and T1 modes:
 -- vm/hyperv-guest/GuestWorkload.ps1, vm/bootstrap/Invoke-SqlVmBootstrap.ps1). T3: T1's managed identity, dbo through
 -- the P6 administrator group (database/azuresql/030-configure.sql). No new permission or role assignment.
--- Least privilege, if the owner wants a dedicated login later: VIEW SERVER PERFORMANCE STATE covers the DMVs below on
--- SQL Server 2022, and ALTER ANY EVENT SESSION the XE session; VIEW DATABASE PERFORMANCE STATE on Azure SQL Database.
+-- Least privilege, if the owner wants a dedicated login later (rca/capture/README.md lists each block's permission).
+-- SQL Server 2022: VIEW SERVER PERFORMANCE STATE covers the DMVs and Query Store's views below, and ALTER ANY EVENT
+-- SESSION the XE session. Azure SQL Database: VIEW DATABASE STATE in ContosoCare covers them, and CREATE ANY DATABASE
+-- EVENT SESSION the XE session; RCA-AZ-04 also needs VIEW SERVER PERFORMANCE STATE, which there comes only through the
+-- ##MS_ServerStateReader## server role, for a login in master with its own user in ContosoCare. Both: VIEW DEFINITION
+-- for the harness's mark (sys.extended_properties).
 --
 -- Blind (ADR 0031): the observer sees what a DBA's tools see. It never reads what the workload plans or injects, and
 -- its cadence follows what it sees: the sentinel (RCA-SQL-09, RCA-XE-02) runs every 30 s for the whole session, and a
@@ -22,7 +26,9 @@
 -- number, date, and binary literals become placeholders; RPC procedure names stay), and only for the workload's own
 -- sessions. The application name is stored without its internal segments, with an opaque run token (rca/README.md,
 -- Names). Any other session that appears in a chain is stored as its session ID, status, and waits, without text,
--- login, or host.
+-- login, or host. Query Store's statements (RCA-SQL-10, 14) belong to no session: every one is kept, normalized the same
+-- way, but the capture's own and the harness's, which every statement here marks or the demo marks
+-- (rca/README.md, What the capture leaves out).
 
 -- name: RCA-SQL-01
 -- The blocking snapshot: one row per session in ContosoCare that waits on another session or that another session
@@ -33,7 +39,7 @@ SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 1000;
 DECLARE @db int = DB_ID();
-WITH edges AS (
+WITH /* dbhubdemo:rca-observer */ edges AS (
     SELECT r.session_id, r.blocking_session_id
     FROM sys.dm_exec_requests AS r
     WHERE r.blocking_session_id <> 0
@@ -103,7 +109,7 @@ ORDER BY s.session_id;
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
 SET LOCK_TIMEOUT 1000;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     l.request_session_id,
     l.resource_type,
@@ -142,7 +148,7 @@ ORDER BY l.resource_type, l.resource_associated_entity_id, l.request_status, l.r
 -- (THREADPOOL). T1, T2 (on T3 the same DMV shows the database's own tasks only).
 SET NOCOUNT ON;
 SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     wt.session_id,
     wt.exec_context_id,
@@ -164,7 +170,7 @@ ORDER BY wt.session_id, wt.exec_context_id;
 -- the export keeps the episode's per-type deltas against the minutes before it (the categories are
 -- sys.query_store_wait_stats' table, the ones Database Hub's SqlServerWaitStats uses). T1, T2.
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     ws.wait_type,
     ws.waiting_tasks_count,
@@ -178,7 +184,7 @@ WHERE ws.waiting_tasks_count > 0;
 -- Memory grants: the granted and waiting grants of sessions in ContosoCare, and each resource semaphore's queue.
 -- Every 15 s while the sentinel sees Memory Grants Pending above 0. T1, T2, T3.
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     mg.session_id,
     mg.request_time,
@@ -205,7 +211,7 @@ WHERE s.database_id = DB_ID();
 -- name: RCA-SQL-06
 -- The memory semaphores behind RCA-SQL-05: how much workspace memory there is, and how many queries wait for it.
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     rs.resource_semaphore_id,
     rs.pool_id,
@@ -225,7 +231,7 @@ FROM sys.dm_exec_query_resource_semaphores AS rs;
 -- Schedulers and workers: runnable tasks (CPU queue), tasks waiting for a worker (work_queue_count), and the worker
 -- limit. Every 15 s during a CPU or worker episode (CPU at or above 80 %, or a THREADPOOL wait rise). T1, T2.
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc  = SYSUTCDATETIME(),
     schedulers       = COUNT(*),
     runnable_tasks   = SUM(sc.runnable_tasks_count),
@@ -243,7 +249,7 @@ WHERE sc.status = N'VISIBLE ONLINE';
 -- File I/O, cumulative (diffed): reads, writes, bytes, and stall time for ContosoCare's files and tempdb's, during an
 -- IO, log, or CPU episode. T1, T2. (T3: RCA-AZ-05.)
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     vfs.database_id,
     vfs.file_id,
@@ -268,7 +274,7 @@ WHERE vfs.database_id IN (DB_ID(N'ContosoCare'), 2);
 -- capture (RCA-SQL-01, 02), which stops after 60 s without one. T1, T2, T3 (Learn's page applies to Azure SQL
 -- Database; the observer reads the counters this returns there, and records a missing one as not captured).
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     object_name     = RTRIM(pc.object_name),
     counter_name    = RTRIM(pc.counter_name),
@@ -282,84 +288,205 @@ WHERE pc.counter_name IN (N'Processes blocked', N'Table Lock Escalations/sec', N
   AND pc.instance_name IN (N'', N'_Total', N'ContosoCare');
 
 -- name: RCA-SQL-10
--- Query Store: an episode's top queries by CPU, per plan, with their module and text. Once at the end of every CPU,
--- waits, or memory episode, and once for the same length of time before it (the baseline). T1, T2, T3 (Query Store is on
--- in ContosoCare on every SQL target: database/*/030-configure.sql). Intervals are 15 minutes long, so the window is
--- widened to whole intervals; the times are said with the result.
+-- Query Store's top plans per interval (the sidecar): for each Query Store interval that ended after @since, the queries
+-- among its top 10 plans by CPU, top 5 by duration, top 5 by logical reads, and top 5 by wait time (every wait category
+-- but Idle and Unknown), with every plan of theirs that ran in the interval: its runtime statistics summed over the
+-- interval's rows (execution-weighted: each row's average times its executions). Read every 15 minutes, 2 minutes after
+-- an interval ends, for the intervals that ended since the previous read; at the observer's start for the 2 hours before
+-- it; and at its end with @final = 1, which adds the interval still open (Query Store unifies its in-memory and on-disk
+-- data when it's read). T1, T2, T3: Query Store is on in ContosoCare on each, at 15-minute intervals
+-- (database/*/030-configure.sql). Parameters: @since datetimeoffset, the end of the last interval read; @final bit;
+-- @left_out nvarchar(max), a JSON array of the query_ids RCA-SQL-16 found to be the runner's own.
+-- Left out, by three fixed rules and nothing else (rca/README.md, What the capture leaves out): the capture's own
+-- statements, which carry the marker dbhubdemo:rca-observer in their text, as this one does; every statement of a
+-- module the demo marks as its harness (the extended property dbhubdemo.role = harness, which database/common's control
+-- script sets on its own modules); and the runner's own ad hoc statements, @left_out. Everything else is measured
+-- evidence: the scenario modules' reads and writes, other applications' statements, and monitoring queries alike. The
+-- top lists are ranked after those leave-outs, a plan is in one only when it used what the list ranks (CPU, time,
+-- reads, or waits above 0), and ties go to the lower plan_id, so two reads of an interval rank it alike. At most 600
+-- rows, the oldest intervals first: the runner reads again from the last whole interval it got.
 SET NOCOUNT ON;
-DECLARE @from datetimeoffset(0) = TODATETIMEOFFSET(DATEADD(minute, -15, SYSUTCDATETIME()), 0);
-DECLARE @to datetimeoffset(0) = TODATETIMEOFFSET(SYSUTCDATETIME(), 0);
-WITH stats AS (
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET LOCK_TIMEOUT 1000;
+WITH /* dbhubdemo:rca-observer */ harness AS (
+    SELECT ep.major_id AS object_id
+    FROM sys.extended_properties AS ep
+    WHERE ep.class = 1
+      AND ep.minor_id = 0
+      AND ep.name = N'dbhubdemo.role'
+      AND CAST(ep.value AS nvarchar(100)) = N'harness'
+),
+intervals AS (
+    SELECT i.runtime_stats_interval_id, i.start_time, i.end_time
+    FROM sys.query_store_runtime_stats_interval AS i
+    WHERE i.end_time > @since
+      AND (i.end_time <= SYSDATETIMEOFFSET() OR @final = 1)
+),
+plans AS (
     SELECT
+        i.runtime_stats_interval_id,
+        i.start_time,
+        i.end_time,
         p.query_id,
         rs.plan_id,
-        interval_start     = MIN(i.start_time),
-        interval_end       = MAX(i.end_time),
-        executions         = SUM(rs.count_executions),
-        cpu_ms             = SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0,
-        duration_ms        = SUM(rs.avg_duration * rs.count_executions) / 1000.0,
-        logical_reads      = SUM(rs.avg_logical_io_reads * rs.count_executions),
-        physical_reads     = SUM(rs.avg_physical_io_reads * rs.count_executions),
-        log_bytes          = SUM(rs.avg_log_bytes_used * rs.count_executions),
-        max_used_memory_kb = MAX(rs.max_query_max_used_memory) * 8,
-        max_dop            = MAX(rs.max_dop)
-    FROM sys.query_store_runtime_stats AS rs
-    JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = rs.runtime_stats_interval_id
+        executions           = SUM(rs.count_executions),
+        aborted_executions   = SUM(CASE WHEN rs.execution_type IN (3, 4) THEN rs.count_executions ELSE 0 END),
+        cpu_ms               = SUM(rs.avg_cpu_time * rs.count_executions) / 1000.0,
+        duration_ms          = SUM(rs.avg_duration * rs.count_executions) / 1000.0,
+        max_duration_ms      = MAX(rs.max_duration) / 1000.0,
+        logical_reads        = SUM(rs.avg_logical_io_reads * rs.count_executions),
+        physical_reads       = SUM(rs.avg_physical_io_reads * rs.count_executions),
+        row_count            = SUM(rs.avg_rowcount * rs.count_executions),
+        log_bytes            = SUM(rs.avg_log_bytes_used * rs.count_executions),
+        tempdb_kb            = SUM(rs.avg_tempdb_space_used * rs.count_executions) * 8,
+        max_used_memory_kb   = MAX(rs.max_query_max_used_memory) * 8,
+        max_dop              = MAX(rs.max_dop),
+        first_execution_time = MIN(rs.first_execution_time),
+        last_execution_time  = MAX(rs.last_execution_time)
+    FROM intervals AS i
+    JOIN sys.query_store_runtime_stats AS rs ON rs.runtime_stats_interval_id = i.runtime_stats_interval_id
     JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id
-    WHERE i.end_time > @from AND i.start_time < @to
-    GROUP BY p.query_id, rs.plan_id
+    GROUP BY i.runtime_stats_interval_id, i.start_time, i.end_time, p.query_id, rs.plan_id
+),
+waits AS (
+    SELECT ws.runtime_stats_interval_id, ws.plan_id, wait_ms = SUM(ws.total_query_wait_time_ms)
+    FROM sys.query_store_wait_stats AS ws
+    WHERE ws.runtime_stats_interval_id IN (SELECT i.runtime_stats_interval_id FROM intervals AS i)
+      AND ws.wait_category_desc NOT IN (N'Idle', N'Unknown')
+    GROUP BY ws.runtime_stats_interval_id, ws.plan_id
+),
+kept AS (
+    SELECT
+        pl.runtime_stats_interval_id,
+        pl.start_time,
+        pl.end_time,
+        pl.query_id,
+        pl.plan_id,
+        pl.executions,
+        pl.aborted_executions,
+        pl.cpu_ms,
+        pl.duration_ms,
+        pl.max_duration_ms,
+        pl.logical_reads,
+        pl.physical_reads,
+        pl.row_count,
+        pl.log_bytes,
+        pl.tempdb_kb,
+        pl.max_used_memory_kb,
+        pl.max_dop,
+        pl.first_execution_time,
+        pl.last_execution_time,
+        wait_ms       = w.wait_ms,
+        q.query_hash,
+        q.object_id,
+        qt.query_sql_text,
+        cpu_rank      = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY pl.cpu_ms DESC, pl.plan_id),
+        duration_rank = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY pl.duration_ms DESC, pl.plan_id),
+        reads_rank    = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY pl.logical_reads DESC, pl.plan_id),
+        wait_rank     = ROW_NUMBER() OVER (PARTITION BY pl.runtime_stats_interval_id ORDER BY ISNULL(w.wait_ms, 0) DESC, pl.plan_id)
+    FROM plans AS pl
+    JOIN sys.query_store_query AS q ON q.query_id = pl.query_id
+    JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+    LEFT JOIN waits AS w ON w.runtime_stats_interval_id = pl.runtime_stats_interval_id AND w.plan_id = pl.plan_id
+    WHERE q.object_id NOT IN (SELECT h.object_id FROM harness AS h)
+      AND qt.query_sql_text NOT LIKE N'%dbhubdemo:rca-observer%'
+      AND q.query_id NOT IN (SELECT CAST(j.[value] AS bigint) FROM OPENJSON(@left_out) AS j)
+),
+chosen AS (
+    SELECT DISTINCT k.runtime_stats_interval_id, k.query_id
+    FROM kept AS k
+    WHERE (k.cpu_rank <= 10 AND k.cpu_ms > 0)
+       OR (k.duration_rank <= 5 AND k.duration_ms > 0)
+       OR (k.reads_rank <= 5 AND k.logical_reads > 0)
+       OR (k.wait_rank <= 5 AND k.wait_ms > 0)
 )
-SELECT TOP (20)
-    st.query_id,
-    st.plan_id,
-    st.interval_start,
-    st.interval_end,
-    st.executions,
-    st.cpu_ms,
-    st.duration_ms,
-    st.logical_reads,
-    st.physical_reads,
-    st.log_bytes,
-    st.max_used_memory_kb,
-    st.max_dop,
-    q.query_hash,
-    module_name = CASE WHEN q.object_id <> 0 THEN QUOTENAME(OBJECT_SCHEMA_NAME(q.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(q.object_id)) END,
-    qt.query_sql_text,
-    p.is_forced_plan,
-    p.plan_forcing_type_desc,
-    p.force_failure_count,
-    p.last_force_failure_reason_desc,
-    p.count_compiles,
-    p.last_compile_start_time,
-    plans_for_query = (SELECT COUNT(*) FROM sys.query_store_plan AS p2 WHERE p2.query_id = st.query_id)
-FROM stats AS st
-JOIN sys.query_store_plan AS p ON p.plan_id = st.plan_id
-JOIN sys.query_store_query AS q ON q.query_id = st.query_id
-JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
-ORDER BY st.cpu_ms DESC;
+SELECT TOP (600)
+    captured_at_utc    = SYSUTCDATETIME(),
+    interval_start_utc = k.start_time,
+    interval_end_utc   = k.end_time,
+    k.query_id,
+    k.plan_id,
+    k.query_hash,
+    plan_hash          = p.query_plan_hash,
+    module_name        = CASE WHEN k.object_id <> 0 THEN QUOTENAME(OBJECT_SCHEMA_NAME(k.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(k.object_id)) END,
+    k.query_sql_text,
+    k.executions,
+    k.aborted_executions,
+    k.cpu_ms,
+    k.duration_ms,
+    k.max_duration_ms,
+    k.logical_reads,
+    k.physical_reads,
+    k.row_count,
+    k.log_bytes,
+    k.tempdb_kb,
+    k.max_used_memory_kb,
+    k.max_dop,
+    k.wait_ms,
+    first_execution_utc = k.first_execution_time,
+    last_execution_utc  = k.last_execution_time
+FROM kept AS k
+JOIN chosen AS c ON c.runtime_stats_interval_id = k.runtime_stats_interval_id AND c.query_id = k.query_id
+JOIN sys.query_store_plan AS p ON p.plan_id = k.plan_id
+ORDER BY k.start_time, k.cpu_ms DESC, k.plan_id;
 
 -- name: RCA-SQL-11
--- Query Store's waits for the same top plans, by wait category (Lock, Buffer IO, Memory, Parallelism, CPU, ...).
+-- Query Store's waits by category (Lock, CPU, Buffer IO, Memory, Parallelism, Tran Log IO, Network IO, ...) for the plans
+-- RCA-SQL-10 returned (the sidecar): each plan's three largest in each interval, Idle and Unknown left out. Read with
+-- RCA-SQL-10, with its @since and @final, and @plans nvarchar(max): its plan_ids, comma-separated. T1, T2, T3.
 SET NOCOUNT ON;
-DECLARE @from datetimeoffset(0) = TODATETIMEOFFSET(DATEADD(minute, -15, SYSUTCDATETIME()), 0);
-DECLARE @to datetimeoffset(0) = TODATETIMEOFFSET(SYSUTCDATETIME(), 0);
-SELECT TOP (60)
-    ws.plan_id,
-    ws.wait_category_desc,
-    total_wait_ms = SUM(ws.total_query_wait_time_ms),
-    max_wait_ms   = MAX(ws.max_query_wait_time_ms)
-FROM sys.query_store_wait_stats AS ws
-JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = ws.runtime_stats_interval_id
-WHERE i.end_time > @from AND i.start_time < @to
-GROUP BY ws.plan_id, ws.wait_category_desc
-ORDER BY total_wait_ms DESC;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET LOCK_TIMEOUT 1000;
+WITH /* dbhubdemo:rca-observer */ waits AS (
+    SELECT
+        i.start_time,
+        i.end_time,
+        p.query_id,
+        ws.plan_id,
+        ws.wait_category_desc,
+        wait_ms     = SUM(ws.total_query_wait_time_ms),
+        max_wait_ms = MAX(ws.max_query_wait_time_ms)
+    FROM sys.query_store_wait_stats AS ws
+    JOIN sys.query_store_runtime_stats_interval AS i ON i.runtime_stats_interval_id = ws.runtime_stats_interval_id
+    JOIN sys.query_store_plan AS p ON p.plan_id = ws.plan_id
+    WHERE i.end_time > @since
+      AND (i.end_time <= SYSDATETIMEOFFSET() OR @final = 1)
+      AND ws.plan_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@plans, N',') AS v)
+      AND ws.wait_category_desc NOT IN (N'Idle', N'Unknown')
+    GROUP BY i.start_time, i.end_time, p.query_id, ws.plan_id, ws.wait_category_desc
+),
+ranked AS (
+    SELECT
+        w.start_time,
+        w.end_time,
+        w.query_id,
+        w.plan_id,
+        w.wait_category_desc,
+        w.wait_ms,
+        w.max_wait_ms,
+        wait_rank = ROW_NUMBER() OVER (PARTITION BY w.start_time, w.plan_id ORDER BY w.wait_ms DESC, w.wait_category_desc)
+    FROM waits AS w
+)
+SELECT
+    captured_at_utc    = SYSUTCDATETIME(),
+    interval_start_utc = r.start_time,
+    interval_end_utc   = r.end_time,
+    r.query_id,
+    r.plan_id,
+    wait_category      = r.wait_category_desc,
+    r.wait_ms,
+    r.max_wait_ms
+FROM ranked AS r
+WHERE r.wait_rank <= 3
+  AND r.wait_ms > 0
+ORDER BY r.start_time, r.plan_id, r.wait_ms DESC, r.wait_category_desc;
 
 -- name: RCA-SQL-12
 -- Deadlock graphs from the always-on system_health session, when the ContosoCare_RCA session isn't there (an older
 -- runner, or the owner turned it off): deadlocks since @since. SQL Server only (T1, T2).
 SET NOCOUNT ON;
 DECLARE @since datetime2(7) = DATEADD(minute, -15, SYSUTCDATETIME());
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     f.timestamp_utc,
     event_xml = CAST(f.event_data AS xml)
 FROM sys.fn_xe_file_target_read_file(N'system_health*.xel', NULL, NULL, NULL) AS f
@@ -372,7 +499,7 @@ WHERE f.object_name = N'xml_deadlock_report'
 -- end of every CPU or IO episode. T1, T2, T3. Suggestions are evidence for a person's review, never applied by the
 -- capture.
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc     = SYSUTCDATETIME(),
     d.index_handle,
     table_name          = d.statement,
@@ -390,13 +517,142 @@ JOIN sys.dm_db_missing_index_group_stats AS s ON s.group_handle = g.index_group_
 WHERE d.database_id = DB_ID()
 ORDER BY s.avg_total_user_cost * s.avg_user_impact * (s.user_seeks + s.user_scans) DESC;
 
+-- name: RCA-SQL-14
+-- Query Store's plans (the sidecar): the plans of the queries RCA-SQL-10 returned, at most the 5 of each query that ran
+-- last, every plan RCA-SQL-10 returned (so each of its rows has its plan), and every forced plan: when each was compiled
+-- and last ran, whether it's forced and how, and its forcing failures; and, for the plans named in @with_plan only, its
+-- showplan XML, which the observer reduces to the plan's shape (its costliest operators with their objects and indexes,
+-- its warnings, a missing index) and never keeps a parameter's value from. A showplan over 16,777,216 bytes (8,388,608
+-- characters, the most the observer reduces) isn't returned: query_plan_bytes says its size, so the coverage says why
+-- the plan has no summary. Read with RCA-SQL-10. Parameters: @queries nvarchar(max), RCA-SQL-10's query_ids,
+-- comma-separated; @plans nvarchar(max), its plan_ids; @with_plan nvarchar(max), the plan_ids whose XML the observer
+-- hasn't reduced yet; @left_out nvarchar(max), RCA-SQL-10's. It leaves out what RCA-SQL-10 leaves out, by the same three
+-- rules, so a forced plan of the runner's own statements isn't returned either. T1, T2, T3.
+SET NOCOUNT ON;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET LOCK_TIMEOUT 1000;
+WITH /* dbhubdemo:rca-observer */ harness AS (
+    SELECT ep.major_id AS object_id
+    FROM sys.extended_properties AS ep
+    WHERE ep.class = 1
+      AND ep.minor_id = 0
+      AND ep.name = N'dbhubdemo.role'
+      AND CAST(ep.value AS nvarchar(100)) = N'harness'
+),
+recent AS (
+    SELECT p.plan_id, last_rank = ROW_NUMBER() OVER (PARTITION BY p.query_id ORDER BY p.last_execution_time DESC, p.plan_id DESC)
+    FROM sys.query_store_plan AS p
+    WHERE p.query_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@queries, N',') AS v)
+),
+chosen AS (
+    SELECT r.plan_id FROM recent AS r WHERE r.last_rank <= 5
+    UNION
+    SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@plans, N',') AS v
+    UNION
+    SELECT p.plan_id FROM sys.query_store_plan AS p WHERE p.is_forced_plan = 1
+)
+SELECT
+    captured_at_utc    = SYSUTCDATETIME(),
+    p.query_id,
+    p.plan_id,
+    q.query_hash,
+    plan_hash          = p.query_plan_hash,
+    module_name        = CASE WHEN q.object_id <> 0 THEN QUOTENAME(OBJECT_SCHEMA_NAME(q.object_id)) + N'.' + QUOTENAME(OBJECT_NAME(q.object_id)) END,
+    qt.query_sql_text,
+    compiled_utc       = p.initial_compile_start_time,
+    last_compiled_utc  = p.last_compile_start_time,
+    last_execution_utc = p.last_execution_time,
+    compiles           = p.count_compiles,
+    p.is_forced_plan,
+    forcing_type       = p.plan_forcing_type_desc,
+    force_failures     = p.force_failure_count,
+    last_force_failure = CASE WHEN p.force_failure_count > 0 THEN p.last_force_failure_reason_desc END,
+    plans_for_query    = (SELECT COUNT(*) FROM sys.query_store_plan AS p2 WHERE p2.query_id = p.query_id),
+    is_parallel        = p.is_parallel_plan,
+    query_plan         = CASE WHEN p.plan_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@with_plan, N',') AS v)
+                               AND DATALENGTH(p.query_plan) <= 16777216 THEN p.query_plan END,
+    query_plan_bytes   = CASE WHEN p.plan_id IN (SELECT TRY_CAST(v.value AS bigint) FROM STRING_SPLIT(@with_plan, N',') AS v) THEN DATALENGTH(p.query_plan) END
+FROM chosen AS c
+JOIN sys.query_store_plan AS p ON p.plan_id = c.plan_id
+JOIN sys.query_store_query AS q ON q.query_id = p.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+WHERE q.object_id NOT IN (SELECT h.object_id FROM harness AS h)
+  AND qt.query_sql_text NOT LIKE N'%dbhubdemo:rca-observer%'
+  AND q.query_id NOT IN (SELECT CAST(j.[value] AS bigint) FROM OPENJSON(@left_out) AS j)
+ORDER BY p.query_id, p.plan_id;
+
+-- name: RCA-SQL-15
+-- Query Store's state as a DBA checks it, and its forced plans, in one row (the sidecar): the actual and desired state,
+-- why it's read-only when it is (readonly_reason, Learn's codes), its capture mode, interval, and storage against its
+-- limit; and every forced plan as query_id:plan_id:forcing type, semicolon-separated. Every 60 s on T1, T2, T3. A state
+-- other than READ_WRITE is a coverage gap that says so, and a plan forced or unforced since the previous read is an RCA
+-- Query Events row, timed within a minute.
+SET NOCOUNT ON;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET LOCK_TIMEOUT 1000;
+SELECT /* dbhubdemo:rca-observer */
+    captured_at_utc    = SYSUTCDATETIME(),
+    actual_state       = o.actual_state_desc,
+    desired_state      = o.desired_state_desc,
+    o.readonly_reason,
+    query_capture_mode = o.query_capture_mode_desc,
+    o.interval_length_minutes,
+    o.current_storage_size_mb,
+    o.max_storage_size_mb,
+    forced_plans       = (SELECT STRING_AGG(CONCAT(CAST(f.query_id AS nvarchar(max)), N':', f.plan_id, N':', f.plan_forcing_type_desc), N';')
+                                 WITHIN GROUP (ORDER BY f.query_id, f.plan_id)
+                          FROM sys.query_store_plan AS f
+                          WHERE f.is_forced_plan = 1)
+FROM sys.database_query_store_options AS o;
+
+-- name: RCA-SQL-16
+-- The ad hoc statements (object_id 0) that ran in the intervals RCA-SQL-10 is about to read, with their text, so that the
+-- runner leaves out its own (rca/README.md, What the capture leaves out, 3): it compares each text, normalized, with its
+-- list of the statements it sends outside a module (Rca/QueryStore/HarnessStatements.cs) and of the observer's own as
+-- earlier runners sent them, before the marker (Rca/QueryStore/SqlObserverStatements.cs; item 1), and passes the
+-- query_ids that match to RCA-SQL-10 and 14 as @left_out. Read before each RCA-SQL-10 read, with its @since and @final.
+-- Not returned: a text over 4,000 characters (the runner's are much shorter), a query the engine generated itself
+-- (is_internal_query, such as an automatic statistics update), and the capture's own statements, which carry the
+-- marker. At most 2,000 rows, the most executed first: the stop check every run polls is always near the top, and the
+-- read's coverage says when the bound was hit. A statement of the runner's that this block doesn't return, past the
+-- bound or in an interval that ended between this read and RCA-SQL-10's, is matched by the text RCA-SQL-10 and 14
+-- return: the runner drops its rows and reads RCA-SQL-10's page again without it. The texts are only compared, never
+-- kept. T1, T2, T3.
+SET NOCOUNT ON;
+SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED;
+SET LOCK_TIMEOUT 1000;
+WITH /* dbhubdemo:rca-observer */ intervals AS (
+    SELECT i.runtime_stats_interval_id
+    FROM sys.query_store_runtime_stats_interval AS i
+    WHERE i.end_time > @since
+      AND (i.end_time <= SYSDATETIMEOFFSET() OR @final = 1)
+),
+ran AS (
+    SELECT p.query_id, executions = SUM(rs.count_executions)
+    FROM intervals AS i
+    JOIN sys.query_store_runtime_stats AS rs ON rs.runtime_stats_interval_id = i.runtime_stats_interval_id
+    JOIN sys.query_store_plan AS p ON p.plan_id = rs.plan_id
+    GROUP BY p.query_id
+)
+SELECT TOP (2000)
+    r.query_id,
+    qt.query_sql_text
+FROM ran AS r
+JOIN sys.query_store_query AS q ON q.query_id = r.query_id
+JOIN sys.query_store_query_text AS qt ON qt.query_text_id = q.query_text_id
+WHERE q.object_id = 0
+  AND q.is_internal_query = 0
+  AND LEN(qt.query_sql_text) <= 4000
+  AND qt.query_sql_text NOT LIKE N'%dbhubdemo:rca-observer%'
+ORDER BY r.executions DESC, r.query_id;
+
 -- name: RCA-AZ-01
 -- T3 only: resource governance, 15-second averages for the last hour (Azure SQL Database keeps them that long): CPU
 -- against the service objective's cap, the log rate governor (avg_log_write_percent), workers, sessions, data I/O, and
 -- memory. Every 30 minutes and at the session's end (Phase 1: T3's dense CPU, where Database Hub's bins are sparse); the
 -- runner keeps every new row, with no deadband, so a missing row is a missing sample, never an unchanged one.
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     rs.end_time,
     rs.avg_cpu_percent,
     rs.avg_data_io_percent,
@@ -414,7 +670,7 @@ ORDER BY rs.end_time;
 -- name: RCA-AZ-02
 -- T3 only: the database's wait statistics, cumulative (diffed like RCA-SQL-04).
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     ws.wait_type,
     ws.waiting_tasks_count,
@@ -426,9 +682,9 @@ WHERE ws.waiting_tasks_count > 0;
 
 -- name: RCA-AZ-03
 -- T3 only: automatic plan correction: the option's desired and actual state and why, as a DBA would check it. Every
--- 30 s with the sentinel; a change of state is recorded as a tuning event (RCA Events).
+-- 30 s with the sentinel; a change of state is an RCA Query Events row of kind tuning (the sidecar).
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     o.name,
     o.desired_state_desc,
@@ -438,9 +694,17 @@ FROM sys.database_automatic_tuning_options AS o;
 
 -- name: RCA-AZ-04
 -- T3 only: the tuning recommendations with their state and plan IDs: the regressed and the recommended plan of each
--- query, when the recommendation was valid, and who forced it (system or user).
+-- query, when the recommendation was valid, and who forced it (system or user). A recommendation that appears, or whose
+-- state changes, is an RCA Query Events row of kind tuning (the sidecar). The plans' CPU averages are Learn's
+-- microseconds (regressedPlanCpuTimeAverage, recommendedPlanCpuTimeAverage), as the recommendation measured them when
+-- it detected the regression; the observer writes them in milliseconds. Learn lists VIEW SERVER PERFORMANCE STATE for
+-- this view on SQL Server 2022 and Azure SQL Database: a server permission, which a contained database user can't
+-- hold. On Azure SQL Database, a login in master holds it through the ##MS_ServerStateReader## server role, in each
+-- database where the login has a user, and the server's Microsoft Entra administrator holds every permission (Learn:
+-- Server roles; Authorize server and database access). A refusal is a gap in the sidecar's coverage that names the
+-- permission and that fix; the other reads go on.
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc            = SYSUTCDATETIME(),
     tr.name,
     tr.type,
@@ -458,15 +722,14 @@ SELECT
     query_id                   = JSON_VALUE(tr.details, N'$.planForceDetails.queryId'),
     regressed_plan_id          = JSON_VALUE(tr.details, N'$.planForceDetails.regressedPlanId'),
     recommended_plan_id        = JSON_VALUE(tr.details, N'$.planForceDetails.recommendedPlanId'),
-    regressed_plan_cpu_ms      = JSON_VALUE(tr.details, N'$.planForceDetails.regressedPlanCpuTimeAverage'),
-    recommended_plan_cpu_ms    = JSON_VALUE(tr.details, N'$.planForceDetails.recommendedPlanCpuTimeAverage'),
-    estimated_gain             = JSON_VALUE(tr.details, N'$.estimatedGain')
+    regressed_plan_cpu_us      = JSON_VALUE(tr.details, N'$.planForceDetails.regressedPlanCpuTimeAverage'),
+    recommended_plan_cpu_us    = JSON_VALUE(tr.details, N'$.planForceDetails.recommendedPlanCpuTimeAverage')
 FROM sys.dm_db_tuning_recommendations AS tr;
 
 -- name: RCA-AZ-05
 -- T3 only: file I/O for ContosoCare's own files (Azure SQL Database has no sys.master_files), cumulative (diffed).
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     captured_at_utc = SYSUTCDATETIME(),
     vfs.file_id,
     df.type_desc,
@@ -484,9 +747,11 @@ JOIN sys.database_files AS df ON df.file_id = vfs.file_id;
 -- SESSION page points to sys.dm_xe_object_columns for them; Learn has no field reference for error_reported). The
 -- runner reads only fields this lists, and records a missing one as "not captured" instead of failing. It reads
 -- sys.dm_xe_object_columns alone, by the events' names and their data columns: its earlier join to sys.dm_xe_objects
--- returned the same fields, and took about 8 s of CPU at each observer start on SQL Server 2022 CU25 (2026-11-23).
+-- returned the same fields, but its plan read sys.dm_xe_objects again for each column row: on SQL Server 2022 CU25 it
+-- ran about 46 s when let finish, so the observer's 30-second timeout for a long statement cut it short at each start,
+-- after about 30 s of CPU (2026-11-23).
 SET NOCOUNT ON;
-SELECT
+SELECT /* dbhubdemo:rca-observer */
     event_name  = c.object_name,
     column_name = c.name,
     c.type_name,
@@ -505,7 +770,7 @@ ORDER BY c.object_name, c.name;
 -- ring_buffer MAX_MEMORY of 1,024 KB or less, and a full buffer is then never truncated on read
 -- (https://learn.microsoft.com/sql/relational-databases/extended-events/targets-for-extended-events-in-sql-server#ring_buffer-target).
 -- A session left behind by a runner that stopped is dropped by the next one's start.
-IF NOT EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'ContosoCare_RCA')
+IF NOT EXISTS (SELECT /* dbhubdemo:rca-observer */ 1 FROM sys.server_event_sessions WHERE name = N'ContosoCare_RCA')
     CREATE EVENT SESSION [ContosoCare_RCA] ON SERVER
     ADD EVENT sqlserver.error_reported (
         ACTION (sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username, sqlserver.session_id, sqlserver.sql_text)
@@ -520,7 +785,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'ContosoCar
     ADD TARGET package0.ring_buffer (SET max_events_limit = (5000), max_memory = (1024))
     WITH (MAX_MEMORY = 8 MB, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, MAX_DISPATCH_LATENCY = 5 SECONDS,
           TRACK_CAUSALITY = OFF, STARTUP_STATE = OFF);
-IF NOT EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'ContosoCare_RCA')
+IF NOT EXISTS (SELECT /* dbhubdemo:rca-observer */ 1 FROM sys.dm_xe_sessions WHERE name = N'ContosoCare_RCA')
     ALTER EVENT SESSION [ContosoCare_RCA] ON SERVER STATE = START;
 
 -- name: RCA-XE-02
@@ -529,7 +794,7 @@ IF NOT EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'ContosoCare_RCA')
 -- in RCA-XE-01, so the runner keeps a deadlock graph only when a process in it ran in ContosoCare (its currentdb is
 -- ContosoCare's database ID) and drops any other graph unread.
 SET NOCOUNT ON;
-SELECT target_data = CAST(t.target_data AS xml)
+SELECT /* dbhubdemo:rca-observer */ target_data = CAST(t.target_data AS xml)
 FROM sys.dm_xe_session_targets AS t
 JOIN sys.dm_xe_sessions AS s ON s.address = t.event_session_address
 WHERE s.name = N'ContosoCare_RCA'
@@ -539,7 +804,7 @@ WHERE s.name = N'ContosoCare_RCA'
 -- T3: the same session, database-scoped (Azure SQL Database has database-scoped sessions only, no system_health, and
 -- Learn says not to read its built-in dl session). Deadlocks are database_xml_deadlock_report there. Needs CREATE ANY
 -- DATABASE EVENT SESSION, which dbo holds through CONTROL.
-IF NOT EXISTS (SELECT 1 FROM sys.database_event_sessions WHERE name = N'ContosoCare_RCA')
+IF NOT EXISTS (SELECT /* dbhubdemo:rca-observer */ 1 FROM sys.database_event_sessions WHERE name = N'ContosoCare_RCA')
     CREATE EVENT SESSION [ContosoCare_RCA] ON DATABASE
     ADD EVENT sqlserver.error_reported (
         ACTION (sqlserver.client_app_name, sqlserver.client_hostname, sqlserver.username, sqlserver.session_id, sqlserver.sql_text)
@@ -552,13 +817,13 @@ IF NOT EXISTS (SELECT 1 FROM sys.database_event_sessions WHERE name = N'ContosoC
     ADD TARGET package0.ring_buffer (SET max_events_limit = (5000), max_memory = (1024))
     WITH (MAX_MEMORY = 8 MB, EVENT_RETENTION_MODE = ALLOW_SINGLE_EVENT_LOSS, MAX_DISPATCH_LATENCY = 5 SECONDS,
           TRACK_CAUSALITY = OFF, STARTUP_STATE = OFF);
-IF NOT EXISTS (SELECT 1 FROM sys.dm_xe_database_sessions WHERE name = N'ContosoCare_RCA')
+IF NOT EXISTS (SELECT /* dbhubdemo:rca-observer */ 1 FROM sys.dm_xe_database_sessions WHERE name = N'ContosoCare_RCA')
     ALTER EVENT SESSION [ContosoCare_RCA] ON DATABASE STATE = START;
 
 -- name: RCA-XE-04
 -- T3: the database-scoped session's events so far.
 SET NOCOUNT ON;
-SELECT target_data = CAST(t.target_data AS xml)
+SELECT /* dbhubdemo:rca-observer */ target_data = CAST(t.target_data AS xml)
 FROM sys.dm_xe_database_session_targets AS t
 JOIN sys.dm_xe_database_sessions AS s ON s.address = t.event_session_address
 WHERE s.name = N'ContosoCare_RCA'
@@ -568,7 +833,7 @@ WHERE s.name = N'ContosoCare_RCA'
 -- T1, T2: the end. Stop and drop the session, so nothing of the observer stays on the instance. (T3: the same
 -- statements with ON DATABASE and sys.database_event_sessions.) Run at the session's end, before RCA-XE-01 at the
 -- observer's start (a session left behind by a runner that stopped), and by the runner's reset (ADR 0010's amendment).
-IF EXISTS (SELECT 1 FROM sys.dm_xe_sessions WHERE name = N'ContosoCare_RCA')
+IF EXISTS (SELECT /* dbhubdemo:rca-observer */ 1 FROM sys.dm_xe_sessions WHERE name = N'ContosoCare_RCA')
     ALTER EVENT SESSION [ContosoCare_RCA] ON SERVER STATE = STOP;
-IF EXISTS (SELECT 1 FROM sys.server_event_sessions WHERE name = N'ContosoCare_RCA')
+IF EXISTS (SELECT /* dbhubdemo:rca-observer */ 1 FROM sys.server_event_sessions WHERE name = N'ContosoCare_RCA')
     DROP EVENT SESSION [ContosoCare_RCA] ON SERVER;

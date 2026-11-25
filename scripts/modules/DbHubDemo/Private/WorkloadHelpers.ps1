@@ -215,13 +215,15 @@ function Get-DemoWorkloadControlScript {
     .DESCRIPTION
     The action name and the Base64 request are checked before they go into single-quoted strings, so nothing
     can break out of them. The script finds the bundle through settings.json (bundlePath), which the loader
-    writes, and prints a Fail line in the same format when anything is missing.
+    writes, and prints a Fail line in the same format when anything is missing. RcaSidecarExport and RcaAck are the
+    Incident RCA sidecar's actions (2026-11-23, rca/README.md, The runner's commands), which a bundle from before them
+    answers with "Unknown action".
     #>
     [CmdletBinding()]
     [OutputType([string])]
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('EnableT3', 'EnableT4', 'Runner', 'StopGuest', 'Rca')]
+        [ValidateSet('EnableT3', 'EnableT4', 'Runner', 'StopGuest', 'Rca', 'RcaSidecarExport', 'RcaAck')]
         [string] $Action,
 
         [Parameter(Mandatory)]
@@ -289,7 +291,7 @@ function Invoke-DemoWorkloadAction {
         [string] $VmName,
 
         [Parameter(Mandatory)]
-        [ValidateSet('EnableT3', 'EnableT4', 'Runner', 'StopGuest', 'Rca')]
+        [ValidateSet('EnableT3', 'EnableT4', 'Runner', 'StopGuest', 'Rca', 'RcaSidecarExport', 'RcaAck')]
         [string] $Action,
 
         [System.Collections.IDictionary] $Request = @{},

@@ -3,8 +3,9 @@ import { afterEach, describe, expect, it, vi, type Mock } from "vitest";
 import { createInvestigations } from "@/copilot/investigations";
 import { createQueryClient, type ConnectorResult, type Execute } from "@/data/query-client";
 import { retryClock } from "@/data/retry";
-import { checkRcaTables, createRcaClient, NEWEST_BIN_DAX } from "./client";
-import { RCA_PRESENCE_DAX, RcaReadError } from "./loader";
+import { checkRcaTables, checkSidecarTables, createRcaClient, NEWEST_BIN_DAX } from "./client";
+import { RCA_PRESENCE_DAX, RcaReadError, SIDECAR_PRESENCE_DAX } from "./loader";
+import { SIDECAR_SPEC, SIDECAR_TABLES } from "./spec";
 
 // The connector's answers, as the deployed app gets them (live, 2026-11-21): Power BI's 429 past 120 queries a minute
 // (Final tests on dbhubra at cb224b28), and Execute Queries' 400 on a model from before the Incident RCA (on dbhubrb at
@@ -82,6 +83,26 @@ describe("whether the history model has the RCA tables", () => {
         const execute = vi.fn<Execute>(async () => UNAVAILABLE);
         expect(await checkRcaTables(createQueryClient(execute))).toEqual({ state: "failed", error: "Fabric couldn't run the query: Service Unavailable Try again in a minute." });
         expect(waits).toEqual([1000, 2000, 4000]);
+    });
+});
+
+describe("whether the history model has Query Store's tables (the sidecar)", () => {
+    // Execute Queries' answer on a model from before the sidecar names the first table it doesn't know.
+    const NO_SIDECAR: ConnectorResult = { status: "error", error: { category: "query", message: "Query (1, 40) Cannot find table '<oii>RCA Query Stats</oii>'.", code: "DatasetExecuteQueriesError" }, requestId: "r-400" };
+    const asked = (execute: Mock<Execute>) => execute.mock.calls.filter(([input]) => input.query === SIDECAR_PRESENCE_DAX).length;
+
+    it("names all six in one query: present when it answers, absent when the model doesn't know one, and failed otherwise", async () => {
+        fakeClock();
+        for (const key of SIDECAR_TABLES) expect(SIDECAR_PRESENCE_DAX).toContain(`COUNTROWS ( '${SIDECAR_SPEC[key].model}' )`);
+        const present = vi.fn<Execute>(async () => ONE);
+        expect(await checkSidecarTables(createQueryClient(present))).toEqual({ state: "present" });
+        expect(asked(present)).toBe(1);
+        const older = vi.fn<Execute>(async () => NO_SIDECAR);
+        expect(await checkSidecarTables(createQueryClient(older))).toEqual({ state: "absent" });
+        expect(asked(older)).toBe(1);
+        expect(waits).toEqual([]);
+        const down = vi.fn<Execute>(async () => UNAVAILABLE);
+        expect(await checkSidecarTables(createQueryClient(down))).toEqual({ state: "failed", error: "Fabric couldn't run the query: Service Unavailable Try again in a minute." });
     });
 });
 

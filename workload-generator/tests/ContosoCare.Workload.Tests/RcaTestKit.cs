@@ -233,6 +233,12 @@ internal sealed class ScriptedConnector(Func<string, int[]?, IReadOnlyList<Captu
 {
     public List<(string BlockId, string Text, int[]? Parameter)> Calls { get; } = [];
 
+    /// <summary>The parameters of every call that had them (the sidecar's reads), by block, in order; each is in Calls too.</summary>
+    public List<(string BlockId, CaptureParameters Parameters)> ParameterCalls { get; } = [];
+
+    /// <summary>When set, answers a call that has parameters; otherwise the script answers it as one without.</summary>
+    public Func<string, CaptureParameters, IReadOnlyList<CaptureValues>>? ParameterAnswer { get; set; }
+
     public int Opens { get; private set; }
 
     /// <summary>When set, opening throws this (a target that doesn't answer).</summary>
@@ -261,11 +267,23 @@ internal sealed class ScriptedConnector(Func<string, int[]?, IReadOnlyList<Captu
 
     private sealed class Connection(ScriptedConnector owner) : ICaptureConnection
     {
-        public async Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken)
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, int[]? parameter, TimeSpan timeout, CancellationToken cancellationToken) =>
+            RunAsync(blockId, text, parameter, null, cancellationToken);
+
+        public Task<IReadOnlyList<CaptureValues>> QueryAsync(string blockId, string text, CaptureParameters parameters, TimeSpan timeout, CancellationToken cancellationToken) =>
+            RunAsync(blockId, text, null, parameters, cancellationToken);
+
+        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
+
+        private async Task<IReadOnlyList<CaptureValues>> RunAsync(string blockId, string text, int[]? parameter, CaptureParameters? parameters, CancellationToken cancellationToken)
         {
             lock (owner.Calls)
             {
                 owner.Calls.Add((blockId, text, parameter));
+                if (parameters is not null)
+                {
+                    owner.ParameterCalls.Add((blockId, parameters));
+                }
             }
 
             if (owner.Delay > TimeSpan.Zero)
@@ -278,9 +296,7 @@ internal sealed class ScriptedConnector(Func<string, int[]?, IReadOnlyList<Captu
                 throw failure;
             }
 
-            return owner.Answer(blockId, parameter);
+            return parameters is not null && owner.ParameterAnswer is { } answer ? answer(blockId, parameters) : owner.Answer(blockId, parameter);
         }
-
-        public ValueTask DisposeAsync() => ValueTask.CompletedTask;
     }
 }
